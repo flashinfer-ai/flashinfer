@@ -53,25 +53,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_Q_SMEM_OFF 1024
-#define SMEM_Q_SMEM_STAGE_BYTES 8192
-#define SMEM_Q_SMEM_STRIDE 8192
-#define SMEM_K_SMEM_OFF 9216
-#define SMEM_K_SMEM_STAGE_BYTES 8192
-#define SMEM_K_SMEM_STRIDE 8192
-#define SMEM_V_TMA_SMEM_OFF 17408
-#define SMEM_V_TMA_SMEM_STAGE_BYTES 8192
-#define SMEM_V_TMA_SMEM_STRIDE 8192
-#define SMEM_V_SMEM_OFF 17408
-#define SMEM_V_SMEM_STAGE_BYTES 8192
-#define SMEM_V_SMEM_STRIDE 8192
-#define SMEM_O_SMEM_OFF 1024
-#define SMEM_O_SMEM_STAGE_BYTES 16384
-#define SMEM_O_SMEM_STRIDE 16384
-#define SMEM_TOTAL 25600
-#define THREADS 128
 #ifndef CAKE_SAGE_HAS_BLOCK_NUMS
 #define CAKE_SAGE_HAS_BLOCK_NUMS 0
 #endif
@@ -196,7 +177,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int8_t* q_smem = reinterpret_cast<int8_t*>(smem_raw + 1024);
     const int q_smem_addr = smem + 1024;
     int8_t* k_smem = reinterpret_cast<int8_t*>(smem_raw + 9216);
@@ -208,8 +189,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
     __nv_bfloat16* o_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int o_smem_addr = smem + 1024;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 3 barriers)
-    // Mbarriers at smem_raw[0..24)
+    // Mbarrier init (3 barriers at smem_raw[0..24))
 
     if (tid == 0) {
         // q_full: 1 barriers, init_count=1
@@ -341,10 +321,10 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_smem_addr + (q_row_base * 8 + (unsigned int)((q_col_base * 16 ^ (q_row_base & 7) << 4) / 16)) * 16)
             : "memory");
         unsigned int q_row_base_0 = warp * 16 + lane % 16;
-        unsigned int q_col_base_1 = lane / 16;
+        unsigned int q_col_base_0 = lane / 16;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(q_prefetch[0]), "=r"(q_prefetch[1]), "=r"(q_prefetch[2]), "=r"(q_prefetch[3])
-            : "r"(q_smem_addr + (q_row_base_0 * 8 + (unsigned int)(((q_col_base_1 + 2) * 16 ^ (q_row_base_0 & 7) << 4) / 16)) * 16)
+            : "r"(q_smem_addr + (q_row_base_0 * 8 + (unsigned int)(((q_col_base_0 + 2) * 16 ^ (q_row_base_0 & 7) << 4) / 16)) * 16)
             : "memory");
         unsigned int k_row_base = lane % 8 + lane / 16 * 8;
         unsigned int k_col_base = lane / 8 % 2;
@@ -388,17 +368,17 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=r"(scores_i32[28]), "=r"(scores_i32[(28) + 1]), "=r"(scores_i32[(28) + 2]), "=r"(scores_i32[(28) + 3])
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
-        unsigned int q_row_base_2 = warp * 16 + lane % 16;
-        unsigned int q_col_base_3 = lane / 16;
+        unsigned int q_row_base_1 = warp * 16 + lane % 16;
+        unsigned int q_col_base_1 = lane / 16;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(q_frag[0]), "=r"(q_frag[1]), "=r"(q_frag[2]), "=r"(q_frag[3])
-            : "r"(q_smem_addr + (q_row_base_2 * 8 + (unsigned int)(((q_col_base_3 + 4) * 16 ^ (q_row_base_2 & 7) << 4) / 16)) * 16)
+            : "r"(q_smem_addr + (q_row_base_1 * 8 + (unsigned int)(((q_col_base_1 + 4) * 16 ^ (q_row_base_1 & 7) << 4) / 16)) * 16)
             : "memory");
-        unsigned int k_row_base_4 = lane % 8 + lane / 16 * 8;
-        unsigned int k_col_base_5 = lane / 8 % 2;
+        unsigned int k_row_base_0 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_0 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + (k_row_base_4 * 8 + (unsigned int)(((k_col_base_5 + 2) * 16 ^ (k_row_base_4 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + (k_row_base_0 * 8 + (unsigned int)(((k_col_base_0 + 2) * 16 ^ (k_row_base_0 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
@@ -408,7 +388,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_4 + 16) * 8 + (unsigned int)(((k_col_base_5 + 2) * 16 ^ (k_row_base_4 + 16 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_0 + 16) * 8 + (unsigned int)(((k_col_base_0 + 2) * 16 ^ (k_row_base_0 + 16 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
@@ -418,7 +398,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_4 + 32) * 8 + (unsigned int)(((k_col_base_5 + 2) * 16 ^ (k_row_base_4 + 32 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_0 + 32) * 8 + (unsigned int)(((k_col_base_0 + 2) * 16 ^ (k_row_base_0 + 32 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
@@ -428,7 +408,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_4 + 48) * 8 + (unsigned int)(((k_col_base_5 + 2) * 16 ^ (k_row_base_4 + 48 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_0 + 48) * 8 + (unsigned int)(((k_col_base_0 + 2) * 16 ^ (k_row_base_0 + 48 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
@@ -436,17 +416,17 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[28]), "+r"(scores_i32[(28) + 1]), "+r"(scores_i32[(28) + 2]), "+r"(scores_i32[(28) + 3])
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
-        unsigned int q_row_base_6 = warp * 16 + lane % 16;
-        unsigned int q_col_base_7 = lane / 16;
+        unsigned int q_row_base_2 = warp * 16 + lane % 16;
+        unsigned int q_col_base_2 = lane / 16;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(q_prefetch[0]), "=r"(q_prefetch[1]), "=r"(q_prefetch[2]), "=r"(q_prefetch[3])
-            : "r"(q_smem_addr + (q_row_base_6 * 8 + (unsigned int)(((q_col_base_7 + 6) * 16 ^ (q_row_base_6 & 7) << 4) / 16)) * 16)
+            : "r"(q_smem_addr + (q_row_base_2 * 8 + (unsigned int)(((q_col_base_2 + 6) * 16 ^ (q_row_base_2 & 7) << 4) / 16)) * 16)
             : "memory");
-        unsigned int k_row_base_8 = lane % 8 + lane / 16 * 8;
-        unsigned int k_col_base_9 = lane / 8 % 2;
+        unsigned int k_row_base_1 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_1 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + (k_row_base_8 * 8 + (unsigned int)(((k_col_base_9 + 4) * 16 ^ (k_row_base_8 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + (k_row_base_1 * 8 + (unsigned int)(((k_col_base_1 + 4) * 16 ^ (k_row_base_1 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
@@ -456,7 +436,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_8 + 16) * 8 + (unsigned int)(((k_col_base_9 + 4) * 16 ^ (k_row_base_8 + 16 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_1 + 16) * 8 + (unsigned int)(((k_col_base_1 + 4) * 16 ^ (k_row_base_1 + 16 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
@@ -466,7 +446,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_8 + 32) * 8 + (unsigned int)(((k_col_base_9 + 4) * 16 ^ (k_row_base_8 + 32 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_1 + 32) * 8 + (unsigned int)(((k_col_base_1 + 4) * 16 ^ (k_row_base_1 + 32 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
@@ -476,7 +456,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_8 + 48) * 8 + (unsigned int)(((k_col_base_9 + 4) * 16 ^ (k_row_base_8 + 48 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_1 + 48) * 8 + (unsigned int)(((k_col_base_1 + 4) * 16 ^ (k_row_base_1 + 48 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
@@ -484,11 +464,11 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[28]), "+r"(scores_i32[(28) + 1]), "+r"(scores_i32[(28) + 2]), "+r"(scores_i32[(28) + 3])
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
-        unsigned int k_row_base_10 = lane % 8 + lane / 16 * 8;
-        unsigned int k_col_base_11 = lane / 8 % 2;
+        unsigned int k_row_base_2 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_2 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + (k_row_base_10 * 8 + (unsigned int)(((k_col_base_11 + 6) * 16 ^ (k_row_base_10 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + (k_row_base_2 * 8 + (unsigned int)(((k_col_base_2 + 6) * 16 ^ (k_row_base_2 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
@@ -498,7 +478,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_10 + 16) * 8 + (unsigned int)(((k_col_base_11 + 6) * 16 ^ (k_row_base_10 + 16 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_2 + 16) * 8 + (unsigned int)(((k_col_base_2 + 6) * 16 ^ (k_row_base_2 + 16 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
@@ -508,7 +488,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_10 + 32) * 8 + (unsigned int)(((k_col_base_11 + 6) * 16 ^ (k_row_base_10 + 32 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_2 + 32) * 8 + (unsigned int)(((k_col_base_2 + 6) * 16 ^ (k_row_base_2 + 32 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
@@ -518,7 +498,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_10 + 48) * 8 + (unsigned int)(((k_col_base_11 + 6) * 16 ^ (k_row_base_10 + 48 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_2 + 48) * 8 + (unsigned int)(((k_col_base_2 + 6) * 16 ^ (k_row_base_2 + 48 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
@@ -662,6 +642,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
                 next_physical = q2k_block_index[index_base + selected_count - 1 - preload_count];
 #endif  // CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             if (warp == 0) {
                 if (elect_sync()) {
@@ -708,132 +689,132 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         scores[31] = (float)scores_i32[31];
         if (valid_tokens < 64) {
             int lane_col_base = 2 * (lane % 4);
-            int token_in_tile = lane_col_base;
-            if (token_in_tile >= valid_tokens) {
+            int token_in_tile_31_0 = lane_col_base;
+            if (token_in_tile_31_0 >= valid_tokens) {
                 scores[0] = -CUDART_INF_F;
             }
-            int token_in_tile_0 = lane_col_base + 1;
-            if (token_in_tile_0 >= valid_tokens) {
+            int token_in_tile_31_1 = lane_col_base + 1;
+            if (token_in_tile_31_1 >= valid_tokens) {
                 scores[1] = -CUDART_INF_F;
             }
-            int token_in_tile_1 = lane_col_base;
-            if (token_in_tile_1 >= valid_tokens) {
+            int token_in_tile_31_2 = lane_col_base;
+            if (token_in_tile_31_2 >= valid_tokens) {
                 scores[2] = -CUDART_INF_F;
             }
-            int token_in_tile_2 = lane_col_base + 1;
-            if (token_in_tile_2 >= valid_tokens) {
+            int token_in_tile_31_3 = lane_col_base + 1;
+            if (token_in_tile_31_3 >= valid_tokens) {
                 scores[3] = -CUDART_INF_F;
             }
-            int token_in_tile_3 = lane_col_base + 8;
-            if (token_in_tile_3 >= valid_tokens) {
+            int token_in_tile_31_4 = lane_col_base + 8;
+            if (token_in_tile_31_4 >= valid_tokens) {
                 scores[4] = -CUDART_INF_F;
             }
-            int token_in_tile_4 = lane_col_base + 8 + 1;
-            if (token_in_tile_4 >= valid_tokens) {
+            int token_in_tile_31_5 = lane_col_base + 8 + 1;
+            if (token_in_tile_31_5 >= valid_tokens) {
                 scores[5] = -CUDART_INF_F;
             }
-            int token_in_tile_5 = lane_col_base + 8;
-            if (token_in_tile_5 >= valid_tokens) {
+            int token_in_tile_31_6 = lane_col_base + 8;
+            if (token_in_tile_31_6 >= valid_tokens) {
                 scores[6] = -CUDART_INF_F;
             }
-            int token_in_tile_6 = lane_col_base + 8 + 1;
-            if (token_in_tile_6 >= valid_tokens) {
+            int token_in_tile_31_7 = lane_col_base + 8 + 1;
+            if (token_in_tile_31_7 >= valid_tokens) {
                 scores[7] = -CUDART_INF_F;
             }
-            int token_in_tile_7 = 16 + lane_col_base;
-            if (token_in_tile_7 >= valid_tokens) {
+            int token_in_tile_31_8 = 16 + lane_col_base;
+            if (token_in_tile_31_8 >= valid_tokens) {
                 scores[8] = -CUDART_INF_F;
             }
-            int token_in_tile_8 = 16 + lane_col_base + 1;
-            if (token_in_tile_8 >= valid_tokens) {
+            int token_in_tile_31_9 = 16 + lane_col_base + 1;
+            if (token_in_tile_31_9 >= valid_tokens) {
                 scores[9] = -CUDART_INF_F;
             }
-            int token_in_tile_9 = 16 + lane_col_base;
-            if (token_in_tile_9 >= valid_tokens) {
+            int token_in_tile_31_10 = 16 + lane_col_base;
+            if (token_in_tile_31_10 >= valid_tokens) {
                 scores[10] = -CUDART_INF_F;
             }
-            int token_in_tile_10 = 16 + lane_col_base + 1;
-            if (token_in_tile_10 >= valid_tokens) {
+            int token_in_tile_31_11 = 16 + lane_col_base + 1;
+            if (token_in_tile_31_11 >= valid_tokens) {
                 scores[11] = -CUDART_INF_F;
             }
-            int token_in_tile_11 = 16 + lane_col_base + 8;
-            if (token_in_tile_11 >= valid_tokens) {
+            int token_in_tile_31_12 = 16 + lane_col_base + 8;
+            if (token_in_tile_31_12 >= valid_tokens) {
                 scores[12] = -CUDART_INF_F;
             }
-            int token_in_tile_12 = 16 + lane_col_base + 8 + 1;
-            if (token_in_tile_12 >= valid_tokens) {
+            int token_in_tile_31_13 = 16 + lane_col_base + 8 + 1;
+            if (token_in_tile_31_13 >= valid_tokens) {
                 scores[13] = -CUDART_INF_F;
             }
-            int token_in_tile_13 = 16 + lane_col_base + 8;
-            if (token_in_tile_13 >= valid_tokens) {
+            int token_in_tile_31_14 = 16 + lane_col_base + 8;
+            if (token_in_tile_31_14 >= valid_tokens) {
                 scores[14] = -CUDART_INF_F;
             }
-            int token_in_tile_14 = 16 + lane_col_base + 8 + 1;
-            if (token_in_tile_14 >= valid_tokens) {
+            int token_in_tile_31_15 = 16 + lane_col_base + 8 + 1;
+            if (token_in_tile_31_15 >= valid_tokens) {
                 scores[15] = -CUDART_INF_F;
             }
-            int token_in_tile_15 = 32 + lane_col_base;
-            if (token_in_tile_15 >= valid_tokens) {
+            int token_in_tile_31_16 = 32 + lane_col_base;
+            if (token_in_tile_31_16 >= valid_tokens) {
                 scores[16] = -CUDART_INF_F;
             }
-            int token_in_tile_16 = 32 + lane_col_base + 1;
-            if (token_in_tile_16 >= valid_tokens) {
+            int token_in_tile_31_17 = 32 + lane_col_base + 1;
+            if (token_in_tile_31_17 >= valid_tokens) {
                 scores[17] = -CUDART_INF_F;
             }
-            int token_in_tile_17 = 32 + lane_col_base;
-            if (token_in_tile_17 >= valid_tokens) {
+            int token_in_tile_31_18 = 32 + lane_col_base;
+            if (token_in_tile_31_18 >= valid_tokens) {
                 scores[18] = -CUDART_INF_F;
             }
-            int token_in_tile_18 = 32 + lane_col_base + 1;
-            if (token_in_tile_18 >= valid_tokens) {
+            int token_in_tile_31_19 = 32 + lane_col_base + 1;
+            if (token_in_tile_31_19 >= valid_tokens) {
                 scores[19] = -CUDART_INF_F;
             }
-            int token_in_tile_19 = 32 + lane_col_base + 8;
-            if (token_in_tile_19 >= valid_tokens) {
+            int token_in_tile_31_20 = 32 + lane_col_base + 8;
+            if (token_in_tile_31_20 >= valid_tokens) {
                 scores[20] = -CUDART_INF_F;
             }
-            int token_in_tile_20 = 32 + lane_col_base + 8 + 1;
-            if (token_in_tile_20 >= valid_tokens) {
+            int token_in_tile_31_21 = 32 + lane_col_base + 8 + 1;
+            if (token_in_tile_31_21 >= valid_tokens) {
                 scores[21] = -CUDART_INF_F;
             }
-            int token_in_tile_21 = 32 + lane_col_base + 8;
-            if (token_in_tile_21 >= valid_tokens) {
+            int token_in_tile_31_22 = 32 + lane_col_base + 8;
+            if (token_in_tile_31_22 >= valid_tokens) {
                 scores[22] = -CUDART_INF_F;
             }
-            int token_in_tile_22 = 32 + lane_col_base + 8 + 1;
-            if (token_in_tile_22 >= valid_tokens) {
+            int token_in_tile_31_23 = 32 + lane_col_base + 8 + 1;
+            if (token_in_tile_31_23 >= valid_tokens) {
                 scores[23] = -CUDART_INF_F;
             }
-            int token_in_tile_23 = 48 + lane_col_base;
-            if (token_in_tile_23 >= valid_tokens) {
+            int token_in_tile_31_24 = 48 + lane_col_base;
+            if (token_in_tile_31_24 >= valid_tokens) {
                 scores[24] = -CUDART_INF_F;
             }
-            int token_in_tile_24 = 48 + lane_col_base + 1;
-            if (token_in_tile_24 >= valid_tokens) {
+            int token_in_tile_31_25 = 48 + lane_col_base + 1;
+            if (token_in_tile_31_25 >= valid_tokens) {
                 scores[25] = -CUDART_INF_F;
             }
-            int token_in_tile_25 = 48 + lane_col_base;
-            if (token_in_tile_25 >= valid_tokens) {
+            int token_in_tile_31_26 = 48 + lane_col_base;
+            if (token_in_tile_31_26 >= valid_tokens) {
                 scores[26] = -CUDART_INF_F;
             }
-            int token_in_tile_26 = 48 + lane_col_base + 1;
-            if (token_in_tile_26 >= valid_tokens) {
+            int token_in_tile_31_27 = 48 + lane_col_base + 1;
+            if (token_in_tile_31_27 >= valid_tokens) {
                 scores[27] = -CUDART_INF_F;
             }
-            int token_in_tile_27 = 48 + lane_col_base + 8;
-            if (token_in_tile_27 >= valid_tokens) {
+            int token_in_tile_31_28 = 48 + lane_col_base + 8;
+            if (token_in_tile_31_28 >= valid_tokens) {
                 scores[28] = -CUDART_INF_F;
             }
-            int token_in_tile_28 = 48 + lane_col_base + 8 + 1;
-            if (token_in_tile_28 >= valid_tokens) {
+            int token_in_tile_31_29 = 48 + lane_col_base + 8 + 1;
+            if (token_in_tile_31_29 >= valid_tokens) {
                 scores[29] = -CUDART_INF_F;
             }
-            int token_in_tile_29 = 48 + lane_col_base + 8;
-            if (token_in_tile_29 >= valid_tokens) {
+            int token_in_tile_31_30 = 48 + lane_col_base + 8;
+            if (token_in_tile_31_30 >= valid_tokens) {
                 scores[30] = -CUDART_INF_F;
             }
-            int token_in_tile_30 = 48 + lane_col_base + 8 + 1;
-            if (token_in_tile_30 >= valid_tokens) {
+            int token_in_tile_31_31 = 48 + lane_col_base + 8 + 1;
+            if (token_in_tile_31_31 >= valid_tokens) {
                 scores[31] = -CUDART_INF_F;
             }
         }
@@ -1064,42 +1045,42 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         float value1 = approx_exp2(__fmaf_rn(scores[3], score_scale_log2, -row_shift[1]));
         scores[3] = value1;
         local_sum[1] = local_sum[1] + value1;
-        float value0_16 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2, -row_shift[0]));
-        scores[4] = value0_16;
-        local_sum[0] = local_sum[0] + value0_16;
-        float value1_17 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2, -row_shift[1]));
-        scores[6] = value1_17;
-        local_sum[1] = local_sum[1] + value1_17;
-        float value0_18 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2, -row_shift[0]));
-        scores[5] = value0_18;
-        local_sum[0] = local_sum[0] + value0_18;
-        float value1_19 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2, -row_shift[1]));
-        scores[7] = value1_19;
-        local_sum[1] = local_sum[1] + value1_19;
-        float value0_20 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2, -row_shift[0]));
-        scores[8] = value0_20;
-        local_sum[0] = local_sum[0] + value0_20;
-        float value1_21 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2, -row_shift[1]));
-        scores[10] = value1_21;
-        local_sum[1] = local_sum[1] + value1_21;
-        float value0_22 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2, -row_shift[0]));
-        scores[9] = value0_22;
-        local_sum[0] = local_sum[0] + value0_22;
-        float value1_23 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2, -row_shift[1]));
-        scores[11] = value1_23;
-        local_sum[1] = local_sum[1] + value1_23;
-        float value0_24 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2, -row_shift[0]));
-        scores[12] = value0_24;
-        local_sum[0] = local_sum[0] + value0_24;
-        float value1_25 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2, -row_shift[1]));
-        scores[14] = value1_25;
-        local_sum[1] = local_sum[1] + value1_25;
-        float value0_26 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2, -row_shift[0]));
-        scores[13] = value0_26;
-        local_sum[0] = local_sum[0] + value0_26;
-        float value1_27 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2, -row_shift[1]));
-        scores[15] = value1_27;
-        local_sum[1] = local_sum[1] + value1_27;
+        float value0_0 = approx_exp2(__fmaf_rn(scores[4], score_scale_log2, -row_shift[0]));
+        scores[4] = value0_0;
+        local_sum[0] = local_sum[0] + value0_0;
+        float value1_0 = approx_exp2(__fmaf_rn(scores[6], score_scale_log2, -row_shift[1]));
+        scores[6] = value1_0;
+        local_sum[1] = local_sum[1] + value1_0;
+        float value0_1 = approx_exp2(__fmaf_rn(scores[5], score_scale_log2, -row_shift[0]));
+        scores[5] = value0_1;
+        local_sum[0] = local_sum[0] + value0_1;
+        float value1_1 = approx_exp2(__fmaf_rn(scores[7], score_scale_log2, -row_shift[1]));
+        scores[7] = value1_1;
+        local_sum[1] = local_sum[1] + value1_1;
+        float value0_2 = approx_exp2(__fmaf_rn(scores[8], score_scale_log2, -row_shift[0]));
+        scores[8] = value0_2;
+        local_sum[0] = local_sum[0] + value0_2;
+        float value1_2 = approx_exp2(__fmaf_rn(scores[10], score_scale_log2, -row_shift[1]));
+        scores[10] = value1_2;
+        local_sum[1] = local_sum[1] + value1_2;
+        float value0_3 = approx_exp2(__fmaf_rn(scores[9], score_scale_log2, -row_shift[0]));
+        scores[9] = value0_3;
+        local_sum[0] = local_sum[0] + value0_3;
+        float value1_3 = approx_exp2(__fmaf_rn(scores[11], score_scale_log2, -row_shift[1]));
+        scores[11] = value1_3;
+        local_sum[1] = local_sum[1] + value1_3;
+        float value0_4 = approx_exp2(__fmaf_rn(scores[12], score_scale_log2, -row_shift[0]));
+        scores[12] = value0_4;
+        local_sum[0] = local_sum[0] + value0_4;
+        float value1_4 = approx_exp2(__fmaf_rn(scores[14], score_scale_log2, -row_shift[1]));
+        scores[14] = value1_4;
+        local_sum[1] = local_sum[1] + value1_4;
+        float value0_5 = approx_exp2(__fmaf_rn(scores[13], score_scale_log2, -row_shift[0]));
+        scores[13] = value0_5;
+        local_sum[0] = local_sum[0] + value0_5;
+        float value1_5 = approx_exp2(__fmaf_rn(scores[15], score_scale_log2, -row_shift[1]));
+        scores[15] = value1_5;
+        local_sum[1] = local_sum[1] + value1_5;
         pack_values[0] = scores[0];
         pack_values[1] = scores[1];
         pack_values[2] = scores[4];
@@ -1252,54 +1233,54 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[60]), "+f"(output[(60) + 1]), "+f"(output[(60) + 2]), "+f"(output[(60) + 3])
             : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
-        float value0_28 = approx_exp2(__fmaf_rn(scores[16], score_scale_log2, -row_shift[0]));
-        scores[16] = value0_28;
-        local_sum[0] = local_sum[0] + value0_28;
-        float value1_29 = approx_exp2(__fmaf_rn(scores[18], score_scale_log2, -row_shift[1]));
-        scores[18] = value1_29;
-        local_sum[1] = local_sum[1] + value1_29;
-        float value0_30 = approx_exp2(__fmaf_rn(scores[17], score_scale_log2, -row_shift[0]));
-        scores[17] = value0_30;
-        local_sum[0] = local_sum[0] + value0_30;
-        float value1_31 = approx_exp2(__fmaf_rn(scores[19], score_scale_log2, -row_shift[1]));
-        scores[19] = value1_31;
-        local_sum[1] = local_sum[1] + value1_31;
-        float value0_32 = approx_exp2(__fmaf_rn(scores[20], score_scale_log2, -row_shift[0]));
-        scores[20] = value0_32;
-        local_sum[0] = local_sum[0] + value0_32;
-        float value1_33 = approx_exp2(__fmaf_rn(scores[22], score_scale_log2, -row_shift[1]));
-        scores[22] = value1_33;
-        local_sum[1] = local_sum[1] + value1_33;
-        float value0_34 = approx_exp2(__fmaf_rn(scores[21], score_scale_log2, -row_shift[0]));
-        scores[21] = value0_34;
-        local_sum[0] = local_sum[0] + value0_34;
-        float value1_35 = approx_exp2(__fmaf_rn(scores[23], score_scale_log2, -row_shift[1]));
-        scores[23] = value1_35;
-        local_sum[1] = local_sum[1] + value1_35;
-        float value0_36 = approx_exp2(__fmaf_rn(scores[24], score_scale_log2, -row_shift[0]));
-        scores[24] = value0_36;
-        local_sum[0] = local_sum[0] + value0_36;
-        float value1_37 = approx_exp2(__fmaf_rn(scores[26], score_scale_log2, -row_shift[1]));
-        scores[26] = value1_37;
-        local_sum[1] = local_sum[1] + value1_37;
-        float value0_38 = approx_exp2(__fmaf_rn(scores[25], score_scale_log2, -row_shift[0]));
-        scores[25] = value0_38;
-        local_sum[0] = local_sum[0] + value0_38;
-        float value1_39 = approx_exp2(__fmaf_rn(scores[27], score_scale_log2, -row_shift[1]));
-        scores[27] = value1_39;
-        local_sum[1] = local_sum[1] + value1_39;
-        float value0_40 = approx_exp2(__fmaf_rn(scores[28], score_scale_log2, -row_shift[0]));
-        scores[28] = value0_40;
-        local_sum[0] = local_sum[0] + value0_40;
-        float value1_41 = approx_exp2(__fmaf_rn(scores[30], score_scale_log2, -row_shift[1]));
-        scores[30] = value1_41;
-        local_sum[1] = local_sum[1] + value1_41;
-        float value0_42 = approx_exp2(__fmaf_rn(scores[29], score_scale_log2, -row_shift[0]));
-        scores[29] = value0_42;
-        local_sum[0] = local_sum[0] + value0_42;
-        float value1_43 = approx_exp2(__fmaf_rn(scores[31], score_scale_log2, -row_shift[1]));
-        scores[31] = value1_43;
-        local_sum[1] = local_sum[1] + value1_43;
+        float value0_6 = approx_exp2(__fmaf_rn(scores[16], score_scale_log2, -row_shift[0]));
+        scores[16] = value0_6;
+        local_sum[0] = local_sum[0] + value0_6;
+        float value1_6 = approx_exp2(__fmaf_rn(scores[18], score_scale_log2, -row_shift[1]));
+        scores[18] = value1_6;
+        local_sum[1] = local_sum[1] + value1_6;
+        float value0_7 = approx_exp2(__fmaf_rn(scores[17], score_scale_log2, -row_shift[0]));
+        scores[17] = value0_7;
+        local_sum[0] = local_sum[0] + value0_7;
+        float value1_7 = approx_exp2(__fmaf_rn(scores[19], score_scale_log2, -row_shift[1]));
+        scores[19] = value1_7;
+        local_sum[1] = local_sum[1] + value1_7;
+        float value0_8 = approx_exp2(__fmaf_rn(scores[20], score_scale_log2, -row_shift[0]));
+        scores[20] = value0_8;
+        local_sum[0] = local_sum[0] + value0_8;
+        float value1_8 = approx_exp2(__fmaf_rn(scores[22], score_scale_log2, -row_shift[1]));
+        scores[22] = value1_8;
+        local_sum[1] = local_sum[1] + value1_8;
+        float value0_9 = approx_exp2(__fmaf_rn(scores[21], score_scale_log2, -row_shift[0]));
+        scores[21] = value0_9;
+        local_sum[0] = local_sum[0] + value0_9;
+        float value1_9 = approx_exp2(__fmaf_rn(scores[23], score_scale_log2, -row_shift[1]));
+        scores[23] = value1_9;
+        local_sum[1] = local_sum[1] + value1_9;
+        float value0_10 = approx_exp2(__fmaf_rn(scores[24], score_scale_log2, -row_shift[0]));
+        scores[24] = value0_10;
+        local_sum[0] = local_sum[0] + value0_10;
+        float value1_10 = approx_exp2(__fmaf_rn(scores[26], score_scale_log2, -row_shift[1]));
+        scores[26] = value1_10;
+        local_sum[1] = local_sum[1] + value1_10;
+        float value0_11 = approx_exp2(__fmaf_rn(scores[25], score_scale_log2, -row_shift[0]));
+        scores[25] = value0_11;
+        local_sum[0] = local_sum[0] + value0_11;
+        float value1_11 = approx_exp2(__fmaf_rn(scores[27], score_scale_log2, -row_shift[1]));
+        scores[27] = value1_11;
+        local_sum[1] = local_sum[1] + value1_11;
+        float value0_12 = approx_exp2(__fmaf_rn(scores[28], score_scale_log2, -row_shift[0]));
+        scores[28] = value0_12;
+        local_sum[0] = local_sum[0] + value0_12;
+        float value1_12 = approx_exp2(__fmaf_rn(scores[30], score_scale_log2, -row_shift[1]));
+        scores[30] = value1_12;
+        local_sum[1] = local_sum[1] + value1_12;
+        float value0_13 = approx_exp2(__fmaf_rn(scores[29], score_scale_log2, -row_shift[0]));
+        scores[29] = value0_13;
+        local_sum[0] = local_sum[0] + value0_13;
+        float value1_13 = approx_exp2(__fmaf_rn(scores[31], score_scale_log2, -row_shift[1]));
+        scores[31] = value1_13;
+        local_sum[1] = local_sum[1] + value1_13;
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
         float _shfl_xor_sync_10 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 1);
         local_sum[0] = local_sum[0] + _shfl_xor_sync_10;
@@ -1402,11 +1383,11 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
                                    "f"(pack_values[2]), "f"(pack_values[3]));
             probabilities[7] = _packed;
         }
-        unsigned int v_row_base_44 = lane % 8 + lane / 16 * 8;
-        unsigned int v_col_base_45 = lane / 8 % 2;
+        unsigned int v_row_base_0 = lane % 8 + lane / 16 * 8;
+        unsigned int v_col_base_0 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + (v_row_base_44 * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + (v_row_base_0 * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[0]), "+f"(output[1]), "+f"(output[2]), "+f"(output[3])
@@ -1416,7 +1397,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_44 + 16) * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 + 16 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_0 + 16) * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 + 16 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[8]), "+f"(output[(8) + 1]), "+f"(output[(8) + 2]), "+f"(output[(8) + 3])
@@ -1426,7 +1407,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_44 + 32) * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 + 32 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_0 + 32) * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 + 32 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[16]), "+f"(output[(16) + 1]), "+f"(output[(16) + 2]), "+f"(output[(16) + 3])
@@ -1436,7 +1417,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_44 + 48) * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 + 48 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_0 + 48) * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 + 48 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[24]), "+f"(output[(24) + 1]), "+f"(output[(24) + 2]), "+f"(output[(24) + 3])
@@ -1446,7 +1427,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_44 + 64) * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 + 64 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_0 + 64) * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 + 64 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[32]), "+f"(output[(32) + 1]), "+f"(output[(32) + 2]), "+f"(output[(32) + 3])
@@ -1456,7 +1437,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_44 + 80) * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 + 80 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_0 + 80) * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 + 80 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[40]), "+f"(output[(40) + 1]), "+f"(output[(40) + 2]), "+f"(output[(40) + 3])
@@ -1466,7 +1447,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_44 + 96) * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 + 96 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_0 + 96) * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 + 96 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[48]), "+f"(output[(48) + 1]), "+f"(output[(48) + 2]), "+f"(output[(48) + 3])
@@ -1476,7 +1457,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_44 + 112) * 4 + (unsigned int)(((v_col_base_45 + 2) * 16 ^ (v_row_base_44 + 112 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_0 + 112) * 4 + (unsigned int)(((v_col_base_0 + 2) * 16 ^ (v_row_base_0 + 112 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[56]), "+f"(output[(56) + 1]), "+f"(output[(56) + 2]), "+f"(output[(56) + 3])
@@ -1485,6 +1466,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "+f"(output[60]), "+f"(output[(60) + 1]), "+f"(output[(60) + 2]), "+f"(output[(60) + 3])
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         if (preload_count < selected_count) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             if (warp == 0) {
                 if (elect_sync()) {
@@ -1503,23 +1485,23 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
     for (int load_count_1 = 1; load_count_1 < selected_count; load_count_1++) {
         mbarrier_wait(k_full_addr, _phase_k_full_0);
         _phase_k_full_0 ^= 1;
-        unsigned int q_row_base_1 = warp * 16 + lane % 16;
-        unsigned int q_col_base_2 = lane / 16;
+        unsigned int q_row_base_3 = warp * 16 + lane % 16;
+        unsigned int q_col_base_3 = lane / 16;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(q_frag[0]), "=r"(q_frag[1]), "=r"(q_frag[2]), "=r"(q_frag[3])
-            : "r"(q_smem_addr + (q_row_base_1 * 8 + (unsigned int)((q_col_base_2 * 16 ^ (q_row_base_1 & 7) << 4) / 16)) * 16)
+            : "r"(q_smem_addr + (q_row_base_3 * 8 + (unsigned int)((q_col_base_3 * 16 ^ (q_row_base_3 & 7) << 4) / 16)) * 16)
             : "memory");
-        unsigned int q_row_base_0_1 = warp * 16 + lane % 16;
-        unsigned int q_col_base_1_1 = lane / 16;
+        unsigned int q_row_base_3_1 = warp * 16 + lane % 16;
+        unsigned int q_col_base_3_1 = lane / 16;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(q_prefetch[0]), "=r"(q_prefetch[1]), "=r"(q_prefetch[2]), "=r"(q_prefetch[3])
-            : "r"(q_smem_addr + (q_row_base_0_1 * 8 + (unsigned int)(((q_col_base_1_1 + 2) * 16 ^ (q_row_base_0_1 & 7) << 4) / 16)) * 16)
+            : "r"(q_smem_addr + (q_row_base_3_1 * 8 + (unsigned int)(((q_col_base_3_1 + 2) * 16 ^ (q_row_base_3_1 & 7) << 4) / 16)) * 16)
             : "memory");
-        unsigned int k_row_base_1 = lane % 8 + lane / 16 * 8;
-        unsigned int k_col_base_1 = lane / 8 % 2;
+        unsigned int k_row_base_3 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_3 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + (k_row_base_1 * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + (k_row_base_3 * 8 + (unsigned int)((k_col_base_3 * 16 ^ (k_row_base_3 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=r"(scores_i32[0]), "=r"(scores_i32[1]), "=r"(scores_i32[2]), "=r"(scores_i32[3])
@@ -1529,7 +1511,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_1 + 16) * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 + 16 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_3 + 16) * 8 + (unsigned int)((k_col_base_3 * 16 ^ (k_row_base_3 + 16 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=r"(scores_i32[8]), "=r"(scores_i32[(8) + 1]), "=r"(scores_i32[(8) + 2]), "=r"(scores_i32[(8) + 3])
@@ -1539,7 +1521,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_1 + 32) * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 + 32 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_3 + 32) * 8 + (unsigned int)((k_col_base_3 * 16 ^ (k_row_base_3 + 32 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=r"(scores_i32[16]), "=r"(scores_i32[(16) + 1]), "=r"(scores_i32[(16) + 2]), "=r"(scores_i32[(16) + 3])
@@ -1549,7 +1531,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_1 + 48) * 8 + (unsigned int)((k_col_base_1 * 16 ^ (k_row_base_1 + 48 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_3 + 48) * 8 + (unsigned int)((k_col_base_3 * 16 ^ (k_row_base_3 + 48 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=r"(scores_i32[24]), "=r"(scores_i32[(24) + 1]), "=r"(scores_i32[(24) + 2]), "=r"(scores_i32[(24) + 3])
@@ -1557,17 +1539,17 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
             : "=r"(scores_i32[28]), "=r"(scores_i32[(28) + 1]), "=r"(scores_i32[(28) + 2]), "=r"(scores_i32[(28) + 3])
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]), "r"(0), "r"(0), "r"(0), "r"(0));
-        unsigned int q_row_base_2_1 = warp * 16 + lane % 16;
-        unsigned int q_col_base_3_1 = lane / 16;
+        unsigned int q_row_base_4 = warp * 16 + lane % 16;
+        unsigned int q_col_base_4 = lane / 16;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(q_frag[0]), "=r"(q_frag[1]), "=r"(q_frag[2]), "=r"(q_frag[3])
-            : "r"(q_smem_addr + (q_row_base_2_1 * 8 + (unsigned int)(((q_col_base_3_1 + 4) * 16 ^ (q_row_base_2_1 & 7) << 4) / 16)) * 16)
+            : "r"(q_smem_addr + (q_row_base_4 * 8 + (unsigned int)(((q_col_base_4 + 4) * 16 ^ (q_row_base_4 & 7) << 4) / 16)) * 16)
             : "memory");
-        unsigned int k_row_base_4_1 = lane % 8 + lane / 16 * 8;
-        unsigned int k_col_base_5_1 = lane / 8 % 2;
+        unsigned int k_row_base_3_1 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_3_1 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + (k_row_base_4_1 * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + (k_row_base_3_1 * 8 + (unsigned int)(((k_col_base_3_1 + 2) * 16 ^ (k_row_base_3_1 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
@@ -1577,7 +1559,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_4_1 + 16) * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 + 16 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_3_1 + 16) * 8 + (unsigned int)(((k_col_base_3_1 + 2) * 16 ^ (k_row_base_3_1 + 16 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
@@ -1587,7 +1569,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_4_1 + 32) * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 + 32 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_3_1 + 32) * 8 + (unsigned int)(((k_col_base_3_1 + 2) * 16 ^ (k_row_base_3_1 + 32 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
@@ -1597,7 +1579,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_4_1 + 48) * 8 + (unsigned int)(((k_col_base_5_1 + 2) * 16 ^ (k_row_base_4_1 + 48 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_3_1 + 48) * 8 + (unsigned int)(((k_col_base_3_1 + 2) * 16 ^ (k_row_base_3_1 + 48 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
@@ -1605,17 +1587,17 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[28]), "+r"(scores_i32[(28) + 1]), "+r"(scores_i32[(28) + 2]), "+r"(scores_i32[(28) + 3])
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
-        unsigned int q_row_base_6_1 = warp * 16 + lane % 16;
-        unsigned int q_col_base_7_1 = lane / 16;
+        unsigned int q_row_base_5 = warp * 16 + lane % 16;
+        unsigned int q_col_base_5 = lane / 16;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(q_prefetch[0]), "=r"(q_prefetch[1]), "=r"(q_prefetch[2]), "=r"(q_prefetch[3])
-            : "r"(q_smem_addr + (q_row_base_6_1 * 8 + (unsigned int)(((q_col_base_7_1 + 6) * 16 ^ (q_row_base_6_1 & 7) << 4) / 16)) * 16)
+            : "r"(q_smem_addr + (q_row_base_5 * 8 + (unsigned int)(((q_col_base_5 + 6) * 16 ^ (q_row_base_5 & 7) << 4) / 16)) * 16)
             : "memory");
-        unsigned int k_row_base_8_1 = lane % 8 + lane / 16 * 8;
-        unsigned int k_col_base_9_1 = lane / 8 % 2;
+        unsigned int k_row_base_4 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_4 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + (k_row_base_8_1 * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + (k_row_base_4 * 8 + (unsigned int)(((k_col_base_4 + 4) * 16 ^ (k_row_base_4 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
@@ -1625,7 +1607,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_8_1 + 16) * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 + 16 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_4 + 16) * 8 + (unsigned int)(((k_col_base_4 + 4) * 16 ^ (k_row_base_4 + 16 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
@@ -1635,7 +1617,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_8_1 + 32) * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 + 32 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_4 + 32) * 8 + (unsigned int)(((k_col_base_4 + 4) * 16 ^ (k_row_base_4 + 32 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
@@ -1645,7 +1627,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_8_1 + 48) * 8 + (unsigned int)(((k_col_base_9_1 + 4) * 16 ^ (k_row_base_8_1 + 48 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_4 + 48) * 8 + (unsigned int)(((k_col_base_4 + 4) * 16 ^ (k_row_base_4 + 48 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
@@ -1653,11 +1635,11 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[28]), "+r"(scores_i32[(28) + 1]), "+r"(scores_i32[(28) + 2]), "+r"(scores_i32[(28) + 3])
             : "r"(q_frag[0]), "r"(q_frag[1]), "r"(q_frag[2]), "r"(q_frag[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
-        unsigned int k_row_base_10_1 = lane % 8 + lane / 16 * 8;
-        unsigned int k_col_base_11_1 = lane / 8 % 2;
+        unsigned int k_row_base_5 = lane % 8 + lane / 16 * 8;
+        unsigned int k_col_base_5 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + (k_row_base_10_1 * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + (k_row_base_5 * 8 + (unsigned int)(((k_col_base_5 + 6) * 16 ^ (k_row_base_5 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[0]), "+r"(scores_i32[1]), "+r"(scores_i32[2]), "+r"(scores_i32[3])
@@ -1667,7 +1649,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_10_1 + 16) * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 + 16 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_5 + 16) * 8 + (unsigned int)(((k_col_base_5 + 6) * 16 ^ (k_row_base_5 + 16 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[8]), "+r"(scores_i32[(8) + 1]), "+r"(scores_i32[(8) + 2]), "+r"(scores_i32[(8) + 3])
@@ -1677,7 +1659,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_10_1 + 32) * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 + 32 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_5 + 32) * 8 + (unsigned int)(((k_col_base_5 + 6) * 16 ^ (k_row_base_5 + 32 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[16]), "+r"(scores_i32[(16) + 1]), "+r"(scores_i32[(16) + 2]), "+r"(scores_i32[(16) + 3])
@@ -1687,7 +1669,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(q_prefetch[0]), "r"(q_prefetch[1]), "r"(q_prefetch[2]), "r"(q_prefetch[3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
-            : "r"(k_smem_addr + ((k_row_base_10_1 + 48) * 8 + (unsigned int)(((k_col_base_11_1 + 6) * 16 ^ (k_row_base_10_1 + 48 & 7) << 4) / 16)) * 16)
+            : "r"(k_smem_addr + ((k_row_base_5 + 48) * 8 + (unsigned int)(((k_col_base_5 + 6) * 16 ^ (k_row_base_5 + 48 & 7) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+r"(scores_i32[24]), "+r"(scores_i32[(24) + 1]), "+r"(scores_i32[(24) + 2]), "+r"(scores_i32[(24) + 3])
@@ -1831,6 +1813,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
                 next_physical_1 = q2k_block_index[index_base + selected_count - 1 - preload_count_1];
 #endif  // CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             if (warp == 0) {
                 if (elect_sync()) {
@@ -1877,132 +1860,132 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         scores[31] = (float)scores_i32[31];
         if (valid_tokens_1 < 64) {
             int lane_col_base_1 = 2 * (lane % 4);
-            int token_in_tile_31 = lane_col_base_1;
-            if (token_in_tile_31 >= valid_tokens_1) {
+            int token_in_tile_31_32 = lane_col_base_1;
+            if (token_in_tile_31_32 >= valid_tokens_1) {
                 scores[0] = -CUDART_INF_F;
             }
-            int token_in_tile_0_1 = lane_col_base_1 + 1;
-            if (token_in_tile_0_1 >= valid_tokens_1) {
+            int token_in_tile_31_33 = lane_col_base_1 + 1;
+            if (token_in_tile_31_33 >= valid_tokens_1) {
                 scores[1] = -CUDART_INF_F;
             }
-            int token_in_tile_1_1 = lane_col_base_1;
-            if (token_in_tile_1_1 >= valid_tokens_1) {
+            int token_in_tile_31_34 = lane_col_base_1;
+            if (token_in_tile_31_34 >= valid_tokens_1) {
                 scores[2] = -CUDART_INF_F;
             }
-            int token_in_tile_2_1 = lane_col_base_1 + 1;
-            if (token_in_tile_2_1 >= valid_tokens_1) {
+            int token_in_tile_31_35 = lane_col_base_1 + 1;
+            if (token_in_tile_31_35 >= valid_tokens_1) {
                 scores[3] = -CUDART_INF_F;
             }
-            int token_in_tile_3_1 = lane_col_base_1 + 8;
-            if (token_in_tile_3_1 >= valid_tokens_1) {
+            int token_in_tile_31_36 = lane_col_base_1 + 8;
+            if (token_in_tile_31_36 >= valid_tokens_1) {
                 scores[4] = -CUDART_INF_F;
             }
-            int token_in_tile_4_1 = lane_col_base_1 + 8 + 1;
-            if (token_in_tile_4_1 >= valid_tokens_1) {
+            int token_in_tile_31_37 = lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_37 >= valid_tokens_1) {
                 scores[5] = -CUDART_INF_F;
             }
-            int token_in_tile_5_1 = lane_col_base_1 + 8;
-            if (token_in_tile_5_1 >= valid_tokens_1) {
+            int token_in_tile_31_38 = lane_col_base_1 + 8;
+            if (token_in_tile_31_38 >= valid_tokens_1) {
                 scores[6] = -CUDART_INF_F;
             }
-            int token_in_tile_6_1 = lane_col_base_1 + 8 + 1;
-            if (token_in_tile_6_1 >= valid_tokens_1) {
+            int token_in_tile_31_39 = lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_39 >= valid_tokens_1) {
                 scores[7] = -CUDART_INF_F;
             }
-            int token_in_tile_7_1 = 16 + lane_col_base_1;
-            if (token_in_tile_7_1 >= valid_tokens_1) {
+            int token_in_tile_31_40 = 16 + lane_col_base_1;
+            if (token_in_tile_31_40 >= valid_tokens_1) {
                 scores[8] = -CUDART_INF_F;
             }
-            int token_in_tile_8_1 = 16 + lane_col_base_1 + 1;
-            if (token_in_tile_8_1 >= valid_tokens_1) {
+            int token_in_tile_31_41 = 16 + lane_col_base_1 + 1;
+            if (token_in_tile_31_41 >= valid_tokens_1) {
                 scores[9] = -CUDART_INF_F;
             }
-            int token_in_tile_9_1 = 16 + lane_col_base_1;
-            if (token_in_tile_9_1 >= valid_tokens_1) {
+            int token_in_tile_31_42 = 16 + lane_col_base_1;
+            if (token_in_tile_31_42 >= valid_tokens_1) {
                 scores[10] = -CUDART_INF_F;
             }
-            int token_in_tile_10_1 = 16 + lane_col_base_1 + 1;
-            if (token_in_tile_10_1 >= valid_tokens_1) {
+            int token_in_tile_31_43 = 16 + lane_col_base_1 + 1;
+            if (token_in_tile_31_43 >= valid_tokens_1) {
                 scores[11] = -CUDART_INF_F;
             }
-            int token_in_tile_11_1 = 16 + lane_col_base_1 + 8;
-            if (token_in_tile_11_1 >= valid_tokens_1) {
+            int token_in_tile_31_44 = 16 + lane_col_base_1 + 8;
+            if (token_in_tile_31_44 >= valid_tokens_1) {
                 scores[12] = -CUDART_INF_F;
             }
-            int token_in_tile_12_1 = 16 + lane_col_base_1 + 8 + 1;
-            if (token_in_tile_12_1 >= valid_tokens_1) {
+            int token_in_tile_31_45 = 16 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_45 >= valid_tokens_1) {
                 scores[13] = -CUDART_INF_F;
             }
-            int token_in_tile_13_1 = 16 + lane_col_base_1 + 8;
-            if (token_in_tile_13_1 >= valid_tokens_1) {
+            int token_in_tile_31_46 = 16 + lane_col_base_1 + 8;
+            if (token_in_tile_31_46 >= valid_tokens_1) {
                 scores[14] = -CUDART_INF_F;
             }
-            int token_in_tile_14_1 = 16 + lane_col_base_1 + 8 + 1;
-            if (token_in_tile_14_1 >= valid_tokens_1) {
+            int token_in_tile_31_47 = 16 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_47 >= valid_tokens_1) {
                 scores[15] = -CUDART_INF_F;
             }
-            int token_in_tile_15_1 = 32 + lane_col_base_1;
-            if (token_in_tile_15_1 >= valid_tokens_1) {
+            int token_in_tile_31_48 = 32 + lane_col_base_1;
+            if (token_in_tile_31_48 >= valid_tokens_1) {
                 scores[16] = -CUDART_INF_F;
             }
-            int token_in_tile_16_1 = 32 + lane_col_base_1 + 1;
-            if (token_in_tile_16_1 >= valid_tokens_1) {
+            int token_in_tile_31_49 = 32 + lane_col_base_1 + 1;
+            if (token_in_tile_31_49 >= valid_tokens_1) {
                 scores[17] = -CUDART_INF_F;
             }
-            int token_in_tile_17_1 = 32 + lane_col_base_1;
-            if (token_in_tile_17_1 >= valid_tokens_1) {
+            int token_in_tile_31_50 = 32 + lane_col_base_1;
+            if (token_in_tile_31_50 >= valid_tokens_1) {
                 scores[18] = -CUDART_INF_F;
             }
-            int token_in_tile_18_1 = 32 + lane_col_base_1 + 1;
-            if (token_in_tile_18_1 >= valid_tokens_1) {
+            int token_in_tile_31_51 = 32 + lane_col_base_1 + 1;
+            if (token_in_tile_31_51 >= valid_tokens_1) {
                 scores[19] = -CUDART_INF_F;
             }
-            int token_in_tile_19_1 = 32 + lane_col_base_1 + 8;
-            if (token_in_tile_19_1 >= valid_tokens_1) {
+            int token_in_tile_31_52 = 32 + lane_col_base_1 + 8;
+            if (token_in_tile_31_52 >= valid_tokens_1) {
                 scores[20] = -CUDART_INF_F;
             }
-            int token_in_tile_20_1 = 32 + lane_col_base_1 + 8 + 1;
-            if (token_in_tile_20_1 >= valid_tokens_1) {
+            int token_in_tile_31_53 = 32 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_53 >= valid_tokens_1) {
                 scores[21] = -CUDART_INF_F;
             }
-            int token_in_tile_21_1 = 32 + lane_col_base_1 + 8;
-            if (token_in_tile_21_1 >= valid_tokens_1) {
+            int token_in_tile_31_54 = 32 + lane_col_base_1 + 8;
+            if (token_in_tile_31_54 >= valid_tokens_1) {
                 scores[22] = -CUDART_INF_F;
             }
-            int token_in_tile_22_1 = 32 + lane_col_base_1 + 8 + 1;
-            if (token_in_tile_22_1 >= valid_tokens_1) {
+            int token_in_tile_31_55 = 32 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_55 >= valid_tokens_1) {
                 scores[23] = -CUDART_INF_F;
             }
-            int token_in_tile_23_1 = 48 + lane_col_base_1;
-            if (token_in_tile_23_1 >= valid_tokens_1) {
+            int token_in_tile_31_56 = 48 + lane_col_base_1;
+            if (token_in_tile_31_56 >= valid_tokens_1) {
                 scores[24] = -CUDART_INF_F;
             }
-            int token_in_tile_24_1 = 48 + lane_col_base_1 + 1;
-            if (token_in_tile_24_1 >= valid_tokens_1) {
+            int token_in_tile_31_57 = 48 + lane_col_base_1 + 1;
+            if (token_in_tile_31_57 >= valid_tokens_1) {
                 scores[25] = -CUDART_INF_F;
             }
-            int token_in_tile_25_1 = 48 + lane_col_base_1;
-            if (token_in_tile_25_1 >= valid_tokens_1) {
+            int token_in_tile_31_58 = 48 + lane_col_base_1;
+            if (token_in_tile_31_58 >= valid_tokens_1) {
                 scores[26] = -CUDART_INF_F;
             }
-            int token_in_tile_26_1 = 48 + lane_col_base_1 + 1;
-            if (token_in_tile_26_1 >= valid_tokens_1) {
+            int token_in_tile_31_59 = 48 + lane_col_base_1 + 1;
+            if (token_in_tile_31_59 >= valid_tokens_1) {
                 scores[27] = -CUDART_INF_F;
             }
-            int token_in_tile_27_1 = 48 + lane_col_base_1 + 8;
-            if (token_in_tile_27_1 >= valid_tokens_1) {
+            int token_in_tile_31_60 = 48 + lane_col_base_1 + 8;
+            if (token_in_tile_31_60 >= valid_tokens_1) {
                 scores[28] = -CUDART_INF_F;
             }
-            int token_in_tile_28_1 = 48 + lane_col_base_1 + 8 + 1;
-            if (token_in_tile_28_1 >= valid_tokens_1) {
+            int token_in_tile_31_61 = 48 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_61 >= valid_tokens_1) {
                 scores[29] = -CUDART_INF_F;
             }
-            int token_in_tile_29_1 = 48 + lane_col_base_1 + 8;
-            if (token_in_tile_29_1 >= valid_tokens_1) {
+            int token_in_tile_31_62 = 48 + lane_col_base_1 + 8;
+            if (token_in_tile_31_62 >= valid_tokens_1) {
                 scores[30] = -CUDART_INF_F;
             }
-            int token_in_tile_30_1 = 48 + lane_col_base_1 + 8 + 1;
-            if (token_in_tile_30_1 >= valid_tokens_1) {
+            int token_in_tile_31_63 = 48 + lane_col_base_1 + 8 + 1;
+            if (token_in_tile_31_63 >= valid_tokens_1) {
                 scores[31] = -CUDART_INF_F;
             }
         }
@@ -2710,54 +2693,54 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[60]), "+f"(output[(60) + 1]), "+f"(output[(60) + 2]), "+f"(output[(60) + 3])
             : "r"(probabilities[0]), "r"(probabilities[1]), "r"(probabilities[2]), "r"(probabilities[3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
-        float value0_1 = approx_exp2(__fmaf_rn(scores[16], score_scale_log2_1, -row_shift[0]));
-        scores[16] = value0_1;
-        local_sum[0] = local_sum[0] + value0_1;
-        float value1_1 = approx_exp2(__fmaf_rn(scores[18], score_scale_log2_1, -row_shift[1]));
-        scores[18] = value1_1;
-        local_sum[1] = local_sum[1] + value1_1;
-        float value0_16_1 = approx_exp2(__fmaf_rn(scores[17], score_scale_log2_1, -row_shift[0]));
-        scores[17] = value0_16_1;
-        local_sum[0] = local_sum[0] + value0_16_1;
-        float value1_17_1 = approx_exp2(__fmaf_rn(scores[19], score_scale_log2_1, -row_shift[1]));
-        scores[19] = value1_17_1;
-        local_sum[1] = local_sum[1] + value1_17_1;
-        float value0_18_1 = approx_exp2(__fmaf_rn(scores[20], score_scale_log2_1, -row_shift[0]));
-        scores[20] = value0_18_1;
-        local_sum[0] = local_sum[0] + value0_18_1;
-        float value1_19_1 = approx_exp2(__fmaf_rn(scores[22], score_scale_log2_1, -row_shift[1]));
-        scores[22] = value1_19_1;
-        local_sum[1] = local_sum[1] + value1_19_1;
-        float value0_20_1 = approx_exp2(__fmaf_rn(scores[21], score_scale_log2_1, -row_shift[0]));
-        scores[21] = value0_20_1;
-        local_sum[0] = local_sum[0] + value0_20_1;
-        float value1_21_1 = approx_exp2(__fmaf_rn(scores[23], score_scale_log2_1, -row_shift[1]));
-        scores[23] = value1_21_1;
-        local_sum[1] = local_sum[1] + value1_21_1;
-        float value0_22_1 = approx_exp2(__fmaf_rn(scores[24], score_scale_log2_1, -row_shift[0]));
-        scores[24] = value0_22_1;
-        local_sum[0] = local_sum[0] + value0_22_1;
-        float value1_23_1 = approx_exp2(__fmaf_rn(scores[26], score_scale_log2_1, -row_shift[1]));
-        scores[26] = value1_23_1;
-        local_sum[1] = local_sum[1] + value1_23_1;
-        float value0_24_1 = approx_exp2(__fmaf_rn(scores[25], score_scale_log2_1, -row_shift[0]));
-        scores[25] = value0_24_1;
-        local_sum[0] = local_sum[0] + value0_24_1;
-        float value1_25_1 = approx_exp2(__fmaf_rn(scores[27], score_scale_log2_1, -row_shift[1]));
-        scores[27] = value1_25_1;
-        local_sum[1] = local_sum[1] + value1_25_1;
-        float value0_26_1 = approx_exp2(__fmaf_rn(scores[28], score_scale_log2_1, -row_shift[0]));
-        scores[28] = value0_26_1;
-        local_sum[0] = local_sum[0] + value0_26_1;
-        float value1_27_1 = approx_exp2(__fmaf_rn(scores[30], score_scale_log2_1, -row_shift[1]));
-        scores[30] = value1_27_1;
-        local_sum[1] = local_sum[1] + value1_27_1;
-        float value0_28_1 = approx_exp2(__fmaf_rn(scores[29], score_scale_log2_1, -row_shift[0]));
-        scores[29] = value0_28_1;
-        local_sum[0] = local_sum[0] + value0_28_1;
-        float value1_29_1 = approx_exp2(__fmaf_rn(scores[31], score_scale_log2_1, -row_shift[1]));
-        scores[31] = value1_29_1;
-        local_sum[1] = local_sum[1] + value1_29_1;
+        float value0_14 = approx_exp2(__fmaf_rn(scores[16], score_scale_log2_1, -row_shift[0]));
+        scores[16] = value0_14;
+        local_sum[0] = local_sum[0] + value0_14;
+        float value1_14 = approx_exp2(__fmaf_rn(scores[18], score_scale_log2_1, -row_shift[1]));
+        scores[18] = value1_14;
+        local_sum[1] = local_sum[1] + value1_14;
+        float value0_14_1 = approx_exp2(__fmaf_rn(scores[17], score_scale_log2_1, -row_shift[0]));
+        scores[17] = value0_14_1;
+        local_sum[0] = local_sum[0] + value0_14_1;
+        float value1_14_1 = approx_exp2(__fmaf_rn(scores[19], score_scale_log2_1, -row_shift[1]));
+        scores[19] = value1_14_1;
+        local_sum[1] = local_sum[1] + value1_14_1;
+        float value0_15 = approx_exp2(__fmaf_rn(scores[20], score_scale_log2_1, -row_shift[0]));
+        scores[20] = value0_15;
+        local_sum[0] = local_sum[0] + value0_15;
+        float value1_15 = approx_exp2(__fmaf_rn(scores[22], score_scale_log2_1, -row_shift[1]));
+        scores[22] = value1_15;
+        local_sum[1] = local_sum[1] + value1_15;
+        float value0_16 = approx_exp2(__fmaf_rn(scores[21], score_scale_log2_1, -row_shift[0]));
+        scores[21] = value0_16;
+        local_sum[0] = local_sum[0] + value0_16;
+        float value1_16 = approx_exp2(__fmaf_rn(scores[23], score_scale_log2_1, -row_shift[1]));
+        scores[23] = value1_16;
+        local_sum[1] = local_sum[1] + value1_16;
+        float value0_17 = approx_exp2(__fmaf_rn(scores[24], score_scale_log2_1, -row_shift[0]));
+        scores[24] = value0_17;
+        local_sum[0] = local_sum[0] + value0_17;
+        float value1_17 = approx_exp2(__fmaf_rn(scores[26], score_scale_log2_1, -row_shift[1]));
+        scores[26] = value1_17;
+        local_sum[1] = local_sum[1] + value1_17;
+        float value0_18 = approx_exp2(__fmaf_rn(scores[25], score_scale_log2_1, -row_shift[0]));
+        scores[25] = value0_18;
+        local_sum[0] = local_sum[0] + value0_18;
+        float value1_18 = approx_exp2(__fmaf_rn(scores[27], score_scale_log2_1, -row_shift[1]));
+        scores[27] = value1_18;
+        local_sum[1] = local_sum[1] + value1_18;
+        float value0_19 = approx_exp2(__fmaf_rn(scores[28], score_scale_log2_1, -row_shift[0]));
+        scores[28] = value0_19;
+        local_sum[0] = local_sum[0] + value0_19;
+        float value1_19 = approx_exp2(__fmaf_rn(scores[30], score_scale_log2_1, -row_shift[1]));
+        scores[30] = value1_19;
+        local_sum[1] = local_sum[1] + value1_19;
+        float value0_20 = approx_exp2(__fmaf_rn(scores[29], score_scale_log2_1, -row_shift[0]));
+        scores[29] = value0_20;
+        local_sum[0] = local_sum[0] + value0_20;
+        float value1_20 = approx_exp2(__fmaf_rn(scores[31], score_scale_log2_1, -row_shift[1]));
+        scores[31] = value1_20;
+        local_sum[1] = local_sum[1] + value1_20;
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
         float _shfl_xor_sync_55 = __shfl_xor_sync(0xFFFFFFFF, local_sum[0], 1);
         local_sum[0] = local_sum[0] + _shfl_xor_sync_55;
@@ -2870,11 +2853,11 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
                                    "f"(pack_values[2]), "f"(pack_values[3]));
             probabilities[7] = _packed;
         }
-        unsigned int v_row_base_30 = lane % 8 + lane / 16 * 8;
-        unsigned int v_col_base_31 = lane / 8 % 2;
+        unsigned int v_row_base_1_1 = lane % 8 + lane / 16 * 8;
+        unsigned int v_col_base_1_1 = lane / 8 % 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + (v_row_base_30 * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + (v_row_base_1_1 * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[0]), "+f"(output[1]), "+f"(output[2]), "+f"(output[3])
@@ -2884,7 +2867,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_30 + 16) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 16 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_1_1 + 16) * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 + 16 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[8]), "+f"(output[(8) + 1]), "+f"(output[(8) + 2]), "+f"(output[(8) + 3])
@@ -2894,7 +2877,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_30 + 32) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 32 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_1_1 + 32) * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 + 32 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[16]), "+f"(output[(16) + 1]), "+f"(output[(16) + 2]), "+f"(output[(16) + 3])
@@ -2904,7 +2887,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_30 + 48) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 48 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_1_1 + 48) * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 + 48 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[24]), "+f"(output[(24) + 1]), "+f"(output[(24) + 2]), "+f"(output[(24) + 3])
@@ -2914,7 +2897,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_30 + 64) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 64 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_1_1 + 64) * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 + 64 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[32]), "+f"(output[(32) + 1]), "+f"(output[(32) + 2]), "+f"(output[(32) + 3])
@@ -2924,7 +2907,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_30 + 80) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 80 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_1_1 + 80) * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 + 80 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[40]), "+f"(output[(40) + 1]), "+f"(output[(40) + 2]), "+f"(output[(40) + 3])
@@ -2934,7 +2917,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_30 + 96) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 96 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_1_1 + 96) * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 + 96 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[48]), "+f"(output[(48) + 1]), "+f"(output[(48) + 2]), "+f"(output[(48) + 3])
@@ -2944,7 +2927,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
-            : "r"(v_smem_addr + ((v_row_base_30 + 112) * 4 + (unsigned int)(((v_col_base_31 + 2) * 16 ^ (v_row_base_30 + 112 >> 1 & 3) << 4) / 16)) * 16)
+            : "r"(v_smem_addr + ((v_row_base_1_1 + 112) * 4 + (unsigned int)(((v_col_base_1_1 + 2) * 16 ^ (v_row_base_1_1 + 112 >> 1 & 3) << 4) / 16)) * 16)
             : "memory");
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
             : "+f"(output[56]), "+f"(output[(56) + 1]), "+f"(output[(56) + 2]), "+f"(output[(56) + 3])
@@ -2953,6 +2936,7 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
             : "+f"(output[60]), "+f"(output[(60) + 1]), "+f"(output[(60) + 2]), "+f"(output[(60) + 3])
             : "r"(probabilities[4]), "r"(probabilities[(4) + 1]), "r"(probabilities[(4) + 2]), "r"(probabilities[(4) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
         if (preload_count_1 < selected_count) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             if (warp == 0) {
                 if (elect_sync()) {
@@ -2969,32 +2953,32 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
     }
     __syncthreads();
     float reciprocal[2];
-    float total = row_sum[0];
+    float total_1_0 = row_sum[0];
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_59 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    float _rcp_59 = approx_rcp(((total_1_0 != 0.0f && total_1_0 == total_1_0) ? total_1_0 : 1.0f));
     reciprocal[0] = _rcp_59;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_58 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    float _rcp_58 = approx_rcp(((total_1_0 != 0.0f && total_1_0 == total_1_0) ? total_1_0 : 1.0f));
     reciprocal[0] = _rcp_58;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-    float _rcp_57 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    float _rcp_57 = approx_rcp(((total_1_0 != 0.0f && total_1_0 == total_1_0) ? total_1_0 : 1.0f));
     reciprocal[0] = _rcp_57;
 #else
-    float _rcp_56 = approx_rcp(((total != 0.0f && total == total) ? total : 1.0f));
+    float _rcp_56 = approx_rcp(((total_1_0 != 0.0f && total_1_0 == total_1_0) ? total_1_0 : 1.0f));
     reciprocal[0] = _rcp_56;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-    float total_0 = row_sum[1];
+    float total_1_1 = row_sum[1];
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_60 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    float _rcp_60 = approx_rcp(((total_1_1 != 0.0f && total_1_1 == total_1_1) ? total_1_1 : 1.0f));
     reciprocal[1] = _rcp_60;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-    float _rcp_59 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    float _rcp_59 = approx_rcp(((total_1_1 != 0.0f && total_1_1 == total_1_1) ? total_1_1 : 1.0f));
     reciprocal[1] = _rcp_59;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-    float _rcp_58 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    float _rcp_58 = approx_rcp(((total_1_1 != 0.0f && total_1_1 == total_1_1) ? total_1_1 : 1.0f));
     reciprocal[1] = _rcp_58;
 #else
-    float _rcp_57 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
+    float _rcp_57 = approx_rcp(((total_1_1 != 0.0f && total_1_1 == total_1_1) ? total_1_1 : 1.0f));
     reciprocal[1] = _rcp_57;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     unsigned int scale_base = v_scale_base + lane % 4 * 2;
@@ -3076,64 +3060,64 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
         :: "r"(_stmatrix_addr_60), "r"(*reinterpret_cast<const uint32_t*>(&packed[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
-    unsigned int scale_base_1 = v_scale_base + 16 + lane % 4 * 2;
-    float _vec_load_2[2];
+    unsigned int scale_base_r_0 = v_scale_base + 16 + lane % 4 * 2;
+    float vec_load_0[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
-        _vec_load_2[0] = _v2_64.x;
-        _vec_load_2[0 + 1] = _v2_64.y;
+        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0);
+        vec_load_0[0] = _v2_64.x;
+        vec_load_0[0 + 1] = _v2_64.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_63 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
-        _vec_load_2[0] = _v2_63.x;
-        _vec_load_2[0 + 1] = _v2_63.y;
+        float2 _v2_63 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0);
+        vec_load_0[0] = _v2_63.x;
+        vec_load_0[0 + 1] = _v2_63.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_62 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
-        _vec_load_2[0] = _v2_62.x;
-        _vec_load_2[0 + 1] = _v2_62.y;
+        float2 _v2_62 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0);
+        vec_load_0[0] = _v2_62.x;
+        vec_load_0[0 + 1] = _v2_62.y;
 #else
-        float2 _v2_61 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
-        _vec_load_2[0] = _v2_61.x;
-        _vec_load_2[0 + 1] = _v2_61.y;
+        float2 _v2_61 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0);
+        vec_load_0[0] = _v2_61.x;
+        vec_load_0[0 + 1] = _v2_61.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float _vec_load_3[2];
+    float vec_load_r_0[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
-        _vec_load_3[0] = _v2_65.x;
-        _vec_load_3[0 + 1] = _v2_65.y;
+        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0 + 8);
+        vec_load_r_0[0] = _v2_65.x;
+        vec_load_r_0[0 + 1] = _v2_65.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
-        _vec_load_3[0] = _v2_64.x;
-        _vec_load_3[0 + 1] = _v2_64.y;
+        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0 + 8);
+        vec_load_r_0[0] = _v2_64.x;
+        vec_load_r_0[0 + 1] = _v2_64.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_63 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
-        _vec_load_3[0] = _v2_63.x;
-        _vec_load_3[0 + 1] = _v2_63.y;
+        float2 _v2_63 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0 + 8);
+        vec_load_r_0[0] = _v2_63.x;
+        vec_load_r_0[0 + 1] = _v2_63.y;
 #else
-        float2 _v2_62 = *reinterpret_cast<const float2*>(v_scale + scale_base_1 + 8);
-        _vec_load_3[0] = _v2_62.x;
-        _vec_load_3[0 + 1] = _v2_62.y;
+        float2 _v2_62 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_0 + 8);
+        vec_load_r_0[0] = _v2_62.x;
+        vec_load_r_0[0 + 1] = _v2_62.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float scale0_2 = _vec_load_2[0];
-    float scale1_3 = _vec_load_2[1];
-    float scale2_4 = _vec_load_3[0];
-    float scale3_5 = _vec_load_3[1];
-    output[8] = output[8] * reciprocal[0] * scale0_2;
-    output[9] = output[9] * reciprocal[0] * scale1_3;
-    output[10] = output[10] * reciprocal[1] * scale0_2;
-    output[11] = output[11] * reciprocal[1] * scale1_3;
-    output[12] = output[12] * reciprocal[0] * scale2_4;
-    output[13] = output[13] * reciprocal[0] * scale3_5;
-    output[14] = output[14] * reciprocal[1] * scale2_4;
-    output[15] = output[15] * reciprocal[1] * scale3_5;
-    unsigned int packed_6[4];
+    float scale0_r_0 = vec_load_0[0];
+    float scale1_r_0 = vec_load_0[1];
+    float scale2_r_0 = vec_load_r_0[0];
+    float scale3_r_0 = vec_load_r_0[1];
+    output[8] = output[8] * reciprocal[0] * scale0_r_0;
+    output[9] = output[9] * reciprocal[0] * scale1_r_0;
+    output[10] = output[10] * reciprocal[1] * scale0_r_0;
+    output[11] = output[11] * reciprocal[1] * scale1_r_0;
+    output[12] = output[12] * reciprocal[0] * scale2_r_0;
+    output[13] = output[13] * reciprocal[0] * scale3_r_0;
+    output[14] = output[14] * reciprocal[1] * scale2_r_0;
+    output[15] = output[15] * reciprocal[1] * scale3_r_0;
+    unsigned int packed_r_0[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(output[_lp*2 + 8], output[_lp*2+1 + 8]));
-        packed_6[_lp] = *(uint32_t*)&_bf2;
+        packed_r_0[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
     uint32_t _stmatrix_addr_66 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
@@ -3146,73 +3130,73 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_66), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+        :: "r"(_stmatrix_addr_66), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[3]))
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_65), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+        :: "r"(_stmatrix_addr_65), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[3]))
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        :: "r"(_stmatrix_addr_64), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+        :: "r"(_stmatrix_addr_64), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[3]))
 #else
-        :: "r"(_stmatrix_addr_63), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
+        :: "r"(_stmatrix_addr_63), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_0[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
-    unsigned int scale_base_7 = v_scale_base + 32 + lane % 4 * 2;
-    float _vec_load_4[2];
+    unsigned int scale_base_r_1 = v_scale_base + 32 + lane % 4 * 2;
+    float vec_load_1[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
-        _vec_load_4[0] = _v2_67.x;
-        _vec_load_4[0 + 1] = _v2_67.y;
+        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1);
+        vec_load_1[0] = _v2_67.x;
+        vec_load_1[0 + 1] = _v2_67.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_66 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
-        _vec_load_4[0] = _v2_66.x;
-        _vec_load_4[0 + 1] = _v2_66.y;
+        float2 _v2_66 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1);
+        vec_load_1[0] = _v2_66.x;
+        vec_load_1[0 + 1] = _v2_66.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
-        _vec_load_4[0] = _v2_65.x;
-        _vec_load_4[0 + 1] = _v2_65.y;
+        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1);
+        vec_load_1[0] = _v2_65.x;
+        vec_load_1[0 + 1] = _v2_65.y;
 #else
-        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
-        _vec_load_4[0] = _v2_64.x;
-        _vec_load_4[0 + 1] = _v2_64.y;
+        float2 _v2_64 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1);
+        vec_load_1[0] = _v2_64.x;
+        vec_load_1[0 + 1] = _v2_64.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float _vec_load_5[2];
+    float vec_load_r_1[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
-        _vec_load_5[0] = _v2_68.x;
-        _vec_load_5[0 + 1] = _v2_68.y;
+        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1 + 8);
+        vec_load_r_1[0] = _v2_68.x;
+        vec_load_r_1[0 + 1] = _v2_68.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
-        _vec_load_5[0] = _v2_67.x;
-        _vec_load_5[0 + 1] = _v2_67.y;
+        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1 + 8);
+        vec_load_r_1[0] = _v2_67.x;
+        vec_load_r_1[0 + 1] = _v2_67.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_66 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
-        _vec_load_5[0] = _v2_66.x;
-        _vec_load_5[0 + 1] = _v2_66.y;
+        float2 _v2_66 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1 + 8);
+        vec_load_r_1[0] = _v2_66.x;
+        vec_load_r_1[0 + 1] = _v2_66.y;
 #else
-        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_7 + 8);
-        _vec_load_5[0] = _v2_65.x;
-        _vec_load_5[0 + 1] = _v2_65.y;
+        float2 _v2_65 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_1 + 8);
+        vec_load_r_1[0] = _v2_65.x;
+        vec_load_r_1[0 + 1] = _v2_65.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float scale0_8 = _vec_load_4[0];
-    float scale1_9 = _vec_load_4[1];
-    float scale2_10 = _vec_load_5[0];
-    float scale3_11 = _vec_load_5[1];
-    output[16] = output[16] * reciprocal[0] * scale0_8;
-    output[17] = output[17] * reciprocal[0] * scale1_9;
-    output[18] = output[18] * reciprocal[1] * scale0_8;
-    output[19] = output[19] * reciprocal[1] * scale1_9;
-    output[20] = output[20] * reciprocal[0] * scale2_10;
-    output[21] = output[21] * reciprocal[0] * scale3_11;
-    output[22] = output[22] * reciprocal[1] * scale2_10;
-    output[23] = output[23] * reciprocal[1] * scale3_11;
-    unsigned int packed_12[4];
+    float scale0_r_1 = vec_load_1[0];
+    float scale1_r_1 = vec_load_1[1];
+    float scale2_r_1 = vec_load_r_1[0];
+    float scale3_r_1 = vec_load_r_1[1];
+    output[16] = output[16] * reciprocal[0] * scale0_r_1;
+    output[17] = output[17] * reciprocal[0] * scale1_r_1;
+    output[18] = output[18] * reciprocal[1] * scale0_r_1;
+    output[19] = output[19] * reciprocal[1] * scale1_r_1;
+    output[20] = output[20] * reciprocal[0] * scale2_r_1;
+    output[21] = output[21] * reciprocal[0] * scale3_r_1;
+    output[22] = output[22] * reciprocal[1] * scale2_r_1;
+    output[23] = output[23] * reciprocal[1] * scale3_r_1;
+    unsigned int packed_r_1[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(output[_lp*2 + 16], output[_lp*2+1 + 16]));
-        packed_12[_lp] = *(uint32_t*)&_bf2;
+        packed_r_1[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
     uint32_t _stmatrix_addr_69 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
@@ -3225,73 +3209,73 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_69), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+        :: "r"(_stmatrix_addr_69), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[3]))
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_68), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+        :: "r"(_stmatrix_addr_68), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[3]))
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        :: "r"(_stmatrix_addr_67), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+        :: "r"(_stmatrix_addr_67), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[3]))
 #else
-        :: "r"(_stmatrix_addr_66), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
+        :: "r"(_stmatrix_addr_66), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_1[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
-    unsigned int scale_base_13 = v_scale_base + 48 + lane % 4 * 2;
-    float _vec_load_6[2];
+    unsigned int scale_base_r_2 = v_scale_base + 48 + lane % 4 * 2;
+    float vec_load_2[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
-        _vec_load_6[0] = _v2_70.x;
-        _vec_load_6[0 + 1] = _v2_70.y;
+        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2);
+        vec_load_2[0] = _v2_70.x;
+        vec_load_2[0 + 1] = _v2_70.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_69 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
-        _vec_load_6[0] = _v2_69.x;
-        _vec_load_6[0 + 1] = _v2_69.y;
+        float2 _v2_69 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2);
+        vec_load_2[0] = _v2_69.x;
+        vec_load_2[0 + 1] = _v2_69.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
-        _vec_load_6[0] = _v2_68.x;
-        _vec_load_6[0 + 1] = _v2_68.y;
+        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2);
+        vec_load_2[0] = _v2_68.x;
+        vec_load_2[0 + 1] = _v2_68.y;
 #else
-        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
-        _vec_load_6[0] = _v2_67.x;
-        _vec_load_6[0 + 1] = _v2_67.y;
+        float2 _v2_67 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2);
+        vec_load_2[0] = _v2_67.x;
+        vec_load_2[0 + 1] = _v2_67.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float _vec_load_7[2];
+    float vec_load_r_2[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
-        _vec_load_7[0] = _v2_71.x;
-        _vec_load_7[0 + 1] = _v2_71.y;
+        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2 + 8);
+        vec_load_r_2[0] = _v2_71.x;
+        vec_load_r_2[0 + 1] = _v2_71.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
-        _vec_load_7[0] = _v2_70.x;
-        _vec_load_7[0 + 1] = _v2_70.y;
+        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2 + 8);
+        vec_load_r_2[0] = _v2_70.x;
+        vec_load_r_2[0 + 1] = _v2_70.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_69 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
-        _vec_load_7[0] = _v2_69.x;
-        _vec_load_7[0 + 1] = _v2_69.y;
+        float2 _v2_69 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2 + 8);
+        vec_load_r_2[0] = _v2_69.x;
+        vec_load_r_2[0 + 1] = _v2_69.y;
 #else
-        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_13 + 8);
-        _vec_load_7[0] = _v2_68.x;
-        _vec_load_7[0 + 1] = _v2_68.y;
+        float2 _v2_68 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_2 + 8);
+        vec_load_r_2[0] = _v2_68.x;
+        vec_load_r_2[0 + 1] = _v2_68.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float scale0_14 = _vec_load_6[0];
-    float scale1_15 = _vec_load_6[1];
-    float scale2_16 = _vec_load_7[0];
-    float scale3_17 = _vec_load_7[1];
-    output[24] = output[24] * reciprocal[0] * scale0_14;
-    output[25] = output[25] * reciprocal[0] * scale1_15;
-    output[26] = output[26] * reciprocal[1] * scale0_14;
-    output[27] = output[27] * reciprocal[1] * scale1_15;
-    output[28] = output[28] * reciprocal[0] * scale2_16;
-    output[29] = output[29] * reciprocal[0] * scale3_17;
-    output[30] = output[30] * reciprocal[1] * scale2_16;
-    output[31] = output[31] * reciprocal[1] * scale3_17;
-    unsigned int packed_18[4];
+    float scale0_r_2 = vec_load_2[0];
+    float scale1_r_2 = vec_load_2[1];
+    float scale2_r_2 = vec_load_r_2[0];
+    float scale3_r_2 = vec_load_r_2[1];
+    output[24] = output[24] * reciprocal[0] * scale0_r_2;
+    output[25] = output[25] * reciprocal[0] * scale1_r_2;
+    output[26] = output[26] * reciprocal[1] * scale0_r_2;
+    output[27] = output[27] * reciprocal[1] * scale1_r_2;
+    output[28] = output[28] * reciprocal[0] * scale2_r_2;
+    output[29] = output[29] * reciprocal[0] * scale3_r_2;
+    output[30] = output[30] * reciprocal[1] * scale2_r_2;
+    output[31] = output[31] * reciprocal[1] * scale3_r_2;
+    unsigned int packed_r_2[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(output[_lp*2 + 24], output[_lp*2+1 + 24]));
-        packed_18[_lp] = *(uint32_t*)&_bf2;
+        packed_r_2[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
     uint32_t _stmatrix_addr_72 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
@@ -3304,73 +3288,73 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_72), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+        :: "r"(_stmatrix_addr_72), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[3]))
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_71), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+        :: "r"(_stmatrix_addr_71), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[3]))
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        :: "r"(_stmatrix_addr_70), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+        :: "r"(_stmatrix_addr_70), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[3]))
 #else
-        :: "r"(_stmatrix_addr_69), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
+        :: "r"(_stmatrix_addr_69), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_2[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
-    unsigned int scale_base_19 = v_scale_base + 64 + lane % 4 * 2;
-    float _vec_load_8[2];
+    unsigned int scale_base_r_3 = v_scale_base + 64 + lane % 4 * 2;
+    float vec_load_3[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
-        _vec_load_8[0] = _v2_73.x;
-        _vec_load_8[0 + 1] = _v2_73.y;
+        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3);
+        vec_load_3[0] = _v2_73.x;
+        vec_load_3[0 + 1] = _v2_73.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_72 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
-        _vec_load_8[0] = _v2_72.x;
-        _vec_load_8[0 + 1] = _v2_72.y;
+        float2 _v2_72 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3);
+        vec_load_3[0] = _v2_72.x;
+        vec_load_3[0 + 1] = _v2_72.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
-        _vec_load_8[0] = _v2_71.x;
-        _vec_load_8[0 + 1] = _v2_71.y;
+        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3);
+        vec_load_3[0] = _v2_71.x;
+        vec_load_3[0 + 1] = _v2_71.y;
 #else
-        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
-        _vec_load_8[0] = _v2_70.x;
-        _vec_load_8[0 + 1] = _v2_70.y;
+        float2 _v2_70 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3);
+        vec_load_3[0] = _v2_70.x;
+        vec_load_3[0 + 1] = _v2_70.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float _vec_load_9[2];
+    float vec_load_r_3[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
-        _vec_load_9[0] = _v2_74.x;
-        _vec_load_9[0 + 1] = _v2_74.y;
+        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3 + 8);
+        vec_load_r_3[0] = _v2_74.x;
+        vec_load_r_3[0 + 1] = _v2_74.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
-        _vec_load_9[0] = _v2_73.x;
-        _vec_load_9[0 + 1] = _v2_73.y;
+        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3 + 8);
+        vec_load_r_3[0] = _v2_73.x;
+        vec_load_r_3[0 + 1] = _v2_73.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_72 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
-        _vec_load_9[0] = _v2_72.x;
-        _vec_load_9[0 + 1] = _v2_72.y;
+        float2 _v2_72 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3 + 8);
+        vec_load_r_3[0] = _v2_72.x;
+        vec_load_r_3[0 + 1] = _v2_72.y;
 #else
-        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_19 + 8);
-        _vec_load_9[0] = _v2_71.x;
-        _vec_load_9[0 + 1] = _v2_71.y;
+        float2 _v2_71 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_3 + 8);
+        vec_load_r_3[0] = _v2_71.x;
+        vec_load_r_3[0 + 1] = _v2_71.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float scale0_20 = _vec_load_8[0];
-    float scale1_21 = _vec_load_8[1];
-    float scale2_22 = _vec_load_9[0];
-    float scale3_23 = _vec_load_9[1];
-    output[32] = output[32] * reciprocal[0] * scale0_20;
-    output[33] = output[33] * reciprocal[0] * scale1_21;
-    output[34] = output[34] * reciprocal[1] * scale0_20;
-    output[35] = output[35] * reciprocal[1] * scale1_21;
-    output[36] = output[36] * reciprocal[0] * scale2_22;
-    output[37] = output[37] * reciprocal[0] * scale3_23;
-    output[38] = output[38] * reciprocal[1] * scale2_22;
-    output[39] = output[39] * reciprocal[1] * scale3_23;
-    unsigned int packed_24[4];
+    float scale0_r_3 = vec_load_3[0];
+    float scale1_r_3 = vec_load_3[1];
+    float scale2_r_3 = vec_load_r_3[0];
+    float scale3_r_3 = vec_load_r_3[1];
+    output[32] = output[32] * reciprocal[0] * scale0_r_3;
+    output[33] = output[33] * reciprocal[0] * scale1_r_3;
+    output[34] = output[34] * reciprocal[1] * scale0_r_3;
+    output[35] = output[35] * reciprocal[1] * scale1_r_3;
+    output[36] = output[36] * reciprocal[0] * scale2_r_3;
+    output[37] = output[37] * reciprocal[0] * scale3_r_3;
+    output[38] = output[38] * reciprocal[1] * scale2_r_3;
+    output[39] = output[39] * reciprocal[1] * scale3_r_3;
+    unsigned int packed_r_3[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(output[_lp*2 + 32], output[_lp*2+1 + 32]));
-        packed_24[_lp] = *(uint32_t*)&_bf2;
+        packed_r_3[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
     uint32_t _stmatrix_addr_75 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
@@ -3383,73 +3367,73 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_75), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+        :: "r"(_stmatrix_addr_75), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[3]))
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_74), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+        :: "r"(_stmatrix_addr_74), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[3]))
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        :: "r"(_stmatrix_addr_73), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+        :: "r"(_stmatrix_addr_73), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[3]))
 #else
-        :: "r"(_stmatrix_addr_72), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
+        :: "r"(_stmatrix_addr_72), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_3[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
-    unsigned int scale_base_25 = v_scale_base + 80 + lane % 4 * 2;
-    float _vec_load_10[2];
+    unsigned int scale_base_r_4 = v_scale_base + 80 + lane % 4 * 2;
+    float vec_load_4[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
-        _vec_load_10[0] = _v2_76.x;
-        _vec_load_10[0 + 1] = _v2_76.y;
+        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4);
+        vec_load_4[0] = _v2_76.x;
+        vec_load_4[0 + 1] = _v2_76.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_75 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
-        _vec_load_10[0] = _v2_75.x;
-        _vec_load_10[0 + 1] = _v2_75.y;
+        float2 _v2_75 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4);
+        vec_load_4[0] = _v2_75.x;
+        vec_load_4[0 + 1] = _v2_75.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
-        _vec_load_10[0] = _v2_74.x;
-        _vec_load_10[0 + 1] = _v2_74.y;
+        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4);
+        vec_load_4[0] = _v2_74.x;
+        vec_load_4[0 + 1] = _v2_74.y;
 #else
-        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
-        _vec_load_10[0] = _v2_73.x;
-        _vec_load_10[0 + 1] = _v2_73.y;
+        float2 _v2_73 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4);
+        vec_load_4[0] = _v2_73.x;
+        vec_load_4[0 + 1] = _v2_73.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float _vec_load_11[2];
+    float vec_load_r_4[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
-        _vec_load_11[0] = _v2_77.x;
-        _vec_load_11[0 + 1] = _v2_77.y;
+        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4 + 8);
+        vec_load_r_4[0] = _v2_77.x;
+        vec_load_r_4[0 + 1] = _v2_77.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
-        _vec_load_11[0] = _v2_76.x;
-        _vec_load_11[0 + 1] = _v2_76.y;
+        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4 + 8);
+        vec_load_r_4[0] = _v2_76.x;
+        vec_load_r_4[0 + 1] = _v2_76.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_75 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
-        _vec_load_11[0] = _v2_75.x;
-        _vec_load_11[0 + 1] = _v2_75.y;
+        float2 _v2_75 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4 + 8);
+        vec_load_r_4[0] = _v2_75.x;
+        vec_load_r_4[0 + 1] = _v2_75.y;
 #else
-        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_25 + 8);
-        _vec_load_11[0] = _v2_74.x;
-        _vec_load_11[0 + 1] = _v2_74.y;
+        float2 _v2_74 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_4 + 8);
+        vec_load_r_4[0] = _v2_74.x;
+        vec_load_r_4[0 + 1] = _v2_74.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float scale0_26 = _vec_load_10[0];
-    float scale1_27 = _vec_load_10[1];
-    float scale2_28 = _vec_load_11[0];
-    float scale3_29 = _vec_load_11[1];
-    output[40] = output[40] * reciprocal[0] * scale0_26;
-    output[41] = output[41] * reciprocal[0] * scale1_27;
-    output[42] = output[42] * reciprocal[1] * scale0_26;
-    output[43] = output[43] * reciprocal[1] * scale1_27;
-    output[44] = output[44] * reciprocal[0] * scale2_28;
-    output[45] = output[45] * reciprocal[0] * scale3_29;
-    output[46] = output[46] * reciprocal[1] * scale2_28;
-    output[47] = output[47] * reciprocal[1] * scale3_29;
-    unsigned int packed_30[4];
+    float scale0_r_4 = vec_load_4[0];
+    float scale1_r_4 = vec_load_4[1];
+    float scale2_r_4 = vec_load_r_4[0];
+    float scale3_r_4 = vec_load_r_4[1];
+    output[40] = output[40] * reciprocal[0] * scale0_r_4;
+    output[41] = output[41] * reciprocal[0] * scale1_r_4;
+    output[42] = output[42] * reciprocal[1] * scale0_r_4;
+    output[43] = output[43] * reciprocal[1] * scale1_r_4;
+    output[44] = output[44] * reciprocal[0] * scale2_r_4;
+    output[45] = output[45] * reciprocal[0] * scale3_r_4;
+    output[46] = output[46] * reciprocal[1] * scale2_r_4;
+    output[47] = output[47] * reciprocal[1] * scale3_r_4;
+    unsigned int packed_r_4[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(output[_lp*2 + 40], output[_lp*2+1 + 40]));
-        packed_30[_lp] = *(uint32_t*)&_bf2;
+        packed_r_4[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
     uint32_t _stmatrix_addr_78 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
@@ -3462,73 +3446,73 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_78), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+        :: "r"(_stmatrix_addr_78), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[3]))
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_77), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+        :: "r"(_stmatrix_addr_77), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[3]))
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        :: "r"(_stmatrix_addr_76), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+        :: "r"(_stmatrix_addr_76), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[3]))
 #else
-        :: "r"(_stmatrix_addr_75), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
+        :: "r"(_stmatrix_addr_75), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_4[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
-    unsigned int scale_base_31 = v_scale_base + 96 + lane % 4 * 2;
-    float _vec_load_12[2];
+    unsigned int scale_base_r_5 = v_scale_base + 96 + lane % 4 * 2;
+    float vec_load_5[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
-        _vec_load_12[0] = _v2_79.x;
-        _vec_load_12[0 + 1] = _v2_79.y;
+        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5);
+        vec_load_5[0] = _v2_79.x;
+        vec_load_5[0 + 1] = _v2_79.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_78 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
-        _vec_load_12[0] = _v2_78.x;
-        _vec_load_12[0 + 1] = _v2_78.y;
+        float2 _v2_78 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5);
+        vec_load_5[0] = _v2_78.x;
+        vec_load_5[0 + 1] = _v2_78.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
-        _vec_load_12[0] = _v2_77.x;
-        _vec_load_12[0 + 1] = _v2_77.y;
+        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5);
+        vec_load_5[0] = _v2_77.x;
+        vec_load_5[0 + 1] = _v2_77.y;
 #else
-        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
-        _vec_load_12[0] = _v2_76.x;
-        _vec_load_12[0 + 1] = _v2_76.y;
+        float2 _v2_76 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5);
+        vec_load_5[0] = _v2_76.x;
+        vec_load_5[0 + 1] = _v2_76.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float _vec_load_13[2];
+    float vec_load_r_5[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
-        _vec_load_13[0] = _v2_80.x;
-        _vec_load_13[0 + 1] = _v2_80.y;
+        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5 + 8);
+        vec_load_r_5[0] = _v2_80.x;
+        vec_load_r_5[0 + 1] = _v2_80.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
-        _vec_load_13[0] = _v2_79.x;
-        _vec_load_13[0 + 1] = _v2_79.y;
+        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5 + 8);
+        vec_load_r_5[0] = _v2_79.x;
+        vec_load_r_5[0 + 1] = _v2_79.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_78 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
-        _vec_load_13[0] = _v2_78.x;
-        _vec_load_13[0 + 1] = _v2_78.y;
+        float2 _v2_78 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5 + 8);
+        vec_load_r_5[0] = _v2_78.x;
+        vec_load_r_5[0 + 1] = _v2_78.y;
 #else
-        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_31 + 8);
-        _vec_load_13[0] = _v2_77.x;
-        _vec_load_13[0 + 1] = _v2_77.y;
+        float2 _v2_77 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_5 + 8);
+        vec_load_r_5[0] = _v2_77.x;
+        vec_load_r_5[0 + 1] = _v2_77.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float scale0_32 = _vec_load_12[0];
-    float scale1_33 = _vec_load_12[1];
-    float scale2_34 = _vec_load_13[0];
-    float scale3_35 = _vec_load_13[1];
-    output[48] = output[48] * reciprocal[0] * scale0_32;
-    output[49] = output[49] * reciprocal[0] * scale1_33;
-    output[50] = output[50] * reciprocal[1] * scale0_32;
-    output[51] = output[51] * reciprocal[1] * scale1_33;
-    output[52] = output[52] * reciprocal[0] * scale2_34;
-    output[53] = output[53] * reciprocal[0] * scale3_35;
-    output[54] = output[54] * reciprocal[1] * scale2_34;
-    output[55] = output[55] * reciprocal[1] * scale3_35;
-    unsigned int packed_36[4];
+    float scale0_r_5 = vec_load_5[0];
+    float scale1_r_5 = vec_load_5[1];
+    float scale2_r_5 = vec_load_r_5[0];
+    float scale3_r_5 = vec_load_r_5[1];
+    output[48] = output[48] * reciprocal[0] * scale0_r_5;
+    output[49] = output[49] * reciprocal[0] * scale1_r_5;
+    output[50] = output[50] * reciprocal[1] * scale0_r_5;
+    output[51] = output[51] * reciprocal[1] * scale1_r_5;
+    output[52] = output[52] * reciprocal[0] * scale2_r_5;
+    output[53] = output[53] * reciprocal[0] * scale3_r_5;
+    output[54] = output[54] * reciprocal[1] * scale2_r_5;
+    output[55] = output[55] * reciprocal[1] * scale3_r_5;
+    unsigned int packed_r_5[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(output[_lp*2 + 48], output[_lp*2+1 + 48]));
-        packed_36[_lp] = *(uint32_t*)&_bf2;
+        packed_r_5[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
     uint32_t _stmatrix_addr_81 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
@@ -3541,73 +3525,73 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_81), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+        :: "r"(_stmatrix_addr_81), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[3]))
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_80), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+        :: "r"(_stmatrix_addr_80), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[3]))
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        :: "r"(_stmatrix_addr_79), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+        :: "r"(_stmatrix_addr_79), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[3]))
 #else
-        :: "r"(_stmatrix_addr_78), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
+        :: "r"(_stmatrix_addr_78), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_5[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
-    unsigned int scale_base_37 = v_scale_base + 112 + lane % 4 * 2;
-    float _vec_load_14[2];
+    unsigned int scale_base_r_6 = v_scale_base + 112 + lane % 4 * 2;
+    float vec_load_6[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_82 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
-        _vec_load_14[0] = _v2_82.x;
-        _vec_load_14[0 + 1] = _v2_82.y;
+        float2 _v2_82 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6);
+        vec_load_6[0] = _v2_82.x;
+        vec_load_6[0 + 1] = _v2_82.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_81 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
-        _vec_load_14[0] = _v2_81.x;
-        _vec_load_14[0 + 1] = _v2_81.y;
+        float2 _v2_81 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6);
+        vec_load_6[0] = _v2_81.x;
+        vec_load_6[0 + 1] = _v2_81.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
-        _vec_load_14[0] = _v2_80.x;
-        _vec_load_14[0 + 1] = _v2_80.y;
+        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6);
+        vec_load_6[0] = _v2_80.x;
+        vec_load_6[0 + 1] = _v2_80.y;
 #else
-        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
-        _vec_load_14[0] = _v2_79.x;
-        _vec_load_14[0 + 1] = _v2_79.y;
+        float2 _v2_79 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6);
+        vec_load_6[0] = _v2_79.x;
+        vec_load_6[0 + 1] = _v2_79.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float _vec_load_15[2];
+    float vec_load_r_6[2];
     {
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_83 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
-        _vec_load_15[0] = _v2_83.x;
-        _vec_load_15[0 + 1] = _v2_83.y;
+        float2 _v2_83 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6 + 8);
+        vec_load_r_6[0] = _v2_83.x;
+        vec_load_r_6[0 + 1] = _v2_83.y;
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        float2 _v2_82 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
-        _vec_load_15[0] = _v2_82.x;
-        _vec_load_15[0 + 1] = _v2_82.y;
+        float2 _v2_82 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6 + 8);
+        vec_load_r_6[0] = _v2_82.x;
+        vec_load_r_6[0 + 1] = _v2_82.y;
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        float2 _v2_81 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
-        _vec_load_15[0] = _v2_81.x;
-        _vec_load_15[0 + 1] = _v2_81.y;
+        float2 _v2_81 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6 + 8);
+        vec_load_r_6[0] = _v2_81.x;
+        vec_load_r_6[0 + 1] = _v2_81.y;
 #else
-        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_37 + 8);
-        _vec_load_15[0] = _v2_80.x;
-        _vec_load_15[0 + 1] = _v2_80.y;
+        float2 _v2_80 = *reinterpret_cast<const float2*>(v_scale + scale_base_r_6 + 8);
+        vec_load_r_6[0] = _v2_80.x;
+        vec_load_r_6[0 + 1] = _v2_80.y;
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     }
-    float scale0_38 = _vec_load_14[0];
-    float scale1_39 = _vec_load_14[1];
-    float scale2_40 = _vec_load_15[0];
-    float scale3_41 = _vec_load_15[1];
-    output[56] = output[56] * reciprocal[0] * scale0_38;
-    output[57] = output[57] * reciprocal[0] * scale1_39;
-    output[58] = output[58] * reciprocal[1] * scale0_38;
-    output[59] = output[59] * reciprocal[1] * scale1_39;
-    output[60] = output[60] * reciprocal[0] * scale2_40;
-    output[61] = output[61] * reciprocal[0] * scale3_41;
-    output[62] = output[62] * reciprocal[1] * scale2_40;
-    output[63] = output[63] * reciprocal[1] * scale3_41;
-    unsigned int packed_42[4];
+    float scale0_r_6 = vec_load_6[0];
+    float scale1_r_6 = vec_load_6[1];
+    float scale2_r_6 = vec_load_r_6[0];
+    float scale3_r_6 = vec_load_r_6[1];
+    output[56] = output[56] * reciprocal[0] * scale0_r_6;
+    output[57] = output[57] * reciprocal[0] * scale1_r_6;
+    output[58] = output[58] * reciprocal[1] * scale0_r_6;
+    output[59] = output[59] * reciprocal[1] * scale1_r_6;
+    output[60] = output[60] * reciprocal[0] * scale2_r_6;
+    output[61] = output[61] * reciprocal[0] * scale3_r_6;
+    output[62] = output[62] * reciprocal[1] * scale2_r_6;
+    output[63] = output[63] * reciprocal[1] * scale3_r_6;
+    unsigned int packed_r_6[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(output[_lp*2 + 56], output[_lp*2+1 + 56]));
-        packed_42[_lp] = *(uint32_t*)&_bf2;
+        packed_r_6[_lp] = *(uint32_t*)&_bf2;
     }
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
     uint32_t _stmatrix_addr_84 = static_cast<uint32_t>(o_smem_addr + (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 + ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) * 16));
@@ -3620,13 +3604,13 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
 #if (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_84), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+        :: "r"(_stmatrix_addr_84), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[3]))
 #elif (CAKE_SAGE_BLOCK_SIZES_MODE == 1 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 2 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES) || (CAKE_SAGE_BLOCK_SIZES_MODE == 3 && !CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES)
-        :: "r"(_stmatrix_addr_83), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+        :: "r"(_stmatrix_addr_83), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[3]))
 #elif CAKE_SAGE_BLOCK_SIZES_MODE == 0 && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
-        :: "r"(_stmatrix_addr_82), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+        :: "r"(_stmatrix_addr_82), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[3]))
 #else
-        :: "r"(_stmatrix_addr_81), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_42[3]))
+        :: "r"(_stmatrix_addr_81), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_r_6[3]))
 #endif  // CAKE_SAGE_BLOCK_SIZES_MODE, CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
         : "memory");
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -3644,3 +3628,4 @@ CAKE_SAGE_SM120_KERNEL(const __grid_constant__ CUtensorMap Q_map, const __grid_c
 }
 
 } // extern "C"
+
