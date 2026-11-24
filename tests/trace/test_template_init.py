@@ -134,6 +134,9 @@ _SMOKE_TEMPLATE_OVERRIDES: Dict[str, Dict[str, int]] = {
         "K_div_128": 1,
         "N_div_128": 1,
     },
+    "trtllm_batch_decode_mla_sparse_with_lengths": {
+        "num_query_rows": 16,  # batch_size=4 * q_len_per_request=4
+    },
 }
 
 

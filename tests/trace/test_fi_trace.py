@@ -1729,6 +1729,104 @@ def test_trtllm_mla_fi_trace_lse_base(layout, return_lse_base, tmp_path):
     torch.testing.assert_close(output, torch.ones(*kwargs["query"].shape[:-1], 4))
 
 
+@pytest.mark.parametrize(
+    ("qk_rope_head_dim", "explicit_lengths", "expected"),
+    [
+        pytest.param(64, None, [0, 2, 2, 4], id="qk576-implicit"),
+        pytest.param(64, [2, 0, 1, 2], [4, 0, 2, 4], id="qk576-explicit"),
+        pytest.param(0, None, [4, 4, 4, 4], id="qk512-implicit"),
+    ],
+)
+def test_trtllm_mla_sparse_fi_trace_selected_prefix(
+    qk_rope_head_dim, explicit_lengths, expected, tmp_path
+):
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    from flashinfer.trace.templates.attention import (
+        trtllm_batch_decode_mla_trace_dispatch,
+    )
+    from flashinfer.trace_apply.adapt import build_candidate_kwargs
+
+    kv_lora_rank = 512
+    head_dim_qk = kv_lora_rank + qk_rope_head_dim
+    # Zero queries assign equal weight to each active token. The two values
+    # distinguish an empty row, a one-token prefix, and the full selection.
+    kv_cache = torch.zeros(1, 1, 2, head_dim_qk, dtype=torch.bfloat16)
+    kv_cache[0, 0, 0, :kv_lora_rank] = 2
+    kv_cache[0, 0, 1, :kv_lora_rank] = 6
+    kwargs = {
+        "query": torch.zeros(2, 2, 1, head_dim_qk, dtype=torch.bfloat16),
+        "kv_cache": kv_cache,
+        "workspace_buffer": torch.empty(1, dtype=torch.uint8),
+        "qk_nope_head_dim": 192 if qk_rope_head_dim else 512,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "block_tables": torch.tensor([0, 1], dtype=torch.int32).repeat(2, 2, 1),
+        "seq_lens": torch.tensor([1, 2], dtype=torch.int32),
+        "max_seq_len": 2,
+        "sparse_mla_top_k": 2,
+    }
+    if explicit_lengths is not None:
+        kwargs["sparse_mla_top_k_lens"] = torch.tensor(
+            explicit_lengths, dtype=torch.int32
+        )
+
+    definition = trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        save_dir=tmp_path, **kwargs
+    )
+    serialized = json.loads((tmp_path / f"{definition['name']}.json").read_text())
+    namespace: dict[str, object] = {}
+    exec(serialized["reference"], namespace)
+    reference = cast(
+        Callable[..., torch.Tensor],
+        namespace["_trtllm_batch_decode_mla_sparse_reference"],
+    )
+    template = trtllm_batch_decode_mla_trace_dispatch(**kwargs)
+    replayed = build_candidate_kwargs(template, kwargs)
+    actual = reference(**replayed)
+    expected_output = (
+        torch.tensor(expected, dtype=torch.bfloat16)
+        .reshape(2, 2, 1, 1)
+        .expand(2, 2, 1, kv_lora_rank)
+    )
+    torch.testing.assert_close(actual, expected_output)
+
+    if explicit_lengths is None:
+        assert serialized["name"].startswith("trtllm_batch_decode_mla_sparse_h")
+        assert "sparse_mla_top_k_lens" not in template.inputs
+        assert "sparse_mla_top_k_lens" not in serialized["inputs"]
+    else:
+        assert serialized["name"].startswith(
+            "trtllm_batch_decode_mla_sparse_with_lengths_h"
+        )
+        lengths = serialized["inputs"]["sparse_mla_top_k_lens"]
+        assert lengths["shape"] == ["num_query_rows"]
+        assert lengths["dtype"] == "int32"
+        assert lengths["optional"] is True
+        exec(serialized["init"], namespace)
+        init = cast(
+            Callable[..., dict[str, object]],
+            namespace["_trtllm_batch_decode_mla_sparse_init"],
+        )
+        initialized = init(
+            batch_size=2,
+            q_len_per_request=2,
+            num_query_rows=4,
+            num_heads=1,
+            qk_nope_head_dim=192,
+            num_pages=1,
+            page_size=2,
+            sparse_mla_top_k=2,
+            workspace_size=1,
+            device="cpu",
+        )
+        torch.testing.assert_close(
+            initialized["sparse_mla_top_k_lens"],
+            torch.tensor([2, 1, 2, 1], dtype=torch.int32),
+        )
+        regenerated = trtllm_batch_decode_with_kv_cache_mla.fi_trace(**initialized)
+        assert regenerated["name"] == serialized["name"]
+
+
 def test_trtllm_mla_prefill_fi_trace_only_changes_public_api_tag():
     import flashinfer.mla
     import flashinfer.prefill

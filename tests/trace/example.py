@@ -4003,6 +4003,7 @@ def example_cudnn_sparse_mla():
     inputs = trtllm_batch_decode_mla_sparse_trace.init(
         batch_size=128,
         q_len_per_request=1,
+        num_query_rows=128,
         num_heads=64,
         qk_nope_head_dim=192,
         num_pages=128,
@@ -4012,7 +4013,11 @@ def example_cudnn_sparse_mla():
     )
     inputs["workspace_buffer"].zero_()
     inputs["bmm1_scale"] = 1 / 16
+    topk_lengths = inputs.pop("sparse_mla_top_k_lens")
     trtllm_batch_decode_with_kv_cache_mla(**inputs, backend="auto")
+    trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        save_dir=SAVE_DIR, **inputs, sparse_mla_top_k_lens=topk_lengths
+    )
 
 
 example_cudnn_sparse_mla()

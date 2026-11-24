@@ -4685,6 +4685,7 @@ def _trtllm_batch_decode_mla_sparse_reference(
     seq_lens,
     max_seq_len,
     sparse_mla_top_k,
+    sparse_mla_top_k_lens=None,
     **kwargs,
 ):
     """Reference for sparse top-k token MLA decode.
@@ -4692,7 +4693,7 @@ def _trtllm_batch_decode_mla_sparse_reference(
     This reference models only the attention output, not optional LSE output.
     ``return_lse_base`` is accepted in kwargs and does not affect it.
     """
-    del workspace_buffer, qk_nope_head_dim, seq_lens, max_seq_len, sparse_mla_top_k
+    del workspace_buffer, qk_nope_head_dim, max_seq_len, sparse_mla_top_k
     batch_size, q_len, num_heads, head_dim_qk = query.shape
     assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
     bmm1_scale = kwargs.get("bmm1_scale", 1.0)
@@ -4704,9 +4705,13 @@ def _trtllm_batch_decode_mla_sparse_reference(
     if kv_cache.dim() == 4:
         kv_cache = kv_cache.squeeze(1)
     kv_flat = kv_cache.reshape(-1, head_dim_qk).to(torch.float32)
-    topk_lengths = kwargs.get("sparse_mla_top_k_lens")
+    topk_lengths = sparse_mla_top_k_lens
     if topk_lengths is not None:
         topk_lengths = topk_lengths.reshape(batch_size, q_len)
+    elif qk_rope_head_dim == 64 and seq_lens is not None:
+        # QK576 bounds selected slots by each query's causal KV length.
+        positions = torch.arange(q_len, dtype=seq_lens.dtype, device=seq_lens.device)
+        topk_lengths = (seq_lens[:, None] - q_len + positions + 1).clamp_min(0)
     output = torch.zeros(
         (batch_size, q_len, num_heads, kv_lora_rank),
         dtype=query.dtype,
@@ -4807,6 +4812,7 @@ def _trtllm_batch_decode_mla_sparse_init(
     *,
     batch_size: int,
     q_len_per_request: int,
+    num_query_rows: int | None = None,
     num_heads: int = 128,
     head_dim_qk: int = 576,
     kv_lora_rank: int = 512,
@@ -4822,6 +4828,8 @@ def _trtllm_batch_decode_mla_sparse_init(
     seed: int = 0,
 ):
     """Build inputs for sparse top-k ``trtllm_batch_decode_with_kv_cache_mla``."""
+    if num_query_rows is not None and num_query_rows != batch_size * q_len_per_request:
+        raise ValueError("num_query_rows must equal batch_size * q_len_per_request")
     torch.manual_seed(seed)
     num_pages = max(num_pages, 1)
     query = (
@@ -4857,7 +4865,7 @@ def _trtllm_batch_decode_mla_sparse_init(
     seq_len = page_size * min(num_pages, sparse_mla_top_k)
     seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
     workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)
-    return {
+    inputs = {
         "query": query,
         "kv_cache": kv_cache,
         "workspace_buffer": workspace_buffer,
@@ -4872,6 +4880,16 @@ def _trtllm_batch_decode_mla_sparse_init(
         "bmm2_scale": 1.0,
         "is_var_seq": False,
     }
+    if num_query_rows is not None:
+        lengths = torch.full(
+            (num_query_rows,),
+            sparse_mla_top_k,
+            dtype=torch.int32,
+            device=device,
+        )
+        lengths[1::2] = sparse_mla_top_k // 2
+        inputs["sparse_mla_top_k_lens"] = lengths
+    return inputs
 
 
 def _trtllm_batch_decode_mla_ragged_init(
@@ -5242,6 +5260,36 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
 )
 
 
+# Trace Apply uses the definition name and ordered inputs to call positional
+# solutions. Give explicit lengths a separate definition to preserve that ABI.
+trtllm_batch_decode_mla_sparse_with_lengths_trace = TraceTemplate(
+    op_type=trtllm_batch_decode_mla_sparse_trace.op_type,
+    name_prefix="trtllm_batch_decode_mla_sparse_with_lengths",
+    description=trtllm_batch_decode_mla_sparse_trace.description,
+    axes={
+        **trtllm_batch_decode_mla_sparse_trace.axes,
+        "num_query_rows": Var(description="Total fixed-layout query rows."),
+    },
+    inputs={
+        **trtllm_batch_decode_mla_sparse_trace.inputs,
+        "sparse_mla_top_k_lens": Tensor(
+            ["num_query_rows"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Active selected slots per query row, flattened in batch-major "
+                "order. Overrides the QK576 causal prefix derived from seq_lens."
+            ),
+        ),
+    },
+    outputs=trtllm_batch_decode_mla_sparse_trace.outputs,
+    tags=trtllm_batch_decode_mla_sparse_trace.tags,
+    constraints=["num_query_rows == batch_size * q_len_per_request"],
+    reference=_trtllm_batch_decode_mla_sparse_reference,
+    init=_trtllm_batch_decode_mla_sparse_init,
+)
+
+
 def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
     if kwargs.get("enable_dcp", False):
         raise NotImplementedError(
@@ -5250,6 +5298,8 @@ def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
         )
     sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
     if sparse_mla_top_k > 0:
+        if kwargs.get("sparse_mla_top_k_lens") is not None:
+            return trtllm_batch_decode_mla_sparse_with_lengths_trace
         return trtllm_batch_decode_mla_sparse_trace
     if kwargs.get("cum_seq_lens_q") is None:
         return trtllm_batch_decode_mla_dense_trace
@@ -5260,6 +5310,7 @@ trtllm_batch_decode_mla_trace_dispatch.templates = [  # type: ignore[attr-define
     trtllm_batch_decode_mla_dense_trace,
     trtllm_batch_decode_mla_ragged_trace,
     trtllm_batch_decode_mla_sparse_trace,
+    trtllm_batch_decode_mla_sparse_with_lengths_trace,
 ]
 
 
