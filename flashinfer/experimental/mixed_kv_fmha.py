@@ -162,6 +162,14 @@ def run(q, k, v, sf, table, seq_lens, qo_indptr, max_q_len, out, qk_scale, v_sca
         raise ValueError(
             "nonempty queries require a positive launch bound and page table"
         )
+    if max_q_len == 1 and table.shape[0] >= 8:
+        from . import mixed_kv_bulk_decode
+
+        if mixed_kv_bulk_decode.supported(q, k, v, sf, table):
+            with torch.cuda.device(q.device):
+                return mixed_kv_bulk_decode.run(
+                    q, k, v, sf, table, seq_lens, qo_indptr, out, qk_scale, v_scale
+                )
     # Split decode across the KV dimension rather than serializing a long
     # request in one CTA. Limit dispatch to the measured GQA geometry.
     if (

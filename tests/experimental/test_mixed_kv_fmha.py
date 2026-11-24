@@ -149,9 +149,10 @@ def test_ragged_attention_and_graph_replay(d, group):
 
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
-    ("width", "batch"), [(3, 4), (160, 4), (136, 1), (3, 16), (160, 64)]
+    ("width", "batch", "hk"),
+    [(3, 4, 2), (160, 4, 2), (136, 1, 2), (3, 16, 2), (160, 64, 2), (625, 16, 8)],
 )
-def test_short_decode_graph(layout, width, batch):
+def test_short_decode_graph(layout, width, batch, hk):
     from flashinfer.attention.mixed_kv import paged_fp8_k_nvfp4_v_fmha
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
@@ -165,8 +166,8 @@ def test_short_decode_graph(layout, width, batch):
 
     def allocate(d, dtype):
         if layout == "HND":
-            return torch.empty((12, 2, 64, d), device=dev, dtype=dtype)
-        return torch.empty((12, 64, 2, d), device=dev, dtype=dtype).transpose(1, 2)
+            return torch.empty((12, hk, 64, d), device=dev, dtype=dtype)
+        return torch.empty((12, 64, hk, d), device=dev, dtype=dtype).transpose(1, 2)
 
     k = allocate(128, fp8)
     k.copy_(torch.randn(k.shape, device=dev))
@@ -196,7 +197,13 @@ def test_short_decode_graph(layout, width, batch):
             ([0] * pad + l1, [0] * pad + p1),
         ]
     lengths, offsets = states[0]
-    q = torch.randn((offsets[-1], 8, 128), device=dev).to(fp8)
+    q = torch.randn((offsets[-1], 4 * hk, 128), device=dev).to(fp8)
+    if torch.cuda.get_device_capability() == (10, 3):
+        from flashinfer.experimental.mixed_kv_bulk_decode import supported
+
+        assert supported(q, k, v, sf, table) == (
+            layout == "HND" and batch >= 8 and width > 32
+        )
     lens = torch.tensor(lengths, device=dev, dtype=torch.int32)
     ptr = torch.tensor(offsets, device=dev, dtype=torch.int32)
     out = torch.empty_like(q, dtype=torch.bfloat16)

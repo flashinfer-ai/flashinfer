@@ -478,6 +478,7 @@ def _get_compiled_paged_decode_kernel(
     use_threshold: bool,
     use_lse: bool,
     use_sink: bool,
+    mixed: bool = False,
 ):
     """Compile and cache the paged GQA decode kernel."""
     grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -609,6 +610,21 @@ def _get_compiled_paged_decode_kernel(
 
     threshold_p_fake = Float32(0.0) if use_threshold else None
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    packed_args = ()
+    if mixed:
+
+        def packed_fake(dtype, channels):
+            return cute.runtime.make_fake_tensor(
+                dtype,
+                (sym_virtual_pages, num_kv_heads, page_size, channels),
+                stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+                assumed_align=16,
+            )
+
+        packed_args = (
+            packed_fake(cutlass.Uint16, head_dim // 4),
+            packed_fake(cutlass.Uint8, head_dim // 16),
+        )
 
     return cute.compile(
         fmha,
@@ -632,6 +648,7 @@ def _get_compiled_paged_decode_kernel(
         threshold_p_fake,
         stream_fake,
         True,  # enable_pdl placeholder (runtime-dynamic)
+        *packed_args,
         options="--enable-tvm-ffi --opt-level 3",
     )
 
