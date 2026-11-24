@@ -4485,8 +4485,9 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
     ``_scale_tensor`` / ``_const``), captured twice: the caches stay empty after both captures, the second graph replays
     before the first, an eager call then fills the caches once per device and both graphs replay again; a layer
     constructed inside a capture (its runner built there, the routed scale a per-call fill) and forwarded in it, its scale
-    unset and the caches empty after the capture, before any replay; and the warm-cache control: a layer used eagerly
-    first, then captured. Every output equals the eager bits of a layer that never saw a capture, under the DeepSeekV3
+    unset and the caches empty after the capture, before any replay (the runner's placeholder operands follow the op's
+    constant rule: nothing of a capture's pool is cached); and the warm-cache control: a layer used eagerly first, then
+    captured. Every output equals the eager bits of a layer that never saw a capture, under the DeepSeekV3
     method with a routed scaling factor and a bias (the scale constant in play), both pairs and the static class."""
     from flashinfer.fused_moe.batch_invariant import api_fp4, runner_fp4
 
@@ -4536,22 +4537,19 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
     torch.cuda.synchronize()
     nan = float("nan")
     s = torch.cuda.Stream()
-    # the op's constant caches and the runner's placeholder cache, warm from the reference; the constants an eager call of
+    # the op's constant caches and the runner's placeholder caches, warm from the reference; the constants an eager call of
     # this class caches (the unread scale-byte atom is the static class's GEMM2's alone)
     caches = (
         (api_fp4, "_GS_INV"),
         (api_fp4, "_DUMMY_SF"),
         (api_fp4, "_UNIT"),
-        (runner_fp4, "_NO_SCALES"),
+        (runner_fp4, "_NO_SF"),
+        (runner_fp4, "_NO_PTS"),
     )
-    warm = {
-        name: getattr(mod, name)
-        for _, name in caches
-        for mod in (api_fp4, runner_fp4)
-        if hasattr(mod, name)
-    }
-    op_caches = ("_GS_INV", "_DUMMY_SF", "_UNIT")
-    filled = {"_GS_INV", "_UNIT"} | ({"_DUMMY_SF"} if which == "static" else set())
+    warm = {name: getattr(mod, name) for mod, name in caches}
+    filled = {"_GS_INV", "_UNIT", "_NO_SF", "_NO_PTS"} | (
+        {"_DUMMY_SF"} if which == "static" else set()
+    )
     assert all(warm[name] for name in filled)
 
     def isolate():
@@ -4559,7 +4557,10 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
             monkeypatch.setattr(mod, name, {})
 
     def op_caches_empty() -> bool:
-        return all(not getattr(api_fp4, name) for name in op_caches)
+        return all(not getattr(mod, name) for mod, name in caches)
+
+    def cached() -> set:
+        return {name for mod, name in caches if getattr(mod, name)}
 
     def captured(layer):
         g = torch.cuda.CUDAGraph()
@@ -4580,8 +4581,8 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
     assert torch.equal(bits(fresh(act, W)), ref)
-    assert {name for name in op_caches if getattr(api_fp4, name)} == filled
-    assert all(len(getattr(api_fp4, name)) == 1 for name in filled)
+    assert cached() == filled
+    assert all(len(getattr(mod, name)) == 1 for mod, name in caches if name in filled)
     for g, out in graphs:
         out.fill_(nan)
         g.replay()
@@ -4602,7 +4603,7 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monke
     assert torch.equal(bits(out), ref)
     assert inside.runners[0]._scale is None and op_caches_empty()
     assert torch.equal(bits(inside(act, W)), ref)
-    assert inside.runners[0]._scale is not None and not op_caches_empty()
+    assert inside.runners[0]._scale is not None and cached() == filled
     # (3) the control: used eagerly with the warm caches, then captured
     for mod, name in caches:
         monkeypatch.setattr(mod, name, warm[name])

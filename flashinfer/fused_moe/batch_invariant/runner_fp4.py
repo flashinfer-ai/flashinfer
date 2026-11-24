@@ -87,7 +87,9 @@ _ACTIVATIONS = (
     ReLU,
     SiLU,
 )
-_NO_SCALES: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+#: The placeholder scale operands per indexed device (the op's constant rule, :func:`~.api_fp4._const`).
+_NO_SF: Dict[str, torch.Tensor] = {}
+_NO_PTS: Dict[str, torch.Tensor] = {}
 
 
 def pair_name(pair: Tuple[QuantFormat, QuantFormat]) -> str:
@@ -106,17 +108,18 @@ def unsupported_pair(quant: QuantConfig) -> BatchInvariantUnsupportedError:
 
 
 def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The placeholder scale operands (never read), one pair per device so a call launches no fill: a 1-byte scale buffer
-    and an empty f32 vector. The empty vector also marks a pre-quantized NVFP4 pack without per-token scales (the per-tensor
-    pack of the TRTLLM backends: unit scales, nothing to read or fill) and stands for the MX pair's absent alphas."""
-    key = str(device)
-    t = _NO_SCALES.get(key)
-    if t is None:
-        t = _NO_SCALES[key] = (
-            torch.empty(1, dtype=torch.uint8, device=device),
-            torch.empty(0, dtype=torch.float32, device=device),
-        )
-    return t
+    """The placeholder scale operands (never read): a 1-byte scale buffer and an empty f32 vector, cached per indexed device
+    as the op's constants are (:func:`~.api_fp4._const`: a blocking host copy outside CUDA graph capture; under capture an
+    allocation of that capture alone, never cached, so a capture's private pool serves no eager call). The empty vector also
+    marks a pre-quantized NVFP4 pack without per-token scales (the per-tensor pack of the TRTLLM backends: unit scales,
+    nothing to read or fill) and stands for the MX pair's absent alphas."""
+    from .api_fp4 import _const, _device_key
+
+    key = _device_key(device)
+    return (
+        _const(_NO_SF, key, lambda d: torch.zeros(1, dtype=torch.uint8, device=d), device),
+        _const(_NO_PTS, key, lambda d: torch.empty(0, dtype=torch.float32, device=d), device),
+    )  # fmt: skip
 
 
 def _tactic_fp4(c1, c2) -> tuple:
