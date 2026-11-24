@@ -320,12 +320,13 @@ class BatchInvariantFp4Runner(MoERunner):
         intermediate class being this candidate's -- the two fp4 candidates of a layer share the view key, so a view prepared
         for the other class is the other candidate's pack and is declined here (the runner driven directly refuses it in
         ``pack_inputs``); a view of another pair stays a refusal, since no candidate of the layer serves it. The view names
-        its class (``prepare_weights`` writes ``intermediate`` for both pairs); a view without the key is declined, never
-        read as the per-token class (``pack_inputs`` names the missing key)."""
+        its pair and its class (``prepare_weights`` writes ``quant`` and ``intermediate`` for both pairs); a view without
+        either key is declined, never read as the NVFP4 pair or the per-token class (``pack_inputs`` names the missing
+        key)."""
         if not super().accepts(act, weights):
             return False
         view = weights.get_view(self.backend_key)
-        return view.get("intermediate") == self._intermediate
+        return "quant" in view and view.get("intermediate") == self._intermediate
 
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
@@ -444,7 +445,13 @@ class BatchInvariantFp4Runner(MoERunner):
         H = self._hidden_of(x)
         k, E = cfg.routing.top_k, cfg.routing.num_experts
         view = weights.get_view(self.backend_key)
-        if view.get("quant", "nvfp4") != pair.name:
+        if "quant" not in view:
+            raise unsupported(
+                cls,
+                "a weight view without its quantization pair (no `quant` key)",
+                "the view of BatchInvariantFp4Config.prepare_weights, which names the pair for both pairs",
+            )
+        if view["quant"] != pair.name:
             raise unsupported(
                 cls,
                 "weights prepared for another pair of the fp4 backend",

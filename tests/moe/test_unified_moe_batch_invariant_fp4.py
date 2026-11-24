@@ -3958,6 +3958,51 @@ def test_weight_view_names_its_intermediate_class_and_a_view_without_it_is_decli
 
 @needs_device
 @each_pair
+def test_weight_view_names_its_pair_and_a_view_without_it_is_declined(pair):
+    """``prepare_weights`` writes the pair into the view (``quant``) for both pairs; the runner's candidate filter requires
+    the key -- a view without it is declined, never read as the NVFP4 pair -- the runner driven directly refuses it with the
+    mode's error naming the key, and the view reader takes no default; the other pair's view stays a refusal naming the
+    pair (accepted by the filter, since no candidate of the layer serves it)."""
+    T, k, H, I, E = 8, 2, 128, 64, 4
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=73)
+    view = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, quant=_QUANT[pair], activation=_SWIGLU
+    )
+    assert view["quant"] == pair.name
+    assert MoEWeightsFp4.prepare(pair, w1, w2).view()["quant"] == pair.name
+    layer = _layer(k, E, I, quant=_QUANT[pair])
+    runner = layer.runners[0]
+    act = _logits_pack(x, logits)
+    pack = MoEWeightPack({})
+    pack.prepare_for(KEY, view)
+    assert runner.accepts(act, pack)
+    ref = bits(layer(act, pack))
+    stripped = MoEWeightPack({})
+    stripped.prepare_for(KEY, {kk: v for kk, v in view.items() if kk != "quant"})
+    assert not runner.accepts(act, stripped)
+    with pytest.raises(NotImplementedError):
+        layer(act, stripped)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="quant"):
+        runner.pack_inputs(act, stripped)
+    with pytest.raises(KeyError, match="quant"):
+        MoEWeightsFp4.from_view(stripped.get_view(KEY))
+    other = MXFP4 if pair.scaled else NVFP4
+    other_pack = MoEWeightPack({})
+    other_pack.prepare_for(
+        KEY,
+        BatchInvariantFp4Config.prepare_weights(
+            w1, w2, quant=_QUANT[other], activation=_SWIGLU
+        ),
+    )
+    assert runner.accepts(act, other_pack)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="another pair") as e:
+        runner.pack_inputs(act, other_pack)
+    assert pair.cls in str(e.value) and pair.name.upper() in str(e.value)
+    assert torch.equal(bits(layer(act, pack)), ref)
+
+
+@needs_device
+@each_pair
 def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
     """The pack is preallocated and filled one expert at a time: the bits of the whole-tensor path (the interleave of every
     expert, each quantized into its own buffers, stacked), and a peak memory beyond the inputs bounded by the pack plus a

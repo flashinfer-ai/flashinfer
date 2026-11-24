@@ -497,7 +497,8 @@ class MoEWeightsFp4:
 
     @staticmethod
     def from_view(view: Dict[str, object]) -> "MoEWeightsFp4":
-        pair = PAIRS_BY_NAME[str(view.get("quant", "nvfp4"))]
+        """The weights of a view :meth:`view` wrote; the pair is read from its ``quant`` key, never assumed."""
+        pair = PAIRS_BY_NAME[str(view["quant"])]
         gated = bool(view.get("gated", True))
         return MoEWeightsFp4(
             pair,
