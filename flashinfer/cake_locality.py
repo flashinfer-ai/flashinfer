@@ -34,22 +34,31 @@ FlashInfer JIT build of :data:`PROBE_SOURCE`, and caches only the outcomes that 
 later probe would repeat. Every condition it cannot meet gives ``None``, and a
 caller then takes its whole-GPU route.
 
-Twins gain from die-local memory reads. Some boards keep their memory at a
-lower clock under load (driver 620.43: 3186 of 4752 MHz). There, for B=64 batch
-DeepGEMM FP8 weights of (4096, 7168), the twin route took 1.01-1.08x the time
-of the whole-GPU route at expected_m <= 64 and 0.92-0.95x at 512 and 4096 while
-the whole-GPU route kept its CTA reserve; with the whole-GPU route on the full
-grid from expected_m 36 (212-SM devices), the twin took 1.01-1.14x its time at
-every measured expected_m from 1 to 4096. At 4752 MHz the twin was faster at
-every measured expected_m than the reserved grid, and, with the full grid from
-expected_m 36, at expected_m <= 36. Neither the CUDA driver API version
-(cuDriverGetVersion) nor the CUDA memory-clock attribute tells the two apart,
+Twins gain mostly from die-local memory reads, not from their schedule. Timed
+as CUPTI kernel time of CUDA graph replays after a read flush of twice the L2
+size: at 4752 MHz, the batch DeepGEMM FP8 twin (B=64 weights of (4096, 7168))
+on ordinary interleaved memory took 0.95-0.97x the time of the whole-GPU
+program on the full grid at expected_m 1-16 and 1.05x at 36 and 64, and homed
+memory cut its time 1.34-1.41x and 1.09x; the GDN decode twin (H=16, HV=32,
+B 48-512) on interleaved memory took 1.03-1.06x the whole-GPU time and homed
+memory cut it 1.08-1.19x. With every die's SMs labelled with the other die
+(an inverted SM table) both twins took 1.8-2.6x their homed time at 4752 MHz
+and 1.6-1.8x at 3186 MHz, with the same bits. Some boards keep their memory
+at a lower clock under load (driver 620.43: 3186 of 4752 MHz). There the batch DeepGEMM FP8 twin took the same time on
+homed as on interleaved memory at expected_m 1-16 (0.99-1.00x), and homed
+weights were slower than plain weights at expected_m 1-32 (1.04-1.07x) and
+equal at 36-64; at 4752 MHz homed weights were faster up to expected_m 64
+(1.03-1.47x) and slower from 72 to 512 (see
+``flashinfer.gemm.cake_batch_deepgemm_fp8.localize_weights``). Neither the CUDA
+driver API version (cuDriverGetVersion) nor the CUDA memory-clock attribute tells the two apart,
 while NVML's current memory clock does: :func:`memory_at_full_clock` reads it
 once per device, and the batch DeepGEMM FP8 path homes and routes no twin
 below :data:`MEMORY_CLOCK_FRACTION` of the maximum, or when NVML cannot read
 it. The GDN decode twin (H=16, HV=32, B 48-512) stays faster than its
-whole-GPU route at 3186 MHz (0.88-0.97x its time in CUDA graphs), so
-:func:`sm_table` does not depend on the memory clock.
+whole-GPU route at 3186 MHz (0.93-0.96x its time; CUPTI kernel time of CUDA
+graph replays after a read flush of twice the L2 size, so the 128 MiB-1 GiB
+state is read from memory), so :func:`sm_table` does not depend on the memory
+clock.
 
 :func:`split_empty` reserves one virtual address range and backs ``[0, cut)``
 with memory of die 0 and ``[cut, size)`` with memory of die 1. The allocation is

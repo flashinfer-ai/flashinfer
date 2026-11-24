@@ -20,7 +20,7 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
       one per expert weight (legacy E8M0 SF wire is dispatched but unused by
       the GEMM dequantization).
     * ``blockwise``: DeepGEMM-style fp32 block scales — per token/128-block
-      for activations, per 128x128 block for weights.
+      for activations, per 128x128 block for weights. Requires MMA tile K=128.
 
     ``fc1_activation_dequant_scale`` / ``fc2_activation_dequant_scale`` are
     the per-tensor-mode static calibration scalars (dequant convention:

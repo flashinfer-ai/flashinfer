@@ -251,10 +251,15 @@ are compiled on demand. Set it to 0 to disable the timeout.
 `FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=0` preserves the full search and its
 order. Positive values opt into the FP4 analytical ranking for persistent
 tactics, while retaining every eligible split-K tactic. The budget must fit
-those split-K tactics plus at least one persistent candidate. This ranking
+those split-K tactics plus at least one persistent candidate. The runner
+reports its budget, including 0, through `get_tactic_cache_key()`, so changing
+it retunes entries tuned under a different budget instead of reusing their
+winners. Entries tuned before the budget was reported are retuned once when
+tuning is next enabled; serving from them is unchanged. This ranking
 needs MXFP8 workload validation before becoming a default: a startup reduction
 alone does not establish steady-state performance parity. The newer warp
-split-K runner and SM107/SM12x paths are outside this change.
+split-K runner and SM12x paths are outside this change; the SM107 low-M runner
+(M <= 32) applies the budget.
 
 Use the following regression harness with a **new** output directory:
 
