@@ -108,6 +108,7 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -620,7 +621,13 @@ def _clear_cuda_last_error() -> None:
     """
     major = (torch.version.cuda or "").split(".")[0]
     try:
-        cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+        if sys.platform == "win32":
+            # Windows has no RTLD_* flags; loading a DLL by name returns the copy the process already holds.
+            cudart = ctypes.CDLL(f"cudart64_{major}.dll")
+        else:
+            cudart = ctypes.CDLL(
+                f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW
+            )
     except OSError:
         return
     cudart.cudaGetLastError.restype = ctypes.c_int

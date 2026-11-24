@@ -121,19 +121,26 @@ def chunk_gated_delta_product(
         runs the Cake GDP prefill kernel
         (:func:`flashinfer.cake_gdp_backend.cake_chunk_gated_delta_product`):
         ``head_size == 128`` with a 64-wide value / state row, one head count
-        for q, k and v, ``num_householder`` in 1..4, an SM90 device (H100 /
-        H200); the argument contract is this function's, with ``initial_state``
-        / ``output_state`` in float32 (a bfloat16 per-sequence ``initial_state``
-        is converted) and contiguous state pools.  One Cake kernel launch per
-        call; the split programs add a workspace clear and the item-table
-        upload.  With ``cu_seqlens_cpu`` given, no device-to-host
-        synchronization is issued (the split rule reads the host copy); without
-        it the sequence offsets are copied to the host once.  ``g=None`` runs
-        the kernel's unit-gate program and
-        ``beta=None`` the unit-beta program, from a zero state; ``g=None``
-        together with ``beta=None``, a unit-gate / unit-beta call with an
-        ``initial_state`` or a ``state_indices`` pool, and a device without an
-        exported route raise ``ValueError`` naming what is exported.
+        for q, k and v, ``num_householder`` in 1..4 on an SM90 (H100 / H200)
+        device and 3 on an SM100 (B200 / GB200) or SM103 (B300 / GB300) device; the argument
+        contract is this function's, with ``initial_state`` / ``output_state``
+        in float32 (a bfloat16 per-sequence ``initial_state`` is converted) and
+        contiguous state pools.  One Cake kernel launch per call; the split
+        programs add a workspace clear and the item-table upload (from pinned
+        host memory on SM100 / SM103, so the call captures into a CUDA graph
+        when ``cu_seqlens_cpu`` is given).  On SM100 / SM103 one launch serves
+        a mixed batch: the long sequences are planned as if alone and the
+        short ones run on the least-loaded CTAs after them; the results
+        agree with any other batch composition within rounding.  With
+        ``cu_seqlens_cpu`` given, no device-to-host synchronization is issued
+        (the split rule reads the host copy); without it the sequence offsets
+        are copied to the host once.  On SM90 ``g=None`` runs the kernel's
+        unit-gate program and ``beta=None`` the unit-beta program, from a zero
+        state (on SM100 / SM103 unit tensors are filled in); ``g=None``
+        together with ``beta=None``, on SM90 a unit-gate / unit-beta call with
+        an ``initial_state`` or a ``state_indices`` pool, on SM100 / SM103 any
+        ``state_indices`` pool, and a device without an exported route raise
+        ``ValueError`` naming what is exported.
     cu_seqlens_cpu : torch.Tensor, optional
         The host copy of ``cu_seqlens`` (a CPU int32 / int64 1-D tensor of ``N +
         1`` entries, as vLLM keeps ``query_start_loc_cpu``).  The Cake backend
@@ -145,6 +152,15 @@ def chunk_gated_delta_product(
         Graph capture does not allow, so a graph-captured caller passes it.  It
         is checked for device, rank, length and dtype, never compared with
         ``cu_seqlens`` value by value.  The cuDNN backends accept and ignore it.
+        On SM100 / SM103 the Cake backend plans the launch from these host
+        lengths, so a CUDA graph it captures is valid only for the batch it
+        captured (the sequence offsets, ``N`` and ``T``): a batch with other
+        lengths needs a new capture or an eager call.  The kernel compares the
+        planned offsets with ``cu_seqlens`` on the device; a replay over changed
+        offsets computes nothing and writes NaN to ``output[0, 0, :2]`` (and to
+        ``output_state[0, 0, 0, 0]`` when a final state is stored), so the
+        failure is visible.  The cuDNN backends read the lengths on the device
+        and accept such a replay.
 
     state_indices : torch.Tensor, optional
         Contiguous int32 ``[num_seqs]`` slots in ``initial_state`` and

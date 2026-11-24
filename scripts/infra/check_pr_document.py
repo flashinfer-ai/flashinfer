@@ -25,7 +25,7 @@ from pr_checks.write_reports import PrFinding, emit_finding, write_report
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = ROOT / "scripts"
+SCRIPTS_DIR = ROOT / "scripts" / "infra"
 
 CHECKER_MODULES = (
     "pr_checks.check_api_docs",

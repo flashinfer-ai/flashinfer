@@ -7,7 +7,7 @@ import torch
 
 from flashinfer.moe_ep import BootstrapConfig, FleetParams
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
 
 

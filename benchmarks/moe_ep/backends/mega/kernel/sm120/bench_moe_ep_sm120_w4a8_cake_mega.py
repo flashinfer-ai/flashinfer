@@ -28,7 +28,7 @@ Examples (one process per GPU; EP world size = torchrun world size):
         --shapes dsv3 --variants noshared fp8shared
 
 Pin NCCL's topology on multi-GPU PCIe hosts (``NCCL_TOPO_FILE``); see
-``flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md``.
+``flashinfer/moe_ep/kernels/cake/mxfp4_megamoe_sm120/README.md``.
 """
 
 from __future__ import annotations

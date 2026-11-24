@@ -164,7 +164,7 @@ def test_uid_broadcast_uses_global_rank_of_group_local_zero(setup_runtime, monke
 def test_free_uses_allocation_kind_even_if_environment_changes(
     setup_runtime, monkeypatch
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import comm
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import comm
 
     nv, _, _ = setup_runtime
     root = object()

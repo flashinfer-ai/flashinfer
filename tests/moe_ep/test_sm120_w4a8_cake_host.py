@@ -657,7 +657,7 @@ def test_epoch_is_device_resident() -> None:
 
 
 def test_manifest_seals_the_parametric_closure() -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
         DEVICE_PARAMETERS,
         INSTANCE_NAMES,
         device_defines,
@@ -684,9 +684,7 @@ def test_aot_device_parameters_match_the_default_deployment() -> None:
         Sm120Mxfp4Mxfp8CakeMegaKernelBackend,
         candidate_instances,
     )
-    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
-        AOT_DEVICE_PARAMETERS,
-    )
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import AOT_DEVICE_PARAMETERS
 
     config = Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(shared_expert="fp8_in_kernel")
     backend = Sm120Mxfp4Mxfp8CakeMegaKernelBackend(config)
@@ -851,14 +849,14 @@ def test_device_resource_check_rejects_spills_at_every_rank_count(ranks: int) ->
 
 
 def test_gin_backend_builds(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
         AOT_DEVICE_PARAMETERS,
         GIN_BACKENDS,
         gen_cake_sm120_megamoe_aot_modules,
         gen_cake_sm120_megamoe_kernel_module,
         gin_backend_name,
     )
-    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim import cake_jit
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import cake_jit
 
     # ncclGinType_t values: 2 proxy, 3 GDAKI, 4 GPI; anything else fails closed.
     assert [gin_backend_name(t) for t in (2, 3, 4)] == ["proxy", "gdaki", "gpi"]
@@ -892,7 +890,7 @@ def test_device_resource_check_without_cuobjdump_defers_to_the_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     G = _geometry()
-    import flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe as package
+    import flashinfer.moe_ep.shims.sm120.cake_mxfp4 as package
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
         check_device_resources,
     )
@@ -1033,8 +1031,9 @@ def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
     support (their libcu++ spells the macro ``_LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE``).
     """
     import subprocess
+    import sys
 
-    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim import cake_jit
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import cake_jit
 
     nvcc = cake_jit._nvcc()
     source = tmp_path / "atomic_ref_probe.cu"
@@ -1057,6 +1056,12 @@ def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
                     "-arch=compute_120a",
                     "-std=c++17",
                     "-O3",
+                    # CCCL requires the conforming preprocessor in cl.exe.
+                    *(
+                        ["-Xcompiler", "/Zc:preprocessor"]
+                        if sys.platform == "win32"
+                        else []
+                    ),
                     *defines,
                     str(source),
                     "-o",

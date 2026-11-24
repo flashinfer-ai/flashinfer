@@ -29,15 +29,31 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import build_meta as orig
-from build_utils import get_cuda_tile_compile_dependency_requirements, get_git_version
+from build_utils import (
+    apply_cutlass_patches,
+    get_cuda_tile_compile_dependency_requirements,
+    get_git_version,
+)
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
 
 
+def _load_spdlog_patch():
+    # The JIT and the wheel build share one definition of the spdlog rewrite; the
+    # package itself is not importable at build time, so load the module by path.
+    import importlib.util
+
+    path = _root / "flashinfer" / "jit" / "spdlog_patch.py"
+    spec = importlib.util.spec_from_file_location("flashinfer_spdlog_patch", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
 # runtime deps moved into the base dependencies (`pip install .` is enough):
-#   NCCL-EP  — provided by the `nccl-extensions>=0.1.0` wheel (a base dep
+#   NCCL-EP  — provided by the `nccl-extensions>=0.2.0` wheel (a base dep
 #              now); NO in-tree build. (nccl.ep used to ship in nccl4py;
 #              nccl4py 0.4.1 dropped it — see requirements.txt.)
 #   NIXL-EP  — built in-tree from 3rdparty/nixl (meson). Missing build deps
@@ -265,7 +281,7 @@ def _build_nixl_ep() -> None:
         str(build),
         str(src),
         "-Dbuild_nixl_ep=true",
-        # H100 + B200 + B300 native SASS; upstream also emits PTX for the
+        # SM90, SM100 and SM103 native SASS; upstream also emits PTX for the
         # highest listed arch (compute_103) for forward-compat. Option exists
         # since NIXL v1.2.0 (ai-dynamo/nixl#1639) — replaces the former
         # 0001-meson-add-blackwell-arches.patch overlay.
@@ -427,7 +443,6 @@ def _check_nccl_version_drift(wheel: Path) -> None:
     If the wheel's installed nccl.h has a different code, warn — we'll build
     against the wheel's ABI which may differ from the submodule we patched.
     """
-    import re
 
     src = _root / "3rdparty" / "nccl" / "src" / "nccl.h.in"
     wheel_h = wheel / "include" / "nccl.h"
@@ -473,7 +488,7 @@ def _build_nccl_ep() -> None:
 
     # contrib/nccl_ep's Makefile refuses any gencode below sm_90 (see
     # 3rdparty/nccl/contrib/nccl_ep/Makefile:15). Override NVCC_GENCODE to only
-    # cover the EP-supported arches: sm_90 (H100), sm_100 (B200), sm_103 (B300).
+    # Cover the EP-supported architectures: sm_90, sm_100 and sm_103.
     nccl_ep_gencode = " ".join(
         [
             "-gencode=arch=compute_90,code=sm_90",
@@ -620,7 +635,7 @@ def _ensure_nixl_wheel() -> None:
 
 
 def _ensure_nccl_floor() -> None:
-    """Best-effort upgrade of nvidia-nccl-cu13 to the B200 EP floor (>=2.30.7).
+    """Best-effort upgrade of nvidia-nccl-cu13 to the NCCL EP floor (>=2.30.7).
 
     Deliberately NOT a base dependency: torch's cu13 wheels pin
     nvidia-nccl-cu13 EXACTLY (e.g. ==2.29.7), so declaring a >=2.30.7 floor
@@ -628,7 +643,7 @@ def _ensure_nccl_floor() -> None:
     backtracks to the CPU-only torch wheel. Installing here with --no-deps
     (mirroring the nixl-cu13 pattern) upgrades the wheel without ever
     entering the resolver. Failures only warn: torch's own NCCL is
-    sufficient everywhere except NCCL-EP group-create on B200, and
+    sufficient everywhere except NCCL-EP group creation, and
     moe_ep/_validators.py enforces the floor at runtime with an actionable
     error where it actually matters.
     """
@@ -652,7 +667,7 @@ def _ensure_nccl_floor() -> None:
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(
             f"[BUILD_NVEP] WARNING: could not install {wheel} ({e}). "
-            "NCCL-EP on B200 needs NCCL >= 2.30.7 (group-create fails on "
+            "NCCL-EP needs NCCL >= 2.30.7 (group-create fails on "
             "older releases); the runtime validator will raise there. "
             "Install manually if needed: pip install --no-deps "
             f"'{wheel}'"
@@ -800,6 +815,17 @@ def _system_cuda_tile_compiler_available() -> bool:
     release = _detect_cuda_release()
     if release is None or release < (13, 4):
         return False
+    if os.name == "nt":
+        # Windows has no /usr/local/cuda; the toolkit root comes from
+        # CUDA_HOME/CUDA_PATH or from the nvcc on PATH.
+        nvcc = shutil.which("nvcc")
+        root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if not root and nvcc:
+            root = str(Path(nvcc).resolve().parent.parent)
+        if not root:
+            return False
+        compiler = Path(root) / "bin" / "tileiras.exe"
+        return compiler.is_file()
     compiler = Path("/usr/local/cuda/bin/tileiras")
     return compiler.is_file() and os.access(compiler, os.X_OK)
 
@@ -958,15 +984,15 @@ def _build_nvep_if_enabled() -> None:
         )
 
     # NCCL-EP is not built from source — it is provided by the released
-    # `nccl-extensions` wheel (>=0.1.0, the `nccl.ep` API + bundled
+    # `nccl-extensions` wheel (>=0.2.0, the `nccl.ep` API + bundled
     # libnccl_ep.so), which is a base dependency now. So BUILD_NCCL_EP
     # requires no in-tree build step; we only note it here.
     if _BUILD_NCCL_EP:
         print(
-            "[BUILD_NVEP] NCCL-EP is provided by the nccl-extensions wheel (>=0.1.0), "
+            "[BUILD_NVEP] NCCL-EP is provided by the nccl-extensions wheel (>=0.2.0), "
             "a base dependency of flashinfer-python; no in-tree build."
         )
-        # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the B200 EP
+        # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the NCCL EP
         # floor), so upgrade it out-of-band; best-effort by design.
         _ensure_nccl_floor()
 
@@ -1102,6 +1128,9 @@ def write_if_different(path: Path, content: str) -> None:
 
 
 def _create_data_dir(use_symlinks=True):
+    # Both source packaging and AOT use this populated CUTLASS checkout.
+    if os.name == "nt":
+        apply_cutlass_patches(_root / "3rdparty" / "cutlass")
     _data_dir.mkdir(parents=True, exist_ok=True)
 
     def ln(source: str, target: str) -> None:
@@ -1347,8 +1376,55 @@ def _slim_wheel(wheel_path: Path) -> dict[str, int]:
     return stats
 
 
+@contextmanager
+def _staged_header(header: Path, patched: bytes, stage: Path):
+    """Hold ``patched`` in ``header`` for the block, then restore the original.
+
+    ``stage`` holds the backup of the original and the temporary files; it lies
+    outside the packaged ``include`` tree, so no wheel ships them.
+    """
+    backup = stage / (header.name + ".flashinfer-orig")
+    for leftover in stage.glob(f"{header.name}.*.tmp"):
+        leftover.unlink()
+    if backup.exists():
+        os.replace(backup, header)
+    original = header.read_bytes()
+    if patched == original:
+        yield
+        return
+
+    def write(path: Path, data: bytes) -> None:
+        """Write ``data`` through a temporary file in ``stage`` and ``os.replace``."""
+        temporary = stage / f"{path.name}.{os.getpid()}.tmp"
+        try:
+            temporary.write_bytes(data)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    write(backup, original)
+    try:
+        write(header, patched)
+        yield
+    finally:
+        os.replace(backup, header)
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
-    name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    if os.name != "nt":
+        name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+        _slim_wheel(Path(wheel_directory) / name)
+        return name
+
+    spdlog_patch = _load_spdlog_patch()
+    spdlog = _root / "3rdparty" / "spdlog"
+    header = spdlog / "include" / spdlog_patch.SPDLOG_FORMAT_HEADER
+    original = header.read_bytes()
+    patched = spdlog_patch.patch_bundled_format_h(original.decode("utf-8")).encode(
+        "utf-8"
+    )
+    with _staged_header(header, patched, stage=spdlog):
+        name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
     _slim_wheel(Path(wheel_directory) / name)
     return name

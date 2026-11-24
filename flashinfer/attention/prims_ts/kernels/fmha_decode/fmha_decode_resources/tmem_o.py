@@ -194,6 +194,104 @@ class TmemOResource(DecodeGenResourceBase):
 
     @producer_work
     @cute.jit
+    def vp_mma_loop_slot(
+        self,
+        stage_info: StageInfo,
+        *,
+        v_desc: DescriptorValue,
+        p_desc: DescriptorValue,
+    ) -> None:
+        """Issue every head-dim stage of a loop PV wave from one grouped V slot."""
+        self._vp_mma_slot(
+            stage_info,
+            v_desc=v_desc,
+            p_desc=p_desc,
+            initial_scale_d=stage_info.loop_offset != Int32(0),
+        )
+
+    @producer_work
+    @cute.jit
+    def vp_mma_tail_slot(
+        self,
+        stage_info: StageInfo,
+        *,
+        v_desc: DescriptorValue,
+        p_desc: DescriptorValue,
+    ) -> None:
+        """Issue every head-dim stage of the tail PV wave from one grouped V slot."""
+        self._vp_mma_slot(
+            stage_info,
+            v_desc=v_desc,
+            p_desc=p_desc,
+            initial_scale_d=stage_info.loop_end != Int32(0),
+        )
+
+    @cute.jit
+    def _vp_mma_slot(
+        self,
+        stage_info: StageInfo,
+        *,
+        v_desc: DescriptorValue,
+        p_desc: DescriptorValue,
+        initial_scale_d,
+    ) -> None:
+        """Issue all PV MMAs of a grouped TMEM V slot from one elected block.
+
+        Equivalent to the staged-head-dim ``_vp_mma`` for stages 0..G-1 in
+        order (SMEM P, TMEM V, Swaps): stage ``h`` reads V at slot column
+        ``h * stage_cols`` and accumulates into O slice ``h``; P is shared.
+        """
+        cfg = self.cfg
+        stages = cfg.transformed_kv_hd_stages_per_slot
+        k_steps = cfg.tile_size_kv // _mma_k_step_pv(cfg)
+        k_step_cols = _mma_k_step_pv(cfg) * cfg.pv_dtype_bytes // 4
+        p_desc = _freeze_smem_descriptor(p_desc)
+        task_cache = _decode_gen_task_cache(stage_info)
+        _, mma_m, mma_n, a_major, b_major = _pv_mma_operand_contract_for_config(cfg)
+        o_base = (
+            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+            + Int32(self._alloc.offset)
+            + stage_info.stage_idx * Int32(cfg.tmem_o_stage_cols)
+        )
+        idesc = prims.Tcgen05InstrDesc.build(
+            c_dtype=Float32,
+            a_dtype=cfg.pv_dtype,
+            b_dtype=cfg.pv_dtype,
+            a_major=a_major,
+            b_major=b_major,
+            n_dim=mma_n,
+            m_dim=mma_m,
+        )
+        o_stage_offsets = tuple(
+            cfg.pv_head_dim_stage_tmem_offset(h) for h in range(stages)
+        )
+        v_stage_cols = cfg.tmem_transformed_kv_stage_cols
+        if prims.elect_sync():
+            for stage in cutlass.range_constexpr(stages):
+                tmem_col = cutlass.inttoptr(
+                    o_base + Int32(o_stage_offsets[stage]),
+                    6,
+                    Float32,
+                )
+                scale_d = initial_scale_d
+                for ki in cutlass.range_constexpr(k_steps):
+                    v_operand = prims.make_tmem_ptr(
+                        v_desc + Int32(stage * v_stage_cols + ki * k_step_cols),
+                        Int32,
+                    )
+                    prims.tcgen05_mma(
+                        _mma_kind_for_pv(cfg),
+                        prims.CTAGroup.CTA_1,
+                        tmem_col,
+                        v_operand,
+                        p_desc + Int32(ki * 2),
+                        idesc,
+                        scale_d,
+                    )
+                    scale_d = True
+
+    @producer_work
+    @cute.jit
     def vp_mma_loop_fragment(
         self,
         stage_info: StageInfo,
@@ -353,6 +451,12 @@ class TmemOResource(DecodeGenResourceBase):
             p_desc = p_desc_1
             p_tmem_addr = p_tmem_addr_1
         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+            if cutlass.const_expr(cfg.transformed_kv_hd_stages_per_slot > 1):
+                # v_desc is the ring-slot base; select this head-dim stage.
+                v_desc = v_desc + Int32(
+                    (head_dim_stage_idx % cfg.transformed_kv_hd_stages_per_slot)
+                    * cfg.tmem_transformed_kv_stage_cols
+                )
             v_operand = prims.make_tmem_ptr(v_desc, Int32)
         else:
             v_operand = _freeze_smem_descriptor(v_desc)
@@ -366,6 +470,12 @@ class TmemOResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.use_keeps_mma_ab):
             # SMEM keeps a complete staging band; MMA/TMEM own only live columns.
             mma_n = min(mma_n, cfg.headdim - head_dim_stage_idx * cfg.head_dim_kv_stage)
+        if cutlass.const_expr(cfg.keeps_o_uses_lane_panels and cfg.uses_tmem_p):
+            # D512 lane panels: stages 2/3 accumulate in lanes 16-31 and read
+            # the duplicated P copy stored in the same panel.
+            p_tmem_addr = p_tmem_addr + Int32(
+                cfg.keeps_p_lane_panel_tmem_offset(head_dim_stage_idx)
+            )
 
         if cutlass.const_expr(cfg.head_dim_per_stage_kv == 0):
             # Full-headDim path: all V columns for this O stage live in one
