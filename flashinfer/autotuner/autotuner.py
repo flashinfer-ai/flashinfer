@@ -3452,17 +3452,6 @@ class AutoTuner:
                                 f"pass to avoid this perf cliff."
                             )
                     else:
-                        # Nothing tuned for this op, yet some other op has
-                        # tuned data (a cache was loaded or an autotune pass
-                        # ran): this call runs with the fallback tactic, and
-                        # that is often not what the user expects (a cache made
-                        # by another FlashInfer version has other op names or
-                        # keys; an op was never included in the tuning).
-                        # Nothing is reported when no tuned data exists at
-                        # all, the default for users who never tune.
-                        # All shapes of an op miss for the same reason, so it is
-                        # reported once per op; every miss is counted in
-                        # ``stats.cache_misses`` / ``cache_miss_config_collection``.
                         if custom_op not in self._logged_cache_miss_no_op_data:
                             tuned_ops = self._ops_with_tune_data()
                             if tuned_ops:
