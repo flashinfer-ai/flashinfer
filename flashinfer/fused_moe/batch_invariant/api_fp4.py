@@ -616,7 +616,7 @@ def grouped_gemm_fp4(
     if config.gather_a:
         return _grouped_gemm_fp4_gather(
             pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt,
-            pts, alpha, out, out_sf, aux, src, k_div, sf_layout,
+            pts, alpha, out, out_sf, aux, src, k_div, sf_layout, rows_sf,
         )  # fmt: skip
     if src is not None:
         raise ValueError(f"{name}: src belongs to the gather record (config.gather_a)")
@@ -785,10 +785,13 @@ def gather_form_ok(K: int, sf_src: str, block: int = 16) -> bool:
 
 
 def _grouped_gemm_fp4_gather(
-    pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, pts, alpha, out, out_sf, aux, src, k_div, sf_layout=None
+    pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, pts, alpha, out, out_sf, aux, src, k_div, sf_layout=None,
+    rows_sf=None,
 ) -> torch.Tensor:  # fmt: skip
     """The gather record of :func:`grouped_gemm_fp4` (its operand rules, the token rows in place of the permuted rows; the
-    swapped body)."""
+    swapped body). The static class's ``out_sf`` holds the scale bytes of the padded rows: ``rows_sf`` (the caller's padded
+    row count, a multiple of 128) or the plan's host bound :func:`padded_rows_bound` of ``T x k_div`` slots, which the
+    caller's count may not undercut."""
     from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
     from .blocks.compile import can_implement_swapped_blockscaled, get_compiled_swapped
 
@@ -864,9 +867,23 @@ def _grouped_gemm_fp4_gather(
     if chain.static_quant:
         n_out //= 2
         out_dtype = torch.uint8
-        if out_sf is None or out_sf.dtype != torch.uint8:
+        # the epilogue stores a dense row's scale bytes at its padded position, below the plan's padded row count, whose host
+        # bound is the groups of T x k_div slots each padded to the atom (the box form takes the count from its pts rows)
+        bound = padded_rows_bound(T, k_div, E)
+        rows_sf = bound if rows_sf is None else rows_sf
+        if rows_sf % GROUP_ALIGN or rows_sf < bound:
             raise ValueError(
-                f"{name}: the static class's GEMM1 takes out_sf, the flat 128x4 scale bytes of the padded rows"
+                f"{name}: rows_sf must be a multiple of 128 and at least the padded-row bound {bound} of T x k_div slots"
+            )
+        n_sf = N // 2 if chain.pair else N
+        if (
+            out_sf is None
+            or out_sf.dtype != torch.uint8
+            or out_sf.numel() < pair.sf_numel(rows_sf, n_sf)
+        ):
+            raise ValueError(
+                f"{name}: the static class's GEMM1 takes out_sf, the flat 128x4 scale bytes of the padded rows "
+                f"(at least sf_numel({rows_sf}, {n_sf}) bytes)"
             )
     else:
         out_dtype = _OUT[chain.out_fmt]

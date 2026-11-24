@@ -4357,6 +4357,94 @@ def test_computed_global_scale_that_is_not_finite_is_refused_naming_the_expert(
 
 
 @needs_device
+def test_gather_static_class_refuses_an_undersized_out_sf_before_any_launch(
+    monkeypatch,
+):
+    """The gather record's static class checks ``out_sf``'s capacity as the box form does: the epilogue stores a dense row's
+    scale bytes at its padded position, below the plan's padded row count, bounded on the host by the groups of ``T x k``
+    slots each padded to the 128-row atom (``padded_rows_bound``). A buffer below ``sf_numel(bound, I)`` bytes -- one whose
+    length passes the kernel's own divisibility check included -- a ``rows_sf`` that is not a multiple of 128 or below the
+    bound, and a caller's larger ``rows_sf`` without the larger buffer are refused before the kernel is fetched or
+    launched; the exactly sized buffer runs and holds the fused op's scale bytes and codes, as does the fused op's own
+    count with its buffer."""
+    from flashinfer.fused_moe.batch_invariant import api_fp4 as A
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.fused_moe.batch_invariant.schedule_fp4 import (
+        gather_twins,
+        swapped_knobs_blockscaled,
+    )
+
+    T, k, H, I, E = 5, 2, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=57)
+    W = MoEWeightsFp4.prepare(NVFP4, w1, w2, intermediate="static")
+    in1, _ = W.classes(_family())
+    cfg = next(
+        c
+        for c in gather_twins(swapped_knobs_blockscaled())
+        if C.can_implement_swapped_blockscaled(c, 2 * I, H, E, W.chain1, in1)
+    )
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    _, im = A.fused_moe_fp4(x, ids, wts, W, config1=cfg, return_intermediates=True)
+    assert im["config1"].gather_a and W.chain1.static_quant
+    counts, src, x4, x_sf, x_pts = (
+        im["counts"],
+        im["src"],
+        im["x4"],
+        im["x_sf"],
+        im["x_pts"],
+    )
+    Tk, bound = T * k, A.padded_rows_bound(T, k, E)
+    need = NVFP4.sf_numel(bound, I)
+    assert im["Tk_pad"] == bound and need % C.SF_BUFFER_DIVISIBILITY == 0
+    a4 = torch.zeros(Tk + A.DENSE_TAIL, I // 2, dtype=torch.uint8, device="cuda")
+    fetched = []
+    real = C.get_compiled_swapped
+    monkeypatch.setattr(
+        C,
+        "get_compiled_swapped",
+        lambda *a, **kw: fetched.append(a) or real(*a, **kw),
+    )
+
+    def run(out_sf, **kw):
+        return A.grouped_gemm_fp4(
+            x4, x_sf, W.w1, W.w1_sf, counts, cfg, W.chain1, in1, pts=x_pts, alpha=W.w1_alpha, out=a4,
+            out_sf=out_sf, aux=W.gs2, src=src, k_div=k, **kw,
+        )  # fmt: skip
+
+    def buf(n):
+        return torch.zeros(n, dtype=torch.uint8, device="cuda")
+
+    for n in (C.SF_BUFFER_DIVISIBILITY, need - C.SF_BUFFER_DIVISIBILITY, need - 1):
+        with pytest.raises(ValueError, match="out_sf"):
+            run(buf(n))
+    with pytest.raises(ValueError, match="out_sf"):
+        run(None)
+    with pytest.raises(ValueError, match="out_sf"):
+        run(buf(need).view(torch.int8))
+    with pytest.raises(ValueError, match="rows_sf"):
+        run(buf(need), rows_sf=bound - A.GROUP_ALIGN)  # below the bound
+    with pytest.raises(ValueError, match="rows_sf"):
+        run(buf(need), rows_sf=bound + 1)  # not a multiple of the atom
+    with pytest.raises(ValueError, match="out_sf"):
+        run(
+            buf(need), rows_sf=bound + A.GROUP_ALIGN
+        )  # a larger count needs the larger buffer
+    assert not fetched  # every refusal precedes the kernel
+    sized = buf(need)
+    run(sized)
+    torch.cuda.synchronize()
+    assert len(fetched) == 1
+    assert torch.equal(a4[:Tk], im["a4"]) and torch.equal(sized, im["a_sf_pad"])
+    # the fused op's own count (the bound plus the dense tail) with its buffer
+    rows_sf = bound + A.DENSE_TAIL
+    larger = buf(NVFP4.sf_numel(rows_sf, I))
+    run(larger, rows_sf=rows_sf)
+    torch.cuda.synchronize()
+    assert torch.equal(larger[:need], sized) and not larger[need:].any()
+
+
+@needs_device
 @each_pair
 def test_gather_form_at_fewer_than_four_expanded_rows_equals_the_box_form(pair):
     """``T * top_k`` below four (one token at top-1 and top-2, two or three tokens at top-1): the gather form's index tensor
