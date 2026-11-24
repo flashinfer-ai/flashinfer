@@ -188,8 +188,33 @@ def test_rubin_nvfp4_batch_m_candidates(layout):
     assert wide.fc2.cfg.build().num_stages_workid == 1
 
 
-@pytest.mark.parametrize("hidden_size,intermediate_size", ((896, 512), (1024, 448)))
-def test_rubin_nvfp4_batch_m_rejects_unaligned_geometry(hidden_size, intermediate_size):
+@pytest.mark.parametrize("tile", (512, 1024))
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,layout,error",
+    [
+        (
+            896,
+            512,
+            WeightLayout.MajorK,
+            "activation scale loads require problem K.*got 896",
+        ),
+        (
+            1024,
+            448,
+            WeightLayout.MajorK,
+            "weight scale indexing requires problem N.*got 896",
+        ),
+        (
+            1024,
+            384,
+            WeightLayout.BlockMajorK,
+            "BlockMajorK requires problem K.*problem_k=384",
+        ),
+    ],
+)
+def test_rubin_nvfp4_batch_m_rejects_unaligned_geometry(
+    tile, hidden_size, intermediate_size, layout, error
+):
     from flashinfer.prims_ts.moe.config_mapper import map_trtllm_nvfp4_moe_tactic
     from flashinfer.prims_ts.moe.runner import PrimsTsNvfp4MoERunner
 
@@ -199,9 +224,12 @@ def test_rubin_nvfp4_batch_m_rejects_unaligned_geometry(hidden_size, intermediat
         num_local_experts=8,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        weight_layout=layout,
     )
-    pair = map_trtllm_nvfp4_moe_tactic([512, 0], sm_arch=107)
-    with pytest.raises(ValueError, match="multiple"):
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [tile, 0], sm_arch=107, weight_layout=int(layout)
+    )
+    with pytest.raises(ValueError, match=error):
         runner._check_cga_tactic(pair.fc1.cfg.build(), pair.fc2.cfg.build())
 
 

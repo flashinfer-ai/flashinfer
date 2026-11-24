@@ -119,9 +119,19 @@ def test_routed_tile256_cli_and_presets():
     assert options("clc")["use_work_throttle"] == 1
 
 
-@pytest.mark.parametrize("n,k", [(384, 768), (512, 384)])
-def test_routed_tile256_rejects_partial_hidden_tiles(n, k):
-    with pytest.raises(ValueError, match="routed_native_sfa requires problem_"):
+@pytest.mark.parametrize(
+    "n,k,error",
+    [
+        (384, 768, "weight scale indexing requires problem N.*tile_n=256, got 384"),
+        (
+            512,
+            384,
+            "16-byte routed activation scale loads require problem K.*256, got 384",
+        ),
+    ],
+)
+def test_routed_tile256_rejects_partial_hidden_tiles(n, k, error):
+    with pytest.raises(ValueError, match=error):
         runner._runtime_config(make_config(**options()), k, out_hidden=n)
 
 

@@ -1267,6 +1267,10 @@ class BatchedGemmConfig:
         return self.sm_arch == 107
 
     @property
+    def is_rubin_nvfp4_batch_m(self) -> bool:
+        return self.is_rubin and self.is_nvfp4_mma and self.is_batch_m
+
+    @property
     def arch_name(self) -> str:
         """CuTe DSL architecture spelling used by architecture helpers."""
         return f"sm_{self.sm_arch}"
@@ -3995,16 +3999,6 @@ def validate_config(
         )
 
     if cfg.dense_m_repeats == 2:
-        # Generic expert lookup expresses the SFB expert stride in N tiles.
-        # A partial final tile would select the wrong expert's scale rows.
-        if not cfg.dense_single_expert and problem_mnk is not None:
-            _, problem_n, _ = problem_mnk
-            if isinstance(problem_n, int) and problem_n % cfg.tile_n != 0:
-                raise ValueError(
-                    "tile512 with generic expert lookup requires problem N to be "
-                    f"a multiple of tile_n={cfg.tile_n} for weight scale indexing, "
-                    f"got {problem_n}"
-                )
         operand_bytes = (
             cfg.num_bytes_a_per_stage * cfg.num_stages_a
             + cfg.num_bytes_b_smem_per_stage * cfg.num_stages_b
@@ -4217,6 +4211,19 @@ def validate_config(
 
     if cfg.tile_n not in (8, 16, 32, 64, 128, 192, 256):
         raise ValueError(f"tile_n must be 8/16/32/64/128/192/256, got {cfg.tile_n}")
+
+    if (
+        cfg.is_rubin_nvfp4_batch_m
+        and not cfg.dense_single_expert
+        and problem_mnk is not None
+    ):
+        # Generic expert lookup measures the SFB expert stride in whole N tiles.
+        _, problem_n, _ = problem_mnk
+        if isinstance(problem_n, int) and problem_n % cfg.tile_n:
+            raise ValueError(
+                "Per-expert weight scale indexing requires problem N to be a "
+                f"multiple of tile_n={cfg.tile_n}, got {problem_n}"
+            )
 
     if cfg.epi_tile_n <= 0:
         raise ValueError(f"epi_tile_n must be positive, got {cfg.epi_tile_n}")
@@ -4509,16 +4516,12 @@ def validate_config(
             "STATIC_PERSISTENT requires routed_native_sfa, two work stages, no work throttle and a positive static_persistent_clusters budget"
         )
     if cfg.routed_native_sfa and problem_mnk is not None:
-        _, problem_n, problem_k = problem_mnk
-        if isinstance(problem_n, int) and problem_n % cfg.tile_n:
+        _, _, problem_k = problem_mnk
+        k_alignment = 16 * cfg.input_sf_block_size_a
+        if isinstance(problem_k, int) and problem_k % k_alignment:
             raise ValueError(
-                "routed_native_sfa requires problem_n to be a multiple of "
-                "tile_n=256 for weight scale indexing"
-            )
-        if isinstance(problem_k, int) and problem_k % cfg.tile_k:
-            raise ValueError(
-                "routed_native_sfa requires problem_k to be a multiple of "
-                "tile_k=256 for aligned 16-byte scale rows"
+                "16-byte routed activation scale loads require problem K to be a "
+                f"multiple of {k_alignment}, got {problem_k}"
             )
     if cfg.routed_low_smem and not (
         cfg.routed_native_sfa

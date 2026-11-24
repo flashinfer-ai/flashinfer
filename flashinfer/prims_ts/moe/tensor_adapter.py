@@ -1019,7 +1019,7 @@ def build_nvfp4_launch_io(
         scale_c = output2_scale_scalar
         scale_gate = output2_scale_scalar
 
-    cfg = _runtime_config(cfg, in_hidden)
+    cfg = _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
     _validate_weight_storage(
         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
         tensor=weights,
@@ -1077,8 +1077,6 @@ def build_nvfp4_launch_io(
             raise ValueError("NVFP4 BatchM MoE does not support partitioned outputs")
         if per_token_sf_a is not None or per_token_sf_b is not None:
             raise ValueError("NVFP4 BatchM MoE does not support per-token scales")
-        # Also validate the native Rubin N/K alignment before making TMA maps.
-        cfg = _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
     if tile_idx.numel() != mn_limit.numel():
         raise ValueError(
             f"tile_idx/mn_limit capacity mismatch: {tile_idx.numel()} vs {mn_limit.numel()}"

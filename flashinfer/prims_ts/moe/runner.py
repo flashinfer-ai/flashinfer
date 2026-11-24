@@ -1272,6 +1272,8 @@ class _PrimsTsMoERunnerMixin:
         return local_fc1_width
 
     def _check_cga_tactic(self, fc1_cfg, fc2_cfg) -> None:
+        from ..batched_gemm.batched_gemm_run import _runtime_config
+
         local_intermediate = (
             self.intermediate_size // 2
             if self._is_partitioned
@@ -1283,13 +1285,14 @@ class _PrimsTsMoERunnerMixin:
             if self._partition_strategy == "tp_n_tp_n"
             else self.hidden_size
         )
-        _validate_swap_ab_cluster_span(fc1_cfg, fc1_width)
-        _validate_swap_ab_cluster_span(fc2_cfg, fc2_width)
-        if getattr(fc1_cfg, "routed_native_sfa", 0):
-            from ..batched_gemm.batched_gemm_run import _runtime_config
-
-            _runtime_config(fc1_cfg, self.hidden_size, out_hidden=fc1_width)
-            _runtime_config(fc2_cfg, local_intermediate, out_hidden=fc2_width)
+        for cfg, in_hidden, out_hidden in (
+            (fc1_cfg, self.hidden_size, fc1_width),
+            (fc2_cfg, local_intermediate, fc2_width),
+        ):
+            if cfg.is_swap_ab:
+                _validate_swap_ab_cluster_span(cfg, out_hidden)
+            elif cfg.is_rubin_nvfp4_batch_m:
+                _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
 
     def _filter_partition_geometry_tactics(
         self, tactics: List[Any], inputs: List[torch.Tensor], cache_key: tuple

@@ -607,9 +607,8 @@ def _runtime_config(cfg, in_hidden: int, *, out_hidden: int | None = None):
                 f"deepseek_fp8_block_size={block}, got problem_k={in_hidden}"
             )
     cfg = resolve_problem_config(cfg, in_hidden)
-    if (cfg.dense_m_repeats == 2 or cfg.routed_native_sfa) and out_hidden is not None:
-        # Validate the expert SF stride before allocating or launching. M is
-        # padded later and does not constrain this output-width check.
+    if out_hidden is not None and cfg.is_rubin_nvfp4_batch_m:
+        # Routing pads M later. N and K are already known for this GEMM.
         validate_config(cfg, problem_mnk=(0, out_hidden, in_hidden))
     return cfg
 

@@ -400,6 +400,17 @@ def test_tile512_generic_experts_require_aligned_weight_scale_stride(preload):
         _runtime_config(cfg, 768, out_hidden=1104)
 
 
+def test_dense_tile256_weight_scale_stride_with_partial_n():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _runtime_config
+
+    cfg = _dense_config()
+    assert cfg.dense_m_repeats == 1 and not cfg.routed_native_sfa
+    _runtime_config(cfg, 384, out_hidden=512)
+    with pytest.raises(ValueError, match="weight scale indexing.*tile_n=256, got 384"):
+        _runtime_config(cfg, 384, out_hidden=384)
+    _runtime_config(_dense_config(dense_single_expert=1), 384, out_hidden=384)
+
+
 def test_tile512_scratch_and_operand_rings_are_disjoint():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         _build_schedule_validate,
