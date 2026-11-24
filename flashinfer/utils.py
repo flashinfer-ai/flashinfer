@@ -229,6 +229,20 @@ def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
         )
 
 
+def _check_num_heads(num_qo_heads: int, num_kv_heads: int) -> None:
+    """Validate num_qo_heads and num_kv_heads requirements."""
+    if num_qo_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError(
+            f"num_qo_heads and num_kv_heads must be positive, got "
+            f"num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}."
+        )
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_qo_heads must be divisible by num_kv_heads, got "
+            f"num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}."
+        )
+
+
 def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 

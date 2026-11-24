@@ -58,6 +58,8 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
     num_kv_heads = k.size(0);
     kv_len = k.size(1);
   }
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
   TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
       << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
       << ")";

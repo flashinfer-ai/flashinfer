@@ -59,6 +59,12 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
 
   PrefillPlanInfo plan_info;
 
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
+
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   cudaError_t status = PrefillPlan<IdType>(
@@ -89,6 +95,12 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
 
   ffi::CUDADeviceGuard device_guard(device_buffer.device().device_id);
   const cudaStream_t stream = get_stream(device_buffer.device());
+
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
   cudaError_t status = PrefillPlanWorkspaceSize<IdType>(
       float_workspace_size_in_bytes, int_workspace_size_in_bytes,
       static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
@@ -121,6 +133,12 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
   int64_t num_qo_heads = q.size(1);
   int64_t head_dim_qk = q.size(2);
   int64_t num_kv_heads = (kv_layout == QKVLayout::kNHD) ? k.size(1) : k.size(0);
+
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
   uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), k_stride_n, k_stride_h, v_stride_n,
            v_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
