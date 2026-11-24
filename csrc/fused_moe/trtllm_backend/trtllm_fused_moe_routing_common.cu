@@ -83,7 +83,7 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
       std::min(1024u, static_cast<uint32_t>(routingCustom::getMaxNumExperts(data.mNumExperts)));
 
   // Determine which path to use based on token count
-  static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
+  int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const useStaticBlock = data.mNumTokens <= routingCustom::BlockKernelMaxNumTokens;
   // Use the dispatched tier size (not raw mNumExperts).
   // Example: 512 experts with topK=22 skips Tier<512,8> and lands on

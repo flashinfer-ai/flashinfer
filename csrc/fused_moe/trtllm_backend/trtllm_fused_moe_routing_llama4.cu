@@ -549,7 +549,7 @@ void run(Data const& data, void* stream) {
       (data.mPtrScores == nullptr && data.mNumTokens <= WarpKernelMaxNumTokens) ||
       data.mNumTokens < WarpKernelMaxNumTokens;
   // Below SM90 (no clusters) the histogram kernels take every batch beyond the warp kernel's.
-  static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
+  int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const useSingleCluster =
       (useSingleWarp || smMajor >= 9) &&
       data.mNumTokens <= ((data.mPtrScores != nullptr) ? MaxNumTokensSingleClusterScores

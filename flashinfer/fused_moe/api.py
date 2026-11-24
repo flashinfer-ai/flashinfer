@@ -2944,7 +2944,9 @@ class RecordsNvfp4Bf16Config:
 
         Register it with ``MoEWeightPack.prepare_for("records_nvfp4_bf16", ...)``
         or ``"records_nvfp4"``. See
-        :func:`flashinfer.fused_moe.prepare.prepare_records_nvfp4_weights`.
+        :func:`flashinfer.fused_moe.prepare.prepare_records_nvfp4_weights`. The
+        view keeps ``hidden_size`` and ``intermediate_size``, which the runners
+        check the inputs against.
         """
         from .prepare import _activation_param_view, prepare_records_nvfp4_weights
 
@@ -2964,7 +2966,8 @@ class RecordsNvfp4Bf16Config:
             device=device,
         )
         rows, device = num_local_experts, view["w1"].device
-        return {**view, **_activation_param_view(activation, rows, device)}
+        sizes = {"hidden_size": hidden_size, "intermediate_size": intermediate_size}
+        return {**view, **_activation_param_view(activation, rows, device), **sizes}
 
     def __repr__(self) -> str:
         return "RecordsNvfp4Bf16Config()"
@@ -2978,7 +2981,7 @@ class RecordsNvfp4Config(RecordsNvfp4Bf16Config):
     :class:`TrtllmFp4Config`'s NVFP4 x NVFP4 support: its routing modes,
     expert parallelism, fused shared experts, per-token scales (with 4over6)
     and ``do_finalize=False``, and every NVFP4 x NVFP4 runner's activations
-    (limits in TRT-LLM's units). It takes TRT-LLM's NVFP4 hidden
+    (limits in output units, as the BF16 peer's). It takes TRT-LLM's NVFP4 hidden
     states, or BF16 ones quantized to NVFP4 inside the op; GEMM1 quantizes its
     output to NVFP4 for GEMM2, with the activation global scales of the
     optional view keys ``"w1_input_global_scale"`` and
@@ -3023,6 +3026,8 @@ class RecordsMxfp4Config:
         """Build the records view from checkpoint MXFP4 weights.
 
         Register it with ``MoEWeightPack.prepare_for("records_mxfp4", ...)``.
+        The view keeps ``hidden_size`` and ``intermediate_size``, which the
+        runner checks the inputs against.
         """
         from .prepare import _activation_param_view, prepare_records_mxfp4_weights
 
@@ -3039,7 +3044,8 @@ class RecordsMxfp4Config:
             device=device,
         )
         rows, device = num_local_experts, view["w1"].device
-        return {**view, **_activation_param_view(activation, rows, device)}
+        sizes = {"hidden_size": hidden_size, "intermediate_size": intermediate_size}
+        return {**view, **_activation_param_view(activation, rows, device), **sizes}
 
     def __repr__(self) -> str:
         return "RecordsMxfp4Config()"
@@ -3819,6 +3825,10 @@ _DEFAULT_BACKEND = BackendOptions(
         CuTileMxfp8Bf16Config(),
         CuTileMxfp8Config(),
         CuTileNvfp4Bf16Config(),
+        # Last of the backends that run below SM100.
+        RecordsNvfp4Bf16Config(),
+        RecordsNvfp4Config(),
+        RecordsMxfp4Config(),
         CudnnFrostBf16Config(),
         CudnnFrostMxfp8Config(),
         CudnnFrostNvfp4Config(),

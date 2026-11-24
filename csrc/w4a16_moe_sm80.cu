@@ -1940,14 +1940,14 @@ __global__ void finalize(const XT* __restrict__ y, const WT* __restrict__ w,
 }
 
 template <cudaDeviceAttr A>
-int dev_attr() {  // attribute A of the current device, cached per device
+int dev_attr() {  // attribute A of the current device, cached for the first 64 devices
   static std::atomic<int> cache[64] = {};
-  int dev = 0;
+  int dev = 0, v = 0;
   cudaGetDevice(&dev);
-  int v = cache[dev].load(std::memory_order_relaxed);
+  if (dev < 64) v = cache[dev].load(std::memory_order_relaxed);
   if (v == 0) {
     cudaDeviceGetAttribute(&v, A, dev);
-    cache[dev].store(v, std::memory_order_relaxed);
+    if (dev < 64) cache[dev].store(v, std::memory_order_relaxed);
   }
   return v;
 }
@@ -1966,15 +1966,15 @@ void raise_smem_limit(F kern, int max_smem) {
 }
 
 template <auto K, int SMEM>
-int ctas_per_sm() {  // resident 256-thread CTAs per SM of kernel K at SMEM bytes, cached per device
+int ctas_per_sm() {  // resident 256-thread CTAs per SM of kernel K at SMEM bytes, cached as above
   static std::atomic<int> cache[64] = {};
-  int dev = 0;
+  int dev = 0, v = 0;
   cudaGetDevice(&dev);
-  int v = cache[dev].load(std::memory_order_relaxed);
+  if (dev < 64) v = cache[dev].load(std::memory_order_relaxed);
   if (v == 0) {
     cudaFuncSetAttribute(K, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&v, K, 256, SMEM);
-    cache[dev].store(v, std::memory_order_relaxed);
+    if (dev < 64) cache[dev].store(v, std::memory_order_relaxed);
   }
   return v;
 }

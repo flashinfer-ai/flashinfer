@@ -2460,7 +2460,7 @@ def _mxfp4_records_u5(
     nonzero = (w.view(torch.uint8) & 0x77).view(e, n, kb, 16).amax(-1).bool()
     if (b == 255).any():
         raise ValueError("records MXFP4: E8M0 byte 255 (NaN) in the weight scales.")
-    grouped = b.view(e, halves, -1)
+    grouped = b.reshape(e, halves, -1)  # a strided (e.g. transposed) scale copies here
     nz = nonzero.view(e, halves, -1)
     top = torch.where(nz, grouped, -1).amax(-1)
     low = torch.where(nz, grouped, 255).amin(-1)
@@ -2497,7 +2497,7 @@ def prepare_records_mxfp4_weights(
     the expert's power of two going to the FP32 ``w1_global_scale`` ([E], or [E, 2] up then gate
     when a gated expert's halves need their own) and ``w2_global_scale`` [E] that scale the GEMMs
     as NVFP4's global scales do. All-zero blocks hold no scale; an expert whose other blocks span
-    more than 30 binades raises.
+    more than 30 binades raises, and so do halves whose powers of two leave an FP32 ratio.
 
     Parameters
     ----------
@@ -2547,6 +2547,12 @@ def prepare_records_mxfp4_weights(
         if not gated:
             raise
         u1, a1 = _mxfp4_records_u5(w1, s1, 2)
+        ratio = a1[:, 0] / a1[:, 1]  # the kernels scale the up half by it in FP32
+        if not ((ratio > 0) & ratio.isfinite()).all():
+            raise ValueError(
+                "records MXFP4: an expert's up and gate halves are too far apart for an "
+                "FP32 ratio of their scales (2^-149 to 2^127)."
+            ) from None
     u2, a2 = _mxfp4_records_u5(w2, s2, 1)
     return {
         "w1": _w4a16_records(w1, u1, gated, u5=True),

@@ -256,14 +256,17 @@ def gen_w4a16_moe_sm80_module(
     recipe=None, exact: bool = False, act: Optional[int] = None, f16: bool = False
 ) -> JitSpec:
     """NVFP4 MoE records kernels (BF16, or FP16 if ``f16``, or NVFP4 activations): sm_80 code for SM80 to SM89,
-    sm_90 for SM90. The NVFP4 activation quantizer runs in software (FLASHINFER_FP4_SW_CVT),
+    plus sm_87 for SM87, and sm_90 for SM90. The NVFP4 activation quantizer runs in software (FLASHINFER_FP4_SW_CVT),
     with the 4over6 ``recipe`` (an ``NVFP44Over6Config``) and without fast math if ``exact``
     (FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH), a module each; with ``act`` (an
     ``ActivationType``) the GEMMs' epilogue extensions for that activation."""
     from ..quantization.nvfp4_quantization_utils import nvfp4_4over6_cache_key
 
-    majors = {major for major, _ in current_compilation_context.TARGET_CUDA_ARCHS}
+    archs = current_compilation_context.TARGET_CUDA_ARCHS
+    majors = {major for major, _ in archs}
     flags = [f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors]
+    if (8, "7") in archs:  # Tegra (Jetson Orin) does not run desktop sm_80 cubins
+        flags.append("-gencode=arch=compute_80,code=sm_87")
     if not flags:
         raise RuntimeError("W4A16 MoE records kernels need an SM80 to SM90 target")
     defines = "ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 FLASHINFER_FP4_SW_CVT FLASHINFER_FP4_SW_CVT_FFMA"

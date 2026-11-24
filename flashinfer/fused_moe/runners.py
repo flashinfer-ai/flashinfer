@@ -9401,6 +9401,13 @@ class RecordsNvfp4Bf16Runner(MoERunner):
         rows = experts.local_num_experts or self.config.routing.num_experts
         rows += experts.num_fused_shared_experts
         inter = experts.intermediate_size
+        # Records of other sizes may take as many bytes: the sizes the view was prepared for
+        for name, size in (("hidden_size", hidden_size), ("intermediate_size", inter)):
+            if view.get(name, size) != size:
+                raise ValueError(
+                    f"{self.backend_key}: the view's records are of {name} "
+                    f"{view[name]}, the layer's inputs {size}."
+                )
         gated = self.config.activation.is_gated
         # A gated MXFP4 expert may scale its halves apart: [rows, 2], up then gate.
         halves = gated and self.config.quant.weight is QuantFormat.MXFP4
@@ -9488,12 +9495,15 @@ class RecordsNvfp4Bf16Runner(MoERunner):
             raise ValueError(
                 f"{type(self).__name__} requires hidden_states_scale to be None."
             )
+        unpacked = act.routing_input_mode is RoutingInputMode.UnpackedPrecomputed
         _validate_prerouted_inputs(
             act,
             x.shape[0],
             self.config.routing.top_k,
-            type(self).__name__,
-            allowed_weights_dtypes=(torch.float32,),
+            type(self).__name__,  # the launcher takes BF16 weights with BF16 x
+            allowed_weights_dtypes=(torch.bfloat16, torch.float32)
+            if unpacked
+            else (torch.float32,),
             require_contiguous=True,
         )
         view = self._records(weights, x.shape[1])
@@ -9541,11 +9551,12 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
     quantizes its output under ``"w2_input_global_scale"`` (FP32 scalars, the
     quantization multiplier ``1 / input_scale``; default 1, unread per token).
     SM100's GEMM scalars follow from them and the weights' global scales,
-    cached per scale tensor version. The activation parameters are TRT-LLM's
-    view tensors in its units: with NVFP4 activations SiTU's and SwiGLUStep's
-    limits in accumulator units, the others (and the typed SwiGLUStep limit
-    without a view tensor) in output units. PowLU's ``m`` and ``limit`` and SiTU's unclamped linear branch,
-    beyond TRT-LLM, are the typed values unless the view gives them.
+    cached per scale tensor version; a CUDA graph computes them as it replays,
+    so it reads a scale updated in place, as on SM100. The activation
+    parameters are the view tensors in output units, as
+    :class:`RecordsNvfp4Bf16Runner` reads them. PowLU's ``m`` and ``limit``
+    and SiTU's unclamped linear branch, beyond TRT-LLM, are the typed values
+    unless the view gives them.
     """
 
     backend_key = "records_nvfp4"
@@ -9628,18 +9639,22 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
         # Inference tensors carry no version counter: the alphas of the caller's are not
         # cached (the unit scale is the runner's own, never written). The cache holds the
         # scales it was keyed on, so no other tensor takes their addresses.
+        # A captured graph computes them from the scales as it replays, as SM100 reads them.
         ts = (g1, a1, g2, a2)
-        cache = not any(t.is_inference() and t is not self._unit_scale for t in ts)
+        cache = not torch.cuda.is_current_stream_capturing() and not any(
+            t.is_inference() and t is not self._unit_scale for t in ts
+        )
         key = tuple((t.data_ptr(), 0 if t.is_inference() else t._version) for t in ts)
-        if not cache or key != self._alphas[0]:
-            act, gate = self.config.activation, g1 / a1
-            # GEMM2's input global scale, gated (but SiTU) times the gate's alpha
-            s1 = gate * a2 if act.is_gated and not isinstance(act, SiTU) else a2
-            alphas = [gate, g2 / a2, s1]
-            if not cache or torch.cuda.is_current_stream_capturing():
-                return [*alphas, a1]
+        entry = self._alphas
+        if cache and key == entry[0]:
+            return [*entry[1], a1]
+        act, gate = self.config.activation, g1 / a1
+        # GEMM2's input global scale, gated (but SiTU) times the gate's alpha
+        s1 = gate * a2 if act.is_gated and not isinstance(act, SiTU) else a2
+        alphas = [gate, g2 / a2, s1]
+        if cache:
             self._alphas = (key, alphas, ts)
-        return [*self._alphas[1], a1]
+        return [*alphas, a1]
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -9799,6 +9814,7 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
             gemm2_bias=None,
             tune_max_num_tokens=tune_max,
             nvfp4_4over6=cfg.quant.nvfp4_4over6,
+            _out_limits=True,  # the view's limits, as the BF16 runner reads them
         )
         slots = next(iter(slot_experts), None)
         res = _trtllm_fp4_records_moe(a, ids, w, slots, tactic=tactic)

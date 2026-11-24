@@ -1333,6 +1333,16 @@ class CuteDslMoEWrapper:
                 and torch.cuda.get_device_capability(device_obj) == (10, 7)
             ):
                 raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
+            if (
+                quant_mode == "mxfp8"
+                and device_obj.type == "cuda"
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability(device_obj)[0] < 10
+            ):
+                raise NotImplementedError(
+                    "Below SM100 CuTe-DSL MoE runs W4A4, W4A16 and W4A8 on records, "
+                    "not quant_mode='mxfp8'."
+                )
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -1553,8 +1563,8 @@ class CuteDslMoEWrapper:
             Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
             ``quant_mode="w4a8"`` or ``"mxfp8"``, or BF16 input for ``quant_mode="w4a16"``.
         x_sf : Optional[torch.Tensor]
-            Scale factors for W4A4, W4A8, or W8A8;
-            must be ``None`` for ``quant_mode="w4a16"``.
+            Scale factors for W4A4, W4A8, or W8A8 (below SM100, W4A4's linear
+            per token, ``[num_tokens, K / 16]``); must be ``None`` for ``quant_mode="w4a16"``.
         token_selected_experts : torch.Tensor
             Expert assignments of shape ``[num_tokens, top_k]``.
         token_final_scales : torch.Tensor
@@ -1943,8 +1953,8 @@ def cute_dsl_fused_moe(
         Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
         ``quant_mode="w4a8"`` or ``"mxfp8"``, or BF16 input for ``quant_mode="w4a16"``.
     x_sf : Optional[torch.Tensor]
-        Scale factors for W4A4, W4A8, or W8A8;
-        must be ``None`` for ``quant_mode="w4a16"``.
+        Scale factors for W4A4, W4A8, or W8A8 (below SM100, W4A4's linear
+        per token, ``[num_tokens, K / 16]``); must be ``None`` for ``quant_mode="w4a16"``.
     token_selected_experts : torch.Tensor
         Expert assignments of shape ``[num_tokens, top_k]``.
     token_final_scales : torch.Tensor
@@ -2128,6 +2138,10 @@ def cute_dsl_fused_moe(
         # W4A8 prepare_records_mxfp4_weights, their global scales in the alphas), which hold
         # the weights too, in the weight-scale slots: the weights give only shapes.
         # localized_* (per-domain copies of these weights) only steer the SM100 kernels.
+        if swap_ab:  # SM100 and SM103 only, as SM100's check below
+            from ..prepare import _cute_dsl_gated_weight_group_size
+
+            _cute_dsl_gated_weight_group_size(x.device, swap_ab)
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_clamped_relu2_config(
             activation, clamped_relu2_limit, x.device
@@ -2140,6 +2154,11 @@ def cute_dsl_fused_moe(
             per_token_scale=pt, localized_weights=localized_weights is not None,
         )  # fmt: skip
         x16 = (torch.bfloat16, torch.float16)
+        if quant_mode == "w4a16" and (x_sf is not None or fc2_input_scale is not None):
+            raise ValueError(  # as on SM100
+                "x_sf, fc2_input_scale, and per_token_scale must be None "
+                "when quant_mode='w4a16'"
+            )
         if (
             quant_mode not in ("w4a4", "w4a16", "w4a8")
             or (x.dtype in x16) == (w4a4 or w4a8)
@@ -2177,7 +2196,11 @@ def cute_dsl_fused_moe(
         inputs = [x, ids, token_final_scales, w1_weight_sf, w1_alpha]
         inputs += [w2_weight_sf, w2_alpha, moe_output]
         if w4a4:  # per token GEMM2 quantizes its rows under fc2_input_scale
-            x_sf = x_sf.view(torch.uint8).reshape(x.shape[0], -1)
+            if x_sf.numel() != x.shape[0] * (x.shape[1] // 8):
+                raise ValueError(
+                    "Below SM100 W4A4 x_sf must be linear: [num_tokens, K / 16] E4M3 scales."
+                )
+            x_sf = x_sf.view(torch.uint8).reshape(x.shape[0], x.shape[1] // 8)
             inputs[0] = x.view(torch.uint8)
             inputs += [x_sf] + (
                 [None, fc2_input_scale] if pt else [fc2_input_scale, None]
@@ -2185,7 +2208,7 @@ def cute_dsl_fused_moe(
             inputs += [None, per_token_scale]
         elif w4a8:  # its E8M0 scales [tokens, K / 32]
             inputs[0] = x.view(torch.uint8)
-            inputs += [x_sf.view(torch.uint8).reshape(x.shape[0], -1), None, None]
+            inputs += [x_sf, None, None]  # uint8 [tokens, K / 32], checked above
         from ..core import _RecordsExt
 
         situ, inf = situ_beta is not None, float("inf")

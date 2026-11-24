@@ -179,6 +179,14 @@ def test_w4a16(gated, tokens):
             _trt(bad, x, None, ids, weights, None, m["w1_g"], m["w2_g"])
         with pytest.raises(ValueError, match="activation type"):
             _cutlass({**m, "act": ActivationType.InvalidType}, x, ids, weights, scales)
+        # No NVFP4 input for a recipe to quantize; a W4A4 scale, rejected as on SM100
+        with pytest.raises(ValueError, match="nvfp4_4over6"):
+            _cutlass(m, x, ids, weights, scales, nvfp4_4over6=RECIPES[1])
+        with pytest.raises(ValueError, match="must be None"):
+            cute_dsl_fused_moe(
+                x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], m["w2_g"], m["w2"],
+                m["r2"], m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value,
+            )  # fmt: skip
         ws = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
         for kw in ({"workspace_buffer": ws}, {"profile_ids": [0, 0]}):  # not read
             with pytest.raises(NotImplementedError, match="profile_ids"):
@@ -209,6 +217,8 @@ def test_w4a4(recipe, gated, tokens):
     _close(out, ref)
     swizzled = fp4_quantize(x, a1, 16, nvfp4_4over6=recipe)[1].view(torch.uint8)
     outs = [cutlass(codes, input_sf=sf, swizzled_input_sf=False)]
+    # the leading tokens of a longer buffer, at K / 16 bytes a token as SM100 reads them
+    outs.append(cutlass(codes, input_sf=torch.cat((sf, sf)), swizzled_input_sf=False))
     outs.append(cutlass(codes, input_sf=swizzled))
     if tokens == 37 and not recipe:  # tuned, the E4M3 scales as vLLM passes them
         with autotune():
@@ -225,6 +235,11 @@ def test_w4a4(recipe, gated, tokens):
         outs.append(_trt(*args, hidden_states_scale_layout=SfLayout.layout_linear)[0])
         with pytest.raises(NotImplementedError, match="hidden_states_scale_layout"):
             _trt(*args, hidden_states_scale_layout=SfLayout.layout_128x4)
+        with pytest.raises(ValueError, match="linear"):  # SM100 infers the block size
+            _trt(m, codes, torch.cat((lin, lin)), *args[3:])
+        # other experts' weights
+        with pytest.raises(ValueError, match="fc2_expert_weights"):
+            _cutlass(m, x, ids, weights, scales, slice(1, None))
         if gated:  # SwigluStep takes its limit only, as on SM100; unclamped, SwiGLU
             step = {**m, "act": ActivationType.SwigluStep}
             ones = torch.ones(E, device="cuda")
@@ -233,13 +248,17 @@ def test_w4a4(recipe, gated, tokens):
                 with pytest.raises(ValueError, match="SwigluStep"):
                     _trt(step, *args[1:], **{k: ones})
 
-        def cute(inp, xsf=sf):
+        def cute(inp, xsf=sf, **kw):
             return cute_dsl_fused_moe(
                 inp, xsf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], alpha1, a2, m["w2"],
-                m["r2"], alpha2, E, K, activation_type=m["act"].value,
+                m["r2"], alpha2, E, K, activation_type=m["act"].value, **kw,
             )  # fmt: skip
 
         outs.append(cute(codes))
+        with pytest.raises(ValueError, match="swap_ab"):  # SM100 and SM103 only
+            cute(codes, swap_ab=True)
+        with pytest.raises(ValueError, match="linear"):  # 128x4 scales read as linear
+            cute(codes, swizzled)
         i8, e5m2 = codes.view(torch.int8), sf.view(torch.float8_e5m2)  # other types
         for bad in (
             lambda: _trt(m, i8, *args[2:]), lambda: _trt(m, codes, e5m2, *args[3:]),
@@ -339,7 +358,11 @@ def test_expert_parallel(gated):
             local_expert_offset=rank * half, quant_mode="w4a16",
             activation_type=m["act"].value,
         )  # fmt: skip
-        for o in (ep, trt, cute):
+        outs = [ep, trt, cute]
+        if not rank:  # SM100 reads the leading local_num_experts of longer weights
+            g1, g2 = m["w1_g"], m["w2_g"]
+            outs.append(_trt(m, x, None, ids, weights, None, g1, g2, local=half)[0])
+        for o in outs:
             torch.testing.assert_close(o, full, atol=0, rtol=0)
 
 
@@ -353,6 +376,8 @@ def test_wrapper_tactics():
     args += (m["w2_g"],)
     wrapper = CuteDslMoEWrapper(E, K, H, I, quant_mode="w4a16")
     assert wrapper.get_valid_tactics() == list(W4A16_SM80_TACTICS)
+    with pytest.raises(NotImplementedError, match="mxfp8"):  # no records to run it on
+        CuteDslMoEWrapper(E, K, H, I, quant_mode="mxfp8")
     ref = _reference(m, x.float(), ids, weights, lambda a: a.float())
     for tactic in wrapper.get_valid_tactics():
         _close(wrapper.run(*args, tactic=tactic), ref)
@@ -697,6 +722,60 @@ def test_mxfp4_w4a16(gated, split):
             use_w4_group_scaling=True, activation_type=m["act"],
         )[0]  # fmt: skip
         torch.testing.assert_close(out, trt, atol=0, rtol=0)
+
+
+def test_mxfp4_scale_layouts():
+    """Strided weight scales prepare as their contiguous copy; halves whose powers of two
+    leave an FP32 ratio raise."""
+    m = _mx_model(True, True)
+    sizes = dict(num_local_experts=E, hidden_size=H, intermediate_size=I)
+
+    def prepare(s1):
+        return prepare_records_mxfp4_weights(
+            m["w1"], s1, m["w2"], m["w2_sf"], **sizes, activation_type=m["act"]
+        ).values()
+
+    for a, b in zip(
+        prepare(m["w1_sf"].mT.contiguous().mT), prepare(m["w1_sf"]), strict=True
+    ):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    s1 = m["w1_sf"].clone()
+    s1[:, :I], s1[:, I:] = 254, 126  # 2^128 apart
+    with pytest.raises(ValueError, match="FP32 ratio"):
+        prepare(s1)
+
+
+def test_zero_tokens():
+    """No tokens on codes with linear scales: cutlass and TRT-LLM (routed and from logits)
+    NVFP4 and MXFP8, CuTe-DSL W4A4 and W4A8."""
+    m, mx = _model(True), _mx_model(True)
+    ids, weights = _routing(0)
+    # NVFP4 codes [0, H / 2] under [0, H / 16] scales, MXFP8 [0, H] under [0, H / 32]
+    codes, x8, sf, sf8 = (
+        torch.empty(0, n, device="cuda", dtype=torch.uint8)
+        for n in (H // 2, H, H // 16, H // 32)
+    )
+    x8, one = x8.view(torch.float8_e4m3fn), torch.ones(1, device="cuda")
+    scales = [one, m["r1"], m["w1_g"], one, m["r2"], m["w2_g"]]
+    mx_scales = [mx["r1"], mx["w1_g"], mx["r2"], mx["w2_g"]]
+    outs = [
+        _cutlass(m, codes, ids, weights, scales, input_sf=sf, swizzled_input_sf=False),
+        _cutlass(mx, x8, ids, weights, mx_scales, input_sf=sf8, swizzled_input_sf=False,
+                 use_mxfp8_act_scaling=True),
+        _trt(m, codes, sf, ids, weights, m["w1_g"], m["w1_g"], m["w2_g"])[0],
+        _trt(mx, x8, sf8, ids, weights, None, mx["w1_g"], mx["w2_g"])[0],
+        trtllm_fp4_block_scale_moe(
+            torch.empty(0, E, device="cuda"), None, codes, sf, m["w1"], m["r1"], None, None,
+            None, None, m["w2"], m["r2"], None, m["w1_g"], m["w1_g"], m["w2_g"], E, K, None,
+            None, I, 0, E, None, routing_method_type=RoutingMethodType.Renormalize.value,
+        )[0],
+    ]  # fmt: skip
+    for model, x, xsf, a2, mode in ((m, codes, sf, one, "w4a4"), (mx, x8, sf8, None, "w4a8")):  # fmt: skip
+        outs.append(cute_dsl_fused_moe(
+            x, xsf, ids, weights, model["w1"], model["r1"], model["w1_g"], a2, model["w2"],
+            model["r2"], model["w2_g"], E, K, quant_mode=mode, activation_type=model["act"].value,
+        ))  # fmt: skip
+    assert all(o.shape == (0, H) for o in outs)
 
 
 def _fp8_rows(a):
