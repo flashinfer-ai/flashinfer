@@ -3717,28 +3717,34 @@ def test_sfu_eval_kernel_is_built_and_called_with_its_devices_current(monkeypatc
 
 def test_sfu_eval_kernels_are_keyed_by_architecture_family(monkeypatch):
     """The SFU evaluation kernels' in-process cache is keyed by the primitive and the device's architecture family, as the
-    tables are: a process that evaluates an SM100 device and then an SM107 one compiles a callable per family and never
-    serves one family's object to the other; two devices of one family share it."""
-    import inspect
-
-    from flashinfer.batch_invariant.fp_interface import sfu
-    from flashinfer.gemm.batch_invariant import api as gemm_api
-
-    parts = {0: (148, "sm_100"), 1: (212, "sm_107"), 2: (212, "sm_107")}
-    monkeypatch.setattr(
-        gemm_api, "part_of", lambda device: parts[torch.device(device).index]
+    tables are: driven with three device identities -- two families and a repeat of the second -- the mocked loader
+    (a distinct callable per build) runs once per family and primitive: the second family loads a new callable, the third
+    device reuses the second family's, and the other primitive on the first family loads a third."""
+    sfu, builds = _mock_sfu_loader(
+        monkeypatch, {0: (148, "sm_100"), 1: (212, "sm_107"), 2: (212, "sm_107")}
     )
-    keys = {i: sfu._kernel_key(0, torch.device("cuda", i)) for i in parts}
-    assert keys[0] == (0, "sm_100") and keys[1] == (0, "sm_107")
-    assert keys[0] != keys[1] and keys[1] == keys[2]
-    assert sfu._kernel_key(1, torch.device("cuda", 0)) == (1, "sm_100")
-    assert (
-        len(
-            {sfu._kernel_key(w, torch.device("cuda", i)) for w in (0, 1) for i in parts}
-        )
-        == 4
-    )
-    assert "_kernel(which, x.device)" in inspect.getsource(sfu._eval)
+    assert sfu._kernel_key(0, torch.device("cuda", 0)) == (0, "sm_100")
+    assert sfu._kernel_key(0, torch.device("cuda", 1)) == (0, "sm_107")
+    k0 = sfu._kernel(0, torch.device("cuda", 0))
+    k1 = sfu._kernel(0, torch.device("cuda", 1))
+    k2 = sfu._kernel(0, torch.device("cuda", 2))
+    assert k1 is not k0 and k2 is k1 and len(builds) == 2
+    r0 = sfu._kernel(1, torch.device("cuda", 0))
+    assert r0 is not k0 and r0 is not k1 and len(builds) == 3
+    assert sfu._kernel(0, torch.device("cuda", 0)) is k0 and len(builds) == 3
+    assert sfu._kernel(1, torch.device("cuda", 2)) is not r0 and len(builds) == 4
+    assert set(sfu._KERNELS) == {
+        (0, "sm_100"),
+        (0, "sm_107"),
+        (1, "sm_100"),
+        (1, "sm_107"),
+    }
+    assert [b for b in builds if b[0] != "call"] == [
+        ("batch_invariant_sfu", "sfu_ex2"),
+        ("batch_invariant_sfu", "sfu_ex2"),
+        ("batch_invariant_sfu", "sfu_rcp"),
+        ("batch_invariant_sfu", "sfu_rcp"),
+    ]
 
 
 def test_static_block_evaluates_the_e2m1_conversion_on_every_backend():
