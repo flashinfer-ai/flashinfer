@@ -3700,7 +3700,8 @@ class BatchInvariantFp4Config:
         elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair. A supplied
         ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry, and
         ``intermediate_scales`` need ``intermediate="static"``: a contradiction is refused with the mode's error before any
-        view is built."""
+        view is built. The experts are quantized one at a time into the preallocated pack: the peak memory beyond the
+        inputs is the fp4 pack plus one expert's temporaries (never a full-size bf16 or fp32 copy of the experts)."""
         from ..batch_invariant.support import unsupported
         from .batch_invariant.api_fp4 import MoEWeightsFp4
         from .batch_invariant.runner_fp4 import PAIRS

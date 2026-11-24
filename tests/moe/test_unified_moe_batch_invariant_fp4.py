@@ -3890,3 +3890,53 @@ def test_weight_view_names_its_intermediate_class_and_a_view_without_it_is_decli
         assert static["intermediate"] == "static"
 
 
+@needs_device
+@each_pair
+def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
+    """The pack is preallocated and filled one expert at a time: the bits of the whole-tensor path (the interleave of every
+    expert, each quantized into its own buffers, stacked), and a peak memory beyond the inputs bounded by the pack plus a
+    few experts' temporaries, below one full-size bf16 copy of the experts."""
+    from flashinfer.batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
+    from flashinfer.fused_moe.batch_invariant.api import interleave_fc1
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        fp4_global_scale,
+        quantize_rows_mx,
+    )
+
+    E, I, H = 32, 512, 1024
+    _, _, w1, w2 = _problem(4, 2, H, I, E, seed=81)
+    w1i = interleave_fc1(w1)
+    q1, s1, q2, s2, a1, a2 = [], [], [], [], [], []
+    for e in range(E):
+        if pair.scaled:
+            gs1, gs2 = fp4_global_scale(w1i[e]), fp4_global_scale(w2[e])
+            c1, f1 = nvfp4_quantize_rows(w1i[e], gs1, "128x4")
+            c2, f2 = nvfp4_quantize_rows(w2[e], gs2, "128x4")
+            a1.append(torch.reciprocal(gs1))
+            a2.append(torch.reciprocal(gs2))
+        else:
+            c1, f1 = quantize_rows_mx(w1i[e])
+            c2, f2 = quantize_rows_mx(w2[e])
+        q1.append(c1)
+        s1.append(f1.reshape(-1))
+        q2.append(c2)
+        s2.append(f2.reshape(-1))
+    del w1i
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    W = MoEWeightsFp4.prepare(pair, w1, w2)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - before
+    assert torch.equal(W.w1, torch.stack(q1)) and torch.equal(W.w1_sf, torch.stack(s1))
+    assert torch.equal(W.w2, torch.stack(q2)) and torch.equal(W.w2_sf, torch.stack(s2))
+    if pair.scaled:
+        assert torch.equal(W.w1_alpha, torch.cat(a1))
+        assert torch.equal(W.w2_alpha, torch.cat(a2))
+    pack = sum(t.numel() * t.element_size() for t in (W.w1, W.w1_sf, W.w2, W.w2_sf))
+    expert = (w1[0].numel() + w2[0].numel()) * w1.element_size()
+    full = (w1.numel() + w2.numel()) * w1.element_size()
+    assert pack + 8 * expert < full  # the bound separates the paths
+    assert peak <= pack + 8 * expert, (peak, pack, expert)
+
+

@@ -287,7 +287,9 @@ class MoEWeightsFp4:
         [E])``, or FlashInfer's ``448 * 6 / amax``), MXFP4 with one UE8M0 scale per 32 elements of a row. The gate / up
         interleave is a row permutation applied before the quantization. ``act`` defaults to the class's default chain of the
         gating. ``intermediate="static"`` selects the NVFP4 static class with the per-expert ``intermediate_scales [E]`` (f32
-        multipliers; default ones) and is refused for the MX pair."""
+        multipliers; default ones) and is refused for the MX pair. The experts are quantized one at a time into the
+        preallocated pack: the peak memory beyond the inputs is the fp4 pack plus one expert's temporaries (its interleaved
+        bf16 rows, the fp32 magnitudes of its amax), the bits those of each expert quantized alone."""
         from ...batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
 
         if intermediate not in INTERMEDIATES:
@@ -334,82 +336,75 @@ class MoEWeightsFp4:
                 f"fc2 {tuple(fc2.shape)} does not match fc1 {tuple(fc1.shape)} (gated={gated})"
             )
         check_shape_fp4(pair, H, I, E, gated=gated)
-        w1i = fc1.contiguous() if (interleaved or not gated) else interleave_fc1(fc1)
-        fc2 = fc2.contiguous()
-        w1s, sf1s, w2s, sf2s = [], [], [], []
-        a1s: list = []
-        a2s: list = []
+        dev = fc1.device
+        fc1, fc2 = fc1.contiguous(), fc2.contiguous()
+        # the pack, preallocated and filled one expert at a time (the quantizer writes every byte of its expert's rows and
+        # scale buffer; the global scale and the interleave are per expert, so the bits are those of the expert quantized
+        # alone): the peak beyond the inputs and the pack is one expert's temporaries -- its interleaved bf16 rows and
+        # the fp32 magnitudes of its amax -- never a full-size bf16 or fp32 copy of the experts
+        w1 = torch.empty(E, N1, H // 2, dtype=torch.uint8, device=dev)
+        w1_sf = torch.empty(E, pair.sf_numel(N1, H), dtype=torch.uint8, device=dev)
+        w2 = torch.empty(E, H, I // 2, dtype=torch.uint8, device=dev)
+        w2_sf = torch.empty(E, pair.sf_numel(H, I), dtype=torch.uint8, device=dev)
+
+        def fc1_rows(e: int) -> torch.Tensor:
+            """Expert ``e``'s GEMM1 rows: the gate / up interleave applied to this expert alone."""
+            if interleaved or not gated:
+                return fc1[e]
+            return interleave_fc1(fc1[e : e + 1])[0]
+
         if not pair.scaled:
             for e in range(E):
-                q1, sf1 = quantize_rows_mx(w1i[e])
-                q2, sf2 = quantize_rows_mx(fc2[e])
-                w1s.append(q1)
-                sf1s.append(sf1)
-                w2s.append(q2)
-                sf2s.append(sf2)
-            return MoEWeightsFp4(
-                pair,
-                torch.stack(w1s).contiguous(),
-                torch.stack(sf1s).contiguous(),
-                torch.stack(w2s).contiguous(),
-                torch.stack(sf2s).contiguous(),
-                H,
-                I,
-                gated,
-                act,
-                key,
-            )
+                quantize_rows_mx(fc1_rows(e), out=(w1[e], w1_sf[e]))
+                quantize_rows_mx(fc2[e], out=(w2[e], w2_sf[e]))
+            return MoEWeightsFp4(pair, w1, w1_sf, w2, w2_sf, H, I, gated, act, key)
         if global_scales is not None:
             global_scales = (
-                _scale_vector(global_scales[0], "global_scales[0]", E, w1i.device),
-                _scale_vector(global_scales[1], "global_scales[1]", E, w1i.device),
+                _scale_vector(global_scales[0], "global_scales[0]", E, dev),
+                _scale_vector(global_scales[1], "global_scales[1]", E, dev),
             )
+        gs_inter = inv_inter = None
+        if intermediate == "static":
+            gs_inter = (
+                torch.ones(E, dtype=torch.float32, device=dev)
+                if intermediate_scales is None
+                else _scale_vector(intermediate_scales, "intermediate_scales", E, dev)
+            )
+            inv_inter = torch.reciprocal(
+                gs_inter
+            ).contiguous()  # div.rn: the quantizer's reciprocal
+        alpha1 = torch.empty(E, dtype=torch.float32, device=dev)
+        alpha2 = torch.empty(E, dtype=torch.float32, device=dev)
         for e in range(E):
+            x1 = fc1_rows(e)
             gs1 = (
                 global_scales[0][e].reshape(1)
                 if global_scales is not None
-                else fp4_global_scale(w1i[e])
+                else fp4_global_scale(x1)
             )
             gs2 = (
                 global_scales[1][e].reshape(1)
                 if global_scales is not None
                 else fp4_global_scale(fc2[e])
             )
-            q1, sf1 = nvfp4_quantize_rows(w1i[e], gs1, "128x4")
-            q2, sf2 = nvfp4_quantize_rows(fc2[e], gs2, "128x4")
-            w1s.append(q1)
-            sf1s.append(sf1.reshape(-1))
-            a1s.append(
-                torch.reciprocal(gs1.to(w1i.device))
-            )  # div.rn: the alpha as mm_fp4 takes it
-            w2s.append(q2)
-            sf2s.append(sf2.reshape(-1))
-            a2s.append(torch.reciprocal(gs2.to(w1i.device)))
-        gs_inter = inv_inter = None
-        if intermediate == "static":
-            gs_inter = (
-                torch.ones(E, dtype=torch.float32, device=w1i.device)
-                if intermediate_scales is None
-                else _scale_vector(
-                    intermediate_scales, "intermediate_scales", E, w1i.device
-                )
-            )
-            inv_inter = torch.reciprocal(
-                gs_inter
-            ).contiguous()  # div.rn: the quantizer's reciprocal
+            nvfp4_quantize_rows(x1, gs1, "128x4", out=(w1[e], w1_sf[e]))
+            nvfp4_quantize_rows(fc2[e], gs2, "128x4", out=(w2[e], w2_sf[e]))
+            # div.rn: the alphas as mm_fp4 takes them
+            alpha1[e : e + 1] = torch.reciprocal(gs1.to(dev))
+            alpha2[e : e + 1] = torch.reciprocal(gs2.to(dev))
         return MoEWeightsFp4(
             pair,
-            torch.stack(w1s).contiguous(),
-            torch.stack(sf1s).contiguous(),
-            torch.stack(w2s).contiguous(),
-            torch.stack(sf2s).contiguous(),
+            w1,
+            w1_sf,
+            w2,
+            w2_sf,
             H,
             I,
             gated,
             act,
             key,
-            torch.cat(a1s).contiguous(),
-            torch.cat(a2s).contiguous(),
+            alpha1,
+            alpha2,
             intermediate,
             gs_inter,
             inv_inter,
