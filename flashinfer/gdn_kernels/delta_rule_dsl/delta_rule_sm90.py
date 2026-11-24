@@ -136,7 +136,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
-        state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        state_dtype: type[cutlass.Numeric] | None = cutlass.Float32,
         checkpoint_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         use_state_indices: bool = False,
         cu_seqlens_dtype: torch.dtype = torch.int64,
@@ -696,6 +696,14 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     sBeta_k[row] = cutlass.Float32(0.0)
 
     # ─── kv_load / kv_store ───────────────────────────────────────────────────
+
+    @cute.jit
+    def indexed_state_layout(self, state: cute.Tensor):
+        # The MMA copy requires static K/V extents even for a strided state pool.
+        layout = cute.make_layout(
+            (state.shape[0], state.shape[1], self.D, self.D), stride=state.stride
+        )
+        return cute.select(layout, mode=[3, 2, 1, 0])
 
     @cute.jit
     def kv_load(
@@ -1469,30 +1477,13 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         packed_state_layout = cute.make_ordered_layout(
             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
-        state_ref_shape = (g_state.shape[0], g_state.shape[1], self.D, self.D)
-        state_ref_layout = cute.make_layout(state_ref_shape, stride=g_state.stride)
-        indexed_state_layout = cute.select(state_ref_layout, mode=[3, 2, 1, 0])
         state_idx = work_desc.seq_idx
         if cutlass.const_expr(self.use_state_indices):
             state_idx = cutlass.Int32(g_state_indices[work_desc.seq_idx])
-            state_layout = indexed_state_layout
-        else:
-            state_layout = packed_state_layout
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
-        mState = cute.make_tensor(g_state.iterator, state_layout)
-        write_idx = state_idx
-        if cutlass.const_expr(self.use_output_state_indices):
-            write_idx = cutlass.Int32(g_output_state_indices[work_desc.seq_idx])
-        gStateKV = mState[None, None, o_head_idx, write_idx]
         if cutlass.const_expr(self.needs_init_state):
-            init_state_ref_layout = cute.make_layout(
-                state_ref_shape, stride=g_init_state.stride
-            )
-            indexed_init_state_layout = cute.select(
-                init_state_ref_layout, mode=[3, 2, 1, 0]
-            )
             if cutlass.const_expr(self.use_state_indices):
-                init_state_layout = indexed_init_state_layout
+                init_state_layout = self.indexed_state_layout(g_init_state)
             else:
                 init_state_layout = packed_state_layout
             mInitState = cute.make_tensor(g_init_state.iterator, init_state_layout)
@@ -1754,11 +1745,21 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 ckpt_key=ckpt_key,
                 row_pref=last_row,
             )
-        if cutlass.const_expr(self.slot_mode):
-            if write_idx >= cutlass.Int32(0):
+        if cutlass.const_expr(self.state_dtype is not None):
+            if cutlass.const_expr(self.use_state_indices):
+                state_layout = self.indexed_state_layout(g_state)
+            else:
+                state_layout = packed_state_layout
+            mState = cute.make_tensor(g_state.iterator, state_layout)
+            write_idx = state_idx
+            if cutlass.const_expr(self.use_output_state_indices):
+                write_idx = cutlass.Int32(g_output_state_indices[work_desc.seq_idx])
+            gStateKV = mState[None, None, o_head_idx, write_idx]
+            if cutlass.const_expr(self.slot_mode):
+                if write_idx >= cutlass.Int32(0):
+                    self.kv_store(tKVrKV, gStateKV, kv_tiled_mma, math_tidx)
+            else:
                 self.kv_store(tKVrKV, gStateKV, kv_tiled_mma, math_tidx)
-        else:
-            self.kv_store(tKVrKV, gStateKV, kv_tiled_mma, math_tidx)
 
     @cute.jit
     def run_aux_loop_body(
@@ -2704,7 +2705,9 @@ def _get_prefill_kernel(
         needs_checkpointing,
         kernel_dtype,
         initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
-        state_dtype=state_dtype_to_cutlass(state_dtype),
+        state_dtype=state_dtype_to_cutlass(state_dtype)
+        if state_dtype is not None
+        else None,
         checkpoint_state_dtype=state_dtype_to_cutlass(checkpoint_state_dtype),
         use_state_indices=use_state_indices,
         cu_seqlens_dtype=cu_seqlens_dtype,
@@ -2724,7 +2727,7 @@ def _get_prefill_kernel(
 
 def delta_rule_prefill_dsl_sm90(
     o: torch.Tensor,  # (total_seqlen, num_o_heads, D) fp16/bf16, output
-    state: torch.Tensor,  # (num_seqs, num_sab_heads, D, D) fp32, output
+    state: torch.Tensor | None,  # optional final-state output
     q: torch.Tensor,  # (total_seqlen, num_q_heads, D)
     k: torch.Tensor,  # (total_seqlen, num_k_heads, D)
     v: torch.Tensor,  # (total_seqlen, num_v_heads, D)
@@ -2793,7 +2796,8 @@ def delta_rule_prefill_dsl_sm90(
         raise RuntimeError(f"beta must have dtype torch.float32, got {beta.dtype}")
     if init_state is not None:
         state_dtype_to_cutlass(init_state.dtype)
-    state_dtype_to_cutlass(state.dtype)
+    if state is not None:
+        state_dtype_to_cutlass(state.dtype)
     if state_checkpoints is not None:
         state_dtype_to_cutlass(state_checkpoints.dtype)
     if not is_integer_dtype(cu_seqlens.dtype):
@@ -2902,7 +2906,7 @@ def delta_rule_prefill_dsl_sm90(
         needs_checkpointing,
         kernel_dtype,
         initial_state_dtype=(init_state.dtype if needs_init_state else torch.float32),
-        state_dtype=state.dtype,
+        state_dtype=state.dtype if state is not None else None,
         checkpoint_state_dtype=(
             state_checkpoints.dtype if needs_checkpointing else torch.float32
         ),
@@ -2912,7 +2916,11 @@ def delta_rule_prefill_dsl_sm90(
         checkpoint_cu_starts_dtype=(
             checkpoint_cu_starts.dtype if needs_checkpointing else None
         ),
-        state_inner_strides=(tuple(state.stride()[1:]) if use_state_indices else None),
+        state_inner_strides=(
+            tuple(state.stride()[1:])
+            if use_state_indices and state is not None
+            else None
+        ),
         init_state_inner_strides=(
             tuple(init_state.stride()[1:])
             if use_state_indices and needs_init_state
@@ -2960,7 +2968,11 @@ def delta_rule_prefill_dsl_sm90(
                 if needs_beta
                 else None
             ),
-            from_dlpack(state, assumed_align=16).mark_layout_dynamic(),
+            (
+                from_dlpack(state, assumed_align=16).mark_layout_dynamic()
+                if state is not None
+                else None
+            ),
             (
                 from_dlpack(init_state, assumed_align=16).mark_layout_dynamic()
                 if needs_init_state

@@ -658,50 +658,60 @@ def test_prefill_state_indices_without_final_state(backend, use_cp):
     assert torch.equal(packed_output, indexed_output)
 
 
-def test_prefill_state_indices_read_only_pool_scratch_spans_pool(monkeypatch):
-    """SM90 stores every final state, to row state_indices[i] when indexed, so
-    the scratch it gets for a read-only pool must span the pool. A compact
-    [num_seqs, ...] scratch took writes past its end that only faulted when
-    the next page happened to be unmapped."""
-    import flashinfer.gdn_prefill as gdn_prefill
-
+def test_sm90_read_only_pool_prefill_peak_memory_and_checkpoints():
     device = torch.device("cuda")
     if get_compute_capability(device)[0] != 9:
-        pytest.skip("checks the SM90 dispatch")
-    H, D = 16, 128
-    seq_lens = [64, 512]
-    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        pytest.skip("checks the SM90 non-CP prefill kernel")
+    H, D = 4, 128
+    seq_lens = [65, 128]
+    q, k, v, g, beta, cu, initial = _make_inputs(
         seq_lens, H, D, torch.bfloat16, device, seed=4
     )
-    slots = [3, 0]
-    pool = _make_pool(init_state, slots, 5, 96, init_state.dtype, device)
-    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+    slots = [63, 3]
+    pool = _make_pool(initial, slots, 64, 96, initial.dtype, device)
+    saved = pool.clone()
+    indices = torch.tensor(slots, dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 1, 3], dtype=torch.int32, device=device)
+    checkpoints = torch.full((3, H, D, D), torch.nan, device=device)
+    args = dict(
+        cu_seqlens=cu,
+        backend="flashinfer",
+        use_cp=False,
+        checkpoint_every_n_tokens=64,
+        checkpoint_cu_starts=starts,
+        state_checkpoints=checkpoints,
+    )
+    expected_output, _ = chunk_gated_delta_rule(
+        q, k, v, g, beta, initial_state=initial, output_final_state=True, **args
+    )
+    expected_checkpoints = checkpoints.clone()
+    output = torch.empty_like(expected_output)
 
-    seen = []
-
-    def record(output, output_state, *args, state_indices=None):
-        seen.append((tuple(output_state.shape), state_indices))
-
-    monkeypatch.setattr(gdn_prefill, "chunk_gated_delta_rule_sm90", record)
-    for initial_state in (pool, None):
-        chunk_gated_delta_rule(
+    def read_pool():
+        return chunk_gated_delta_rule(
             q,
             k,
             v,
             g,
             beta,
-            initial_state=initial_state,
+            initial_state=pool,
+            state_indices=indices,
+            output=output,
             output_final_state=False,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            use_cp=False,
-            backend="flashinfer",
-            max_seqlen=max(seq_lens),
+            **args,
         )
-    (pool_shape, pool_indices), (no_pool_shape, no_pool_indices) = seen
-    assert pool_shape == tuple(pool.shape) and pool_indices is state_indices
-    # Nothing to read or write through: the slot ids are dropped.
-    assert no_pool_shape == (len(seq_lens), H, D, D) and no_pool_indices is None
+
+    read_pool()  # warm compilation and workspace caches
+    checkpoints.fill_(torch.nan)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats(device)
+    baseline = torch.cuda.memory_allocated(device)
+    read_pool()
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated(device) - baseline < pool.nbytes
+    assert torch.equal(output, expected_output)
+    assert torch.equal(checkpoints, expected_checkpoints)
+    assert torch.equal(pool, saved)
 
 
 @pytest.mark.parametrize("backend,use_cp", BACKEND_CP_CASES)
