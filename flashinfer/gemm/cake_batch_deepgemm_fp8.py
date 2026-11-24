@@ -5,7 +5,8 @@
 The same mathematical contract as :func:`flashinfer.gemm.batch_deepgemm_fp8_nt_groupwise`:
 ``out[g, :masked_m[g], :] = (a[g] . b[g]^T)`` with FP8 E4M3 operands, per-row
 128-wide K-block A scales, 128x128 B block scales, FP32 accumulation with the
-block scales applied in DeepGEMM's K order, BF16 output; the contents of rows
+block scales applied in DeepGEMM's K order (the masked pair program below:
+inside its MMAs), BF16 output; the contents of rows
 at or beyond ``masked_m[g]`` are unspecified (whole tiles may be stored), as on
 the DeepGEMM path.
 
@@ -35,6 +36,17 @@ equal within the family's tolerance to the whole-GPU serving program shipped
 here, which is an older build, so falling back to the whole-GPU program may
 change the low bits of the result.  Every other call runs the whole-GPU
 program.
+
+On a 212-SM SM107a device, a packed-scale serving problem whose ``expected_m``
+reaches the low bound of ``PAIR_SERVING_EXPECTED_M`` (its homed bound when ``b``
+is homed, which :func:`localize_weights` does only where the memory runs at its
+full clock) runs the masked pair program instead (:func:`pair_serving_tile`):
+weights-major 2-CTA clusters, one persistent launch of at most half as many
+clusters as SMs.
+It never writes the rows at or beyond ``masked_m[g]`` (the contract still leaves
+them unspecified).  It applies the block scales inside block-scaled tensor-core
+MMAs and accumulates in FP32, so its low bits may differ from the serving
+program's and from DeepGEMM's.
 """
 
 from __future__ import annotations
@@ -53,6 +65,7 @@ from ..jit.gemm.cake_batch_deepgemm_fp8 import (
     ARG_PLANS,
     DOMAIN_SERVING_CELLS,
     DOMAIN_SERVING_PROGRAMS,
+    PAIR_SERVING_EXPECTED_M,
     PROGRAMS,
     SERVING_PROGRAMS,
     SUPPORTED_COMPUTE_CAPABILITIES,
@@ -98,6 +111,15 @@ DOMAIN_SERVING_ROUTE = "seed_serving_m32_packed_domain"
 PAIR_COUNTER_WORDS = 2
 DOMAIN_ARCH = "sm_107a"
 DOMAIN_COUNTERS = ("counters0", "counters1")
+# The masked pair route (SM107a, measured SM counts, expected_m from a low bound
+# of PAIR_SERVING_EXPECTED_M): one persistent launch of 2-CTA clusters, each
+# taking 512 or 256 weight rows of one group (the pair tile) against a 256-row
+# pass of the group's tokens.  The program holds the pass list of at most
+# PAIR_GROUP_MAX groups in shared memory.
+PAIR_SERVING_ROUTE = "seed_serving_pair_packed"
+PAIR_ARCH = "sm_107a"
+PAIR_GROUP_MAX = 1024
+PAIR_PASS_ROWS = 256
 # Values of expected_m at both sides of every bound of serving_config and of
 # expected_m_class: every serving key a weight shape reaches is reached by one.
 DOMAIN_EXPECTED_M_PROBES = (0, 1, 2, 3, 4, 7, 8, 15, 16, 17)
@@ -130,6 +152,12 @@ def serving_config(
     hint, so at ``expected_m=1`` a group can still span several M blocks; with
     ``n_l2_group=1`` the two CTAs of such a group would compute different M
     blocks and the output would be wrong.
+
+    ``cta_reserve`` is a measured schedule choice: the grid is the SM count less
+    the reserve, in whole CTA pairs. On 212-SM devices the full grid (reserve 0)
+    is faster from ``expected_m`` 36 up (by 2-11% at ``expected_m`` 36 to 4096 on
+    every measured shape) and slower at ``expected_m`` 32 and below, which keep
+    the default reserve.
     """
     if k == 7168:
         if expected_m <= 1:
@@ -138,6 +166,8 @@ def serving_config(
             return 5, 2, "evict_normal", 16, 8
         if sm_count == 148:
             cta_reserve = 8 if arch == "sm_103a" else 20
+        elif sm_count == 212 and expected_m >= 36:
+            cta_reserve = 0
         else:
             cta_reserve = 24
         return 5, 2, "evict_normal", cta_reserve, 8
@@ -145,6 +175,8 @@ def serving_config(
         return 5, 3, "evict_normal", 0, 8
     if expected_m == 2:
         return 5, 2, "evict_normal", 20, 8
+    if sm_count == 212 and expected_m >= 36:
+        return 5, 2, "evict_normal", 0, 8
     return 5, 2, "evict_normal", 24, 8
 
 
@@ -158,6 +190,73 @@ def serving_program_key(
     n_l2_group: int,
 ) -> str:
     return f"n{n}_k{k}_g{groups}_s{num_stages}e{num_epi_stages}_{a_cache_hint}_l{n_l2_group}"
+
+
+def pair_serving_key(n: int, k: int, pair_w: int) -> str:
+    """The ``SERVING_PROGRAMS`` key (less ``"sm_107a:"``) of the masked pair
+    program whose pair tile covers ``pair_w`` weight rows."""
+    return f"pair_masked_n{n}_k{k}_w{pair_w}"
+
+
+def pair_serving_tile(
+    arch: str,
+    sm_count: int,
+    groups: int,
+    m: int,
+    n: int,
+    k: int,
+    expected_m: int,
+    homed: bool = False,
+) -> Optional[int]:
+    """The pair tile (512 or 256 weight rows) of the masked pair program that
+    serves this packed-scale problem, or ``None`` when the serving program of
+    :func:`serving_config` keeps it: an architecture other than SM107a, an SM
+    count without measured bounds in ``PAIR_SERVING_EXPECTED_M``, a shape outside
+    the serving set (``(N, K)`` in ``PACKED_NK``, ``B`` in ``PACKED_GROUPS``) or
+    the program's limits (``B <= 1024``, ``K % 512 == 0``, ``N`` a multiple of the
+    pair tile, ``M`` a positive multiple of 128), ``expected_m`` below the low
+    bound (the homed low bound when ``homed``: ``b`` homed by groups, whose
+    locality-domain twin is faster below it), or no program registered for the
+    key."""
+    bounds = PAIR_SERVING_EXPECTED_M.get(sm_count)
+    if arch != PAIR_ARCH or bounds is None:
+        return None
+    if (n, k) not in PACKED_NK or groups not in PACKED_GROUPS:
+        return None
+    if not 1 <= groups <= PAIR_GROUP_MAX or k <= 0 or k % PACKED_K_GRANULE:
+        return None
+    if m < BLOCK or m % BLOCK:
+        return None
+    low, high, homed_low = bounds
+    if expected_m < (homed_low if homed else low):
+        return None
+    pair_w = 512 if expected_m >= high else 256
+    if n < pair_w or n % pair_w:
+        return None
+    if f"{arch}:{pair_serving_key(n, k, pair_w)}" not in SERVING_PROGRAMS:
+        return None
+    return pair_w
+
+
+def pair_serving_plan(
+    arch: str, sm_count: int, groups: int, m: int, n: int, k: int, pair_w: int
+) -> RoutePlan:
+    """The masked pair route of pair tile ``pair_w``: one launch of
+    ``min(items, sm_count // 2)`` 2-CTA clusters walking the
+    ``items = (N / pair_w) * B * ceil(M / 256)`` items (one pass of one weight
+    tile each) with the grid's stride, so no cluster is idle while items remain;
+    the output does not depend on the grid."""
+    program = SERVING_PROGRAMS[f"{arch}:{pair_serving_key(n, k, pair_w)}"]
+    items = (n // pair_w) * groups * -(-m // PAIR_PASS_ROWS)
+    clusters = max(1, min(items, sm_count // 2))
+    return RoutePlan(
+        route=PAIR_SERVING_ROUTE,
+        parent=SERVING_ROUTE,
+        stages=(
+            StagePlan(program=program, grid=(2, 1, clusters), args=(n // pair_w,)),
+        ),
+        workspaces={},
+    )
 
 
 def expected_m_class(expected_m: int) -> str:
@@ -207,11 +306,15 @@ def domain_serving_routed(
     groups: int,
 ) -> bool:
     """True when every packed-scale serving problem on weights of ``groups`` x
-    ``(n, k)`` runs a locality-domain twin on a device of ``sm_count`` SMs split
-    ``counts`` over its dies: whatever its ``expected_m``, the serving key it
-    selects has a twin listed in the cell of that ``expected_m``.  Homed weights
-    of any other shape could run a whole-GPU program, which is slower on homed
-    weights than on ordinary ones, so :func:`localize_weights` refuses them."""
+    ``(n, k)`` that the serving program would run (``expected_m`` below the homed
+    low bound of ``PAIR_SERVING_EXPECTED_M``; from it the masked pair program
+    runs) runs a locality-domain twin on a device of ``sm_count`` SMs split
+    ``counts`` over its dies: the serving key each ``expected_m`` selects has a
+    twin listed in the cell of that ``expected_m`` (``DOMAIN_EXPECTED_M_PROBES``
+    reach every key).  Homed weights of any other shape could run a whole-GPU
+    serving program, which is slower on homed weights than on ordinary ones, so
+    :func:`localize_weights` refuses them.  It does not say that homing is
+    faster: see :func:`localize_weights` for the ``expected_m`` where it is not."""
     return _domain_class_routed(
         arch, sm_count, cake_locality.die_class(counts), n, k, groups
     )
@@ -250,10 +353,17 @@ def serving_plan(
 ) -> RoutePlan:
     """The packed-scale serving route: one specialised program, grid from the SM count.
 
+    The masked pair program serves the problem when :func:`pair_serving_tile`
+    names a pair tile (by the homed bound when ``counts`` is given).  Otherwise
     ``counts`` (the SMs of each die of a dual-die device whose ``b`` is homed by
     groups) selects the locality-domain twin of the program when the cell is
     listed in ``DOMAIN_SERVING_CELLS``; the twin's grid is one CTA per SM and it
     binds a pair of per-die claim counters."""
+    pair_w = pair_serving_tile(
+        arch, sm_count, groups, m, n, k, expected_m, homed=counts is not None
+    )
+    if pair_w is not None:
+        return pair_serving_plan(arch, sm_count, groups, m, n, k, pair_w)
     num_stages, num_epi_stages, a_cache_hint, cta_reserve, n_l2_group = serving_config(
         m, k, expected_m, sm_count, arch
     )
@@ -449,6 +559,9 @@ _SERVING_VALUES = (
     "counters0",
     "counters1",
 )
+# The masked pair program's names of the same per-call values (its output is
+# bound twice: as the TMA store's tensor map and as the row-guarded stores' base).
+_PAIR_VALUES = {"A": 0, "B": 1, "C": 2, "C_rows": 2, "SFA": 3, "SFB": 4, "masked_m": 5}
 # (device index, arch, program, grid, B, M, N, K, g_cut) -> (FFI entry, the
 # fixed arguments, a getter of the argument tuple from the per-call values
 # followed by the fixed ones, the SM table tensor bound): a serving launch's
@@ -482,15 +595,28 @@ def _serving_launch(
         return cached[0], cached[1], cached[2]
     entry, arg_plan = _program_entry(problem.arch, stage.program)
     domain = problem.plan.route == DOMAIN_SERVING_ROUTE
-    fixed_values: dict[str, Any] = {
-        "num_groups": problem.B,
-        "shape_m": problem.M,
-        "N": problem.N,
-        "K": problem.K,
-    }
-    if domain:
-        fixed_values.update(g_cut=problem.g_cut, sm_table=table)
-    per_call = _SERVING_VALUES if domain else _SERVING_VALUES[:6]
+    fixed_values: dict[str, Any]
+    per_call: dict[str, int]
+    if problem.plan.route == PAIR_SERVING_ROUTE:
+        fixed_values = {
+            "G": problem.B,
+            "M": problem.M,
+            "N": problem.N,
+            "K": problem.K,
+            "fd_w": stage.args[0],
+        }
+        per_call = _PAIR_VALUES
+    else:
+        fixed_values = {
+            "num_groups": problem.B,
+            "shape_m": problem.M,
+            "N": problem.N,
+            "K": problem.K,
+        }
+        if domain:
+            fixed_values.update(g_cut=problem.g_cut, sm_table=table)
+        names = _SERVING_VALUES if domain else _SERVING_VALUES[:6]
+        per_call = {name: _SERVING_VALUES.index(name) for name in names}
     grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     fixed: list[Any] = []
     picks: list[int] = []
@@ -500,7 +626,7 @@ def _serving_launch(
         elif kind in ("tma_buffer", "buffer", "parameter", "param_array") and (
             name in per_call
         ):
-            picks.append(_SERVING_VALUES.index(name))
+            picks.append(per_call[name])
             continue
         elif (
             kind in ("tma_buffer", "buffer", "parameter", "param_array")
@@ -530,9 +656,11 @@ def _domain_homing(
     """``(g_cut, sm_table)`` when ``b`` covers the whole allocation
     :func:`localize_weights` returned (that tensor or a full alias of it: an
     ``nn.Parameter`` over it, ``detach()``, ``.data``, a view of the same shape;
-    not a view of part of it, not a copy) on a device with a probed SM table,
-    else ``None``.  ``g_cut`` is the group of ``b`` nearest to its die cut (the
-    twin's result does not depend on it).  Reads the record the allocation's
+    not a view of part of it, not a copy) on a device with a probed SM table
+    whose memory runs at its full clock
+    (:func:`flashinfer.cake_locality.memory_at_full_clock`), else ``None``.
+    ``g_cut`` is the group of ``b`` nearest to its die cut (the twin's result
+    does not depend on it).  Reads the record the allocation's
     storage carries (:func:`flashinfer.cake_locality.tensor_homing`), not the
     allocation registry.  A shape :func:`localize_weights` refuses
     (:func:`domain_serving_routed` is False) plans unhomed even when its ``b`` was
@@ -543,7 +671,7 @@ def _domain_homing(
     if b.numel() * b.element_size() != homed.nbytes:
         return None
     table = cake_locality.sm_table(index)
-    if table is None:
+    if table is None or not cake_locality.memory_at_full_clock(index):
         return None
     n, k = int(b.shape[1]), int(b.shape[2])
     key = ("routed", arch, sm_count, table.counts, n, k, groups)
@@ -1280,14 +1408,19 @@ def _serving_arguments(
     (stage,) = problem.plan.stages
     entry, fixed, getter = _serving_launch(problem, stage)
     cols = problem.K // PACKED_K_GRANULE
-    # The logical [B, MN, K/512] int32 scales live in MN-major [B, K/512, MN] storage;
-    # reinterpret that storage as the contiguous 2-D surface the scale tensor maps read.
-    sfa = a_scale.as_strided((problem.B * cols, problem.M), (problem.M, 1)).view(
-        torch.uint32
-    )
-    sfb = b_scale.as_strided((problem.B * cols, problem.N), (problem.N, 1)).view(
-        torch.uint32
-    )
+    # The logical [B, MN, K/512] int32 scales live in MN-major [B, K/512, MN] storage.
+    if problem.plan.route == PAIR_SERVING_ROUTE:
+        # The pair program reads that storage as contiguous int32 [B, K/512, MN].
+        sfa = a_scale.transpose(1, 2)
+        sfb = b_scale.transpose(1, 2)
+    else:
+        # Reinterpret it as the contiguous 2-D surface the scale tensor maps read.
+        sfa = a_scale.as_strided((problem.B * cols, problem.M), (problem.M, 1)).view(
+            torch.uint32
+        )
+        sfb = b_scale.as_strided((problem.B * cols, problem.N), (problem.N, 1)).view(
+            torch.uint32
+        )
     values = (
         a.view(torch.uint8),
         b.view(torch.uint8),
@@ -1512,27 +1645,38 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     ``g_cut`` defaults to the SM-proportional share of die 0,
     ``split_units(B, counts)[0]`` over the device's probed SM table.  Passing the
     copy as ``b`` makes every packed-scale serving problem on it run the
-    locality-domain twin of its serving program; the twin's result is the same
-    bits for any ``g_cut``.
+    locality-domain twin of its serving program, except from the homed low bound
+    of ``PAIR_SERVING_EXPECTED_M`` on, where the masked pair program runs (the
+    same bits as on plain weights); the twin's result is the same bits for any
+    ``g_cut``.
+
+    Homing is decided once per tensor but pays off only for some ``expected_m``:
+    it makes the decode range faster and larger ``expected_m`` slower (see the
+    measurements below), so home weights whose calls mostly fall in the decode
+    range.
 
     Returns ``b`` itself, unhomed, when the call is under CUDA graph capture, or
-    when homing could make a call slower: ``b`` is not float8_e4m3fn weights of a
-    packed-scale serving shape (``(N, K)`` in ``PACKED_NK``, ``B`` in
+    when no listed twin would serve the decode range: ``b`` is not float8_e4m3fn
+    weights of a packed-scale serving shape (``(N, K)`` in ``PACKED_NK``, ``B`` in
     ``PACKED_GROUPS``) on an SM107a device, no die class of the device's SM count
     routes every ``expected_m`` of that shape to a twin, the device has no SM
-    table (:func:`flashinfer.cake_locality.sm_table` is ``None``), some
-    ``expected_m`` of that shape selects a serving program without a twin listed
-    in the cell of the device's dies (:func:`domain_serving_routed`), or the cut
+    table (:func:`flashinfer.cake_locality.sm_table` is ``None``), its memory
+    does not run at its full clock
+    (:func:`flashinfer.cake_locality.memory_at_full_clock` is ``False``), some
+    ``expected_m`` below the homed low bound of ``PAIR_SERVING_EXPECTED_M``
+    selects a serving program without a twin listed in the cell of the device's
+    dies (:func:`domain_serving_routed`), or the cut
     is not a multiple of the allocation granularity of locality-domain memory.
     The checks that need no device work come first: a refused shape is returned
     before the SM table is probed or anything is built or synchronized.  Raises
     ``ValueError`` for a ``g_cut`` outside ``[0, B]``.
 
     With the cells listed for 212-SM devices, only ``B=64`` weights of
-    ``(N, K) = (4096, 7168)`` are homed: at every ``expected_m`` their serving
-    program has a listed twin, including the ``expected_m >= 16`` cell listed for
-    homed weights only (see ``DOMAIN_SERVING_CELLS``).  ``B=32`` weights of
-    ``(4096, 7168)`` and ``B=32`` and ``B=64`` weights of ``(7168, 2048)`` are
+    ``(N, K) = (4096, 7168)`` are homed: below the homed low bound their serving
+    program has a listed twin at every ``expected_m``, including the
+    ``expected_m >= 16`` cell listed for homed weights only (see
+    ``DOMAIN_SERVING_CELLS``); from that bound the masked pair program runs.
+    ``B=32`` weights of ``(4096, 7168)`` and ``B=32`` and ``B=64`` weights of ``(7168, 2048)`` are
     returned unhomed: their ``expected_m <= 1`` serving program has no twin.
 
     Homing weights also fills the device's reserve of pre-zeroed claim counter
@@ -1541,13 +1685,59 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     captured before any eager call holds no memset node; a failure there does
     not fail this call.
 
+    Measured for ``B=64`` weights of ``(4096, 7168)`` on 212-SM devices with
+    the memory at its full clock (driver 620.70.06; two GPUs, dies of 108/104
+    and 106/106 SMs; CUPTI kernel time of CUDA graph replays after a read
+    flush of twice the L2 size, median of 6 alternating rounds), every group
+    holding ``expected_m`` rows, the time of plain weights over that of homed
+    weights was:
+
+    - 1.32-1.47 at ``expected_m`` 1-32 (the twin against the serving
+      program) and 1.03-1.05 at 36-64; with uneven rows (0.7-1.3x
+      ``expected_m`` in each group) 1.12-1.36 up to 32, 1.03-1.10 at 36-48
+      and 0.97-1.00 at 56 and 64;
+    - 0.75-0.76 at ``expected_m`` 72 and 96, where plain weights run the
+      masked pair program and homed weights the twin (0.66-0.82 with uneven
+      rows);
+    - 0.66-0.80 at ``expected_m`` 128-512, where both run the masked pair
+      program (0.67-0.93 with uneven rows), and 0.97-1.02 at 1024 and 4096.
+
+    The twin's gain also needs each step's rows spread over both dies' groups.
+    With every row in the groups of one die the ratio was 0.63-0.79 at
+    ``expected_m`` 1-64; with 5 or 6 of 6 active groups on one die at
+    ``expected_m`` 1, 0.67-0.79.  Over 100 random masks of a skewed routing
+    (8 of 256 experts per token, this rank holding 64) its median was 0.94 at
+    ``expected_m`` 1, 1.27 at 8, 1.20 at 16, 0.93 at 64 and 0.57 at 128.
+
     Homed weights are meant for ``backend="cake"``.  ``backend="deepgemm"``
     reads them correctly but more slowly: on 212-SM devices it took 1.39-1.50x
-    the time of plain weights at ``expected_m`` 2-64.  The twin's gain comes
-    from die-local memory reads and was measured with the memory at its full
-    clock.  On a device whose memory ran at a lower clock (driver 620.43, 3186
-    of 4752 MHz) the twin route took 0.99-1.06x the time of plain weights at
-    ``expected_m <= 64``; keep plain weights on such a device.
+    the time of plain weights at ``expected_m`` 2-64.  Most of the twin's gain
+    comes from die-local memory reads: on ordinary (interleaved) memory the
+    twin took 0.95-0.97x the time of the whole program on the full grid at
+    ``expected_m`` 1-16 and 1.05x at 36 and 64, and homed memory then cut its
+    time 1.34-1.41x and 1.09x; with the SM table's dies swapped (every first
+    claim remote) it took 1.9-2.6x its homed time, with the same bits.
+
+    With the memory at a lower clock (driver 620.43, 3186 of 4752 MHz; homing
+    forced for the measurement, dies of 100/112 SMs) homed weights gained
+    nothing: the ratio was 0.94-0.96 at ``expected_m`` 1-32, 1.00 at 36-64,
+    0.47-0.77 at 72-159 and 0.59-0.68 at 160-512; on that clock the twin took
+    the same time on homed as on interleaved memory at ``expected_m`` 1-16
+    (dies of 106/106 SMs).  So this returns ``b`` unhomed on a device whose
+    memory clock NVML reads below
+    :data:`flashinfer.cake_locality.MEMORY_CLOCK_FRACTION` of its maximum, or
+    cannot read (:func:`flashinfer.cake_locality.memory_at_full_clock`), and
+    weights homed there take the whole-GPU route; the homed low bound of
+    ``PAIR_SERVING_EXPECTED_M`` does not apply there.
+
+    From the homed low bound (128) the masked pair program serves homed weights
+    (the same bits as on plain weights).  On homed weights it took 1.15-1.16x
+    the twin's time at ``expected_m`` 72 and 96 and 0.76-0.92x at 128-159.  Its
+    slowdown on homed weights is not extra remote traffic: on homed and plain
+    weights at ``expected_m`` 256 it read the dies' memory in equal totals and
+    took the same share of its L2 sectors over the die fabric (0.44 and 0.41);
+    its walk of the weight tiles in group order may read one die's memory at a
+    time, which was not measured.
 
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor
@@ -1590,7 +1780,7 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     ):
         return b
     table = cake_locality.sm_table(index)
-    if table is None:
+    if table is None or not cake_locality.memory_at_full_clock(index):
         return b
     if not domain_serving_routed(arch, sm_count, table.counts, n, k, groups):
         return b
@@ -1709,6 +1899,8 @@ __all__ = [
     "PACKED_NK",
     "DOMAIN_SERVING_ROUTE",
     "PAIR_COUNTER_WORDS",
+    "PAIR_GROUP_MAX",
+    "PAIR_SERVING_ROUTE",
     "PreparedBatchDeepGemmFp8NtGroupwise",
     "SUPPORTED_NK",
     "WORKSPACE_DTYPES",
@@ -1720,6 +1912,9 @@ __all__ = [
     "expected_m_class",
     "is_batch_deepgemm_fp8_nt_groupwise_cake_available",
     "localize_weights",
+    "pair_serving_key",
+    "pair_serving_plan",
+    "pair_serving_tile",
     "prepare_batch_deepgemm_fp8_nt_groupwise",
     "run_batch_deepgemm_fp8_nt_groupwise",
     "select_route",

@@ -28,7 +28,7 @@ def validate_forward_inputs(
         )
         return
 
-    from ......kernel_src.sm120.split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import (
         ACTIVATION_DTYPE,
         SCALE_DTYPE,
     )

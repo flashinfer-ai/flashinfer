@@ -4,9 +4,9 @@
 
 The Rubin backends support NVFP4, MXFP8 E4M3/E5M2, and MXFP4 weights with
 MXFP8 E4M3 activations through
-`MoEEpLayer`, with BF16 combine and output. The kernel comes from CuTe DSL
-MegaMoE `1667b47a`; [VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/VENDOR.md)
-records the full source and exporter revisions.
+`MoEEpLayer`, with BF16 combine and output. [VENDOR.md](../../flashinfer/moe_ep/kernels/cutedsl_megamoe/VENDOR.md)
+records the current source and exporter revisions. Qualification counts
+below retain their original source revisions.
 
 ## Correctness coverage
 
@@ -299,7 +299,7 @@ added for the specific code or deployment being validated.
 
 ## Benchmarks and CI
 
-[TUNING.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
+[TUNING.md](../../flashinfer/moe_ep/shims/sm107/cutedsl_megamoe/TUNING.md)
 defines the two geometries, timing scopes, cache policies, and rank statistics.
 Use compute/eager with L2 flushing for historical
 comparisons and kernel/forward × eager/graph without flushing. Each point has
@@ -311,7 +311,8 @@ labels. Adding it to required CI needs a provisioned Rubin runner and an owner.
 Engine integration and whole-model serving benchmarks are separate follow-ups.
 
 Device-kernel fixes belong in the upstream kernel repository. Re-export them
-and update `VENDOR.md`; keep `kernel_src/**/src/` byte-identical to that export.
+and update `VENDOR.md`; keep the provider export under
+`kernels/cutedsl_megamoe/` byte-identical to that export.
 
 ## Distributed tests and caller-managed expert placement
 

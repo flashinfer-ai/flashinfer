@@ -70,7 +70,7 @@ def _github_path_regex(pattern: str) -> "re.Pattern[str]":
         "flashinfer/jit/fused_moe.py",
         "flashinfer/aot.py",
         "flashinfer/artifacts.py",
-        "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_jit.py",
+        "flashinfer/moe_ep/shims/sm90/cake_bf16/cake_jit.py",
         "ci/docker-tags.yml",
         "ci/cuda-versions.json",
         f"scripts/infra/{AOT_SCRIPT}",

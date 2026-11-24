@@ -46,15 +46,25 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
+    - `mm_tf32` - Matrix multiplication with FP32 inputs and output, TF32 MMAs (CuTe DSL cluster split-K on SM100/SM103/SM107; cuBLAS on SM80+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
-    - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
-    - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
-    - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
+    - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling (NVFP4, MXFP4 x MXFP8, MXFP4 x BF16).
+    - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling (DeepSeek 128x128 blocks, or MXFP8 via `--fp8_quant_type mxfp8`).
+    - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling (or per-channel weight scales via `--fp8_scale_granularity per_channel`).
+    - `trtllm_bf16_moe` - TRT-LLM Gen BF16 x BF16 fused MoE (BlockMajorK weights).
+    - `trtllm_mxint4_block_scale_moe` - TRT-LLM Gen MxInt4 weights x BF16 activations (e.g. Kimi-K2 INT4).
+    - The `trtllm_*` routines take `--backends trtllm prims-ts` (Prims-TS GEMMs behind the same signature; SM100/SM103, and SM107 with a CuTe DSL that targets it) and `--routing_input precomputed` (the `*_routed_moe` APIs with packed top-k ids from a torch reference of `--routing_method`).
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+    - `cute_dsl_fp4_block_scale_moe` - CuTe-DSL NVFP4 (W4A4) fused MoE on SM100/SM103/SM107 with SwiGLU, GeGLU-Tanh or ReLU2. W4A8/W4A16/MXFP8 are benchmarked through `unified_moe --backends cute_dsl`.
     - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
-    - `unified_moe` - Unified MoE API comparison between the CUTLASS, cuTile, b12x and cuDNN grouped-GEMM backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
+    - `b12x_fused_moe` - b12x (CuTe-DSL SM120/SM121) NVFP4 or W4A16 fused MoE.
+    - `alphamoe_nvfp4_aligned_moe` - AlphaMoE NVFP4 megakernel (SM100/SM103) over a pre-aligned plan, or `--alphamoe_routing routed` for `alphamoe_nvfp4_routed_moe` (route alignment + MoE in one call).
+    - `unified_nvfp4_moe` - `MoELayer` cross-backend NVFP4 autotune over CuTe-DSL and TRT-LLM.
+    - `bgmv_moe` - Multi-LoRA BGMV shrink + expand kernels for MoE experts.
+    - `moe_routing` - Standalone MoE routing kernels on the same logits: `trtllm` (`trtllm_gen_routing`, every routing method), `dsv3` (`fused_topk_deepseek`), `alphamoe` (`alphamoe_fused_router`) and `hash` (`hash_topk`, DeepSeek-V4). `--refcheck` compares each backend's expert selection with a torch reference. `deepseek_v3` needs `--n_group` and `--topk_group`.
+    - `unified_moe` - Unified MoE API (`MoELayer` runners) comparison on identical inputs across the CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRT-LLM Gen (`trtllm`), CuTe-DSL (`cute_dsl`), Prims-TS (`prims_ts`), cuDNN Frost (`cudnn_frost`, SM107/SM120), Frost low-latency decode (`frost_low_latency`, 1-8 tokens) and Cake StepFun (`cake_stepfun`) backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 W8A8/W8A16, DeepSeek block FP8 (`deepseek_fp8`), MXFP8 W8A8/W8A16, MXFP4 W4A8 and MxInt4 W4A16 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, SiTU and PowLU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication: no routine yet; standalone scripts cover it. `benchmarks/moe_ep/bench_moe_ep_comm.py` times dispatch + combine of the `flashinfer.moe_ep` communication backends (launched with `torchrun`), `benchmarks/moe_ep/bench_moe_ep.py` times one MoE layer (quantize + dispatch + expert computation + combine) per stage over the same backends, and `benchmarks/moe_ep/bench_moe_ep_fleet.py` times the layer over the Fleet/Handle transports (`nccl_ep`, `nixl_ep`), including the NCCL-EP `ep_bench` reference cases.
 - AllReduce Communication:
     - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
@@ -324,7 +334,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `mm_tf32`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags
@@ -340,7 +350,18 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--routed_scaling_factor`| Scaling factor for routing. Default: 2.5                                                                   |
 | `--local_expert_offset`  | Offset of local experts in global expert space. Default: 0                                                 |
 | `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                      |                                                                    |
-| `--routing_method`       | Routing method: `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`. Default: `deepseek_v3`.       |
+| `--routing_method`       | Routing method: `default`, `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`, `topk`, `sigmoid_renorm`, `minimax2`, `sigmoid`, `topk_sigmoid` (all `RoutingMethodType` values), or `hash` (`moe_routing` only). Default: `deepseek_v3`. |
+| `--backends`             | `trtllm_*` routines: `trtllm` (default) and/or `prims-ts`. `moe_routing`: `trtllm`, `dsv3`, `alphamoe`, `hash` (default: all that implement the routing method, except `alphamoe`, which runs only when named). `unified_moe`: see the routine description. A backend that rejects the configuration is reported and skipped; the other backends still produce rows. |
+| `--routing_input`        | `trtllm_*` routines: `logits` (default, in-kernel routing) or `precomputed` (`*_routed_moe` APIs with packed top-k ids) |
+| `--fp8_quant_type`       | `trtllm_fp8_block_scale_moe`: `deepseek` (default, 128x128 FP8 blocks) or `mxfp8`                           |
+| `--fp8_scale_granularity`| `trtllm_fp8_per_tensor_scale_moe`: `per_tensor` (default) or `per_channel` (`trtllm_fp8_per_channel_scale_moe`) |
+| `--swiglu_alpha` / `--swiglu_beta` / `--swiglu_limit` | gpt-oss style SwiGLU parameters (`trtllm_*` routines where the API accepts them, `cutlass_fused_moe`) |
+| `--gemm_bias`            | Add FC1/FC2 expert biases (`trtllm_fp4_block_scale_moe`)                                                    |
+| `--refcheck` (`trtllm_*` routines) | `trtllm_bf16_moe`, `trtllm_mxint4_block_scale_moe` and `--fp8_quant_type mxfp8` compare the output with a BF16 torch reference. The other modes use synthetic scales, so they compare a `--routing_input precomputed` call with its logits-routed twin and each later backend with the first; a line with neither prints a warning. |
+| `--valid_hidden_size` / `--valid_intermediate_size` | `trtllm_*` routines: unpadded sizes when `--hidden_size` / `--intermediate_size` are padded (e.g. GPT-OSS 3072/2944 with valid 2880/2880) |
+| `--num_fused_shared_experts` | Fused shared experts appended to the routed experts (`trtllm_fp4/fp8_block_scale_moe`, DeepSeekV3 routing, logits input) |
+| `--alphamoe_routing`     | `alphamoe_nvfp4_aligned_moe`: `aligned` (default, pre-aligned plan) or `routed` (`alphamoe_nvfp4_routed_moe`) |
+| `--tile_tokens_dim` / `--hash_vocab_size` | `moe_routing`: trtllm token tile (default 8) / hash-routing vocabulary (default 129280)  |
 | `--use_shuffled_weight`  | Whether to use shuffled weight layout                                                                      |
 | `--weight_layout`        | Weight layout: 0=MajorK, 1=MajorMn,  2=BlockMajorK. Default: 0                                             |
 | `--use_routing_bias`     | Whether to use routing bias                                                                                |
@@ -354,7 +375,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--ep_size`              | Expert-parallel world size                                                                                  |
 | `--ep_rank`              | Expert-parallel rank                                                                                        |
 | `--activation-type`      | Activation function: `Swiglu` (default), `Geglu`, `SwigluStep` (clipped SwiGLU, limit=7.0), `Relu2`, etc.  |
-| `--autotune`             | Enable autotune for supported operation                                                                     |
+| `--autotune`             | Enable autotune for supported operation (all `trtllm_*` routines, `cutlass_fused_moe`, `cute_dsl_*`, `unified_moe`) |
 
 ### MOE Routing Method Compatibility
 
@@ -478,6 +499,37 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--high_freq_factor`     | High frequency factor for Llama 3.1 RoPE. Default: 4.0                                                     |
 | `--old_context_len`      | Old context length for Llama 3.1 RoPE. Default: 8192                                                       |
 | `--backends`             | Backend to test: `cuda` (default)                                                                          |
+
+### Norm / Activation / Quantization / RoPE / Sampling additions (2026-10)
+New routines (all write `refcheck`-checked rows where a reference exists):
+
+| Routine | API | Backends (CSV `backend`) | Notes |
+|---|---|---|---|
+| `fused_add_rmsnorm_fp8_block_quant` | `flashinfer.norm.fused_add_rmsnorm_fp8_block_quant` | `cuda` | add + RMSNorm + 1x128 block-fp8 (DeepGEMM scale layout) |
+| `layernorm` | `flashinfer.layernorm` | `cute-dsl` (CUDA JIT fallback in `resolved_backend`) | bf16 in/out, fp32 gamma/beta |
+| `act_and_mul` | `silu_and_mul` / `gelu_and_mul` / `gelu_tanh_and_mul` | `cuda` | `--act_type silu\|gelu\|gelu_tanh`; `--hidden_size` = output width |
+| `mhc` | `flashinfer.mhc.mhc_post` / `mhc_pre_big_fuse[_with_prenorm]` | `cuda` | `--mhc_mode`, `--num_splits` |
+| `gated_residual_rmsnorm`, `gated_residual_next_rmsnorm`, `rmsnorm_sigmoid_gate` | `flashinfer.*` | `cute-dsl` (forces `backend="cute"`) | SM100/103/107; hidden 8192 / head dim 64; `--norm_variant` |
+| `scaled_fp4_grouped_quantize`, `mxfp8_grouped_quantize`, `silu_and_mul_scaled_nvfp4_experts_quantize`, `silu_and_mul_mxfp8_experts_quantize` | masked grouped `[B, M, K]` quantizers | `cuda` (+ `cutile` for mxfp8 grouped) | `--batch_size` = groups, `--masked_m` valid rows |
+| `per_token_group_quant_8bit` | `flashinfer.quantization.per_token_group_quant_8bit` | `cutile` | `--group_size --quant_dtype --column_major_scales --scale_tma_aligned --scale_ue8m0` |
+| `silu_and_mul_nvfp4_quantize` | fused SwiGLU + NVFP4 | `cute-dsl` | input `[m, 2k]` |
+| `nvfp4_kv_quantize`, `nvfp4_kv_dequantize`, `nvfp4_kv_dequantize_paged` | NVFP4 KV cache (de)quant | `cuda` | paged: `--num_kv_heads --page_size --kv_layout` |
+| `packbits`, `segment_packbits` | `flashinfer.packbits` | `cuda` | `--bitorder big\|little` |
+
+New modes on existing routines: `nvfp4_quantize --per_token_activation`, `--nvfp4_4over6 env|off|mae|mse`,
+fp8 input, `8x4`/`linear` layouts, cute-dsl vs cuda bitwise refcheck; RoPE `--inplace` (the `*_inplace` APIs),
+`--mla_kv`, `rope_quantize_fp8 --backends cutile`; sampling `--param_mode tensor` (per-request tensors),
+`--deterministic`, `--input_distribution`; top-k `--backends radix|clusters|cub` (forced through
+`FLASHINFER_TOPK_ALGO`; `cuda` = library auto-dispatch), `--sorted`, `--tie_break`, `--dsa_graph_safe`,
+top-k page-table `--page_size`. The Cake backend is not benchmarked by these routines.
+
+New mode flags are written as new CSV columns and stay empty on rows that do not use them
+(`blank_unused_mode_columns`), so pre-existing testlist lines keep the same CSV row.
+Two existing columns change on purpose:
+
+- `resolved_backend` is `cute-dsl` (was empty) on norm rows that ran the CuTe-DSL kernel.
+- `sf_layout` is `linear` (was `128x4`) on `mxfp8_quantize --no_sf_swizzled_layout` rows. The old
+  value was the unused `--sf_layout` default; the row always ran the linear layout.
 
 ### Mamba Flags
 | Flag                     | Description                                                                                                 |

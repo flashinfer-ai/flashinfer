@@ -263,9 +263,12 @@ def test_finalize_matches_ordered_exact_fold(weight_before_fc2):
     import cuda.bindings.driver as cuda
     from cutlass.cute.runtime import from_dlpack
 
-    import flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe  # noqa: F401
-    from moe_nvfp4_swapab.topk_reduce import TopkReduce
-    from src.token_comm import CombineFormat
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.token_comm import (
+        CombineFormat,
+    )
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.topk_reduce import (
+        TopkReduce,
+    )
 
     generator = torch.Generator(device="cuda").manual_seed(172)
     terms = torch.randn(
@@ -366,7 +369,7 @@ def test_whole_kernel_matches_independent_dense_reference(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         bf16_mega_moe,
         compute_megamoe_reference_bf16,
         get_symm_buffer_for_bf16_mega_moe,

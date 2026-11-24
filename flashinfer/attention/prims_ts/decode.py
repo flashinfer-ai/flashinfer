@@ -1599,6 +1599,7 @@ def _make_decode_compile_spec(
     out_dtype_key: str,
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
     flat_native_kv_tma: bool = False,
+    flat_nvfp4_scale_num_heads: int = 0,
     lse_mode: str = "none",
     runtime_kv_lengths: bool = False,
     runtime_q_lengths: bool = True,
@@ -1650,6 +1651,7 @@ def _make_decode_compile_spec(
     config_items["lse_mode"] = lse_mode
     config_items["use_flat_native_kv_tma"] = flat_native_kv_tma
     config_items["flat_native_kv_num_heads"] = num_kv_heads if flat_native_kv_tma else 1
+    config_items["flat_nvfp4_scale_num_heads"] = flat_nvfp4_scale_num_heads
     return _DecodeCompileSpec(
         device_index=device_index,
         config_items=tuple(config_items.items()),
@@ -2816,6 +2818,8 @@ class PrimsTSBatchDecodePlan:
     _output_scale: GlobalScale
     _direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = ()
     _flat_locator_heads: int = 1
+    # Persistent grouped QToken launches read the metadata's route order.
+    _uses_route_order: bool = False
     _lse_mode: str = "none"
     _use_attention_sinks: bool = False
     _requested_splits: int = 1
@@ -3223,8 +3227,12 @@ def _validate_q_token_kv_block_sparse_page_memberships(
     expected_device: torch.device,
     batch_size: int,
     max_num_pages: int,
+    planes: int = 1,
 ) -> None:
-    """Validate the private grouped-QToken-KvBlock-Sparse-Attention packed-membership table."""
+    """Validate the private grouped-QToken-KvBlock-Sparse-Attention packed-membership table.
+
+    G9-G32 rows hold ``planes`` byte planes (queries 8p..8p+7 in plane p).
+    """
 
     if not isinstance(q_token_kv_block_sparse_page_memberships, torch.Tensor):
         raise TypeError(
@@ -3245,7 +3253,7 @@ def _validate_q_token_kv_block_sparse_page_memberships(
         )
     if not q_token_kv_block_sparse_page_memberships.is_contiguous():
         raise ValueError("q_token_kv_block_sparse_page_memberships must be contiguous")
-    expected_shape = (batch_size, (max_num_pages + 3) // 4)
+    expected_shape = (batch_size, planes * ((max_num_pages + 3) // 4))
     if tuple(q_token_kv_block_sparse_page_memberships.shape) != expected_shape:
         raise ValueError(
             "q_token_kv_block_sparse_page_memberships must have shape "
@@ -3283,8 +3291,9 @@ def _resolve_q_token_kv_block_sparse_decode_config(
 
     NVFP4 K/V is transformed into Q's compute dtype before MMA. The transform
     targets TMEM on the SwapsMmaAb recipe, or SMEM K/V rings on the KeepsMmaAb
-    recipe where ``prefers_nvfp4_keeps`` selects it. The cache layout
-    (interleaved rows or separate scale tensors) does not affect the choice.
+    recipe where ``prefers_nvfp4_keeps`` selects it (from Q's dtype and the
+    group's size and rows). The cache layout (interleaved rows or separate
+    scale tensors) does not affect the choice.
     """
 
     from .kernels.fmha_decode.fmha_decode_config import (
@@ -3298,6 +3307,20 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         num_qo_heads,
         num_kv_heads,
     )
+    if group_size > 8 and not (
+        packed_query and page_size <= _sparse_policy.MAX_WIDE_GROUP_BLOCK_SIZE
+    ):
+        # G16/G32 memberships are read from page-major GMEM planes only (the
+        # fixed-Q layout caches one plane in SMEM), four kernel pages per word.
+        # ``page_size`` here is the kernel page: the K/V fragment
+        # gcd(kv_block_size, storage page size) that holds one membership byte.
+        raise ValueError(
+            f"QToken-KvBlock-Sparse-Attention group_size={group_size} needs packed "
+            "queries (qo_indptr) and K/V fragments, gcd(kv_block_size, page_size), "
+            f"of at most {_sparse_policy.MAX_WIDE_GROUP_BLOCK_SIZE} tokens; got "
+            f"{'packed' if packed_query else 'fixed'} queries and {page_size}-token "
+            "fragments"
+        )
     # This route has no QK-BF16/PV-FP8 kernel, so Q, K, and V must match,
     # except NVFP4 K/V, which is transformed exactly to BF16 for BF16 Q.
     q_token_kv_block_sparse_dtype_supported = (
@@ -3347,6 +3370,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         route_kv_tokens=max_kv_len,
         multi_processor_count=max_active_clusters,
         split_kv=split_kv,
+        nvfp4_kv=use_nvfp4_kv,
     )
     nvfp4_keeps = use_nvfp4_kv and _sparse_policy.prefers_nvfp4_keeps(
         q_dtype_key, group_size, heads_q_per_kv
@@ -3430,6 +3454,12 @@ def _resolve_q_token_kv_block_sparse_decode_config(
             correction_warp_idx=8,
             load_num_warps=4,
         )
+    if group_size > 8:
+        # Swaps reads one membership byte plane; the policy takes Keeps here.
+        assert launch.use_keeps_mma_ab
+        q_token_kv_block_sparse_profile["q_token_membership_planes"] = (
+            _sparse_policy.membership_planes(group_size)
+        )
     return make_config(
         q_token_kv_block_sparse_profile,
         split_kv_mode=(
@@ -3473,7 +3503,7 @@ def _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
     num_qo_heads: int,
     num_kv_heads: int,
 ) -> int:
-    """Validate that one caller-selected sparse Q group fits TileQ128 and a membership byte."""
+    """Validate that one caller-selected sparse Q group fits TileQ128 and four membership planes."""
 
     from .kernels.fmha_decode.fmha_decode_constants import (
         Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
@@ -3482,8 +3512,9 @@ def _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
     group_size = _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size)
     _validate_head_geometry(num_qo_heads, num_kv_heads)
     heads_q_per_kv = num_qo_heads // num_kv_heads
+    # Up to four byte planes hold G9-G32 memberships (queries 8p..8p+7 in plane p).
     max_group_size = min(
-        Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
+        4 * Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
         _sparse_policy.MAX_TILE_SIZE_Q // heads_q_per_kv,
     )
     if group_size > max_group_size:
@@ -3508,17 +3539,24 @@ def suggest_q_token_kv_block_sparse_group_size(
     q_dtype: torch.dtype = torch.bfloat16,
     split_kv: bool = True,
     kv_block_size: int = 4,
+    union_exponent: float = _sparse_policy.DEFAULT_UNION_EXPONENT,
+    nvfp4_kv: bool = False,
+    seq_len_kv: Optional[int] = None,
+    packed_query: bool = False,
+    nvfp4_interleaved_kv: bool = False,
 ) -> int:
-    """Suggest a Q1--Q8 QToken-KvBlock-Sparse-Attention group.
+    """Suggest a QToken-KvBlock-Sparse-Attention group (G1-G8, G16 or G32).
 
     This pure host-side policy uses the caller-provided SM count; it never
-    queries device properties or reads tensors. It starts with the largest
-    legal group and the smallest fitting dense Q-tile recipe, then adds
-    useful one-wave split-KV parallelism. It considers the largest group for
-    each dense Q tile and further ungrouping at the smallest tile. If the
-    largest group cannot fill a wave, prefer better active SM coverage after
-    instruction-aligned split rounding. Ties prefer less Q padding, then the
-    larger group. Explicit G passed to plan/run is never overridden.
+    queries device properties or reads tensors. For NVFP4 K/V
+    (``nvfp4_kv=True``) it estimates every legal group's call latency: the
+    group's expected K/V union (from ``union_exponent``) under the selected
+    recipe's split fanout gives the KV tiles per work item and the number of
+    SM waves; grouped metadata (G >= 2) and the split reduction add fixed
+    costs. The cheapest group wins; ties prefer the smaller group. BF16/FP8
+    caches keep the G1-G8 coverage rule (the largest group that fills the
+    SMs, shrunk only for better SM coverage); the latency constants were
+    fitted on NVFP4 only. Explicit G passed to plan/run is never overridden.
 
     Query lengths need not be divisible by the result. Packed prefill may end
     each request with a shorter route. Fixed-shape decode may pad its final
@@ -3526,11 +3564,10 @@ def suggest_q_token_kv_block_sparse_group_size(
     rows and discard their outputs.
 
     ``selected_seq_len_kv`` is the maximum candidate K/V-token count for one
-    query, including its causal tail. Configured split fanout uses union
-    capacity to accommodate non-shared KV. The recommendation scores useful
-    active splits using a fully-shared per-query proxy, rather than counting
-    every capacity-based split as active. Actual union-overlap and scattered-load
-    costs remain a TODO.
+    query, including its causal tail; pass ``min(budget + tail, kv_length)``
+    for short contexts. Configured split fanout uses union capacity to
+    accommodate non-shared KV; the estimate counts the splits active on the
+    expected union.
 
     Parameters
     ----------
@@ -3562,11 +3599,39 @@ def suggest_q_token_kv_block_sparse_group_size(
     kv_block_size : int
         Semantic sparse block size: 4/8/16/32/64/128, default four. Used to
         bound grouped union work; storage-page size does not affect this bound.
+    union_exponent : float
+        Growth of a G-query group's K/V union, estimated as
+        ``selected * G ** union_exponent``; in [0, 1]. The default is fitted
+        to latency on real sparse-indexer outputs, whose unions grow about
+        1.4x per doubling of G. Used with ``nvfp4_kv=True`` only.
+    nvfp4_kv : bool
+        Plan for NVFP4 K/V with the recipes ``plan`` takes for it (BF16 Q
+        always takes KeepsMmaAb). For BF16 K/V that the caller converted from NVFP4 (see
+        ``QTokenKvBlockSparsePagedTSWrapper.run``), pass ``False``; that
+        suggestion stays within G1-G8, while the conversion only pays with
+        TileQ128 groups, which the caller then selects explicitly.
+    seq_len_kv : int, optional
+        KV length of the longest request (its context including these
+        queries). A group's union cannot exceed it, so short contexts (e.g. a
+        prefill from an empty prefix) favor larger groups; pass it whenever it
+        is known. ``None`` keeps the uncapped union estimate. Used with
+        ``nvfp4_kv=True`` only.
+    packed_query : bool
+        Whether the launch passes packed queries (``qo_indptr``). G16 and G32
+        are suggested only for NVFP4 K/V when True and ``kv_block_size`` is at
+        most 16; ``plan`` rejects them for fixed-shape queries. Default False
+        (G1-G8).
+    nvfp4_interleaved_kv : bool
+        Whether the NVFP4 K/V cache stores interleaved rows (payload and
+        scales in one row, ``kv_scale_factors=None`` at run) rather than
+        separate scale tensors; the two layouts have separate latency
+        constants. Default False. Used with ``nvfp4_kv=True`` only.
 
     Returns
     -------
     int
-        One of Q1--Q8, subject to the TileQ128 head-capacity bound.
+        One of G1--G8, or G16/G32 for packed NVFP4 queries, subject to the
+        TileQ128 head-capacity bound.
     """
 
     from .q_token_kv_block_sparse_metadata import _validate_sparse_block_size
@@ -3588,6 +3653,13 @@ def suggest_q_token_kv_block_sparse_group_size(
         raise ValueError("q_dtype must be float16, bfloat16, or float8_e4m3fn")
     if not isinstance(split_kv, bool):
         raise TypeError("split_kv must be a bool")
+    if not isinstance(packed_query, bool):
+        raise TypeError("packed_query must be a bool")
+    if not isinstance(nvfp4_interleaved_kv, bool):
+        raise TypeError("nvfp4_interleaved_kv must be a bool")
+    kv_tokens = (
+        0 if seq_len_kv is None else _validate_positive_int(seq_len_kv, "seq_len_kv")
+    )
     return _sparse_policy.suggest_sparse_group(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
@@ -3599,6 +3671,11 @@ def suggest_q_token_kv_block_sparse_group_size(
         q_dtype_key=_dtype_key(q_dtype),
         split_kv=split_kv,
         block_size=kv_block_size,
+        union_exponent=float(union_exponent),
+        nvfp4_kv=bool(nvfp4_kv),
+        kv_tokens=kv_tokens,
+        packed_query=packed_query,
+        nvfp4_interleaved_kv=nvfp4_interleaved_kv,
     )
 
 
@@ -3863,6 +3940,7 @@ def _prepare_prims_ts_batch_decode_plan(
     lse_mode: Literal["none", "base2"] = "none",
     softmax_scale: Optional[GlobalScale] = None,
     output_scale: GlobalScale = 1.0,
+    balanced_scheduler: Optional[bool] = None,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -4014,6 +4092,29 @@ def _prepare_prims_ts_batch_decode_plan(
         *policy_args,
         use_attention_sinks=use_attention_sinks,
     )
+    if balanced_scheduler is not False and (
+        use_q_token_kv_block_sparse_route
+        and packed_query
+        and seq_len_q > 1
+        and not direct_q1_inputs
+        and spec.config.use_persistent_scheduler
+        and spec.config.shares_sparse_pattern
+    ):
+        # Longest-first CLC dispatch pays when work spans more than one wave of
+        # SMs (within one wave every route starts at once) and routes can read
+        # more than one KV128 tile (one-tile routes leave nothing to balance).
+        # The order costs about 1-2 us, which routes of up to four tiles repay
+        # only over three or more waves. True forces it.
+        tile = _sparse_policy.TILE_SIZE_KV
+        work_items = batch_size * num_kv_heads
+        sm_count = get_device_sm_count(torch.device("cuda", device_index))
+        enable = balanced_scheduler or (
+            work_items > sm_count
+            and max_kv_len > tile
+            and (work_items >= 3 * sm_count or max_kv_len > 4 * tile)
+        )
+        if enable:
+            spec = replace(spec, config=replace(spec.config, balanced_scheduler=True))
     nvfp4_keeps = spec.config.uses_keeps_transformed_kv
     policy_config = replace(spec.config, fixed_seqlen=True)
     if query_major_memberships:
@@ -4060,6 +4161,7 @@ def _prepare_prims_ts_batch_decode_plan(
             expected_device=query.device,
             batch_size=metadata_rows,
             max_num_pages=max_num_pages,
+            planes=policy_config.page_membership_planes,
         )
     else:
         if q_token_kv_block_sparse_page_memberships is not None:
@@ -4133,6 +4235,21 @@ def _prepare_prims_ts_batch_decode_plan(
             <= NVFP4_GATHER4_MAX_FRAGMENT_BYTES
         )
     )
+    # Compact separate scale tensors view every page fragment's scale rows
+    # as one row of a flat 2-D map, which the Keeps raw ring gathers four
+    # fragments at a time (FmhaDecodeConfig.uses_nvfp4_scale_gather4).
+    flat_nvfp4_scale_num_heads = 0
+    if (
+        use_q_token_kv_block_sparse_route
+        and spec.config.uses_nvfp4_scale_tensors
+        and k_sf_cache.is_contiguous()
+        and v_sf_cache.is_contiguous()
+        and k_sf_cache.numel() // max(1, page_size * k_sf_cache.shape[-1]) < (1 << 31)
+        and replace(
+            spec.config, flat_nvfp4_scale_num_heads=num_kv_heads
+        ).uses_nvfp4_scale_gather4
+    ):
+        flat_nvfp4_scale_num_heads = num_kv_heads
     compile_spec = _make_decode_compile_spec(
         spec,
         device_index=device_index,
@@ -4146,6 +4263,7 @@ def _prepare_prims_ts_batch_decode_plan(
         out_dtype_key=_dtype_key(out_dtype),
         direct_q1_spec=direct_q1_spec,
         flat_native_kv_tma=flat_native_kv_tma,
+        flat_nvfp4_scale_num_heads=flat_nvfp4_scale_num_heads,
         lse_mode=lse_mode,
         scale_types=scale_types(softmax_scale, output_scale),
     )
@@ -4188,6 +4306,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _output_scale=output_scale,
         _direct_q1_inputs=direct_q1_inputs,
         _flat_locator_heads=num_kv_heads if flat_native_kv_tma else 1,
+        _uses_route_order=bool(spec.config.uses_longest_first_route_order),
         _lse_mode=lse_mode,
         _use_attention_sinks=use_attention_sinks,
         _requested_splits=spec.requested_splits or int(spec.config.splits_kv),

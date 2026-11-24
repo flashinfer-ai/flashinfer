@@ -1,8 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Bring up the moe_ep dev environment inside an enroot container on Lyris
-# (or any aarch64 Grace-Blackwell host). Run this inside a `srun
+# Bring up the moe_ep dev environment inside an enroot container on a GPU host.
+# Run this inside a `srun
 # --container-image=nvcr.io/nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
 # --container-writable` session; it installs system deps, builds UCX
 # v1.21.x + GDRCopy v2.5.1 from source, creates a venv with FlashInfer
@@ -16,8 +16,6 @@
 #   GDRCOPY_VERSION    GDRCopy tag (default: v2.5.1)
 #   VENV               venv path (default: /opt/flashinfer-venv)
 #
-# Time budget on Lyris aarch64: ~30-40 min (NCCL EP template compile
-# dominates; UCX ~5 min; meson NIXL EP ~2 min; FlashInfer kernels ~5 min).
 
 set -eo pipefail
 
@@ -28,7 +26,7 @@ set -eo pipefail
 : "${GDRCOPY_VERSION:=v2.5.1}"
 : "${VENV:=/opt/flashinfer-venv}"
 
-# Detect Debian multiarch dir at runtime (aarch64-linux-gnu on Lyris).
+# Detect the Debian multiarch directory at runtime.
 MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH 2>/dev/null || echo "$(uname -m)-linux-gnu")"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -124,7 +122,7 @@ uv pip install --python "${VENV}/bin/python" --no-deps \
 # Why: torch 2.12's `cuda-toolkit[nvjitlink]` metapackage pin trips uv's
 # resolver during the editable `-e .` resolution (nvidia-nvjitlink METADATA
 # mismatch). Installing the leaf deps first + `--no-deps -e .` sidesteps that.
-# nccl-extensions>=0.1.0 = NCCL-EP (nccl.ep + bundled libnccl_ep.so). nccl.ep
+# nccl-extensions>=0.2.0 supplies NCCL EP 0.3 (nccl.ep + bundled libnccl_ep.so). nccl.ep
 # moved out of nccl4py in 0.4.1, so nccl4py alone no longer provides it; we
 # still need nccl4py>=0.4.1 for nccl.core.Communicator (it comes in
 # transitively, pinned here only to exclude the 0.3.1 that also shipped
@@ -140,10 +138,15 @@ if [[ -n "${CUDA_EXTRA_DEPENDENCY_OUTPUT}" ]]; then
 fi
 uv pip install --python "${VENV}/bin/python" \
     numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
-    "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.32.0" \
+    "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.33.0" \
     "cuda-tile>=1.4.0" "cuda-python>=13.0" \
-    "nccl-extensions>=0.1.0" "nccl4py>=0.4.1" \
-    "nvidia-nccl-cu13>=2.30.7"   # B200 NCCL-EP needs >=2.30.7; load this first on LD_LIBRARY_PATH
+    "nccl-extensions>=0.2.0" "nccl4py>=0.4.1" \
+    "nvidia-nccl-cu13>=2.30.7"
+
+# Prefer the selected wheel before any system NCCL, including later sessions.
+NCCL_WHEEL_LIB="$("${VENV}/bin/python" -c \
+    'import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], "lib"))')"
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}:${LD_LIBRARY_PATH:-}"
 
 # ---- 6. FlashInfer + both EP backends -------------------------------------
 # Wipe any half-populated meson subproject extracts from prior aborted runs.
@@ -183,7 +186,7 @@ BUILD_NIXL_EP=1 \
 # ---- 7. persist env for subsequent srun on the same container --------------
 cat > /etc/profile.d/flashinfer.sh <<EOF
 export PATH=${VENV}/bin:${UCX_PREFIX}/bin:/root/.local/bin:\${PATH}
-export LD_LIBRARY_PATH=${UCX_PREFIX}/lib:/opt/mellanox/doca/lib/${MULTIARCH}:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=${NCCL_WHEEL_LIB}:${UCX_PREFIX}/lib:/opt/mellanox/doca/lib/${MULTIARCH}:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}
 export PKG_CONFIG_PATH=${UCX_PREFIX}/lib/pkgconfig:/opt/mellanox/doca/lib/${MULTIARCH}/pkgconfig:\${PKG_CONFIG_PATH:-}
 export CPATH=/opt/mellanox/doca/include:\${CPATH:-}
 export VIRTUAL_ENV=${VENV}

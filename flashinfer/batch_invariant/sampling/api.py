@@ -60,6 +60,17 @@ def _dummy(device, dtype) -> torch.Tensor:
     return _dummies[key]
 
 
+_dummies2: Dict[tuple, torch.Tensor] = {}
+
+
+def _dummy2(device, dtype) -> torch.Tensor:
+    """The ``(1, 8)`` view of the dummy, cached (a view per call otherwise)."""
+    key = (device, dtype)
+    if key not in _dummies2:
+        _dummies2[key] = _dummy(device, dtype).view(1, 8)
+    return _dummies2[key]
+
+
 def _rows(t: torch.Tensor, N: int, name: str) -> torch.Tensor:
     try:
         t2 = t.view(-1, N)
@@ -89,6 +100,14 @@ def _temperature(
                 f"a temperature tensor of dtype {temperature.dtype}",
                 "f16 / bf16 / f32 / f64 temperatures",
             )
+        if (
+            temperature.dtype == torch.float32
+            and temperature.device == device
+            and temperature.dim() == 1
+            and temperature.shape[0] == M
+            and temperature.is_contiguous()
+        ):
+            return temperature, 0.0  # already the kernel's form: no copy, no view
         t = temperature.to(device=device, dtype=torch.float32)
         if t.dim() == 0 or t.numel() == 1:
             t = t.reshape(1).expand(M)
@@ -203,7 +222,7 @@ def lse_row(
     dev = logits.device
     res: Dict[str, torch.Tensor] = {}
     yb = lb = pb = None  # the caller-owned buffers, when given
-    y = _dummy(dev, torch.float32).view(1, 8)
+    y = _dummy2(dev, torch.float32)
     if mode.row_output:
         row_dtype = (
             logits.dtype
@@ -234,8 +253,8 @@ def lse_row(
         res["lse"] = lb if lb is not None else lse_t.view(lead)
     elif lse_out is not None:
         raise ValueError("lse_out needs return_lse=True")
-    logp_t = _dummy(dev, torch.float32).view(1, 8)
-    tok = _dummy(dev, torch.int64).view(1, 8)
+    logp_t = _dummy2(dev, torch.float32)
+    tok = _dummy2(dev, torch.int64)
     K = 1
     if mode.logp:
         if token_ids is None:
@@ -302,7 +321,19 @@ def lse_row(
         bool(enable_pdl),
         k_slots_for(K),
     )
-    kernel(x2, y, lse_t, tok, logp_t, temp_arg, float(c), M, N, K)
+    kernel(
+        x2,
+        y,
+        lse_t,
+        tok,
+        logp_t,
+        temp_arg,
+        float(c),
+        M,
+        N,
+        K,
+        int(bool(enable_pdl)),
+    )
     return res
 
 
