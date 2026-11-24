@@ -70,7 +70,16 @@ class SfuEvalKernel:
                 mY[i] = rcp_approx_ftz(x)
 
 
-_KERNELS: Dict[int, Callable[..., None]] = {}
+_KERNELS: Dict[Tuple[int, str], Callable[..., None]] = {}
+
+
+def _kernel_key(which: int, device: torch.device) -> Tuple[int, str]:
+    """The in-process key of an evaluation kernel: the primitive and the device's architecture family (the compiled object
+    is the family's, as :func:`tables_for` keys the tables), so one process evaluating two parts never reuses the other
+    part's callable."""
+    from ...gemm.batch_invariant.api import part_of
+
+    return which, part_of(device)[1]
 
 
 def _eval(which: int, x: torch.Tensor) -> torch.Tensor:
@@ -79,7 +88,7 @@ def _eval(which: int, x: torch.Tensor) -> torch.Tensor:
 
     assert x.dtype == torch.float32 and x.is_cuda and x.is_contiguous(), x
     y = torch.empty_like(x)
-    key = which
+    key = _kernel_key(which, x.device)
     if key not in _KERNELS:
         name = "sfu_ex2" if which == 0 else "sfu_rcp"
 

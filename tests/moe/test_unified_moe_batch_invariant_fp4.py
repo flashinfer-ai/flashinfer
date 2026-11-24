@@ -3559,3 +3559,34 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
         torch.cuda.synchronize()
         assert torch.all(out2 == 0), swap
     assert torch.all(fused_moe_fp4(x, ids_none, wts_any, W, path="padded") == 0)
+
+
+# ----------------------------------------------------------------------------- review round 2
+
+
+def test_sfu_eval_kernels_are_keyed_by_architecture_family(monkeypatch):
+    """The SFU evaluation kernels' in-process cache is keyed by the primitive and the device's architecture family, as the
+    tables are: a process that evaluates an SM100 device and then an SM107 one compiles a callable per family and never
+    serves one family's object to the other; two devices of one family share it."""
+    import inspect
+
+    from flashinfer.batch_invariant.fp_interface import sfu
+    from flashinfer.gemm.batch_invariant import api as gemm_api
+
+    parts = {0: (148, "sm_100"), 1: (212, "sm_107"), 2: (212, "sm_107")}
+    monkeypatch.setattr(
+        gemm_api, "part_of", lambda device: parts[torch.device(device).index]
+    )
+    keys = {i: sfu._kernel_key(0, torch.device("cuda", i)) for i in parts}
+    assert keys[0] == (0, "sm_100") and keys[1] == (0, "sm_107")
+    assert keys[0] != keys[1] and keys[1] == keys[2]
+    assert sfu._kernel_key(1, torch.device("cuda", 0)) == (1, "sm_100")
+    assert (
+        len(
+            {sfu._kernel_key(w, torch.device("cuda", i)) for w in (0, 1) for i in parts}
+        )
+        == 4
+    )
+    assert "_kernel_key(which, x.device)" in inspect.getsource(sfu._eval)
+
+
