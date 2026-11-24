@@ -174,7 +174,6 @@ def test_rubin_nvfp4_batch_m_candidates(layout):
     for extra in (
         {"sm_arch": 100},
         {"sm_arch": 107, "fc1_has_bias": True},
-        {"sm_arch": 107, "use_per_token_sf_b": True},
         {"sm_arch": 107, "activation_type": int(ActivationType.Situ)},
     ):
         assert all(
@@ -186,6 +185,32 @@ def test_rubin_nvfp4_batch_m_candidates(layout):
     wide = map_trtllm_nvfp4_moe_tactic([1024, 0], sm_arch=107)
     assert wide.fc1.cfg.build().num_stages_workid == 1
     assert wide.fc2.cfg.build().num_stages_workid == 1
+
+
+@pytest.mark.parametrize("layout", (WeightLayout.MajorK, WeightLayout.BlockMajorK))
+@pytest.mark.parametrize("use_fused_finalize", (False, True))
+def test_rubin_nvfp4_large_prefill_per_token_tiles(layout, use_fused_finalize):
+    from flashinfer.prims_ts.moe.config_mapper import (
+        map_trtllm_nvfp4_moe_tactic,
+        valid_prims_ts_nvfp4_moe_tactics,
+    )
+
+    options = dict(
+        sm_arch=107,
+        num_tokens=8192,
+        top_k=8,
+        num_local_experts=32,
+        weight_layout=int(layout),
+        use_fused_finalize=use_fused_finalize,
+    )
+    unscaled = valid_prims_ts_nvfp4_moe_tactics(**options)
+    assert {tile for tile, _ in unscaled} == {512, 1024}
+
+    scaled = valid_prims_ts_nvfp4_moe_tactics(**options, use_per_token_sf_b=True)
+    assert {tile for tile, _ in scaled} == {128, 256}
+    for tile in (512, 1024):
+        with pytest.raises(ValueError, match=f"tile_N={tile}"):
+            map_trtllm_nvfp4_moe_tactic([tile, 0], **options, use_per_token_sf_b=True)
 
 
 @pytest.mark.parametrize("tile", (512, 1024))

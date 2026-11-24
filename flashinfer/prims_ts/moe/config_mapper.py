@@ -301,10 +301,12 @@ def _fp8_per_tensor_supported_tiles(*, use_per_token_sf_b: bool) -> tuple[int, .
     return SUPPORTED_FP8_TILE_N
 
 
-def _nvfp4_supported_tiles(sm_arch: int | None) -> tuple[int, ...]:
+def _nvfp4_supported_tiles(
+    sm_arch: int, *, use_per_token_sf_b: bool
+) -> tuple[int, ...]:
     return (
         SUPPORTED_RUBIN_NVFP4_TILE_N
-        if _resolve_moe_sm_arch(sm_arch) == 107
+        if sm_arch == 107 and not use_per_token_sf_b
         else SUPPORTED_NVFP4_TILE_N
     )
 
@@ -2086,7 +2088,9 @@ def valid_prims_ts_nvfp4_moe_tactics(
     sm_arch = _resolve_moe_sm_arch(sm_arch)
     tactics = _valid_json_moe_tactics(
         sm_arch=sm_arch,
-        supported_tiles=_nvfp4_supported_tiles(sm_arch),
+        supported_tiles=_nvfp4_supported_tiles(
+            sm_arch, use_per_token_sf_b=use_per_token_sf_b
+        ),
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
@@ -2409,12 +2413,14 @@ def map_trtllm_nvfp4_moe_tactic(
         # non-swap-AB 512/1024 tactics are selected explicitly or by autotuning.
         supported_tiles=SUPPORTED_NVFP4_TILE_N,
     )
-    if tile_n not in _nvfp4_supported_tiles(sm_arch):
+    sm_arch = _resolve_moe_sm_arch(sm_arch)
+    if tile_n not in _nvfp4_supported_tiles(
+        sm_arch, use_per_token_sf_b=use_per_token_sf_b
+    ):
         raise ValueError(f"Unsupported Prims-TS NVFP4 tile_N={tile_n}")
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
-    sm_arch = _resolve_moe_sm_arch(sm_arch)
     requested_index = moe_config_index
     policy_index = 0
     if use_fused_finalize and tile_n == 512 and moe_config_index >= 0:
