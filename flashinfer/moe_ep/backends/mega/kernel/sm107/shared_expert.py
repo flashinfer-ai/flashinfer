@@ -146,6 +146,16 @@ def validate_shared_inputs(config, tensors, fleet, *, quantize_input):
 
 @cache
 def _shared_bf16_stager():
+    import torch
+
+    from flashinfer.utils import version_at_least
+
+    # Torch added the saturating CUDA E4M3 cast in 2.12 for CUDA 13 builds.
+    if not (
+        version_at_least(torch.__version__, "2.12")
+        and version_at_least(torch.version.cuda or "0", "13.0")
+    ):
+        return None
     # Triton remains optional for the existing shared-expert path.
     try:
         from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.shared_staging import (
@@ -180,6 +190,7 @@ def stage_shared_inputs(tensors, workspace, *, quantize_input):
         and os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
         and workspace.shared_x.shape[0] <= 65_535 // 128 * 128
         and workspace.shared_x.numel() <= 2**31
+        and workspace.shared_x_sf.numel() <= 2**31
     ):
         stage = _shared_bf16_stager()
         if stage is not None:

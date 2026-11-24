@@ -161,7 +161,15 @@ def test_shared_staging_separate_input(cuda_device):
 
 @pytest.mark.parametrize(
     "mode",
-    ["strided", "e5m2", "padded_columns", "prequantized", "disabled", "large_capacity"],
+    [
+        "strided",
+        "e5m2",
+        "padded_columns",
+        "prequantized",
+        "disabled",
+        "large_capacity",
+        "large_blocked_scales",
+    ],
 )
 def test_shared_staging_fallback(cuda_device, monkeypatch, mode):
     def unexpected_fast_path():
@@ -177,8 +185,26 @@ def test_shared_staging_fallback(cuda_device, monkeypatch, mode):
     if mode != "strided":
         x = x.contiguous()
     workspace = _workspace(capacity, hidden, cuda_device, kind)
+    if mode == "large_blocked_scales":
+        monkeypatch.setattr(workspace.shared_x_sf, "numel", lambda: 2**31 + 1)
     sf = None
     if mode == "prequantized":
         x, sf = quantize_mxfp8_block32(x, workspace.shared_x.dtype)
     _stage(x, workspace, scales=sf)
     _check(x, workspace, scales=sf)
+
+
+@pytest.mark.parametrize(
+    "torch_version,cuda_version", [("2.11.0", "13.0"), ("2.12.0", "12.9")]
+)
+def test_shared_stager_requires_saturating_cast(
+    monkeypatch, torch_version, cuda_version
+):
+    stager = shared_expert._shared_bf16_stager
+    stager.cache_clear()
+    try:
+        monkeypatch.setattr(torch, "__version__", torch_version)
+        monkeypatch.setattr(torch.version, "cuda", cuda_version)
+        assert stager() is None
+    finally:
+        stager.cache_clear()
