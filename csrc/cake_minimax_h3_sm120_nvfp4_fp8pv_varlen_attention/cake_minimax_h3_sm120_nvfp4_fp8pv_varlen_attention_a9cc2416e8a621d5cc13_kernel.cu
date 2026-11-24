@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -69,7 +66,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int sub = tid & 7;
     int trow = tid >> 3;
     int col16 = sub * 16;
@@ -122,54 +119,54 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         int vseg[4];
         vlive[0] = ((tok_base + (chunk * 16 + 2 * t8) < total_tokens) ? 1 : 0);
         vseg[0] = tok_seg[((tok_base + (chunk * 16 + 2 * t8) < total_tokens) ? tok_base + (chunk * 16 + 2 * t8) : total_tokens - 1)];
-        float _vec_load_2[4];
+        float vec[4];
         {
             uint2 _vld_2;
             _vld_2 = *reinterpret_cast<const uint2*>(V + ((((tok_base + (chunk * 16 + 2 * t8) < total_tokens) ? tok_base + (chunk * 16 + 2 * t8) : total_tokens - 1) * num_heads + head) * 128 + ch) + 0);
             uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                (&_vec_load_2[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
-                (&_vec_load_2[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
+                (&vec[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                (&vec[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
             }
         }
         vlive[1] = ((tok_base + (chunk * 16 + 2 * t8 + 1) < total_tokens) ? 1 : 0);
         vseg[1] = tok_seg[((tok_base + (chunk * 16 + 2 * t8 + 1) < total_tokens) ? tok_base + (chunk * 16 + 2 * t8 + 1) : total_tokens - 1)];
-        float _vec_load_3[4];
+        float vec_0[4];
         {
             uint2 _vld_3;
             _vld_3 = *reinterpret_cast<const uint2*>(V + ((((tok_base + (chunk * 16 + 2 * t8 + 1) < total_tokens) ? tok_base + (chunk * 16 + 2 * t8 + 1) : total_tokens - 1) * num_heads + head) * 128 + ch) + 0);
             uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                (&_vec_load_3[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-                (&_vec_load_3[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
+                (&vec_0[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                (&vec_0[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
             }
         }
         vlive[2] = ((tok_base + (chunk * 16 + 8 + 2 * t8) < total_tokens) ? 1 : 0);
         vseg[2] = tok_seg[((tok_base + (chunk * 16 + 8 + 2 * t8) < total_tokens) ? tok_base + (chunk * 16 + 8 + 2 * t8) : total_tokens - 1)];
-        float _vec_load_4[4];
+        float vec_1[4];
         {
             uint2 _vld_4;
             _vld_4 = *reinterpret_cast<const uint2*>(V + ((((tok_base + (chunk * 16 + 8 + 2 * t8) < total_tokens) ? tok_base + (chunk * 16 + 8 + 2 * t8) : total_tokens - 1) * num_heads + head) * 128 + ch) + 0);
             uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                (&_vec_load_4[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
-                (&_vec_load_4[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
+                (&vec_1[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
+                (&vec_1[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
             }
         }
         vlive[3] = ((tok_base + (chunk * 16 + 8 + 2 * t8 + 1) < total_tokens) ? 1 : 0);
         vseg[3] = tok_seg[((tok_base + (chunk * 16 + 8 + 2 * t8 + 1) < total_tokens) ? tok_base + (chunk * 16 + 8 + 2 * t8 + 1) : total_tokens - 1)];
-        float _vec_load_5[4];
+        float vec_2[4];
         {
             uint2 _vld_5;
             _vld_5 = *reinterpret_cast<const uint2*>(V + ((((tok_base + (chunk * 16 + 8 + 2 * t8 + 1) < total_tokens) ? tok_base + (chunk * 16 + 8 + 2 * t8 + 1) : total_tokens - 1) * num_heads + head) * 128 + ch) + 0);
             uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                (&_vec_load_5[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
-                (&_vec_load_5[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
+                (&vec_2[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
+                (&vec_2[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
             }
         }
         __syncthreads();
@@ -452,22 +449,22 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         qf[13] = (((sub >> 2 & 1) == 1) ? tmp[13] - qf[13] : qf[13] + tmp[13]);
         qf[14] = (((sub >> 2 & 1) == 1) ? tmp[14] - qf[14] : qf[14] + tmp[14]);
         qf[15] = (((sub >> 2 & 1) == 1) ? tmp[15] - qf[15] : qf[15] + tmp[15]);
-        qf[0] = qf[0] * (sgn_hi * 0.08838834764831843f);
-        qf[1] = qf[1] * (sgn_hi * -0.08838834764831843f);
-        qf[2] = qf[2] * (sgn_hi * 0.08838834764831843f);
-        qf[3] = qf[3] * (sgn_hi * 0.08838834764831843f);
-        qf[4] = qf[4] * (sgn_hi * -0.08838834764831843f);
-        qf[5] = qf[5] * (sgn_hi * 0.08838834764831843f);
-        qf[6] = qf[6] * (sgn_hi * -0.08838834764831843f);
-        qf[7] = qf[7] * (sgn_hi * -0.08838834764831843f);
-        qf[8] = qf[8] * (sgn_hi * 0.08838834764831843f);
-        qf[9] = qf[9] * (sgn_hi * 0.08838834764831843f);
-        qf[10] = qf[10] * (sgn_hi * -0.08838834764831843f);
-        qf[11] = qf[11] * (sgn_hi * 0.08838834764831843f);
-        qf[12] = qf[12] * (sgn_hi * -0.08838834764831843f);
-        qf[13] = qf[13] * (sgn_hi * -0.08838834764831843f);
-        qf[14] = qf[14] * (sgn_hi * 0.08838834764831843f);
-        qf[15] = qf[15] * (sgn_hi * -0.08838834764831843f);
+        qf[0] = qf[0] * (sgn_hi * 0.088388346f);
+        qf[1] = qf[1] * (sgn_hi * -0.088388346f);
+        qf[2] = qf[2] * (sgn_hi * 0.088388346f);
+        qf[3] = qf[3] * (sgn_hi * 0.088388346f);
+        qf[4] = qf[4] * (sgn_hi * -0.088388346f);
+        qf[5] = qf[5] * (sgn_hi * 0.088388346f);
+        qf[6] = qf[6] * (sgn_hi * -0.088388346f);
+        qf[7] = qf[7] * (sgn_hi * -0.088388346f);
+        qf[8] = qf[8] * (sgn_hi * 0.088388346f);
+        qf[9] = qf[9] * (sgn_hi * 0.088388346f);
+        qf[10] = qf[10] * (sgn_hi * -0.088388346f);
+        qf[11] = qf[11] * (sgn_hi * 0.088388346f);
+        qf[12] = qf[12] * (sgn_hi * -0.088388346f);
+        qf[13] = qf[13] * (sgn_hi * -0.088388346f);
+        qf[14] = qf[14] * (sgn_hi * 0.088388346f);
+        qf[15] = qf[15] * (sgn_hi * -0.088388346f);
         float qamax = 0.0f;
         float bmax = 0.0f;
         for (int e_1 = 0; e_1 < 16; e_1++) {
@@ -482,7 +479,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         qamax = fmaxf(qamax, 1e-12f);
         float qs = __fdiv_rn(qamax, 2688.0f);
         float qg = __fdiv_rn(2688.0f, qamax);
-        float qsf_val = bmax * qg * 0.16666666666666666f;
+        float qsf_val = bmax * qg * 0.16666667f;
         uint16_t _cvt_satfinite_e4m3x2_f32_57;
         asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_57) : "f"(0.0f), "f"(qsf_val));
         uint16_t _e4m3x2_decode_58 = (uint16_t)((unsigned int)_cvt_satfinite_e4m3x2_f32_57 & 0xFFu);
@@ -508,13 +505,11 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         unsigned int _shfl_xor_sync_61 = __shfl_xor_sync(0xFFFFFFFF, qw[1], 1);
         qstore[3] = _shfl_xor_sync_61;
         if (valid == 1) {
-            {
-                unsigned short _sf_pair;
-                asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(qsf_val));
-                *(reinterpret_cast<unsigned char*>(q_sf + ((tok * num_heads + head) * 8 + sub)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
-            }
+            uint16_t _cvt_satfinite_e4m3x2_f32_62;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_62) : "f"(0.0f), "f"(qsf_val));
+            *reinterpret_cast<unsigned char*>(q_sf + ((tok * num_heads + head) * 8 + sub)) = (unsigned char)((unsigned int)(unsigned char)(_cvt_satfinite_e4m3x2_f32_62 & 127));
             if ((sub & 1) == 0) {
-                reinterpret_cast<int4*>(q4 + (((tok * num_heads + head) * 64 + sub * 8) / 4))[0] = reinterpret_cast<int4*>(qstore)[0];
+                reinterpret_cast<int4*>(q4 + ((tok * num_heads + head) * 64 + sub * 8) / 4)[0] = reinterpret_cast<int4*>(qstore)[0];
             }
             if (sub == 0) {
                 *(reinterpret_cast<float*>(q_scale + (tok * num_heads + head)) + (0)) = qs;
@@ -665,38 +660,38 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         kf16[13] = tmp[13];
         kf16[14] = tmp[14];
         kf16[15] = tmp[15];
-        float _shfl_xor_sync_63 = __shfl_xor_sync(0xFFFFFFFF, kf16[0], 1);
-        tmp[0] = _shfl_xor_sync_63;
-        float _shfl_xor_sync_64 = __shfl_xor_sync(0xFFFFFFFF, kf16[1], 1);
-        tmp[1] = _shfl_xor_sync_64;
-        float _shfl_xor_sync_65 = __shfl_xor_sync(0xFFFFFFFF, kf16[2], 1);
-        tmp[2] = _shfl_xor_sync_65;
-        float _shfl_xor_sync_66 = __shfl_xor_sync(0xFFFFFFFF, kf16[3], 1);
-        tmp[3] = _shfl_xor_sync_66;
-        float _shfl_xor_sync_67 = __shfl_xor_sync(0xFFFFFFFF, kf16[4], 1);
-        tmp[4] = _shfl_xor_sync_67;
-        float _shfl_xor_sync_68 = __shfl_xor_sync(0xFFFFFFFF, kf16[5], 1);
-        tmp[5] = _shfl_xor_sync_68;
-        float _shfl_xor_sync_69 = __shfl_xor_sync(0xFFFFFFFF, kf16[6], 1);
-        tmp[6] = _shfl_xor_sync_69;
-        float _shfl_xor_sync_70 = __shfl_xor_sync(0xFFFFFFFF, kf16[7], 1);
-        tmp[7] = _shfl_xor_sync_70;
-        float _shfl_xor_sync_71 = __shfl_xor_sync(0xFFFFFFFF, kf16[8], 1);
-        tmp[8] = _shfl_xor_sync_71;
-        float _shfl_xor_sync_72 = __shfl_xor_sync(0xFFFFFFFF, kf16[9], 1);
-        tmp[9] = _shfl_xor_sync_72;
-        float _shfl_xor_sync_73 = __shfl_xor_sync(0xFFFFFFFF, kf16[10], 1);
-        tmp[10] = _shfl_xor_sync_73;
-        float _shfl_xor_sync_74 = __shfl_xor_sync(0xFFFFFFFF, kf16[11], 1);
-        tmp[11] = _shfl_xor_sync_74;
-        float _shfl_xor_sync_75 = __shfl_xor_sync(0xFFFFFFFF, kf16[12], 1);
-        tmp[12] = _shfl_xor_sync_75;
-        float _shfl_xor_sync_76 = __shfl_xor_sync(0xFFFFFFFF, kf16[13], 1);
-        tmp[13] = _shfl_xor_sync_76;
-        float _shfl_xor_sync_77 = __shfl_xor_sync(0xFFFFFFFF, kf16[14], 1);
-        tmp[14] = _shfl_xor_sync_77;
-        float _shfl_xor_sync_78 = __shfl_xor_sync(0xFFFFFFFF, kf16[15], 1);
-        tmp[15] = _shfl_xor_sync_78;
+        float _shfl_xor_sync_64 = __shfl_xor_sync(0xFFFFFFFF, kf16[0], 1);
+        tmp[0] = _shfl_xor_sync_64;
+        float _shfl_xor_sync_65 = __shfl_xor_sync(0xFFFFFFFF, kf16[1], 1);
+        tmp[1] = _shfl_xor_sync_65;
+        float _shfl_xor_sync_66 = __shfl_xor_sync(0xFFFFFFFF, kf16[2], 1);
+        tmp[2] = _shfl_xor_sync_66;
+        float _shfl_xor_sync_67 = __shfl_xor_sync(0xFFFFFFFF, kf16[3], 1);
+        tmp[3] = _shfl_xor_sync_67;
+        float _shfl_xor_sync_68 = __shfl_xor_sync(0xFFFFFFFF, kf16[4], 1);
+        tmp[4] = _shfl_xor_sync_68;
+        float _shfl_xor_sync_69 = __shfl_xor_sync(0xFFFFFFFF, kf16[5], 1);
+        tmp[5] = _shfl_xor_sync_69;
+        float _shfl_xor_sync_70 = __shfl_xor_sync(0xFFFFFFFF, kf16[6], 1);
+        tmp[6] = _shfl_xor_sync_70;
+        float _shfl_xor_sync_71 = __shfl_xor_sync(0xFFFFFFFF, kf16[7], 1);
+        tmp[7] = _shfl_xor_sync_71;
+        float _shfl_xor_sync_72 = __shfl_xor_sync(0xFFFFFFFF, kf16[8], 1);
+        tmp[8] = _shfl_xor_sync_72;
+        float _shfl_xor_sync_73 = __shfl_xor_sync(0xFFFFFFFF, kf16[9], 1);
+        tmp[9] = _shfl_xor_sync_73;
+        float _shfl_xor_sync_74 = __shfl_xor_sync(0xFFFFFFFF, kf16[10], 1);
+        tmp[10] = _shfl_xor_sync_74;
+        float _shfl_xor_sync_75 = __shfl_xor_sync(0xFFFFFFFF, kf16[11], 1);
+        tmp[11] = _shfl_xor_sync_75;
+        float _shfl_xor_sync_76 = __shfl_xor_sync(0xFFFFFFFF, kf16[12], 1);
+        tmp[12] = _shfl_xor_sync_76;
+        float _shfl_xor_sync_77 = __shfl_xor_sync(0xFFFFFFFF, kf16[13], 1);
+        tmp[13] = _shfl_xor_sync_77;
+        float _shfl_xor_sync_78 = __shfl_xor_sync(0xFFFFFFFF, kf16[14], 1);
+        tmp[14] = _shfl_xor_sync_78;
+        float _shfl_xor_sync_79 = __shfl_xor_sync(0xFFFFFFFF, kf16[15], 1);
+        tmp[15] = _shfl_xor_sync_79;
         kf16[0] = (((sub & 1) == 1) ? tmp[0] - kf16[0] : kf16[0] + tmp[0]);
         kf16[1] = (((sub & 1) == 1) ? tmp[1] - kf16[1] : kf16[1] + tmp[1]);
         kf16[2] = (((sub & 1) == 1) ? tmp[2] - kf16[2] : kf16[2] + tmp[2]);
@@ -713,38 +708,38 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         kf16[13] = (((sub & 1) == 1) ? tmp[13] - kf16[13] : kf16[13] + tmp[13]);
         kf16[14] = (((sub & 1) == 1) ? tmp[14] - kf16[14] : kf16[14] + tmp[14]);
         kf16[15] = (((sub & 1) == 1) ? tmp[15] - kf16[15] : kf16[15] + tmp[15]);
-        float _shfl_xor_sync_79 = __shfl_xor_sync(0xFFFFFFFF, kf16[0], 2);
-        tmp[0] = _shfl_xor_sync_79;
-        float _shfl_xor_sync_80 = __shfl_xor_sync(0xFFFFFFFF, kf16[1], 2);
-        tmp[1] = _shfl_xor_sync_80;
-        float _shfl_xor_sync_81 = __shfl_xor_sync(0xFFFFFFFF, kf16[2], 2);
-        tmp[2] = _shfl_xor_sync_81;
-        float _shfl_xor_sync_82 = __shfl_xor_sync(0xFFFFFFFF, kf16[3], 2);
-        tmp[3] = _shfl_xor_sync_82;
-        float _shfl_xor_sync_83 = __shfl_xor_sync(0xFFFFFFFF, kf16[4], 2);
-        tmp[4] = _shfl_xor_sync_83;
-        float _shfl_xor_sync_84 = __shfl_xor_sync(0xFFFFFFFF, kf16[5], 2);
-        tmp[5] = _shfl_xor_sync_84;
-        float _shfl_xor_sync_85 = __shfl_xor_sync(0xFFFFFFFF, kf16[6], 2);
-        tmp[6] = _shfl_xor_sync_85;
-        float _shfl_xor_sync_86 = __shfl_xor_sync(0xFFFFFFFF, kf16[7], 2);
-        tmp[7] = _shfl_xor_sync_86;
-        float _shfl_xor_sync_87 = __shfl_xor_sync(0xFFFFFFFF, kf16[8], 2);
-        tmp[8] = _shfl_xor_sync_87;
-        float _shfl_xor_sync_88 = __shfl_xor_sync(0xFFFFFFFF, kf16[9], 2);
-        tmp[9] = _shfl_xor_sync_88;
-        float _shfl_xor_sync_89 = __shfl_xor_sync(0xFFFFFFFF, kf16[10], 2);
-        tmp[10] = _shfl_xor_sync_89;
-        float _shfl_xor_sync_90 = __shfl_xor_sync(0xFFFFFFFF, kf16[11], 2);
-        tmp[11] = _shfl_xor_sync_90;
-        float _shfl_xor_sync_91 = __shfl_xor_sync(0xFFFFFFFF, kf16[12], 2);
-        tmp[12] = _shfl_xor_sync_91;
-        float _shfl_xor_sync_92 = __shfl_xor_sync(0xFFFFFFFF, kf16[13], 2);
-        tmp[13] = _shfl_xor_sync_92;
-        float _shfl_xor_sync_93 = __shfl_xor_sync(0xFFFFFFFF, kf16[14], 2);
-        tmp[14] = _shfl_xor_sync_93;
-        float _shfl_xor_sync_94 = __shfl_xor_sync(0xFFFFFFFF, kf16[15], 2);
-        tmp[15] = _shfl_xor_sync_94;
+        float _shfl_xor_sync_80 = __shfl_xor_sync(0xFFFFFFFF, kf16[0], 2);
+        tmp[0] = _shfl_xor_sync_80;
+        float _shfl_xor_sync_81 = __shfl_xor_sync(0xFFFFFFFF, kf16[1], 2);
+        tmp[1] = _shfl_xor_sync_81;
+        float _shfl_xor_sync_82 = __shfl_xor_sync(0xFFFFFFFF, kf16[2], 2);
+        tmp[2] = _shfl_xor_sync_82;
+        float _shfl_xor_sync_83 = __shfl_xor_sync(0xFFFFFFFF, kf16[3], 2);
+        tmp[3] = _shfl_xor_sync_83;
+        float _shfl_xor_sync_84 = __shfl_xor_sync(0xFFFFFFFF, kf16[4], 2);
+        tmp[4] = _shfl_xor_sync_84;
+        float _shfl_xor_sync_85 = __shfl_xor_sync(0xFFFFFFFF, kf16[5], 2);
+        tmp[5] = _shfl_xor_sync_85;
+        float _shfl_xor_sync_86 = __shfl_xor_sync(0xFFFFFFFF, kf16[6], 2);
+        tmp[6] = _shfl_xor_sync_86;
+        float _shfl_xor_sync_87 = __shfl_xor_sync(0xFFFFFFFF, kf16[7], 2);
+        tmp[7] = _shfl_xor_sync_87;
+        float _shfl_xor_sync_88 = __shfl_xor_sync(0xFFFFFFFF, kf16[8], 2);
+        tmp[8] = _shfl_xor_sync_88;
+        float _shfl_xor_sync_89 = __shfl_xor_sync(0xFFFFFFFF, kf16[9], 2);
+        tmp[9] = _shfl_xor_sync_89;
+        float _shfl_xor_sync_90 = __shfl_xor_sync(0xFFFFFFFF, kf16[10], 2);
+        tmp[10] = _shfl_xor_sync_90;
+        float _shfl_xor_sync_91 = __shfl_xor_sync(0xFFFFFFFF, kf16[11], 2);
+        tmp[11] = _shfl_xor_sync_91;
+        float _shfl_xor_sync_92 = __shfl_xor_sync(0xFFFFFFFF, kf16[12], 2);
+        tmp[12] = _shfl_xor_sync_92;
+        float _shfl_xor_sync_93 = __shfl_xor_sync(0xFFFFFFFF, kf16[13], 2);
+        tmp[13] = _shfl_xor_sync_93;
+        float _shfl_xor_sync_94 = __shfl_xor_sync(0xFFFFFFFF, kf16[14], 2);
+        tmp[14] = _shfl_xor_sync_94;
+        float _shfl_xor_sync_95 = __shfl_xor_sync(0xFFFFFFFF, kf16[15], 2);
+        tmp[15] = _shfl_xor_sync_95;
         kf16[0] = (((sub >> 1 & 1) == 1) ? tmp[0] - kf16[0] : kf16[0] + tmp[0]);
         kf16[1] = (((sub >> 1 & 1) == 1) ? tmp[1] - kf16[1] : kf16[1] + tmp[1]);
         kf16[2] = (((sub >> 1 & 1) == 1) ? tmp[2] - kf16[2] : kf16[2] + tmp[2]);
@@ -761,38 +756,38 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         kf16[13] = (((sub >> 1 & 1) == 1) ? tmp[13] - kf16[13] : kf16[13] + tmp[13]);
         kf16[14] = (((sub >> 1 & 1) == 1) ? tmp[14] - kf16[14] : kf16[14] + tmp[14]);
         kf16[15] = (((sub >> 1 & 1) == 1) ? tmp[15] - kf16[15] : kf16[15] + tmp[15]);
-        float _shfl_xor_sync_95 = __shfl_xor_sync(0xFFFFFFFF, kf16[0], 4);
-        tmp[0] = _shfl_xor_sync_95;
-        float _shfl_xor_sync_96 = __shfl_xor_sync(0xFFFFFFFF, kf16[1], 4);
-        tmp[1] = _shfl_xor_sync_96;
-        float _shfl_xor_sync_97 = __shfl_xor_sync(0xFFFFFFFF, kf16[2], 4);
-        tmp[2] = _shfl_xor_sync_97;
-        float _shfl_xor_sync_98 = __shfl_xor_sync(0xFFFFFFFF, kf16[3], 4);
-        tmp[3] = _shfl_xor_sync_98;
-        float _shfl_xor_sync_99 = __shfl_xor_sync(0xFFFFFFFF, kf16[4], 4);
-        tmp[4] = _shfl_xor_sync_99;
-        float _shfl_xor_sync_100 = __shfl_xor_sync(0xFFFFFFFF, kf16[5], 4);
-        tmp[5] = _shfl_xor_sync_100;
-        float _shfl_xor_sync_101 = __shfl_xor_sync(0xFFFFFFFF, kf16[6], 4);
-        tmp[6] = _shfl_xor_sync_101;
-        float _shfl_xor_sync_102 = __shfl_xor_sync(0xFFFFFFFF, kf16[7], 4);
-        tmp[7] = _shfl_xor_sync_102;
-        float _shfl_xor_sync_103 = __shfl_xor_sync(0xFFFFFFFF, kf16[8], 4);
-        tmp[8] = _shfl_xor_sync_103;
-        float _shfl_xor_sync_104 = __shfl_xor_sync(0xFFFFFFFF, kf16[9], 4);
-        tmp[9] = _shfl_xor_sync_104;
-        float _shfl_xor_sync_105 = __shfl_xor_sync(0xFFFFFFFF, kf16[10], 4);
-        tmp[10] = _shfl_xor_sync_105;
-        float _shfl_xor_sync_106 = __shfl_xor_sync(0xFFFFFFFF, kf16[11], 4);
-        tmp[11] = _shfl_xor_sync_106;
-        float _shfl_xor_sync_107 = __shfl_xor_sync(0xFFFFFFFF, kf16[12], 4);
-        tmp[12] = _shfl_xor_sync_107;
-        float _shfl_xor_sync_108 = __shfl_xor_sync(0xFFFFFFFF, kf16[13], 4);
-        tmp[13] = _shfl_xor_sync_108;
-        float _shfl_xor_sync_109 = __shfl_xor_sync(0xFFFFFFFF, kf16[14], 4);
-        tmp[14] = _shfl_xor_sync_109;
-        float _shfl_xor_sync_110 = __shfl_xor_sync(0xFFFFFFFF, kf16[15], 4);
-        tmp[15] = _shfl_xor_sync_110;
+        float _shfl_xor_sync_96 = __shfl_xor_sync(0xFFFFFFFF, kf16[0], 4);
+        tmp[0] = _shfl_xor_sync_96;
+        float _shfl_xor_sync_97 = __shfl_xor_sync(0xFFFFFFFF, kf16[1], 4);
+        tmp[1] = _shfl_xor_sync_97;
+        float _shfl_xor_sync_98 = __shfl_xor_sync(0xFFFFFFFF, kf16[2], 4);
+        tmp[2] = _shfl_xor_sync_98;
+        float _shfl_xor_sync_99 = __shfl_xor_sync(0xFFFFFFFF, kf16[3], 4);
+        tmp[3] = _shfl_xor_sync_99;
+        float _shfl_xor_sync_100 = __shfl_xor_sync(0xFFFFFFFF, kf16[4], 4);
+        tmp[4] = _shfl_xor_sync_100;
+        float _shfl_xor_sync_101 = __shfl_xor_sync(0xFFFFFFFF, kf16[5], 4);
+        tmp[5] = _shfl_xor_sync_101;
+        float _shfl_xor_sync_102 = __shfl_xor_sync(0xFFFFFFFF, kf16[6], 4);
+        tmp[6] = _shfl_xor_sync_102;
+        float _shfl_xor_sync_103 = __shfl_xor_sync(0xFFFFFFFF, kf16[7], 4);
+        tmp[7] = _shfl_xor_sync_103;
+        float _shfl_xor_sync_104 = __shfl_xor_sync(0xFFFFFFFF, kf16[8], 4);
+        tmp[8] = _shfl_xor_sync_104;
+        float _shfl_xor_sync_105 = __shfl_xor_sync(0xFFFFFFFF, kf16[9], 4);
+        tmp[9] = _shfl_xor_sync_105;
+        float _shfl_xor_sync_106 = __shfl_xor_sync(0xFFFFFFFF, kf16[10], 4);
+        tmp[10] = _shfl_xor_sync_106;
+        float _shfl_xor_sync_107 = __shfl_xor_sync(0xFFFFFFFF, kf16[11], 4);
+        tmp[11] = _shfl_xor_sync_107;
+        float _shfl_xor_sync_108 = __shfl_xor_sync(0xFFFFFFFF, kf16[12], 4);
+        tmp[12] = _shfl_xor_sync_108;
+        float _shfl_xor_sync_109 = __shfl_xor_sync(0xFFFFFFFF, kf16[13], 4);
+        tmp[13] = _shfl_xor_sync_109;
+        float _shfl_xor_sync_110 = __shfl_xor_sync(0xFFFFFFFF, kf16[14], 4);
+        tmp[14] = _shfl_xor_sync_110;
+        float _shfl_xor_sync_111 = __shfl_xor_sync(0xFFFFFFFF, kf16[15], 4);
+        tmp[15] = _shfl_xor_sync_111;
         kf16[0] = (((sub >> 2 & 1) == 1) ? tmp[0] - kf16[0] : kf16[0] + tmp[0]);
         kf16[1] = (((sub >> 2 & 1) == 1) ? tmp[1] - kf16[1] : kf16[1] + tmp[1]);
         kf16[2] = (((sub >> 2 & 1) == 1) ? tmp[2] - kf16[2] : kf16[2] + tmp[2]);
@@ -809,39 +804,39 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         kf16[13] = (((sub >> 2 & 1) == 1) ? tmp[13] - kf16[13] : kf16[13] + tmp[13]);
         kf16[14] = (((sub >> 2 & 1) == 1) ? tmp[14] - kf16[14] : kf16[14] + tmp[14]);
         kf16[15] = (((sub >> 2 & 1) == 1) ? tmp[15] - kf16[15] : kf16[15] + tmp[15]);
-        kf16[0] = kf16[0] * (sgn_hi * 0.08838834764831843f);
-        kf16[1] = kf16[1] * (sgn_hi * -0.08838834764831843f);
-        kf16[2] = kf16[2] * (sgn_hi * 0.08838834764831843f);
-        kf16[3] = kf16[3] * (sgn_hi * 0.08838834764831843f);
-        kf16[4] = kf16[4] * (sgn_hi * -0.08838834764831843f);
-        kf16[5] = kf16[5] * (sgn_hi * 0.08838834764831843f);
-        kf16[6] = kf16[6] * (sgn_hi * -0.08838834764831843f);
-        kf16[7] = kf16[7] * (sgn_hi * -0.08838834764831843f);
-        kf16[8] = kf16[8] * (sgn_hi * 0.08838834764831843f);
-        kf16[9] = kf16[9] * (sgn_hi * 0.08838834764831843f);
-        kf16[10] = kf16[10] * (sgn_hi * -0.08838834764831843f);
-        kf16[11] = kf16[11] * (sgn_hi * 0.08838834764831843f);
-        kf16[12] = kf16[12] * (sgn_hi * -0.08838834764831843f);
-        kf16[13] = kf16[13] * (sgn_hi * -0.08838834764831843f);
-        kf16[14] = kf16[14] * (sgn_hi * 0.08838834764831843f);
-        kf16[15] = kf16[15] * (sgn_hi * -0.08838834764831843f);
+        kf16[0] = kf16[0] * (sgn_hi * 0.088388346f);
+        kf16[1] = kf16[1] * (sgn_hi * -0.088388346f);
+        kf16[2] = kf16[2] * (sgn_hi * 0.088388346f);
+        kf16[3] = kf16[3] * (sgn_hi * 0.088388346f);
+        kf16[4] = kf16[4] * (sgn_hi * -0.088388346f);
+        kf16[5] = kf16[5] * (sgn_hi * 0.088388346f);
+        kf16[6] = kf16[6] * (sgn_hi * -0.088388346f);
+        kf16[7] = kf16[7] * (sgn_hi * -0.088388346f);
+        kf16[8] = kf16[8] * (sgn_hi * 0.088388346f);
+        kf16[9] = kf16[9] * (sgn_hi * 0.088388346f);
+        kf16[10] = kf16[10] * (sgn_hi * -0.088388346f);
+        kf16[11] = kf16[11] * (sgn_hi * 0.088388346f);
+        kf16[12] = kf16[12] * (sgn_hi * -0.088388346f);
+        kf16[13] = kf16[13] * (sgn_hi * -0.088388346f);
+        kf16[14] = kf16[14] * (sgn_hi * 0.088388346f);
+        kf16[15] = kf16[15] * (sgn_hi * -0.088388346f);
         float kbmax = 0.0f;
         for (int e_4 = 0; e_4 < 16; e_4++) {
             kbmax = fmaxf(kbmax, fabsf(kf16[e_4]));
         }
         float ks = k_scale[seg * num_heads + head];
         float kg = __fdiv_rn(1.0f, ks);
-        float ksf_val = kbmax * kg * 0.16666666666666666f;
-        uint16_t _cvt_satfinite_e4m3x2_f32_111;
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_111) : "f"(0.0f), "f"(ksf_val));
-        uint16_t _e4m3x2_decode_112 = (uint16_t)((unsigned int)_cvt_satfinite_e4m3x2_f32_111 & 0xFFu);
-        uint32_t _f16x2_decode_112;
+        float ksf_val = kbmax * kg * 0.16666667f;
+        uint16_t _cvt_satfinite_e4m3x2_f32_112;
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_112) : "f"(0.0f), "f"(ksf_val));
+        uint16_t _e4m3x2_decode_113 = (uint16_t)((unsigned int)_cvt_satfinite_e4m3x2_f32_112 & 0xFFu);
+        uint32_t _f16x2_decode_113;
         float ksf_dec;
-        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_112) : "h"(_e4m3x2_decode_112));
-        uint16_t _f16_decode_112 = (uint16_t)_f16x2_decode_112;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(ksf_dec) : "h"(_f16_decode_112));
-        float _fdiv_113 = __fdiv_rn(kg, ksf_dec);
-        float kout = ((ksf_dec != 0.0f) ? _fdiv_113 : 0.0f);
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_113) : "h"(_e4m3x2_decode_113));
+        uint16_t _f16_decode_113 = (uint16_t)_f16x2_decode_113;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(ksf_dec) : "h"(_f16_decode_113));
+        float _fdiv_114 = __fdiv_rn(kg, ksf_dec);
+        float kout = ((ksf_dec != 0.0f) ? _fdiv_114 : 0.0f);
         float kn[16];
         for (int e_5 = 0; e_5 < 16; e_5++) {
             kn[e_5] = kf16[e_5] * kout;
@@ -850,20 +845,18 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(kw[0]) : "f"(kn[0]), "f"(kn[1]), "f"(kn[2]), "f"(kn[3]), "f"(kn[4]), "f"(kn[5]), "f"(kn[6]), "f"(kn[7]));
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(kw[1]) : "f"(kn[8]), "f"(kn[9]), "f"(kn[10]), "f"(kn[11]), "f"(kn[12]), "f"(kn[13]), "f"(kn[14]), "f"(kn[15]));
         unsigned int kstore[4];
-        unsigned int _shfl_xor_sync_114 = __shfl_xor_sync(0xFFFFFFFF, kw[0], 1);
-        kstore[0] = _shfl_xor_sync_114;
-        unsigned int _shfl_xor_sync_115 = __shfl_xor_sync(0xFFFFFFFF, kw[1], 1);
-        kstore[1] = _shfl_xor_sync_115;
+        unsigned int _shfl_xor_sync_115 = __shfl_xor_sync(0xFFFFFFFF, kw[0], 1);
+        kstore[0] = _shfl_xor_sync_115;
+        unsigned int _shfl_xor_sync_116 = __shfl_xor_sync(0xFFFFFFFF, kw[1], 1);
+        kstore[1] = _shfl_xor_sync_116;
         kstore[2] = kw[0];
         kstore[3] = kw[1];
-        {
-            unsigned short _sf_pair;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(ksf_val));
-            *(reinterpret_cast<unsigned char*>(k_sf + (((head * num_kblocks + (tok >> 7)) * 128 + (tok & 127)) * 8 + sub)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
-        }
+        uint16_t _cvt_satfinite_e4m3x2_f32_117;
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_117) : "f"(0.0f), "f"(ksf_val));
+        *reinterpret_cast<unsigned char*>(k_sf + (((head * num_kblocks + (tok >> 7)) * 128 + (tok & 127)) * 8 + sub)) = (unsigned char)((unsigned int)(unsigned char)(_cvt_satfinite_e4m3x2_f32_117 & 127));
         if (valid == 1) {
             if ((sub & 1) == 1) {
-                reinterpret_cast<int4*>(k4 + (((tok * num_heads + head) * 64 + (sub - 1) * 8) / 4))[0] = reinterpret_cast<int4*>(kstore)[0];
+                reinterpret_cast<int4*>(k4 + ((tok * num_heads + head) * 64 + (sub - 1) * 8) / 4)[0] = reinterpret_cast<int4*>(kstore)[0];
             }
         }
         float vq[16];
@@ -876,18 +869,18 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
             _vec_load_7[0 + 2] = _v4.z;
             _vec_load_7[0 + 3] = _v4.w;
         }
-        vf4[0] = _vec_load_2[0];
-        vf4[1] = _vec_load_2[1];
-        vf4[2] = _vec_load_2[2];
-        vf4[3] = _vec_load_2[3];
-        float _fdiv_117 = __fdiv_rn(vf4[0], _vec_load_7[0]);
-        vq[0] = ((vlive[0] == 1) ? _fdiv_117 : 0.0f);
-        float _fdiv_118 = __fdiv_rn(vf4[1], _vec_load_7[1]);
-        vq[1] = ((vlive[0] == 1) ? _fdiv_118 : 0.0f);
-        float _fdiv_119 = __fdiv_rn(vf4[2], _vec_load_7[2]);
-        vq[2] = ((vlive[0] == 1) ? _fdiv_119 : 0.0f);
-        float _fdiv_120 = __fdiv_rn(vf4[3], _vec_load_7[3]);
-        vq[3] = ((vlive[0] == 1) ? _fdiv_120 : 0.0f);
+        vf4[0] = vec[0];
+        vf4[1] = vec[1];
+        vf4[2] = vec[2];
+        vf4[3] = vec[3];
+        float _fdiv_119 = __fdiv_rn(vf4[0], _vec_load_7[0]);
+        vq[0] = ((vlive[0] == 1) ? _fdiv_119 : 0.0f);
+        float _fdiv_120 = __fdiv_rn(vf4[1], _vec_load_7[1]);
+        vq[1] = ((vlive[0] == 1) ? _fdiv_120 : 0.0f);
+        float _fdiv_121 = __fdiv_rn(vf4[2], _vec_load_7[2]);
+        vq[2] = ((vlive[0] == 1) ? _fdiv_121 : 0.0f);
+        float _fdiv_122 = __fdiv_rn(vf4[3], _vec_load_7[3]);
+        vq[3] = ((vlive[0] == 1) ? _fdiv_122 : 0.0f);
         float _vec_load_8[4];
         {
             float4 _v4 = *reinterpret_cast<const float4*>(v_scale + ((vseg[1] * num_heads + head) * 128 + ch) + 0);
@@ -896,18 +889,18 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
             _vec_load_8[0 + 2] = _v4.z;
             _vec_load_8[0 + 3] = _v4.w;
         }
-        vf4[0] = _vec_load_3[0];
-        vf4[1] = _vec_load_3[1];
-        vf4[2] = _vec_load_3[2];
-        vf4[3] = _vec_load_3[3];
-        float _fdiv_122 = __fdiv_rn(vf4[0], _vec_load_8[0]);
-        vq[4] = ((vlive[1] == 1) ? _fdiv_122 : 0.0f);
-        float _fdiv_123 = __fdiv_rn(vf4[1], _vec_load_8[1]);
-        vq[5] = ((vlive[1] == 1) ? _fdiv_123 : 0.0f);
-        float _fdiv_124 = __fdiv_rn(vf4[2], _vec_load_8[2]);
-        vq[6] = ((vlive[1] == 1) ? _fdiv_124 : 0.0f);
-        float _fdiv_125 = __fdiv_rn(vf4[3], _vec_load_8[3]);
-        vq[7] = ((vlive[1] == 1) ? _fdiv_125 : 0.0f);
+        vf4[0] = vec_0[0];
+        vf4[1] = vec_0[1];
+        vf4[2] = vec_0[2];
+        vf4[3] = vec_0[3];
+        float _fdiv_124 = __fdiv_rn(vf4[0], _vec_load_8[0]);
+        vq[4] = ((vlive[1] == 1) ? _fdiv_124 : 0.0f);
+        float _fdiv_125 = __fdiv_rn(vf4[1], _vec_load_8[1]);
+        vq[5] = ((vlive[1] == 1) ? _fdiv_125 : 0.0f);
+        float _fdiv_126 = __fdiv_rn(vf4[2], _vec_load_8[2]);
+        vq[6] = ((vlive[1] == 1) ? _fdiv_126 : 0.0f);
+        float _fdiv_127 = __fdiv_rn(vf4[3], _vec_load_8[3]);
+        vq[7] = ((vlive[1] == 1) ? _fdiv_127 : 0.0f);
         float _vec_load_9[4];
         {
             float4 _v4 = *reinterpret_cast<const float4*>(v_scale + ((vseg[2] * num_heads + head) * 128 + ch) + 0);
@@ -916,18 +909,18 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
             _vec_load_9[0 + 2] = _v4.z;
             _vec_load_9[0 + 3] = _v4.w;
         }
-        vf4[0] = _vec_load_4[0];
-        vf4[1] = _vec_load_4[1];
-        vf4[2] = _vec_load_4[2];
-        vf4[3] = _vec_load_4[3];
-        float _fdiv_127 = __fdiv_rn(vf4[0], _vec_load_9[0]);
-        vq[8] = ((vlive[2] == 1) ? _fdiv_127 : 0.0f);
-        float _fdiv_128 = __fdiv_rn(vf4[1], _vec_load_9[1]);
-        vq[9] = ((vlive[2] == 1) ? _fdiv_128 : 0.0f);
-        float _fdiv_129 = __fdiv_rn(vf4[2], _vec_load_9[2]);
-        vq[10] = ((vlive[2] == 1) ? _fdiv_129 : 0.0f);
-        float _fdiv_130 = __fdiv_rn(vf4[3], _vec_load_9[3]);
-        vq[11] = ((vlive[2] == 1) ? _fdiv_130 : 0.0f);
+        vf4[0] = vec_1[0];
+        vf4[1] = vec_1[1];
+        vf4[2] = vec_1[2];
+        vf4[3] = vec_1[3];
+        float _fdiv_129 = __fdiv_rn(vf4[0], _vec_load_9[0]);
+        vq[8] = ((vlive[2] == 1) ? _fdiv_129 : 0.0f);
+        float _fdiv_130 = __fdiv_rn(vf4[1], _vec_load_9[1]);
+        vq[9] = ((vlive[2] == 1) ? _fdiv_130 : 0.0f);
+        float _fdiv_131 = __fdiv_rn(vf4[2], _vec_load_9[2]);
+        vq[10] = ((vlive[2] == 1) ? _fdiv_131 : 0.0f);
+        float _fdiv_132 = __fdiv_rn(vf4[3], _vec_load_9[3]);
+        vq[11] = ((vlive[2] == 1) ? _fdiv_132 : 0.0f);
         float _vec_load_10[4];
         {
             float4 _v4 = *reinterpret_cast<const float4*>(v_scale + ((vseg[3] * num_heads + head) * 128 + ch) + 0);
@@ -936,18 +929,18 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_a9cc2416e8a621d5cc13(_
             _vec_load_10[0 + 2] = _v4.z;
             _vec_load_10[0 + 3] = _v4.w;
         }
-        vf4[0] = _vec_load_5[0];
-        vf4[1] = _vec_load_5[1];
-        vf4[2] = _vec_load_5[2];
-        vf4[3] = _vec_load_5[3];
-        float _fdiv_132 = __fdiv_rn(vf4[0], _vec_load_10[0]);
-        vq[12] = ((vlive[3] == 1) ? _fdiv_132 : 0.0f);
-        float _fdiv_133 = __fdiv_rn(vf4[1], _vec_load_10[1]);
-        vq[13] = ((vlive[3] == 1) ? _fdiv_133 : 0.0f);
-        float _fdiv_134 = __fdiv_rn(vf4[2], _vec_load_10[2]);
-        vq[14] = ((vlive[3] == 1) ? _fdiv_134 : 0.0f);
-        float _fdiv_135 = __fdiv_rn(vf4[3], _vec_load_10[3]);
-        vq[15] = ((vlive[3] == 1) ? _fdiv_135 : 0.0f);
+        vf4[0] = vec_2[0];
+        vf4[1] = vec_2[1];
+        vf4[2] = vec_2[2];
+        vf4[3] = vec_2[3];
+        float _fdiv_134 = __fdiv_rn(vf4[0], _vec_load_10[0]);
+        vq[12] = ((vlive[3] == 1) ? _fdiv_134 : 0.0f);
+        float _fdiv_135 = __fdiv_rn(vf4[1], _vec_load_10[1]);
+        vq[13] = ((vlive[3] == 1) ? _fdiv_135 : 0.0f);
+        float _fdiv_136 = __fdiv_rn(vf4[2], _vec_load_10[2]);
+        vq[14] = ((vlive[3] == 1) ? _fdiv_136 : 0.0f);
+        float _fdiv_137 = __fdiv_rn(vf4[3], _vec_load_10[3]);
+        vq[15] = ((vlive[3] == 1) ? _fdiv_137 : 0.0f);
         int vt_word = (head * 128 + ch) * total_padded + tok_base + chunk * 16 + 4 * t8 >> 2;
         for (int e_6 = 0; e_6 < 4; e_6++) {
             float four[4];

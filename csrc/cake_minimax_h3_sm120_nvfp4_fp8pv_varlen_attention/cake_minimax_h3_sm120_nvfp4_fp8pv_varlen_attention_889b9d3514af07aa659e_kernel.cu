@@ -47,25 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_RED_SUM_OFF 0
-#define SMEM_RED_SUM_STAGE_BYTES 8192
-#define SMEM_RED_SUM_STRIDE 8192
-#define SMEM_RED_MAX_OFF 8192
-#define SMEM_RED_MAX_STAGE_BYTES 8192
-#define SMEM_RED_MAX_STRIDE 8192
-#define SMEM_RED_NORM_OFF 16384
-#define SMEM_RED_NORM_STAGE_BYTES 64
-#define SMEM_RED_NORM_STRIDE 64
-#define SMEM_RED_OFF 16448
-#define SMEM_RED_STAGE_BYTES 32
-#define SMEM_RED_STRIDE 32
-#define SMEM_FLAG_OFF 16480
-#define SMEM_FLAG_STAGE_BYTES 16
-#define SMEM_FLAG_STRIDE 16
-#define SMEM_TOTAL 16512
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -88,7 +69,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_889b9d3514af07aa659e(_
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red_sum = reinterpret_cast<float*>(smem_raw + 0);
     const int red_sum_addr = smem + 0;
     float* red_max = reinterpret_cast<float*>(smem_raw + 8192);
@@ -100,7 +81,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_889b9d3514af07aa659e(_
     int* flag = reinterpret_cast<int*>(smem_raw + 16480);
     const int flag_addr = smem + 16480;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int col = (tid & 15) * 8;
     int rgrp = tid >> 4;
     int chan = tid & 127;
@@ -113,7 +94,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_889b9d3514af07aa659e(_
         int head = work % num_heads;
         int _vec_load_0[4];
         {
-            const int4* _ivptr_0 = reinterpret_cast<const int4*>(tile_table + (8 * tile) + 0);
+            const int4* _ivptr_0 = reinterpret_cast<const int4*>(tile_table + 8 * tile + 0);
             int4 _ivld_0;
             _ivld_0 = *_ivptr_0;
             _vec_load_0[0 + 0] = _ivld_0.x;
@@ -868,7 +849,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_fp8pv_varlen_attention_889b9d3514af07aa659e(_
             }
             float acc = acc_a[0];
             float knf = knf_a[0];
-            float lenf = (float)(((length > 0) ? length : 1));
+            float lenf = (float)((length > 0) ? length : 1);
             float mean_v = __fdiv_rn(acc, lenf);
             float msq = ((is_max == 0) ? mean_v * mean_v : 0.0f);
             for (int stage = 0; stage < 5; stage++) {
