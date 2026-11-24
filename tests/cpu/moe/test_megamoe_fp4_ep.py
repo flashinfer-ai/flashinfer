@@ -613,6 +613,8 @@ def test_compact_prefill_rejected_before_kernel_dispatch(monkeypatch, ep, tokens
     [
         (4096, 2176, r"hidden >= 2 \* intermediate_hidden"),
         (16640, 8320, "intermediate_hidden <= 8192"),
+        (4352, 2048, "hidden divisible by 512"),
+        (16384, 8192, "shared-memory capacity"),
     ],
 )
 def test_mxfp4_canonical_rejects_scheduler_shape_limits(hidden, intermediate, message):
@@ -621,7 +623,7 @@ def test_mxfp4_canonical_rejects_scheduler_shape_limits(hidden, intermediate, me
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("hidden,intermediate,topk", [(512, 256, 32), (16384, 8192, 6)])
+@pytest.mark.parametrize("hidden,intermediate,topk", [(512, 256, 32), (8192, 4096, 6)])
 def test_mxfp4_canonical_scheduler_boundaries_reach_jit(hidden, intermediate, topk):
     plan = select_mxfp4_fused_plan(78, 16, 256, topk, hidden, intermediate, 2, 1)
     assert plan.use_interleaved_scheduler and plan.block_n == 256

@@ -269,6 +269,11 @@ def select_mxfp4_fused_plan(
             )
         if intermediate_hidden > 8192:
             raise ValueError("canonical MXFP4 requires intermediate_hidden <= 8192")
+        if 3 * 8 * hidden * 2 // (1 if hidden <= 4096 else 2) > SMEM_CAPACITY:
+            raise ValueError("canonical MXFP4 plan exceeds SM90 shared-memory capacity")
+
+    if hidden > 4096 and hidden % 512:
+        raise ValueError("MXFP4 combine requires hidden divisible by 512 above 4096")
 
     def max_tokens(bm):
         return bm * num_logical_experts // (num_ranks * num_topk)
@@ -296,10 +301,6 @@ def select_mxfp4_fused_plan(
             raise ValueError(
                 "noncanonical MXFP4 storage requires hidden >= 2 * "
                 "intermediate_hidden and intermediate_hidden <= 8192"
-            )
-        if hidden > 4096 and hidden % 512:
-            raise ValueError(
-                "noncanonical MXFP4 combine requires hidden divisible by 512 above 4096"
             )
         if weight_tile_bytes == 8448 and num_max_tokens_per_rank <= 2 and hidden % 2048:
             raise ValueError(
