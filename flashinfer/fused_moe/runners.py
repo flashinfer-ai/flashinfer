@@ -9550,9 +9550,8 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
     routing prep quantizes to NVFP4 under ``"w1_input_global_scale"``. GEMM1
     quantizes its output under ``"w2_input_global_scale"`` (FP32 scalars, the
     quantization multiplier ``1 / input_scale``; default 1, unread per token).
-    SM100's GEMM scalars follow from them and the weights' global scales,
-    cached per scale tensor version; a CUDA graph computes them as it replays,
-    so it reads a scale updated in place, as on SM100. The activation
+    The records' routing prep divides the weights' global scales by them each
+    call, so a CUDA graph reads a scale updated in place, as on SM100. The activation
     parameters are the view tensors in output units, as
     :class:`RecordsNvfp4Bf16Runner` reads them. PowLU's ``m`` and ``limit``
     and SiTU's unclamped linear branch, beyond TRT-LLM, are the typed values
@@ -9576,7 +9575,6 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__(config, device)
         self._unit_scale: Optional[torch.Tensor] = None
-        self._alphas: tuple[tuple, List[torch.Tensor], tuple] = ((), [], ())
         # MXFP4 activations take CuTileMxfp4Runner's contract.
         self._mx4 = config.quant.activation is QuantFormat.MXFP4
         if self._mx4:
@@ -9628,33 +9626,14 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
         return scale.reshape(1)
 
     def _scales(self, view: dict[str, torch.Tensor]) -> List[Any]:
-        """SM100's output1_scale_gate_scalar, output2_scale_scalar and
-        output1_scale_scalar, then the BF16 input's global scale."""
+        """The weights' global scales, then GEMM2's input global scale and
+        GEMM1's (MXFP4: the alphas, then None twice)."""
         g1, g2 = super()._scales(view)
         if self.config.quant.weight is QuantFormat.MXFP4:
             return [g1, g2, None, None]
         given = {} if self.config.quant.per_token_scale else view
         a1 = self._input_scale(given, "w1_input_global_scale")
-        a2 = self._input_scale(given, "w2_input_global_scale")
-        # Inference tensors carry no version counter: the alphas of the caller's are not
-        # cached (the unit scale is the runner's own, never written). The cache holds the
-        # scales it was keyed on, so no other tensor takes their addresses.
-        # A captured graph computes them from the scales as it replays, as SM100 reads them.
-        ts = (g1, a1, g2, a2)
-        cache = not torch.cuda.is_current_stream_capturing() and not any(
-            t.is_inference() and t is not self._unit_scale for t in ts
-        )
-        key = tuple((t.data_ptr(), 0 if t.is_inference() else t._version) for t in ts)
-        entry = self._alphas
-        if cache and key == entry[0]:
-            return [*entry[1], a1]
-        act, gate = self.config.activation, g1 / a1
-        # GEMM2's input global scale, gated (but SiTU) times the gate's alpha
-        s1 = gate * a2 if act.is_gated and not isinstance(act, SiTU) else a2
-        alphas = [gate, g2 / a2, s1]
-        if cache:
-            self._alphas = (key, alphas, ts)
-        return [*alphas, a1]
+        return [g1, g2, self._input_scale(given, "w2_input_global_scale"), a1]
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -9663,7 +9642,7 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
         output2_scale_scalar, out, hidden_states_scale, output1_scale_scalar,
         routing_bias, None, per_token_scale]`` in ``_w4a16_moe_sm80``'s tuning
         slots (from logits, the logits for the ids and weights), then the
-        activation parameters."""
+        activation parameters and GEMM1's input global scale (MXFP4: None)."""
         self._require_built()
         self._validate_pack_contract(act)
         quant, routing = self.config.quant, self.config.routing
@@ -9746,7 +9725,7 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
             out = x.new_empty(tokens, hidden, dtype=torch.bfloat16)
         params = self._act_params(view)
         inputs: List[Any] = [x, ids, w, view["w1"], s_gate, view["w2"], s2, out]
-        return inputs + [xs, s1, act.routing_bias, None, pt, *params]
+        return inputs + [xs, s1, act.routing_bias, None, pt, *params, a1]
 
     def _launch(self, inputs: List[Any], tactic: Any) -> Any:
         from .core import (
@@ -9757,7 +9736,7 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
         )
 
         cfg, act = self.config, self.config.activation
-        x, ids, w, r1, s_gate, r2, s2, out, xs, s1, bias, _, pt, *params = inputs
+        x, ids, w, r1, s_gate, r2, s2, out, xs, s1, bias, _, pt, *params, a1 = inputs
         routing, experts = cfg.routing, cfg.experts
         finalize, inter = cfg.finalize.do_finalize, experts.intermediate_size
         tune_max = cfg.execution.tune_max_num_tokens
@@ -9815,6 +9794,7 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
             tune_max_num_tokens=tune_max,
             nvfp4_4over6=cfg.quant.nvfp4_4over6,
             _out_limits=True,  # the view's limits, as the BF16 runner reads them
+            _input_scales=None if a1 is None else (a1, s1),
         )
         slots = next(iter(slot_experts), None)
         res = _trtllm_fp4_records_moe(a, ids, w, slots, tactic=tactic)

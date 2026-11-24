@@ -1493,6 +1493,26 @@ struct DqArgs {
   const int* ids;
   int top_k, num_experts;
 };
+// Past 128 bytes, prep loads DqArgs's fields inside the restores' loop, which then spills.
+static_assert(sizeof(DqArgs) <= 128, "DqArgs past 128 bytes spills prep");
+
+// The GEMM alphas [2][E], or null: num1[e] / den1[0], then num2[e] / den2[0]. A parameter apart
+// from DqArgs, which they would push past 128 bytes.
+struct AlArgs {
+  float* al;
+  const float *num1, *num2, *den1, *den2;
+};
+
+// The first CTA's GEMM alphas, IEEE as torch's division.
+__device__ __forceinline__ void prep_alphas(AlArgs const& a, int E) {
+  if (!a.al) return;
+  for (int e = threadIdx.x; e < E; e += blockDim.x) {
+    // Load all four first: else num2 and den2 load after the first store, which may alias them.
+    const float n1 = a.num1[e], n2 = a.num2[e], d1 = *a.den1, d2 = *a.den2;
+    a.al[e] = __fdiv_rn(n1, d1);
+    a.al[E + e] = __fdiv_rn(n2, d2);
+  }
+}
 
 // Scale g of token t: [tokens][sf_pitch], or 128x4 swizzled (sf_pitch tiles of 128 rows x 4).
 __device__ __forceinline__ long sf_index(DqArgs const& d, int t, int g) {
@@ -1664,7 +1684,7 @@ constexpr int kPrepCtas = k4over6 && DQ >= 2 ? 1 : 2;
 template <int R, int DQ = 0, bool LUT = false, bool ONE = false>
 __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
     prep(const int* __restrict__ ids, int M, int E, int W, int Q, int* nblocks, int* block_expert,
-         int* block_rows, int* rowmap, DqArgs dq) {
+         int* block_rows, int* rowmap, DqArgs dq, AlArgs al) {
   if constexpr (DQ == 3 || DQ == 8) {
     if (blockIdx.x >= dq.cta0) {
       dequant_pt<DQ == 8>(dq);
@@ -1682,6 +1702,7 @@ __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
     }
   }
   if (dq.cnt && threadIdx.x < kFinCnt) dq.cnt[threadIdx.x] = 0;
+  prep_alphas(al, E);
   if constexpr (ONE) {
     const int t = threadIdx.x;
     for (int i = t; i < M * R; i += blockDim.x)
@@ -1790,8 +1811,8 @@ __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
 // + 1) Q)), ranks offset by the chunk's base.
 template <int DQ = 0>
 __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
-    prepx_count(const int* __restrict__ ids, int M, int E, int CH, int* __restrict__ pc,
-                DqArgs dq) {
+    prepx_count(const int* __restrict__ ids, int M, int E, int CH, int* __restrict__ pc, DqArgs dq,
+                AlArgs al) {
   if constexpr (DQ == 3 || DQ == 8) {
     if (blockIdx.x >= dq.cta0) {
       dequant_pt<DQ == 8>(dq);
@@ -1808,6 +1829,7 @@ __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
       return;
     }
   }
+  if (blockIdx.x == 0) prep_alphas(al, E);
   extern __shared__ int hist[];
   const int tid = threadIdx.x, nt = blockDim.x;
   for (int i = tid; i < E; i += nt) hist[i] = 0;
@@ -2092,13 +2114,17 @@ using namespace flashinfer::w4a16_moe_sm80;
 // (RECORDS_ACT modules, BF16) 1, 2, 3: x is MXFP8 [tokens][K] or MXFP4 [tokens][K / 2] under E8M0
 // x_sf [tokens][>= K / 32] (or 128x4 swizzled), or FP8 E4M3 [tokens][K] (x_sf unread); x_fmt 4
 // (BF16 or FP16): x quantized per token to FP8 E4M3 as SM90's Humming path, x_ts receiving 1 / q
-// (x_sf unread).
+// (x_sf unread). With alphas (FP32 [2 num_experts]) the first CTA writes the GEMM alphas num1 /
+// den1, then num2 / den2 (FP32 [num_experts] over [1]).
 void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap,
                          TensorView workspace, int64_t num_experts, int64_t row_tile,
                          int64_t max_blocks, tvm::ffi::Optional<TensorView> x,
                          tvm::ffi::Optional<TensorView> x_sf, tvm::ffi::Optional<TensorView> x_out,
                          bool sf_swizzled, tvm::ffi::Optional<TensorView> slot_experts,
-                         tvm::ffi::Optional<TensorView> x_ts, int64_t x_fmt) {
+                         tvm::ffi::Optional<TensorView> x_ts, int64_t x_fmt,
+                         tvm::ffi::Optional<TensorView> alphas, tvm::ffi::Optional<TensorView> num1,
+                         tvm::ffi::Optional<TensorView> num2, tvm::ffi::Optional<TensorView> den1,
+                         tvm::ffi::Optional<TensorView> den2) {
   CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
   CHECK_INPUT_AND_TYPE(meta, dl_int32);
   CHECK_INPUT_AND_TYPE(rowmap, dl_int32);
@@ -2125,6 +2151,7 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
   TVM_FFI_ICHECK(dq == x_sf.has_value() && dq == x_out.has_value())
       << "x, x_sf and x_out go together";
   DqArgs d{};
+  AlArgs al{};
   int dq_ctas = 0;
 #ifdef RECORDS_ACT
   TVM_FFI_ICHECK(x_fmt >= 0 && x_fmt <= 4 &&
@@ -2211,6 +2238,22 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
     TVM_FFI_ICHECK(dq && R < 64 && !d.ids) << "slot_experts go with x, row_tile < 64, x_sf [1]";
     d.lut = static_cast<const int*>(slot_experts.value().data_ptr());
   }
+  if (alphas.has_value()) {
+    TVM_FFI_ICHECK(num1.has_value() && num2.has_value() && den1.has_value() && den2.has_value())
+        << "alphas take num1, num2, den1 and den2";
+    for (TensorView t : {alphas.value(), num1.value(), num2.value(), den1.value(), den2.value()}) {
+      CHECK_INPUT_AND_TYPE(t, dl_float32);
+    }
+    TVM_FFI_ICHECK(alphas.value().numel() == 2 * e && num1.value().numel() == e &&
+                   num2.value().numel() == e && den1.value().numel() == 1 &&
+                   den2.value().numel() == 1)
+        << "alphas: FP32 [2 num_experts], num1 and num2 [num_experts], den1 and den2 [1]";
+    al.al = static_cast<float*>(alphas.value().data_ptr());
+    al.num1 = static_cast<const float*>(num1.value().data_ptr());
+    al.num2 = static_cast<const float*>(num2.value().data_ptr());
+    al.den1 = static_cast<const float*>(den1.value().data_ptr());
+    al.den2 = static_cast<const float*>(den2.value().data_ptr());
+  }
 
   if (R < 64) {
     if (workspace.numel() >= kFinCnt) d.cnt = static_cast<int*>(workspace.data_ptr());
@@ -2237,7 +2280,7 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
       // the 48 KB default bounds dynamic plus static shared memory
       if (!one && dyn + stat > 48 * 1024) raise_smem_limit(kern, max_smem);
       d.cta0 = 1;
-      kern<<<1 + dq_ctas, nt, dyn, st>>>(ids, M, e, W, Q, m, m + 1, m + 1 + nb, rm, d);
+      kern<<<1 + dq_ctas, nt, dyn, st>>>(ids, M, e, W, Q, m, m + 1, m + 1 + nb, rm, d, al);
     };
     auto pick = [&](auto tile) {
       constexpr int RT = decltype(tile)::value;
@@ -2292,7 +2335,7 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
 #ifdef RECORDS_ACT
   auto count_mx = [&](auto f, bool launch) {  // DQ 8: sm_q
     constexpr auto kern = prepx_count<4 + decltype(f)::value>;
-    launch ? kern<<<nC + dq_ctas, 1024, sm_q, st>>>(ids, M, e, ch, pc, d) : big(kern, sm_q);
+    launch ? kern<<<nC + dq_ctas, 1024, sm_q, st>>>(ids, M, e, ch, pc, d, al) : big(kern, sm_q);
   };
   auto mx = [&](bool launch) {
     x_fmt == 1   ? count_mx(std::integral_constant<int, 1>{}, launch)
@@ -2315,17 +2358,17 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
     big(prepx_scan<RT>, sm_e);
     big(prepx_place<RT>, sm_p);
     if (!dq)
-      prepx_count<<<nC, 1024, sm_e, st>>>(ids, M, e, ch, pc, d);
+      prepx_count<<<nC, 1024, sm_e, st>>>(ids, M, e, ch, pc, d, al);
     else if (x_fmt)
       mx(true);
     else if (d.ts)
-      prepx_count<3><<<nC + dq_ctas, 1024, sm_q, st>>>(ids, M, e, ch, pc, d);
+      prepx_count<3><<<nC + dq_ctas, 1024, sm_q, st>>>(ids, M, e, ch, pc, d, al);
     else if (d.ids)
-      prepx_count<4><<<nC + dq_ctas, 1024, sm_e, st>>>(ids, M, e, ch, pc, d);
+      prepx_count<4><<<nC + dq_ctas, 1024, sm_e, st>>>(ids, M, e, ch, pc, d, al);
     else if (d.gs)
-      prepx_count<2><<<nC + dq_ctas, 1024, sm_e, st>>>(ids, M, e, ch, pc, d);
+      prepx_count<2><<<nC + dq_ctas, 1024, sm_e, st>>>(ids, M, e, ch, pc, d, al);
     else
-      prepx_count<1><<<nC + dq_ctas, 1024, sm_e, st>>>(ids, M, e, ch, pc, d);
+      prepx_count<1><<<nC + dq_ctas, 1024, sm_e, st>>>(ids, M, e, ch, pc, d, al);
     prepx_scan<RT><<<1, 1024, sm_e, st>>>(e, nC, pc, off, m, m + 1, m + 1 + nb, rm);
     prepx_place<RT><<<nC, 1024, sm_p, st>>>(ids, M, e, ch, W, Q, pc, off, rm);
   };

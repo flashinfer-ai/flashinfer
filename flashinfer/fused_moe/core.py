@@ -2320,8 +2320,9 @@ class _RecordsExt:
     2, 3 GEMM2's input MXFP8, MXFP4 or FP8 (its scale in alpha2) of GEMM1's output times ``fq_inv``
     (FP32 [E], or None), quantized and restored in place; both 4 (with ``per_token_scale``): FP8
     E4M3 as SM90's Humming path, of a 16-bit ``x`` per token (``x_scale`` unread) and of GEMM2's
-    input per row, under dynamic scales. Swiglu at the default ``scalars`` and
-    Relu2, without tensors, run the base module's GEMM1."""
+    input per row, under dynamic scales. ``alpha_den`` FP32 [1] each: alpha1 and alpha2 are
+    weights' global scales, the GEMM alphas them over these, divided by the prep each call. Swiglu
+    at the default ``scalars`` and Relu2, without tensors, run the base module's GEMM1."""
 
     act: int
     params: Tuple[Optional[torch.Tensor], ...] = (None, None, None)
@@ -2338,6 +2339,7 @@ class _RecordsExt:
     x_fmt: int = 0
     fq: int = 0
     fq_inv: Optional[torch.Tensor] = None
+    alpha_den: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def hidden(self, x: torch.Tensor) -> int:  # x's values a row
         return x.shape[1] * (
@@ -2455,16 +2457,22 @@ def _w4a16_moe_sm80(
     n2 = _w4a16_records_geometry(hidden, inter, False)[0]
     max_blocks = (m + (row_tile - 1) * min(num_experts, m)) // row_tile
     rows = max_blocks * row_tile
-    # Per token GEMM2's row scales first (8 B aligned).
+    den = None if ext is None else ext.alpha_den
+    # Per token GEMM2's row scales first (8 B aligned); the prep's GEMM alphas last.
     ints = (rows,) * pt + (1 + 2 * max_blocks, rows, (-(-m // 2048) + 1) * num_experts)
+    ints += (2 * num_experts * (den is not None),)
     # The GEMM scratch from a 256 B boundary (its tiles on whole 128 B lines), then the restored x.
     start = -(-sum(ints) // 64) * 256
     xrows = m if pe else tokens
     sizes = (rows * inter,) + (m * hidden,) * finalize + (xrows * hidden,) * dq
     ws = x.new_empty(start + 2 * sum(sizes), dtype=torch.uint8)
-    *row_scales, meta, rowmap, workspace = (
+    *row_scales, meta, rowmap, workspace, alphas = (
         ws[: 4 * sum(ints)].view(torch.int32).split(ints)
     )
+    num = None
+    if den is not None:  # the prep's, from the scales as a CUDA graph replays
+        num, alphas = (alpha1, alpha2), alphas.view(torch.float32)
+        alpha1, alpha2 = alphas.split(num_experts)
     blocked, *rest = ws[start:].view(xt).split(sizes)
     y = rest.pop(0).view(m, hidden) if finalize else y
     act = rest[0].view(xrows, hidden) if dq else x
@@ -2483,6 +2491,7 @@ def _w4a16_moe_sm80(
         topk_ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks,
         x if dq else None, x_scale, act if dq else None, sf_swizzled, slot_experts,
         None if codes else per_token_scale, xf,
+        *((None,) * 5 if num is None else (alphas, *num, *den)),
     )  # fmt: skip
     blocked = blocked.view(rows, inter)
     fq = (
@@ -2753,8 +2762,11 @@ def _trtllm_fp4_records_moe(
     read at their valid columns, the finalized output is ``valid_hidden_size`` wide, and GEMM2's
     rows and the activation are zero-padded; without them a finalized ``output`` narrower than
     the hidden size receives its leading columns. Per token ``fc2_input_out`` receives GEMM2's
-    input as on SM100."""
+    input as on SM100. With ``_input_scales`` (``RecordsNvfp4Runner``'s GEMM1 and GEMM2 input
+    scales, FP32 [1]) the gate and GEMM2 scalars are the weights' global scales and
+    ``output1_scale_scalar`` GEMM2's input scale, the alphas divided by the prep each call."""
     x, x_scale, pt = a["hidden_states"], a["hidden_states_scale"], a["per_token_scale"]
+    dens = a.get("_input_scales")
     s1, s_gate, s2 = (
         a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
     )
@@ -2842,11 +2854,10 @@ def _trtllm_fp4_records_moe(
         x = x[:, : hv // 2 if nv else hv].contiguous()
         if codes and x_scale is not None:
             x_scale = x_scale[:, : hv // (16 if nv else 32)].contiguous()
-    inv = (
-        None  # FP8 GEMM2 input: under s1, gated (but SiTU) over the gate half's s_gate
-    )
+    # GEMM2's input under s1, gated (but SiTU, or with dens) over the gate half's s_gate
+    sit = gated and act != ActivationType.Situ and dens is None
+    inv = None  # FP8 GEMM2 input
     if fp8 and s1 is not None:
-        sit = gated and act != ActivationType.Situ
         inv = (
             s1.float() / s_gate.view(s_gate.shape[0], -1)[:, -1] if sit else s1.float()
         )
@@ -2905,10 +2916,11 @@ def _trtllm_fp4_records_moe(
         x_fmt=(2 if x_scale is x else 1) if fp8 else 0,
         fq=(3 if x_scale is x else 1) if fp8 else 0,
         fq_inv=inv,
+        alpha_den=dens,
     )
     inputs = [x, ids, weights, r1, s_gate, r2, s2, out if finalize else None]
     if w4a4:  # NVFP4 GEMM2 input under s1, gated but SiTU over s_gate
-        den = s_gate if gated and act != ActivationType.Situ else None
+        den = s_gate if sit else None
         if pt is not None:  # rows per token, GEMM2 dequantizing by s1 over s_gate
             s1 = s1 if den is None else s1 / den.view(experts, -1)[:, -1]
         inputs += [x_scale, s1, None if pt is not None else den]
