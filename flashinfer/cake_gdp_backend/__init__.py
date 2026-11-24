@@ -1531,13 +1531,15 @@ def _run_two_classes(
 # waits for that copy alone (a few KB; the compute stream is not synchronized), then keeps the table in a small LRU;
 # a CUDA graph captured after an eager call of the same batch (the usual warm-up) reuses that complete table, so the
 # graph holds no copy node, and the table is then kept for the life of the process (the graph reads it at every
-# replay).  A table first seen during capture is copied in the graph from a pinned buffer kept as long.
+# replay).  A table first seen during capture is copied inside the graph from a pinned buffer; both are kept as long
+# as the process, but that table is never served to another call: its memory holds the table only once the graph
+# has replayed, so a later eager call or another capture of the same batch makes its own complete copy.
 _ITEM_TABLES_EAGER: collections.OrderedDict[tuple[int, bytes], torch.Tensor] = (
     collections.OrderedDict()
 )
 _ITEM_TABLES_EAGER_MAX = 64
 _ITEM_TABLES_CAPTURED: dict[tuple[int, bytes], torch.Tensor] = {}
-_CAPTURED_PINNED: dict[tuple[int, bytes], torch.Tensor] = {}
+_ITEM_TABLES_IN_GRAPHS: list[tuple[torch.Tensor, torch.Tensor]] = []
 _COPY_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
@@ -1554,11 +1556,14 @@ def _item_table(words: tuple[int, ...], device: torch.device) -> torch.Tensor:
         return table
     if torch.cuda.is_current_stream_capturing():
         table = _ITEM_TABLES_EAGER.pop(key, None)
-        if table is None:
-            pinned = _CAPTURED_PINNED.setdefault(key, host.pin_memory())
-            table = torch.empty((host.numel(),), dtype=torch.int32, device=device)
-            table.copy_(pinned, non_blocking=True)
-        _ITEM_TABLES_CAPTURED[key] = table
+        if table is not None:
+            # a complete table: the graph reads it at every replay, so it is kept and served from now on
+            _ITEM_TABLES_CAPTURED[key] = table
+            return table
+        pinned = host.pin_memory()
+        table = torch.empty((host.numel(),), dtype=torch.int32, device=device)
+        table.copy_(pinned, non_blocking=True)
+        _ITEM_TABLES_IN_GRAPHS.append((pinned, table))
         return table
     table = _ITEM_TABLES_EAGER.get(key)
     if table is not None:
