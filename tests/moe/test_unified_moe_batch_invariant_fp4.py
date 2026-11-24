@@ -3638,6 +3638,83 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
 # ----------------------------------------------------------------------------- review round 2
 
 
+class _DeviceContext:
+    """A stand-in for ``torch.cuda.device`` that records its entries and exits (device-free)."""
+
+    events: list = []
+
+    def __init__(self, device):
+        self.index = torch.device(device).index
+
+    def __enter__(self):
+        self.events.append(("enter", self.index))
+
+    def __exit__(self, *exc):
+        self.events.append(("exit", self.index))
+
+
+def _mock_sfu_loader(monkeypatch, parts):
+    """The SFU module with a loader that returns a distinct callable per build (recorded), ``part_of`` from ``parts`` by
+    device index, an empty kernel cache and the recording device context."""
+    from flashinfer.batch_invariant import jit as bi_jit
+    from flashinfer.batch_invariant.fp_interface import sfu
+    from flashinfer.gemm.batch_invariant import api as gemm_api
+
+    builds = []
+
+    def loader(module, name, compile_fn):
+        builds.append((module, name))
+        return lambda *args: builds.append(("call", args))
+
+    monkeypatch.setattr(bi_jit, "build_and_load", loader)
+    monkeypatch.setattr(
+        gemm_api, "part_of", lambda device: parts[torch.device(device).index]
+    )
+    monkeypatch.setattr(sfu, "_KERNELS", {})
+    monkeypatch.setattr(_DeviceContext, "events", [])
+    monkeypatch.setattr(torch.cuda, "device", _DeviceContext)
+    return sfu, builds
+
+
+def test_sfu_eval_kernel_is_built_and_called_with_its_devices_current(monkeypatch):
+    """The SFU evaluation kernel's build, load and launch run with the tensor's device current: the JIT cache's artifact
+    directory and the compiled object's target are the current device's (``cute_dsl_core._get_compile_arch`` reads the
+    current device's capability), so a tensor on a device that is not current gets its own family's object, never the
+    current device's filed under its key. Device-free: the loader and the device context are mocked, the context is
+    entered with the tensor's device index around the build and again around the call."""
+    import inspect
+    import types
+
+    from flashinfer.jit import cute_dsl_core
+
+    assert "get_device_capability()" in inspect.getsource(
+        cute_dsl_core._get_compile_arch
+    )
+    sfu, builds = _mock_sfu_loader(monkeypatch, {1: (212, "sm_107")})
+    kernel = sfu._kernel(0, torch.device("cuda", 1))
+    assert _DeviceContext.events == [("enter", 1), ("exit", 1)]
+    assert builds == [("batch_invariant_sfu", "sfu_ex2")]
+    assert sfu._kernel(0, torch.device("cuda", 1)) is kernel
+    assert (
+        len(_DeviceContext.events) == 2 and len(builds) == 1
+    )  # a cache hit enters no context
+    x = types.SimpleNamespace(
+        dtype=torch.float32,
+        is_cuda=True,
+        is_contiguous=lambda: True,
+        device=torch.device("cuda", 1),
+        view=lambda n: "x_flat",
+        numel=lambda: 7,
+    )
+    monkeypatch.setattr(
+        torch, "empty_like", lambda t: types.SimpleNamespace(view=lambda n: "y_flat")
+    )
+    sfu._eval(0, x)
+    assert _DeviceContext.events[2:] == [("enter", 1), ("exit", 1)]
+    assert builds[1] == ("call", ("x_flat", "y_flat", 7))
+    assert len(builds) == 2  # the call reused the cached kernel, no second build
+
+
 def test_sfu_eval_kernels_are_keyed_by_architecture_family(monkeypatch):
     """The SFU evaluation kernels' in-process cache is keyed by the primitive and the device's architecture family, as the
     tables are: a process that evaluates an SM100 device and then an SM107 one compiles a callable per family and never
@@ -3661,7 +3738,7 @@ def test_sfu_eval_kernels_are_keyed_by_architecture_family(monkeypatch):
         )
         == 4
     )
-    assert "_kernel_key(which, x.device)" in inspect.getsource(sfu._eval)
+    assert "_kernel(which, x.device)" in inspect.getsource(sfu._eval)
 
 
 def test_static_block_evaluates_the_e2m1_conversion_on_every_backend():
