@@ -4087,12 +4087,16 @@ def _prepare_prims_ts_batch_decode_plan(
     ):
         # Longest-first CLC dispatch pays when work spans more than one wave of
         # SMs (within one wave every route starts at once) and routes can read
-        # more than two KV128 tiles (shorter routes leave nothing to balance;
-        # the order costs about 1-2 us). True forces it.
+        # more than one KV128 tile (one-tile routes leave nothing to balance).
+        # The order costs about 1-2 us, which routes of up to four tiles repay
+        # only over three or more waves. True forces it.
+        tile = _sparse_policy.TILE_SIZE_KV
+        work_items = batch_size * num_kv_heads
+        sm_count = get_device_sm_count(torch.device("cuda", device_index))
         enable = balanced_scheduler or (
-            batch_size * num_kv_heads
-            > get_device_sm_count(torch.device("cuda", device_index))
-            and max_kv_len > 2 * _sparse_policy.TILE_SIZE_KV
+            work_items > sm_count
+            and max_kv_len > tile
+            and (work_items >= 3 * sm_count or max_kv_len > 4 * tile)
         )
         if enable:
             spec = replace(spec, config=replace(spec.config, balanced_scheduler=True))

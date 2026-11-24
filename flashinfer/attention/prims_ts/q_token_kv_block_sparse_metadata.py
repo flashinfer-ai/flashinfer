@@ -632,8 +632,9 @@ class QTokenKvBlockSparsePagedTSWrapper:
         orders routes by their K/V union and SMs take the longest first, so
         long routes do not extend the last wave. ``None`` (default) enables it
         when the routes span more than one wave of SMs and can read more than
-        two KV128 tiles (``max_seq_len_kv`` > 256); True enables it on every
-        persistent launch; False keeps route order. Launches without the
+        one KV128 tile (``max_seq_len_kv`` > 128); routes of up to four tiles
+        (``max_seq_len_kv`` <= 512) also need three or more waves. True
+        enables it on every persistent launch; False keeps route order. Launches without the
         persistent scheduler (split-KV, single-wave static grids) ignore it.
         Routes are ranked by whole KV128 tiles of their union; routes of 127
         or more tiles (16K+ tokens) share the longest rank, so their order
