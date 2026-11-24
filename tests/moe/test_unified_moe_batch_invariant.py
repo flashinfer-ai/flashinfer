@@ -2775,10 +2775,7 @@ def test_route_plan_dual_equals_route_and_the_dual_plan(T, k, E):
     block-scaled classes' ``permute_plan_dual`` (experts, weights, counts, dest, src, dest_pad, pos_pad)."""
     from flashinfer.fused_moe.batch_invariant import api
     from flashinfer.fused_moe.batch_invariant import spec as S
-
-    permute_plan_dual = pytest.importorskip(
-        "flashinfer.fused_moe.batch_invariant.api_fp4"
-    ).permute_plan_dual  # the block-scaled package: a later PR
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import permute_plan_dual
 
     g = torch.Generator().manual_seed(T * 3 + E)
     logits = (torch.randn(max(T, 1), E, generator=g) * 2).float()[:T].cuda()
