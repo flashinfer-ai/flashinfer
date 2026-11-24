@@ -264,7 +264,7 @@ def test_backend_is_registered_and_never_a_default_candidate():
 def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
     """A quantization pair the fp4 backend does not serve: the layer's candidate filter skips the runner
     (``supports_quant``), and ``prepare_weights`` / ``prepare_activations`` / the runner's ``check_support`` raise the
-    mode's error naming the served pairs and the pending one; both served pairs take bf16 rows as given."""
+    mode's error naming the served pairs (no other pair, no sequencing note); both served pairs take bf16 rows as given."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
     mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
@@ -290,7 +290,7 @@ def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
         msg = str(excinfo.value)
         assert "weight=MXFP4, activation=MXFP8" in msg
         assert "NVFP4 x NVFP4" in msg and "MXFP4 x MXFP4" in msg
-        assert "mixed MoE PR" in msg and KEY in msg
+        assert "and no other pair" in msg and KEY in msg and "PR" not in msg
     # the default pair is NVFP4 x NVFP4; either pair takes the bf16 rows as given, no scale
     x, sf = BatchInvariantFp4Config.prepare_activations(w1[0].float())
     assert x.dtype == torch.bfloat16 and sf is None

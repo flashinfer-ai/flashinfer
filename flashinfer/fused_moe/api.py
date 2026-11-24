@@ -3615,8 +3615,8 @@ class BatchInvariantFp4Config:
     per typed activation and parameter set as the bf16 backend, documented in ``flashinfer/batch_invariant/README.md``:
     NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM,
     per-token NVFP4 activations), and MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
-    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale). MXFP4 x MXFP8 arrives with the mixed
-    MoE PR; a pair the backend does not serve is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
+    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale). A pair the backend does not serve
+    (MXFP4 x MXFP8 among them) is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
     ``prepare_activations`` and by the runner with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming
     the served pairs. The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``,
     ``fingerprint("fused_moe_mxfp4", ...)``); the weight view carries its pair, and a pack prepared for one pair is refused by a
