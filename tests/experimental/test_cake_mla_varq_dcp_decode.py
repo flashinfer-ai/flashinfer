@@ -106,6 +106,10 @@ def test_plan_invariants(num_sms):
                     assert plan["grid_clusters"] == resident
                     assert plan["max_units"] == 1
                     assert plan["partial_rows"] == resident * TILE_Q
+                    assert (
+                        _ceil_div(plan["max_local_tiles"], plan["unit_min"])
+                        <= cake_backend.PARTITION_MAX_UNITS_PER_ITEM
+                    )
                 else:
                     assert plan["max_units"] >= 2
                 # A static-only plan never splits, so it never launches the merge.
@@ -911,6 +915,26 @@ def test_split_items_merge_kernel(dtype):
         seed=76,
     )
     assert runner.plan["partition_mode"] == 0 and runner.launches_merge
+    ref_out, ref_lse = _reference_variable_q(
+        query, cum_q, global_kv, global_lens.tolist(), cp_world=1, cp_rank=0
+    )
+    _assert_close_to_reference(out, lse, ref_out, ref_lse, dtype)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize("global_length", [24064, 24065, 29000, 40000])
+def test_partition_mode_long_item(dtype, global_length):
+    """One long item in partition mode, split over more units than the in-kernel merge stages at once."""
+    _device_or_skip()
+    query, cum_q, max_q_len, global_kv, global_lens = _make_batched_inputs(
+        (global_length,), (1,), 16, dtype, seed=77, max_q_len=1
+    )
+    out, lse, runner = _launch_rank(
+        query, cum_q, max_q_len, global_kv, global_lens, cp_world=1, cp_rank=0
+    )
+    assert runner.plan["partition_mode"] == 1
     ref_out, ref_lse = _reference_variable_q(
         query, cum_q, global_kv, global_lens.tolist(), cp_world=1, cp_rank=0
     )
