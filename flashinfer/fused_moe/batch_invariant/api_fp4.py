@@ -1385,7 +1385,7 @@ def fused_moe_fp4(
     if gather1 and not gather_form_ok(
         H, "128x4" if x_rows is not None else sf_src, pair.block
     ):
-        if explicit1 or gather:
+        if T and (explicit1 or gather):
             # the caller asked for the gather form (a gather record, or gather=True): the layout's rule is reported
             raise unsupported(
                 pair.cls,
@@ -1393,7 +1393,7 @@ def fused_moe_fp4(
                 f"the linear layout's rows as whole 4-byte groups (H a multiple of {4 * pair.block}) or the 128x4 "
                 "layout for the gather form; the dispatcher's own pick takes the box form here",
             )
-        # the dispatcher's pick: the box form through the scatter
+        # the dispatcher's pick, or an empty batch (no row to transport): the box form through the scatter
         config1 = dataclasses.replace(config1, gather_a=False)
         gather1 = False
     if path != "dense" and plan is not None:

@@ -4667,11 +4667,22 @@ def test_empty_prequantized_pack_names_the_128x4_layout_and_gives_an_empty_outpu
     """At ``T = 0`` the linear ``[0, K / block]`` rows and the 128x4 buffer of no rows are one empty buffer, so the shape
     rule returns the 128x4 layout before the collision rule (which holds at every multiple of 128, zero included); a named
     layout keeps its shape check. On a device the op and the layer take an empty pre-quantized pack of either scale shape
-    (both pairs) and give the empty ``[0, H]`` output, as they take the flat empty buffer and empty bf16 rows."""
+    (both pairs) and give the empty ``[0, H]`` output, as they take the flat empty buffer and empty bf16 rows. An explicit
+    gather record (or ``gather=True``) with the named linear layout at an ``H`` whose linear rows the gather form cannot
+    copy gives the empty output too -- an empty batch has no row to transport, so the transport check applies to a
+    non-empty batch alone -- while one row keeps the refusal."""
     from flashinfer.fused_moe.batch_invariant.api_fp4 import (
         fused_moe_fp4,
+        gather_form_ok,
         gather_sf_layout,
         sf_layouts_collide,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import (
+        can_implement_swapped_blockscaled,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp4 import (
+        gather_twins,
+        swapped_knobs_blockscaled,
     )
 
     assert sf_layouts_collide(0, 512, 16)
@@ -4714,6 +4725,52 @@ def test_empty_prequantized_pack_names_the_128x4_layout_and_gives_an_empty_outpu
             routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
         )  # fmt: skip
         assert _layer(k, E, I, quant=quant)(rows, W_pack).shape == (0, H)
+    # the explicit gather request with the named linear layout at H = 96 (six NVFP4 / three MXFP4 scale bytes per row, not
+    # whole 4-byte groups): the empty batch gives the empty output through the record's box form, one row is refused
+    k, H, I, E = 2, 96, 64, 8
+    for pair in (NVFP4, MXFP4):
+        assert not gather_form_ok(H, "linear", pair.block)
+        _, _, w1, w2 = _problem(4, k, H, I, E, seed=5)
+        W = MoEWeightsFp4.prepare(pair, w1, w2)
+        in1, _ = W.classes(_family())
+        rec = next(
+            c
+            for c in gather_twins(swapped_knobs_blockscaled())
+            if can_implement_swapped_blockscaled(c, 2 * I, H, E, W.chain1, in1)
+        )
+        x4 = torch.empty(0, H // 2, dtype=torch.uint8, device="cuda")
+        sf = torch.empty(0, H // pair.block, dtype=torch.uint8, device="cuda")
+        pts = (
+            torch.empty(0, dtype=torch.float32, device="cuda") if pair.scaled else None
+        )
+        ids = torch.empty(0, k, dtype=torch.int32, device="cuda")
+        wts = torch.empty(0, k, dtype=torch.float32, device="cuda")
+        for kw in (
+            dict(config1=rec),
+            dict(gather=True),
+            dict(config1=rec, sf_layout="linear"),
+            dict(gather=True, sf_layout="linear"),
+        ):
+            out = fused_moe_fp4(_pack(pair, x4, sf, pts), ids, wts, W, **kw)
+            assert out.shape == (0, H) and out.dtype == torch.bfloat16, kw
+        x1 = (
+            (torch.randn(1, H, generator=torch.Generator().manual_seed(9)) * 0.5)
+            .to(torch.bfloat16)
+            .cuda()
+        )
+        q4, qsf, qpts = _quantized(x1, pair=pair)
+        lin = _unswizzle(pair, qsf, 1, H).view(torch.uint8).reshape(1, H // pair.block)
+        ids1 = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+        wts1 = torch.tensor([[0.5, 0.5]], dtype=torch.float32, device="cuda")
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="gather form"):
+            fused_moe_fp4(
+                _pack(pair, q4, lin, qpts),
+                ids1,
+                wts1,
+                W,
+                config1=rec,
+                sf_layout="linear",
+            )
 
 
 @needs_device
