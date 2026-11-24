@@ -5469,6 +5469,206 @@ class CuteDslRunner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
+# Firefly — experimental per-token NVFP4 MoE for SM100/SM103 (CuTe DSL)
+# ---------------------------------------------------------------------------
+
+
+class FireflyNvfp4Runner(MoERunner):
+    """Run :mod:`flashinfer.experimental.firefly` from the unified packs.
+
+    One ``CuteMoE`` per hidden size serves every batch size up to
+    ``tune_max_num_tokens`` with one workspace; its kernels choose their
+    schedule from the batch size, so there is a single tactic. The weights
+    come with each call (the ``"firefly_nvfp4"`` view), so one runner serves
+    every layer of a shape. Per-token or per-tensor activations
+    (``QuantConfig(per_token_scale=)``; ``None`` is per-tensor), one ``CuteMoE``
+    mode per runner.
+    """
+
+    backend_key = "firefly_nvfp4"
+    supports_per_token_scale = True
+    # The kernels read topk_ids / topk_weights as given; no in-kernel router.
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    )
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        SwiGLUStep,
+        GeGLU,
+        GeGLUTanh,
+        SiTU,
+        ReLU2,
+    )
+    # The kernels never read the FLASHINFER_NVFP4_4OVER6* environment, so an
+    # explicit ``None`` is honored; _check_support() rejects a resolved recipe.
+    supports_nvfp4_4over6 = True
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        self._moes: dict[int, Any] = {}
+        self.tuning_config = TuningConfig()
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..experimental.firefly.activation import as_activation
+        from ..experimental.firefly.moe import check_support
+        from ..experimental.firefly.weights import check_nvfp4_4over6
+
+        quant = self.config.quant
+        if quant.swizzled_scale_factors is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} consumes only the linear activation "
+                "block-scale layout."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
+        check_nvfp4_4over6(quant.nvfp4_4over6)
+        as_activation(self.config.activation)  # e.g. SiTU's clamp_limit
+        routing = self.config.routing
+        # H comes with the pack; 256 passes the hidden-size rule here.
+        try:
+            check_support(
+                routing.num_experts,
+                routing.top_k,
+                256,
+                self.config.experts.intermediate_size,
+            )
+        except ValueError as e:
+            raise NotImplementedError(f"{type(self).__name__}: {e}") from None
+
+    def _build(self) -> None:
+        from ..api_logging import warn_experimental_backend_once
+        from ..experimental.firefly.weights import KernelWeights
+
+        self._kernel_weights = KernelWeights
+        warn_experimental_backend_once("fused_moe", self.backend_key)
+
+    def _moe_for(self, hidden_size: int) -> Any:
+        """The ``CuteMoE`` of this hidden size, created (and its workspace
+        allocated) on the first pack of that size."""
+        moe = self._moes.get(hidden_size)
+        if moe is None:
+            from ..experimental.firefly.moe import CuteMoE
+
+            experts = self.config.experts
+            moe = CuteMoE(
+                self.config.routing.num_experts,
+                self.config.routing.top_k,
+                hidden_size,
+                experts.intermediate_size,
+                max_tokens=self.config.execution.tune_max_num_tokens,
+                use_fused_finalize=self.config.finalize.use_fused_finalize,
+                activation=self.config.activation,
+                enable_pdl=self.config.execution.enable_pdl,
+                per_token_scale=bool(self.config.quant.per_token_scale),
+                local_expert_offset=experts.local_expert_offset,
+                local_num_experts=experts.local_num_experts,
+                device=self.device,
+            )
+            self._moes[hidden_size] = moe
+        return moe
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [0]
+
+    def _cache_key_extras(self) -> tuple:
+        return super()._cache_key_extras() + (
+            bool(self.config.finalize.use_fused_finalize),
+            self.config.execution.enable_pdl is not False,
+            bool(self.config.quant.per_token_scale),
+        )
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        """Inputs: hidden_states_q, hidden_states_scale, per_token_scale (None
+        for per-tensor activations), topk_ids, topk_weights, the six view
+        tensors (w1, w1_sf, w1_gs, w2, w2_sf, w2_gs) and the BF16 output
+        buffer."""
+        self._require_built()
+        self._validate_pack_contract(act)
+        v = weights.get_view(self.backend_key)
+        num_tokens = act.hidden_states_q.shape[0]
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32, torch.bfloat16, torch.float16),
+        )
+        per_token = bool(self.config.quant.per_token_scale)
+        if act.hidden_states_scale is None or (
+            per_token and act.per_token_scale is None
+        ):
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_states_scale"
+                + (
+                    " and per_token_scale (per-token NVFP4 activations)."
+                    if per_token
+                    else " (per-tensor NVFP4 activations, unit global scale)."
+                )
+            )
+        if bool(v.get("gated", True)) != self.config.activation.is_gated:
+            raise ValueError(
+                f"{type(self).__name__}: the weight view was prepared for a "
+                f"{'gated' if v.get('gated', True) else 'non-gated'} activation, "
+                f"the layer uses {type(self.config.activation).__name__}; "
+                "prepare it with the same activation."
+            )
+        hidden_size = act.hidden_states_q.shape[1] * 2
+        self._moe_for(hidden_size)
+        out = act.hidden_states_q.new_empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16
+        )
+        return [
+            act.hidden_states_q,
+            act.hidden_states_scale,
+            act.per_token_scale,
+            act.topk_ids,
+            act.topk_weights,
+            v["w1"],
+            v["w1_sf"],
+            v["w1_gs"],
+            v["w2"],
+            v["w2_sf"],
+            v["w2_gs"],
+            out,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        q, sf, gs, ids, wts, *w, out = inputs
+        moe = self._moe_for(q.shape[1] * 2)
+        if do_preparation:
+            # Build the batch size's plan (compiling its kernels) without a launch.
+            if q.shape[0] > 0:
+                moe.plan(q.shape[0], wts.dtype)
+            return out
+        return moe(
+            q,
+            sf,
+            gs,
+            self._kernel_weights(*w),
+            topk_ids=ids,
+            topk_weights=wts,
+            out=out,
+        )
+
+
+# ---------------------------------------------------------------------------
 # TRTLLM runners — shared module lifecycle, shape-specific inner runners
 # ---------------------------------------------------------------------------
 
