@@ -1065,8 +1065,14 @@ def _get_trtllm_gen_workspace_counter_buffer(
     because older captured graphs can still reference them.
     """
     state_attr = "_flashinfer_trtllm_gen_multi_ctas_kv_counter_buffers"
+    owner_attr = "_flashinfer_trtllm_gen_counter_workspace_id"
     allocation_stream_attr = "_flashinfer_trtllm_gen_counter_allocation_stream"
-    counters = getattr(workspace_buffer, state_attr, None)
+    workspace_id = id(workspace_buffer)
+    counters = None
+    # A deep copy can carry the cached buffers and stream tags into new
+    # storage. Only the original workspace can use those tags.
+    if getattr(workspace_buffer, owner_attr, None) == workspace_id:
+        counters = getattr(workspace_buffer, state_attr, None)
     required_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
         batch_size, num_qo_heads, sm_count
     )
@@ -1112,6 +1118,7 @@ def _get_trtllm_gen_workspace_counter_buffer(
         if counters is None:
             counters = []
             setattr(workspace_buffer, state_attr, counters)
+            setattr(workspace_buffer, owner_attr, workspace_id)
         counters.append(counter)
     # During capture, zeros() records initialization without executing it. Do
     # not publish that buffer for an eager call or another graph to reuse before

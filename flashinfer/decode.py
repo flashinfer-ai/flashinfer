@@ -4638,11 +4638,13 @@ def trtllm_batch_decode_with_kv_cache(
         Optional separate counter buffer for ``trtllm-gen`` multi-CTA KV mode.
         When omitted, FlashInfer caches a zero-initialized internal buffer on
         the supplied ``workspace_buffer`` tensor. Reuse the same workspace
-        object and warm up before CUDA graph capture to avoid a counter fill
-        on every replay. A cache miss during capture uses a graph-local buffer.
-        Calls sharing a workspace must be serialized, including graph replays.
-        Keep the workspace tensor alive for every graph that uses it, until
-        its final replay has completed.
+        object and warm up before CUDA graph capture with a call that needs
+        at least as much counter capacity as the captured call. This avoids
+        a counter fill on each replay. A cache miss during capture uses a
+        graph-local buffer. Serialize GPU work that shares a workspace,
+        including graph replays. Use an event or stream wait when switching
+        streams. Keep the workspace tensor alive for every graph that uses it,
+        until its final replay has completed.
         When provided, it must be zero-initialized at allocation (e.g. via
         ``torch.zeros``); the kernel self-resets the counters at the end of each
         launch, so it does not need to be re-zeroed between calls.

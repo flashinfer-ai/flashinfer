@@ -6,6 +6,7 @@ import subprocess
 import sys
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from typing import Union
 
 import pytest
@@ -1081,6 +1082,8 @@ def _test_trtllm_batch_decode(
                 multi_ctas_kv_counter_buffer=counter,
             )
 
+        expected = output.float() * o_scale
+        assert torch.isfinite(expected).all()
         cached = None
         for counter in (
             multi_ctas_kv_counter_buffer,
@@ -1091,9 +1094,11 @@ def _test_trtllm_batch_decode(
             before = tuple(getattr(workspace_buffer, _WORKSPACE_COUNTERS_ATTR, ()))
             reused_output = run_with_counter(counter)
             assert reused_output.data_ptr() == reused_out.data_ptr()
+            actual = reused_output.float() * o_scale
+            assert torch.isfinite(actual).all()
             assert_close_with_mismatch_tolerance(
-                reused_output.float() * o_scale,
-                output.float() * o_scale,
+                actual,
+                expected,
                 rtol=rtol,
                 atol=atol,
                 max_mismatched_elements=max_mismatched_elements,
@@ -1713,6 +1718,8 @@ def test_trtllm_batch_decode_gpt_oss_counter_reuse():
 def test_trtllm_workspace_counter_release_after_stream_handoff(
     monkeypatch, stream_lookup
 ):
+    if os.environ.get("CUDA_LAUNCH_BLOCKING") == "1":
+        pytest.skip("Allocator probes require asynchronous CUDA launches")
     # Isolate allocator lifetime from the native semaphore kernel: a read of
     # the counter is sufficient, and probes never overwrite recycled storage.
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1795,6 +1802,41 @@ def test_trtllm_workspace_counter_release_after_stream_handoff(
     assert observed.item() == 0
 
 
+def test_trtllm_workspace_counter_deepcopy_starts_a_new_cache():
+    device = torch.device(GPU_DEVICE)
+    sm_count = get_device_sm_count(device)
+    allocation_stream, copy_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(allocation_stream):
+        workspace = torch.zeros(16, device=device, dtype=torch.uint8)
+        original = _get_trtllm_gen_workspace_counter_buffer(
+            workspace, 1, 16, sm_count, device
+        )
+        original.fill_(7)
+
+    copy_stream.wait_stream(allocation_stream)
+    with torch.cuda.stream(copy_stream):
+        copied_workspace = deepcopy(workspace)
+    inherited = tuple(getattr(copied_workspace, _WORKSPACE_COUNTERS_ATTR, ()))
+
+    allocation_stream.wait_stream(copy_stream)
+    with torch.cuda.stream(allocation_stream):
+        counter = _get_trtllm_gen_workspace_counter_buffer(
+            copied_workspace, 1, 16, sm_count, device
+        )
+        assert all(counter.data_ptr() != old.data_ptr() for old in inherited)
+        assert torch.count_nonzero(counter).item() == 0
+        assert (
+            _get_trtllm_gen_workspace_counter_buffer(
+                copied_workspace, 1, 16, sm_count, device
+            )
+            is counter
+        )
+        assert (
+            _get_trtllm_gen_workspace_counter_buffer(workspace, 1, 16, sm_count, device)
+            is original
+        )
+
+
 def test_trtllm_workspace_counter_graph_ownership_and_growth():
     device = torch.device(GPU_DEVICE)
     sm_count = get_device_sm_count(device)
@@ -1807,8 +1849,13 @@ def test_trtllm_workspace_counter_graph_ownership_and_growth():
         counter.fill_(value)
         counter.sum()  # Warm up the harmless read before capture.
         torch.cuda.synchronize()
+        warmed_pointer = counter.data_ptr()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
+            counter = _get_trtllm_gen_workspace_counter_buffer(
+                owner, 1, 16, sm_count, device
+            )
+            assert counter.data_ptr() == warmed_pointer
             output = counter.sum()
         graphs.append(graph)
         outputs.append(output)
