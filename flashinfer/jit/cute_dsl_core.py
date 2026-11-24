@@ -14,20 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
+import dataclasses
+import enum
 import functools
 import hashlib
+import inspect
 import json
 import os
 import re
 import shutil
 import sys
 import sysconfig
-import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from . import env as jit_env
-from .core import JitSpec, _record_jit_build, get_tmpdir, logger
+from .core import JitSpec, get_tmpdir, logger
 from ._cute_dsl_source import (
     _hash_source_files,
     cute_dsl_strict_cache_key as cute_dsl_strict_cache_key,
@@ -163,8 +166,18 @@ class JitSpecCuteDsl(JitSpec):
 
     @property
     def lock_path(self) -> Path:
-        # Module-level lock: kernels of one op family serialize their builds
-        # (meta.json wipes/writes must not race sibling kernel exports).
+        # Per-kernel lock, held by build_and_load() while compiling: processes
+        # that miss the same kernel wait for one compile and load its artifact,
+        # while different kernels of a module (e.g. autotuning tactics split
+        # across tensor-parallel ranks) compile concurrently.
+        lock_dir = get_tmpdir() / self.module_dir_name
+        lock_dir.mkdir(exist_ok=True)
+        return lock_dir / f"{self.kernel_name}.lock"
+
+    @property
+    def module_lock_path(self) -> Path:
+        # Module-level lock, held only to commit an artifact: meta.json
+        # wipes/writes must not race sibling kernel exports.
         return get_tmpdir() / f"{self.module_dir_name}.lock"
 
     @property
@@ -201,62 +214,32 @@ class JitSpecCuteDsl(JitSpec):
     def build(self) -> None:
         """Compile via ``cute.compile`` and export the ``.o`` artifact.
 
-        Runs under ``lock_path`` when invoked via ``build_and_load()``.
+        Runs under the kernel's ``lock_path`` when invoked via
+        ``build_and_load()``. The compile holds no module lock; only the
+        stale-module wipe and the export take it (``_commit``), so the
+        kernels of one module build concurrently and each is committed.
         Persistence failures degrade gracefully: the in-process kernel is
         kept for load(); only the disk write is lost.
         Stale modules (dsl version / source change) are wiped like a ninja rebuild.
         """
-        if (
-            self.module_dir.exists()
-            and _read_meta(self.meta_path) != self.expected_meta
-        ):
-            logger.info(f"Invalidating stale CuTe-DSL module {self.module_dir_name}")
-            shutil.rmtree(self.module_dir, ignore_errors=True)
-
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
-        if self.export_compile_fn is None:
-            self._compiled_kernel = self.compile_fn()
-            try:
-                self._export()
-            except Exception as e:
-                logger.warning(
-                    f"Failed to persist CuTe-DSL kernel {self.name} to "
-                    f"{self.object_path}: {e}. The kernel will be recompiled next run."
-                )
-            return
         # The exported object is what load() hands back: compile without the
-        # execution engine, and again with one only if the export fails.
-        self._compiled_kernel = self.export_compile_fn()
-        try:
-            self._export()
-        except Exception as e:
-            logger.warning(
-                f"Failed to persist CuTe-DSL kernel {self.name} to "
-                f"{self.object_path}: {e}. Compiling it again with an execution "
-                "engine; the kernel will be recompiled next run."
-            )
-            self._compiled_kernel = self.compile_fn()
-            return
-        self._compiled_kernel = None
+        # execution engine when the caller provides that compile, and again
+        # with one only if the export fails (an engine-less kernel cannot run).
+        self._compiled_kernel = (self.export_compile_fn or self.compile_fn)()
+        exported = self._commit()
+        if self.export_compile_fn is not None:
+            self._compiled_kernel = None if exported else self.compile_fn()
 
     def compile_and_persist(self) -> None:
-        """Compile outside the module lock; commit the artifact under it.
+        """``build()`` without the kernel lock, for parallel precompilation workers."""
+        self._timed_build()
 
-        ``build_and_load()`` holds the module lock for the whole build.
-        This variant runs ``compile_fn`` unlocked and takes the lock only
-        for the stale-module wipe and the artifact export (~ms).
-
-        Meant for parallel precompilation workers.
-        """
+    def _commit(self) -> bool:
+        """Export the compiled kernel under the module lock; False if that failed."""
         from filelock import FileLock
 
-        started = time.perf_counter()
-        # Only the export is wanted here: no execution engine when the
-        # caller provides the engine-less compile.
-        self._compiled_kernel = (self.export_compile_fn or self.compile_fn)()
-        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
-        exported = False
-        with FileLock(self.lock_path, thread_local=False):
+        with FileLock(self.module_lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
                 and _read_meta(self.meta_path) != self.expected_meta
@@ -267,17 +250,14 @@ class JitSpecCuteDsl(JitSpec):
                 shutil.rmtree(self.module_dir, ignore_errors=True)
             try:
                 self._export()
-                exported = True
+                return True
             except Exception as e:  # noqa: BLE001 -- persistence is best-effort
                 logger.warning(
                     f"Failed to persist CuTe-DSL kernel {self.name} to "
                     f"{self.object_path}: {e}. The kernel will be recompiled "
                     f"next run."
                 )
-        if self.export_compile_fn is not None:
-            # the exported object is what load() hands back; an engine-less
-            # kernel cannot run, so without one compile again with the engine
-            self._compiled_kernel = None if exported else self.compile_fn()
+                return False
 
     def load(self) -> Any:
         """The kernel to hand back: the exported artifact whenever one exists.
@@ -426,3 +406,103 @@ def build_and_load_cute_dsl_kernel(
         export_compile_fn=export_compile_fn,
     )
     return spec.build_and_load()
+
+
+def _key_value(value: Any) -> Any:
+    """A process-independent rendering of one kernel-key component."""
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, enum.Enum):
+        return (type(value).__module__, type(value).__qualname__, value.name)
+    if isinstance(value, type):
+        return (value.__module__, value.__qualname__)
+    if dataclasses.is_dataclass(value):
+        return (
+            type(value).__module__,
+            type(value).__qualname__,
+            tuple(
+                (field.name, _key_value(getattr(value, field.name)))
+                for field in dataclasses.fields(value)
+            ),
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_key_value(item) for item in value)
+    import torch
+
+    if isinstance(value, torch.dtype):
+        return str(value)
+    raise TypeError(
+        f"no stable CuTe-DSL kernel-key rendering for {type(value).__qualname__}"
+    )
+
+
+def cute_dsl_kernel_name(prefix: str, key: Any) -> str:
+    """On-disk kernel name for ``key``: ``prefix`` and a digest of its rendering.
+
+    ``key`` may hold None, bools, ints, floats, strings, enums, types (e.g.
+    CuTe-DSL dtypes), torch dtypes, dataclasses and tuples/lists of these;
+    anything else raises ``TypeError`` rather than being weakened into a name
+    that two kernels could share.
+    """
+    digest = hashlib.sha256(repr(_key_value(key)).encode()).hexdigest()
+    return f"{prefix}_{digest[:40]}"
+
+
+def cute_dsl_disk_cached(
+    module_name: str,
+    key_files: Sequence[str],
+    *,
+    enable_tvm_ffi: bool = True,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Persist the CuTe-DSL kernels a compile function returns.
+
+    For a compile function memoized with ``functools.cache``, whose arguments
+    therefore already determine the kernel it compiles: they name the kernel
+    in the disk cache, which keys the source in ``key_files`` as
+    ``build_and_load_cute_dsl_kernel`` does. An argument named
+    ``device_index`` selects the device the kernel is compiled under (and so
+    the compile target); only that device's compute capability enters the
+    name. Arguments without a stable rendering (see ``cute_dsl_kernel_name``)
+    bypass the disk cache.
+
+    ``enable_tvm_ffi`` states how the function compiles (see
+    :class:`JitSpecCuteDsl`). Put ``functools.cache`` outside this decorator.
+    """
+
+    def decorator(compile_fn: Callable[..., Any]) -> Callable[..., Any]:
+        signature = inspect.signature(compile_fn)
+
+        @functools.wraps(compile_fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            key = dict(bound.arguments)
+            device_index = key.pop("device_index", None)
+            if device_index is None:
+                device = contextlib.nullcontext()
+            else:
+                import torch
+
+                device = torch.cuda.device(device_index)
+                key["device_index"] = torch.cuda.get_device_capability(device_index)
+            with device:
+                try:
+                    kernel_name = cute_dsl_kernel_name(
+                        compile_fn.__name__, tuple(key.items())
+                    )
+                except TypeError as e:
+                    logger.warning(
+                        f"CuTe-DSL disk cache bypassed for {module_name}: {e}"
+                    )
+                    return compile_fn(*args, **kwargs)
+                return build_and_load_cute_dsl_kernel(
+                    module_name,
+                    kernel_name,
+                    lambda: compile_fn(*args, **kwargs),
+                    key_files,
+                    enable_tvm_ffi=enable_tvm_ffi,
+                )
+
+        return wrapper
+
+    return decorator

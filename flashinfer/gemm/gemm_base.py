@@ -10174,17 +10174,32 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                     use_scale=scale_tensor is not None,
                     use_bias=bias_tensor is not None,
                 )
-                compiled_gemm = cute.compile(
-                    gemm,
-                    fake_a_ptr,
-                    fake_sfa_ptr,
-                    fake_b_ptr,
-                    fake_sfb_ptr,
-                    fake_c_ptr,
-                    fake_scale_ptr,
-                    fake_bias_ptr,
-                    dummy_mnkl,
-                    make_fake_stream(),
+                from ..jit.cute_dsl_core import (
+                    build_and_load_cute_dsl_kernel,
+                    cute_dsl_kernel_name,
+                )
+                from .kernels.cute_dsl import low_latency_blockscaled_gemm
+
+                # cache_key[0] is the device, whose compile target the
+                # module directory keys; the bias pointer's alignment is its
+                # element size, which c_cutlass_dtype determines.
+                compiled_gemm = build_and_load_cute_dsl_kernel(
+                    "gemm_low_latency_blockscaled",
+                    cute_dsl_kernel_name("gemm", cache_key[1:]),
+                    lambda: cute.compile(
+                        gemm,
+                        fake_a_ptr,
+                        fake_sfa_ptr,
+                        fake_b_ptr,
+                        fake_sfb_ptr,
+                        fake_c_ptr,
+                        fake_scale_ptr,
+                        fake_bias_ptr,
+                        dummy_mnkl,
+                        make_fake_stream(),
+                    ),
+                    (low_latency_blockscaled_gemm.__file__, __file__),
+                    enable_tvm_ffi=False,
                 )
                 _CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE[cache_key] = (
                     compiled_gemm

@@ -38,6 +38,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import cute_dsl_disk_cached
+from . import dense_bf16_gemm_warp_splitk as _bf16_warp_splitk
 from .dense_bf16_gemm_warp_splitk import (
     _A_LOADER_THREADS,
     _A_LOADER_WARPS,
@@ -954,6 +956,11 @@ def _from_dlpack_1d(tensor: _torch.Tensor, *, dynamic: bool):
 
 
 @functools.cache
+@cute_dsl_disk_cached(
+    "gemm_mxfp8_warp_splitk",
+    (__file__, _bf16_warp_splitk.__file__),
+    enable_tvm_ffi=False,
+)
 def _compile(
     device_index: int,
     out_dtype,

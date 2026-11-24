@@ -24,6 +24,8 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from flashinfer.jit.cute_dsl_core import cute_dsl_disk_cached
+from flashinfer.gemm.kernels import dense_bf16_gemm_warp_splitk as _warp_splitk
 from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
     LamportPeerStoreConfig,
     bind_peer_store_args,
@@ -1172,6 +1174,11 @@ def _to_cute_swap(a, b, out, bias):
 
 
 @functools.cache
+@cute_dsl_disk_cached(
+    "gemm_bf16_sm100_splitk",
+    (__file__, _warp_splitk.__file__),
+    enable_tvm_ffi=False,
+)
 def _get_compiled_splitk_kernel(
     device_index: int,
     dtype,

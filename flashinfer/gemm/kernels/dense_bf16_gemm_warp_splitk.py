@@ -22,6 +22,8 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils.distributed import multimem_st_4xb32
 
+from ...jit.cute_dsl_core import cute_dsl_disk_cached
+
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
 _A_LOADER_WARPS = 2
@@ -1213,6 +1215,7 @@ def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
 
 
 @functools.cache
+@cute_dsl_disk_cached("gemm_bf16_warp_splitk", (__file__,), enable_tvm_ffi=False)
 def _compile(
     device_index: int,
     dtype,
