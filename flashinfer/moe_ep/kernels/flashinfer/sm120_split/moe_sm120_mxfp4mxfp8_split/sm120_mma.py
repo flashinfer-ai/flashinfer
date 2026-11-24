@@ -8,8 +8,8 @@ instruction is PTX:
     mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X
       .m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0
 
-The instruction issue path uses the low-level
-``cute_nvgpu.arch.mma.SM120.block_scaled`` operation.
+The instruction issue path emits PTX directly, as does the packed-scale path,
+so it does not depend on intermediate compiler arch operations.
 """
 
 from __future__ import annotations
@@ -22,9 +22,7 @@ import cutlass.cute.nvgpu.warp.mma as warp_mma
 import cutlass.utils.blackwell_helpers as sm120_utils
 from cutlass import Float32, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir, llvm
-from cutlass.cute.nvgpu.warp.mma import _pack_shape
+from cutlass._mlir.dialects import llvm
 
 
 MMA_M = 16
@@ -153,46 +151,62 @@ def _arch_mma_m16n8k32_mxfp8(
 
     a_i32 = a_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
     b_i32 = b_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
-    sfa_i8 = sfa_scalar.bitcast(cutlass.Int8, loc=loc, ip=ip)
-    sfb_i8 = sfb_scalar.bitcast(cutlass.Int8, loc=loc, ip=ip)
+    sfa_u8 = sfa_scalar.bitcast(cutlass.Uint8, loc=loc, ip=ip)
+    sfb_u8 = sfb_scalar.bitcast(cutlass.Uint8, loc=loc, ip=ip)
 
-    # Byte selectors are for packed 32-bit scale words, not these scalar bytes.
-    shape_attr = _pack_shape((MMA_M, MMA_N, MMA_K), loc=loc, ip=ip).type.attribute
-    res = _cute_nvgpu_ir.arch_mma_SM120_block_scaled(
-        [acc_dtype.mlir_type] * 4,
-        shape_attr,
-        MXFP8_BLOCK,
-        ir.TypeAttr.get(a_dtype.mlir_type),
-        ir.TypeAttr.get(b_dtype.mlir_type),
-        ir.TypeAttr.get(sf_dtype.mlir_type),
+    if acc_dtype != cutlass.Float32 or sf_dtype != cutlass.Float8E8M0FNU:
+        raise ValueError("m16n8k32 MXFP8 requires F32 accumulators and E8M0 scales")
+    ptx_types = {
+        cutlass.Float4E2M1FN: "e2m1",
+        cutlass.Float8E4M3FN: "e4m3",
+        cutlass.Float8E5M2: "e5m2",
+    }
+    mma_ptx = (
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X"
+        f".m16n8k32.row.col.f32.{ptx_types[a_dtype]}.{ptx_types[b_dtype]}.f32.ue8m0"
+    )
+    # Encode byte selector 0 in PTX: each scalar occupies the low byte.
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
         [
-            a_i32[0].ir_value(loc=loc, ip=ip),
-            a_i32[1].ir_value(loc=loc, ip=ip),
-            a_i32[2].ir_value(loc=loc, ip=ip),
-            a_i32[3].ir_value(loc=loc, ip=ip),
+            Uint32(a_i32[0]).ir_value(loc=loc, ip=ip),
+            Uint32(a_i32[1]).ir_value(loc=loc, ip=ip),
+            Uint32(a_i32[2]).ir_value(loc=loc, ip=ip),
+            Uint32(a_i32[3]).ir_value(loc=loc, ip=ip),
+            Uint32(b_i32[0]).ir_value(loc=loc, ip=ip),
+            Uint32(b_i32[1]).ir_value(loc=loc, ip=ip),
+            Uint32(sfa_u8).ir_value(loc=loc, ip=ip),
+            cutlass.Int16(thread_id_a).ir_value(loc=loc, ip=ip),
+            Uint32(sfb_u8).ir_value(loc=loc, ip=ip),
+            cutlass.Int16(thread_id_b).ir_value(loc=loc, ip=ip),
+            Float32(acc[0]).ir_value(loc=loc, ip=ip),
+            Float32(acc[1]).ir_value(loc=loc, ip=ip),
+            Float32(acc[2]).ir_value(loc=loc, ip=ip),
+            Float32(acc[3]).ir_value(loc=loc, ip=ip),
         ],
-        [
-            b_i32[0].ir_value(loc=loc, ip=ip),
-            b_i32[1].ir_value(loc=loc, ip=ip),
-        ],
-        [
-            acc[0].ir_value(loc=loc, ip=ip),
-            acc[1].ir_value(loc=loc, ip=ip),
-            acc[2].ir_value(loc=loc, ip=ip),
-            acc[3].ir_value(loc=loc, ip=ip),
-        ],
-        sfa_i8.ir_value(loc=loc, ip=ip),
-        sfb_i8.ir_value(loc=loc, ip=ip),
-        thread_id_a=thread_id_a,
-        thread_id_b=thread_id_b,
+        mma_ptx + """
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3},
+        {$10},
+        {0, $11},
+        {$12},
+        {0, $13};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,r,h,0,1,2,3",
+        # All lanes must issue the MMA even when only some consume the result.
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
+    acc[0] = Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip))
+    acc[1] = Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip))
+    acc[2] = Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip))
+    acc[3] = Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip))
 
-    acc[0] = acc_dtype(res[0])
-    acc[1] = acc_dtype(res[1])
-    acc[2] = acc_dtype(res[2])
-    acc[3] = acc_dtype(res[3])
 
 
 @dsl_user_op
@@ -253,7 +267,8 @@ def _arch_mma_m16n8k32_mxfp8_packed_sfb(
         {$14, $15};
         """,
         "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
-        has_side_effects=False,
+        # All lanes must issue the MMA even when only some consume the result.
+        has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
