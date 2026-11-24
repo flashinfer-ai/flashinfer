@@ -258,7 +258,8 @@ winners. Entries tuned before the budget was reported are retuned once when
 tuning is next enabled; serving from them is unchanged. This ranking
 needs MXFP8 workload validation before becoming a default: a startup reduction
 alone does not establish steady-state performance parity. The newer warp
-split-K runner and SM107/SM12x paths are outside this change.
+split-K runner and SM12x paths are outside this change; the SM107 low-M runner
+(M <= 32) applies the budget.
 
 Use the following regression harness with a **new** output directory:
 
