@@ -445,6 +445,7 @@ kernel_cake_sage_block_sparse_attention_f6fc272a4f67d46dd9cf(const __grid_consta
                         : "=r"(*reinterpret_cast<uint32_t*>(&xw[p * 4])), "=r"(*reinterpret_cast<uint32_t*>(&xw[(p * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xw[(p * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xw[(p * 4) + 3]))
                         : "r"(slot_addr + (unsigned int)((wq * 16 + hrow + p * 2) * 256 + c16 * 16)));
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(empty_addr + ((int)((unsigned int)kk % 8)) * 8);
                 if (uc_q != 0) {
                     int bh = uc_bc / uc_chunks * num_heads + uc_w % uc_heads;
