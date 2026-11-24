@@ -103,21 +103,25 @@ def _model(gated, experts=E, seed=0):
 
 
 def _reference(
-    m, xr, ids, weights, gemm2_input, act=lambda g, u: F.silu(g) * u, gemm1_bf16=True
-):
-    """The top-k sum from the dequantized input xr, quantizing GEMM2's input by gemm2_input."""
+    m, xr, ids, weights, gemm2_input, act=lambda g, u: F.silu(g) * u, gemm1_bf16=True,
+    plain=lambda h: F.relu(h).square(), pre_fc2=False,
+):  # fmt: skip
+    """The top-k sum from the dequantized input xr, quantizing GEMM2's input by gemm2_input
+    (``pre_fc2``: that input weighted by the routing weights, the sum unweighted)."""
     tokens, top_k = ids.shape
     y = torch.zeros(tokens * top_k, H, device=xr.device)
-    flat = ids.flatten()
+    flat, w = ids.flatten(), weights.float()
     for e in range(m["w1"].shape[0]):
         sel = (flat == e).nonzero().squeeze(1)
         if sel.numel():
             h = xr[sel // top_k] @ m["w1_deq"][e].T
             if gemm1_bf16:  # the GEMM1 output in BF16
                 h = h.bfloat16().float()
-            a = act(h[:, I:], h[:, :I]) if m["gated"] else F.relu(h).square()
+            a = act(h[:, I:], h[:, :I]) if m["gated"] else plain(h)
+            if pre_fc2:  # the 16-bit activation times its routing weight
+                a = a.bfloat16().float() * w.flatten()[sel, None]
             y[sel] = gemm2_input(a.bfloat16()) @ m["w2_deq"][e].T
-    return (y.view(tokens, top_k, H) * weights.float()[..., None]).sum(1)
+    return (y.view(tokens, top_k, H) * (1 if pre_fc2 else w[..., None])).sum(1)
 
 
 # 3e-2 for a quantized GEMM2 input: quantizing the activation from FP32 (the kernels) or from
@@ -340,8 +344,8 @@ def test_expert_parallel(gated):
 
 
 def test_wrapper_tactics():
-    """Below SM100 the CuTe-DSL wrapper offers the records tactics its run takes (W4A4 those
-    of per token too)."""
+    """Below SM100 the CuTe-DSL wrapper offers the records tactics its run takes, and runs
+    each: W4A16, W4A4 per token and W4A4 weighting its routing before FC2 (ClampedRelu2)."""
     m, tokens = _model(True), 37
     x = torch.randn(tokens, H, device="cuda").bfloat16()
     ids, weights = _routing(tokens)
@@ -352,8 +356,34 @@ def test_wrapper_tactics():
     ref = _reference(m, x.float(), ids, weights, lambda a: a.float())
     for tactic in wrapper.get_valid_tactics():
         _close(wrapper.run(*args, tactic=tactic), ref)
-    w4a4 = CuteDslMoEWrapper(E, K, H, I).get_valid_tactics()
-    assert w4a4 == list(W4A16_SM80_TACTICS[:4])
+    codes, sf, s, xr = _quant_pt(x)
+    ref = _reference(m, xr, ids, weights, lambda a: _quant_pt(a)[3])
+    args = (codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], m["w1_g"], _base())
+    args += (m["w2"], m["r2"], m["w2_g"])
+    wrapper = CuteDslMoEWrapper(E, K, H, I)
+    assert wrapper.get_valid_tactics() == list(W4A16_SM80_TACTICS[:4])
+    for tactic in wrapper.get_valid_tactics():
+        _close(
+            wrapper.run(*args, tactic=tactic, per_token_scale=s, nvfp4_4over6=None), ref
+        )
+    # W4A4 weighting its routing before FC2, ClampedRelu2 clamping GEMM1's output
+    m, limit = _model(False), torch.tensor([2.0], device="cuda")
+    a1 = 448 * 6 / x.float().abs().amax().view(1)
+    a2 = torch.tensor([448 * 6 / 128.0], device="cuda")
+    codes, sf, xr = _quant(x, a1)
+    ref = _reference(
+        m, xr, ids, weights, lambda a: _quant(a, a2)[2], pre_fc2=True,
+        plain=lambda h: F.relu(limit * torch.tanh(h / limit)).square(),
+    )  # fmt: skip
+    args = (codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], m["w1_g"] / a1, a2)
+    args += (m["w2"], m["r2"], m["w2_g"] / a2)
+    wrapper = CuteDslMoEWrapper(
+        E, K, H, I, activation_type=ActivationType.ClampedRelu2.value,
+        clamped_relu2_limit=limit, routing_weights_before_fc2=True,
+    )  # fmt: skip
+    assert wrapper.get_valid_tactics() == list(W4A16_SM80_TACTICS[:4])
+    for tactic in wrapper.get_valid_tactics():
+        _close(wrapper.run(*args, tactic=tactic), ref)
 
 
 def test_alltoall():

@@ -1780,6 +1780,7 @@ def cutlass_fused_moe(
     profile_ids : Optional[List[int]]
         Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
         the runner's combined tactic list; ``-1`` keeps the default tactic for that GEMM.
+        The FP4 records below SM100 (see ``quant_scales``) reject it.
 
     workspace_buffer : Optional[torch.Tensor]
         Pre-allocated scratch buffer reused across calls to eliminate per-call workspace
@@ -1802,6 +1803,9 @@ def cutlass_fused_moe(
         per CUDA stream context; overlapping micro-batches on separate streams each need
         their own buffer. A buffer sized for the maximum token count is valid for all
         smaller counts on the same call.
+
+        The FP4 records below SM100 (see ``quant_scales``) take no workspace buffer: they
+        reject one, and :func:`cutlass_fused_moe_workspace_size` does not apply to them.
 
     backend : str
         ``"cutlass"`` preserves the existing backend. ``"cake"`` selects the
@@ -2151,7 +2155,9 @@ def cutlass_fused_moe_workspace_size(
     Allocate the returned number of bytes once at model-load time (as a 1-D
     ``torch.uint8`` tensor) and pass the buffer as ``workspace_buffer=`` on
     every :func:`cutlass_fused_moe` call to eliminate the per-call
-    multi-GiB scratch allocation.
+    multi-GiB scratch allocation. The FP4 records below SM100 (see the
+    ``quant_scales`` of :func:`cutlass_fused_moe`) take no workspace buffer:
+    this size does not apply to them.
 
     Parameters
     ----------
@@ -8140,7 +8146,7 @@ def trtllm_fp4_block_scale_moe(
         a single buffer. Requires ``do_finalize=True`` and no
         ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
         scratch that does not fit (a larger token count) is allocated per call.
-        Default ``None`` (allocate per call).
+        Default ``None`` (allocate per call). Below SM100 the records reject it.
 
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 4over6 recipe for the per-token requantization of the GEMM2
@@ -8544,7 +8550,7 @@ def trtllm_fp4_block_scale_routed_moe(
         a single buffer. Requires ``do_finalize=True`` and no
         ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
         scratch that does not fit (a larger token count) is allocated per call.
-        Default ``None`` (allocate per call).
+        Default ``None`` (allocate per call). Below SM100 the records reject it.
 
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 4over6 recipe for the per-token requantization of the GEMM2
@@ -9133,7 +9139,9 @@ def trtllm_fused_moe_workspace_size(
     tensor) and pass it as ``workspace_buffer=`` to ``trtllm_*_moe`` /
     ``trtllm_*_routed_moe``. The launch then carves its routing maps,
     intermediate GEMM outputs and batched-GEMM workspaces from that buffer
-    instead of allocating and freeing them on every call.
+    instead of allocating and freeing them on every call. FP4 below SM100 runs
+    on records, which take no workspace buffer: this size does not apply to
+    them.
 
     With ``tactic=None``, the size is measured by the launcher's own allocation
     code, over every tile size at ``max_num_tokens``, so one buffer fits whichever
