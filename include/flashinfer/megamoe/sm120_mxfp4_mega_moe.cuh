@@ -219,8 +219,10 @@ __device__ __forceinline__ int ld_acquire_gpu(const int* p) {
   asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
   return v;
 }
-__device__ __forceinline__ void st_release_sys(int* p, int v) {
-  asm volatile("st.release.sys.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+// a peer's flag: every caller has fenced the data it publishes with __threadfence_system first, so
+// a plain store (a release store adds a second system fence: 1-3 us per flag on RTX 6000D)
+__device__ __forceinline__ void st_flag_sys(int* p, int v) {
+  *reinterpret_cast<volatile int*>(p) = v;
 }
 __device__ __forceinline__ void st_release_gpu(int* p, int v) {
   asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
@@ -283,10 +285,10 @@ __device__ __forceinline__ constexpr bool is_gin(const Args&, int) { return fals
 #endif
 
 // Wait until every rank w's flag flags[w] (written over PCIe) reaches epoch, or a GIN rank's
-// signal sig + w reaches target(w). One CTA (the last) polls them, a thread per rank, and
-// republishes on the local word ctr[kCtrFlag + kind]; the other CTAs wait on that word: with every
-// CTA polling, the loads delay the flags' and signals' arrival. A failed wait records err first.
-// Every thread calls it; the result is thread 0's.
+// signal sig + w reaches target(w). One CTA (the last) polls them, a lane of its warp 0 per rank,
+// and republishes on the local word ctr[kCtrFlag + kind]; the other CTAs wait on that word: with
+// every CTA polling, the loads delay the flags' and signals' arrival. A failed wait records err
+// first. Every thread calls it; the result is thread 0's.
 template <class Target>
 __device__ __forceinline__ bool wait_peers(const Args& a, const int* flags, int epoch, int kind,
                                            int sig, int err, Target target) {
@@ -295,27 +297,23 @@ __device__ __forceinline__ bool wait_peers(const Args& a, const int* flags, int 
     if (threadIdx.x != 0) return true;
     return wait_ge(local, epoch, false) && ld_acquire_gpu(a.ctr + kCtrErr) == 0;
   }
-  __shared__ int s_fail;
-  if (threadIdx.x == 0) s_fail = 0;
-  __syncthreads();
+  if (threadIdx.x >= 32) return true;  // warp 0 polls, a lane per rank (W <= 32)
   const int w = threadIdx.x;
+  bool ok = true;
   if (w < a.W) {
-    bool ok;
 #if MEGAMOE_SM120_GIN_DEVICE
     if (is_gin(a, w))
       ok = gin_wait(a, sig + w, target(w));
     else
 #endif
       ok = wait_ge(flags + w, epoch, true);
-    if (!ok) s_fail = 1;
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    if (s_fail) atomicExch(a.ctr + kCtrErr, err);
-    __threadfence();
+  ok = __all_sync(0xffffffffu, ok);
+  if (threadIdx.x == 0) {  // the release orders the error word before the local flag
+    if (!ok) atomicExch(a.ctr + kCtrErr, err);
     st_release_gpu(local, epoch);
   }
-  return threadIdx.x != 0 || !s_fail;
+  return ok;
 }
 
 __device__ __forceinline__ void mma_w4a8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0,
@@ -658,16 +656,28 @@ struct Map {  // per-expert token bookkeeping, built identically by every CTA af
   int lag;  // queue order (item_decode): tiles whose FC1 items precede the first FC2 item
 };
 
-// Top-k id of (token t, slot k) as every phase reads it: -1 for a masked route, an id outside
-// [0, W * EL), or a repeat of an earlier slot of the same token, so a token reaches each expert at
-// most once and its dispatch slot stays below TCAP
-__device__ __forceinline__ int route_at(const Args& a, int t, int k) {
-  const int64_t* ids = a.topk_ids + size_t(t) * a.TOPK;
-  const int64_t id = ids[k];
-  if (id < 0 || id >= int64_t(a.W) * a.EL) return -1;
-  for (int j = 0; j < k; ++j)
-    if (ids[j] == id) return -1;
-  return int(id);
+// This rank's top-k ids as every phase reads them, into rt[t * TOPK + k]: -1 for a masked route,
+// an id outside [0, W * EL), or a repeat of an earlier slot of the same token, so a token reaches
+// each expert at most once and its dispatch slot stays below TCAP. A thread per route reads its id
+// and the token's earlier ones (one cache line, loads in flight together): the int64 ids cost one
+// memory latency, not TOPK in a row. Every thread of the CTA calls it.
+__device__ __forceinline__ void load_routes(const Args& a, int16_t* rt) {
+  constexpr int kPer = kMaxTokens * kMaxTopk / (kWarps * 32);
+  const int n = a.T * a.TOPK;
+  const int64_t lim = int64_t(a.W) * a.EL;
+#pragma unroll
+  for (int p = 0; p < kPer; ++p) {
+    const int u = int(threadIdx.x) + p * kWarps * 32;
+    if (u < n) {
+      const int k = u % a.TOPK;
+      const int64_t* ids = a.topk_ids + (u - k);
+      const int64_t id = ids[k];
+      bool keep = id >= 0 && id < lim;
+      for (int j = 0; j < k; ++j) keep &= ids[j] != id;
+      rt[u] = keep ? int16_t(id) : int16_t(-1);
+    }
+  }
+  __syncthreads();
 }
 
 // Queue order over the tiles (a tile = one expert's kTileN tokens; nblk1 FC1 items, nblk2 FC2
@@ -741,6 +751,11 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
   __syncthreads();
   const int epoch = s_epoch;
   int* ctr = a.ctr;
+  // the rank's routes, read once: the routing counts, the dispatch slots, the prefetch and the
+  // combine all scan them
+  __shared__ int16_t s_rt[kMaxTokens * kMaxTopk];
+  const int nitems = a.T * TOPK;
+  load_routes(a, s_rt);
 
   // ---------------- routing exchange first (tiny): every rank learns its experts' load from each
   // source before the rows land: per destination rank, this rank's routes to each of its local
@@ -760,7 +775,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
     for (int t = threadIdx.x; t < a.T; t += blockDim.x) {  // m.cnt as scratch: [dst][el]
       unsigned to = 0;
       for (int k = 0; k < TOPK; ++k) {
-        const int e = route_at(a, t, k);
+        const int e = s_rt[t * TOPK + k];
         if (e < 0) continue;
         atomicAdd(&m.cnt[e / EL][e % EL], 1);
         to |= 1u << (e / EL);
@@ -790,7 +805,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
                 ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigRoute + a.rank), 1});
       else
 #endif
-        st_release_sys(a.peers.route_flag[dst] + a.rank, epoch);
+        st_flag_sys(a.peers.route_flag[dst] + a.rank, epoch);
     }
     st_[8] = gtime();
   }
@@ -803,8 +818,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
     __shared__ unsigned long long s_known;
     if (threadIdx.x == 0) s_known = 0;
     __syncthreads();
-    for (int u = threadIdx.x; u < a.T * TOPK; u += blockDim.x) {
-      const int e = route_at(a, u / TOPK, u % TOPK);
+    for (int u = threadIdx.x; u < nitems; u += blockDim.x) {
+      const int e = s_rt[u];
       if (e >= 0 && e / EL == a.rank) atomicOr(&s_known, 1ull << (e % EL));
     }
     __syncthreads();
@@ -827,19 +842,11 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
 
   // ---------------- dispatch: one CTA per token: the staged MXFP8 row into smem, push TOPK copies
   // with every thread
-  const int nitems = a.T * TOPK;
   {
     uint8_t* s_q = reinterpret_cast<uint8_t*>(
         &s_tile[0][0]);  // [H] e4m3, then [H/32] ue8m0 (H + H/32 <= smem)
     uint8_t* s_sc = s_q + H;
     __shared__ int s_rowk[8], s_dstk[8], s_posk[8];
-    // the rank's routes (route_at, masked: -1), read once: every copy's slot scans all of them
-    __shared__ int16_t s_rt[kMaxTokens * kMaxTopk];
-    if (int(blockIdx.x) < a.T) {
-      for (int u = threadIdx.x; u < nitems; u += blockDim.x)
-        s_rt[u] = int16_t(route_at(a, u / TOPK, u % TOPK));
-      __syncthreads();
-    }
     for (int t = blockIdx.x; t < a.T; t += gridDim.x) {
       if (threadIdx.x < H / 32) {  // one thread per K32 group: the staged codes and their scale
         const uint4* s4 = reinterpret_cast<const uint4*>(a.x + size_t(t) * H + threadIdx.x * 32);
@@ -936,7 +943,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
   if (s_item) {  // last CTA out of the dispatch: every row of this rank is visible -> a thread per
                  // P2P rank flags it, then a thread per GIN rank puts its slot table and rows
     if (threadIdx.x < W && !is_gin(a, threadIdx.x))
-      st_release_sys(a.peers.recv_flag[threadIdx.x] + a.rank, epoch);
+      st_flag_sys(a.peers.recv_flag[threadIdx.x] + a.rank, epoch);
 #if MEGAMOE_SM120_GIN_DEVICE
     if (a.gin.mask) {
       // the routing counts staged for each GIN rank: this rank's routes there (its slot table
@@ -1224,14 +1231,17 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
               s_tile[th * 8 + 2 * c + h][col + 8] = acc[jb][th][2 + h];
             }
         }
+        // the tile's tokens: source rank and slot there, in (source, slot) order
+        __shared__ int s_tw[kTileN], s_ti[kTileN];
+        if (threadIdx.x < ntok)
+          token_src(m, el, tile * kTileN + threadIdx.x, W, s_tw[threadIdx.x], s_ti[threadIdx.x]);
         __syncthreads();
         // push: token tk of this tile -> its source rank's combine slot, kRowsPerItem bf16 in 16 B
         // stores
         constexpr int kVec = kRowsPerItem / 8;
         for (int u = threadIdx.x; u < ntok * kVec; u += blockDim.x) {
           const int tk = u / kVec, q = u % kVec;
-          int w, i;
-          token_src(m, el, tile * kTileN + tk, W, w, i);
+          const int w = s_tw[tk], i = s_ti[tk];
           uint32_t pk[4];
 #pragma unroll
           for (int p = 0; p < 4; ++p) {
@@ -1256,18 +1266,12 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
         __threadfence_system();
         __syncthreads();
 #if MEGAMOE_SM120_GIN_DEVICE
-        if (a.gin.mask) {  // the tile's last FC2 item puts its finished rows to GIN sources
-          if (threadIdx.x == 0) {
-            s_item = atomicAdd(ctr + kCtrTile + tile_g, 1) == nblk2 - 1;
-            __threadfence();
-          }
+        if (a.gin.mask) {  // the tile's last FC2 item puts its finished rows to GIN sources, one
+                           // put per run of a GIN source
+          __shared__ int s_last;
+          if (threadIdx.x == 0) s_last = atomicAdd(ctr + kCtrTile + tile_g, 1) == nblk2 - 1;
           __syncthreads();
-          // the tile's tokens are in (source, slot) order: one put per run of a GIN source
-          __shared__ int s_tw[kTileN], s_ti[kTileN];
-          if (s_item && threadIdx.x < ntok)
-            token_src(m, el, tile * kTileN + threadIdx.x, W, s_tw[threadIdx.x], s_ti[threadIdx.x]);
-          __syncthreads();
-          if (s_item && threadIdx.x < ntok && is_gin(a, s_tw[threadIdx.x]) &&
+          if (s_last && threadIdx.x < ntok && is_gin(a, s_tw[threadIdx.x]) &&
               (threadIdx.x == 0 || s_tw[threadIdx.x - 1] != s_tw[threadIdx.x])) {
             const int w = s_tw[threadIdx.x];
             int n = 1;
@@ -1277,7 +1281,6 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
                     a.gin.off_stage_comb + (size_t(w) * TCAP * TOPK + r) * H * 2, size_t(n) * H * 2,
                     ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigComb + a.rank), uint64_t(n)});
           }
-          __syncthreads();
         }
 #endif
         if (threadIdx.x == 0) {
@@ -1293,7 +1296,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
             gin_signal(a, w, ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigComb + a.rank), 1});
           else
 #endif
-            st_release_sys(a.peers.comb_flag[w] + a.rank, epoch);
+            st_flag_sys(a.peers.comb_flag[w] + a.rank, epoch);
           st_[15] = gtime();
         }
       }
@@ -1309,7 +1312,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
         gin_signal(a, w, ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigComb + a.rank), 1});
       else
 #endif
-        st_release_sys(a.peers.comb_flag[w] + a.rank, epoch);
+        st_flag_sys(a.peers.comb_flag[w] + a.rank, epoch);
     }
   }
 
@@ -1319,8 +1322,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
   if (a.gin.mask) {
     if (threadIdx.x < W) s_rows[threadIdx.x] = 0;
     __syncthreads();
-    for (int u = threadIdx.x; u < a.T * TOPK; u += blockDim.x) {
-      const int e = route_at(a, u / TOPK, u % TOPK);
+    for (int u = threadIdx.x; u < nitems; u += blockDim.x) {
+      const int e = s_rt[u];
       if (e >= 0) atomicAdd(&s_rows[e / EL], 1);
     }
     __syncthreads();
@@ -1357,7 +1360,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
       const int t = v / (H / 8), h8 = (v % (H / 8)) * 8;
       float s[8] = {};
       for (int k = 0; k < TOPK; ++k) {
-        const int e = route_at(a, t, k);
+        const int e = s_rt[t * TOPK + k];
         if (e < 0) continue;  // masked route: never dispatched
         const float wk = a.topk_w[t * TOPK + k];
         const __nv_bfloat16* row = comb + (size_t(t) * TOPK + k) * H;

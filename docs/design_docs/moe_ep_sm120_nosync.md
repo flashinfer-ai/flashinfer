@@ -102,10 +102,9 @@ every CTA is resident (CTAs wait on each other's flags). Phases:
    CTA also pulls the weights and scales of its static first work item (FC1 or
    FC2).
 3. **Dispatch.** One CTA per token: the staged MXFP8 row (codes and scales) goes
-   to each destination rank's expert pool with 16-byte P2P stores. The CTA reads
-   the rank's routes into shared memory once (each copy's pool slot counts the
-   earlier routes to its expert). The last CTA out flags the P2P ranks, a thread
-   per rank, then puts each GIN rank its rows.
+   to each destination rank's expert pool with 16-byte P2P stores (each copy's
+   pool slot counts the earlier routes to its expert). The last CTA out flags
+   the P2P ranks, a thread per rank, then puts each GIN rank its rows.
 4. **Expert map.** Each rank builds the per-expert token lists from the exchanged
    counts (same slot order as the dispatch) and waits for every source's rows.
 5. **FC1 / FC2 work queue.** A work item is one expert's 128 weight rows times a
@@ -147,12 +146,20 @@ wave of load slots: EP8 at 1 token per rank was 207 µs, 195 µs with two. A
 change in register allocation still changes the grid; check `cuobjdump
 --dump-resource-usage` of both builds after kernel edits.
 
-**Synchronization and errors.** Flags are written with `st.release.sys` after
-the data and read with `ld.acquire.sys`; there are no remote atomics. For each
-wait on every rank (routes, rows, partials) one CTA polls the peers' flags and
-GIN signals, a thread per rank, and republishes the epoch on a local word that
-the other CTAs wait on: with every CTA polling, the loads delayed the flags'
-and signals' arrival. Messages to every rank (routes, the "done" after the last
+**Routes.** Every CTA reads the rank's top-k ids into shared memory once at
+start (int16, masked or repeated ids as -1), a thread per route: the routing
+counts, the prefetch, the dispatch slots and the combine all read that copy.
+Reading the int64 ids where each phase needed them put up to top-k dependent
+memory latencies on the routing CTA's path (GLM-5.3-Flash EP8, 1 token per
+rank: routes sent at 8 µs instead of 3).
+
+**Synchronization and errors.** The data is fenced with `__threadfence_system`
+and the flag then written with a plain store (a release store adds a second
+system fence, 1–3 µs per flag), read with `ld.acquire.sys`; there are no remote
+atomics. For each wait on every rank (routes, rows, partials) one CTA's warp 0
+polls the peers' flags and GIN signals, a lane per rank, and republishes the
+epoch on a local word that the other CTAs wait on: with every CTA polling, the
+loads delayed the flags' and signals' arrival. Messages to every rank (routes, the "done" after the last
 FC2 item) go out a thread per rank. Every spin
 times out (30 s) and records an error code instead of hanging;
 `backend.protocol_error(workspace)` reads it. The last CTA to exit resets the
