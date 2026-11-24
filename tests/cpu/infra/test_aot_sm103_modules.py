@@ -432,10 +432,23 @@ def test_cake_tinygemm2_tcgen05_sm107a_needs_cuda_13_4(monkeypatch, cuda, regist
         ("cake_tinygemm2_tcgen05", "sm_107a", 36),
     ],
 )
-def test_cake_tinygemm2_aot_specs_are_the_runtime_specs(module_name, target, count):
+def test_cake_tinygemm2_aot_specs_are_the_runtime_specs(
+    monkeypatch, module_name, target, count
+):
     # The jit-cache must ship the module names and flags the runtime loads.
     import importlib
 
+    from flashinfer.jit import core
+
+    # gen_jit_spec checks the build targets; without a GPU and without
+    # FLASHINFER_CUDA_ARCH_LIST there are none, so build for this one.
+    arch = {
+        "sm_90a": (9, "0a"),
+        "sm_100a": (10, "0a"),
+        "sm_103a": (10, "3a"),
+        "sm_107a": (10, "7a"),
+    }[target]
+    monkeypatch.setattr(core.current_compilation_context, "TARGET_CUDA_ARCHS", {arch})
     programs = importlib.import_module(f"flashinfer.jit.{module_name}")
     specs = programs.aot_specs(target)
 
