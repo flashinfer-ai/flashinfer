@@ -3682,3 +3682,29 @@ def test_linear_scale_source_names_the_gather_objects_and_is_refused_for_the_box
             get_compiled_swapped(box, chain, sf_src="linear")
 
 
+@each_pair
+def test_fingerprint_refuses_the_shapes_the_layer_refuses(pair):
+    """``fingerprint("fused_moe_<pair>", ...)`` applies the class's complete shape rule after the alignment check: an expert
+    weight shape the dense class would K-split (the layer refuses it) has no fingerprint, on either family; the bounds on
+    ``E`` and ``top_k`` keep their errors; the model shapes keep their receipts."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import check_shape_fp4
+
+    op = f"fused_moe_{pair.name}"
+    for H, I, k, E in ((65536, 32, 1, 1), (8192, 64, 1, 4)):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="unsplit"):
+            check_shape_fp4(pair, H, I, E, k)
+        for arch in ("sm_100", "sm_107"):
+            with pytest.raises(bi.BatchInvariantUnsupportedError, match="unsplit") as e:
+                bi.fingerprint(op, H=H, I=I, top_k=k, num_experts=E, arch=arch)
+            assert pair.cls in str(e.value)
+    with pytest.raises(ValueError, match="top_k"):
+        bi.fingerprint(op, H=2048, I=768, top_k=17, num_experts=128, arch="sm_107")
+    with pytest.raises(ValueError, match="num_experts"):
+        bi.fingerprint(op, H=2048, I=768, top_k=1, num_experts=1025, arch="sm_107")
+    pins = {"nvfp4": "moe-597946a0417ed788", "mxfp4": "moe-e69167a89fd7e380"}
+    assert (
+        bi.fingerprint(op, H=2048, I=768, top_k=8, num_experts=128, arch="sm_107")
+        == pins[pair.name]
+    )
+
+

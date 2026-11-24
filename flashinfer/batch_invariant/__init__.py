@@ -361,7 +361,12 @@ def _moe_nvfp4_fingerprint(
     unsplit shapes, the K = 64 step elsewhere): the architecture family is a dimension of the class (SM100 and SM103 are one
     family); ``intermediate`` the
     intermediate's quantization class (``per_token`` / ``static``)."""
-    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4, expert_classes
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        ALIGN_FP4,
+        NVFP4,
+        check_shape_fp4,
+        expert_classes,
+    )
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import spec_fingerprint_nvfp4
 
     for dim, value in (("H", H), ("I", I)):
@@ -381,6 +386,8 @@ def _moe_nvfp4_fingerprint(
         n_group,
         topk_group,
     )
+    # the class's complete shape rule (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(NVFP4, H, I, num_experts, top_k, bool(gated))
     family = _mx_family(arch, "fused_moe_nvfp4")
     return spec_fingerprint_nvfp4(
         H,
@@ -414,7 +421,11 @@ def _moe_mxfp4_fingerprint(
     ``arch`` (an architecture family, a compute capability or a device; the current CUDA device by default) selects the
     instruction class of the expert GEMMs (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere): the architecture is
     a dimension of the class."""
-    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        ALIGN_FP4,
+        MXFP4,
+        check_shape_fp4,
+    )
     from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import (
         expert_classes_mx,
         spec_fingerprint_mxfp4,
@@ -437,6 +448,8 @@ def _moe_mxfp4_fingerprint(
         n_group,
         topk_group,
     )
+    # the class's complete shape rule (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(MXFP4, H, I, num_experts, top_k, bool(gated))
     family = _mx_family(arch, "fused_moe_mxfp4")
     return spec_fingerprint_mxfp4(
         H, I, top_k, num_experts, rm, name, params, gated, expert_classes_mx(family)
