@@ -162,6 +162,22 @@ def run(q, k, v, sf, table, seq_lens, qo_indptr, max_q_len, out, qk_scale, v_sca
         raise ValueError(
             "nonempty queries require a positive launch bound and page table"
         )
+    # Short low-concurrency decode has too few CTAs when looping over K/V
+    # in a single tile. Use independent sequence splits and a narrow MMA.
+    if (
+        max_q_len == 1
+        and table.shape[0] <= 4
+        and table.shape[1] <= 32
+        and hkv == 2
+        and q.shape[1] == 8
+        and d == 128
+        and page_size == 64
+    ):
+        from .mixed_kv_decode import run_decode
+
+        return run_decode(
+            q, k, v, sf, table, seq_lens, qo_indptr, out, qk_scale, v_scale
+        )
     # The dtype views preserve storage offsets and physical page/row strides.
     v16 = v.view(torch.uint16)
     group = q.shape[1] // hkv

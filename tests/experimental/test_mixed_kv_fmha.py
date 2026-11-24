@@ -145,3 +145,70 @@ def test_ragged_attention_and_graph_replay(d, group):
         out.fill_(torch.nan)
         graph.replay()
         check()
+
+
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+def test_short_decode_graph(layout):
+    from flashinfer.attention.mixed_kv import paged_fp8_k_nvfp4_v_fmha
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires a QMUL-capable Blackwell GPU")
+    dev = "cuda"
+    fp8 = torch.float8_e4m3fn
+    torch.manual_seed(21)
+
+    def allocate(d, dtype):
+        if layout == "HND":
+            return torch.empty((12, 2, 64, d), device=dev, dtype=dtype)
+        return torch.empty((12, 64, 2, d), device=dev, dtype=dtype).transpose(1, 2)
+
+    k = allocate(128, fp8)
+    k.copy_(torch.randn(k.shape, device=dev))
+    v = allocate(64, torch.uint8).random_(0, 256)
+    sf = allocate(8, fp8)
+    logical = (torch.rand(sf.shape, device=dev) + 0.0625).to(fp8)
+    sf.copy_(_writer_scale_layout(logical))
+    table = torch.tensor(
+        [[6, 7, 9], [9, 1, 3], [7, 5, 2], [1, 0, 4]], device=dev, dtype=torch.int32
+    )
+    q = torch.randn((3, 8, 128), device=dev).to(fp8)
+    lens = torch.tensor([129, 0, 65, 1], device=dev, dtype=torch.int32)
+    ptr = torch.tensor([0, 1, 1, 2, 3], device=dev, dtype=torch.int32)
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+
+    def run():
+        return paged_fp8_k_nvfp4_v_fmha(
+            q,
+            k,
+            v,
+            sf,
+            table,
+            lens,
+            ptr,
+            max_q_len=1,
+            out=out,
+            qk_scale=0.073,
+            v_scale=1.8,
+        )
+
+    run()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+    for l, p in [
+        ([129, 0, 65, 1], [0, 1, 1, 2, 3]),
+        ([0, 66, 1, 153], [0, 0, 1, 2, 3]),
+    ]:
+        lens.copy_(torch.tensor(l, device=dev))
+        ptr.copy_(torch.tensor(p, device=dev))
+        table.copy_(table.roll(1, 0))
+        out.fill_(torch.nan)
+        g.replay()
+        ref = _reference(q, k, v, logical, table, lens, ptr, 0.073, 1.8)
+        assert (
+            torch.isfinite(out).all()
+            and (out.float() - ref).norm() / ref.norm() < 0.055
+        )
