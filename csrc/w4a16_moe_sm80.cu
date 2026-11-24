@@ -33,7 +33,9 @@
 // the FC2 global scale, as the CUTLASS SM80 path's doActivation) and writes code x scale in BF16.
 // Both restores are exact; the global scales go to the GEMM alphas.
 // A RECORDS_F16 module runs all of it in FP16 (activations, MMA, outputs): the codes take
-// e2m1 x 2^-14 and the U5 scales s x 2^7, the same 2^-7 products; the restores stay exact.
+// e2m1 x 2^-14 and the U5 scales s x 2^7, the same 2^-7 products, exact for U5 f >= 6 (every
+// NVFP4 scale; MXFP4 blocks within 24 binades of their expert's largest). Smaller MXFP4 blocks
+// round to FP16 subnormals (f = 5's 0.5 to 0); BF16 keeps all 30 binades.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -151,8 +153,8 @@ __device__ __forceinline__ void mma_x(float* d, uint32_t const* a, uint32_t cons
                                  cute::SM80_16x8x16_F32BF16BF16F32_TN>;
   Mma::fma(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b[0], b[1], d[0], d[1], d[2], d[3]);
 }
-// a x {lo(s2), lo(s2)} and a x {hi(s2), hi(s2)}, exact; the broadcast is built
-// inside the asm so ptxas can fold it into HFMA2's operand swizzle.
+// a x {lo(s2), lo(s2)} and a x {hi(s2), hi(s2)}, exact (FP16: for U5 f >= 6); the broadcast
+// is built inside the asm so ptxas can fold it into HFMA2's operand swizzle.
 __device__ __forceinline__ uint32_t mul_lo(uint32_t a, uint32_t s2) {
   uint32_t r;
   asm("{\n.reg .b16 l, h;\n.reg .b32 b;\nmov.b32 {l, h}, %2;\nmov.b32 b, {l, "

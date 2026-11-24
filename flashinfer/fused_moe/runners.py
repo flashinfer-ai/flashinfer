@@ -9371,6 +9371,10 @@ class RecordsNvfp4Bf16Runner(MoERunner):
             for i, v in typed.items()
             if v is not None
         }
+        # NVFP4 x NVFP4's input scale when none is given or per token
+        self._unit_scale = torch.ones(1, dtype=torch.float32, device=self.device)
+        # Written before a call on any stream reads them
+        torch.cuda.current_stream(self.device).synchronize()
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         from .core import _W4A16_SM80_PT_TACTICS
@@ -9491,6 +9495,10 @@ class RecordsNvfp4Bf16Runner(MoERunner):
             raise TypeError(
                 f"{type(self).__name__} requires contiguous 2D BF16 hidden states."
             )
+        if x.device != self.device:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden states on {self.device}."
+            )
         if act.hidden_states_scale is not None:
             raise ValueError(
                 f"{type(self).__name__} requires hidden_states_scale to be None."
@@ -9574,7 +9582,6 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__(config, device)
-        self._unit_scale: Optional[torch.Tensor] = None
         # MXFP4 activations take CuTileMxfp4Runner's contract.
         self._mx4 = config.quant.activation is QuantFormat.MXFP4
         if self._mx4:
@@ -9609,10 +9616,6 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
     def _input_scale(self, view: dict[str, torch.Tensor], key: str) -> torch.Tensor:
         scale = view.get(key)
         if scale is None:
-            if self._unit_scale is None:
-                self._unit_scale = torch.ones(
-                    1, dtype=torch.float32, device=self.device
-                )
             return self._unit_scale
         if (scale.numel(), scale.dtype, scale.device) != (
             1,
@@ -9653,6 +9656,8 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
                 f"{name} requires contiguous 2D hidden states (MXFP4: tokens, as "
                 "CuTileMxfp4Runner)."
             )
+        if x.device != self.device:
+            raise ValueError(f"{name} requires hidden states on {self.device}.")
         tokens, hidden = x.shape[0], x.shape[1] * (2 if x.dtype == torch.uint8 else 1)
         # TRT-LLM's NVFP4 or MXFP8 codes and block scales; else BF16
         code = {

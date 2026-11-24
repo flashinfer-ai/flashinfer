@@ -2497,7 +2497,9 @@ def prepare_records_mxfp4_weights(
     the expert's power of two going to the FP32 ``w1_global_scale`` ([E], or [E, 2] up then gate
     when a gated expert's halves need their own) and ``w2_global_scale`` [E] that scale the GEMMs
     as NVFP4's global scales do. All-zero blocks hold no scale; an expert whose other blocks span
-    more than 30 binades raises, and so do halves whose powers of two leave an FP32 ratio.
+    more than 30 binades raises, and so do halves whose powers of two leave an FP32 ratio. BF16
+    activations restore all 30 binades exactly; FP16 ones restore the top 24 exactly and round
+    blocks further below to FP16 subnormals.
 
     Parameters
     ----------

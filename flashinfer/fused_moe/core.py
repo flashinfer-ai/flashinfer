@@ -2450,7 +2450,7 @@ def _w4a16_moe_sm80(
     if slot_experts is not None and (
         row_tile >= 64 or not dq or pe
     ):  # the prep's slots: R < 64
-        topk_ids = torch.gather(slot_experts, 0, topk_ids.view(-1)).view_as(topk_ids)
+        topk_ids = slot_experts.index_select(0, topk_ids.view(-1)).view_as(topk_ids)
         slot_experts = None
     inter = intermediate_size
     n1 = _w4a16_records_geometry(inter * (2 if gated else 1), hidden, gated)[0]
@@ -2532,6 +2532,7 @@ def _w4a16_moe_sm80_tuning(
     tune_max_num_tokens: int,
     inputs: Sequence[Optional[torch.Tensor]] = (),
     sf_swizzled: bool = False,
+    x_fmt: int = 0,
 ) -> TuningConfig:
     """Tuning of ``_w4a16_moe_sm80``'s ``inputs`` at ``num_tokens``' bucket: seeded BF16 input
     (or E2M1 codes with E4M3 scales in [2^-1, 2^2)), expert ids (or each (token, k) its own slot of
@@ -2568,10 +2569,12 @@ def _w4a16_moe_sm80_tuning(
             (8, lambda s, dtype, d: scales(s, torch.uint8, d).view(dtype))
         )
     constraints = []
-    if codes and sf_swizzled:  # 128x4 tiles over [tokens, K / 16]
+    if codes and sf_swizzled:  # 128x4 tiles over [tokens, K / 16] (MX: K / 32)
+        # x's bytes per 4 scales: NVFP4 32, MXFP8 128, MXFP4 64
+        per = {1: 128, 3: 64}.get(x_fmt, 32)
         constraints.append(
             ConstraintSpec(
-                8, 0, lambda s: -(-s[0][0] // 128) * 128 * -(-s[0][1] // 32) * 4
+                8, 0, lambda s: -(-s[0][0] // 128) * 128 * -(-s[0][1] // per) * 4
             )
         )
     if slots:  # a slot per (token, k)
@@ -2698,8 +2701,9 @@ def _records_moe(
         _W4A16Sm80Runner, intermediate_size, gated, sf_swizzled, recipe, exact
     )
     if tactic is None:  # the profiles do not write fc2_out
+        x_fmt = 0 if ext is None else ext.x_fmt
         tuning = _w4a16_moe_sm80_tuning(
-            experts, x.shape[0], tune_max_num_tokens, inputs, sf_swizzled
+            experts, x.shape[0], tune_max_num_tokens, inputs, sf_swizzled, x_fmt
         )
         tuned = runner(ext if ext is None else replace(ext, fc2_out=None))
         _, tactic = AutoTuner.get().choose_one(
@@ -2735,7 +2739,7 @@ def _trtllm_routing_sm80(
             )  # fmt: skip
     if not gather:
         return slots.view(tokens, k), weights, expert_of_slot
-    return torch.gather(expert_of_slot, 0, slots).view(tokens, k), weights
+    return expert_of_slot.index_select(0, slots).view(tokens, k), weights
 
 
 def _trtllm_fp4_records_moe(
@@ -2813,17 +2817,17 @@ def _trtllm_fp4_records_moe(
             out.shape[1] == hv if a["valid_hidden_size"] else 0 < out.shape[1] <= hidden
         )))
         or s_gate is None or s2 is None or ((w4a4 or fp8 and x_scale is None) and s1 is None)
-        or a.get("workspace_buffer") is not None
+        or a.get("workspace_buffer") is not None or a.get("routing_metadata") is not None
     ):  # fmt: skip
         raise NotImplementedError(
             "Below SM100 TRT-LLM FP4 runs on records: NVFP4 hidden states, BF16 ones (with an "
             "FP32 global scale for NVFP4 activations), per token NVFP4 activations, MXFP8 or FP8 "
             "ones (MXFP4 records), with the GEMM scalars; valid sizes multiples of 16 (MXFP8 and "
             "FP8: 32), the output [num_tokens, valid hidden] (without valid sizes at most hidden "
-            "wide: its leading columns); no workspace_buffer."
+            "wide: its leading columns); no workspace_buffer or routing_metadata."
         )
     if fo is not None and (  # SM100's checks
-        pt is None or a.get("_nfse") or a.get("routing_metadata") is not None or inter % 16
+        pt is None or a.get("_nfse") or inter % 16
         or any(not t.is_contiguous() or t.dim() < 2 or t.shape[0] < tokens
                or t.shape[1] != top_k for t in fo)
         or (fo[0].dtype, fo[0].shape[2:]) != (torch.uint8, (inter // 2,)) or fo[0].data_ptr() % 8
@@ -2836,8 +2840,7 @@ def _trtllm_fp4_records_moe(
             "E4M3 or uint8 block scales [..., intermediate_size / 16], FP32 token scales "
             "[>= num_tokens, top_k], contiguous."
         )
-    # routing_metadata (a precomputed permutation of these ids) and localized_* (per-domain copies
-    # of the weights passed in full) only steer the SM100 kernels.
+    # localized_* (per-domain copies of the weights passed in full) only steer the SM100 kernels.
     if a["local_expert_offset"]:  # local ids; the other ranks' are skipped
         ids = ids - a["local_expert_offset"]
     if codes and x_scale is not None:  # NVFP4's hidden / 16 bytes a token, MXFP8's / 32
@@ -8639,7 +8642,8 @@ def trtllm_fp4_block_scale_routed_moe(
         routing included; the autotuned config is used only when the tuner chose
         the slot's tile, otherwise that tile's default config runs. The body
         allocates its own buffers. Not supported with ``gemm1_lora_delta``,
-        fused shared experts or ``workspace_buffer`` (``ValueError``).
+        fused shared experts or ``workspace_buffer`` (``ValueError``). Below SM100,
+        where no kernel populates it, passing it raises ``NotImplementedError``.
         Default ``None`` (route inside the call).
     localized_weights : Optional[List[Dict[str, torch.Tensor]]]
         Per-locality-domain weight shards for uGPU localization; see

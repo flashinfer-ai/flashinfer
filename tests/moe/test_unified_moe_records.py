@@ -261,7 +261,7 @@ def test_records_unified_graph():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = layer(act, packs[0])
-    layer(act, packs[1])  # the second view, then the memory it freed taken again
+    layer(act, packs[1])  # a call on the second view, then NaN-filled tensors
     junk = [torch.full((E,), float("nan"), device="cuda") for _ in range(16)]
     graph.replay()
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
