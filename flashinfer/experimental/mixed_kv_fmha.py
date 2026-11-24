@@ -167,7 +167,7 @@ def run(q, k, v, sf, table, seq_lens, qo_indptr, max_q_len, out, qk_scale, v_sca
     if (
         max_q_len == 1
         and table.shape[0] <= 4
-        and table.shape[1] <= 32
+        and table.shape[1] <= 512
         and hkv == 2
         and q.shape[1] == 8
         and d == 128

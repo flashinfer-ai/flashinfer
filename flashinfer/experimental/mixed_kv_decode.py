@@ -167,7 +167,7 @@ def run_decode(q, k, v, sf, table, lens, ptr, out, scale, vscale):
 
     heads, d = q.shape[1:]
     hkv, page = k.shape[1:3]
-    n, s, w = 32, 32, 2
+    n, s, w = (32, 32, 2) if table.shape[1] <= 32 else (64, 128, 2)
     tmp = torch.empty(
         (q.shape[0], heads, s, d + 2), device=q.device, dtype=torch.float32
     )

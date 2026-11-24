@@ -148,7 +148,8 @@ def test_ragged_attention_and_graph_replay(d, group):
 
 
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
-def test_short_decode_graph(layout):
+@pytest.mark.parametrize("width", [3, 128])
+def test_short_decode_graph(layout, width):
     from flashinfer.attention.mixed_kv import paged_fp8_k_nvfp4_v_fmha
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
@@ -174,6 +175,7 @@ def test_short_decode_graph(layout):
     table = torch.tensor(
         [[6, 7, 9], [9, 1, 3], [7, 5, 2], [1, 0, 4]], device=dev, dtype=torch.int32
     )
+    table = table.repeat(1, (width + 2) // 3)[:, :width].contiguous()
     q = torch.randn((3, 8, 128), device=dev).to(fp8)
     lens = torch.tensor([129, 0, 65, 1], device=dev, dtype=torch.int32)
     ptr = torch.tensor([0, 1, 1, 2, 3], device=dev, dtype=torch.int32)
@@ -200,7 +202,7 @@ def test_short_decode_graph(layout):
         run()
     for l, p in [
         ([129, 0, 65, 1], [0, 1, 1, 2, 3]),
-        ([0, 66, 1, 153], [0, 0, 1, 2, 3]),
+        ([0, 66, 1, width * 64 - 39], [0, 0, 1, 2, 3]),
     ]:
         lens.copy_(torch.tensor(l, device=dev))
         ptr.copy_(torch.tensor(p, device=dev))
