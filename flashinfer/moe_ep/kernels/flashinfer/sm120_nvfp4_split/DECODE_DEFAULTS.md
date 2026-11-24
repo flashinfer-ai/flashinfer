@@ -3,7 +3,7 @@
 This publication updates the previous FlashInfer `72a6079e` integration with
 standalone kernel `f6f6b5ae0f7d16fc7856d1af1d633d421590f44d` and the qualified
 FlashInfer GIN host/graph adaptations. The delivery cache ABI is
-`2814542011116`. It does not publish SGLang adapters or benchmark harnesses.
+`2814542011117`. It does not publish SGLang adapters or benchmark harnesses.
 
 ## Default selection
 

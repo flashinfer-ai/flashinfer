@@ -39,7 +39,7 @@ from .jit_config import Sm120JitConfig
 # Rank-local combine now reserves a source-generated contributor-plan plane.
 # Version 22 refreshes generated code for whole-warp rank-local reduction;
 # the workspace layout and completion protocol are unchanged.
-KERNEL_CACHE_ABI = 2814542011116  # K2 weight prefetch off on 3-stage pipelines
+KERNEL_CACHE_ABI = 2814542011117  # proxy fence before K2 stage release
 
 
 @dataclass(frozen=True)

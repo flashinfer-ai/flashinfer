@@ -3,7 +3,7 @@
 The raw source under `moe_sm120_nvfp4_split/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
 `b2fd4cac1d28d6a9be0cdfaf303ccd072ce21f54`. The FlashInfer
-delivery uses ABI `2814542011116` (standalone source ABI `281454201`).
+delivery uses ABI `2814542011117` (standalone source ABI `281454201`).
 This revision includes continuous decode policies, M128 workers, utility
 defaults, DATA TMA eviction hints and the NCCL memory/transport runtime.
 It adds the measured anchor table (`tuned_table.json`, DSV4.1-Flash and
@@ -17,11 +17,13 @@ NUMA node's. It adds EP16 anchors, the K1/K2 weight L2 prefetch knob
 `weight_prefetch_ahead` (0/4/8 K tiles) and the forwarder split `xnuma_fsplit`
 (1/2/4 CTAs per cross source), a fused record+commit GIN put and deferred GIN
 quiet in the sender, and launch-phase / sender / scatter diagnostics.
-FlashInfer compiles the K2 weight prefetch only for 2-stage K2 pipelines: on
-3-stage K2 (DSv4.1 EP4 T7/T16 anchors) the prefetch made a refilled weight stage
-land before the slowest compute warp had finished it, giving intermittent wrong
-rows (byte-exact reference failures). K1 prefetch is unchanged. Cache ABI
-`2814542011116` separates kernels compiled before this change.
+FlashInfer adds `fence.proxy.async.shared::cta` before every K2 consumer stage
+release. Without it, a stage released by lane 0 could be refilled by the next
+TMA (async proxy) before the warp's last ldmatrix (generic proxy) had read it;
+with the K2 weight prefetch on 3-stage pipelines (DSv4.1 EP4 T7/T16, EP8 decode
+anchors) the L2-hit refill overwrote the first rows of the stage, giving
+intermittent wrong rows. Cache ABI `2814542011117` separates kernels compiled
+before this change.
 FlashInfer keeps one `xnuma_fsplit` per workspace: its p2p_split buckets share
 one epoch and cumulative commit words, and the scatter waits for
 `fsplit * epoch` commits, so the value most p2p_split buckets selected is used
