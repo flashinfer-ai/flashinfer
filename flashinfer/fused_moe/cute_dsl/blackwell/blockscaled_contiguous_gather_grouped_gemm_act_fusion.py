@@ -3133,6 +3133,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             compact_sfc_u8,
                             compact_c_u64_per_row,
                             compact_sfc_k_atoms,
+                            epilogue_op,
                         )
 
                 for subtile_idx in cutlass.range(
@@ -3981,6 +3982,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         sfc_u8: cute.Pointer,
         c_u64_per_row: cutlass.Int32,
         sfc_k_atoms: cutlass.Int32,
+        epilogue_op: cutlass.Constexpr,
     ):
         """Pre-FC2 epilogue of a tile with few valid rows (decode).
 
@@ -4056,7 +4058,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Block amax -> E4M3 scale -> NVFP4, as in the full path.
                 #
                 tFrg = cute.logical_divide(tCompute, cute.make_layout(self.sf_vec_size))
-                frg = tFrg.load()
+                frg = epilogue_op(tFrg.load())  # as in the full path, before the amax
                 abs_frg = type(frg)(math.absf(frg.ir_value()), frg.shape, frg.dtype)
                 tPv = cute.make_rmem_tensor((2,), cutlass.Float32)
                 tPv[0] = (
