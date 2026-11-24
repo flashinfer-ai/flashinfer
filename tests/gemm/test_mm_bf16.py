@@ -903,6 +903,7 @@ def test_bmm_bf16_does_not_request_full_profiling(monkeypatch):
 def test_mm_bf16_full_rejects_unsupported(monkeypatch):
     _skip_unless_runnable("cublaslt")
     from flashinfer.autotune_cache import autotune_v2
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     a = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(256, 1024, device="cuda", dtype=torch.bfloat16).T
@@ -910,7 +911,8 @@ def test_mm_bf16_full_rejects_unsupported(monkeypatch):
         mm_bf16(a, b, backend="auto", batch_invariant=True, full=True)
     cc = get_compute_capability(torch.device("cuda"))
     cc_num = cc[0] * 10 + cc[1]
-    if mm_bf16.is_backend_supported("tgv", cc_num):
+    # Without CuTe DSL the TGV backend checker raises LibraryError first.
+    if mm_bf16.is_backend_supported("tgv", cc_num) and is_cute_dsl_available():
         with pytest.raises(ValueError, match="explicit tactic"):
             mm_bf16(a, b, backend="tgv", tactic=1, full=True)
     if is_cuda_tile_available() and mm_bf16.is_backend_supported("cutile", cc_num):

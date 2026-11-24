@@ -2047,6 +2047,16 @@ class _V2Local(threading.local):
 # load: SW power cap, HW slowdown, SW thermal, HW thermal, HW power brake.
 _NVML_CLOCK_LIMIT_REASONS = 0x4 | 0x8 | 0x20 | 0x40 | 0x80
 _NVML_GPU_IDLE_REASON = 0x1
+_FULL_PROFILING_CUPTI_ERROR = (
+    "full_profiling cannot be tuned under the CUPTI timer: CUPTI timing does not "
+    "wait for the SM clock before each sample, so the result would not be a "
+    "full-profiling result. Tune it without MeasurementPolicy(_timer='cupti')."
+)
+_FULL_PROFILING_RANK_TACTICS_ERROR = (
+    "full_profiling is not supported by rank_tactics with k > 1 in tuning mode: "
+    "the shortlist and its cached winner would not get the full-profiling "
+    "clock checks. Use k=1 (choose_one) for full profiling."
+)
 _nvml_handles: dict[int, Any] = {}
 _nvml_lock = threading.Lock()
 
@@ -3532,6 +3542,20 @@ class AutoTuner:
                 "All Given runners must be subclass of TunableRunner"
             )
 
+            # CUPTI timing skips the SM clock waits of full profiling, so its
+            # winner would be stored as a full result it is not. Rejected
+            # before any measurement; under a tuning group through the
+            # profile gate below, so every rank fails at the same collective.
+            full_error = (
+                _FULL_PROFILING_CUPTI_ERROR
+                if tuning_config.full_profiling
+                and measure_policy is not None
+                and measure_policy.timer == "cupti"
+                else None
+            )
+            if full_error is not None and _tune_process_group is None:
+                raise ValueError(full_error)
+
             plan_error = None
             profiles = []
             profiling_candidates = None
@@ -3553,7 +3577,7 @@ class AutoTuner:
             _check_tuning_group_phase(
                 ("profiles", custom_op),
                 (len(profiles), self._profiling_policy(tuning_config)),
-                plan_error,
+                plan_error or full_error,
             )
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
@@ -4278,6 +4302,18 @@ class AutoTuner:
                     tuning_config, self._effective_measure_policy
                 )
 
+            # A shortlist would be ranked and its winner cached from timings
+            # whose SM clock was never checked: full profiling goes through
+            # choose_one (k=1) only. Rejected before any measurement; under a
+            # tuning group through the ranking gate below.
+            full_error = (
+                _FULL_PROFILING_RANK_TACTICS_ERROR
+                if tuning_config.full_profiling
+                else None
+            )
+            if full_error is not None and _tune_process_group is None:
+                raise ValueError(full_error)
+
             plan_error = None
             # Read before enumeration, as choose_one() does, so a pool that
             # changes during preparation is ranked again on the next pass.
@@ -4320,7 +4356,7 @@ class AutoTuner:
             _check_tuning_group_phase(
                 ("ranking_profile", custom_op),
                 self._profiling_policy(tuning_config),
-                plan_error,
+                plan_error or full_error,
             )
             cache_key = AutoTuner._get_cache_key(
                 custom_op,

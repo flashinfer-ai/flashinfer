@@ -3645,6 +3645,37 @@ def test_full_profiling_cache_from_v1_json(monkeypatch, tmp_path):
     assert profiled == []
 
 
+def test_full_profiling_rejects_the_cupti_timer(monkeypatch):
+    """CUPTI timing skips the clock waits: no full result is measured or stored."""
+    from flashinfer.autotune_cache import MeasurementPolicy
+
+    tuner, runner, inputs, ordinary, full, profiled = _full_cache_fixture(monkeypatch)
+    monkeypatch.setattr(
+        AutoTuner,
+        "_effective_measure_policy",
+        property(lambda self: MeasurementPolicy(_timer="cupti")),
+    )
+    with pytest.raises(ValueError, match="CUPTI"):
+        _tune(tuner, full, runner, inputs)
+    assert profiled == [] and not tuner.profiling_cache
+    # A lookup is not a measurement, and ordinary tuning keeps using CUPTI.
+    assert _tune(tuner, full, runner, inputs, tune_mode=False) == (runner, -1)
+    assert _tune(tuner, ordinary, runner, inputs)[1] == 1
+
+
+def test_rank_tactics_rejects_full_profiling_with_k_above_one(monkeypatch):
+    """A k > 1 shortlist would be ranked and cached without the clock checks."""
+    tuner, runner, inputs, ordinary, full, profiled = _full_cache_fixture(monkeypatch)
+    with autotune(tune_mode=True), pytest.raises(ValueError, match="rank_tactics"):
+        tuner.rank_tactics("dummy_full", [runner], full, inputs, k=2)
+    assert profiled == [] and not tuner.profiling_cache
+    # k=1 tunes through choose_one; outside tuning any k only looks up.
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("dummy_full", [runner], full, inputs, k=1) == [2]
+    assert profiled == [(True, 0), (True, 1), (True, 2)]
+    assert tuner.rank_tactics("dummy_full", [runner], full, inputs, k=2) == [2]
+
+
 def test_full_profiling_outside_autotune_does_not_profile(monkeypatch):
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))

@@ -93,6 +93,36 @@ for case, state in rank0_state.items():
         assert not hit and calls == [0, 1, 2], (case, hit, calls)
     print(f"OK {rank} {case} tactic={tactic}", flush=True)
 
+# Rejected full profiling fails on every rank at the same gate, before any
+# measurement (no hang, nothing cached).
+from flashinfer.autotune_cache import MeasurementPolicy
+from flashinfer.autotuner.autotuner import _TuningGroupError
+
+clock["state"] = RECOVERED
+measure = AutoTuner._effective_measure_policy
+rejected = {
+    "cupti": lambda: tuner.choose_one("full_op", [runner], config, inputs),
+    "rank_k2": lambda: tuner.rank_tactics("full_op", [runner], config, inputs, k=2),
+}
+for case, call in rejected.items():
+    tuner.clear_cache()
+    calls.clear()
+    if case == "cupti":
+        AutoTuner._effective_measure_policy = property(
+            lambda self: MeasurementPolicy(_timer="cupti")
+        )
+    try:
+        with autotune(True):
+            call()
+    except _TuningGroupError as error:
+        assert "full_profiling" in str(error) or "another rank" in str(error), error
+    else:
+        raise AssertionError(f"{case}: full profiling was not rejected")
+    finally:
+        AutoTuner._effective_measure_policy = measure
+    assert calls == [] and not tuner.profiling_cache, (case, calls)
+    print(f"OK {rank} {case} rejected", flush=True)
+
 set_autotune_process_group(None)
 dist.destroy_process_group()
 """
@@ -131,6 +161,8 @@ def test_full_profiling_caches_only_when_every_rank_confirmed_the_clock(tmp_path
                 ("confirmed", 0),
             ):
                 assert f"OK {rank} {case} tactic={tactic}" in output, output
+            for case in ("cupti", "rank_k2"):
+                assert f"OK {rank} {case} rejected" in output, output
     finally:
         for process in processes:
             if process.poll() is None:
