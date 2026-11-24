@@ -3646,8 +3646,9 @@ class BatchInvariantFp4Config:
     weight shapes unsplit by the dense class's chunk rule. Activations: bf16 ``[num_tokens, H]`` as given
     (``prepare_activations``: the class quantizes them per token itself), or packed fp4 ``uint8 [num_tokens, H / 2]`` with
     ``hidden_states_scale`` (the 128x4 swizzled scales of ``nvfp4_quantize(..., per_token_activation=True,
-    batch_invariant=True)`` or the linear ``[num_tokens, H / 16]`` layout) and ``per_token_scale`` (unit scales when
-    absent: the per-tensor pack of :class:`TrtllmFp4Config`).
+    batch_invariant=True)``, their pad columns zero as every FlashInfer quantizer writes them, or the linear
+    ``[num_tokens, H / 16]`` layout) and ``per_token_scale`` (unit scales when absent: the per-tensor pack of
+    :class:`TrtllmFp4Config`).
 
     ``intermediate`` selects the intermediate's quantization, two classes of the NVFP4 pair: ``"per_token"`` (the default,
     ``moe.nvfp4.<act>``: the bf16 intermediate quantized per token by the mode's quantizer) or ``"static"``

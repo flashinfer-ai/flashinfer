@@ -1263,7 +1263,8 @@ def fused_moe_fp4(
     """The fp4 MoE FFN for pre-routed tokens: ``x`` bf16 ``[T, H]`` (quantized here by the pair's class; ``gs_inv`` the NVFP4
     recipe's inverse base scale) or the pair's quantized pack (NVFP4 ``(x4 [T, H/2] uint8, x_sf, x_pts [T] f32 or None: unit
     scales, the per-tensor pack)``, MXFP4 ``(x4, x_sf)``; ``x_sf`` the 128x4 swizzled buffer or the linear ``[T, H/block]``
-    bytes); ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` f32 (``round_scales``: the combine takes their
+    bytes; the buffer's pad columns are zero, as every FlashInfer quantizer writes them: the scatter and the gather copy a
+    row's last 4-byte group as given); ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` f32 (``round_scales``: the combine takes their
     bf16 rounding, the pre-routed packed-word convention); the output bf16 ``[T, H]`` in token order. ``in_fmts`` names the
     instruction class per GEMM (default: the pair's rule on this part); ``config1`` / ``config2`` the grouped records (any
     record of the space gives the same bits; the dispatcher's pick by default); ``path`` the packing of the expanded rows
