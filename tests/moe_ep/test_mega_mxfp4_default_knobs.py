@@ -366,13 +366,13 @@ def test_mxfp4_rejects_rank_divergence_before_pool_lookup(mismatch):
         assert kwargs["group"] is backend._ep_comm_group
         error, proposal = report
         assert error is None
-        config, clusters = proposal
+        mode, (config, clusters) = proposal
         peer = (
             (dataclasses.replace(config, token_in_flag_batch=4), clusters)
             if mismatch == "config"
             else (config, clusters - 1)
         )
-        reports[:] = [report, (None, peer)]
+        reports[:] = [report, (None, (mode, peer))]
 
     with (
         mock.patch.object(backend, "_active_clusters", return_value=76),

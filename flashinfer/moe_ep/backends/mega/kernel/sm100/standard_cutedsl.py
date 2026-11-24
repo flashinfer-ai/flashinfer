@@ -49,7 +49,6 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     supports_output_view = True
     supports_auto_workspaces = True
     supports_live_token_tuning = True
-    _check_workspace_occupancy = False
     _workspace_mismatch = "Standard configuration differs across EP ranks"
     quant_kind: str | None = None
 
@@ -192,15 +191,13 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return dataclasses.replace(config, rank=0)
 
     def _workspace_pool_request(self, fleet_params):
-        """Agree on geometry before any rank checks the pool."""
-        if (
-            self._config.kernel_variant == "inference"
-            and self.ep_world_size > 1
-            and (self._config.knobs is None or self._check_workspace_occupancy)
-        ):
+        """Agree on tuning mode and geometry before any rank checks the pool."""
+        if self._config.kernel_variant == "inference" and self.ep_world_size > 1:
             error, proposal = None, None
             try:
-                proposal = self._workspace_proposal(fleet_params)
+                knobs = self._config.knobs
+                mode = "explicit" if isinstance(knobs, dict) else knobs
+                proposal = mode, self._workspace_proposal(fleet_params)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             proposals = self._gather_workspace_proposals(error, proposal)
@@ -815,7 +812,6 @@ class StandardMxfp8Backend(_StandardBlockScaledBackend):
 @register_mega_kernel("sm100_mxfp8_mxfp4_bf16_cutedsl")
 class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
     quant_kind = "mxfp4_mxfp8"
-    _check_workspace_occupancy = True
     _workspace_mismatch = (
         "MXFP4 configuration or active cluster count differs across EP ranks"
     )

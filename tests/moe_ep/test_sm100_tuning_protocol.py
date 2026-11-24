@@ -493,7 +493,7 @@ def test_standard_cached_workspace_agrees_before_pool_lookup(
     second = right._workspace_config(fleet)
     assert first.reduce_topk_in_kernel and not second.reduce_topk_in_kernel
 
-    peer = dataclasses.replace(second, rank=0)
+    peer = None, dataclasses.replace(second, rank=0)
 
     def gather(reports, report, *, group):
         assert group is left.ep_comm_group
@@ -643,6 +643,33 @@ def _subgroup_worker(rank, rendezvous):
 
                 with pytest.raises(RuntimeError, match="candidate preparation failed"):
                     native._prepare_collectively(prepare, 2, group)
+
+                from flashinfer.moe_ep import (
+                    Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+                )
+                from flashinfer.moe_ep.core.kernel import workspace_pool
+                from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+                bootstrap = BootstrapConfig(
+                    world_size=2, rank=rank - 1, process_group=group
+                )
+                fleet = FleetParams(8, 128, 512)
+                config = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(256, 2)
+                standard = create_mega_kernel(
+                    dataclasses.replace(config, knobs=None if rank == 1 else {})
+                )
+                standard.bind_ep_bootstrap(bootstrap)
+                geometry = dataclasses.replace(
+                    standard._workspace_config(fleet), rank=0
+                )
+                geometries = [None, None]
+                dist.all_gather_object(geometries, geometry, group=group)
+                assert geometries == [geometry, geometry]
+                pool = Mock()
+                patch.setattr(workspace_pool, "acquire_workspace", pool)
+                with pytest.raises(MoEEpConfigError, match="differs across EP ranks"):
+                    standard.prepare_workspace(bootstrap, fleet)
+                pool.assert_not_called()
             dist.barrier()
         finally:
             dist.destroy_process_group()
