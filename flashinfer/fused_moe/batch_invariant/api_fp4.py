@@ -235,9 +235,11 @@ def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
 
 def fp4_global_scale(w: torch.Tensor) -> torch.Tensor:
     """FlashInfer's per-tensor global scale of a weight: ``448 * 6 / amax(w)``, one for an all-zero tensor (the convention of
-    the package's weight preparation; a 1-element f32 tensor)."""
+    the package's weight preparation; a 1-element f32 tensor); a NaN amax (a NaN weight) propagates, so the validator of
+    the computed scales (:func:`fp4_global_scales`) refuses the expert."""
     amax = w.detach().to(torch.float32).abs().amax().reshape(1)
-    return torch.where(amax > 0, E4M3_MAX * E2M1_MAX / amax, torch.ones_like(amax)).to(
+    # the unit scale for the all-zero tensor alone: ``amax > 0`` would select it for a NaN amax too
+    return torch.where(amax == 0, torch.ones_like(amax), E4M3_MAX * E2M1_MAX / amax).to(
         torch.float32
     )
 

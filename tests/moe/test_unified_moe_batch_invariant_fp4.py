@@ -4273,9 +4273,14 @@ def test_computed_global_scale_that_is_not_finite_is_refused_naming_the_expert(
     rows would give NaN for every token routed to it where a block of its weights is all zero, a silent zero otherwise.
     ``prepare_weights`` applies the rule of the caller's scales to the computed ones -- finite, positive and normal -- and
     refuses the pack with the mode's error naming the weight and the expert before any expert is quantized; normal weights
-    keep their bits, and caller-supplied scales keep their own rule."""
+    keep their bits, and caller-supplied scales keep their own rule. A NaN weight gives a NaN amax, which the computed
+    scale propagates (the unit scale is the all-zero tensor's alone), so the expert is refused the same way, as a NaN among
+    caller-supplied scales is."""
     from flashinfer.batch_invariant.quantization import nvfp4_api
-    from flashinfer.fused_moe.batch_invariant.api_fp4 import fp4_global_scales
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        fp4_global_scale,
+        fp4_global_scales,
+    )
 
     E, I, H = 4, 64, 64
     _, _, w1, w2 = _problem(8, 2, H, I, E, seed=37)
@@ -4301,6 +4306,28 @@ def test_computed_global_scale_that_is_not_finite_is_refused_naming_the_expert(
     assert not quantized
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="expert 1"):
         fp4_global_scales(bad, "w1")
+    # one NaN element in one expert: its amax is NaN, the computed scale propagates it (the zero tensor's unit scale is not
+    # selected) and the expert is refused by name before any expert is quantized; the all-zero expert keeps the unit scale
+    nan = w1.clone()
+    nan[2, 3, 5] = float("nan")
+    assert torch.isnan(fp4_global_scale(nan[2])).item()
+    assert fp4_global_scale(torch.zeros_like(nan[2])).item() == 1.0
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="w1.*expert 2") as e:
+        BatchInvariantFp4Config.prepare_weights(nan, w2)
+    assert NVFP4.cls in str(e.value) and "nan" in str(e.value) and not quantized
+    nan2 = w2.clone()
+    nan2[0, 0, 0] = float("nan")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="w2.*expert 0"):
+        BatchInvariantFp4Config.prepare_weights(w1, nan2)
+    assert not quantized
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="not finite"):
+        MoEWeightsFp4.prepare(
+            NVFP4,
+            w1,
+            w2,
+            global_scales=(torch.tensor([1.0, float("nan"), 1.0, 1.0]), torch.ones(E)),
+        )
+    assert not quantized  # a NaN among the caller's scales is refused by the same rule
     assert torch.equal(
         torch.reciprocal(fp4_global_scales(w1, "w1")), ref["gemm1_alpha"]
     )
