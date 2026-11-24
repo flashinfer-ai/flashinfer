@@ -488,6 +488,12 @@ class Sm90Nvfp4W4A16MoEWorkspace:
     not be used by two calls that can run concurrently (different streams);
     create one per stream. Create it, and reserve prefill buffers, before CUDA
     graph capture.
+
+    CUDA graphs that captured the large-batch kernel keep using the prefill
+    buffers they were captured with. If a later call grows the reservation
+    (a larger ``prefill_chunk_tokens``), the superseded buffers are therefore
+    kept alive for the lifetime of the workspace instead of being freed;
+    reserve the largest chunk size before capture to avoid holding both.
     """
 
     def __init__(
@@ -519,10 +525,19 @@ class Sm90Nvfp4W4A16MoEWorkspace:
         self.h: Optional[torch.Tensor] = None
         self.maps: Optional[torch.Tensor] = None
         self.prefill_counters: Optional[torch.Tensor] = None
+        # set when a CUDA graph captured the large-batch kernel with the current buffers
+        self._prefill_captured = False
+        # superseded buffers that captured graphs may still read and write
+        self._retired_prefill: List[Tuple[torch.Tensor, ...]] = []
 
     def reserve_prefill(self, chunk_tokens: int = DEFAULT_PREFILL_CHUNK_TOKENS) -> None:
         """Allocate the large-batch buffers for chunks of ``chunk_tokens`` tokens
-        (``(8 * chunk_tokens + 1152) * (hidden + intermediate) * 2`` bytes)."""
+        (``(8 * chunk_tokens + 1152) * (hidden + intermediate) * 2`` bytes).
+
+        Only grows: a smaller ``chunk_tokens`` keeps the current buffers. When a
+        CUDA graph has captured the large-batch kernel with the current buffers,
+        growing keeps them alive (the graph still uses them) next to the new
+        ones."""
         if chunk_tokens <= 0 or chunk_tokens % 128 != 0:
             raise ValueError("chunk_tokens must be a positive multiple of 128")
         if self.prefill_chunk_tokens >= chunk_tokens:
@@ -545,6 +560,11 @@ class Sm90Nvfp4W4A16MoEWorkspace:
             module.prefill_counter_words(), dtype=torch.int32, device=self.device
         )
         module.prefill_init(xt, h, maps)
+        if self._prefill_captured:
+            self._retired_prefill.append(
+                (self.xt, self.h, self.maps, self.prefill_counters)
+            )
+            self._prefill_captured = False
         self.xt, self.h, self.maps, self.prefill_counters = xt, h, maps, counters
         self.prefill_chunk_tokens = chunk_tokens
 
@@ -851,6 +871,8 @@ def sm90_nvfp4_w4a16_moe(
             ((MAX_LOCAL_EXPERTS + TOPK_SLOTS) * M,), dtype=torch.int32, device=device
         )
         ucnt = torch.empty((((M + 127) // 128) * 64,), dtype=torch.int32, device=device)
+        if torch.cuda.is_current_stream_capturing():
+            workspace._prefill_captured = True
         module.prefill_run(
             x, ids, w, w13, gs_gate, gs_up, w2, w2_global_scale, nw, out, recv,
             workspace.xt, workspace.maps, rev, ucnt, workspace.prefill_counters,

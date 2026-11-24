@@ -339,6 +339,43 @@ def test_cuda_graph_replay(num_tokens):
         assert_in_band(out, reference_moe(ckpt, x, ids, w))
 
 
+def test_prefill_graph_survives_reservation_growth():
+    """A graph that captured the large-batch kernel keeps working after a later
+    call grows the workspace's prefill reservation (the captured buffers stay
+    alive; their memory is not handed to other tensors)."""
+    _, packed = checkpoint(SHAPES[4])
+    H, I, E, top_k = SHAPES[4]
+    num_tokens = 600
+    ws = Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)
+    ws.reserve_prefill(128)
+    x = torch.randn(num_tokens, H, device="cuda").bfloat16()
+    ids, w = routing(num_tokens, E, top_k, "cuda", seed=23)
+    out = torch.empty(num_tokens, H, device="cuda", dtype=torch.bfloat16)
+    kw = dict(workspace=ws, prefill_min_tokens=1, prefill_chunk_tokens=128)
+    run(packed, x, ids, w, out=out, **kw)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(packed, x, ids, w, out=out, **kw)
+    captured = [t.data_ptr() for t in (ws.xt, ws.h, ws.maps, ws.prefill_counters)]
+    ref_ws = Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)
+    ref = run(packed, x, ids, w, **dict(kw, workspace=ref_ws))
+    # an eager call with a larger chunk grows the reservation
+    run(packed, x, ids, w, **dict(kw, prefill_chunk_tokens=512))
+    assert ws.prefill_chunk_tokens == 512
+    assert ws.xt.data_ptr() not in captured
+    # take whatever the allocator has free and fill it with garbage
+    junk = [
+        torch.full((n,), -1, dtype=torch.int32, device="cuda")
+        for n in [1 << 20] * 64 + [1 << 12] * 256
+    ]
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    del junk
+
+
 def test_zero_tokens():
     _, packed = checkpoint(SHAPES[5])
     H = SHAPES[5][0]
