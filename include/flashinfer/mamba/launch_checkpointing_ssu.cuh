@@ -161,12 +161,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
             pcfg.numAttrs = 1;
             FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
           };
-      static int const num_sms = [] {
-        int dev = 0, n = 0;
-        FLASHINFER_CUDA_CHECK(cudaGetDevice(&dev));
-        FLASHINFER_CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
-        return n;
-      }();
+      int const num_sms = GetCudaMultiProcessorCount();
 
       // ── Head-tiling default: heads/CTA == warps/CTA (1 head/warp), coupled in
       // launch_precompute (PRECOMPUTE_NUM_WARPS = max(hc, 4)).  hc=8 (→ 8 warps) measured as

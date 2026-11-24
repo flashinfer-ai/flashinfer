@@ -1259,7 +1259,12 @@ def _time_kernel_cupti(
     run_fn,
     reset_fn,
     tag: str,
-) -> tuple[float, float, float]:
+    *,
+    graph=None,
+    prepare_sample=None,
+    return_samples=False,
+    expected_kernel_count=None,
+) -> tuple[float, float, float] | list[float]:
     """CUPTI hardware-level GPU kernel timing (requires cupti-python >= 13).
     Source: flashinfer/testing/utils.py bench_gpu_time_with_cupti"""
     from cupti import cupti
@@ -1280,31 +1285,41 @@ def _time_kernel_cupti(
                 name = (
                     a.name if a.kind == cupti.ActivityKind.CONCURRENT_KERNEL else None
                 )
-                kernels.append((a.start, a.end, a.correlation_id, name))
+                kernels.append(
+                    (a.start, a.end, a.correlation_id, name, getattr(a, "stream_id", 0))
+                )
             elif a.kind in (cupti.ActivityKind.RUNTIME, cupti.ActivityKind.DRIVER):
                 launches.append((a.start, a.end, a.correlation_id))
 
-    # Eager warmup (triggers Triton autotune etc.)
-    reset_fn()
-    run_fn()
-    torch.cuda.synchronize()
-
-    # Capture two separate graphs: reset+flush vs run
-    g_reset = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g_reset):
+    if graph is None:
+        # Eager warmup (triggers Triton autotune etc.)
         reset_fn()
-        if args.l2_flush:
-            _l2_flush.fill_(0.0)
-    torch.cuda.synchronize()
-
-    g_run = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g_run):
         run_fn()
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+
+        # Capture two separate graphs: reset+flush vs run
+        g_reset = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g_reset):
+            reset_fn()
+            if args.l2_flush:
+                _l2_flush.fill_(0.0)
+        torch.cuda.synchronize()
+
+        g_run = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g_run):
+            run_fn()
+        torch.cuda.synchronize()
+    else:
+        if prepare_sample is None:
+            raise ValueError("A prepared graph requires an untimed prepare_sample")
+        g_run = graph
 
     # Warmup graph replays
     for _ in range(args.warmup):
-        g_reset.replay()
+        if prepare_sample is None:
+            g_reset.replay()
+        else:
+            prepare_sample(0)
         g_run.replay()
     torch.cuda.synchronize()
 
@@ -1323,8 +1338,11 @@ def _time_kernel_cupti(
     )
 
     torch.cuda.nvtx.range_push(tag)
-    for _ in range(args.iters):
-        g_reset.replay()
+    for index in range(args.iters):
+        if prepare_sample is None:
+            g_reset.replay()
+        else:
+            prepare_sample(index)
         torch.cuda.synchronize()
         start_cpu = cupti.get_timestamp()
         g_run.replay()
@@ -1339,6 +1357,23 @@ def _time_kernel_cupti(
     cupti.activity_disable(cupti.ActivityKind.DRIVER)
     cupti.activity_disable(cupti.ActivityKind.MEMCPY)
     cupti.activity_disable(cupti.ActivityKind.MEMSET)
+    if expected_kernel_count is not None:
+        import ctypes
+
+        from cuda.bindings import driver
+
+        status, context = driver.cuCtxGetCurrent()
+        if int(status):
+            raise RuntimeError(f"CUDA context query failed: {status}")
+        queues = {(0, 0), (int(context), 0)}
+        queues.update((int(context), int(row[4])) for row in kernels)
+        for queue_context, stream_id in queues:
+            dropped = ctypes.c_size_t()
+            cupti.activity_get_num_dropped_records(
+                queue_context, stream_id, ctypes.addressof(dropped)
+            )
+            if dropped.value:
+                raise RuntimeError(f"CUPTI dropped {dropped.value} activities")
     # NOTE: no cupti.finalize() here.  cuptiFinalize() is once-per-process teardown, and
     # this runs per (kernel, batch); finalizing per call cycled attach/detach into a
     # cudaErrorIllegalAddress after ~40 calls (a 5-kernel x 9-batch sweep died at the 43rd).
@@ -1367,6 +1402,15 @@ def _time_kernel_cupti(
 
         if not iter_kernels:
             raise ValueError(f"No kernel activities recorded for iteration {idx}")
+        if expected_kernel_count is not None and (
+            len(iter_kernels) != expected_kernel_count
+            or any(
+                k[3] is None or "checkpointing_ssu" not in k[3] for k in iter_kernels
+            )
+        ):
+            raise ValueError(
+                f"Unexpected checkpointing SSU activity inventory: {iter_kernels}"
+            )
 
         min_start = min(k[0] for k in iter_kernels)
         max_end = max(k[1] for k in iter_kernels)
@@ -1385,7 +1429,7 @@ def _time_kernel_cupti(
                     file=sys.stderr,
                 )
 
-    return _compute_stats(latencies_us)
+    return latencies_us if return_samples else _compute_stats(latencies_us)
 
 
 _CUPTI_UNAVAILABLE_WARNED = False

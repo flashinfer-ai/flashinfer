@@ -12,7 +12,7 @@ chain and time the kernel on those mixed batches directly.
 
 Pipeline
 --------
-1. Parse the AL (acceptance-length) histogram CSV.
+1. Fit conditional acceptance to draft length and mean AL, or read a histogram CSV.
 2. Build the (window+1)x(window+1) Markov transition matrix from the AL
    distribution; solve for the stationary distribution pi over PNAT.
 3. Cross-check via the "depletion sim" method (E[N] from PNAT=0).
@@ -21,6 +21,9 @@ Pipeline
    ``bench_checkpointing_ssu.time_kernel`` in-process and collect timings.
 6. Aggregate per-sample medians into one steady-state row per kernel/batch.
 7. Dump CSV and plot.
+
+Use --draft-length 7 --mean-acceptance 4.3 for the Bolt synthetic law.
+The mean includes the guaranteed verifier token; the legacy default T is 6.
 
 CSV layout
 ----------
@@ -32,11 +35,11 @@ Usage
 -----
   # Full run: collect data + plot
   python benchmarks/bench_ssu_checkpoint_mixed.py \\
-      --al-csv benchmarks/histogram_T6.csv --batch-sizes 64
+      --al-csv histogram.csv --batch-sizes 64
 
   # With conv1d (measures total span: conv1d + SSU, captures PDL overlap)
   python benchmarks/bench_ssu_checkpoint_mixed.py \\
-      --al-csv benchmarks/histogram_T6.csv --batch-sizes 64 --with-conv1d
+      --al-csv histogram.csv --batch-sizes 64 --with-conv1d
 
   # Plot only from existing CSV
   python benchmarks/bench_ssu_checkpoint_mixed.py \\
@@ -64,11 +67,10 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import bench_checkpointing_ssu as bench_ssu  # noqa: E402
 
-DEFAULT_AL_CSV = SCRIPT_DIR / "histogram_T6.csv"
 DEFAULT_BATCH_SIZES = [64]
 DEFAULT_T = 6
 DEFAULT_WINDOW = 16
-DEFAULT_COLUMN = 1  # replay_count in histogram_T6.csv
+DEFAULT_COLUMN = 1  # count or probability column in a user-supplied histogram
 DEFAULT_SEED = 42
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
@@ -291,7 +293,7 @@ def _aggregate_stats(
 
 def run_in_process_bench(
     *,
-    al_csv: Path,
+    al_csv: Path | None,
     column: int,
     T: int,
     window: int,
@@ -312,6 +314,7 @@ def run_in_process_bench(
     external_pdl: bool = True,
     cuda_graph: bool = True,
     varlen: bool = False,
+    mean_acceptance: float = 4.3,
 ) -> tuple[list[dict], dict]:
     """Collect rows for one full sweep.  Returns ``(rows, meta)``.
 
@@ -329,7 +332,14 @@ def run_in_process_bench(
     ``meta`` holds the analytical fields (e_al, write_frac, pi, weights)
     so callers can include them in plot titles / printed summaries.
     """
-    al = load_al_distribution(al_csv, T, column=column)
+    if al_csv is None:
+        from ssu_markov import fit_acceptance
+
+        conditional_p, histogram = fit_acceptance(T - 1, mean_acceptance)
+        al = np.array((0.0, *histogram))
+    else:
+        conditional_p = None
+        al = load_al_distribution(al_csv, T, column=column)
     pi = markov_stationary(al, T, window)
     write_frac = float(pi[window - T + 1 :].sum())
     e_al = float(sum(i * p for i, p in enumerate(al)))
@@ -525,6 +535,10 @@ def run_in_process_bench(
 
     meta = {
         "al": al,
+        "acceptance_source": str(al_csv)
+        if al_csv
+        else "synthetic constant conditional acceptance",
+        "conditional_p": conditional_p,
         "pi": pi,
         "write_frac": write_frac,
         "write_frac_dep": write_frac_dep,
@@ -690,9 +704,13 @@ def main() -> None:
         description="AL-distribution-driven SSU checkpointing bench (heterogeneous PNATs)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--al-csv", type=Path, default=DEFAULT_AL_CSV)
+    parser.add_argument("--al-csv", type=Path)
+    parser.add_argument("--draft-length", type=int)
+    parser.add_argument("--mean-acceptance", type=float)
     parser.add_argument("--column", type=int, default=DEFAULT_COLUMN)
-    parser.add_argument("--T", type=int, default=DEFAULT_T)
+    parser.add_argument(
+        "--T", type=int, help="Tokens per step, including verifier token"
+    )
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW)
     parser.add_argument(
         "--batch-sizes",
@@ -804,6 +822,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.al_csv and (
+        args.draft_length is not None or args.mean_acceptance is not None
+    ):
+        parser.error("Use either --al-csv or --draft-length/--mean-acceptance")
+    if args.draft_length is not None:
+        if args.T is not None and args.draft_length + 1 != args.T:
+            parser.error("--T must equal --draft-length + 1")
+        args.T = args.draft_length + 1
+    args.T = DEFAULT_T if args.T is None else args.T
+    args.mean_acceptance = 4.3 if args.mean_acceptance is None else args.mean_acceptance
+    if not args.al_csv:
+        from ssu_markov import fit_acceptance
+
+        try:
+            fit_acceptance(args.T - 1, args.mean_acceptance)
+        except ValueError as error:
+            parser.error(str(error))
+
     if args.window <= args.T:
         parser.error(f"--T ({args.T}) must be < --window ({args.window})")
 
@@ -856,6 +892,7 @@ def main() -> None:
         external_pdl=args.external_pdl,
         cuda_graph=args.cuda_graph,
         varlen=args.varlen,
+        mean_acceptance=args.mean_acceptance,
     )
 
     if not rows:

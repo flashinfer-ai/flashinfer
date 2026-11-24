@@ -329,6 +329,12 @@ class CheckpointingSSURunner(TunableRunner):
         optional_tensor_presence: tuple[bool, ...],
     ) -> None:
         self._module_base_args = module_base_args
+        # Only non-default RNG policies extend the persistent tuning key.
+        self._tuning_module_args = (
+            module_base_args[:-1]
+            if module_base_args[-1] == "philox"
+            else module_base_args
+        )
         self._dt_softplus = dt_softplus
         self._pad_slot_id = pad_slot_id
         self._requested_algorithm = requested_algorithm
@@ -430,7 +436,7 @@ class CheckpointingSSURunner(TunableRunner):
                 d_splits,
             )
         return (
-            self._module_base_args,
+            self._tuning_module_args,
             self._dt_softplus,
             self._pad_slot_id,
             self._requested_d_split,
@@ -844,7 +850,8 @@ def checkpointing_ssu(
     state_scale : Optional[torch.Tensor]
         Block-scale decode factors for quantized state, shape (state_cache_size, nheads, dim), f32.
     rand_seed : Optional[torch.Tensor]
-        Single-element int64 CUDA tensor for stochastic rounding seed.
+        Single-element int64 CUDA tensor on the same device as ``state`` for
+        the stochastic rounding seed.
     philox_rounds : int
         Philox rounds for stochastic rounding (default 10). Under
         sr_rng='philox', omitting rand_seed selects RN. Shared-seed mode does
@@ -1006,6 +1013,9 @@ def checkpointing_ssu(
             f"rand_seed must be int64, got {rand_seed.dtype}"
         )
         assert rand_seed.is_cuda, "rand_seed must be a CUDA tensor"
+        assert rand_seed.device == state.device, (
+            "rand_seed must be on the same device as state"
+        )
         assert philox_rounds > 0, (
             f"philox_rounds must be > 0 with rand_seed, got {philox_rounds}"
         )

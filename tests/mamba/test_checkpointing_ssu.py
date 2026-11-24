@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import triton
 from einops import repeat
 
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import AutoTuner, TuningConfig, autotune
 from flashinfer.mamba.checkpointing_ssu import (
     CheckpointingSSURunner,
     _CTA_PER_SM_CANDIDATES,
@@ -664,7 +664,9 @@ def _make_autotune_key_inputs():
     return inputs, dynamic_inputs
 
 
-def _make_autotune_runner(inputs, heads_per_group=16):
+def _make_autotune_runner(
+    inputs, heads_per_group=16, module_base_args=(torch.float32,)
+):
     optional_input_indices = (
         12,  # D
         13,  # z
@@ -675,7 +677,7 @@ def _make_autotune_runner(inputs, heads_per_group=16):
         18,  # cu_seqlens
     )
     return CheckpointingSSURunner(
-        (torch.float32,),
+        module_base_args,
         dt_softplus=True,
         pad_slot_id=0,
         requested_algorithm=0,
@@ -717,6 +719,73 @@ def test_autotune_runner_key_is_synthesis_invariant():
         strided_runner.get_cache_key_extras(inputs)
     )
     assert hash(strided_runner) == hash(runner)
+
+
+def test_autotune_default_philox_preserves_persisted_key():
+    inputs, _ = _make_autotune_key_inputs()
+    legacy_args = (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        8,
+        16,
+        16,
+        8,
+        5,
+        False,
+    )
+    config = TuningConfig()
+
+    def file_key(args):
+        runner = _make_autotune_runner(inputs, module_base_args=args)
+        return AutoTuner._get_cache_key(
+            "checkpointing_ssu",
+            runner,
+            (),
+            config,
+            runner.get_cache_key_extras(inputs),
+            nearest_profile=(),
+        ).file_key
+
+    assert file_key(legacy_args + ("philox",)) == file_key(legacy_args)
+    assert file_key(legacy_args + ("shared_seed",)) != file_key(legacy_args)
+
+
+@pytest.mark.parametrize("sr_rng", ["philox", "shared_seed"])
+def test_checkpointing_ssu_rejects_seed_on_other_device(sr_rng):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        state = torch.empty(3, 16, 64, 128, dtype=torch.float16, device="cuda:0")
+        x = torch.empty(1, 8, 16, 64, dtype=torch.bfloat16, device="cuda:0")
+        dt = torch.empty(1, 8, 16, 1, dtype=x.dtype, device=x.device).expand_as(x)
+        bc = torch.empty(1, 8, 1, 128, dtype=x.dtype, device=x.device)
+        with pytest.raises(
+            AssertionError, match="rand_seed must be on the same device as state"
+        ):
+            checkpointing_ssu(
+                state,
+                torch.empty(3, 16, 24, 64, dtype=x.dtype, device=x.device),
+                torch.empty(3, 1, 24, 128, dtype=x.dtype, device=x.device),
+                torch.empty(3, 16, 24, device=x.device),
+                torch.empty(3, dtype=torch.int32, device=x.device),
+                torch.empty(3, dtype=torch.int32, device=x.device),
+                x,
+                dt,
+                torch.empty(16, 64, 128, device=x.device),
+                bc,
+                bc,
+                torch.empty_like(x),
+                rand_seed=torch.empty(1, dtype=torch.int64, device="cuda:1"),
+                philox_rounds=5,
+                sr_rng=sr_rng,
+            )
 
 
 def test_autotune_runner_key_is_batch_bucket_invariant(monkeypatch):
@@ -6174,8 +6243,9 @@ _PADDING_HISTORY_CASES = [
 
 @pytest.mark.parametrize("state_dtype,rounds,algorithm", _PADDING_HISTORY_CASES)
 @pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("varlen", [False, True])
 def test_checkpointing_ssu_ignores_inactive_ring_rows(
-    state_dtype, rounds, algorithm, enable_pdl
+    state_dtype, rounds, algorithm, enable_pdl, varlen
 ):
     """Future append rows must not enter replay as NaN * zero.
 
@@ -6189,7 +6259,16 @@ def test_checkpointing_ssu_ignores_inactive_ring_rows(
     if state_dtype == torch.float8_e4m3fn and _get_sm_version() < 89:
         pytest.skip("FP8 state requires SM89+")
     device, dtype = "cuda", torch.bfloat16
-    batch, slots, nheads, ngroups, dim, dstate, T, window = 1, 3, 16, 1, 64, 128, 8, 16
+    nheads, ngroups, dim, dstate, T, window = 16, 1, 64, 128, 8, 16
+    lengths = [T, 5] if varlen else [T]
+    histories = [9, 12] if varlen else [9]
+    batch, slots = len(lengths), len(lengths) + 2
+    input_batch, input_tokens = (1, sum(lengths)) if varlen else (batch, T)
+    cu_seqlens = (
+        torch.tensor([0, T, T + 5], device=device, dtype=torch.int32)
+        if varlen
+        else None
+    )
     torch.manual_seed(42)
     source = torch.randn(slots, nheads, dim, dstate, device=device) * 0.03
     quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
@@ -6200,26 +6279,36 @@ def test_checkpointing_ssu_ignores_inactive_ring_rows(
     else:
         state0, scales0 = source.to(state_dtype), None
     starts = torch.full((slots,), 23, device=device, dtype=torch.int32)
-    previous = torch.tensor([0, 9, 0], device=device, dtype=torch.int32)
-    indices = torch.tensor([1], device=device, dtype=torch.int32)
+    previous = torch.tensor([0, *histories, 0], device=device, dtype=torch.int32)
+    indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
     x0, B0, dt0, _ = _make_ring_caches(
         slots, nheads, ngroups, dim, dstate, window, T, dtype, device, starts
     )
     x0.mul_(0.01)
     B0.mul_(0.01)
-    x = torch.randn(batch, T, nheads, dim, device=device, dtype=dtype) * 0.01
+    x = (
+        torch.randn(input_batch, input_tokens, nheads, dim, device=device, dtype=dtype)
+        * 0.01
+    )
     dt = repeat(
-        torch.randn(batch, T, nheads, device=device, dtype=dtype),
+        torch.randn(input_batch, input_tokens, nheads, device=device, dtype=dtype),
         "b t h -> b t h p",
         p=dim,
     )
     A = repeat(-torch.rand(nheads, device=device) - 0.5, "h -> h p n", p=dim, n=dstate)
-    B = torch.randn(batch, T, ngroups, dstate, device=device, dtype=dtype) * 0.01
+    B = (
+        torch.randn(
+            input_batch, input_tokens, ngroups, dstate, device=device, dtype=dtype
+        )
+        * 0.01
+    )
     C = torch.randn_like(B) * 0.01
     seed = (
         torch.tensor([0x12345678], device=device, dtype=torch.int64) if rounds else None
     )
     readonly = [x, dt, A, B, C, starts, previous, indices]
+    if cu_seqlens is not None:
+        readonly.append(cu_seqlens)
     if seed is not None:
         readonly.append(seed)
     unchanged = [value.clone() for value in readonly]
@@ -6228,11 +6317,17 @@ def test_checkpointing_ssu_ignores_inactive_ring_rows(
         state, xc, Bc, dtc = (value.clone() for value in (state0, x0, B0, dt0))
         scales = scales0.clone() if scales0 is not None else None
         if poison:
-            # h9/start23 appends logical9..16: all poisoned9..15 are overwritten.
-            rows = (23 + torch.arange(9, 16, device=device)) % (window + T)
-            xc[1, :, rows, :] = float("nan")
-            Bc[1, :, rows, :] = float("nan")
-            dtc[1, :, rows] = float("nan")
+            # Each append overwrites the poisoned future rows, including the short sequence.
+            for slot, (history, length) in enumerate(
+                zip(histories, lengths, strict=True), 1
+            ):
+                assert history + length > window
+                rows = (23 + torch.arange(history, window, device=device)) % (
+                    window + T
+                )
+                xc[slot, :, rows, :] = float("nan")
+                Bc[slot, :, rows, :] = float("nan")
+                dtc[slot, :, rows] = float("nan")
         out = torch.empty_like(x)
         scratch = (
             _two_kernel_scratch(batch, nheads, T, window, dtype, device)
@@ -6260,6 +6355,8 @@ def test_checkpointing_ssu_ignores_inactive_ring_rows(
                 philox_rounds=rounds,
                 d_split=1,
                 enable_pdl=enable_pdl,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=T if varlen else None,
                 **(scratch if scratch else {"algorithm": algorithm}),
             )
         torch.cuda.synchronize()
@@ -6589,7 +6686,7 @@ def test_checkpointing_ssu_int8_flush_keeps_tiny_scales(philox_rounds, sr_rng):
     boundary = (row_case >= 4) & (row_case <= 6)
     # Compare in quantization-step units so tiny absolute differences are not
     # themselves FTZ. RN permits half a step; SR permits either neighbor.
-    scaled_reference = before[boundary] / scales[1][boundary, None]
+    scaled_reference = before[boundary] / scales[1][boundary].unsqueeze(-1)
     margin = 8 * torch.finfo(torch.float32).eps * 127.0
     bound = (1.0 if philox_rounds else 0.5) + margin
     assert torch.all((state[1][boundary].float() - scaled_reference).abs() <= bound)

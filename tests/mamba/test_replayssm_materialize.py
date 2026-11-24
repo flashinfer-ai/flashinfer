@@ -687,6 +687,10 @@ def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
             for slot in (0, 2, 3, 4, 6, 7):
                 assert torch.equal(scales[layer][slot], before_scales[layer][slot])
 
+    for layer in range(layers):
+        state[layer][[1, 5, 6, 7]] = -7
+        if quantized:
+            scales[layer][[1, 5, 6, 7]] = 3.0
     after = [tensor.clone() for tensor in state]
     after_scales = [tensor.clone() for tensor in scales] if quantized else None
     _materialize(
@@ -695,10 +699,10 @@ def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
         b_cache,
         dt_cache,
         a_values,
-        torch.tensor([[0, 2, 3, -1]] * layers, dtype=torch.int32, device="cuda"),
+        torch.tensor([[0, 2, 3, 4]] * layers, dtype=torch.int32, device="cuda"),
         torch.tensor([[1, 5, 6, 7]] * layers, dtype=torch.int32, device="cuda"),
         ring_start,
-        count,
+        torch.tensor([5, 0, 2, 1], dtype=torch.int32, device="cuda"),
         ring_len,
         active_request_indices=torch.full((4,), -1, dtype=torch.int32, device="cuda"),
         rand_seed=seeds,
