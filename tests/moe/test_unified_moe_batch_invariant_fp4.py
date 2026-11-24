@@ -3961,7 +3961,8 @@ def test_weight_view_names_its_intermediate_class_and_a_view_without_it_is_decli
 def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
     """The pack is preallocated and filled one expert at a time: the bits of the whole-tensor path (the interleave of every
     expert, each quantized into its own buffers, stacked), and a peak memory beyond the inputs bounded by the pack plus a
-    few experts' temporaries, below one full-size bf16 copy of the experts."""
+    few experts' temporaries, below one full-size bf16 copy of the experts -- for contiguous weights and for a strided view
+    of them (one expert's slice is made contiguous at a time, never the full tensors), with the same bits."""
     from flashinfer.batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
     from flashinfer.fused_moe.batch_invariant.api import interleave_fc1
     from flashinfer.fused_moe.batch_invariant.api_fp4 import (
@@ -4004,6 +4005,27 @@ def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
     full = (w1.numel() + w2.numel()) * w1.element_size()
     assert pack + 8 * expert < full  # the bound separates the paths
     assert peak <= pack + 8 * expert, (peak, pack, expert)
+    # a strided view of the same values (a full-tensor contiguous() would copy both weights at once)
+    w1s = w1.transpose(1, 2).contiguous().transpose(1, 2)
+    w2s = w2.transpose(1, 2).contiguous().transpose(1, 2)
+    assert not w1s.is_contiguous() and torch.equal(w1s, w1) and torch.equal(w2s, w2)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    Ws = MoEWeightsFp4.prepare(pair, w1s, w2s)
+    torch.cuda.synchronize()
+    peak_s = torch.cuda.max_memory_allocated() - before
+    for a, b in (
+        (Ws.w1, W.w1),
+        (Ws.w1_sf, W.w1_sf),
+        (Ws.w2, W.w2),
+        (Ws.w2_sf, W.w2_sf),
+    ):
+        assert torch.equal(a, b)
+    if pair.scaled:
+        assert torch.equal(Ws.w1_alpha, W.w1_alpha)
+        assert torch.equal(Ws.w2_alpha, W.w2_alpha)
+    assert peak_s <= pack + 8 * expert, (peak_s, pack, expert)
 
 
 @needs_device

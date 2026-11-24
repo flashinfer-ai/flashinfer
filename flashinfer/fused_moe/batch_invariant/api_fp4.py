@@ -312,8 +312,8 @@ class MoEWeightsFp4:
         multipliers; default ones) and is refused for the MX pair. The per-expert global scales, the caller's or the computed
         ones, are validated before any expert is quantized (finite, positive and normal: :func:`fp4_global_scales`). The
         experts are quantized one at a time into the preallocated pack: the peak memory beyond the inputs is the fp4 pack
-        plus one expert's temporaries (its interleaved bf16 rows, the fp32 magnitudes of its amax), the bits those of each
-        expert quantized alone."""
+        plus one expert's temporaries (its interleaved bf16 rows, the fp32 magnitudes of its amax; a strided view's expert
+        made contiguous), the bits those of each expert quantized alone."""
         from ...batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
 
         if intermediate not in INTERMEDIATES:
@@ -361,26 +361,29 @@ class MoEWeightsFp4:
             )
         check_shape_fp4(pair, H, I, E, gated=gated)
         dev = fc1.device
-        fc1, fc2 = fc1.contiguous(), fc2.contiguous()
         # the pack, preallocated and filled one expert at a time (the quantizer writes every byte of its expert's rows and
         # scale buffer; the global scale and the interleave are per expert, so the bits are those of the expert quantized
-        # alone): the peak beyond the inputs and the pack is one expert's temporaries -- its interleaved bf16 rows and
-        # the fp32 magnitudes of its amax -- never a full-size bf16 or fp32 copy of the experts
+        # alone): the peak beyond the inputs and the pack is one expert's temporaries -- its interleaved or contiguous bf16
+        # rows and the fp32 magnitudes of its amax -- never a full-size bf16 or fp32 copy of the experts (a strided view
+        # is made contiguous one expert at a time)
         w1 = torch.empty(E, N1, H // 2, dtype=torch.uint8, device=dev)
         w1_sf = torch.empty(E, pair.sf_numel(N1, H), dtype=torch.uint8, device=dev)
         w2 = torch.empty(E, H, I // 2, dtype=torch.uint8, device=dev)
         w2_sf = torch.empty(E, pair.sf_numel(H, I), dtype=torch.uint8, device=dev)
 
         def fc1_rows(e: int) -> torch.Tensor:
-            """Expert ``e``'s GEMM1 rows: the gate / up interleave applied to this expert alone."""
+            """Expert ``e``'s GEMM1 rows, contiguous: the gate / up interleave applied to this expert alone."""
             if interleaved or not gated:
-                return fc1[e]
+                return fc1[e].contiguous()
             return interleave_fc1(fc1[e : e + 1])[0]
+
+        def fc2_rows(e: int) -> torch.Tensor:
+            return fc2[e].contiguous()
 
         if not pair.scaled:
             for e in range(E):
                 quantize_rows_mx(fc1_rows(e), out=(w1[e], w1_sf[e]))
-                quantize_rows_mx(fc2[e], out=(w2[e], w2_sf[e]))
+                quantize_rows_mx(fc2_rows(e), out=(w2[e], w2_sf[e]))
             return MoEWeightsFp4(pair, w1, w1_sf, w2, w2_sf, H, I, gated, act, key)
         # the per-expert global scales, the caller's or the computed ones, under one rule before any expert is quantized
         if global_scales is not None:
@@ -408,7 +411,7 @@ class MoEWeightsFp4:
                 fc1_rows(e), gs1_all[e : e + 1].clone(), "128x4", out=(w1[e], w1_sf[e])
             )
             nvfp4_quantize_rows(
-                fc2[e], gs2_all[e : e + 1].clone(), "128x4", out=(w2[e], w2_sf[e])
+                fc2_rows(e), gs2_all[e : e + 1].clone(), "128x4", out=(w2[e], w2_sf[e])
             )
         return MoEWeightsFp4(
             pair,
