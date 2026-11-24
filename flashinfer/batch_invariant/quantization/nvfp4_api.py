@@ -94,6 +94,26 @@ def recipe_of(nvfp4_4over6, cls: str) -> Optional[Recipe]:
     return Recipe(mode, e4m3_max)
 
 
+def _check_per_token_scale_pairing(a_global_sf, recipe: Recipe) -> None:
+    """The per-token global scale of a 4over6 class is the pure function ``1 / (6 e4m3_max)`` of the recipe; a host value
+    (a Python scalar or a CPU tensor: readable without a device synchronization) that contradicts it is refused, as the
+    operator's wrapper refuses it (``_check_per_token_global_scale``, the same relative tolerance): the row would be scaled
+    with one clamp and the candidates scored with the other."""
+    from ...quantization.nvfp4_quantization_utils import NVFP4_PER_TOKEN_SCALE_RTOL
+
+    if isinstance(a_global_sf, torch.Tensor):
+        if a_global_sf.is_cuda or a_global_sf.numel() != 1:
+            return
+    value = float(a_global_sf)
+    expected = 1.0 / (6.0 * recipe.e4m3_max)
+    if abs(value - expected) > NVFP4_PER_TOKEN_SCALE_RTOL * expected:
+        raise ValueError(
+            f"a_global_sf={value!r} does not match the requested NVFP4 4over6 recipe (e4m3_max={recipe.e4m3_max}), which "
+            f"implies a_global_sf={expected!r} (1 / (6 e4m3_max)). Build the scale from the same recipe: "
+            "flashinfer.make_nvfp4_global_scale(a, per_token_activation=True, nvfp4_4over6_config=<the same value>)."
+        )
+
+
 def _scale_tensor(scale, ref: torch.Tensor) -> torch.Tensor:
     """The global scale as a 1-element fp32 device tensor. A tensor already in that form on the input's device passes
     through; another is converted as the operators' own paths do (a copy is not capturable). A host float is a cached
@@ -193,11 +213,14 @@ def nvfp4_quantize_rows(
     assert fp4.stride(0) % 8 == 0 or M == 1, (
         "fp4 row stride must be a multiple of 8 bytes"
     )
+    if recipe is not None and config.elems_per_thread != BLOCK:
+        raise ValueError(
+            f"config {config.describe()} is not a 4over6 placement: the block's error sum is a register-level fold, so a "
+            "config of the 4over6 classes holds a whole block in one thread (elems_per_thread == 16; "
+            "nvfp4_schedule.valid_configs_4over6)"
+        )
     kernel = _compiled_kernel(
         _DTYPE_STR[a.dtype], K, config, variant, bool(enable_pdl), layout
-    )
-    assert recipe is None or config.elems_per_thread == BLOCK, (
-        "a 4over6 config holds a whole block in one thread (elems_per_thread == 16)"
     )
     kernel(x2, fp4, sf, pts, gs, M, K, padded_M)
     if a.dim() != 2:
@@ -237,14 +260,17 @@ def nvfp4_quantize_batch_invariant(
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class: a dtype
     other than bf16 / f16 / fp32, ``K`` not a multiple of 16 or a row beyond the enumerated space, ``sf_vec_size != 16``,
-    an explicit 4over6 recipe (a scale-candidate search is another specification), ``expanded_idx_to_permuted_idx``
+    a 4over6 recipe with ``err_use_fast_math=True`` (approximate arithmetic: not a class), ``expanded_idx_to_permuted_idx``
     (the MoE row map), ``out_scale`` (folded into the per-token scale by other backends), a layout outside the three,
-    device, architecture; it never falls back."""
+    device, architecture; it never falls back. A per-token 4over6 call whose host global scale contradicts the recipe's
+    ``e4m3_max`` raises ``ValueError`` as the operator does; a forced ``config`` outside the 4over6 space raises ``ValueError``."""
     cls = CLASS_NVFP4 + (".pertoken" if per_token_activation else "")
     check_device(a.device, cls, NVFP4_QUANT_ARCHS)
     recipe = recipe_of(nvfp4_4over6, cls)
     if recipe is not None:
         cls = Variant(per_token_activation, recipe).class_name
+        if per_token_activation:
+            _check_per_token_scale_pairing(a_global_sf, recipe)
     if a.dtype not in _DTYPE_STR:
         raise unsupported(cls, f"input dtype {a.dtype}", "bf16, f16 or fp32 inputs")
     if a.dim() < 1:

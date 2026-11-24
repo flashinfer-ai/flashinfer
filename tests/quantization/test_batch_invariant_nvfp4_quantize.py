@@ -213,7 +213,9 @@ def test_determinism_graph_replay_and_pdl(per_token):
             )
     for _ in range(2):
         for o in outs:
-            o.zero_()
+            o.view(torch.uint8).fill_(
+                0xA5
+            )  # a nonzero pattern: a skipped store cannot pass as a zero
         g.replay()
         torch.cuda.synchronize()
         assert same_bits(tuple(o.cpu() for o in outs), ref)
@@ -477,7 +479,9 @@ def test_global_scale_forms_and_the_float_scale_cache():
             outs = flashinfer.nvfp4_quantize(x, w, batch_invariant=True)
     for _ in range(2):
         for o in outs:
-            o.zero_()
+            o.view(torch.uint8).fill_(
+                0xA5
+            )  # a nonzero pattern: a skipped store cannot pass as a zero
         g.replay()
         torch.cuda.synchronize()
         assert same_bits(tuple(o.cpu() for o in outs), ref_w)
@@ -834,7 +838,9 @@ def test_4over6_determinism_graph_replay_and_batch_invariance(per_token, recipe)
             )
     for _ in range(2):
         for o in outs:
-            o.zero_()
+            o.view(torch.uint8).fill_(
+                0xA5
+            )  # a nonzero pattern: a skipped store cannot pass as a zero
         g.replay()
         torch.cuda.synchronize()
         got = (outs[0].reshape(37, K // 2).cpu(), outs[1].reshape(-1).cpu()) + (
@@ -892,6 +898,37 @@ def test_4over6_zero_rule_and_unsupported_forms():
     with pytest.raises((bi.BatchInvariantUnsupportedError, ValueError), match="4over6"):
         flashinfer.fp4_quantize(
             x, None, 32, True, nvfp4_4over6=NVFP44Over6Config(), batch_invariant=True
+        )
+    # a per-token host scale that contradicts the recipe's e4m3_max (the operator's wrapper refuses it the same way)
+    for e4m3_max, wrong in ((448, 1.0 / (6 * 256)), (256, 1.0 / (6 * 448))):
+        with pytest.raises(ValueError, match="does not match"):
+            flashinfer.nvfp4_quantize(
+                x,
+                wrong,
+                per_token_activation=True,
+                nvfp4_4over6=NVFP44Over6Config(
+                    e4m3_max=e4m3_max, err_use_fast_math=False
+                ),
+                batch_invariant=True,
+            )
+        with pytest.raises(ValueError, match="does not match"):
+            flashinfer.nvfp4_quantize(
+                x,
+                torch.tensor([wrong], dtype=torch.float32),
+                per_token_activation=True,
+                nvfp4_4over6=NVFP44Over6Config(
+                    e4m3_max=e4m3_max, err_use_fast_math=False
+                ),
+                batch_invariant=True,
+            )
+    # a forced placement outside the 4over6 space (two lanes per block) is refused before any kernel is requested
+    with pytest.raises(ValueError, match="4over6 placement"):
+        nvfp4_quantize_rows(
+            x,
+            torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+            "128x4",
+            config=C.QuantConfig(32, 4, 8),
+            recipe=S.Recipe("mae"),
         )
 
 
