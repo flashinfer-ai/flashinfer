@@ -1534,10 +1534,24 @@ def test_route_tables_are_consistent() -> None:
         device_capability=(12, 0), num_householder=1
     )
     assert loader.PREFILL_LOGICAL_TENSORS[:4] == ("q", "k", "v", "o")
+    # the logical names of the shared prefill vocabulary but the Blackwell body's own (its item table, workspace,
+    # flags word and counts)
+    blackwell_only = {
+        "items",
+        "split_workspace",
+        "state_stride_slot",
+        "num_items",
+        "flags",
+    }
     for name in (base, merged):
-        assert set(loader.MODULES[name]["logical"].values()) == set(
-            loader.PREFILL_LOGICAL_TENSORS
-        ) | set(loader.PREFILL_LOGICAL_SCALARS)
+        assert (
+            set(loader.MODULES[name]["logical"].values())
+            == (
+                set(loader.PREFILL_LOGICAL_TENSORS)
+                | set(loader.PREFILL_LOGICAL_SCALARS)
+            )
+            - blackwell_only
+        )
     # both bodies take the same 23 formals in the same order: one ``values`` dict serves every launch
     assert loader.MODULES[base]["logical"] == loader.MODULES[merged]["logical"]
     assert loader.MODULES[base]["arg_plan"] == loader.MODULES[merged]["arg_plan"]
@@ -1585,14 +1599,15 @@ def test_no_final_state_runs_the_v6_body(monkeypatch) -> None:
 
 
 def test_prefill_records_reference_the_build_manifest() -> None:
-    """Every prefill record names its ``build.json`` library; the entries compile with fast math (their validated
-    setting)."""
+    """Every prefill record of this device's architecture names its ``build.json`` library; the entries compile
+    with fast math (their validated setting).  (The Blackwell body's records are covered by
+    ``test_cake_gdp_prefill_bw.py``.)"""
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     seen = 0
     v6_seen = 0
     for name, record in loader.MODULES.items():
-        if record["role"] != "prefill":
+        if record["role"] != "prefill" or _arch() not in record["arches"]:
             continue
         seen += 1
         assert record["library"] == record["kernel"] == name
