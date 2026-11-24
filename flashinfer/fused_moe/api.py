@@ -3630,10 +3630,12 @@ class BatchInvariantFp4Config:
     ``cvt_bf16(act(mul(g, s)) * mul(u, s))``, ``s = mul(alpha1[e], pts[token])``, the bf16 intermediate quantized per token
     by the same class, GEMM2 with ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))``, the slot-order combine. The instruction
     class of each expert weight shape is the dense 4-bit class rule's (the sm_107 K = 128 step on SM107, the K = 64 step
-    elsewhere), so the architecture family is a dimension of ``fingerprint("fused_moe_nvfp4", ...)`` (SM100 and SM103 are one family). Both pairs' activation chains
-    compute their exponential and divisions with the part's SFU (``ex2.approx.ftz`` / ``rcp.approx.ftz``): deterministic and
-    batch-invariant per part, the bits a property of the part (the verification standard is in the mode's README); the ReLU
-    family and PowLU have no such step and are the declared sequences.
+    elsewhere), so the architecture family is a dimension of ``fingerprint("fused_moe_nvfp4", ...)`` (SM100 and SM103 are one family). The fp4 classes' bits are a
+    property of the architecture family: the fold's instruction class and, for the activation chains with an exponential or a
+    division, the part's SFU primitives (``ex2.approx.ftz`` / ``rcp.approx.ftz``, measured into tables the tests pin per
+    part), so the output is deterministic and batch-invariant within a family and not, in general, equal across families
+    (``flashinfer/batch_invariant/README.md``: the hardware hypothesis and the pinned digests); the ReLU family and PowLU
+    have no SFU step and are the declared sequences.
 
     Weights (NVFP4 x NVFP4): ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or
     ``[E, I, H]`` for the ungated activations, and ``w2 [E, H, I]``, and quantizes every expert with the mode's per-tensor
