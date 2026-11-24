@@ -1869,6 +1869,22 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             pass
 
     @cute.jit
+    def release_kv_stage(
+        self,
+        mbar_consumed: cutlass.Pointer,
+    ) -> None:
+        """Order every lane's generic-proxy SMEM reads before TMA refills the stage."""
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
+        prims.mbarrier_arrive(mbar_consumed)
+
+    @cute.jit
     def should_skip_softmax(
         self,
         basic_params: SimpleNamespace,
@@ -2044,12 +2060,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
         sK = self.get_kv_stage_ptr(mma_params.sKV, k_stage)
         s_regs = self.mma_qk(basic_params, mma_params, q_regs, sK)
-        if prims.elect_sync():
-            k_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, k_stage)
-            prims.mbarrier_arrive(
-                k_consumed,
-                count=cute.arch.WARP_SIZE,
-            )
+        k_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, k_stage)
+        self.release_kv_stage(k_consumed)
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
         enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
@@ -2097,12 +2109,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
             self.wait_pipeline_barrier(v_arrived, v_phase)
             self.mma_pv(basic_params, mma_params, p_regs, sV)
-        if prims.elect_sync():
-            v_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, v_stage)
-            prims.mbarrier_arrive(
-                v_consumed,
-                count=cute.arch.WARP_SIZE,
-            )
+        v_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, v_stage)
+        self.release_kv_stage(v_consumed)
         return row_state
 
     @cute.jit
@@ -2157,11 +2165,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             sK,
             tracks_tile_row_max,
         )
-        if prims.elect_sync():
-            prims.mbarrier_arrive(
-                k_consumed,
-                count=cute.arch.WARP_SIZE,
-            )
+        self.release_kv_stage(k_consumed)
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
         skip_softmax = cutlass.Boolean(False)
@@ -2225,11 +2229,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 p_regs,
                 v_initial,
             )
-        if prims.elect_sync():
-            prims.mbarrier_arrive(
-                v_consumed,
-                count=cute.arch.WARP_SIZE,
-            )
+        self.release_kv_stage(v_consumed)
 
     @cute.kernel
     def kernel(
