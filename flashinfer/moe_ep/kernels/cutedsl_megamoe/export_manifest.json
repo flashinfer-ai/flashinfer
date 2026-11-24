@@ -293,7 +293,7 @@
     "sources/kernel_src/blackwell/inference/genphase/shared_expert_helper.py": "c4e29ddf71734089b73f9095f28583ef67b661723708722463da1a8598d55ce5",
     "sources/kernel_src/blackwell/inference/genphase/shared_expert_mainloop.py": "dcd49f30a115cf092a9f940ace9b40ca8a7bc7f43668ff82d51e8ec97a83cdda",
     "sources/kernel_src/blackwell/inference/genphase/tma_gather.py": "14b713d575ccdd4a5d7478762bb17fb16a08a1d0bf176602c07bec3bded3ad92",
-    "sources/kernel_src/blackwell/inference/genphase/token_comm_gen_specialized.py": "6caa57763b8e9adb322b4ac009764ee313ea2f240b27f11bbbfaa709a63f3f89",
+    "sources/kernel_src/blackwell/inference/genphase/token_comm_gen_specialized.py": "007ec13e4803349c5a50113b401489c934fc46d3585df767bf406329529832cd",
     "sources/kernel_src/blackwell/inference/genphase/weight_prefetch.py": "44ba70254c86ad0faae3bcacdbf6a6d966d2658681aaf0e1a63fc3a1541611e5",
     "sources/kernel_src/blackwell/inference/mega/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py": "2e48158014a1fb4970aa0857e367df1be8214b3214f28d228c42086a2364ea6e",

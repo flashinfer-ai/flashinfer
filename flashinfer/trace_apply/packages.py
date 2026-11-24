@@ -79,6 +79,7 @@ __all__ = [
     "SealedPackageError",
     "check_target_hardware",
     "import_entry",
+    "installed_packages",
     "load_packages",
     "release_packages",
     "setup_stats",
@@ -755,6 +756,9 @@ class _BundleFinder(importlib.abc.MetaPathFinder):
 #: sealed one and stays), and drops their preloaded entries; a Definition a
 #: captured binding serves is kept, identities and all.
 _preloaded_solutions: set[tuple[str, str, str]] = set()
+#: {definition: package} that ``load_packages`` installed last and
+#: ``release_packages`` has not released; a forked child inherits it.
+_installed: dict[str, SealedPackage] = {}
 _bound_lock = threading.Lock()
 #: {(digest, pid): SetupBoundCallable} — one binding per package and process,
 #: so a repeat ``import_entry`` returns the identical object and the states it
@@ -768,13 +772,18 @@ def _own_bound() -> None:
 
     The parent may have held the lock at the fork, which would block the child
     for good instead of refusing; the parent's bindings refuse every call by
-    pid anyway, and the parent is the one to tear them down.
+    pid anyway, and the parent is the one to tear them down. A binding released
+    by its own ``release()`` leaves the registry here, frozen or not, so a later
+    ``import_entry`` binds afresh.
     """
     global _bound_lock, _bound, _bound_pid
     if _bound_pid != os.getpid():
         _bound_lock = threading.Lock()
         _bound = {}
         _bound_pid = os.getpid()
+    with _bound_lock:
+        for key in [key for key, bound in _bound.items() if bound.released]:
+            del _bound[key]
 
 
 def _sealed_symbol(
@@ -908,7 +917,7 @@ def _solution_hash(value: Any) -> str | None:
     return hash_of() if callable(hash_of) else None
 
 
-def release_packages() -> None:
+def release_packages(*, allow_frozen: bool = False) -> None:
     """Release this process's sealed packages: their routes first, then their bindings.
 
     The routes are disarmed before any teardown runs, in an order that is safe
@@ -930,7 +939,10 @@ def release_packages() -> None:
     kept, states, route and preloaded entry included, and stays in
     ``setup_stats()``: captured graphs replay against the state addresses, so
     the state lives for the rest of the process (the reason nothing runs at
-    process exit either, where CUDA frees during interpreter teardown).
+    process exit either, where CUDA frees during interpreter teardown). With
+    ``allow_frozen`` even those bindings release: the caller — an inference
+    engine swapping kernels at runtime — guarantees the graphs were destroyed
+    first.
     Callers quiesce their calls first: a call in flight holds the state object
     it was handed, and a teardown that empties it in place is the Solution's
     own choice.
@@ -940,9 +952,15 @@ def release_packages() -> None:
 
     _own_bound()
     with _bound_lock:
-        released = [bound for bound in _bound.values() if not bound.frozen]
-        kept = {bound.name for bound in _bound.values() if bound.frozen}
-        for key in [key for key, bound in _bound.items() if not bound.frozen]:
+        released = [
+            bound for bound in _bound.values() if allow_frozen or not bound.frozen
+        ]
+        kept = {
+            bound.name for bound in _bound.values() if bound.frozen and not allow_frozen
+        }
+        for key in [
+            key for key, bound in _bound.items() if allow_frozen or not bound.frozen
+        ]:
             del _bound[key]
     releasing = {
         identity for identity in _preloaded_solutions if identity[0] not in kept
@@ -963,10 +981,12 @@ def release_packages() -> None:
     for definition, name, _ in sorted(releasing):
         apply.unregister_preloaded(definition, name)
     _preloaded_solutions.difference_update(releasing)
+    for definition in set(_installed) - kept:
+        del _installed[definition]
     failures: list[SetupStateError] = []
     for bound in released:
         try:
-            bound.release()
+            bound.release(allow_frozen=allow_frozen)
         except SetupStateError as error:
             failures.append(error)
     if failures:
@@ -974,6 +994,19 @@ def release_packages() -> None:
             f"{len(failures)} of {len(released)} setup-bearing bindings failed to "
             "release: " + "; ".join(str(error) for error in failures)
         ) from failures[0]
+
+
+def installed_packages() -> list[tuple[SealedPackage, Callable[..., Any]]]:
+    """The sealed packages installed, each with its callable for this process.
+
+    What ``load_packages`` installed (nothing with ``enable=False``), minus what
+    ``release_packages`` released, one per Definition: a later load for a
+    Definition replaces its entry, and a package refused at load is never
+    listed. An engine that routes its own call sites pairs each Definition with
+    the callable of the same package, without repeating the load. A forked
+    child gets a binding of its own.
+    """
+    return [(package, import_entry(package)) for package in list(_installed.values())]
 
 
 def setup_stats() -> dict[str, dict[str, Any]]:
@@ -1111,6 +1144,7 @@ def load_packages(
                 definition, name, fn, solution_hash=solutions[definition].hash()
             )
             _preloaded_solutions.add((definition, name, solutions[definition].hash()))
+        _installed.update({package.operation: package for package in result.packages})
         if solutions:
             result.applied = apply.enable_apply({**current, **solutions})
     return result

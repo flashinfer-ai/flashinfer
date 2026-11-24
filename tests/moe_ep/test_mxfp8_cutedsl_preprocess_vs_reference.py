@@ -145,8 +145,7 @@ def _plain_mxfp8_from_bf16(problem: dict):
     )
 
 
-# Shared with the sm120 twin (the kernel trees are process-exclusive, so the
-# band helper lives in an arch-free module both suites can import).
+# Use the same tolerance as the SM120 oracle.
 from .mega_oracle_compare import (  # noqa: E402
     _assert_mega_oracle_term_band_close,
 )

@@ -973,8 +973,13 @@ kernel_cake_sm110_xqa_09a5cd2e68fb4fbe4ec9(const __grid_constant__ CUtensorMap Q
                     unsigned int ht = row_begin + r;
                     unsigned int orow = (request_offset + ht / 8) * q_heads + head_1 * 8 + ht % 8;
                     uint32_t _sstage_reg_0[4];
+#if defined(_MSC_VER)
+                    uint64_t _smem_raw_39[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_39[0]), "=l"(_smem_raw_39[1]) : "r"(sstage_addr + (r * 132 + lane * 4) * 4));
+#else
                     __int128_t _smem_raw_39;
                     asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_39) : "r"(sstage_addr + (r * 132 + lane * 4) * 4));
+#endif
                     _sstage_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_39)[0];
                     _sstage_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_39)[1];
                     _sstage_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_39)[2];

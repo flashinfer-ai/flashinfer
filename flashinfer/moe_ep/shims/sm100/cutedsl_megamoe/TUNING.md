@@ -22,9 +22,8 @@ See [VENDOR.md](../../../kernels/cutedsl_megamoe/VENDOR.md) for source pins and
 
 The comparison uses four B200 GPUs at EP4 and CuTe DSL 4.8.1. The baseline is
 FlashInfer `9e37595004d839e934a5444b4a71d6026034b136`; each refreshed path is
-compared with the same implementation on that baseline. The refreshed
-measurement tree is `1bbb61a939f99aab2b9b0d49051640e0e9aae4d4`, before
-the Hopper reconciliation of shared legacy helpers. Standard and GenPhase
+compared with the same implementation on that baseline. Measurements
+predate the Hopper reconciliation of shared legacy helpers. Standard and GenPhase
 are measured separately. The retained NVFP4 and BF16 paths are included as
 regression controls.
 
@@ -153,8 +152,8 @@ capture.
 Native SM107, eight Rubin GPUs, EP8, hidden 4096, intermediate 2048,
 256 experts, top-6, capacity 256, uniform routing and no shared experts.
 The BF16 intermediate and combine use early routing weights and a gate/up
-clamp of 10. GPU clocks were not locked. The baseline BF16 integration
-files match revision `9f51f1aa1415dbdd22ddbfe6aa29069196a5a2b7`.
+clamp of 10. GPU clocks were not locked. The baseline uses the previous
+BF16 integration.
 
 These are full public forward calls including input staging and caller
 output. Each value averages two runs; each run takes the maximum of the
@@ -212,6 +211,9 @@ staging equality checks.
 
 ## Microbenchmark results (2026-07-22, e2e_pipelined p50 µs)
 
+The July NVFP4 results use the implementation now selected with
+`sm100_nvfp4_nvfp4_bf16_cutedsl_legacy`.
+
 Measured with `nvidia-cutlass-dsl==4.5.2`, using the mainloop workaround
 below. Geometry: hidden 7168, intermediate 2048, 256 experts, top-8,
 4x GB200. Ratios compare against `sm100_fp8_fp4_bf16_deepgemm`.
@@ -235,18 +237,16 @@ between 512 and 1024, win growing to 1.62x at 8192** (1.86x with the fp4
 combine wire).  The small-batch regime is weight-load bound and fp4-vs-fp4
 there is a wash.
 
-The `sm100_mxfp8_mxfp8_bf16_cutedsl` backend (latest sweep 2026-07-22 on dsl 4.5.2, CSV
-`sweep_20260722_114210_fi_mega.csv`; its >=2048 rows use the re-derived
-dispatch-warp default profile) runs 0.63x / 0.82x / 0.88x / 0.96x vs dg at
+The `sm100_mxfp8_mxfp8_bf16_cutedsl` backend (2026-07-22 sweep on DSL 4.5.2;
+the >=2048 rows use the re-derived dispatch-warp default profile)
+runs 0.63x / 0.82x / 0.88x / 0.96x vs dg at
 1024 / 2048 / 4096 / 8192 tok/rank — near dg parity at 8192 at a 3x better
 accuracy point (6.4% vs 20.6% rel-L2).
 
 ### Real-model geometry sweep (2026-07-21)
 
-The same sweep across the MoE geometries of real models (same recipe,
-session, and node as the table above; CSVs
-`moe_ep_benchmark/model_shapes/results/model_shapes_20260721_1109*_*.csv`,
-generated tables in that repo's `model_shapes/RESULTS.md`).  Pattern holds
+The sweep across real-model MoE geometries used the same recipe,
+session, and node as the table above. Pattern holds
 everywhere: dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens (1.6-1.9x on 7168-hidden shapes).  `e2e_pipelined` p50 µs, speedup
 vs `sm100_fp8_fp4_bf16_deepgemm` in parens.
@@ -370,10 +370,9 @@ path) and `fi_dg` run the mxfp4 checkpoint.
 ## Historical note: nvfp4 numbers before 2026-07-15 are invalid
 
 All `sm100_nvfp4_nvfp4_bf16_cutedsl` measurements taken before 2026-07-15 used a broken
-weight layout and have been removed (raw CSVs archived under
-`moe_ep_benchmark/results/archive_pre20260715_broken_nvfp4_layout/`): the
-FI preprocess materialized fc1/fc2 weights N-stride-1 while the frontend
-compiles the kernel's TMA layout from the tensor's actual strides, so those
+weight layout. The FI preprocess materialized fc1/fc2 weights N-stride-1
+while the frontend compiles the kernel's TMA layout from the tensor's actual
+strides, so those
 runs used a faster-but-wrong load pattern and produced incorrect results
 (the old "uniform 1.5-1.7x at every token count" claim was this artifact).
 Caught by the torch-oracle tests
@@ -393,8 +392,7 @@ noise (<= ~4% per cell); the tables above are the current reference.
 Same recipe, geometry and runbook as the microbenchmark table above, with
 the only change being the CuTe-DSL runtime pinned to 4.5.2 instead of
 >= 4.6.1.  Measured 2026-07-15 against a same-day 4.6.1 baseline (which the
-2026-07-21 table reproduces within run noise, so the comparison stands);
-CSVs `moe_ep_benchmark/results/sweep_20260715_1634*..1641*_fi_mega.csv`:
+2026-07-21 table reproduces within run noise, so the comparison stands).
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -428,9 +426,7 @@ follow-up below.**
 `moe_nvfp4_swapab/kernel_fc12.py` peels the last k-tile out of the
 MMA-consumer mainloop when `cutlass.__version__ == 4.5.2` exactly
 (`cutlass.const_expr`-gated, so 4.6.1+ traces are unchanged). Rerun of the
-same sweep recipe with 4.5.2 pinned (CSVs
-`moe_ep_benchmark/results/sweep_20260722_1125*/1126*/1129*_fi_mega.csv`;
-e2e_pipelined p50 µs, ratio vs same-run dg):
+same sweep recipe with 4.5.2 pinned (e2e_pipelined p50 µs, ratio vs same-run dg):
 
 | tok/rank | dg     | nvfp4 bf16     | +combine_nvfp4     |
 |---------:|-------:|---------------:|-------------------:|
@@ -448,8 +444,7 @@ dg-crossover / large-token win shape is restored. Correctness: the full
 `tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all eight
 sections, 2026-07-22).
 
-mxfp8 needs no WAR: a same-day 4.5.2 sweep
-(`sweep_20260722_114210_fi_mega.csv`) matches the 4.6.1 mxfp8 reference
+mxfp8 needs no WAR: a same-day 4.5.2 sweep matches the 4.6.1 mxfp8 reference
 within noise at every point (373.7/604.1/750.4/1007.2/1714.7/3215.3 µs at
 8..8192 vs 385.8/634.9/749.6/1006.6/1742.8/3122.2) — the 4.5.2 codegen
 regression was specific to the nvfp4 swap-AB fc12 mainloop. With both
@@ -463,7 +458,7 @@ reference numbers — see "Microbenchmark results (2026-07-22)" and the
 end-to-end section above.
 
 The two published versions between 4.5.2 and 4.6.1 were also measured
-(dg + nvfp4 @1024/2048/8192, `sweep_20260722_132849/133055_fi_mega.csv`):
+(dg + nvfp4 @1024/2048/8192):
 **4.5.3 (424.4/613.3/1933.3 µs) and 4.6.0 (427.0/614.1/1922.0 µs) both
 match the fast reference** — the codegen regression existed only in
 4.5.2 and was fixed upstream in 4.5.3, so the WAR's exact `== 4.5.2` gate
@@ -740,7 +735,7 @@ Steady-state cost of the full FI forward over the bare kernel launch is now
 
 ## Benchmarking lessons (how the 2x-slower misread happened)
 
-Use `moe_ep_benchmark` (`RUNBOOK.md` there) with `MEGA_TIMING`:
+The three timing modes measure different portions of a call.
 
 - `kernel` — tester-parity bare launch (back-to-back, per-iter events,
   L2 flush outside the window).  Compare THIS against the kernel team's
@@ -838,22 +833,19 @@ Takeaways at this (single-node NVLink) geometry, from the 2026-07-21 sweep:
   production default at DSV4; re-check the wires at higher
   combine-traffic geometries.
 
-### Sweep methodology + environment (reproduce recipe)
+### Sweep methodology and environment
 
 **Hardware / software.** One GB200 node with four GPUs (SM100, compute
 capability 10.0) over NVLink. Use a CUDA 13 environment with PyTorch,
 DeepGEMM, NVSHMEM and `nvidia-cutlass-dsl[cu13]>=4.5.2`. Install this
 checkout with `pip install --no-build-isolation -e .`.
 
-**Harness.**  `moe_ep_benchmark/bench_moe_ep_mega.py` via
-`SECTION=fi_mega GPUS=4 SEQ_LENS="1024 2048 4096 8192" run_sweep.sh`
-(see that repo's RUNBOOK.md), one `torch.multiprocessing.spawn` of 4 EP
-ranks per (variant, token-count) point — every point pays a fresh
-`cute.compile` (amortized by cute's on-disk cache).  Variants selected
-with the bench env knobs `MEGA_IKR=1` / `MEGA_COMBINE_DTYPE=nvfp4|mxfp8`
-(mapped onto `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`); knobs left at the default
-per-size heuristic profiles (`tuner.default_knobs`), which the quantized
-wires auto-adjust to dispatch-warp token-back.
+**Harness.** The sweep used a fresh four-rank process group for each backend,
+combine variant and token count (1024, 2048, 4096 and 8192). Compilation ran
+before timing. The NVFP4 variants selected in-kernel reduction or NVFP4/MXFP8
+combine at the default per-size heuristics. Quantized combine uses dispatch
+warps for token-back. The sweep took about 17 minutes with a warm compiler
+cache.
 
 **Problem.**  DeepSeek-V3-like: hidden 7168, inter 2048 (post-SwiGLU),
 256 experts, top-8, EP=4, `gate_up_clamp` default.  Random bf16
@@ -875,51 +867,6 @@ Reported number = rank-0 median of the 50 iters (p50); min/max in the
 CSVs.  `sm100_fp8_fp4_bf16_deepgemm` has no thunk API, so its "kernel" number loops
 `compute()` (includes its thin FI wrapper).
 
-### Runbook (rerun the sweep)
-
-The harness lives at <https://github.com/mhoqueanik/moe_ep_benchmark>.
-Its README documents the benchmark flags. For a Slurm/Pyxis run, set
-`MEGA_BENCH_IMAGE` to a container image with the dependencies above:
-
-```bash
-export ROOT=/path/to/workspace
-export REPO=$ROOT/flashinfer
-export MEGA_BENCH_IMAGE=/path/to/prepared-image.sqsh
-srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
-  --container-image="$MEGA_BENCH_IMAGE" \
-  --container-mounts="$ROOT:$ROOT" --container-workdir="$REPO" \
-  bash -lc '
-    export FLASHINFER_DISABLE_VERSION_CHECK=1
-    PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
-    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"
-    export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
-    export SEQ_LENS="1024 2048 4096 8192"
-    for MODE in kernel e2e_pipelined; do
-      export MEGA_TIMING=$MODE
-      MEGA_LIST="sm100_fp8_fp4_bf16_deepgemm sm100_nvfp4_nvfp4_bf16_cutedsl" \
-        bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # baseline
-      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_IKR=1 \
-        bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +ikr
-      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_COMBINE_DTYPE=nvfp4 \
-        bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +combine_nvfp4
-      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_COMBINE_DTYPE=mxfp8 \
-        bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +combine_mxfp8
-    done
-  '
-```
-
-Each `run_sweep.sh` invocation writes its own timestamped CSV under
-`moe_ep_benchmark/results/`; the variant is identified by the
-`compute_kernel` column suffix (`+ikr`, `+combine_nvfp4`, ...).  Notes:
-- The editable install lives in the container overlay — rerun it in
-  every fresh container.  Verify `import flashinfer` resolves to the
-  checkout, not the image copy.
-- Every (variant, token-count) point pays a `cute.compile`, amortized by
-  cute's on-disk cache; the 8-invocation sweep above completed in ~17 min
-  warm (budget ~2 h cold).
-- Geometry knobs (`HIDDEN INTER NUM_EXPERTS TOP_K GPUS`) and
-  `MEGA_KNOBS` (explicit knob dict / `auto` online autotune) are
-  documented in the bench README.
 
 ## Next levers
 

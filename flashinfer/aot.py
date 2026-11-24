@@ -144,6 +144,7 @@ from .jit.gemm import (
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_mm_bf16_cublaslt_module,
+    gen_mm_mxfp8_smallm_sm107_module,
     gen_gemm_sm120_module_cutlass_mxfp8,
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
@@ -1052,6 +1053,11 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm107a_exact:
+            # Small-M MXFP8 "specialized" GEMM backend: sm_107a-exact (fused
+            # scaled cvt + DSMEM cluster reductions), so it ships pre-built
+            # only for exact-SM107a wheels; other targets JIT it on demand.
+            jit_specs.append(gen_mm_mxfp8_smallm_sm107_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
             # fp4_gemm_cutlass also targets SM110 and must ship in its provider
