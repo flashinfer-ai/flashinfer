@@ -57,7 +57,9 @@ SM103_ONLY_MODULES = {
 }
 
 
-def _registered_generators(monkeypatch, sm_capabilities, overrides=None, add_moe=True):
+def _registered_generators(
+    monkeypatch, sm_capabilities, overrides=None, add_moe=True, cuda="13.0"
+):
     """Run gen_all_modules with every module generator stubbed to its own name."""
     from flashinfer import aot
     from flashinfer.jit import comm as jit_comm
@@ -79,7 +81,19 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None, add_moe
     for attr, stub in (overrides or {}).items():
         monkeypatch.setattr(aot, attr, stub)
     monkeypatch.setattr(aot, "_gen_blackwell_bf16_bmm_aot_specs", lambda caps: [])
-    monkeypatch.setattr(aot, "get_cuda_version", lambda: Version("13.0"))
+    monkeypatch.setattr(aot, "get_cuda_version", lambda: Version(cuda))
+    # The generated tinygemm_bf16 programs, one name per (operator, target).
+    for operator in ("cake_tinygemm2_wgmma", "cake_tinygemm2_tcgen05"):
+        monkeypatch.setattr(
+            aot,
+            operator,
+            SimpleNamespace(
+                aot_specs=lambda target, _op=operator: [
+                    SimpleNamespace(name=f"{_op}:{target}")
+                ]
+            ),
+            raising=False,
+        )
 
     specs = aot.gen_all_modules(
         [],
@@ -348,3 +362,157 @@ def test_tinygemm2_sm100_targets_follow_the_build_targets(
         for flag in flags
         if flag.startswith("-gencode=")
     ] == expected
+
+
+def _cake_tinygemm2(registered):
+    return {name for name in registered if name.startswith("cake_tinygemm2_")}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("sm_capabilities", "expected"),
+    [
+        ({"sm90": True, "sm90a_exact": True}, {"cake_tinygemm2_wgmma:sm_90a"}),
+        # compute_90 without an exact sm_90a target: the wgmma programs need it.
+        ({"sm90": True}, set()),
+        (
+            {"sm100": True, "sm100a_exact": True, "sm100f": True},
+            {"cake_tinygemm2_tcgen05:sm_100a"},
+        ),
+        ({"sm103": True, "sm103a_exact": True}, {"cake_tinygemm2_tcgen05:sm_103a"}),
+        (
+            {
+                "sm100": True,
+                "sm100a_exact": True,
+                "sm103": True,
+                "sm103a_exact": True,
+                "sm107": True,
+                "sm107a_exact": True,
+            },
+            {
+                "cake_tinygemm2_tcgen05:sm_100a",
+                "cake_tinygemm2_tcgen05:sm_103a",
+                "cake_tinygemm2_tcgen05:sm_107a",
+            },
+        ),
+        ({"sm110": True}, set()),
+        ({"sm120": True, "sm121": True}, set()),
+    ],
+    ids=["sm90a", "sm90-not-exact", "sm100a", "sm103a", "sm10x", "sm110", "sm12x"],
+)
+def test_cake_tinygemm2_programs_are_prebuilt_per_exact_target(
+    monkeypatch, sm_capabilities, expected
+):
+    # tinygemm_bf16 tries these before the tinygemm2 kernels; they are
+    # registered for the exact build targets, also without MoE.
+    for add_moe in (True, False):
+        registered = _registered_generators(
+            monkeypatch, sm_capabilities, add_moe=add_moe, cuda="13.4"
+        )
+        assert _cake_tinygemm2(registered) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("cuda", "registered"), [("13.0", False), ("13.4", True)])
+def test_cake_tinygemm2_tcgen05_sm107a_needs_cuda_13_4(monkeypatch, cuda, registered):
+    names = _registered_generators(
+        monkeypatch, {"sm107": True, "sm107a_exact": True}, cuda=cuda
+    )
+
+    assert ("cake_tinygemm2_tcgen05:sm_107a" in names) == registered
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("module_name", "target", "count"),
+    [
+        ("cake_tinygemm2_wgmma", "sm_90a", 84),
+        ("cake_tinygemm2_tcgen05", "sm_100a", 36),
+        ("cake_tinygemm2_tcgen05", "sm_103a", 36),
+        ("cake_tinygemm2_tcgen05", "sm_107a", 36),
+    ],
+)
+def test_cake_tinygemm2_aot_specs_are_the_runtime_specs(module_name, target, count):
+    # The jit-cache must ship the module names and flags the runtime loads.
+    import importlib
+
+    programs = importlib.import_module(f"flashinfer.jit.{module_name}")
+    specs = programs.aot_specs(target)
+
+    assert len(specs) == count
+    assert [spec.name for spec in specs] == [
+        program.module_name(target) for program in programs.PROGRAMS
+    ]
+    assert all(
+        spec is program.spec(target)
+        for spec, program in zip(specs, programs.PROGRAMS, strict=True)
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "arch", ["sm80", "sm89", "sm90", "sm100", "sm103", "sm107", "sm110", "sm120"]
+)
+def test_bf16_cublaslt_is_prebuilt_for_every_arch_mm_bf16_supports(monkeypatch, arch):
+    # mm_bf16(backend="cublaslt") supports SM80+; CUTLASS BF16 only SM10x.
+    registered = _registered_generators(monkeypatch, {arch: True}, add_moe=False)
+
+    assert "gen_mm_bf16_cublaslt_module" in registered
+    assert ("gen_gemm_sm100_module_cutlass_bf16" in registered) == (
+        arch in ("sm100", "sm103", "sm107")
+    )
+
+
+def _sm103_with_cuda_12_8(monkeypatch, tmp_path):
+    """An SM103 GPU and a local CUDA 12.8 toolkit, which cannot build sm_103a."""
+    from flashinfer.jit import core, tinygemm2
+
+    monkeypatch.setattr(
+        tinygemm2, "is_cuda_version_at_least", lambda v: Version("12.8") >= Version(v)
+    )
+    monkeypatch.setattr(
+        tinygemm2.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "3a")}
+    )
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+
+    def no_compilation(*args, **kwargs):
+        raise AssertionError("tinygemm2_sm100 must not be compiled")
+
+    monkeypatch.setattr(core.JitSpecNvcc, "write_ninja", no_compilation)
+    monkeypatch.setattr(core, "run_ninja", no_compilation)
+    return core, tinygemm2
+
+
+@pytest.mark.cpu_only
+def test_tinygemm2_sm100_loads_a_prebuilt_sm103_module_with_cuda_12_8(
+    monkeypatch, tmp_path
+):
+    core, tinygemm2 = _sm103_with_cuda_12_8(monkeypatch, tmp_path)
+    artifact = core.jit_env.AOTArtifact(
+        "flashinfer-jit-cache", tmp_path / "tinygemm2_sm100.so", None
+    )
+    monkeypatch.setattr(core.jit_env, "get_aot_artifacts", lambda name: (artifact,))
+    loaded = object()
+    monkeypatch.setattr(core.JitSpecNvcc, "load", lambda self, so_path=None: loaded)
+
+    spec = tinygemm2.gen_tinygemm2_sm100_module()  # must not raise
+
+    assert spec.name == "tinygemm2_sm100"
+    assert spec.build_and_load() is loaded
+
+
+@pytest.mark.cpu_only
+def test_tinygemm2_sm100_aot_miss_with_cuda_12_8_does_not_compile(
+    monkeypatch, tmp_path
+):
+    core, tinygemm2 = _sm103_with_cuda_12_8(monkeypatch, tmp_path)
+    monkeypatch.setattr(core.jit_env, "get_aot_artifacts", lambda name: ())
+
+    spec = tinygemm2.gen_tinygemm2_sm100_module()
+
+    # No local target: a build would fall back to the global -gencode flags
+    # (sm_103a here), which this toolkit cannot compile, so it is refused.
+    assert not any(flag.startswith("-gencode=") for flag in spec.extra_cuda_cflags)
+    with pytest.raises(RuntimeError, match="cannot build it"):
+        spec.build_and_load()

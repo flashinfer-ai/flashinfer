@@ -225,6 +225,7 @@ from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
+from .jit import cake_tinygemm2_tcgen05, cake_tinygemm2_wgmma
 from .jit.tinygemm2 import (
     gen_tinygemm2_module,
     gen_tinygemm2_sm100_module,
@@ -630,6 +631,28 @@ def _gen_cake_grouped_fp8_fused_silu_quant_aot_specs(
         for name, record in sorted(CAKE_GROUPED_FP8_FUSED_SILU_QUANT_MODULES.items())
         if record["arch"] == "sm_100a"
     ]
+
+
+def _gen_cake_tinygemm2_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
+    """Generated programs that tinygemm_bf16 tries before the tinygemm2 kernels.
+
+    The router GEMM serves the shapes in their measured windows with the wgmma
+    programs on SM90 and the tcgen05 programs on SM100/SM103/SM107, one library
+    each per exact target (36 tcgen05 programs per target, 84 wgmma programs).
+    """
+    specs: List[JitSpec] = []
+    if sm_capabilities.get("sm90a_exact", False):
+        specs.extend(cake_tinygemm2_wgmma.aot_specs("sm_90a"))
+    if sm_capabilities.get("sm100a_exact", False):
+        specs.extend(cake_tinygemm2_tcgen05.aot_specs("sm_100a"))
+    if sm_capabilities.get("sm103a_exact", False):
+        specs.extend(cake_tinygemm2_tcgen05.aot_specs("sm_103a"))
+    # The sm_107a programs need CUDA 13.4, as the router GEMM requires at runtime.
+    if sm_capabilities.get("sm107a_exact", False) and get_cuda_version() >= Version(
+        "13.4"
+    ):
+        specs.extend(cake_tinygemm2_tcgen05.aot_specs("sm_107a"))
+    return specs
 
 
 def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
@@ -1103,9 +1126,23 @@ def gen_all_modules(
     if (has_sm100 or has_sm103 or has_sm107) and tinygemm2_sm100_has_targets():
         # Generated SM100/SM103/SM107 variant, selected by the router GEMM bias path.
         jit_specs.append(gen_tinygemm2_sm100_module())
-    if has_sm100 or has_sm103 or has_sm107:
-        # mm_bf16(backend="cutlass" / "cublaslt") load these without MoE.
+    # The Cake programs tinygemm_bf16 tries first, per exact build target.
+    jit_specs.extend(_gen_cake_tinygemm2_aot_specs(sm_capabilities))
+    if (
+        has_sm80
+        or has_sm89
+        or has_sm90
+        or has_sm100
+        or has_sm103
+        or has_sm107
+        or has_sm110
+        or has_sm120
+        or has_sm121
+    ):
+        # mm_bf16(backend="cublaslt") supports SM80+ and loads it without MoE.
         jit_specs.append(gen_mm_bf16_cublaslt_module())
+    if has_sm100 or has_sm103 or has_sm107:
+        # mm_bf16(backend="cutlass") supports SM100/SM103/SM107, without MoE.
         jit_specs.append(gen_gemm_sm100_module_cutlass_bf16())
 
     if add_comm:
@@ -1567,6 +1604,8 @@ def detect_sm_capabilities():
         # Keep the existing CUDA >= 12.8 floor for Lowp AOT builds.
         "sm89": has_sm("compute_89", "12.8"),
         "sm90": has_sm("compute_90", "12.3"),
+        "sm90a_exact": (9, "0a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
         and cuda_version >= Version("12.8"),

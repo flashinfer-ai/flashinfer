@@ -1,5 +1,9 @@
+import dataclasses
+from typing import Optional
+
 from .core import (
     JitSpec,
+    JitSpecNvcc,
     gen_jit_spec,
     current_compilation_context,
     common_nvcc_flags,
@@ -40,14 +44,20 @@ def tinygemm2_sm100_has_targets() -> bool:
     return bool(_sm100_family_archs())
 
 
-def _sm100_family_nvcc_flags() -> list[str]:
-    flags = [
-        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
-        for major, minor in _sm100_family_archs()
-    ]
-    if not flags:
-        raise RuntimeError("No supported SM10x CUDA architecture for tinygemm2_sm100.")
-    return flags + common_nvcc_flags
+@dataclasses.dataclass
+class _PrebuiltOnlyJitSpec(JitSpecNvcc):
+    """A spec that loads its prebuilt (AOT) module but never compiles.
+
+    Used when the local nvcc can build none of the module's targets, for
+    example an SM103 GPU with CUDA 12.8 (sm_103a needs 12.9): an installed
+    jit-cache module still loads, while a miss raises instead of compiling
+    with the global ``-gencode`` flags of the visible GPUs.
+    """
+
+    reason: str = ""
+
+    def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:
+        raise RuntimeError(self.reason)
 
 
 def gen_tinygemm2_sm100_module() -> JitSpec:
@@ -59,10 +69,31 @@ def gen_tinygemm2_sm100_module() -> JitSpec:
     ``csrc/tinygemm2.cu`` layout. The kernel is a generated port of the
     TensorRT-LLM tinygemm2 kernel with bit-identical outputs; the ring depth
     is selected inside the binding from the problem shape.
+
+    The SM10x targets are the build targets the local nvcc supports. Without
+    any, the spec only loads a prebuilt module (see ``_PrebuiltOnlyJitSpec``).
     """
-    return gen_jit_spec(
+    archs = _sm100_family_archs()
+    spec = gen_jit_spec(
         "tinygemm2_sm100",
         [jit_env.FLASHINFER_CSRC_DIR / "tinygemm2_sm100.cu"],
-        extra_cuda_cflags=_sm100_family_nvcc_flags(),
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            for major, minor in archs
+        ]
+        + common_nvcc_flags,
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+    )
+    if archs:
+        return spec
+    targets = sorted(current_compilation_context.TARGET_CUDA_ARCHS)
+    return _PrebuiltOnlyJitSpec(
+        **{field.name: getattr(spec, field.name) for field in dataclasses.fields(spec)},
+        reason=(
+            "tinygemm2_sm100 is not in the installed jit-cache and the local "
+            f"CUDA toolkit cannot build it for the target architectures {targets} "
+            "(sm_103a needs CUDA 12.9, sm_107a CUDA 13.4). Install a "
+            "flashinfer-jit-cache that ships it, use a newer CUDA toolkit, or set "
+            "FLASHINFER_DISABLE_TINYGEMM2_SM100=1."
+        ),
     )
