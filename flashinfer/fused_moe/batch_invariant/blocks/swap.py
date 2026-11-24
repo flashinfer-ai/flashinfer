@@ -253,13 +253,6 @@ class SwappedGroupedGemm:
         self.mma_warp = len(self.epilogue_warps) + (1 if bs else 0)
         self.tma_warp = self.mma_warp + 1
         self.threads = 32 * (self.tma_warp + 1)
-        # the box form reads the group counts before its wait (the kernel body): a placement that triggers before its wait
-        # would let this grid launch before the plan completed (pdl.BOX_FORM_TRIGGERS)
-        assert gather or pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS, (
-            "the swapped box form reads the plan's counts before its PDL wait: it compiles under the trigger placements "
-            f"{pdl.BOX_FORM_TRIGGERS} only",
-            pdl.TRIGGER,
-        )
 
     @cute.jit
     def __call__(
@@ -750,10 +743,9 @@ class SwappedGroupedGemm:
             if cutlass.const_expr(bs):
                 cpasync.prefetch_descriptor(tma_atom_sfw)
         # programmatic dependent launch: every warp waits for the preceding grid before the group tables (the tables read
-        # ``counts``, the predecessor chain's writes: a no-op when nothing before triggered early, and the rule that no kernel
-        # of the chain triggers before its own wait -- ``pdl.BOX_FORM_TRIGGERS``, asserted at the builder -- is the margin);
-        # the producer waits once more before its first read of the predecessor's output (the token rows), the epilogue
-        # before its first store; the trigger placement is the chain's (``pdl.TRIGGER``).
+        # ``counts``, the predecessor chain's writes); the producer waits once more before its first read of the
+        # predecessor's output (the token rows), the epilogue before its first store; the trigger placement is the chain's
+        # (``pdl.TRIGGER``).
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )

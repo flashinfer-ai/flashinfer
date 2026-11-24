@@ -14,16 +14,13 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 
-#: The trigger placement of the persistent bodies: ``none`` (the dependents launch at completion).
+#: The trigger placement of the persistent bodies: ``none`` (the dependents launch at completion). Every body waits before
+#: its first dependent read -- the swapped body before its group tables read the plan's counts -- so no placement is
+#: excluded for any of them.
 TRIGGER = "none"
 #: The trigger placement of the one-wave kernels (gather, scatters, quantizers, combine; the plan-side kernels never
 #: trigger): ``none`` -- an early trigger would keep the persistent bodies' CTAs resident while these kernels run.
 TRIGGER_SMALL = "none"
-#: The placements the swapped box form compiles under (asserted by its builder, ``blocks/swap.py``): the form reads
-#: the plan's group counts -- its predecessor's predecessor's output -- before its own wait, which holds while every
-#: dependent launches only after its predecessor's wait has returned (the trigger after the loads, or completion). The
-#: early placement is kept out as the rule's margin: a trigger that close to the wait is one edit from preceding it.
-BOX_FORM_TRIGGERS = ("none", "late")
 
 
 @cute.jit

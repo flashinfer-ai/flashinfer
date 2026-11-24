@@ -462,11 +462,12 @@ def test_ranking_is_memoised_per_token_count():
     assert _rank_grouped.cache_info().hits == hits + 2
 
 
-def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
-    """The swapped body at an fp8 chain reads the plan's group counts under the chain's trigger rule
-    (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own wait before the tables
-    is the margin) and its builder asserts the shipped placement is one of them, as it does for the bf16 chains; the gather
-    form belongs to the bf16 classes."""
+def test_swapped_body_builds_under_every_trigger_placement_at_an_fp8_chain(
+    monkeypatch,
+):
+    """The swapped body at an fp8 chain waits before its group tables read the plan's counts, as at the bf16 chains, so
+    its builder accepts every trigger placement of the chain; the gather form belongs to the bf16 and block-scaled
+    classes."""
     from flashinfer.fused_moe.batch_invariant import pdl
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
@@ -475,13 +476,11 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     )
 
     cfg = swapped_knobs_fp8()[0]
-    assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
-    SwappedGroupedGemm(cfg, gemm1_chain("silu"))
+    for placement in ("none", "late", "early"):
+        monkeypatch.setattr(pdl, "TRIGGER", placement)
+        SwappedGroupedGemm(cfg, gemm1_chain("silu"))
     with pytest.raises(AssertionError):
         SwappedGroupedGemm(cfg, gemm1_chain("silu"), gather=True)
-    monkeypatch.setattr(pdl, "TRIGGER", "early")
-    with pytest.raises(AssertionError):
-        SwappedGroupedGemm(cfg, gemm1_chain("silu"))
 
 
 def test_one_body_per_form_serves_both_formats():

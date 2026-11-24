@@ -876,22 +876,26 @@ def test_slot_count_bound_at_every_entry_point():
         )
 
 
-def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
-    """The swapped box form reads the plan's group counts before its PDL wait -- the predecessor's predecessor's output,
-    complete under the chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own
-    wait) -- and its builder asserts the shipped placement is one of them, so a placement outside the rule cannot build the
-    box form; the gather form, which waits before its tables, builds under any."""
+def test_swapped_body_waits_before_its_group_tables_under_every_trigger_placement(
+    monkeypatch,
+):
+    """The swapped body, box and gather forms alike, waits for the preceding grid before its group tables read the plan's
+    counts (the wait precedes the tables in the kernel's source), so no trigger placement of the chain is excluded for it:
+    the builder accepts both forms under every placement."""
+    import inspect
+
     from flashinfer.fused_moe.batch_invariant import pdl
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
     from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
 
     cfg = swapped_knobs()[0]
-    assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
-    SwappedGroupedGemm(cfg, "plain")
-    monkeypatch.setattr(pdl, "TRIGGER", "early")
-    with pytest.raises(AssertionError):
+    src = inspect.getsource(SwappedGroupedGemm.kernel)
+    assert src.index("griddepcontrol_wait()") < src.index("build_group_tables")
+    assert not hasattr(pdl, "BOX_FORM_TRIGGERS")
+    for placement in ("none", "late", "early"):
+        monkeypatch.setattr(pdl, "TRIGGER", placement)
         SwappedGroupedGemm(cfg, "plain")
-    SwappedGroupedGemm(cfg, "plain", gather=True)
+        SwappedGroupedGemm(cfg, "plain", gather=True)
 
 
 def test_combine_oracle_treats_a_dropped_slot_as_zero():
