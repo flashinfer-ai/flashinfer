@@ -55,3 +55,21 @@ def test_gemm_help_formats(routine, monkeypatch, capsys):
         entry.parse_args(["--routine", routine, "--help"])
     assert exc.value.code == 0
     assert "--routine" in capsys.readouterr().out
+
+
+def test_probe_reraises_benchmark_bugs_only(monkeypatch):
+    _entry(monkeypatch)
+    gemm = importlib.import_module("routines.gemm")
+
+    # A NameError whose innermost frame is under benchmarks/ fails the line.
+    ns = {}
+    fake = str(_BENCHMARKS / "routines" / "fake_closure.py")
+    exec(compile("def bad():\n    return undefined_name\n", fake, "exec"), ns)
+    with pytest.raises(NameError):
+        gemm._drop_failing_backends(["x"], lambda backend: ns["bad"]())
+
+    # The same error types raised outside benchmarks/ only drop the backend.
+    def rejects(backend):
+        raise TypeError("unsupported configuration")
+
+    assert gemm._drop_failing_backends(["x"], rejects) == []

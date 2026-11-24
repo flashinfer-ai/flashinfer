@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -328,9 +329,22 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
     return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
-# Raised by a mistake in the benchmark's own closure, not by a backend that
-# rejects the problem: let them fail the line instead of dropping the backend.
 _BENCHMARK_BUG_ERRORS = (NameError, AttributeError, TypeError)
+_BENCHMARKS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _is_benchmark_bug(e):
+    """True for a NameError / AttributeError / TypeError raised by the
+    benchmark's own code (innermost frame under benchmarks/). Those fail the
+    line; the same types raised inside a library are a backend rejecting the
+    problem and only drop that backend."""
+    if not isinstance(e, _BENCHMARK_BUG_ERRORS) or e.__traceback__ is None:
+        return False
+    tb = e.__traceback__
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    filename = os.path.abspath(tb.tb_frame.f_code.co_filename)
+    return filename.startswith(_BENCHMARKS_DIR + os.sep)
 
 
 def _log_dropped_backend(backend, e, reason):
@@ -348,9 +362,9 @@ def _drop_failing_backends(backends, trial):
     for backend in list(backends):
         try:
             trial(backend)
-        except _BENCHMARK_BUG_ERRORS:
-            raise
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             _log_dropped_backend(backend, e, "does not support this configuration")
             backends.remove(backend)
     return backends
@@ -786,6 +800,8 @@ def testGroupGemmFp8NtGroupwise(args):
                 a_scale, b_scale, group_size * m, n, k, group_size
             )
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] deepgemm backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -1062,6 +1078,8 @@ def testBmmFp8(args):
         try:
             run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s)
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -1808,6 +1826,8 @@ def testMmFp4(args):
                 do_shuffle=True,
             )
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] trtllm backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -1918,6 +1938,8 @@ def testMmFp4(args):
                 mat2_inv_s_trtllm,
             )
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -2204,6 +2226,8 @@ def testMmBf16Fp4(args):
             runner(a)
             backend_runners[backend] = runner
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -2714,6 +2738,8 @@ def testMmBf16(args):
         try:
             run_backend(backend, a, b, bias, use_pdl, out_dtype)
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -2929,6 +2955,8 @@ def _run_mm_tf32(args):
         try:
             run_backend(backend, a, b, use_pdl)
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -3095,6 +3123,8 @@ def testTinygemmBf16(args):
         try:
             tinygemm_bf16(input, weight, outs[backend], bias=bias, use_pdl=use_pdl)
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -3281,6 +3311,8 @@ def testBmmBf16(args):
                 backend=backend,
             )
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             print(
                 f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
@@ -4077,6 +4109,8 @@ def testMaskedGroupedGemm(args):
                 run_fns[backend] = run_cutile
             refchecks[backend] = lambda o, ref=ref: _masked_cos_sim(ref, o, masked_m)
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             _log_dropped_backend(
                 backend, e, "could not build inputs for this configuration"
             )
@@ -4287,6 +4321,8 @@ def testGroupedMm(args):
                 run_fns[backend] = run_ragged_scaled
             refchecks[backend] = lambda o, ref=ref: _min_group_cos_sim(ref, o, [m] * G)
         except Exception as e:
+            if _is_benchmark_bug(e):
+                raise
             _log_dropped_backend(
                 backend, e, "could not build inputs for this configuration"
             )

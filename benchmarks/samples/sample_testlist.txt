@@ -51,6 +51,18 @@
 --routine mm_fp4 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn cutlass batch_invariant --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command --case_tag "mm_fp4_nvfp4_batch_invariant"
 --routine mm_fp4 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn batch_invariant --use_128x4_sf_layout --refcheck -vv --generate_repro_command --case_tag "mm_fp4_mxfp4_batch_invariant"
 
+## TF32, router, grouped, masked, SVDQuant and fused-epilogue GEMMs (SM100 / SM103 / SM107 unless the backend table says otherwise)
+--routine mm_tf32 --m 512 --n 4096 --k 4096 --backends cute-dsl cublas auto --refcheck -vv --generate_repro_command
+--routine router_gemm --m 8 --n 256 --k 7168 --out_dtype bfloat16 --refcheck -vv --generate_repro_command
+--routine gemm_fp8_nt_groupwise --m 128 --n 4096 --k 7168 --input_dtype fp8_e5m2 --mat2_dtype fp8_e5m2 --scale_granularity_m 128 --backends cutlass --refcheck -vv --generate_repro_command
+--routine group_gemm_fp8_nt_groupwise --m 128 --n 4096 --k 7168 --group_size 4 --scale_major_mode K --backends cutlass cutile deepgemm cute-dsl --refcheck -vv --generate_repro_command
+--routine group_gemm_mxfp4_nt_groupwise --m 128 --n 4096 --k 7168 --group_size 4 --refcheck -vv --generate_repro_command
+--routine masked_grouped_gemm --group_size 8 --m 256 --n 4096 --k 7168 --expected_m 100 --input_dtype nvfp4 --backends deepgemm cute-dsl cutile --refcheck -vv --generate_repro_command
+--routine grouped_mm --group_size 4 --m 128 --n 4096 --k 4096 --input_dtype bfloat16 --backends cudnn cutile --refcheck -vv --generate_repro_command
+--routine mm_nvfp4_svdquant --m 512 --n 4096 --k 4096 --rank 64 --bias --refcheck -vv --generate_repro_command
+--routine fused_linear --m 512 --n 4096 --k 4096 --input_dtype fp8_e4m3 --epilogue swiglu --bias --refcheck -vv --generate_repro_command
+--routine fused_linear --m 512 --n 3072 --k 4096 --input_dtype nvfp4 --epilogue qkv_qknorm_rope --refcheck -vv --generate_repro_command
+
 ## MoE
 --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 256 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
 --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --routing_method renormalize_naive --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
