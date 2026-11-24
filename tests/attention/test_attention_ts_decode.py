@@ -7223,6 +7223,7 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     ids=("fixed-q4", "packed-q4", "fixed-q3", "fixed-q4-b1", "default-runtime-q"),
 )
 def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
+    monkeypatch: pytest.MonkeyPatch,
     packed_query: bool,
     runtime_q_lengths: bool,
     seq_len_q: int,
@@ -7230,10 +7231,20 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
     expect_fixed: bool,
 ):
     """Fixed-Q plans key the kernel on the Q length only when it drops a mask."""
+    _mock_decode_hardware(monkeypatch)
+
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 152 // cluster_size,
+    )
 
     def compile_items(seq_len_q: int) -> dict[str, object]:
         spec = _resolve_decode_launch_spec(
-            torch.cuda.current_device(),
+            0,
             batch_size,
             32,
             4,
@@ -7252,7 +7263,7 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
         )
         compile_spec = _make_decode_compile_spec(
             spec,
-            device_index=torch.cuda.current_device(),
+            device_index=0,
             num_qo_heads=32,
             num_kv_heads=4,
             head_dim=128,
@@ -7267,7 +7278,12 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
         assert compile_spec.packed_query == packed_query
         return dict(compile_spec.config_items)
 
-    items = compile_items(seq_len_q)
+    # Planner results are cached per process; keep mocked hardware out of them.
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        items = compile_items(seq_len_q)
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
     assert items["fixed_seqlen_q"] is expect_fixed
     assert ("max_seq_len_q" in items) is expect_fixed
     if expect_fixed:

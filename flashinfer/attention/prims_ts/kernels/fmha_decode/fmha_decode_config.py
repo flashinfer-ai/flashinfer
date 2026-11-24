@@ -92,7 +92,7 @@ from .fmha_decode_constants import (
 )
 
 LENGTH_DERIVED_FIELDS = (
-    "max_seq_len_q",  # will be skipped if fixed_seqlen_q
+    "max_seq_len_q",
     "total_kv_tiles",
     "static_seq_len_kv",
     "max_num_pages_per_seq_kv",
@@ -3051,6 +3051,7 @@ class FmhaDecodeConfig:
         if not self.fixed_seqlen:
             policy = replace(self, fixed_seqlen=True)
             for name in LENGTH_DERIVED_FIELDS:
+                # no need to derive max_seq_len_q if seq len q is a fixed length
                 if name == "max_seq_len_q" and self.fixed_seqlen_q:
                     continue
                 del items[name]

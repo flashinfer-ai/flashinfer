@@ -1616,13 +1616,8 @@ def _make_decode_compile_spec(
 
     if launch_spec.config.fixed_seqlen:
         raise ValueError("cached TS decode compiles runtime sequence lengths only")
-    resolved_packed_query = (
-        launch_spec.config.use_variable_seqlens_q
-        if packed_query is None
-        else packed_query
-    ) or direct_q1_spec is not None
     signature_items = launch_spec.config.compile_signature()
-    if not runtime_q_lengths and not resolved_packed_query:
+    if not runtime_q_lengths:
         # Keying on the exact Q length forfeits kernel reuse across Q lengths,
         # so take it only when complete Q tiles then drop the inactive-row
         # score mask; otherwise the runtime-length kernel is identical work.
@@ -1666,7 +1661,12 @@ def _make_decode_compile_spec(
         k_dtype_key=k_dtype_key,
         v_dtype_key=v_dtype_key,
         out_dtype_key=out_dtype_key,
-        packed_query=resolved_packed_query,
+        packed_query=(
+            launch_spec.config.use_variable_seqlens_q
+            if packed_query is None
+            else packed_query
+        )
+        or direct_q1_spec is not None,
         max_active_clusters=launch_spec.max_active_clusters,
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,
