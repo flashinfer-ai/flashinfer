@@ -58,6 +58,13 @@ rewrites cached entries must respect that:
   for a new reason; keep separate state and re-check the on-disk value.
 - Before touching shared `AutoTuner` state, read every consumer of the field
   and note what each one assumes.
+- The tactics blocklist applies to every cached-winner source through
+  `AutoTuner._cached_winner_rejection` (memory, config file, managed cache,
+  bundled config), and `_sweep_blocklisted_winners` evicts in-memory and
+  loaded-file winners once per blocklist load. A new winner source calls the
+  former before serving an entry; a new rejection reason goes there, not into
+  one source. A rejection never deletes a managed-store entry; a retune
+  overwrites it through the publish path.
 - Add a two-writer regression in `tests/autotuner/` using two independent
   `AutoTuner` instances (reset `AutoTuner._instance` between them): writer A
   drops or invalidates a key, writer B re-tunes it to a permitted tactic and

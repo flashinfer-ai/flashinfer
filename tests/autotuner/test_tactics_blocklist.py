@@ -11,7 +11,7 @@ import tempfile
 import pytest
 
 from flashinfer import ReplayCoverage
-from flashinfer.autotune_cache import autotune_v2
+from flashinfer.autotune_cache import ManagedAutotuneCache, autotune_v2
 from flashinfer.autotuner import (
     AutoTuner,
     TunableRunner,
@@ -690,14 +690,8 @@ class TestAutotunerIntegration:
 # ---------------------------------------------------------------------------
 
 
-class TestBlocklistCacheFiles:
-    """Entries loaded from a cache file obey the blocklist like fresh tuning.
-
-    A cache file tuned before a tactic was listed must not keep serving that
-    tactic: the entry becomes a cache miss (re-profiled without the listed
-    tactic inside a tuning context, the default tactic -1 otherwise),
-    whether the blocklist is loaded before or after the cache file.
-    """
+class _BlocklistHarness:
+    """A tuner with stubbed profiling; tactic 1 wins unless it is listed."""
 
     OP = "cache_file_op"
     OTHER_OP = "cache_file_other_op"
@@ -761,6 +755,16 @@ class TestBlocklistCacheFiles:
         else:
             load_cache()
             load_blocklist()
+
+
+class TestBlocklistCacheFiles(_BlocklistHarness):
+    """Entries loaded from a cache file obey the blocklist like fresh tuning.
+
+    A cache file tuned before a tactic was listed must not keep serving that
+    tactic: the entry becomes a cache miss (re-profiled without the listed
+    tactic inside a tuning context, the default tactic -1 otherwise),
+    whether the blocklist is loaded before or after the cache file.
+    """
 
     def test_is_blocked(self, monkeypatch):
         monkeypatch.setattr(
@@ -1087,6 +1091,185 @@ class TestBlocklistCacheFiles:
 # ---------------------------------------------------------------------------
 # Offline generator (flashinfer generate-tactics-blocklist)
 # ---------------------------------------------------------------------------
+
+
+class TestBlocklistAllSources(_BlocklistHarness):
+    """Every cached-winner source obeys the blocklist, whichever loads first.
+
+    Memory, the managed v2 store and bundled package configs can hold a
+    winner tuned or promoted before its tactic was listed (by this process,
+    by another process, or in a package).  Each is a miss like a listed
+    cache-file entry: re-profiled without the tactic in tuning mode, the
+    default tactic otherwise.  A rejection never deletes anything on disk.
+    """
+
+    def _inputs(self):
+        import torch
+
+        return [torch.empty((4, 8), dtype=torch.float32)]
+
+    def _tune(self, runner, inputs, *ops):
+        with autotune(tune_mode=True):
+            for op in ops:
+                _, tactic = self.tuner.choose_one(op, [runner], TuningConfig(), inputs)
+                assert tactic == 1
+
+    def _fresh_tuner(self):
+        AutoTuner._instance = None
+        self.tuner = AutoTuner.get()
+
+    def test_memory_winner_listed_after_tuning_is_evicted(self, monkeypatch, tmp_path):
+        """A winner tuned before its tactic was listed misses, then retunes."""
+        profiled = self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = self._inputs()
+        self._tune(runner, inputs, self.OP, self.OTHER_OP)
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+
+        is_hit, _, tactic, _ = self._lookup(self.OP, runner, inputs)
+        assert (is_hit, tactic) == (False, -1)
+        is_hit, _, tactic, _ = self._lookup(self.OTHER_OP, runner, inputs)
+        assert (is_hit, tactic) == (True, 1)
+        # Evicted, not skipped on every lookup.
+        assert len(self.tuner.profiling_cache) == 1
+
+        profiled.clear()
+        with autotune(tune_mode=True):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert tactic == 2
+        assert 1 not in profiled
+        assert len(self.tuner.profiling_cache) == 2
+
+    def test_save_after_a_late_blocklist_skips_the_listed_winner(
+        self, monkeypatch, tmp_path
+    ):
+        """No lookup in between: save_configs sweeps the winners itself."""
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = self._inputs()
+        self._tune(runner, inputs, self.OP, self.OTHER_OP)
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+
+        cache_path = tmp_path / "cache.json"
+        self.tuner.save_configs(str(cache_path))
+        with open(cache_path) as f:
+            keys = [k for k in json.load(f) if k.startswith("(")]
+        assert not any(f"{self.OP!r}" in k for k in keys)
+        assert any(f"{self.OTHER_OP!r}" in k for k in keys)
+
+    def test_replay_reports_an_evicted_memory_winner_as_blocklisted(
+        self, monkeypatch, tmp_path
+    ):
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = self._inputs()
+        self._tune(runner, inputs, self.OP, self.OTHER_OP)
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+
+        report = ReplayCoverage()
+        with autotune_v2(mode="replay", persistent_cache=False, replay_report=report):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+            assert tactic == -1
+            _, tactic = self.tuner.choose_one(
+                self.OTHER_OP, [runner], TuningConfig(), inputs
+            )
+            assert tactic == 1
+        miss, hit = report.records
+        assert miss["status"] == "miss"
+        assert miss["reasons"] == ("blocklisted_tactic",)
+        assert hit["status"] == "hit"
+        assert hit["source"] == "memory"
+
+    def test_managed_store_entry_tuned_by_another_process(self, monkeypatch, tmp_path):
+        """Rejected before promotion and never deleted; a retune overwrites it."""
+        profiled = self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = self._inputs()
+        root = tmp_path / "store"
+        with autotune_v2(cache_root=root):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert tactic == 1
+        (entry,) = root.glob("v2/*/entries/*.json")
+        before = entry.read_text()
+
+        # Another process, with the blocklist loaded.
+        self._fresh_tuner()
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+        reads = []
+        lookup_record = ManagedAutotuneCache._lookup_record
+        monkeypatch.setattr(
+            ManagedAutotuneCache,
+            "_lookup_record",
+            lambda store, key: reads.append(key) or lookup_record(store, key),
+        )
+        report = ReplayCoverage()
+        with autotune_v2(mode="replay", cache_root=root, replay_report=report):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+            assert tactic == -1
+            disk_reads = len(reads)
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+            assert tactic == -1
+            # The warm miss is served from the decoded memo, not the filesystem.
+            assert len(reads) == disk_reads
+        assert [r["reasons"] for r in report.records] == [("blocklisted_tactic",)] * 2
+        assert entry.read_text() == before
+        assert not self.tuner.profiling_cache
+        assert not any(self.tuner._winner_partitions.values())
+
+        profiled.clear()
+        with autotune_v2(cache_root=root):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert tactic == 2
+        assert 1 not in profiled
+        with open(entry) as f:
+            assert json.load(f)["tactic"] == 2
+
+    def test_blocklist_loaded_after_a_promoted_managed_hit(self, monkeypatch, tmp_path):
+        """The promoted copy in memory is swept; the store entry stays on disk."""
+        self._patch_env(monkeypatch)
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = self._inputs()
+        root = tmp_path / "store"
+        with autotune_v2(cache_root=root):
+            self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        (entry,) = root.glob("v2/*/entries/*.json")
+        before = entry.read_text()
+
+        self._fresh_tuner()
+        with autotune_v2(mode="replay", cache_root=root):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert tactic == 1  # promoted into memory before the list exists
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+
+        report = ReplayCoverage()
+        with autotune_v2(mode="replay", cache_root=root, replay_report=report):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert tactic == -1
+        assert report.records[0]["reasons"] == ("blocklisted_tactic",)
+        assert not any(self.tuner._winner_partitions.values())
+        assert entry.read_text() == before
+
+    def test_bundled_config_is_filtered_at_lookup(self, monkeypatch, tmp_path):
+        self._patch_env(monkeypatch)
+        monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "1")
+        monkeypatch.setattr(
+            "flashinfer.autotuner.autotuner.load_from_file",
+            lambda file_key: (True, 0, 1, None),
+        )
+        runner = StubRunnerA(valid_tactics=[0, 1, 2])
+        inputs = self._inputs()
+        self.tuner._blocklist.load(self._blocklist_path(tmp_path))
+
+        is_hit, _, tactic, _ = self._lookup(self.OP, runner, inputs)
+        assert (is_hit, tactic) == (False, -1)
+        is_hit, _, tactic, _ = self._lookup(self.OTHER_OP, runner, inputs)
+        assert (is_hit, tactic) == (True, 1)
+
+        report = ReplayCoverage()
+        with autotune_v2(mode="replay", persistent_cache=False, replay_report=report):
+            _, tactic = self.tuner.choose_one(self.OP, [runner], TuningConfig(), inputs)
+        assert tactic == -1
+        assert report.records[0]["reasons"] == ("blocklisted_tactic",)
 
 
 class TestGeneratorModule:

@@ -74,7 +74,14 @@ class TacticsBlocklist:
 
     def __init__(self) -> None:
         self._invalid: Dict[str, Set[Any]] = {}
+        # The same sets keyed by (custom_op, runner_name), so is_blocked() on
+        # the serving path indexes a tuple instead of formatting a string.
+        self._invalid_by_pair: Dict[tuple, Set[Any]] = {}
         self._loaded_path: Optional[str] = None
+        # Bumped by every successful load(); the autotuner sweeps the winners
+        # it already holds once per generation (see
+        # AutoTuner._sweep_blocklisted_winners).
+        self._generation = 0
 
     # ------------------------------------------------------------------
     # Loading
@@ -126,6 +133,10 @@ class TacticsBlocklist:
                 default_listed.append(key)
             if listed:
                 self._invalid[key] = listed
+                if "::" in key:
+                    # custom_op may itself contain "::"; the class name cannot.
+                    custom_op, runner_name = key.rsplit("::", 1)
+                    self._invalid_by_pair[(custom_op, runner_name)] = listed
         if default_listed:
             logger.warning(
                 f"[TacticsBlocklist]: {path} lists the default tactic "
@@ -135,6 +146,7 @@ class TacticsBlocklist:
             )
 
         self._loaded_path = path
+        self._generation += 1
         total = sum(len(v) for v in self._invalid.values())
         logger.info(
             f"[TacticsBlocklist]: Loaded {total} invalid tactic(s) "
@@ -156,9 +168,9 @@ class TacticsBlocklist:
             tactic: A tactic as returned by ``get_valid_tactics()`` or read
                 back from a cache file.
         """
-        if not self._invalid:
+        if not self._invalid_by_pair:
             return False
-        invalid_set = self._invalid.get(f"{custom_op}::{runner_name}")
+        invalid_set = self._invalid_by_pair.get((custom_op, runner_name))
         return invalid_set is not None and _is_listed(invalid_set, tactic)
 
     def filter(
@@ -265,6 +277,11 @@ class TacticsBlocklist:
     @property
     def loaded_path(self) -> Optional[str]:
         return self._loaded_path
+
+    @property
+    def generation(self) -> int:
+        """Number of successful :meth:`load` calls so far."""
+        return self._generation
 
     def summary(self) -> Dict[str, int]:
         """Return a {op_key: count} mapping of invalid tactics per operation."""
