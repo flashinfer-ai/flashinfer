@@ -661,8 +661,13 @@ def test_cuda_graph_replays_updated_fp8_scales(paged, device_scales):
             if name == "k"
             else torch.ones((), device="cuda")
         )
+    _check_cuda_graph_replays_updated_fp8_scales(wrapper, inputs, scales)
+
+
+def _check_cuda_graph_replays_updated_fp8_scales(wrapper, inputs, scales):
+    q = inputs[0]
     out = torch.empty_like(q, dtype=torch.bfloat16)
-    lse = torch.empty(q.shape[:2], device="cuda")
+    lse = torch.empty(q.shape[:2], dtype=torch.float32, device="cuda")
     wrapper.run_return_lse(*inputs, **scales, out=out, lse=lse, enable_pdl=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -685,3 +690,38 @@ def test_cuda_graph_replays_updated_fp8_scales(paged, device_scales):
         if previous is not None:
             assert not torch.equal(previous, out)
         previous = out.clone()
+
+
+def test_cuda_graph_replays_updated_fp8_scales_4k_rounding():
+    # Seeded normal inputs expose early FP32 rounding of the log2 softmax factor.
+    torch.manual_seed(81)
+    seq_len, hq, hkv, d = 4096, 24, 4, 256
+
+    def fp8(heads):
+        return torch.randn(seq_len, heads, d, device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+
+    q, k, v = fp8(hq), fp8(hkv), fp8(hkv)
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="cute-dsl-prims"
+    )
+    indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+    wrapper.plan(
+        indptr,
+        indptr,
+        hq,
+        hkv,
+        d,
+        causal=True,
+        q_data_type=q.dtype,
+        kv_data_type=k.dtype,
+        o_data_type=torch.bfloat16,
+    )
+    scales = dict(
+        q_scale=torch.ones((), dtype=torch.float32, device="cuda"),
+        k_scale=1.25,
+        v_scale=0.5,
+    )
+    _check_cuda_graph_replays_updated_fp8_scales(wrapper, (q, k, v), scales)
