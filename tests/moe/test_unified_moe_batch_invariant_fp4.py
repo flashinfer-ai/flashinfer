@@ -4071,3 +4071,97 @@ def test_explicit_gather_request_with_an_unsuitable_linear_layout_is_refused(pai
         assert torch.equal(bits(layer(act, W_pack)), ref), flag
 
 
+@needs_device
+@pytest.mark.parametrize("which", ["nvfp4", "mxfp4", "static"])
+def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which):
+    """A layer whose first forward runs under CUDA-graph capture (its constants are then device fills of that capture:
+    ``_scale_tensor`` / ``_const``), captured twice, both graphs replayed, then an eager call; a layer constructed inside a
+    capture (its runner built there, the routed scale a per-call fill) and forwarded in it; and a layer used eagerly first
+    and then captured: every output equals the eager bits of a layer that never saw a capture, under the DeepSeekV3 method
+    with a routed scaling factor and a bias (the scale constant in play), both pairs and the static class."""
+    T, k, H, I, E = 48, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=91)
+    bias = (
+        (torch.randn(E, generator=torch.Generator().manual_seed(92)) * 0.1)
+        .float()
+        .cuda()
+    )
+    quant = _MX if which == "mxfp4" else _NVFP4
+
+    def make():
+        backend = (
+            BatchInvariantFp4Config(intermediate="static")
+            if which == "static"
+            else BatchInvariantFp4Config()
+        )
+        return MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E, top_k=k, method=RoutingMethodType.DeepSeekV3, routed_scaling_factor=1.75
+                ),
+                quant=quant,
+                experts=ExpertConfig(intermediate_size=I),
+                activation=_SWIGLU,
+                backend=BackendOptions((backend,)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
+            ),
+            device=torch.device("cuda"),
+        )  # fmt: skip
+
+    if which == "static":
+        W = MoEWeightPack({})
+        W.prepare_for(
+            KEY,
+            BatchInvariantFp4Config.prepare_weights(
+                w1, w2, activation=_SWIGLU, intermediate="static"
+            ),
+        )
+    else:
+        W = _weights(w1, w2, quant=quant)
+    act = _logits_pack(x, logits, bias)
+    ref = bits(make()(act, W))  # eager, never captured: the compile, the bits
+    torch.cuda.synchronize()
+    nan = float("nan")
+    s = torch.cuda.Stream()
+
+    def captured(layer):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+            out = layer(act, W)
+        torch.cuda.synchronize()
+        return g, out
+
+    # (1) first used under capture: two captures, both replayed, an eager call after
+    fresh = make()
+    graphs = [captured(fresh) for _ in range(2)]
+    for g, out in graphs:
+        out.fill_(nan)
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+    assert torch.equal(bits(fresh(act, W)), ref)
+    for g, out in graphs:
+        out.fill_(nan)
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+    # (2) constructed and first forwarded inside one capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        inside = make()
+        out = inside(act, W)
+    torch.cuda.synchronize()
+    out.fill_(nan)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    assert torch.equal(bits(inside(act, W)), ref)
+    # (3) used eagerly, then captured
+    warm = make()
+    assert torch.equal(bits(warm(act, W)), ref)
+    g, out = captured(warm)
+    out.fill_(nan)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    assert torch.equal(bits(warm(act, W)), ref)
