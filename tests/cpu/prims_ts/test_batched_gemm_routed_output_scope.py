@@ -44,6 +44,20 @@ def test_repeat_poison_detects_missing_c_or_scale_store_and_preserves_guards(dty
         output[touched] = first
 
 
+@pytest.mark.parametrize("written_bits", [0x0F, 0xF0], ids=["low-only", "high-only"])
+def test_fp4_repeat_poison_detects_partial_byte_store(written_bits):
+    expected = torch.tensor([0xA5], dtype=torch.uint8)
+    masks = set()
+    for repeat in range(256):
+        output = expected.clone()
+        _poison_checked_output(output, repeat)
+        masks.add((output ^ expected).item())
+        # Simulate a kernel restoring only one of the two packed outputs.
+        output = (expected & written_bits) | (output & (0xFF ^ written_bits))
+        assert not _same_launch_output(expected, output), repeat
+    assert len(masks) > 1
+
+
 @pytest.mark.parametrize("values_per_byte", [1, 2])
 @pytest.mark.parametrize("layout", [1, 2])
 def test_quantized_repeat_excludes_padded_tokens_but_keeps_guard_checks(

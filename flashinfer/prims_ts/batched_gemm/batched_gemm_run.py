@@ -2082,9 +2082,10 @@ def _same_launch_output(first: torch.Tensor, current: torch.Tensor) -> bool:
 def _poison_checked_output(output, repeat, touched=None):
     """Invalidate previous results without resetting allocation/stride guards."""
     if output.dtype == torch.uint8:
-        # FP4 has no NaN. Change every byte from its previous result, with a
-        # different mask each repeat, so a missing store cannot look unchanged.
-        mask = repeat % 255 + 1
+        # FP4 has no NaN. Cycle through the 15 nonzero masks for each nibble
+        # so a missed store to either packed value leaves a detectable change.
+        high, low = divmod(repeat % (15 * 15), 15)
+        mask = ((high + 1) << 4) | (low + 1)
         if touched is None:
             output.bitwise_xor_(mask)
         else:
