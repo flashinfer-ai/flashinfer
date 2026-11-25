@@ -91,6 +91,7 @@ function fixture({
     paginate: async (fn) => fn(),
     rest: {
       pulls: {
+        list: async () => [pr],
         get: async () => ({
           data: { ...pr, head: { sha: stale ? "c".repeat(40) : pr.head.sha } },
         }),
@@ -275,7 +276,16 @@ test("newer revoke wins even if older expected workflow finishes later", async (
 });
 test("edited latest approval does not resurrect an older expected", async () => {
   const f = fixture();
-  f.comment.updated_at = "2026-11-25T02:00:00Z";
+  const older = { ...f.comment };
+  const newer = {
+    ...f.comment,
+    id: 11,
+    html_url: f.comment.html_url.replace("-10", "-11"),
+    updated_at: "2026-11-25T02:00:00Z",
+  };
+  f.github.rest.issues.getComment = async ({ comment_id }) => ({
+    data: comment_id === 10 ? older : newer,
+  });
   const records = [10, 11].map((id) => ({
     context: "api-break-exception/pr-3",
     description: `expected:${id}`,
@@ -284,6 +294,7 @@ test("edited latest approval does not resurrect an older expected", async () => 
     creator: { login: "github-actions[bot]" },
   }));
   const { approved } = require("../pr_checks/api_gate.cjs");
+  assert.equal(await approved(f.github, f.context, f.pr, [records[0]]), true);
   assert.equal(await approved(f.github, f.context, f.pr, records), false);
 });
 test("revoke reblocks the gate without posting an unblock thumbs-up", async () => {
@@ -318,6 +329,9 @@ test("trusted scanner ignores a PR replacement checker and never imports package
   const git = (...args) =>
     execFileSync("git", args, {
       cwd: directory,
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+      ),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
@@ -392,4 +406,95 @@ test("revoke persists before a failed rescan and leaves no passing gate", async 
       false,
     );
   }
+});
+
+test("deleted latest approval invalidates it without hiding other API errors", async () => {
+  const f = fixture();
+  const item = {
+    context: "api-break-exception/pr-3",
+    description: "expected:11",
+    state: "success",
+    target_url: "https://github.com/org/repo/actions/runs/2",
+    creator: { login: "github-actions[bot]" },
+  };
+  f.github.rest.issues.getComment = async () => {
+    throw Object.assign(Error("deleted"), { status: 404 });
+  };
+  assert.equal(await validException(f.github, f.context, f.pr, item), false);
+  f.github.rest.issues.getComment = async () => {
+    throw Object.assign(Error("rate limited"), { status: 403 });
+  };
+  await assert.rejects(
+    validException(f.github, f.context, f.pr, item),
+    /rate limited/,
+  );
+});
+
+test("successful command rescan restores evidence for a later expected command", async () => {
+  const f = fixture({ scanState: "error" });
+  f.comment.body = "@flashinfer-bot API BREAK revoke";
+  const scan = async () => ({
+    execution_status: "COMPLETE",
+    findings: [{ classification: "BREAKING", level: "error" }],
+  });
+  await handleCommand({ ...f, core: { warning() {} }, scan });
+  const restored = f.calls
+    .filter((x) => x[0] === "status" && x[1].context === "api-scan/pr-3")
+    .at(-1);
+  assert.equal(restored?.[1].state, "success");
+  f.comment.id = 11;
+  f.comment.html_url = f.comment.html_url.replace("-10", "-11");
+  f.comment.body = "@flashinfer-bot API BREAK expected";
+  f.comment.created_at = f.comment.updated_at = "2026-11-25T03:00:00Z";
+  await handleCommand({ ...f, core: { warning() {} }, scan });
+  assert.equal(f.calls.at(-1)[1], "+1");
+});
+
+test("failed revoke refreshes an old expected summary as incomplete", async () => {
+  const f = fixture();
+  f.comment.body = "@flashinfer-bot API BREAK revoke";
+  f.github.rest.issues.listComments = async () => [
+    {
+      id: 5,
+      user: { login: "github-actions[bot]" },
+      body: "<!-- flashinfer-api-compatibility -->PASS (expected)",
+    },
+  ];
+  let body;
+  f.github.rest.issues.updateComment = async (x) => {
+    body = x.body;
+  };
+  f.github.rest.pulls.listFiles = async () => [];
+  f.github.rest.pulls.listReviewComments = async () => [];
+  await handleCommand({
+    ...f,
+    core: { warning() {} },
+    scan: async () => {
+      throw Error("syntax failure");
+    },
+  });
+  assert.match(body, /INCOMPLETE/);
+  assert.doesNotMatch(body, /PASS/);
+});
+
+test("one PR exception cannot pass a shared head used by another open PR", async () => {
+  const f = fixture();
+  f.github.rest.pulls.list = async () => [f.pr, { ...f.pr, number: 4 }];
+  await handleCommand({
+    ...f,
+    core: { warning() {} },
+    scan: async () => ({
+      execution_status: "COMPLETE",
+      findings: [{ classification: "BREAKING", level: "error" }],
+    }),
+  });
+  const gate = f.calls
+    .filter((x) => x[0] === "status" && x[1].context === "API compatibility")
+    .at(-1)[1];
+  assert.equal(gate.state, "failure");
+  assert.match(gate.description, /shared|share/i);
+  assert.equal(
+    f.calls.some((x) => x[0] === "reaction" && x[1] === "+1"),
+    false,
+  );
 });

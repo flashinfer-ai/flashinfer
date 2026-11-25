@@ -265,3 +265,82 @@ test("clean publication is silent and removes only its own stale summary", async
     assert.equal(delivery.posted, 0);
   }
 });
+
+test("removed API links use the analyzed base revision", () => {
+  const item = {
+    ...make("removed", "BREAKING"),
+    anchors: [["flashinfer/old.py", "LEFT", 8, 10]],
+  };
+  const body = renderSummary(
+    { ...report, base: "b".repeat(40), findings: [item] },
+    { repo: "org/repo", head: "a".repeat(40) },
+  );
+  assert.match(body, /blob\/b{40}\/flashinfer\/old.py#L8/);
+});
+test("summary includes analyzed head and standalone command guidance", () => {
+  const body = renderSummary(report, {
+    repo: "org/repo",
+    head: "a".repeat(40),
+  });
+  assert.match(body, /Analyzed head:.*aaaaaaa/);
+  assert.match(body, /entire comment/);
+});
+test("large reports keep full counts and run link within GitHub comment limit", () => {
+  const findings = Array.from({ length: 300 }, (_, i) => ({
+    ...make(`api_${i}`, "BREAKING"),
+    before: "x".repeat(2500),
+    after: "y".repeat(2500),
+  }));
+  const body = renderSummary(
+    { ...report, findings },
+    {
+      repo: "org/repo",
+      head: "a".repeat(40),
+      runUrl: "https://github.com/org/repo/actions/runs/1",
+    },
+  );
+  assert.ok(body.length < 60000);
+  assert.match(body, /300 breaking/);
+  assert.match(body, /omitted/);
+  assert.match(body, /actions\/runs\/1/);
+});
+test("head changes while listing comments or diff prevent stale writes", async () => {
+  const { publishReport } = require("../pr_checks/api_report.cjs");
+  for (const phase of ["comments", "diff"]) {
+    const pr = { number: 3, head: { sha: "a".repeat(40) } };
+    let head = pr.head.sha;
+    const writes = [];
+    const github = {
+      paginate: async (fn) => fn(),
+      rest: {
+        issues: {
+          listComments: async () => {
+            if (phase === "comments") head = "b".repeat(40);
+            return [];
+          },
+          createComment: async () => writes.push("summary"),
+        },
+        pulls: {
+          get: async () => ({ data: { ...pr, head: { sha: head } } }),
+          listFiles: async () => {
+            if (phase === "diff") head = "b".repeat(40);
+            return [
+              {
+                filename: "flashinfer/example.py",
+                patch: "@@ -12 +12 @@\n-old\n+new",
+              },
+            ];
+          },
+          listReviewComments: async () => [],
+          createReview: async () => writes.push("inline"),
+        },
+      },
+    };
+    await publishReport(github, { warning() {} }, pr, report, {
+      owner: "org",
+      repo: "repo",
+    });
+    assert.equal(writes.includes("inline"), false, phase);
+    if (phase === "comments") assert.equal(writes.length, 0);
+  }
+});

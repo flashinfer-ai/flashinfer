@@ -95,6 +95,24 @@ async function provenance(github, context, item, event, workflow) {
     run.repository?.full_name === `${context.repo.owner}/${context.repo.repo}`
   );
 }
+async function trustedScan(github, context, item) {
+  return (
+    (await provenance(
+      github,
+      context,
+      item,
+      "pull_request_target",
+      "pr-api-compatibility.yml",
+    )) ||
+    (await provenance(
+      github,
+      context,
+      item,
+      "issue_comment",
+      "ci-bot-commands.yml",
+    ))
+  );
+}
 async function commandPermission(github, context, pr, comment) {
   const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
     ...context.repo,
@@ -124,10 +142,16 @@ async function exceptionComment(github, context, pr, item) {
   )
     return null;
   const id = Number(item.description.split(":")[1]);
-  const { data: comment } = await github.rest.issues.getComment({
-    ...context.repo,
-    comment_id: id,
-  });
+  let comment;
+  try {
+    ({ data: comment } = await github.rest.issues.getComment({
+      ...context.repo,
+      comment_id: id,
+    }));
+  } catch (error) {
+    if (error.status === 404) return null;
+    throw error;
+  }
   const expectedUrl = `${context.serverUrl || "https://github.com"}/${context.repo.owner}/${context.repo.repo}/pull/${pr.number}#issuecomment-${id}`;
   if (
     comment.html_url !== expectedUrl ||
@@ -180,6 +204,9 @@ function scan(pr) {
     throw Error("Invalid PR revisions");
   const command = (file, args) =>
     execFileSync(file, args, {
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+      ),
       encoding: "utf8",
       timeout: 180000,
       maxBuffer: 20 * 1024 * 1024,
@@ -225,7 +252,26 @@ async function evaluate({ github, core, context, pr, report, publish = true }) {
     pr,
     await statuses(github, context, pr),
   );
-  const state = gateState(report, expected);
+  let state = gateState(report, expected);
+  let blockedReason;
+  if (state === "success") {
+    // Commit statuses are shared across PRs. Fail closed instead of allowing
+    // one PR's exception to unblock another PR pointing at the same commit.
+    const open = await github.paginate(github.rest.pulls.list, {
+      ...context.repo,
+      state: "open",
+      per_page: 100,
+    });
+    if (
+      open.some(
+        (other) => other.number !== pr.number && other.head.sha === pr.head.sha,
+      )
+    ) {
+      state = "failure";
+      blockedReason =
+        "Head commit is shared by multiple open PRs; push a distinct commit before retrying.";
+    }
+  }
   if (!(await currentHead(github, context, pr))) return false;
   await status(
     github,
@@ -233,13 +279,14 @@ async function evaluate({ github, core, context, pr, report, publish = true }) {
     pr,
     GATE,
     state,
-    state === "error"
-      ? "API scan incomplete"
-      : expected
-        ? "API breaks accepted for this head"
-        : state === "failure"
-          ? "Breaking API changes require maintainer confirmation"
-          : "No blocking API changes",
+    blockedReason ||
+      (state === "error"
+        ? "API scan incomplete"
+        : expected
+          ? "API breaks accepted for this head"
+          : state === "failure"
+            ? "Breaking API changes require maintainer confirmation"
+            : "No blocking API changes"),
   );
   if (publish) {
     let maintainers = [];
@@ -257,7 +304,8 @@ async function evaluate({ github, core, context, pr, report, publish = true }) {
     try {
       const delivery = await publishReport(github, core, pr, report, {
         ...context.repo,
-        expected,
+        expected: expected && state === "success",
+        blockedReason,
         maintainers,
         runUrl: runUrl(context),
       });
@@ -355,13 +403,7 @@ async function handleCommand({ github, core, context, scan: scanFn = scan }) {
     (!latestScan ||
       latestScan.state !== "success" ||
       Date.parse(latestScan.created_at) > Date.parse(comment.created_at) ||
-      !(await provenance(
-        github,
-        context,
-        latestScan,
-        "pull_request_target",
-        "pr-api-compatibility.yml",
-      )))
+      !(await trustedScan(github, context, latestScan)))
   )
     return;
   // Read live source comment, so edits/deletions during queueing cannot approve.
@@ -432,9 +474,30 @@ async function handleCommand({ github, core, context, scan: scanFn = scan }) {
       "error",
       "API rescan failed; inspect workflow logs",
     );
+    try {
+      await publishReport(
+        github,
+        core,
+        pr,
+        { execution_status: "FAILED", findings: [], error: error.message },
+        { ...context.repo, runUrl: runUrl(context) },
+      );
+    } catch (publicationError) {
+      core.warning(
+        `API failure summary could not be updated: ${publicationError.message}`,
+      );
+    }
     return;
   }
   if (!(await currentHead(github, context, pr))) return;
+  await status(
+    github,
+    context,
+    pr,
+    scanContext(pr),
+    "success",
+    "Trusted API rescan complete",
+  );
   if (command === "expected") {
     await status(
       github,

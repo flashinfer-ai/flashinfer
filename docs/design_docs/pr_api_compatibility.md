@@ -47,11 +47,15 @@ available, use an explicit file-level review comment rather than an unrelated
 line. Findings with no changed file are logged as unplaced. Full evidence and
 `comment_delivery` counts remain in the `trusted-public-api-report` artifact.
 New line comments are submitted in one review; reruns update matching active
-comments without duplicating threads.
+comments without duplicating threads. Summaries identify the analyzed head and
+are bounded below GitHub's comment limit, retaining full counts and a link to
+the complete artifact even when some changes are omitted. Removed-source links
+use the base revision. Head/base identity is checked again after comment and
+diff reads so stale findings are not attached to a newer diff.
 
 All report text is English. A blocked report ends with:
 
-> Maintainers @xxxx can comment `@flashinfer-bot API BREAK expected`, Reason: …, to unblock all API BREAK findings for the current head.
+> Maintainers @xxxx can comment `@flashinfer-bot API BREAK expected` as the entire comment to unblock all API BREAK findings for the current head. Reason: … (provide separately in the PR description or discussion).
 
 `@xxxx` is replaced by maintainer accounts where accessible, with a permission
 based fallback. Reason is explanatory text outside the command, not a mandatory
@@ -76,9 +80,12 @@ BREAKING/error in the evidence.
 A trusted complete scan must predate the command. A queued command cannot approve
 a new head whose scan completed after the command was posted. Every new commit
 requires a new command. Approval records bind PR, SHA, command ID, actor and
-workflow provenance. Editing an approval does not retarget it or resurrect an
-older approval. A later explicit revocation takes precedence over an older
-command even if workflow execution is delayed:
+workflow provenance. Editing or deleting an approval invalidates it without
+resurrecting an older approval. A deleted comment does not invalidate completed scan evidence.
+A successful rescan from either trusted workflow refreshes that evidence; a
+failed revoke rescan leaves the gate in error and refreshes the summary as
+incomplete when comment delivery is available. A later explicit revocation takes
+precedence over an older command even if workflow execution is delayed:
 
 ```text
 @flashinfer-bot API BREAK revoke
@@ -107,7 +114,15 @@ Scanner exit codes are 0 (no blocking error), 1 (breaking findings), and 2
 A complete scan with no unaccepted errors passes; an incomplete scan never does.
 Commit statuses store the scan and exception audit references separately from
 the final required `API compatibility` status. The scanner and bot serialize
-updates per PR and recheck head/base identity before publishing gate results.
+updates per PR using `queue: max` (up to 100 queued jobs; additional jobs are
+canceled by GitHub) and recheck head/base identity before publishing gate results.
+Retargeting a PR to `main` also schedules a scan; title/body edits do not.
+
+GitHub commit statuses are shared by all PRs using the same head SHA. Before
+publishing success, the gate checks for other open PRs at that SHA and fails
+closed if any exist. Use a distinct head commit for each open PR (an empty commit
+is sufficient). An exception in one PR cannot waive this restriction or unblock
+another PR. The required check name remains **API compatibility**.
 
 ## Validation
 
@@ -133,5 +148,6 @@ provenance, delayed approval, head races, revocation and scan failures.
 4. Roll back by removing the required status requirement before reverting the
    workflow, to avoid leaving PRs waiting forever on a removed status.
 
-GitHub references: [commit statuses](https://docs.github.com/en/rest/commits/statuses)
+GitHub references: [commit statuses](https://docs.github.com/en/rest/commits/statuses),
+[concurrency queues](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
 and [pull_request_target](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target).

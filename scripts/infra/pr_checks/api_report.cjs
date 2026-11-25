@@ -89,7 +89,14 @@ function renderInline(finding) {
 }
 function renderSummary(
   report,
-  { repo, head, expected = false, maintainers = [], runUrl = "" },
+  {
+    repo,
+    head,
+    expected = false,
+    maintainers = [],
+    runUrl = "",
+    blockedReason = "",
+  },
 ) {
   const findings = groupFindings(report.findings || []);
   const counts = Object.fromEntries(
@@ -101,11 +108,13 @@ function renderSummary(
   if (
     report.execution_status === "COMPLETE" &&
     !counts.BREAKING &&
-    !counts.LIKELY_BREAKING
+    !counts.LIKELY_BREAKING &&
+    !blockedReason
   )
     return null;
-  const state =
-    report.execution_status !== "COMPLETE"
+  const state = blockedReason
+    ? "BLOCKED"
+    : report.execution_status !== "COMPLETE"
       ? "INCOMPLETE"
       : counts.BREAKING && !expected
         ? "BLOCKED"
@@ -116,15 +125,22 @@ function renderSummary(
     MARKER,
     `**API check: ${state} · ${counts.BREAKING} breaking · ${counts.LIKELY_BREAKING} likely breaking**`,
   ];
+  if (blockedReason) lines.push("", text(blockedReason));
   if (report.execution_status !== "COMPLETE")
     lines.push(
       "",
       `Scan did not complete: ${text(report.error || "See the check run.")}`,
     );
+  lines.push(
+    "",
+    `Analyzed head: [\`${head.slice(0, 7)}\`](https://github.com/${repo}/commit/${head})`,
+  );
+  let remaining = 50000;
   for (const kind of ["BREAKING", "LIKELY_BREAKING"]) {
     const items = findings.filter((f) => f.classification === kind);
     if (!items.length) continue;
     lines.push("", `**${heading(items[0])} · ${items.length}**`);
+    let omitted = 0;
     for (const item of items) {
       const source =
         (item.anchors || []).find((a) => a[1] === "RIGHT") || item.anchors?.[0];
@@ -136,21 +152,32 @@ function renderSummary(
         .map(encodeURIComponent)
         .join("/");
       const url = `https://github.com/${repo}/blob/${revision}/${path}#L${Number(sourceLine) || 1}`;
-      lines.push(
+      const entry = [
         "",
         `**\`${text(item.api)}\`** · [${text(sourcePath)}:${Number(sourceLine) || 1}](${url})`,
         "",
         diff(item),
-      );
+      ].join("\n");
+      if (entry.length > remaining) {
+        omitted++;
+        continue;
+      }
+      remaining -= entry.length;
+      lines.push(entry);
     }
+    if (omitted)
+      lines.push(
+        "",
+        `${omitted} API changes omitted here; see the full report artifact in the check run.`,
+      );
   }
-  if (state === "BLOCKED") {
+  if (state === "BLOCKED" && !blockedReason) {
     const names = maintainers.length
       ? maintainers.map((name) => `@${name}`).join(", ")
       : "with maintain/admin permission";
     lines.push(
       "",
-      `Maintainers ${names} can comment \`@flashinfer-bot API BREAK expected\`, Reason: …, to unblock all API BREAK findings for the current head.`,
+      `Maintainers ${names} can comment \`@flashinfer-bot API BREAK expected\` as the entire comment to unblock all API BREAK findings for the current head. Reason: … (provide separately in the PR description or discussion).`,
     );
   }
   if (runUrl) lines.push("", `[Full report and check run](${runUrl})`);
@@ -175,16 +202,24 @@ async function publishReport(github, core, pr, report, options) {
     unplaced: 0,
     failed: 0,
   };
-  const current = (
-    await github.rest.pulls.get({ owner, repo, pull_number: pr.number })
-  ).data;
-  if (current.head.sha !== pr.head.sha) return;
+  const isCurrent = async () => {
+    const { data: current } = await github.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: pr.number,
+    });
+    return (
+      current.head.sha === pr.head.sha && current.base?.sha === pr.base?.sha
+    );
+  };
+  if (!(await isCurrent())) return;
   const comments = await github.paginate(github.rest.issues.listComments, {
     owner,
     repo,
     issue_number: pr.number,
     per_page: 100,
   });
+  if (!(await isCurrent())) return;
   const body = renderSummary(report, {
     ...options,
     repo: `${owner}/${repo}`,
@@ -203,8 +238,6 @@ async function publishReport(github, core, pr, report, options) {
       });
     return delivery;
   }
-  if (body.length > 60000)
-    throw new Error("API report exceeds comment size; inspect the artifact.");
   if (previous)
     await github.rest.issues.updateComment({
       owner,
@@ -233,6 +266,7 @@ async function publishReport(github, core, pr, report, options) {
       per_page: 100,
     }),
   ]);
+  if (!(await isCurrent())) return;
   const pendingLines = [];
   for (const finding of groupFindings(report.findings || []).filter(
     (f) => f.classification !== "NON_BREAKING",
