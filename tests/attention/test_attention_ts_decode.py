@@ -10643,15 +10643,25 @@ def _resolve_d512_decode_policy(
         decode_module._resolve_decode_launch_spec.cache_clear()
 
 
-@pytest.mark.parametrize("max_kv_len", (32768, 262144))
-@pytest.mark.parametrize("batch_size", (8, 16, 32))
+@pytest.mark.parametrize(
+    ("batch_size", "max_kv_len"),
+    (
+        (8, 32768),
+        (16, 32768),
+        (32, 32768),
+        (13, 8192),
+        (8, 262144),
+        (16, 262144),
+        (32, 262144),
+    ),
+)
 @pytest.mark.parametrize("kv_dtype_key", ("float4_e2m1fn", "float8_e4m3fn"))
 def test_attention_ts_decode_d512_q8_auto_selects_grouped_keeps(
     monkeypatch, batch_size, kv_dtype_key, max_kv_len
 ):
     """Eight-token D512 decode at eight Q heads per KV head runs grouped Keeps Q64.
 
-    A long ``max_kv_len`` (plans made at the model context) keeps Keeps.
+    Underfilled grids (B13, or a plan made at the model context) keep Keeps.
     """
     spec = _resolve_d512_decode_policy(
         monkeypatch,
@@ -10667,10 +10677,11 @@ def test_attention_ts_decode_d512_q8_auto_selects_grouped_keeps(
     assert cfg.groups_tokens_heads_q
     assert cfg.tile_size_q == 64
     assert not cfg.use_cluster_smem_reduction
-    if kv_dtype_key == "float4_e2m1fn" and max_kv_len == 262144:
-        # Long plans keep the multi-wave split fanout, not one-wave Keeps.
+    nvfp4_splits = {(13, 8192): 5, (8, 262144): 9, (16, 262144): 9, (32, 262144): 8}
+    if kv_dtype_key == "float4_e2m1fn" and (batch_size, max_kv_len) in nvfp4_splits:
+        # Underfilled grids keep the multi-wave split fanout, not one-wave Keeps.
         assert cfg.use_split_kv
-        assert spec.requested_splits == {8: 9, 16: 9, 32: 8}[batch_size]
+        assert spec.requested_splits == nvfp4_splits[(batch_size, max_kv_len)]
     if cfg.use_split_kv:
         # D512 Keeps publishes partials for the standalone reducer, whose
         # tail is shorter than the in-kernel GMEM reduction.
