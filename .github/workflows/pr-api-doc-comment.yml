@@ -190,7 +190,9 @@ jobs:
             let executionStatus = {};
             if (fs.existsSync('reports/execution-status.json')) {
               try {
-                executionStatus = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
+                const parsed = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected checker outcomes');
+                executionStatus = parsed;
               } catch (error) {
                 reportErrors.push('execution-status.json is malformed');
               }
