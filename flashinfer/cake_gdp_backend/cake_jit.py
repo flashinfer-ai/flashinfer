@@ -16064,7 +16064,8 @@ SPLIT_LOG2_THRESHOLD_ARCH = {"sm_90a": -24.0, "sm_100a": -48.0, "sm_103a": -48.0
 # A cut's warm-up is the fewest chunks before it whose log2 gate decay reaches the threshold, within the build's warm-up
 # cap (SPLIT_WARMUP_MAX, or an inference build's longer cap) and the sequence start; a cut with none is not saturated.
 # A later cut of a saturated item ends its window iff the decay total of its whole warm-up window reaches the threshold
-# (gates lie in (0, 1], so the total reaches it iff a warm-up does; the device may sum a window in any order and parts).
+# (gates lie in (0, 1], so the total reaches it iff a warm-up does). An inference build sums each token's log2 decay in
+# integer units of 2^-16, rounded to nearest: a window's total, and so its cut's decision, is the same in every order.
 # (H above, least span in chunks) per arch: sm_90a H > 24 -> 48, H > 12 -> 24, else 12; Blackwell (sm_100a / sm_103a)
 # H > 12 -> 48, else 12 (its chunk step is shorter, so an item needs more chunks to pay its fill and drain)
 SPLIT_SPAN_MIN_ARCH = {
