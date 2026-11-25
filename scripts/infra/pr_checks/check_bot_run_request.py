@@ -35,7 +35,12 @@ def is_bot_response(item):
     if user.get("id") != BOT_ID or user.get("login", "").lower() != "flashinfer-bot":
         return False
     body = item.get("body", "").strip()
-    if not body or body.startswith((">", "`", "~")) or PUBLIC_NOTE in body:
+    if (
+        not body
+        or body.startswith((">", "`", "~"))
+        or PUBLIC_NOTE in body
+        or re.search(r"@+flashinfer-bot\b", body, re.I)
+    ):
         return False
     # Internal acknowledgements may follow scope/cost or stacked-PR notes.
     if not body.startswith("##") and "\n\n---\n\n" in body:

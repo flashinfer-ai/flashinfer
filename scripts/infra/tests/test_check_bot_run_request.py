@@ -95,6 +95,7 @@ class GateTests(unittest.TestCase):
             comment(ACK),
             forged,
             comment("Documentation check complete", True),
+            comment(ADVICE.replace("/bot run", "@flashinfer-bot run"), True),
             comment("> " + ACK, True),
             comment("```\n" + ACK + "\n```", True),
             comment(ADVICE + "\n<!-- flashinfer-bot:ci-bot-commands-note -->", True),
