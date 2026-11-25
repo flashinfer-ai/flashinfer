@@ -71,7 +71,7 @@ class PreparationProgramCache:
     def call(self, factory, args, kwargs):
         memo = self._caches.get(factory)
         if memo is None:
-            memo = program_cache(factory._function)
+            memo = program_cache(factory._function, _register=False)
             memo._metadata = True
             self._caches[factory] = memo
         before = memo._misses
@@ -108,7 +108,7 @@ _CacheInfo = namedtuple("CacheInfo", "hits misses maxsize currsize")
 
 
 class program_cache:
-    def __init__(self, function=None, *, scope="process"):
+    def __init__(self, function=None, *, scope="process", _register=True):
         if scope not in ("process", "preparation"):
             raise ValueError("program cache scope must be process or preparation")
         if function is not None:
@@ -119,7 +119,8 @@ class program_cache:
         self._values = {}
         self._lock = RLock()
         self._hits = self._misses = 0
-        _CACHES.add(self)
+        if _register and scope == "process":
+            _CACHES.add(self)
 
     def __call__(self, *args, **kwargs):
         if self._function is None:

@@ -8,7 +8,9 @@ alternative persistent cache format is involved.
 
 from __future__ import annotations
 
+import gc
 import hashlib
+import sys
 import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
@@ -117,7 +119,7 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
                 for mirror in mirrors:
                     mirror.pop(key, None)
             removed += len(obsolete)
-    for jit in tuple(_NATIVE_JITS):
+    for jit in _native_triton_jits():
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
             obsolete = {key for key, kernel in kernel_cache.items() if stale(kernel)}
             for key in obsolete:
@@ -129,9 +131,41 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
     return removed
 
 
+def _is_native_b12x_module(module: str) -> bool:
+    return (
+        module == "b12x"
+        or module.startswith("b12x.")
+        or module == "flashinfer.experimental.b12x"
+        or module.startswith("flashinfer.experimental.b12x.")
+    )
+
+
+def _iter_subclasses(cls):
+    yield cls
+    for sub in cls.__subclasses__():
+        yield from _iter_subclasses(sub)
+
+
+def _native_triton_jits() -> tuple[Any, ...]:
+    jits = list(_NATIVE_JITS)
+    seen = {id(jit) for jit in jits}
+    jit_module = sys.modules.get("triton.runtime.jit")
+    jit_cls = getattr(jit_module, "JITFunction", None)
+    if jit_cls is not None:
+        for cls in _iter_subclasses(jit_cls):
+            for obj in gc.get_referrers(cls):
+                if id(obj) in seen or not isinstance(obj, jit_cls):
+                    continue
+                module = getattr(getattr(obj, "fn", None), "__module__", "")
+                if _is_native_b12x_module(module):
+                    seen.add(id(obj))
+                    jits.append(obj)
+    return tuple(jits)
+
+
 def triton_cached_program_keys() -> frozenset[ProgramKey]:
     keys = set()
-    for jit in tuple(_NATIVE_JITS):
+    for jit in _native_triton_jits():
         for kernel_cache, *_ in jit.device_caches.values():
             for kernel in tuple(kernel_cache.values()):
                 keys.update(
@@ -142,7 +176,7 @@ def triton_cached_program_keys() -> frozenset[ProgramKey]:
 
 def evict_unretained_triton(keep, *, evict=None):
     removed = 0
-    for jit in tuple(_NATIVE_JITS):
+    for jit in _native_triton_jits():
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
             if evict is None:
                 obsolete = {
@@ -333,11 +367,11 @@ def observe_programs():
 
 
 @contextmanager
-def retain_compiled_programs():
+def retain_compiled_programs(*, isolated: bool = False):
     """Own warmed programs until captured graphs release their CUDA functions."""
     _ensure_triton_hook()
     retained = _RETAINED_PROGRAMS.get()
-    if retained is not None:
+    if retained is not None and not isolated:
         yield retained
         return
     retained = _RetainedPrograms()
@@ -563,7 +597,7 @@ def _ensure_triton_hook():
     def init_handles(self):
         fn = getattr(getattr(getattr(self, "src", None), "fn", None), "fn", None)
         module = getattr(fn, "__module__", "")
-        native = module == "b12x" or module.startswith("b12x.")
+        native = _is_native_b12x_module(module)
         if native and self.module is None:
             from .runtime_control import raise_if_kernel_resolution_frozen
 
@@ -588,7 +622,7 @@ def _ensure_triton_hook():
     def run_observed(self, *args, **kwargs):
         result = original_run(self, *args, **kwargs)
         module = getattr(self.fn, "__module__", "")
-        if module == "b12x" or module.startswith("b12x."):
+        if _is_native_b12x_module(module):
             _NATIVE_JITS.add(self)
             if result is not None and not isinstance(result, DeferredTritonKernel):
                 for program in program_keys(result):
@@ -605,7 +639,7 @@ def _ensure_triton_hook():
         self, key, signature, device, constexprs, options, attrs, warmup
     ):
         module = getattr(self.fn, "__module__", "")
-        if module == "b12x" or module.startswith("b12x."):
+        if _is_native_b12x_module(module):
             from .runtime_control import raise_if_kernel_resolution_frozen
 
             raise_if_kernel_resolution_frozen(

@@ -201,9 +201,12 @@ def test_failed_or_cancelled_job_only_evicts_programs_it_created(
     tmp_path, monkeypatch, cancel
 ):
     """A failed or cancelled job rolls back its own programs without evicting others."""
+    _deterministic_timer(monkeypatch)
+
     unplanned_key = ProgramKey("cute", "5" * 64, "unplanned")
     existing_plan_key = ProgramKey("cute", "6" * 64, "existing.plan")
     failed_job_key = ProgramKey("cute", "7" * 64, "failed.job")
+    failed_job_key_2 = ProgramKey("cute", "70" * 32, "failed.job.2")
 
     @program_cache.program_cache
     def cache(tag):
@@ -211,12 +214,22 @@ def test_failed_or_cancelled_job_only_evicts_programs_it_created(
             "unplanned": unplanned_key,
             "existing": existing_plan_key,
             "failed": failed_job_key,
+            "failed2": failed_job_key_2,
         }
+        if tag in ("failed", "failed2"):
+            width = 1 if tag == "failed" else 2
+            return CompiledCuTeProgram(lambda width=width: width * 3, keys[tag])
         return CompiledCuTeProgram(lambda tag=tag: tag, keys[tag])
 
     monkeypatch.setattr(program_cache, "_CACHES", {cache})
     monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
     monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+    monkeypatch.setattr(session_module, "compiled_program_available", lambda _p: True)
+    monkeypatch.setattr(
+        session_module,
+        "describe_compilation",
+        lambda job: SimpleNamespace(programs=(job,)),
+    )
 
     unplanned = cache("unplanned")
     unplanned_ref = weakref.ref(unplanned)
@@ -224,36 +237,48 @@ def test_failed_or_cancelled_job_only_evicts_programs_it_created(
 
     created_refs = []
 
-    def make_failed(_cfg):
-        prog = cache("failed")
+    def make_failed(cfg):
+        tag = "failed2" if cfg.width == 2 else "failed"
+        prog = cache(tag)
         created_refs.append(weakref.ref(prog))
         return prog
 
-    with session(tmp_path, autotune=False) as engine:
+    monkeypatch.setattr(session_module, "_ADVANCE_SECONDS", 0.0)
+    with session(tmp_path) as engine:
         existing_req = _plan_with_program(lambda _cfg: cache("existing"), name="keep")
-        engine.prepare((existing_req,))
+        engine.prepare((existing_req,), autotune=False)
         existing_ref = weakref.ref(existing_req.plan.prepared.state)
 
-        failing_req = _plan_with_program(make_failed, name="boom", fail=not cancel)
-        job = engine.begin((failing_req,))
         if cancel:
-            # Simulate a program loaded into the process cache before early cancellation.
-            created = cache("failed")
-            created_refs.append(weakref.ref(created))
-            del created
+            # Advance an autotuning job until it loads candidate programs inside its
+            # advance() scope and yields mid-race, then cancel before completion.
+            cand_keys = {1: failed_job_key, 2: failed_job_key_2, 7: failed_job_key}
+            cancel_req = _plan_with_program(
+                make_failed,
+                name="boom",
+                tuning=contract(values=(1, 2)),
+                benchmark=lambda state: PreparedCall(run=state, produce=lambda: None),
+                compile_jobs=lambda cfg, _device: (cand_keys[cfg.width],),
+            )
+            job = engine.begin((cancel_req,))
+            while not created_refs:
+                progress = job.advance()
+                assert not progress.done
             job.close()
         else:
+            failing_req = _plan_with_program(make_failed, name="boom", fail=True)
+            job = engine.begin((failing_req,))
             with pytest.raises(RuntimeError, match="prepare_call failed"):
                 while not job.advance().done:
                     pass
-        # Failed/cancelled job's program must be evicted from the cache immediately.
+        # Failed/cancelled job's programs must be evicted from the cache immediately.
         assert cache.cache_info().currsize == 2
         del job
         gc.collect()
 
         assert unplanned_ref() is not None
         assert existing_ref() is not None
-        assert created_refs and created_refs[0]() is None
+        assert created_refs and all(ref() is None for ref in created_refs)
 
     gc.collect()
     assert unplanned_ref() is not None
@@ -576,3 +601,240 @@ def test_graph_replay_of_unplanned_kernels_survives_first_use_preparation():
             torch.testing.assert_close(got, want, rtol=0, atol=0)
     finally:
         graph.reset()
+
+
+def test_prehook_native_triton_specialization_survives_later_preparation(
+    tmp_path, monkeypatch
+):
+    """A native Triton specialization cached before hook installation is not evicted."""
+    import triton
+    from triton.compiler import CompiledKernel
+
+    class _FakeCompiledTritonKernel(CompiledKernel):
+        def __init__(self, program_key: ProgramKey):
+            self.__b12x_programs__ = (program_key,)
+            self.module = object()
+
+        def __call__(self):
+            return None
+
+        def __del__(self):
+            pass
+
+    prehook_key = ProgramKey("triton", "91" * 32, "prehook.native.spec1")
+    job_key = ProgramKey("triton", "92" * 32, "job.native.spec2")
+
+    @triton.jit
+    def _native_kernel(x):
+        pass
+
+    # Mark the JIT as a native b12x kernel and pre-populate a specialization before
+    # _NATIVE_JITS ever sees this JITFunction (simulating compilation before hook install).
+    _native_kernel.fn.__module__ = "b12x.test_prehook"
+    prehook_compiled = _FakeCompiledTritonKernel(prehook_key)
+    kernel_cache = {"k_prehook": prehook_compiled}
+    key_cache = {"sig_prehook": "k_prehook"}
+    _native_kernel.device_caches[0] = (kernel_cache, key_cache, None, None)
+
+    monkeypatch.setattr(program_cache, "_CACHES", set())
+    monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
+    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+
+    prehook_ref = weakref.ref(prehook_compiled)
+    del prehook_compiled
+
+    # Confirm discovery sees the pre-hook specialization even with _NATIVE_JITS empty.
+    assert prehook_key in compile_plan.triton_cached_program_keys()
+
+    job_compiled_refs = []
+
+    def make_plan(_cfg):
+        # During preparation, the JIT is observed and adds a second specialization.
+        compile_plan._NATIVE_JITS.add(_native_kernel)
+        job_compiled = _FakeCompiledTritonKernel(job_key)
+        kernel_cache["k_job"] = job_compiled
+        key_cache["sig_job"] = "k_job"
+        job_compiled_refs.append(weakref.ref(job_compiled))
+        return job_compiled
+
+    with session(tmp_path, autotune=False) as engine:
+        req = _plan_with_program(make_plan, name="prehook_triton_op")
+        engine.prepare((req,))
+        assert prehook_ref() is not None
+        assert "k_prehook" in kernel_cache and "sig_prehook" in key_cache
+        assert "k_job" in kernel_cache
+
+        engine.release(req.plan)
+        gc.collect()
+        assert prehook_ref() is not None
+        assert "k_prehook" in kernel_cache and "sig_prehook" in key_cache
+        assert "k_job" not in kernel_cache and "sig_job" not in key_cache
+
+    gc.collect()
+    assert prehook_ref() is not None
+    assert "k_prehook" in kernel_cache and "sig_prehook" in key_cache
+    assert job_compiled_refs and job_compiled_refs[0]() is None
+
+
+def test_nested_retain_compiled_programs_keeps_caller_container_intact(
+    tmp_path, monkeypatch
+):
+    """Preparation inside caller-owned retain_compiled_programs does not clear outer state."""
+    outer_key = ProgramKey("cute", "a1" * 32, "outer.retained")
+    plan_key = ProgramKey("cute", "a2" * 32, "nested.plan")
+    fail_key = ProgramKey("cute", "a3" * 32, "nested.fail")
+
+    @program_cache.program_cache
+    def cache(tag):
+        keys = {"outer": outer_key, "plan": plan_key, "fail": fail_key}
+        return CompiledCuTeProgram(lambda tag=tag: tag, keys[tag])
+
+    monkeypatch.setattr(program_cache, "_CACHES", {cache})
+    monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
+    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+
+    with compile_plan.retain_compiled_programs() as outer:
+        outer_prog = cache("outer")
+        outer_prog()
+        outer_id = id(outer_prog)
+        outer_ref = weakref.ref(outer_prog)
+        del outer_prog
+        assert outer_id in outer.owners
+
+        with session(tmp_path, autotune=False) as engine:
+            # 1. Successful prepare + release must not touch caller's outer container.
+            req = _plan_with_program(lambda _cfg: cache("plan"), name="nested_ok")
+            engine.prepare((req,))
+            assert req.plan.prepared.retained is not outer
+            assert outer_id in outer.owners
+
+            engine.release(req.plan)
+            gc.collect()
+            assert outer_id in outer.owners
+            assert outer_key in compile_plan.retained_program_keys()
+            assert outer_ref() is not None
+
+            # 2. Failed _instantiate error cleanup must not clear caller's outer container.
+            failing = _plan_with_program(
+                lambda _cfg: cache("fail"), name="nested_fail", fail=True
+            )
+            with pytest.raises(RuntimeError, match="prepare_call failed"):
+                engine.prepare((failing,))
+            assert outer_id in outer.owners
+            assert outer_key in compile_plan.retained_program_keys()
+            assert outer_ref() is not None
+
+    # Even after exiting outer retention, outer_prog was external to the session and survives.
+    gc.collect()
+    assert outer_ref() is not None
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_external_program_loaded_between_begin_and_advance_survives(
+    tmp_path, monkeypatch, cancel
+):
+    """Unrelated programs loaded after begin() or between advances are never evicted."""
+    _deterministic_timer(monkeypatch)
+
+    ext_before_advance_key = ProgramKey("cute", "b1" * 32, "ext.before.advance")
+    ext_between_advances_key = ProgramKey("cute", "b2" * 32, "ext.between.advances")
+    ext_before_cancel_key = ProgramKey("cute", "b3" * 32, "ext.before.cancel")
+    winner_key = ProgramKey("cute", "b4" * 32, "job.winner")
+    loser_key = ProgramKey("cute", "b5" * 32, "job.loser")
+    default_key = ProgramKey("cute", "b6" * 32, "job.default")
+
+    @program_cache.program_cache
+    def cache(tag):
+        keys = {
+            "ext_before_advance": ext_before_advance_key,
+            "ext_between_advances": ext_between_advances_key,
+            "ext_before_cancel": ext_before_cancel_key,
+            "winner": winner_key,
+            "loser": loser_key,
+            "default": default_key,
+        }
+        widths = {"loser": 1, "winner": 2, "default": 7}
+        if tag in widths:
+            width = widths[tag]
+            return CompiledCuTeProgram(lambda width=width: width * 3, keys[tag])
+        return CompiledCuTeProgram(lambda tag=tag: tag, keys[tag])
+
+    monkeypatch.setattr(program_cache, "_CACHES", {cache})
+    monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
+    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+    monkeypatch.setattr(session_module, "compiled_program_available", lambda _p: True)
+    monkeypatch.setattr(
+        session_module,
+        "describe_compilation",
+        lambda job: SimpleNamespace(programs=(job,)),
+    )
+
+    refs = {}
+    cand_keys = {1: loser_key, 2: winner_key, 7: default_key}
+
+    def factory(cfg):
+        tag = {1: "loser", 2: "winner", 7: "default"}[cfg.width]
+        prog = cache(tag)
+        refs[tag] = weakref.ref(prog)
+        return prog
+
+    req = _plan_with_program(
+        factory,
+        name="coop_op",
+        tuning=contract(values=(1, 2)),
+        benchmark=lambda state: PreparedCall(run=state, produce=lambda: None),
+        compile_jobs=lambda cfg, _device: (cand_keys[cfg.width],),
+    )
+
+    monkeypatch.setattr(session_module, "_ADVANCE_SECONDS", 0.0)
+    with session(tmp_path) as engine:
+        job = engine.begin((req,))
+
+        # Caller loads an unrelated kernel after begin() and before the first advance().
+        ext1 = cache("ext_before_advance")
+        ext1_ref = weakref.ref(ext1)
+        del ext1
+
+        progress = job.advance()
+        assert not progress.done
+
+        # Caller loads another unrelated kernel between cooperative advances.
+        ext2 = cache("ext_between_advances")
+        ext2_ref = weakref.ref(ext2)
+        del ext2
+
+        if cancel:
+            # Advance until at least one job candidate is loaded, then load an external
+            # kernel right before calling job.close().
+            while not refs:
+                progress = job.advance()
+                assert not progress.done
+            ext3 = cache("ext_before_cancel")
+            ext3_ref = weakref.ref(ext3)
+            del ext3
+            job.close()
+            del job
+            gc.collect()
+            assert ext1_ref() is not None
+            assert ext2_ref() is not None
+            assert ext3_ref() is not None
+            # Programs loaded by the cancelled job itself were reclaimed.
+            for ref in refs.values():
+                assert ref() is None
+        else:
+            while not job.advance().done:
+                pass
+            del job
+            gc.collect()
+            assert ext1_ref() is not None
+            assert ext2_ref() is not None
+            assert refs["winner"]() is not None
+            assert refs["loser"]() is None
+
+    gc.collect()
+    assert ext1_ref() is not None
+    assert ext2_ref() is not None
+    if cancel:
+        assert ext3_ref() is not None
+    else:
+        assert refs["winner"]() is None

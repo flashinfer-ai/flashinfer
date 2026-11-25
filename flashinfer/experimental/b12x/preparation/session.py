@@ -14,6 +14,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -24,7 +25,6 @@ from b12x._lib.compile_plan import (
     observe_programs,
     program_keys,
     retain_compiled_programs,
-    retained_program_keys,
 )
 from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in_process
 from b12x._lib.program_cache import (
@@ -418,6 +418,7 @@ class PreparationSession:
         self._tuning_ranks = (0,)
         self._tuning_cache_synchronized = False
         self.state = "OPEN"
+        _ACTIVE_SESSIONS.add(self)
 
     def configure_compile_workers(self, workers: int | None = None) -> None:
         """Change compiler concurrency between preparation jobs."""
@@ -721,6 +722,24 @@ class PreparationSession:
         finally:
             _close_all((self._reclaim_programs,))
 
+    def _owned_programs(self):
+        owned = set(self._released_programs)
+        for plan in self._plans:
+            prepared = plan.prepared
+            if prepared is None:
+                continue
+            owned.update(prepared.programs)
+            if prepared.retained is not None:
+                for owner in prepared.retained.owners.values():
+                    owned.update(program_keys(owner))
+        if self._job is not None:
+            owned.update(self._job._job_introduced_programs)
+        return frozenset(owned)
+
+    def _record_external_programs(self, snapshot):
+        self._external_programs.intersection_update(snapshot)
+        self._external_programs.update(snapshot - _all_session_owned_programs())
+
     def _reclaim_programs(self):
         timing = PreparationTiming("cleanup", rank=self._tuning_rank)
         candidates = frozenset(self._released_programs) - self._external_programs
@@ -789,6 +808,7 @@ class PreparationSession:
                 _close_all((self._reclaim_programs,))
             finally:
                 self._external_programs.clear()
+                _ACTIVE_SESSIONS.discard(self)
 
     def __enter__(self):
         """Enter the session after validating the owning thread."""
@@ -820,14 +840,12 @@ class PreparationJob:
         self._benchmark_closers = []
         self._cache_hits = self._benchmarked = self._overlaps = 0
         self._all_programs = set()
-        # Programs already cached before this job belong to other owners, such
-        # as kernels compiled outside any plan or still referenced by captured
-        # CUDA graphs; this job only reclaims programs it introduces or replaces.
-        self._preexisting_programs = cached_program_keys()
-        session._external_programs.intersection_update(self._preexisting_programs)
-        session._external_programs.update(
-            self._preexisting_programs - retained_program_keys()
-        )
+        # Track only programs introduced during this job's advance() steps so
+        # kernels loaded outside preparation (before begin() or between
+        # cooperative advances) remain protected as external programs.
+        self._job_introduced_programs = set()
+        self._step_before_programs = None
+        session._record_external_programs(cached_program_keys())
         self._dependency_programs = {}
         self._coverage = {}
         self._benchmark_calls = {}
@@ -961,17 +979,31 @@ class PreparationJob:
                 f"collective barrier for {requirement.key!r} failed: {error}"
             ) from error
 
+    def _capture_step_introduced(self):
+        if self._step_before_programs is None:
+            return
+        now = cached_program_keys()
+        introduced = now - self._step_before_programs
+        if introduced:
+            self._job_introduced_programs.update(introduced)
+            self.session._external_programs.difference_update(introduced)
+        self._step_before_programs = now
+
     def advance(self, *, collective_key=None, tuning=None, cache=None):
         """Advance preparation until work completes or reaches a readiness boundary."""
         started = time.perf_counter()
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
+        self._step_before_programs = cached_program_keys()
+        self.session._record_external_programs(self._step_before_programs)
         try:
             with self._program_cache.activate():
                 return self._advance(
                     collective_key=collective_key, tuning=tuning, cache=cache
                 )
         finally:
+            self._capture_step_introduced()
+            self._step_before_programs = None
             if self._result is not None or self._closed:
                 self._program_cache.clear()
             self._timing.add("advance", time.perf_counter() - started)
@@ -1145,14 +1177,14 @@ class PreparationJob:
         try:
             _close_all(closers)
         finally:
+            self._capture_step_introduced()
+            self._step_before_programs = None
             self._program_cache.clear()
             if self._result is None:
                 from b12x._lib.compile_plan import evict_planning_artifacts
 
                 evict_planning_artifacts()
-                self.session._released_programs.update(
-                    cached_program_keys() - self._preexisting_programs
-                )
+                self.session._released_programs.update(self._job_introduced_programs)
                 _close_all((self.session._reclaim_programs,))
 
     def _choice_key(self, obligation, selections):
@@ -1516,7 +1548,7 @@ class PreparationJob:
             _plan_scope(request.plan),
             self.session._gpu_scope(),
             compilation,
-            retain_compiled_programs() as retained,
+            retain_compiled_programs(isolated=True) as retained,
             observe_programs() as used,
         ):
             # Prepared resources outlive the caller's profiling scope and must
@@ -2263,7 +2295,7 @@ class PreparationJob:
         if summary is not None:
             self._compilations = summary.cute_compilations + summary.triton_compilations
         from b12x._lib.compile_plan import evict_planning_artifacts
-        from b12x._lib.program_cache import cached_program_keys, evict_unretained
+        from b12x._lib.program_cache import evict_unretained
 
         keep = frozenset(
             program
@@ -2272,11 +2304,12 @@ class PreparationJob:
             for program in plan.prepared.programs
         )
         self.session._synchronize()
+        self._capture_step_introduced()
+        self._step_before_programs = None
         self._program_cache.clear()
         evict_planning_artifacts()
         candidates = (
-            (cached_program_keys() - self._preexisting_programs)
-            | self.session._released_programs
+            frozenset(self._job_introduced_programs) | self.session._released_programs
         ) - self.session._external_programs
         self.session._released_programs.clear()
         evict_unretained(keep, candidates=candidates)
@@ -2315,7 +2348,15 @@ class PreparationJob:
         return _expand_requests(self.requests)
 
 
+_ACTIVE_SESSIONS: weakref.WeakSet[PreparationSession] = weakref.WeakSet()
 _LAZY_SESSIONS: dict[object, PreparationSession] = {}
+
+
+def _all_session_owned_programs():
+    owned = set()
+    for active in tuple(_ACTIVE_SESSIONS):
+        owned.update(active._owned_programs() - active._external_programs)
+    return frozenset(owned)
 
 
 def prepare_default(request):
