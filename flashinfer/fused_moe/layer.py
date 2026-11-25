@@ -465,10 +465,9 @@ class MoELayer:
         winner_key = (bucket, mode, eligible, prims_modes)
         winner = self._winners.get(winner_key)
         inputs = None
-        if winner is not None and isinstance(winner[0], PrimsTsRunner):
-            runner, tactic = winner
-            inputs = runner.pack_inputs(act_pack, weight_pack)
-            if not runner.validate_tactic(inputs, tactic):
+        if winner is not None and isinstance(cached_runner := winner[0], PrimsTsRunner):
+            inputs = cached_runner.pack_inputs(act_pack, weight_pack)
+            if not cached_runner.validate_tactic(inputs, winner[1]):
                 winner = None
                 inputs = None
         if winner is None:
