@@ -190,7 +190,9 @@ void sm90_nvfp4_w4a16_moe_prefill_run(TensorView hidden_states, TensorView topk_
       << "topk_weights must be [num_tokens, 8]";
   TVM_FFI_ICHECK(out.size(0) == M && out.size(1) == kH);
   TVM_FFI_ICHECK_GE(recv.numel(), (int64_t)kTopKSlots * M * kH) << "recv must hold [8, M, hidden]";
-  TVM_FFI_ICHECK(chunk_tokens >= 128 && chunk_tokens % 128 == 0);
+  TVM_FFI_ICHECK(chunk_tokens >= 128 && chunk_tokens % 128 == 0 &&
+                 chunk_tokens <= pf::kMaxChunkTokens)
+      << "chunk_tokens must be a multiple of 128 in [128, " << pf::kMaxChunkTokens << "]";
   TVM_FFI_ICHECK(xt.size(1) == kH && xt.size(0) >= sm90_nvfp4_w4a16_moe_prefill_slots(chunk_tokens))
       << "xt must be [slots, hidden] with the rows the chunk needs";
   TVM_FFI_ICHECK_GE(maps.numel(), (int64_t)(kNumMaps * sizeof(pf::Tmap)))

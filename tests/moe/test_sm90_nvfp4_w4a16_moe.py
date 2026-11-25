@@ -505,6 +505,60 @@ def test_rejects_bad_inputs():
         run(packed, x, ids, w, post_norm_weight=torch.ones(H + 1, device="cuda"))
 
 
+def test_prefill_chunk_tokens_limit():
+    """A large-batch launch has up to chunk_tokens / 32 + 32 tiles of 256 rows,
+    and its per-tile counters hold 1024: past MAX_PREFILL_CHUNK_TOKENS the done
+    word of one tile would be the ready word of another. The workspace, the
+    wrapper and the launcher reject such chunks."""
+    from flashinfer.fused_moe.sm90_nvfp4_w4a16 import (
+        MAX_PREFILL_CHUNK_TOKENS,
+        _get_module,
+        _routing_inputs,
+    )
+
+    _, packed = checkpoint(SHAPES[5])
+    H, I, E, _ = SHAPES[5]
+    big = MAX_PREFILL_CHUNK_TOKENS + 128
+    ws = Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)
+    with pytest.raises(ValueError, match="chunk_tokens"):
+        ws.reserve_prefill(big)
+    assert ws.prefill_chunk_tokens == 0
+    x = torch.randn(4, H, device="cuda").bfloat16()
+    ids, w = routing(4, E, 1, "cuda")
+    with pytest.raises(ValueError, match="prefill_chunk_tokens"):
+        run(
+            packed,
+            x,
+            ids,
+            w,
+            workspace=ws,
+            prefill_min_tokens=1,
+            prefill_chunk_tokens=big,
+        )
+    # the launcher has the same bound: the largest chunk passes the chunk check and
+    # then fails on the (deliberately small) `xt`
+    module = _get_module(H, I, False)
+    ids8, w8 = _routing_inputs(ids, w)
+    i32 = dict(dtype=torch.int32, device="cuda")
+
+    def launch(chunk):
+        module.prefill_run(
+            x, ids8, w8, packed.w13, packed.w13_global_scale[0],
+            packed.w13_global_scale[1], packed.w2, packed.w2_global_scale,
+            torch.empty(4, device="cuda"), torch.empty_like(x),
+            torch.empty(8 * 4 * H, dtype=torch.bfloat16, device="cuda"),
+            torch.empty(128, H, dtype=torch.bfloat16, device="cuda"),
+            torch.empty(module.prefill_map_bytes(), dtype=torch.uint8, device="cuda"),
+            torch.empty(1 << 12, **i32), torch.empty(64, **i32),
+            torch.zeros(module.prefill_counter_words(), **i32), E, chunk, 1e-6, False,
+        )  # fmt: skip
+
+    with pytest.raises(Exception, match="chunk_tokens must be"):
+        launch(big)
+    with pytest.raises(Exception, match="xt must be"):
+        launch(MAX_PREFILL_CHUNK_TOKENS)
+
+
 def test_launcher_checks_expert_params():
     """Direct launcher calls reject global scales / norm weights of the wrong dtype
     or size and packed weights with fewer experts than ``num_experts``."""

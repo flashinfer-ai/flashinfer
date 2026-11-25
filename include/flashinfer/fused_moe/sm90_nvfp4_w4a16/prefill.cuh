@@ -65,6 +65,13 @@ constexpr int K_G1 = 0, K_G2 = 1, K_CNT = 2, K_CMB = 4, K_PLAN = 5, K_LIST = 7, 
 constexpr int MAXLAG = 16, MAXSEG = 2 * (NE + 1 + MAXLAG);
 // Rows of `xt` / `h` one launch may fill: chunk_tokens * 8 routes plus per-expert padding.
 constexpr int kSlotPad = 1152, kSlotSlack = 1088;
+// A launch takes at most 8 * chunk_tokens + (kSlotPad - kSlotSlack) routes, so it has at most
+// chunk_tokens / 32 + NE tiles of 256 rows. Up to this chunk size the per-tile done
+// (C_DONE + tile) and ready (C_READY + tile) words never meet.
+constexpr int kMaxChunkTokens = 32 * (C_READY - C_DONE - NE);
+static_assert((8 * kMaxChunkTokens + kSlotPad - kSlotSlack + 255 * NE) / 256 <= C_READY - C_DONE &&
+                  C_READY + (C_READY - C_DONE) <= C_TOT,
+              "tile counters of the largest chunk overlap");
 // item widths: 32 .. 256 step 32; 240 = an expert's last 256-wide tile with >= 16 padding rows
 constexpr int NW = 9;
 DEVI int widx(int n) { return n & 31 ? 8 : (n >> 5) - 1; }

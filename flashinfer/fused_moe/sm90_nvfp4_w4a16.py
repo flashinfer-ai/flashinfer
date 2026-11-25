@@ -73,6 +73,10 @@ DECODE_MAX_TOKENS = 1024
 #: Upper bound of the automatic switch to the large-batch kernel.
 DEFAULT_PREFILL_MIN_TOKENS = 2049
 DEFAULT_PREFILL_CHUNK_TOKENS = 8192
+#: Largest ``prefill_chunk_tokens``. A large-batch launch has up to
+#: chunk_tokens / 32 + 32 tiles of 256 rows; its per-tile counters hold 1024
+#: (``pf::kMaxChunkTokens`` in prefill.cuh).
+MAX_PREFILL_CHUNK_TOKENS = 31744
 
 # Automatic kernel choice (measured on H200 over 16 shapes, uniform and skewed
 # routing): the large-batch kernel is faster once each expert receives about 64
@@ -501,6 +505,14 @@ def _get_module(hidden_size: int, intermediate_size: int, post_norm: bool):
     ).build_and_load()
 
 
+def _check_chunk_tokens(chunk_tokens: int, name: str) -> None:
+    if not (0 < chunk_tokens <= MAX_PREFILL_CHUNK_TOKENS and chunk_tokens % 128 == 0):
+        raise ValueError(
+            f"{name} must be a multiple of 128 in [128, {MAX_PREFILL_CHUNK_TOKENS}], "
+            f"got {chunk_tokens}"
+        )
+
+
 class Sm90Nvfp4W4A16MoEWorkspace:
     """Persistent device state of :func:`sm90_nvfp4_w4a16_moe`.
 
@@ -554,14 +566,14 @@ class Sm90Nvfp4W4A16MoEWorkspace:
 
     def reserve_prefill(self, chunk_tokens: int = DEFAULT_PREFILL_CHUNK_TOKENS) -> None:
         """Allocate the large-batch buffers for chunks of ``chunk_tokens`` tokens
-        (``(8 * chunk_tokens + 1152) * (hidden + intermediate) * 2`` bytes).
+        (``(8 * chunk_tokens + 1152) * (hidden + intermediate) * 2`` bytes), a
+        multiple of 128 up to ``MAX_PREFILL_CHUNK_TOKENS``.
 
         Only grows: a smaller ``chunk_tokens`` keeps the current buffers. When a
         CUDA graph has captured the large-batch kernel with the current buffers,
         growing keeps them alive (the graph still uses them) next to the new
         ones."""
-        if chunk_tokens <= 0 or chunk_tokens % 128 != 0:
-            raise ValueError("chunk_tokens must be a positive multiple of 128")
+        _check_chunk_tokens(chunk_tokens, "chunk_tokens")
         if self.prefill_chunk_tokens >= chunk_tokens:
             return
         if torch.cuda.is_current_stream_capturing():
@@ -799,8 +811,7 @@ def _check_sm90_nvfp4_w4a16_moe(
     tensors += [t for t in (post_norm_weight, out) if t is not None]
     if any(t.device != hidden_states.device for t in tensors):
         raise ValueError("all tensors must be on the same device")
-    if prefill_chunk_tokens <= 0 or prefill_chunk_tokens % 128 != 0:
-        raise ValueError("prefill_chunk_tokens must be a positive multiple of 128")
+    _check_chunk_tokens(prefill_chunk_tokens, "prefill_chunk_tokens")
     if workspace is not None and (
         workspace.hidden_size,
         workspace.intermediate_size,
@@ -874,7 +885,8 @@ def sm90_nvfp4_w4a16_moe(
         :meth:`Sm90Nvfp4W4A16MoEWorkspace.reserve_prefill` before capture to
         capture the large-batch kernel).
     prefill_chunk_tokens : int
-        Tokens per large-batch launch (sizes the prefill workspace).
+        Tokens per large-batch launch (sizes the prefill workspace): a multiple
+        of 128, at most ``MAX_PREFILL_CHUNK_TOKENS`` (31744).
 
     Returns
     -------
