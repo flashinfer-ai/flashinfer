@@ -129,15 +129,33 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
     return removed
 
 
-def evict_unretained_triton(keep):
+def triton_cached_program_keys() -> frozenset[ProgramKey]:
+    keys = set()
+    for jit in tuple(_NATIVE_JITS):
+        for kernel_cache, *_ in jit.device_caches.values():
+            for kernel in tuple(kernel_cache.values()):
+                keys.update(
+                    set(program_keys(kernel)) - set(_planning_artifacts(kernel))
+                )
+    return frozenset(keys)
+
+
+def evict_unretained_triton(keep, *, evict=None):
     removed = 0
     for jit in tuple(_NATIVE_JITS):
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
-            obsolete = {
-                key
-                for key, kernel in kernel_cache.items()
-                if not frozenset(program_keys(kernel)) <= keep
-            }
+            if evict is None:
+                obsolete = {
+                    key
+                    for key, kernel in kernel_cache.items()
+                    if not frozenset(program_keys(kernel)) <= keep
+                }
+            else:
+                obsolete = {
+                    key
+                    for key, kernel in kernel_cache.items()
+                    if frozenset(program_keys(kernel)) & evict
+                }
             for key in obsolete:
                 del kernel_cache[key]
             for key, value in tuple(key_cache.items()):
@@ -572,6 +590,10 @@ def _ensure_triton_hook():
         module = getattr(self.fn, "__module__", "")
         if module == "b12x" or module.startswith("b12x."):
             _NATIVE_JITS.add(self)
+            if result is not None and not isinstance(result, DeferredTritonKernel):
+                for program in program_keys(result):
+                    if _RESIDENT_PROGRAMS.get(program) is not result:
+                        _RESIDENT_PROGRAMS[program] = result
         if result is not None and (
             _OBSERVERS.get() or planning() or _RETAINED_PROGRAMS.get() is not None
         ):

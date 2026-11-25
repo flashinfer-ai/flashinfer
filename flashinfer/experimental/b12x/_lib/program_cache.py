@@ -17,9 +17,11 @@ from enum import Enum
 from .compile_plan import (
     CompiledCuTeProgram,
     _RESIDENT_PROGRAMS,
+    _planning_artifacts,
     evict_unretained_triton,
     program_keys,
     retained_program_keys,
+    triton_cached_program_keys,
 )
 
 _CACHES = weakref.WeakSet()
@@ -151,34 +153,71 @@ class program_cache:
             self._values.clear()
             self._hits = self._misses = 0
 
-    def evict_unretained(self, keep):
+    def evict_unretained(self, keep, *, evict=None):
         with self._lock:
-            obsolete = [
-                key
-                for key, value in self._values.items()
-                if not frozenset(program_keys(value)) <= keep
-            ]
+            if evict is None:
+                obsolete = [
+                    key
+                    for key, value in self._values.items()
+                    if not frozenset(program_keys(value)) <= keep
+                ]
+            else:
+                obsolete = [
+                    key
+                    for key, value in self._values.items()
+                    if frozenset(program_keys(value)) & evict
+                ]
             for key in obsolete:
                 del self._values[key]
             return len(obsolete)
 
 
-def evict_unretained(keep):
-    keep = frozenset(keep) | retained_program_keys()
-    removed = sum(cache.evict_unretained(keep) for cache in tuple(_CACHES))
-    for cache, mirrors, lock in _MAPPING_CACHES:
+def cached_program_keys():
+    """Program identities currently resident or present in registered caches."""
+    keys = set(_RESIDENT_PROGRAMS)
+    for cache in tuple(_CACHES):
+        with cache._lock:
+            values = tuple(cache._values.values())
+        for value in values:
+            keys.update(set(program_keys(value)) - set(_planning_artifacts(value)))
+    for cache, _mirrors, lock in tuple(_MAPPING_CACHES):
         with lock if lock is not None else nullcontext():
-            obsolete = [
-                key
-                for key, value in cache.items()
-                if not frozenset(program_keys(value)) <= keep
-            ]
+            values = tuple(cache.values())
+        for value in values:
+            keys.update(set(program_keys(value)) - set(_planning_artifacts(value)))
+    keys.update(triton_cached_program_keys())
+    return frozenset(keys)
+
+
+def evict_unretained(keep, *, candidates=None):
+    keep = frozenset(keep) | retained_program_keys()
+    if candidates is None:
+        evict = None
+    else:
+        evict = frozenset(candidates) - keep
+        if not evict:
+            return 0
+    removed = sum(cache.evict_unretained(keep, evict=evict) for cache in tuple(_CACHES))
+    for cache, mirrors, lock in tuple(_MAPPING_CACHES):
+        with lock if lock is not None else nullcontext():
+            if evict is None:
+                obsolete = [
+                    key
+                    for key, value in cache.items()
+                    if not frozenset(program_keys(value)) <= keep
+                ]
+            else:
+                obsolete = [
+                    key
+                    for key, value in cache.items()
+                    if frozenset(program_keys(value)) & evict
+                ]
             for key in obsolete:
                 del cache[key]
                 for mirror in mirrors:
                     mirror.pop(key, None)
             removed += len(obsolete)
-    return removed + evict_unretained_triton(keep)
+    return removed + evict_unretained_triton(keep, evict=evict)
 
 
 def _check(result):

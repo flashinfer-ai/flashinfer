@@ -22,10 +22,16 @@ from pathlib import Path
 from b12x._lib.compile_plan import (
     compiled_program_available,
     observe_programs,
+    program_keys,
     retain_compiled_programs,
+    retained_program_keys,
 )
 from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in_process
-from b12x._lib.program_cache import PreparationProgramCache, evict_unretained
+from b12x._lib.program_cache import (
+    PreparationProgramCache,
+    cached_program_keys,
+    evict_unretained,
+)
 from b12x._lib.runtime_control import (
     KernelResolutionFrozenError,
     kernel_resolution_guard,
@@ -135,6 +141,9 @@ class _Trial:
         try:
             self.guard.finish()
         finally:
+            if self.retained is not None:
+                self.retained.owners.clear()
+                self.retained.cache.clear()
             self.call = self.state = self.retained = None
 
 
@@ -402,6 +411,8 @@ class PreparationSession:
         self._pending_collective_barrier = None
         self._plans = []
         self._shared = {}
+        self._external_programs = set()
+        self._released_programs = set()
         self._guard = None
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
@@ -662,10 +673,17 @@ class PreparationSession:
         if prepared.users or prepared.closed:
             return
         prepared.closed = True
+        self._released_programs.update(prepared.programs)
+        if prepared.retained is not None:
+            for owner in prepared.retained.owners.values():
+                self._released_programs.update(program_keys(owner))
         closers, prepared.closers = prepared.closers, ()
         try:
             _close_all(closers)
         finally:
+            if prepared.retained is not None:
+                prepared.retained.owners.clear()
+                prepared.retained.cache.clear()
             prepared.retained = None
             prepared.state = None
             prepared.owners = ()
@@ -705,6 +723,8 @@ class PreparationSession:
 
     def _reclaim_programs(self):
         timing = PreparationTiming("cleanup", rank=self._tuning_rank)
+        candidates = frozenset(self._released_programs) - self._external_programs
+        self._released_programs.clear()
         keep = frozenset(
             program
             for plan in self._plans
@@ -712,7 +732,7 @@ class PreparationSession:
             for program in plan.prepared.programs
         )
         with timing.span("program_reclamation"):
-            removed = evict_unretained(keep)
+            removed = evict_unretained(keep, candidates=candidates)
             gc.collect()
         timing.record("complete", evicted_entries=removed)
 
@@ -765,7 +785,10 @@ class PreparationSession:
         finally:
             self._plans.clear()
             self._shared.clear()
-            _close_all((self._reclaim_programs,))
+            try:
+                _close_all((self._reclaim_programs,))
+            finally:
+                self._external_programs.clear()
 
     def __enter__(self):
         """Enter the session after validating the owning thread."""
@@ -797,6 +820,14 @@ class PreparationJob:
         self._benchmark_closers = []
         self._cache_hits = self._benchmarked = self._overlaps = 0
         self._all_programs = set()
+        # Programs already cached before this job belong to other owners, such
+        # as kernels compiled outside any plan or still referenced by captured
+        # CUDA graphs; this job only reclaims programs it introduces or replaces.
+        self._preexisting_programs = cached_program_keys()
+        session._external_programs.intersection_update(self._preexisting_programs)
+        session._external_programs.update(
+            self._preexisting_programs - retained_program_keys()
+        )
         self._dependency_programs = {}
         self._coverage = {}
         self._benchmark_calls = {}
@@ -1116,6 +1147,12 @@ class PreparationJob:
         finally:
             self._program_cache.clear()
             if self._result is None:
+                from b12x._lib.compile_plan import evict_planning_artifacts
+
+                evict_planning_artifacts()
+                self.session._released_programs.update(
+                    cached_program_keys() - self._preexisting_programs
+                )
                 _close_all((self.session._reclaim_programs,))
 
     def _choice_key(self, obligation, selections):
@@ -1516,8 +1553,12 @@ class PreparationJob:
                 if synchronize:
                     self.session._synchronize()
             except _CandidateLaunchRejected:
+                retained.owners.clear()
+                retained.cache.clear()
                 raise
             except Exception as error:
+                retained.owners.clear()
+                retained.cache.clear()
                 message = (
                     f"{request.name} failed to prepare with configuration "
                     f"{selection.config!r} ({selection.source}): {error}"
@@ -1527,9 +1568,15 @@ class PreparationJob:
                 except Exception:
                     wrapped = RuntimeError(message)
                 raise wrapped from error
+            except BaseException:
+                retained.owners.clear()
+                retained.cache.clear()
+                raise
         if compile_directly:
             expected.update(used)
         if used - expected:
+            retained.owners.clear()
+            retained.cache.clear()
             raise RuntimeError(
                 f"preparation used undeclared programs for {request.name}"
             )
@@ -2215,7 +2262,8 @@ class PreparationJob:
         summary = yield from self.session._drain()
         if summary is not None:
             self._compilations = summary.cute_compilations + summary.triton_compilations
-        from b12x._lib.program_cache import evict_unretained
+        from b12x._lib.compile_plan import evict_planning_artifacts
+        from b12x._lib.program_cache import cached_program_keys, evict_unretained
 
         keep = frozenset(
             program
@@ -2225,7 +2273,13 @@ class PreparationJob:
         )
         self.session._synchronize()
         self._program_cache.clear()
-        evict_unretained(keep)
+        evict_planning_artifacts()
+        candidates = (
+            (cached_program_keys() - self._preexisting_programs)
+            | self.session._released_programs
+        ) - self.session._external_programs
+        self.session._released_programs.clear()
+        evict_unretained(keep, candidates=candidates)
         result = PreparationResult(
             plans=self._plans_by_name,
             coverage=self._coverage,
