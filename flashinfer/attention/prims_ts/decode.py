@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Union, cast
 import torch
 
 from ._compile_cache import build_and_load_attention_kernel
-from ._quant_output import (
+from .quant_output import (
     implied_quant_out_dtype,
     quant_output_format,
     prepare_out_scale,

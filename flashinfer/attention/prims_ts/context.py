@@ -45,7 +45,7 @@ import torch
 
 from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
-from ._quant_output import (
+from .quant_output import (
     implied_quant_out_dtype,
     prepare_out_scale,
     quant_output_format,
@@ -189,7 +189,7 @@ class _ContextPlanGeometry:
     # The plan's Sage recipe, part of the compile identity; ``None`` without
     # Sage attention.
     sage: SageAttentionConfig | None = None
-    # Block-scale dtype of a quantized output (``_quant_output.py``), or None.
+    # Block-scale dtype of a quantized output (``prims_ts/quant_output.py``), or None.
     out_scale_dtype: Optional[torch.dtype] = None
 
 
@@ -236,7 +236,7 @@ class _PagedContextPlanGeometry:
     has_q_offset: bool
     paged_v_tail_is_zero: bool
     packed_dense_k_mask: bool
-    # Block-scale dtype of a quantized output (``_quant_output.py``), or None.
+    # Block-scale dtype of a quantized output (``prims_ts/quant_output.py``), or None.
     out_scale_dtype: Optional[torch.dtype] = None
 
 

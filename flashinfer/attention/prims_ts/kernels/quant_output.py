@@ -17,7 +17,7 @@
 The output is quantized as the 2-D matrix ``[tokens, Hq * Dv]``: the format's
 data dtype with one scale per ``sf_vec_size`` consecutive channels of a token
 row. The formats are the ``QuantOutputFormat`` entries of
-``_quant_output.py``; kernel configs name them with cutlass dtypes, which
+``prims_ts/quant_output.py``; kernel configs name them with cutlass dtypes, which
 ``quant_output_format`` maps to that table.
 
 UE8M0 scales with E4M3 data (MXFP8) follow the following recipe: for a
@@ -48,8 +48,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 from cutlass.experimental import primitives as prims
 
-from .._quant_output import QuantOutputFormat
-from .._quant_output import quant_output_format as _quant_output_format_for_torch
+from ..quant_output import QuantOutputFormat
+from ..quant_output import quant_output_format as _quant_output_format_for_torch
 
 # Bytes of one 128-row by 4-column swizzled scale block.
 _SF_BLOCK_BYTES = 512

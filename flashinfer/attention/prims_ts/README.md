@@ -778,7 +778,7 @@ is `B * Sq`, `total_q`, or `B` for single-token decode.
 
 `uint8` scales hold the same UE8M0 bytes, as `mxfp8_quantize` returns and
 `mm_mxfp8` takes them; both spellings share compiled kernels. The formats are
-listed in `_quant_output.py` (host) and `kernels/quant_output.py` (device
+listed in `quant_output.py` (host) and `kernels/quant_output.py` (device
 recipes).
 
 MXFP8 follows trtllm-gen's `MxE4m3` FMHA output recipe, the OCP MX shared
