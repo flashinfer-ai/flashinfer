@@ -188,29 +188,82 @@ cast(Any, _mm_mxfp8_reference)._trace_reference_dependencies = (
 )
 
 
-def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
-    """Dequantize FP4 inputs and compute C = A @ B."""
+def _unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """Decode [rows, cols] uint8 or float4_e2m1fn_x2, two E2M1 codes per byte
+    (low nibble first), to float32 [rows, 2 * cols]."""
+    # Same values as _E2M1_VALUES in this module. This function is copied into
+    # the trace JSON, which must run without the module, so the table is local.
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.float32,
+        device=packed.device,
+    )  # fmt: skip
+    # float4_e2m1fn_x2 cannot be cast to an integer type, only viewed as bytes.
+    codes = packed.view(torch.uint8).to(torch.int64)
+    codes = torch.stack([codes & 0xF, (codes >> 4) & 0xF], dim=-1)
+    return lut[codes].reshape(packed.shape[0], -1)
 
-    def _unpack_fp4(packed, rows, cols):
-        lo = (packed & 0x0F).to(torch.float32)
-        hi = ((packed >> 4) & 0x0F).to(torch.float32)
-        out = torch.stack([lo, hi], dim=-1).reshape(rows, cols)
-        return out
 
-    M, K_packed = A.shape
-    K = K_packed * 2
-    _, N_packed = B.shape
-    N = N_packed * 2
+def _mm_fp4_reference(A, B, a_descale, b_descale, alpha=None, block_size=16):
+    """Dequantize FP4 inputs and compute C = A @ B, times alpha when given.
 
-    A_fp32 = _unpack_fp4(A, M, K)
-    B_fp32 = _unpack_fp4(B, K, N)
+    A is [M, K//2] and B is [K//2, N], E2M1 codes packed two per byte along
+    K; B is the transposed view of the [N, K//2] weight. a_descale is the
+    128x4-swizzled scale buffer of the [M, K//block_size] grid; b_descale is
+    the transposed view of the buffer of the [N, K//block_size] grid.
+    Scales are E4M3 for block_size 16 (NVFP4) and UE8M0 for 32 (MXFP4).
+    The 8x4 scale layout (``mm_fp4(..., use_8x4_sf_layout=True)``) is not
+    supported, and such a buffer is not detected: it would be misread.
+    The output is multiplied by ``alpha`` (the NVFP4 global scale) when given.
+    ``alpha`` must hold one value. A per-token ``alpha``, which ``mm_fp4``
+    accepts, raises ValueError.
+    """
+    M = A.shape[0]
+    K = A.shape[1] * 2
+    N = B.shape[1]
+    if block_size not in (16, 32):
+        raise ValueError(f"block_size must be 16 or 32, got {block_size}")
+    if K % block_size:
+        raise ValueError(f"K = {K} is not a multiple of block_size = {block_size}")
 
-    # Apply per-block scales.
-    a_scale = a_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [M, K]
-    b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [K, N]
-    A_scaled = A_fp32 * a_scale
-    B_scaled = B_fp32 * b_scale
-    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)
+    def _block_scales(buf, rows):
+        # mm_fp4 takes the scales as uint8 or float8_e4m3fn for either block size and
+        # reads the bytes as UE8M0 (block_size 32) or E4M3 (16). A buffer of another
+        # dtype would be misread, so it is refused.
+        if buf.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise ValueError(
+                f"scales must be uint8 or float8_e4m3fn bytes, got {buf.dtype}"
+            )
+        sf = _unswizzle_sf_128x4(
+            buf.contiguous().view(torch.uint8), rows, K // block_size
+        )
+        if block_size == 32:
+            sf = _e8m0_to_float(sf)
+        else:
+            sf = sf.contiguous().view(torch.float8_e4m3fn).to(torch.float32)
+        return sf.repeat_interleave(block_size, dim=1)
+
+    b_buf = b_descale.T  # b_descale is the transposed view of B's scale buffer
+    A_scaled = _unpack_e2m1(A) * _block_scales(a_descale, M)  # [M, K]
+    W_scaled = _unpack_e2m1(B.T) * _block_scales(b_buf, N)  # [N, K]
+    out = torch.matmul(A_scaled, W_scaled.T)
+    if alpha is not None:
+        if alpha.numel() != 1:
+            raise ValueError(
+                f"this template takes one global alpha; got {alpha.numel()} values "
+                "(per-token alpha is not covered)"
+            )
+        out = out * alpha.float()
+    return out.to(torch.bfloat16)
+
+
+cast(Any, _mm_fp4_reference)._trace_reference_dependencies = (
+    _unpack_e2m1,
+    _e8m0_to_float,
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
 
 
 def _mm_bf16_init(
@@ -409,8 +462,10 @@ def _mm_fp4_init(
     N: int = 2048,
     K: int = 7168,
     block_size: int = 16,
-    K_div_block_size: int = 0,  # derived
-    N_div_block_size: int = 0,  # derived
+    K_div_2: int = 0,  # derived
+    M_padded: int = 0,  # derived
+    N_padded: int = 0,  # derived
+    K_div_block_size_padded: int = 0,  # derived
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -421,7 +476,7 @@ def _mm_fp4_init(
     ``flashinfer.nvfp4_quantize`` with ``global_sf = (448 * 6) / amax``.
     Requires SM100+ at runtime; CPU smoke tests skip.
     """
-    del K_div_block_size, N_div_block_size
+    del K_div_2, M_padded, N_padded, K_div_block_size_padded
     from flashinfer import nvfp4_quantize  # noqa: PLC0415
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
@@ -447,6 +502,7 @@ def _mm_fp4_init(
         "b": mat2_fp4.T.contiguous(),
         "a_descale": a_descale,
         "b_descale": mat2_descale.T.contiguous(),
+        "alpha": 1.0 / (global_sf_input * global_sf_mat2),
         "block_size": int(block_size),
     }
 
@@ -454,35 +510,65 @@ def _mm_fp4_init(
 mm_fp4_trace = TraceTemplate(
     op_type="gemm_fp4",
     description=(
-        "FP4 GEMM C = A @ B. "
+        "FP4 GEMM C = (A @ B) * alpha. "
         "A and B are fp4 (e2m1fn_x2 packed as uint8); scale tensors use block_size."
     ),
     axes={
         "M": Var(),
         "N": Const(),
-        "K": Const(),
+        # A is packed two codes per byte, so K is twice its last dimension.
+        "K": Const(extract=lambda kw: int(kw["a"].shape[-1]) * 2),
+        # Derived axes. abbrev="" keeps the Const ones out of the definition name.
+        "K_div_2": Const(abbrev="", description="K // 2 (FP4 packed dim)."),
+        "M_padded": Var(description="M rounded up to 128 (scale buffer rows)."),
+        "N_padded": Const(
+            abbrev="",
+            description="N rounded up to 128 (rows of B's scale buffer; columns of "
+            "the transposed b_descale).",
+        ),
+        "K_div_block_size_padded": Const(
+            abbrev="",
+            description="K // block_size rounded up to 4 (scale buffer columns).",
+        ),
         "block_size": Const(
             description="FP4 quantization block size (16 for nvfp4, 32 for mxfp4)."
         ),
     },
     inputs={
         "A": Tensor(
-            ["M", "K"],
+            ["M", "K_div_2"],
             param="a",
-            description="Input A tensor, fp4 e2m1fn_x2 packed as uint8.",
+            description="Input A tensor, fp4 e2m1fn_x2 packed as uint8, [M, K//2].",
         ),
         "B": Tensor(
-            ["K", "N"],
+            ["K_div_2", "N"],
             param="b",
-            description="Input B tensor, fp4 e2m1fn_x2 packed as uint8, column-major.",
+            description=(
+                "Input B tensor, fp4 e2m1fn_x2 packed as uint8, [K//2, N]: "
+                "the transposed view of the [N, K//2] weight."
+            ),
         ),
         "a_descale": Tensor(
-            ["M", "K_div_block_size"],
-            description="Block scale for A, shape [M, K//block_size], float8_e4m3fn or uint8.",
+            ["M_padded", "K_div_block_size_padded"],
+            description=(
+                "Block scale for A: the 128x4-swizzled buffer of the "
+                "[M, K//block_size] grid, rows padded to 128 and columns to 4. "
+                "E4M3 bytes for nvfp4 (float8_e4m3fn or uint8), UE8M0 uint8 for mxfp4."
+            ),
         ),
         "b_descale": Tensor(
-            ["K", "N_div_block_size"],
-            description="Block scale for B, shape [K, N//block_size], float8_e4m3fn or uint8.",
+            ["K_div_block_size_padded", "N_padded"],
+            description=(
+                "Block scale for B: the transposed view of the 128x4-swizzled "
+                "buffer of the [N, K//block_size] grid. "
+                "E4M3 bytes for nvfp4 (float8_e4m3fn or uint8), UE8M0 uint8 for mxfp4."
+            ),
+        ),
+        "alpha": Tensor(
+            ["1"],
+            dtype="float32",
+            optional=True,
+            description="Optional global scale, float32, shape (1,).",
         ),
         "block_size": Scalar(
             "int32",
@@ -492,6 +578,12 @@ mm_fp4_trace = TraceTemplate(
     outputs={
         "C": Tensor(["M", "N"], dtype="bfloat16"),
     },
+    constraints=[
+        "K == K_div_2 * 2",
+        "M_padded == (M + 127) // 128 * 128",
+        "N_padded == (N + 127) // 128 * 128",
+        "K_div_block_size_padded == (K // block_size + 3) // 4 * 4",
+    ],
     tags=["status:verified", "quantization:fp4"],
     reference=_mm_fp4_reference,
     check=_fp4_gemm_check,
