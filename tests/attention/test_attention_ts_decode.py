@@ -7355,24 +7355,51 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
         _get_compiled_decode.cache_clear()
 
 
+_FP8_KEY = "float8_e4m3fn"
+_NVFP4_KEY = "float4_e2m1fn"
+
+
 @pytest.mark.parametrize(
-    ("packed_query", "runtime_q_lengths", "seq_len_q", "batch_size", "expect_fixed"),
+    (
+        "kv_dtype_key",
+        "packed_query",
+        "runtime_q_lengths",
+        "seq_len_q",
+        "batch_size",
+        "expect_fixed",
+    ),
     (
         # Complete grouped Q tiles drop the inactive-row score mask.
-        (False, False, 4, 16, True),
+        (_FP8_KEY, False, False, 4, 16, True),
         # Packed Q keeps one kernel across lengths.
-        (True, True, 4, 16, False),
+        (_FP8_KEY, True, True, 4, 16, False),
         # A partial final token band still needs the mask: no gain, keep reuse.
-        (False, False, 3, 16, False),
+        (_FP8_KEY, False, False, 3, 16, False),
         # One-request tiles are already full without the exact length.
-        (False, False, 4, 1, False),
+        (_FP8_KEY, False, False, 4, 1, False),
         # Callers that do not opt in (prepared sparse plans) are unchanged.
-        (False, True, 4, 16, False),
+        (_FP8_KEY, False, True, 4, 16, False),
+        # Guarded FP8 Keeps and NVFP4 Swaps already drop the mask once the
+        # launch binds uniform Q offsets, so the exact length buys nothing.
+        (_FP8_KEY, False, False, 8, 16, False),
+        (_NVFP4_KEY, False, False, 6, 16, False),
+        # Unguarded NVFP4 Keeps gains; its standalone reducer stays shared.
+        (_NVFP4_KEY, False, False, 8, 16, True),
     ),
-    ids=("fixed-q4", "packed-q4", "fixed-q3", "fixed-q4-b1", "default-runtime-q"),
+    ids=(
+        "fixed-q4",
+        "packed-q4",
+        "fixed-q3",
+        "fixed-q4-b1",
+        "default-runtime-q",
+        "guarded-fp8-keeps-q8",
+        "guarded-nvfp4-swaps-q6",
+        "nvfp4-keeps-q8",
+    ),
 )
 def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
     monkeypatch: pytest.MonkeyPatch,
+    kv_dtype_key: str,
     packed_query: bool,
     runtime_q_lengths: bool,
     seq_len_q: int,
@@ -7384,6 +7411,8 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
 
     from contextlib import nullcontext
 
+    from flashinfer.attention.prims_ts.decode import _decode_reducer_compile_spec
+
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(
         fmha_decode_config,
@@ -7391,7 +7420,7 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
         lambda cluster_size: 152 // cluster_size,
     )
 
-    def compile_items(seq_len_q: int) -> dict[str, object]:
+    def compile_spec_for(runtime_q_lengths: bool):
         spec = _resolve_decode_launch_spec(
             0,
             batch_size,
@@ -7401,9 +7430,9 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
             32,
             1024 if batch_size == 1 else 4096,
             seq_len_q,
-            "float8_e4m3fn",
-            "float8_e4m3fn",
-            "float8_e4m3fn",
+            _FP8_KEY,
+            kv_dtype_key,
+            kv_dtype_key,
             "bfloat16",
             "HND",
             "causal",
@@ -7417,27 +7446,42 @@ def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
             num_kv_heads=4,
             head_dim=128,
             page_size=32,
-            q_dtype_key="float8_e4m3fn",
-            k_dtype_key="float8_e4m3fn",
-            v_dtype_key="float8_e4m3fn",
+            q_dtype_key=_FP8_KEY,
+            k_dtype_key=kv_dtype_key,
+            v_dtype_key=kv_dtype_key,
             out_dtype_key="bfloat16",
             packed_query=packed_query,
             runtime_q_lengths=runtime_q_lengths,
         )
         assert compile_spec.packed_query == packed_query
-        return dict(compile_spec.config_items)
+        return compile_spec
 
     # Planner results are cached per process; keep mocked hardware out of them.
     _resolve_decode_launch_spec.cache_clear()
     try:
-        items = compile_items(seq_len_q)
+        compile_spec = compile_spec_for(runtime_q_lengths)
+        runtime_spec = compile_spec_for(True)
     finally:
         _resolve_decode_launch_spec.cache_clear()
+    items = dict(compile_spec.config_items)
     assert items["fixed_seqlen_q"] is expect_fixed
     assert ("max_seq_len_q" in items) is expect_fixed
     if expect_fixed:
         assert items["max_seq_len_q"] == seq_len_q
-        assert not FmhaDecodeConfig(**items).q_score_rows_need_mask
+        launched = replace(FmhaDecodeConfig(**items), uniform_query_offsets=True)
+        assert not launched.q_score_rows_need_mask
+        assert compile_spec != runtime_spec
+        if kv_dtype_key == _NVFP4_KEY:
+            # This profile launches the standalone reducer, so sharing it
+            # across Q lengths saves a JIT build per Q length.
+            assert FmhaDecodeConfig(**items).use_separate_reduction_kernel
+    else:
+        assert compile_spec == runtime_spec
+    # The standalone reducer reads Q through runtime offsets, so every Q-length
+    # specialization of the main kernel shares the runtime-Q reducer.
+    assert _decode_reducer_compile_spec(compile_spec) == _decode_reducer_compile_spec(
+        runtime_spec
+    )
 
 
 @pytest.mark.parametrize(

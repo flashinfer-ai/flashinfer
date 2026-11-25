@@ -1617,18 +1617,32 @@ def _make_decode_compile_spec(
 
     if launch_spec.config.fixed_seqlen:
         raise ValueError("cached TS decode compiles runtime sequence lengths only")
+    packed_query = (
+        launch_spec.config.use_variable_seqlens_q
+        if packed_query is None
+        else packed_query
+    ) or direct_q1_spec is not None
     signature_items = launch_spec.config.compile_signature()
     if not runtime_q_lengths:
         # Keying on the exact Q length forfeits kernel reuse across Q lengths,
         # so take it only when complete Q tiles then drop the inactive-row
         # score mask; otherwise the runtime-length kernel is identical work.
+        # Evaluate both kernels in the Q-offset mode the launch binds: the
+        # launcher sets uniform_query_offsets for fixed-Q inputs, which already
+        # lets guarded NVFP4 Swaps and FP8 Keeps profiles drop the mask.
         exact_items = replace(
             launch_spec.config, fixed_seqlen_q=True
         ).compile_signature()
         config_type = type(launch_spec.config)
+
+        def launched(items: tuple[tuple[str, object], ...]) -> "FmhaDecodeConfig":
+            return replace(
+                config_type(**dict(items)), uniform_query_offsets=not packed_query
+            )
+
         if (
-            config_type(**dict(signature_items)).q_score_rows_need_mask
-            and not config_type(**dict(exact_items)).q_score_rows_need_mask
+            launched(signature_items).q_score_rows_need_mask
+            and not launched(exact_items).q_score_rows_need_mask
         ):
             signature_items = exact_items
     config_items = dict(signature_items)
@@ -1663,18 +1677,34 @@ def _make_decode_compile_spec(
         k_dtype_key=k_dtype_key,
         v_dtype_key=v_dtype_key,
         out_dtype_key=out_dtype_key,
-        packed_query=(
-            launch_spec.config.use_variable_seqlens_q
-            if packed_query is None
-            else packed_query
-        )
-        or direct_q1_spec is not None,
+        packed_query=packed_query,
         max_active_clusters=launch_spec.max_active_clusters,
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,
         direct_q1_spec=direct_q1_spec,
         runtime_kv_lengths=runtime_kv_lengths,
         scale_types=scale_types,
+    )
+
+
+def _decode_reducer_compile_spec(
+    compile_spec: _DecodeCompileSpec,
+) -> _DecodeCompileSpec:
+    """Return the standalone reducer's compile identity.
+
+    The reducer reads every request's Q rows through runtime offsets and only
+    specializes on the Q length under ``fixed_seqlen``, so an exact-Q main
+    kernel shares the runtime-Q reducer across Q lengths. Scales never reach
+    the reducer.
+    """
+    items = dict(compile_spec.config_items)
+    if items.get("fixed_seqlen_q"):
+        items["fixed_seqlen_q"] = False
+        del items["max_seq_len_q"]
+    return replace(
+        compile_spec,
+        config_items=tuple(items.items()),
+        scale_types=(False, False),
     )
 
 
@@ -2192,10 +2222,12 @@ def _get_compiled_decode(
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
             assert reduction_tensor_adapter is not None
+            reducer_spec = _decode_reducer_compile_spec(compile_spec)
+            reducer_cfg = FmhaDecodeConfig(**dict(reducer_spec.config_items))
             compiled_reducer = build_and_load_attention_kernel(
                 "decode",
                 "reducer",
-                replace(compile_spec, scale_types=(False, False)),
+                reducer_spec,
                 _COMPILE_OPTIONS,
                 lambda: cute.compile(
                     reduction_tensor_adapter,
@@ -2211,7 +2243,7 @@ def _get_compiled_decode(
                     direct_q1_fake,
                     Int32(0),
                     stream_fake,
-                    cfg,
+                    reducer_cfg,
                     num_qo_heads,
                     num_kv_heads,
                     head_dim,
