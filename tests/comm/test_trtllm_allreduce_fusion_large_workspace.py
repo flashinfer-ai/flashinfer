@@ -62,23 +62,22 @@ def _run_ranks(worker) -> None:
         ]
         for proc in procs:
             proc.start()
-        port_in_use = False
-        while any(proc.is_alive() for proc in procs) and not port_in_use:
-            port_in_use = any(p.exitcode == PORT_IN_USE_EXIT_CODE for p in procs)
+        # A rank that exits early leaves its peers in the unbounded Lamport
+        # wait (or waiting on the store), so stop them instead of joining.
+        while any(p.is_alive() for p in procs) and all(
+            p.exitcode in (None, 0) for p in procs
+        ):
             time.sleep(0.2)
-        port_in_use = port_in_use or any(
-            p.exitcode == PORT_IN_USE_EXIT_CODE for p in procs
-        )
-        if not port_in_use:
-            break
-        # The other ranks are still waiting to connect to the store.
+        failed = any(p.exitcode not in (None, 0) for p in procs)
+        port_in_use = any(p.exitcode == PORT_IN_USE_EXIT_CODE for p in procs)
         for proc in procs:
-            if proc.is_alive():
+            if failed and proc.is_alive():
                 proc.kill()
             proc.join()
-    for rank, proc in enumerate(procs):
-        proc.join()
-        assert proc.exitcode == 0, f"rank {rank} failed with exit code {proc.exitcode}"
+        if not port_in_use:
+            break
+    exit_codes = [proc.exitcode for proc in procs]
+    assert all(code == 0 for code in exit_codes), f"rank exit codes: {exit_codes}"
 
 
 def _worker(rank: int, port: int) -> None:
