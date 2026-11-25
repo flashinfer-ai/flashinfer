@@ -5,8 +5,9 @@ import pytest
 import torch
 
 from flashinfer import mm_fp4
-from flashinfer.utils import get_compute_capability
+from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _blockscaled_gemm_cache_key_files
 from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm107
+from flashinfer.utils import get_compute_capability
 
 
 def _is_sm107() -> bool:
@@ -31,9 +32,24 @@ def test_sm107_kernel_alpha_preserves_fp32():
         )
 
 
+def test_sm107_in_cache_key_files():
+    """Verify dense_blockscaled_gemm_sm107 is registered in cache invalidation files."""
+    cache_files = _blockscaled_gemm_cache_key_files()
+    assert dense_blockscaled_gemm_sm107.__file__ in cache_files
+
+
 @pytest.mark.skipif(not _is_sm107(), reason="Requires an SM107 GPU")
-@pytest.mark.parametrize("res_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("alpha_val", [2.0**-16, 2.0**-26, 68000.0])
+@pytest.mark.parametrize(
+    "res_dtype,alpha_val",
+    [
+        (torch.float16, 2.0**-16),
+        (torch.float16, 2.0**-26),
+        (torch.float16, 2000.0),  # Fits in FP16 (< 65504)
+        (torch.bfloat16, 2.0**-16),
+        (torch.bfloat16, 2.0**-26),
+        (torch.bfloat16, 68000.0),  # Valid in BF16 (max ~3.4e38), would overflow FP16
+    ],
+)
 def test_mm_fp4_sm107_alpha_extreme_values(res_dtype, alpha_val):
     """Verify that extreme alpha scaling factors do not underflow or overflow in SM107 epilogue."""
     m, n, k = 128, 256, 256
@@ -42,7 +58,6 @@ def test_mm_fp4_sm107_alpha_extreme_values(res_dtype, alpha_val):
     a = torch.randn((m, k), device="cuda", dtype=torch.float32)
     b = torch.randn((n, k), device="cuda", dtype=torch.float32)
 
-    # Convert to FP4 dummy representation or test through mm_fp4
     from flashinfer import SfLayout, nvfp4_quantize
 
     a_global_sf = torch.tensor(1.0, device="cuda", dtype=torch.float32)
@@ -62,7 +77,7 @@ def test_mm_fp4_sm107_alpha_extreme_values(res_dtype, alpha_val):
         a_sf,
         b_sf.T,
         alpha=alpha_val,
-        res_dtype=res_dtype,
+        out_dtype=res_dtype,
         out=res,
         block_size=16,
         use_8x4_sf_layout=False,
@@ -72,3 +87,10 @@ def test_mm_fp4_sm107_alpha_extreme_values(res_dtype, alpha_val):
 
     assert torch.isfinite(res).all(), f"Found non-finite values in output with alpha={alpha_val}"
     assert not (res == 0).all(), f"Output underflowed to all zeros with alpha={alpha_val}"
+
+    # Verify numerical alignment against scaled reference
+    ref = (torch.mm(a, b.T) * alpha_val).to(res_dtype)
+    cos_sim = torch.nn.functional.cosine_similarity(
+        res.float().reshape(-1), ref.float().reshape(-1), dim=0
+    )
+    assert cos_sim > 0.90, f"Low cosine similarity ({cos_sim.item()}) against reference"
