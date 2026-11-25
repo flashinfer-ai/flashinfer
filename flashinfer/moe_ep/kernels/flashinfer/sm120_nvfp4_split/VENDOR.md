@@ -2,7 +2,7 @@
 
 The raw source under `moe_sm120_nvfp4_split/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
-`7ce815e` (on top of `b2fd4cac1d28d6a9be0cdfaf303ccd072ce21f54`). The FlashInfer
+`db07ca3` (on top of `b2fd4cac1d28d6a9be0cdfaf303ccd072ce21f54`). The FlashInfer
 delivery uses ABI `2814542011118` (standalone source ABI `281454205`).
 This revision includes continuous decode policies, M128 workers, utility
 defaults, DATA TMA eviction hints and the NCCL memory/transport runtime.
@@ -187,7 +187,7 @@ Packed FP4 weight interleave uses byte views so it is bit-preserving on PyTorch
 versions without native FP4 `copy_` support. CuTe DLPack conversion uses the
 vendored low-precision wrapper where Torch does not export FP4/FP8 DLPack.
 
-Drop `7ce815e` (local, not yet committed) adds the one-host decode front path
+Drop `7ce815e` adds the one-host decode front path
 (push dispatch into same-NUMA peers' local shadows, t=0 FC1 weight L2 prefetch,
 fused replay reset, fenced K1 ready publish), the packed p2p_split cross
 dispatch at EP16 from 64 tokens per rank, the device-independent cross-NUMA
@@ -207,3 +207,9 @@ available on CUDA 13.0 drivers: FlashInfer's `NativeGreenContextResources`
 builds the four partitions there from equal SM units
 (`cuDevSmResourceSplitByCount`), so the standalone CUDA 13.1 requirement does
 not apply (`MEGAMOE_HYBRID_SM_SPLIT=0|1` still forces the answer).
+
+Drop `db07ca3` changes only `tuned_table.json`: three of the `7ce815e` retuned
+decode anchors were slower on power-law routes (the retune scored balanced
+routes only) and are back at their `29f8a02` values: DSv4.1 EP8 T64 (K1 N64),
+DSv4.1 EP16 T32 (K1 N32) and GLM5.3 EP16 T256 (K1 3 stages). Kernel sources and
+the cache ABI are unchanged.

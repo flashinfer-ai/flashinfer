@@ -39,21 +39,13 @@
      "tokens": 32,
      "knobs": {
       "backend": "p2p_split",
+      "k1_n": 32,
       "k2_n": 64,
-      "fc1_utility_postprocess": "on",
-      "weight_prefetch_ahead": 4,
-      "xnuma_fsplit": 4,
-      "k1_n": 16,
-      "k2_warps": 8
+      "weight_prefetch_ahead": 4
      },
-     "p50_us": 700.9,
-     "default_us": 783.8,
-     "confirm": {
-      "best_us": 725.3,
-      "default_us": 790.0,
-      "seed": 6197
-     },
-     "note": "retuned 2026-11-25 on the ported decode transport"
+     "p50_us": 743.8,
+     "default_us": 786.6,
+     "note": "2026-11-25 retune (K1 N16) kept off: -4.7% balanced but +15.2% power-law"
     },
     {
      "tokens": 64,
@@ -309,20 +301,14 @@
      "tokens": 64,
      "knobs": {
       "backend": "p2p_split",
+      "k1_n": 64,
       "k2_n": 64,
       "weight_prefetch_ahead": 4,
-      "xnuma_fsplit": 4,
-      "k1_n": 16,
-      "push_dispatch": "off"
+      "xnuma_fsplit": 4
      },
-     "p50_us": 1066.0,
-     "default_us": 1204.1,
-     "confirm": {
-      "best_us": 1063.5,
-      "default_us": 1201.2,
-      "seed": 6197
-     },
-     "note": "retuned 2026-11-25 on the ported decode transport"
+     "p50_us": 1309.7,
+     "default_us": 1351.8,
+     "note": "2026-11-25 retune (K1 N16) kept off: -6.6% balanced but +18.1% power-law and slower end to end"
     },
     {
      "tokens": 128,
@@ -542,24 +528,17 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "k1_stages": 4,
+      "k1_stages": 3,
       "sms": [
        72,
        0,
        0,
        38
-      ],
-      "weight_prefetch_ahead": 4,
-      "k2_stages": 2
+      ]
      },
-     "p50_us": 882.5,
-     "default_us": 983.6,
-     "confirm": {
-      "best_us": 882.6,
-      "default_us": 983.0,
-      "seed": 6197
-     },
-     "note": "retuned 2026-11-25 on the ported decode transport"
+     "p50_us": 984.1,
+     "default_us": 1064.5,
+     "note": "2026-11-25 retune (K1 4 stages) kept off: -2.8% balanced but +3.8% power-law"
     }
    ]
   },
