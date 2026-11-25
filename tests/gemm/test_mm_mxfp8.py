@@ -15,7 +15,7 @@ from flashinfer import (
 from flashinfer import utils
 from flashinfer.autotuner import AutoTuner, TunableRunner
 from flashinfer.fp8_quantization import mxfp8_quantize
-from flashinfer.gemm import gemm_base, gemm_mm_mxfp8_cute_dsl
+from flashinfer.gemm import gemm_base, gemm_mm_fp4_cute_dsl, gemm_mm_mxfp8_cute_dsl
 from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 from flashinfer.utils import get_compute_capability
 
@@ -396,6 +396,50 @@ def test_mm_mxfp8_b12x_short_k_multi_wave(m, n, k):
             auto_tuning=False,
             provide_out=True,
         )
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "b12x"])
+def test_mm_mxfp8_in_cuda_graph_with_empty_alpha_cache(backend, monkeypatch):
+    # These runners always pass alpha=None to _prepare_alpha_for_launch in
+    # gemm_mm_fp4_cute_dsl.
+    # Captured before the cached 1.0 exists, the captures must leave the cache
+    # empty, and both graphs must match the eager reference when replayed in
+    # reverse order.
+    _skip_if_unsupported(backend)
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("the cute-dsl backend requires nvidia-cutlass-dsl")
+    m, n, k = 128, 256, 256
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_q, b_q, a_s, b_s = _prepare_mxfp8_tensors(
+        a, b, SfLayout.layout_128x4, SfLayout.layout_128x4, backend
+    )
+
+    def run(out):
+        mm_mxfp8(
+            a_q, b_q.T, a_s, b_s, out=out, out_dtype=torch.bfloat16, backend=backend
+        )
+
+    # Running the reference eagerly also compiles the kernel, which cannot
+    # happen during capture.
+    ref = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    run(ref)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    outs, graphs = [], []
+    for _ in range(2):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(out)
+        outs.append(out)
+        graphs.append(graph)
+    assert not gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize()
+    assert torch.equal(outs[1], ref) and torch.equal(outs[0], ref)
 
 
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 64])

@@ -119,5 +119,38 @@ def test_mm_fp8_trtllm_low_latency_rejects_unprocessed_weight():
         mm_fp8(a, b, backend="trtllm_low_latency")
 
 
+def test_mm_fp8_without_alpha_in_cuda_graph(monkeypatch: pytest.MonkeyPatch):
+    # mm_fp8 passes the shared 1.0 as both scales of its cublas, cudnn and
+    # cutlass runners when alpha is None; this test runs the cublas one.
+    # Captured with an empty cache, the graph and later eager calls must
+    # match the eager reference, and the shared 1.0 must still hold 1.0.
+    if get_compute_capability(torch.device("cuda"))[0] not in (10, 12):
+        pytest.skip("this mm_fp8 test runs on SM10x and SM12x only")
+    backend = "cublas"
+    from flashinfer.gemm import gemm_base, gemm_mm_fp4_cute_dsl
+
+    # b is the contiguous (n, k) weight mm_fp8 takes; n != k so a swapped layout would fail.
+    a = torch.randn(128, 256, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(384, 256, device="cuda").to(torch.float8_e4m3fn)
+    from flashinfer.utils import BackendSupportedError, LibraryError
+
+    try:
+        ref = mm_fp8(a, b, backend=backend)
+    except (BackendSupportedError, LibraryError) as exc:
+        pytest.skip(f"mm_fp8 {backend} is not available here: {exc}")
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mm_fp8(a, b, backend=backend)
+    assert gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE == {}
+    eager = mm_fp8(a, b, backend=backend)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(eager, ref)
+    assert torch.equal(captured, ref)
+    assert gemm_base._fp8_unit_scale(a.device).item() == 1.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

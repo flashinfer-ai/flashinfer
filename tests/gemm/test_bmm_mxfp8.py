@@ -122,6 +122,58 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
     )
 
 
+def test_bmm_mxfp8_cute_dsl_in_cuda_graph_with_empty_alpha_cache(monkeypatch):
+    # The SM107 runner always passes alpha=None to _prepare_alpha_for_launch
+    # in gemm_mm_fp4_cute_dsl.
+    # Captured before the cached 1.0 exists, the captures must leave the cache
+    # empty, and both graphs must match the eager reference when replayed in
+    # reverse order.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+
+    if tuple(get_compute_capability(torch.device("cuda"))) != (10, 7):
+        pytest.skip("bmm_mxfp8 cute-dsl backend requires SM107.")
+    from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip("bmm_mxfp8 cute-dsl backend requires CuTe DSL >= 4.8.")
+    torch.manual_seed(0)
+    b, m, n, k = 2, 384, 384, 512
+    x = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16) * 0.05
+    a, a_scale = mxfp8_quantize(x, True)
+    w, w_scale = mxfp8_quantize(weight, True)
+
+    def run(out):
+        bmm_mxfp8(
+            a,
+            w.transpose(-2, -1),
+            a_scale,
+            w_scale,
+            torch.bfloat16,
+            out,
+            backend="cute-dsl",
+        )
+
+    # Running the reference eagerly also compiles the kernel, which cannot
+    # happen during capture.
+    ref = torch.empty([b, m, n], device="cuda", dtype=torch.bfloat16)
+    run(ref)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    outs, graphs = [], []
+    for _ in range(2):
+        out = torch.empty([b, m, n], device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(out)
+        outs.append(out)
+        graphs.append(graph)
+    assert not gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize()
+    assert torch.equal(outs[1], ref) and torch.equal(outs[0], ref)
+
+
 def test_bmm_mxfp8_raises_for_row_major_weight():
     a = torch.empty((1, 2, 32), dtype=torch.float8_e4m3fn)
     b = torch.empty((1, 32, 2), dtype=torch.float8_e4m3fn)

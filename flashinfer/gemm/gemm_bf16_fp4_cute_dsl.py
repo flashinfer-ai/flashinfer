@@ -22,23 +22,17 @@ from ..fused_moe.utils import (
 from ..utils import _get_stream_cache_buf, get_compute_capability, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout, _unswizzle_sf_128x4
-
-_BF16_FP4_ALPHA_ONE_CACHE: dict = {}
+from .gemm_mm_fp4_cute_dsl import _prepare_alpha_for_launch
 
 
 def _prepare_bf16_fp4_alpha(
     alpha: Optional[torch.Tensor], device: torch.device
 ) -> torch.Tensor:
     """Normalize ``alpha`` to a ``(1,) float32`` tensor for the kernel."""
-    if alpha is None:
-        cached = _BF16_FP4_ALPHA_ONE_CACHE.get(device)
-        if cached is None:
-            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
-            _BF16_FP4_ALPHA_ONE_CACHE[device] = cached
-        return cached
-    if alpha.dim() == 0:
-        return alpha.to(device=device, dtype=torch.float32).unsqueeze(0)
-    return alpha.to(device=device, dtype=torch.float32).reshape(1)
+    # The cached 1.0 lives in _prepare_alpha_for_launch; this module keeps no
+    # cache of its own. That helper creates the cached 1.0 only outside CUDA
+    # graph capture, so a call during capture does not create it.
+    return _prepare_alpha_for_launch(alpha, device)
 
 
 def _select_bf16_fp4_tile_shape(

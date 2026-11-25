@@ -299,5 +299,26 @@ def test_bmm_fp8_bias_tuning_key() -> None:
     )
 
 
+def test_fp8_unit_scale_is_not_cached_from_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _fp8_unit_scale, the per-tensor FP8 runners' 1.0, must not be cached
+    # from a capture: a 1.0 created there is filled only when that graph
+    # replays.
+    from flashinfer.gemm import gemm_base, gemm_mm_fp4_cute_dsl
+
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    device = torch.device("cuda", torch.cuda.current_device())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = gemm_base._fp8_unit_scale(device)
+    eager = gemm_base._fp8_unit_scale(device)
+    assert eager is not captured
+    assert eager.item() == 1.0
+    graph.replay()
+    torch.cuda.synchronize()
+    assert captured.item() == 1.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

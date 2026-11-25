@@ -122,6 +122,63 @@ def test_cuda_graph_replay():
     _check(out, _reference(a, b, sf, None, ids, num_rows, 0), torch.bfloat16)
 
 
+def test_empty_call_without_alpha_leaves_the_cache_empty(monkeypatch):
+    # An empty call returns before alpha is prepared, so it does not create
+    # the cached 1.0.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+
+    k, num_rows = 2560, 512
+    b, sf = _random_rows(num_rows, k, seed=6)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    for m, j in ((0, 64), (4, 0)):
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        ids = torch.zeros((m, j), device="cuda", dtype=torch.int64)
+        out = torch.zeros((m, num_rows), device="cuda", dtype=torch.bfloat16)
+        assert gemv_bf16_fp4_gather(a, b, sf, None, ids, out) is out
+    assert not gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE
+
+
+def test_without_alpha_captured_before_eager(monkeypatch):
+    # With the cached 1.0 alpha not yet created, a captured alpha=None call
+    # must not leave its 1.0 for later eager calls. That 1.0 is filled only
+    # when the graph replays, so an eager call before any replay would read
+    # memory that does not hold 1.0 yet.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+
+    k, num_rows = 2560, 512
+    b, sf = _random_rows(num_rows, k, seed=5)
+    a = torch.randn(4, k, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(0, num_rows, (4, 64), device="cuda")
+    one = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    def run(alpha, out):
+        gemv_bf16_fp4_gather(a, b, sf, alpha, ids, out)
+
+    def new_out():
+        return torch.zeros((4, num_rows), device="cuda", dtype=torch.bfloat16)
+
+    # Compiles the kernel outside capture.
+    ref = new_out()
+    run(one, ref)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    captured = new_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(None, captured)
+    assert not gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE
+    eager = new_out()
+    run(None, eager)
+    torch.cuda.synchronize()
+    assert torch.equal(eager, ref)
+    # The capture left the cache empty and the eager call added one entry.
+    # Unlike the torch.equal above, this does not depend on what the graph's
+    # memory holds.
+    assert len(gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE) == 1
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, ref)
+
+
 def test_rejects_bad_shapes():
     b, sf = _random_rows(10, 64, seed=0)
     a = torch.randn(1, 64, device="cuda", dtype=torch.bfloat16)

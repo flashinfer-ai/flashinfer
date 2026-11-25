@@ -9,9 +9,9 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import gemv_bf16_fp4_gather_trace
 from ..utils import backend_requirement, supported_compute_capability
+from .gemm_mm_fp4_cute_dsl import _prepare_alpha_for_launch
 
 _KERNEL_CACHE: dict = {}
-_ALPHA_ONE: dict = {}
 
 # Within 2% of the best measured tile at K in {2048, 2560}, J = 16384,
 # M in {1, 4, 5, 8, 32} on GB10.
@@ -178,13 +178,13 @@ def gemv_bf16_fp4_gather(
     Returns:
         ``out``.
     """
-    if alpha is None:
-        alpha = _ALPHA_ONE.get(a.device)
-        if alpha is None:
-            alpha = torch.ones(1, dtype=torch.float32, device=a.device)
-            _ALPHA_ONE[a.device] = alpha
     if a.shape[0] == 0 or row_ids.shape[1] == 0:
         return out
+    if alpha is None:
+        # _prepare_alpha_for_launch creates the cached 1.0 only outside CUDA
+        # graph capture, so a call during capture does not create it. An empty
+        # call returns above, so it does not create it either.
+        alpha = _prepare_alpha_for_launch(None, a.device)
     kernel = _get_kernel(
         a.shape[1],
         row_ids.dtype,
