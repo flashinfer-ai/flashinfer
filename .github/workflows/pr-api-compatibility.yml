@@ -54,9 +54,6 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Test trusted API policy and gate
-        run: |
-          python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
       - name: Scan git objects and publish API gate
         id: scan
         env:

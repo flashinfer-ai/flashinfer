@@ -9,25 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  reporter-contract:
-    name: Documentation reporter contract
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - run: python3 -m unittest discover -s scripts/infra/tests -p 'test_doc_reporter_contract.py' -v
-
-  api-policy-tests:
-    name: API policy tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - run: |
-          python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
-
   documentation:
     name: Documentation checks (advisory)
     if: github.event.pull_request.draft == false

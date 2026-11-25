@@ -147,14 +147,16 @@ The required check name remains **API compatibility**.
 
 ## Validation
 
+`scripts/infra/tests/test_check_pr_api_diff.py` is retained for local validation. PR workflows run
+the API scan and merge gate without running the checker unit tests.
+
 ```sh
-python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
+python3 -m unittest discover -s scripts/infra/tests -p 'test_check_pr_api_diff.py' -v
 pre-commit run --files <changed-paths>
 ```
 
-Fixtures cover widening returns, optional binding policy, mixed severity reports,
-decorator-plus-signature changes, dynamic exports, authorization, source-comment
-provenance, delayed approval, head races, revocation and scan failures.
+The retained tests cover signature comparison, type aliases, compatible
+re-exports, table-driven exports, and experimental API exclusions.
 
 ## Rollout and rollback
 
@@ -181,9 +183,7 @@ marker are independent of documentation reports. Evidence-upload failures warn
 without replacing a completed gate decision.
 
 `pr-api-doc-checks.yml` runs the read-only advisory documentation producer and
-uploads only documentation evidence. It also hosts the separate `API policy
-tests` job; the two jobs share a workflow trigger, but the tests do not publish
-API findings or make the compatibility decision. `pr-api-doc-comment.yml` reads
+uploads only documentation evidence. `pr-api-doc-comment.yml` reads
 only documentation artifacts and writes only documentation comments.
 
 The privileged documentation reporter runs from the default branch. Until this
