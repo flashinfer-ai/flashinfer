@@ -90,7 +90,7 @@ def test_seed_ignores_unrelated_changes(path):
 
 def test_seed_matches_pr_aot_lanes():
     seed_jobs = _workflow("aot-cache-seed.yml")["jobs"]
-    pr_test = (REPO_ROOT / ".github" / "workflows" / "pr-test.yml").read_text(
+    pr_test = (REPO_ROOT / ".github" / "workflows" / "pr-test-dispatch.yml").read_text(
         encoding="utf-8"
     )
 

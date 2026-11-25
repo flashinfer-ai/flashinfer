@@ -35,7 +35,8 @@ SOURCES = {
     "tests/ignored/test_old.py": "def test_old():\n    pass\n",
 }
 CI_FILES = {
-    ".github/workflows/pr-test.yml": 'variables:\n  PYTEST_ADDOPTS: "--ignore=tests/infra/test_sharding"\nunit-test:\n  script: scripts/run_flashinfer_tests.sh\n',
+    ".github/workflows/pr-test-dispatch.yml": "jobs: {}\n",
+    ".github/workflows/pr-test.yml": '# CI_BOT_PR_TEST_DISPATCH_V1: routing lives in pr-test-dispatch.yml.\nvariables:\n  PYTEST_ADDOPTS: "--ignore=tests/infra/test_sharding"\nunit-test:\n  script: scripts/run_flashinfer_tests.sh\n',
     "scripts/infra/pr_checks/targeted_lane_scope.py": 'bash scripts/infra/task_run_unit_tests.sh --test-path "$TEST_PATH"',
 }
 
@@ -112,6 +113,33 @@ class PytestTargetSelectorTests(unittest.TestCase):
         self.read_ci = Mock(side_effect=lambda path: CI_FILES.get(path))
         self.inference = FakeInference()
         self.selector = PytestTargetSelector(self.github, self.read_ci, self.inference)
+
+    def test_pre_cutover_routing_does_not_require_dispatcher(self):
+        legacy = dict(CI_FILES)
+        legacy[".github/workflows/pr-test.yml"] = "jobs: {test: {}}\n"
+        del legacy[".github/workflows/pr-test-dispatch.yml"]
+        self.read_ci.side_effect = lambda path: legacy.get(path)
+        self.assertEqual(
+            ["tests/attention/test_rope.py"], self.selector.select(PR).paths
+        )
+
+    def test_post_cutover_routing_requires_dispatcher(self):
+        self.read_ci.side_effect = lambda path: (
+            None if path.endswith("pr-test-dispatch.yml") else CI_FILES.get(path)
+        )
+        with self.assertRaisesRegex(TargetSelectionError, "CI routing evidence"):
+            self.selector.select(PR)
+        self.assertEqual([], self.inference.calls)
+
+    def test_repository_routing_includes_dispatcher_evidence(self):
+        root = Path(__file__).resolve().parents[3]
+        self.read_ci.side_effect = lambda path: (root / path).read_text()
+        self.selector.select(PR)
+        self.assertTrue(
+            self.inference.calls[0][0]["ci_files"].get(
+                ".github/workflows/pr-test-dispatch.yml"
+            )
+        )
 
     def test_selects_existing_tests_using_merged_tree_and_ci_evidence_without_executing_code(
         self,
