@@ -2069,7 +2069,8 @@ def cutlass_fused_moe(
         if codes and not swizzled_input_sf:
             # NVFP4's K / 16 bytes a token, MXFP8's K / 32: the leading tokens', as SM100 reads
             tokens, cols = input.shape[0], input.shape[1] // (32 if fp8 else 8)
-            if input_sf.element_size() != 1 or input_sf.numel() < tokens * cols:
+            byte = input_sf.element_size() == 1 and input_sf.dtype != torch.bool
+            if not byte or input_sf.numel() < tokens * cols:
                 raise ValueError(
                     f"input_sf must hold a byte per linear block scale, {tokens} tokens of "
                     f"{cols} at least; got {input_sf.dtype} {tuple(input_sf.shape)}."
@@ -2315,14 +2316,15 @@ class _RecordsExt:
     BF16 [tokens * top_k, I] receives the activation (before ``rw``); ``up`` FP32 [E] the gated
     linear half's alpha over alpha1 (alpha1 [E, 2]); ``fc2_out`` per token SM100's
     ``fc2_input_out`` as uint8 [entries, I' / 2], [entries, I' / 16] and FP32 [entries] (I' >= I;
-    not in the key: the autotuner's runs drop it); ``x_fmt`` 1, 2, 3 an MXFP8, FP8 (its scale in
-    alpha1) or MXFP4 ``x`` (uint8) under E8M0 ``x_scale`` per 32, restored by the prep; ``fq`` 1,
-    2, 3 GEMM2's input MXFP8, MXFP4 or FP8 (its scale in alpha2) of GEMM1's output times ``fq_inv``
-    (FP32 [E], or None), quantized and restored in place; both 4 (with ``per_token_scale``): FP8
-    E4M3 as SM90's Humming path, of a 16-bit ``x`` per token (``x_scale`` unread) and of GEMM2's
-    input per row, under dynamic scales. ``alpha_den`` FP32 [1] each: alpha1 and alpha2 are
-    weights' global scales, the GEMM alphas them over these, divided by the prep each call. Swiglu
-    at the default ``scalars`` and Relu2, without tensors, run the base module's GEMM1."""
+    not in the key: the autotuner's runs drop it), zeroed first if ``fc2_zero``; ``x_fmt`` 1, 2,
+    3 an MXFP8, FP8 (its scale in alpha1) or MXFP4 ``x`` (uint8) under E8M0 ``x_scale`` per 32,
+    restored by the prep; ``fq`` 1, 2, 3 GEMM2's input MXFP8, MXFP4 or FP8 (its scale in alpha2)
+    of GEMM1's output times ``fq_inv`` (FP32 [E], or None), quantized and restored in place;
+    both 4 (with ``per_token_scale``): FP8 E4M3 as SM90's Humming path, of a 16-bit ``x`` per
+    token (``x_scale`` unread) and of GEMM2's input per row, under dynamic scales. ``alpha_den``
+    FP32 [1] each: alpha1 and alpha2 are weights' global scales, the GEMM alphas them over
+    these, divided by the prep each call. Swiglu at the default ``scalars`` and Relu2, without
+    tensors, run the base module's GEMM1."""
 
     act: int
     params: Tuple[Optional[torch.Tensor], ...] = (None, None, None)
@@ -2336,6 +2338,7 @@ class _RecordsExt:
     act_out: Optional[torch.Tensor] = None
     up: Optional[torch.Tensor] = None
     fc2_out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    fc2_zero: bool = False
     x_fmt: int = 0
     fq: int = 0
     fq_inv: Optional[torch.Tensor] = None
@@ -2429,6 +2432,8 @@ def _w4a16_moe_sm80(
         x, topk_ids, topk_weights, r1, alpha1, r2, alpha2, out, x_scale, fc2_scale,
         fc2_den, slot_experts, per_token_scale, *(vars(ext).values() if ext else ()),
     )  # fmt: skip
+    if x.dim() != 2:  # before its sizes are read
+        raise ValueError(f"Below SM100 the MoE's input is 2D, got {tuple(x.shape)}.")
     pt = per_token_scale is not None
     tactics = _W4A16_SM80_PT_TACTICS if pt else W4A16_SM80_TACTICS
     tactic = W4A16_SM80_TACTICS[3] if tactic in (None, -1) else tuple(tactic)
@@ -2441,8 +2446,10 @@ def _w4a16_moe_sm80(
     tokens, hidden = x.shape[0], (ext or _RecordsExt(0)).hidden(x)
     num_experts, top_k, m = r1.shape[0], topk_ids.shape[1], topk_ids.numel()
     routed = tokens, top_k
-    if topk_ids.shape != routed or finalize and topk_weights.shape != routed:
-        raise ValueError("Routing ids and weights must be [num_tokens, top_k].")
+    if (topk_ids.shape, topk_weights.shape) != (routed,) * 2 or not (
+        topk_weights.is_floating_point()
+    ):  # also unfinalized, which return them
+        raise ValueError("Routing ids and float weights must be [num_tokens, top_k].")
     xt = out.dtype if codes and finalize else torch.bfloat16 if codes else x.dtype
     if xt not in (torch.bfloat16, torch.float16) or (finalize and out.dtype != xt):
         raise ValueError(f"Below SM100 the MoE runs BF16 or FP16 throughout, got {x.dtype} in, "
@@ -2500,6 +2507,9 @@ def _w4a16_moe_sm80(
         mx = _w4a16_moe_sm80_module(recipe, exact, xa, f16)
         m1, e1 = (mx, g1) if g1 is not None else (m1, e1)
         m2, e2 = (mx, g2) if g2 is not None else (m2, e2)
+    if ext is not None and ext.fc2_zero and ext.fc2_out is not None:  # after the checks
+        for t in ext.fc2_out:
+            t.zero_()
     # MX inputs: the extension module's prep
     (_w4a16_moe_sm80_module(recipe, exact, xa, f16) if xf else module).prep(
         topk_ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks,
@@ -2813,7 +2823,8 @@ def _trtllm_fp4_records_moe(
     # SM100's checks: GEMM2's roundUp(valid, 128) columns within hidden, unfinalized rows as wide
     _infer_trtllm_moe_output_hidden_size(hidden, a["valid_hidden_size"])
     _check_valid_hidden_size_supports_finalize(a["valid_hidden_size"], finalize, hidden)
-    hv, iv = a["valid_hidden_size"] or hidden, a["valid_intermediate_size"] or inter
+    vh, vi = a["valid_hidden_size"], a["valid_intermediate_size"]
+    hv, iv = hidden if vh is None else vh, inter if vi is None else vi
     gated, top_k = act.is_gated, ids.shape[1]
     bf16_scale = (
         not codes and w4a4 and (x_scale.dtype, x_scale.numel()) == (torch.float32, 1)
@@ -2822,14 +2833,16 @@ def _trtllm_fp4_records_moe(
         (w4a4 != (nv or bf16_scale))
         or x.dtype not in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
         or (nv and x_scale.dtype not in (torch.float8_e4m3fn, torch.uint8))
-        or (fp8 and x_scale is not None and x_scale.element_size() != 1)
+        or (fp8 and x_scale is not None and (
+            x_scale.element_size() != 1 or x_scale.dtype == torch.bool
+        ))
         or (pt is not None and (
             not w4a4 or pt.dtype != torch.float32 or pt.numel() != tokens
             or not pt.is_contiguous()
         ))
         or hv % 16 or iv % 16 or not 0 < iv <= inter or (fp8 and (hv % 32 or iv % 32))
         or (finalize and out is not None and (out.dim() != 2 or out.shape[0] != tokens or not (
-            out.shape[1] == hv if a["valid_hidden_size"] else 0 < out.shape[1] <= hidden
+            out.shape[1] == hv if vh is not None else 0 < out.shape[1] <= hidden
         )))
         or s_gate is None or s2 is None or ((w4a4 or fp8 and x_scale is None) and s1 is None)
         or a.get("workspace_buffer") is not None or a.get("routing_metadata") is not None
@@ -2919,10 +2932,10 @@ def _trtllm_fp4_records_moe(
     if act == ActivationType.SwigluStep:  # its limit only, as on SM100
         if p["1_alpha"] is not None or p["1_beta"] is not None:
             raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
-    if fo is not None:  # by (token, k) entry; skipped slots zero, as on SM100
-        if experts < a["num_experts"] or a.get("routing_logits") is None:
-            for t in fo:
-                t[:tokens].zero_()
+    fz = fo is not None and (  # skipped slots zero, as on SM100
+        experts < a["num_experts"] or a.get("routing_logits") is None
+    )
+    if fo is not None:  # by (token, k) entry
         fo = (fo[0][:tokens].flatten(0, 1), fo[1][:tokens].view(torch.uint8).flatten(0, 1),
               fo[2][:tokens].view(-1))  # fmt: skip
     ext = _RecordsExt(
@@ -2936,6 +2949,7 @@ def _trtllm_fp4_records_moe(
         lora,
         act_out=act_out,
         fc2_out=fo,
+        fc2_zero=fz,
         x_fmt=(2 if x_scale is x else 1) if fp8 else 0,
         fq=(3 if x_scale is x else 1) if fp8 else 0,
         fq_inv=inv,
@@ -8340,6 +8354,18 @@ def trtllm_fp4_block_scale_moe(
     if get_compute_capability(hidden_states.device)[0] < 10:
         if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
             raise ValueError(f"Invalid activation type: {activation_type}")
+        _check_records_device(
+            hidden_states, routing_logits, routing_bias, routing_replay_out
+        )
+        if routing_logits.shape != (hidden_states.shape[0], num_experts) or (
+            routing_bias is not None
+            and (routing_bias.shape, routing_bias.dtype)
+            not in (((num_experts,), torch.bfloat16), ((num_experts,), torch.float32))
+        ):  # as SM100's launcher
+            raise ValueError(
+                "routing_logits must be [num_tokens, num_experts], routing_bias BF16 or FP32 "
+                "[num_experts]."
+            )
         # Records look each slot's expert up as they route, unless the ids are replayed,
         # local to an EP rank (fewer local experts than routed) or returned unfinalized.
         gather = (
@@ -8352,9 +8378,10 @@ def trtllm_fp4_block_scale_moe(
             routing_logits, routing_bias, routing_method_type, top_k, n_group, topk_group,
             routed_scaling_factor, norm_topk_prob, enable_pdl, _nfse, bool(gather),
         )  # fmt: skip
-        if routing_replay_out is not None:
+        res = _trtllm_fp4_records_moe(locals(), ids, weights, *slot_experts)
+        if routing_replay_out is not None:  # a call that runs
             routing_replay_out[: ids.shape[0]].copy_(ids[:, :top_k])
-        return _trtllm_fp4_records_moe(locals(), ids, weights, *slot_experts)
+        return res
     localized = _flatten_localized_moe_args(
         localized_weights, localized_streams, localized_sm_count, hidden_states.device
     )
@@ -8721,8 +8748,14 @@ def trtllm_fp4_block_scale_routed_moe(
         if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
             raise ValueError(f"Invalid activation type: {activation_type}")
         ids, weights = topk_ids_tensor, topk_weights
-        if ids.shape[1:] != (top_k,):  # as SM100's launcher
-            raise ValueError("topk_ids must be [num_tokens, top_k].")
+        routed = (hidden_states.shape[0], top_k)
+        w16 = (torch.bfloat16, torch.float32)
+        if (ids.dtype, ids.shape) != (torch.int32, routed) or not (
+            weights is None or weights.dtype in w16 and weights.shape == routed
+        ):  # as SM100's launcher, before any output is written
+            raise ValueError(
+                "topk_ids must be int32 [num_tokens, top_k], topk_weights BF16 or FP32 as wide."
+            )
         if weights is None:  # (expert id << 16) | BF16 weight
             weights, ids = ids.view(torch.bfloat16)[..., ::2].contiguous(), ids >> 16
         if _nfse:  # every token to the shared experts, weight 1

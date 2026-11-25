@@ -2535,8 +2535,8 @@ def prepare_records_mxfp4_weights(
         ("w2_fp4", w2_fp4, (experts, hidden_size, intermediate_size // 2)),
         ("w2_block_scale", w2_block_scale, (experts, hidden_size, intermediate_size // 32)),
     ):  # fmt: skip
-        if t.element_size() != 1 or tuple(t.shape) != shape:
-            raise ValueError(
+        if t.element_size() != 1 or t.dtype == torch.bool or tuple(t.shape) != shape:
+            raise ValueError(  # their bytes, as uint8 or a byte type
                 f"{name} must be uint8 {shape}, got {t.dtype} {tuple(t.shape)}."
             )
     device = torch.device(device if device is not None else w1_fp4.device)

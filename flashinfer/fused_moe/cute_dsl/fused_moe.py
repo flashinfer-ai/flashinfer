@@ -2176,6 +2176,10 @@ def cute_dsl_fused_moe(
                 "Below SM100 CuTe-DSL MoE runs W4A4, W4A16 and W4A8 on records: BF16 or FP16 "
                 "output (the W4A16 input of that type), per token with W4A4."
             )
+        if w4a8 and output_dtype is not torch.bfloat16:  # as on SM100
+            raise ValueError("MXFP8 activations support only torch.bfloat16 output")
+        if w4a8 and token_final_scales.dtype is not torch.float32:  # as on SM100
+            raise TypeError("W4A8 token_final_scales must have dtype torch.float32")
         recipe = resolve_nvfp4_4over6(nvfp4_4over6) if pt else None  # as on SM100
         if pt and nvfp4_4over6 is not _UNSET:
             _check_gemm2_input_scale(fc2_input_scale, recipe)

@@ -173,6 +173,8 @@ def test_w4a16(gated, tokens):
     )  # fmt: skip
     torch.testing.assert_close(trt, out, atol=0, rtol=0)
     torch.testing.assert_close(cute, out, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="2D"):  # [tokens, H, 2]: H a row as given
+        _cutlass(m, x[..., None].expand(-1, -1, 2).contiguous(), ids, weights, scales)
     if not gated:  # CUTLASS-only on TRT-LLM, and the sentinel: rejected as on SM100
         with pytest.raises(ValueError, match="activation type"):
             bad = {**m, "act": ActivationType.ClampedRelu2}
@@ -219,8 +221,9 @@ def test_w4a4(recipe, gated, tokens):
     outs = [cutlass(codes, input_sf=sf, swizzled_input_sf=False)]
     # the leading tokens of a longer buffer, at K / 16 bytes a token as SM100 reads them
     outs.append(cutlass(codes, input_sf=torch.cat((sf, sf)), swizzled_input_sf=False))
-    with pytest.raises(ValueError, match="a byte per linear block scale"):
-        cutlass(codes, input_sf=sf.float(), swizzled_input_sf=False)
+    for bad in (sf.float(), sf.bool()):
+        with pytest.raises(ValueError, match="a byte per linear block scale"):
+            cutlass(codes, input_sf=bad, swizzled_input_sf=False)
     outs.append(cutlass(codes, input_sf=swizzled))
     if tokens == 37 and not recipe:  # tuned, the E4M3 scales as vLLM passes them
         with autotune():
@@ -463,6 +466,8 @@ def test_valid_sizes(gated):
         assert padded[2].shape[1] == ip and not padded[2][:, I:].any()
         with pytest.raises(ValueError, match="gemm1_lora_delta"):  # SM100's top_k slots
             _trt(*args, gemm1_lora_delta=lora[:, :1].contiguous())
+    with pytest.raises(NotImplementedError, match="valid sizes"):  # not the default
+        _trt(*args, valid_intermediate_size=0)
 
 
 @pytest.mark.parametrize("width", [H - 128, H - 2])
@@ -523,11 +528,12 @@ def test_fc2_input_out():
     fo = [torch.full((tokens + 3, K, ip // n), 9, dtype=torch.uint8, device="cuda")
           for n in (2, 16)] + [torch.full((tokens + 3, K), 9.0, device="cuda")]  # fmt: skip
 
-    def run(fo):
+    def run(fo, **kw):
         return _trt(
             sub, codes, sf.view(torch.float8_e4m3fn), ids, weights,
             torch.ones(half, device="cuda"), m["w1_g"][:half], m["w2_g"][:half], num_experts=E,
             local=half, inter=ip, valid_intermediate_size=I, per_token_scale=s, fc2_input_out=fo,
+            **kw,
         )[0]  # fmt: skip
 
     out = run(fo)
@@ -545,6 +551,9 @@ def test_fc2_input_out():
         y[ids == e] = rows[ids == e] @ m["w2_deq"][e].T
     _close(out, (y * weights[..., None]).sum(1), 1e-2)
     bad = [t.clone().fill_(9) for t in fo]
+    with pytest.raises(ValueError, match="BF16 or FP16"):  # the records' check
+        run(bad, output=torch.empty(tokens, H, device="cuda"))
+    assert all(t.eq(9).all() for t in bad)
     bad[2] = bad[2].cpu()  # one off the device
     with pytest.raises(ValueError, match="input's device"):
         run(bad)
@@ -567,6 +576,10 @@ def test_deferred_finalize_and_shared_experts():
     explicit = _trt(*args1, num_experts=E + 1)
     torch.testing.assert_close(shared[0], explicit[0], atol=0, rtol=0)
     y, w, idx = _trt(*args1, num_experts=E + 1, do_finalize=False)
+    # as SM100's launcher
+    for bad in ((ids, weights[:, :1]), (ids.long(), weights), (ids, weights.half())):
+        with pytest.raises(ValueError, match="num_tokens, top_k"):
+            _trt(m, x, None, *bad, *args[5:], local=E, do_finalize=False)
     summed = (y[idx.long()].view(tokens, K + 1, H).float() * w[..., None]).sum(1)
     _close(explicit[0], summed, 1e-2)
 
@@ -578,9 +591,9 @@ def test_from_logits(tokens):
     x = torch.randn(tokens, H, device="cuda").bfloat16()
     logits = torch.randn(tokens, E, device="cuda")
 
-    def run(**kw):
+    def run(logits=logits, bias=None, **kw):
         return trtllm_fp4_block_scale_moe(
-            logits, None, x, None, m["w1"], m["r1"], None, None, None, None, m["w2"],
+            logits, bias, x, None, m["w1"], m["r1"], None, None, None, None, m["w2"],
             m["r2"], None, None, m["w1_g"], m["w2_g"], E, K, None, None, I, 0, E, None,
             routing_method_type=RoutingMethodType.Renormalize.value, **kw,
         )[0]  # fmt: skip
@@ -596,6 +609,17 @@ def test_from_logits(tokens):
     assert torch.equal(replay.long().sort(1).values, ids.sort(1).values)
     weights = torch.gather(logits, 1, replay.long()).softmax(-1)
     _close(slots, _reference(m, x.float(), replay, weights, lambda a: a.float()), 2e-2)
+    # As SM100's launcher: logits of the experts, a BF16 or FP32 bias, the replay on the device
+    for kw in ({"logits": torch.randn(tokens, E + 1, device="cuda")},
+               {"bias": torch.zeros(E, dtype=torch.half, device="cuda")}):  # fmt: skip
+        with pytest.raises(ValueError, match="num_experts"):
+            run(**kw)
+    with pytest.raises(ValueError, match="input's device"):
+        run(routing_replay_out=replay.cpu())
+    replay.fill_(-1)
+    with pytest.raises(NotImplementedError, match="workspace_buffer"):
+        run(routing_replay_out=replay, workspace_buffer=torch.empty(8, dtype=torch.uint8, device="cuda"))  # fmt: skip
+    assert replay.eq(-1).all()  # written by a call that runs
 
 
 def test_from_logits_rank0(monkeypatch):
@@ -688,10 +712,10 @@ def test_mxfp4_mxfp8(gated, split, tokens):
     ]
     outs.append(_trt(m, x8, sf, ids, weights, None, m["w1_g"], m["w2_g"])[0])
 
-    def cute(xsf):
+    def cute(xsf, w=weights, **kw):
         return cute_dsl_fused_moe(
-            x8, xsf, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
-            m["w2_g"], E, K, quant_mode="w4a8", activation_type=m["act"].value,
+            x8, xsf, ids, w, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
+            m["w2_g"], E, K, quant_mode="w4a8", activation_type=m["act"].value, **kw,
         )  # fmt: skip
 
     outs.append(cute(sf))
@@ -699,6 +723,12 @@ def test_mxfp4_mxfp8(gated, split, tokens):
         torch.testing.assert_close(o, out, atol=0, rtol=0)
     with pytest.raises(NotImplementedError, match="records"):  # [M, H/32] as on SM100
         cute(sf.t().contiguous())
+    with pytest.raises(ValueError, match="bfloat16 output"):  # as on SM100
+        cute(sf, output_dtype=torch.float16)
+    with pytest.raises(TypeError, match="float32"):
+        cute(sf, weights.bfloat16())
+    with pytest.raises(NotImplementedError, match="records"):  # bytes of a byte type
+        _trt(m, x8, sf.bool(), ids, weights, None, m["w1_g"], m["w2_g"])
 
 
 @pytest.mark.parametrize("gated", [True, False])
@@ -760,6 +790,8 @@ def test_mxfp4_scale_layouts():
     s1[:, :I], s1[:, I:] = 254, 126  # 2^128 apart
     with pytest.raises(ValueError, match="FP32 ratio"):
         prepare(s1)
+    with pytest.raises(ValueError, match="must be uint8"):
+        prepare(m["w1_sf"].bool())
 
 
 def test_zero_tokens():
