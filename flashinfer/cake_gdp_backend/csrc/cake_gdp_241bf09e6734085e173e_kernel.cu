@@ -1155,8 +1155,8 @@ kernel_cake_gdp_241bf09e6734085e173e(const __grid_constant__ CUtensorMap Q, cons
             int pl_nb = 1;
             int pl_echo0 = num_seqs * num_heads;
             #pragma unroll 1
-            for (int pl_it0 = pl_lo + warp1 * 32 * pl_nb; pl_it0 < pl_hi; pl_it0 += 128 * pl_nb) {
-                int pl_it = pl_it0 + lane * pl_nb;
+            for (int pl_it0 = pl_lo + warp1 * 1 * pl_nb; pl_it0 < pl_hi; pl_it0 += 128 * pl_nb) {
+                int pl_it = pl_it0 + lane * 4 * pl_nb;
                 int pl_need = 0;
                 if (pl_it < pl_hi) {
                     int pl_seq = items[pl_it * 4];
@@ -1180,7 +1180,7 @@ kernel_cake_gdp_241bf09e6734085e173e(const __grid_constant__ CUtensorMap Q, cons
                 #pragma unroll 1
                 for (int pl_j = 0; pl_j < 32; pl_j++) {
                     if ((pl_mask >> (unsigned int)pl_j & 1) != 0) {
-                        int pj_it = pl_it0 + pl_j * pl_nb;
+                        int pj_it = pl_it0 + pl_j * 4 * pl_nb;
                         int pj_seq = items[pj_it * 4];
                         int pj_head = items[pj_it * 4 + 1];
                         int pj_cut = items[pj_it * 4 + 2];
@@ -1203,331 +1203,503 @@ kernel_cake_gdp_241bf09e6734085e173e(const __grid_constant__ CUtensorMap Q, cons
                         int pj_sat = ((pj_cut == 0) ? 1 : 0);
                         int pj_wend = pj_chunks;
                         int pj_go = ((pj_span < 0 && pj_cut >= pj_chunks) ? 0 : 1);
+                        int pj_prev = 0;
+                        float pj_tot = 0.0f;
                         while (pj_go != 0) {
                             pj_go = ((pj_fw == 0 || pj_fw <= 48 && pj_x < pj_chunks && pj_span != 0) ? 1 : 0);
                             if (pj_go != 0) {
-                                int pk_lane = lane;
-                                float pk_acc = 0.0f;
-                                int w = 0;
-                                int pk_b = 0;
-                                int pk_go = 1;
-                                while (pk_go != 0) {
-                                    int pk_x0 = pj_x - pk_b * 8;
-                                    float pk_g[16];
-                                    int pk_cnt[16];
-                                    int pk_row_0 = (pk_x0 - 1) * 64 + pk_lane;
-                                    int pk_tok_0 = pk_row_0 / num_hh;
-                                    pk_cnt[0] = ((pk_x0 - 1 >= 0 && pk_row_0 - pk_tok_0 * num_hh == 0 && pk_tok_0 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[0] = 1.0f;
-                                    if (pk_cnt[0] != 0) {
-                                        pk_g[0] = gate[(pj_s0 + pk_tok_0) * num_heads + pj_head];
+                                int pj_w = 0;
+                                if (pj_fw == 0) {
+                                    int pk_lane = lane;
+                                    float pk_acc = 0.0f;
+                                    int w = 0;
+                                    int pk_b = 0;
+                                    int pk_go = 1;
+                                    while (pk_go != 0) {
+                                        int pk_x0 = pj_x - pk_b * 8;
+                                        float pk_g[16];
+                                        int pk_cnt[16];
+                                        int pk_row_0 = (pk_x0 - 1) * 64 + pk_lane;
+                                        int pk_tok_0 = pk_row_0 / num_hh;
+                                        pk_cnt[0] = ((pk_x0 - 1 >= 0 && pk_row_0 - pk_tok_0 * num_hh == 0 && pk_tok_0 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[0] = 1.0f;
+                                        if (pk_cnt[0] != 0) {
+                                            pk_g[0] = gate[(pj_s0 + pk_tok_0) * num_heads + pj_head];
+                                        }
+                                        int pk_row_1 = (pk_x0 - 1) * 64 + pk_lane + 32;
+                                        int pk_tok_1 = pk_row_1 / num_hh;
+                                        pk_cnt[1] = ((pk_x0 - 1 >= 0 && pk_row_1 - pk_tok_1 * num_hh == 0 && pk_tok_1 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[1] = 1.0f;
+                                        if (pk_cnt[1] != 0) {
+                                            pk_g[1] = gate[(pj_s0 + pk_tok_1) * num_heads + pj_head];
+                                        }
+                                        int pk_row_2 = (pk_x0 - 1 - 1) * 64 + pk_lane;
+                                        int pk_tok_2 = pk_row_2 / num_hh;
+                                        pk_cnt[2] = ((pk_x0 - 1 - 1 >= 0 && pk_row_2 - pk_tok_2 * num_hh == 0 && pk_tok_2 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[2] = 1.0f;
+                                        if (pk_cnt[2] != 0) {
+                                            pk_g[2] = gate[(pj_s0 + pk_tok_2) * num_heads + pj_head];
+                                        }
+                                        int pk_row_3 = (pk_x0 - 1 - 1) * 64 + pk_lane + 32;
+                                        int pk_tok_3 = pk_row_3 / num_hh;
+                                        pk_cnt[3] = ((pk_x0 - 1 - 1 >= 0 && pk_row_3 - pk_tok_3 * num_hh == 0 && pk_tok_3 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[3] = 1.0f;
+                                        if (pk_cnt[3] != 0) {
+                                            pk_g[3] = gate[(pj_s0 + pk_tok_3) * num_heads + pj_head];
+                                        }
+                                        int pk_row_4 = (pk_x0 - 1 - 2) * 64 + pk_lane;
+                                        int pk_tok_4 = pk_row_4 / num_hh;
+                                        pk_cnt[4] = ((pk_x0 - 1 - 2 >= 0 && pk_row_4 - pk_tok_4 * num_hh == 0 && pk_tok_4 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[4] = 1.0f;
+                                        if (pk_cnt[4] != 0) {
+                                            pk_g[4] = gate[(pj_s0 + pk_tok_4) * num_heads + pj_head];
+                                        }
+                                        int pk_row_5 = (pk_x0 - 1 - 2) * 64 + pk_lane + 32;
+                                        int pk_tok_5 = pk_row_5 / num_hh;
+                                        pk_cnt[5] = ((pk_x0 - 1 - 2 >= 0 && pk_row_5 - pk_tok_5 * num_hh == 0 && pk_tok_5 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[5] = 1.0f;
+                                        if (pk_cnt[5] != 0) {
+                                            pk_g[5] = gate[(pj_s0 + pk_tok_5) * num_heads + pj_head];
+                                        }
+                                        int pk_row_6 = (pk_x0 - 1 - 3) * 64 + pk_lane;
+                                        int pk_tok_6 = pk_row_6 / num_hh;
+                                        pk_cnt[6] = ((pk_x0 - 1 - 3 >= 0 && pk_row_6 - pk_tok_6 * num_hh == 0 && pk_tok_6 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[6] = 1.0f;
+                                        if (pk_cnt[6] != 0) {
+                                            pk_g[6] = gate[(pj_s0 + pk_tok_6) * num_heads + pj_head];
+                                        }
+                                        int pk_row_7 = (pk_x0 - 1 - 3) * 64 + pk_lane + 32;
+                                        int pk_tok_7 = pk_row_7 / num_hh;
+                                        pk_cnt[7] = ((pk_x0 - 1 - 3 >= 0 && pk_row_7 - pk_tok_7 * num_hh == 0 && pk_tok_7 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[7] = 1.0f;
+                                        if (pk_cnt[7] != 0) {
+                                            pk_g[7] = gate[(pj_s0 + pk_tok_7) * num_heads + pj_head];
+                                        }
+                                        int pk_row_8 = (pk_x0 - 1 - 4) * 64 + pk_lane;
+                                        int pk_tok_8 = pk_row_8 / num_hh;
+                                        pk_cnt[8] = ((pk_x0 - 1 - 4 >= 0 && pk_row_8 - pk_tok_8 * num_hh == 0 && pk_tok_8 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[8] = 1.0f;
+                                        if (pk_cnt[8] != 0) {
+                                            pk_g[8] = gate[(pj_s0 + pk_tok_8) * num_heads + pj_head];
+                                        }
+                                        int pk_row_9 = (pk_x0 - 1 - 4) * 64 + pk_lane + 32;
+                                        int pk_tok_9 = pk_row_9 / num_hh;
+                                        pk_cnt[9] = ((pk_x0 - 1 - 4 >= 0 && pk_row_9 - pk_tok_9 * num_hh == 0 && pk_tok_9 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[9] = 1.0f;
+                                        if (pk_cnt[9] != 0) {
+                                            pk_g[9] = gate[(pj_s0 + pk_tok_9) * num_heads + pj_head];
+                                        }
+                                        int pk_row_10 = (pk_x0 - 1 - 5) * 64 + pk_lane;
+                                        int pk_tok_10 = pk_row_10 / num_hh;
+                                        pk_cnt[10] = ((pk_x0 - 1 - 5 >= 0 && pk_row_10 - pk_tok_10 * num_hh == 0 && pk_tok_10 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[10] = 1.0f;
+                                        if (pk_cnt[10] != 0) {
+                                            pk_g[10] = gate[(pj_s0 + pk_tok_10) * num_heads + pj_head];
+                                        }
+                                        int pk_row_11 = (pk_x0 - 1 - 5) * 64 + pk_lane + 32;
+                                        int pk_tok_11 = pk_row_11 / num_hh;
+                                        pk_cnt[11] = ((pk_x0 - 1 - 5 >= 0 && pk_row_11 - pk_tok_11 * num_hh == 0 && pk_tok_11 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[11] = 1.0f;
+                                        if (pk_cnt[11] != 0) {
+                                            pk_g[11] = gate[(pj_s0 + pk_tok_11) * num_heads + pj_head];
+                                        }
+                                        int pk_row_12 = (pk_x0 - 1 - 6) * 64 + pk_lane;
+                                        int pk_tok_12 = pk_row_12 / num_hh;
+                                        pk_cnt[12] = ((pk_x0 - 1 - 6 >= 0 && pk_row_12 - pk_tok_12 * num_hh == 0 && pk_tok_12 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[12] = 1.0f;
+                                        if (pk_cnt[12] != 0) {
+                                            pk_g[12] = gate[(pj_s0 + pk_tok_12) * num_heads + pj_head];
+                                        }
+                                        int pk_row_13 = (pk_x0 - 1 - 6) * 64 + pk_lane + 32;
+                                        int pk_tok_13 = pk_row_13 / num_hh;
+                                        pk_cnt[13] = ((pk_x0 - 1 - 6 >= 0 && pk_row_13 - pk_tok_13 * num_hh == 0 && pk_tok_13 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[13] = 1.0f;
+                                        if (pk_cnt[13] != 0) {
+                                            pk_g[13] = gate[(pj_s0 + pk_tok_13) * num_heads + pj_head];
+                                        }
+                                        int pk_row_14 = (pk_x0 - 1 - 7) * 64 + pk_lane;
+                                        int pk_tok_14 = pk_row_14 / num_hh;
+                                        pk_cnt[14] = ((pk_x0 - 1 - 7 >= 0 && pk_row_14 - pk_tok_14 * num_hh == 0 && pk_tok_14 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[14] = 1.0f;
+                                        if (pk_cnt[14] != 0) {
+                                            pk_g[14] = gate[(pj_s0 + pk_tok_14) * num_heads + pj_head];
+                                        }
+                                        int pk_row_15 = (pk_x0 - 1 - 7) * 64 + pk_lane + 32;
+                                        int pk_tok_15 = pk_row_15 / num_hh;
+                                        pk_cnt[15] = ((pk_x0 - 1 - 7 >= 0 && pk_row_15 - pk_tok_15 * num_hh == 0 && pk_tok_15 < pj_e0 - pj_s0) ? 1 : 0);
+                                        pk_g[15] = 1.0f;
+                                        if (pk_cnt[15] != 0) {
+                                            pk_g[15] = gate[(pj_s0 + pk_tok_15) * num_heads + pj_head];
+                                        }
+                                        float pk_part_0 = 0.0f;
+                                        float pk_lg_0;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_0) : "f"(pk_g[0] + 1e-10f));
+                                        pk_part_0 = pk_part_0 + ((pk_cnt[0] != 0) ? pk_lg_0 : 0.0f);
+                                        float pk_lg_1;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_1) : "f"(pk_g[1] + 1e-10f));
+                                        pk_part_0 = pk_part_0 + ((pk_cnt[1] != 0) ? pk_lg_1 : 0.0f);
+                                        float pk_o_0 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 1);
+                                        pk_part_0 = pk_part_0 + pk_o_0;
+                                        float pk_o_1 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 2);
+                                        pk_part_0 = pk_part_0 + pk_o_1;
+                                        float pk_o_2 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 4);
+                                        pk_part_0 = pk_part_0 + pk_o_2;
+                                        float pk_o_3 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 8);
+                                        pk_part_0 = pk_part_0 + pk_o_3;
+                                        float pk_o_4 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 16);
+                                        pk_part_0 = pk_part_0 + pk_o_4;
+                                        if (w == 0 && pk_x0 - 1 >= 0) {
+                                            pk_acc = pk_acc + pk_part_0;
+                                            int pk_hit_0 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_0 != 0) {
+                                                w = pk_b * 8 + 1;
+                                            }
+                                        }
+                                        float pk_part_1 = 0.0f;
+                                        float pk_lg_2;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_2) : "f"(pk_g[2] + 1e-10f));
+                                        pk_part_1 = pk_part_1 + ((pk_cnt[2] != 0) ? pk_lg_2 : 0.0f);
+                                        float pk_lg_3;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_3) : "f"(pk_g[3] + 1e-10f));
+                                        pk_part_1 = pk_part_1 + ((pk_cnt[3] != 0) ? pk_lg_3 : 0.0f);
+                                        float pk_o_5 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 1);
+                                        pk_part_1 = pk_part_1 + pk_o_5;
+                                        float pk_o_6 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 2);
+                                        pk_part_1 = pk_part_1 + pk_o_6;
+                                        float pk_o_7 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 4);
+                                        pk_part_1 = pk_part_1 + pk_o_7;
+                                        float pk_o_8 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 8);
+                                        pk_part_1 = pk_part_1 + pk_o_8;
+                                        float pk_o_9 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 16);
+                                        pk_part_1 = pk_part_1 + pk_o_9;
+                                        if (w == 0 && pk_x0 - 1 - 1 >= 0) {
+                                            pk_acc = pk_acc + pk_part_1;
+                                            int pk_hit_1 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_1 != 0) {
+                                                w = pk_b * 8 + 1 + 1;
+                                            }
+                                        }
+                                        float pk_part_2 = 0.0f;
+                                        float pk_lg_4;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_4) : "f"(pk_g[4] + 1e-10f));
+                                        pk_part_2 = pk_part_2 + ((pk_cnt[4] != 0) ? pk_lg_4 : 0.0f);
+                                        float pk_lg_5;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_5) : "f"(pk_g[5] + 1e-10f));
+                                        pk_part_2 = pk_part_2 + ((pk_cnt[5] != 0) ? pk_lg_5 : 0.0f);
+                                        float pk_o_10 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 1);
+                                        pk_part_2 = pk_part_2 + pk_o_10;
+                                        float pk_o_11 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 2);
+                                        pk_part_2 = pk_part_2 + pk_o_11;
+                                        float pk_o_12 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 4);
+                                        pk_part_2 = pk_part_2 + pk_o_12;
+                                        float pk_o_13 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 8);
+                                        pk_part_2 = pk_part_2 + pk_o_13;
+                                        float pk_o_14 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 16);
+                                        pk_part_2 = pk_part_2 + pk_o_14;
+                                        if (w == 0 && pk_x0 - 1 - 2 >= 0) {
+                                            pk_acc = pk_acc + pk_part_2;
+                                            int pk_hit_2 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_2 != 0) {
+                                                w = pk_b * 8 + 2 + 1;
+                                            }
+                                        }
+                                        float pk_part_3 = 0.0f;
+                                        float pk_lg_6;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_6) : "f"(pk_g[6] + 1e-10f));
+                                        pk_part_3 = pk_part_3 + ((pk_cnt[6] != 0) ? pk_lg_6 : 0.0f);
+                                        float pk_lg_7;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_7) : "f"(pk_g[7] + 1e-10f));
+                                        pk_part_3 = pk_part_3 + ((pk_cnt[7] != 0) ? pk_lg_7 : 0.0f);
+                                        float pk_o_15 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 1);
+                                        pk_part_3 = pk_part_3 + pk_o_15;
+                                        float pk_o_16 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 2);
+                                        pk_part_3 = pk_part_3 + pk_o_16;
+                                        float pk_o_17 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 4);
+                                        pk_part_3 = pk_part_3 + pk_o_17;
+                                        float pk_o_18 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 8);
+                                        pk_part_3 = pk_part_3 + pk_o_18;
+                                        float pk_o_19 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 16);
+                                        pk_part_3 = pk_part_3 + pk_o_19;
+                                        if (w == 0 && pk_x0 - 1 - 3 >= 0) {
+                                            pk_acc = pk_acc + pk_part_3;
+                                            int pk_hit_3 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_3 != 0) {
+                                                w = pk_b * 8 + 3 + 1;
+                                            }
+                                        }
+                                        float pk_part_4 = 0.0f;
+                                        float pk_lg_8;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_8) : "f"(pk_g[8] + 1e-10f));
+                                        pk_part_4 = pk_part_4 + ((pk_cnt[8] != 0) ? pk_lg_8 : 0.0f);
+                                        float pk_lg_9;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_9) : "f"(pk_g[9] + 1e-10f));
+                                        pk_part_4 = pk_part_4 + ((pk_cnt[9] != 0) ? pk_lg_9 : 0.0f);
+                                        float pk_o_20 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 1);
+                                        pk_part_4 = pk_part_4 + pk_o_20;
+                                        float pk_o_21 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 2);
+                                        pk_part_4 = pk_part_4 + pk_o_21;
+                                        float pk_o_22 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 4);
+                                        pk_part_4 = pk_part_4 + pk_o_22;
+                                        float pk_o_23 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 8);
+                                        pk_part_4 = pk_part_4 + pk_o_23;
+                                        float pk_o_24 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 16);
+                                        pk_part_4 = pk_part_4 + pk_o_24;
+                                        if (w == 0 && pk_x0 - 1 - 4 >= 0) {
+                                            pk_acc = pk_acc + pk_part_4;
+                                            int pk_hit_4 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_4 != 0) {
+                                                w = pk_b * 8 + 4 + 1;
+                                            }
+                                        }
+                                        float pk_part_5 = 0.0f;
+                                        float pk_lg_10;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_10) : "f"(pk_g[10] + 1e-10f));
+                                        pk_part_5 = pk_part_5 + ((pk_cnt[10] != 0) ? pk_lg_10 : 0.0f);
+                                        float pk_lg_11;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_11) : "f"(pk_g[11] + 1e-10f));
+                                        pk_part_5 = pk_part_5 + ((pk_cnt[11] != 0) ? pk_lg_11 : 0.0f);
+                                        float pk_o_25 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 1);
+                                        pk_part_5 = pk_part_5 + pk_o_25;
+                                        float pk_o_26 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 2);
+                                        pk_part_5 = pk_part_5 + pk_o_26;
+                                        float pk_o_27 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 4);
+                                        pk_part_5 = pk_part_5 + pk_o_27;
+                                        float pk_o_28 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 8);
+                                        pk_part_5 = pk_part_5 + pk_o_28;
+                                        float pk_o_29 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 16);
+                                        pk_part_5 = pk_part_5 + pk_o_29;
+                                        if (w == 0 && pk_x0 - 1 - 5 >= 0) {
+                                            pk_acc = pk_acc + pk_part_5;
+                                            int pk_hit_5 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_5 != 0) {
+                                                w = pk_b * 8 + 5 + 1;
+                                            }
+                                        }
+                                        float pk_part_6 = 0.0f;
+                                        float pk_lg_12;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_12) : "f"(pk_g[12] + 1e-10f));
+                                        pk_part_6 = pk_part_6 + ((pk_cnt[12] != 0) ? pk_lg_12 : 0.0f);
+                                        float pk_lg_13;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_13) : "f"(pk_g[13] + 1e-10f));
+                                        pk_part_6 = pk_part_6 + ((pk_cnt[13] != 0) ? pk_lg_13 : 0.0f);
+                                        float pk_o_30 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 1);
+                                        pk_part_6 = pk_part_6 + pk_o_30;
+                                        float pk_o_31 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 2);
+                                        pk_part_6 = pk_part_6 + pk_o_31;
+                                        float pk_o_32 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 4);
+                                        pk_part_6 = pk_part_6 + pk_o_32;
+                                        float pk_o_33 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 8);
+                                        pk_part_6 = pk_part_6 + pk_o_33;
+                                        float pk_o_34 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 16);
+                                        pk_part_6 = pk_part_6 + pk_o_34;
+                                        if (w == 0 && pk_x0 - 1 - 6 >= 0) {
+                                            pk_acc = pk_acc + pk_part_6;
+                                            int pk_hit_6 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_6 != 0) {
+                                                w = pk_b * 8 + 6 + 1;
+                                            }
+                                        }
+                                        float pk_part_7 = 0.0f;
+                                        float pk_lg_14;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_14) : "f"(pk_g[14] + 1e-10f));
+                                        pk_part_7 = pk_part_7 + ((pk_cnt[14] != 0) ? pk_lg_14 : 0.0f);
+                                        float pk_lg_15;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_15) : "f"(pk_g[15] + 1e-10f));
+                                        pk_part_7 = pk_part_7 + ((pk_cnt[15] != 0) ? pk_lg_15 : 0.0f);
+                                        float pk_o_35 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 1);
+                                        pk_part_7 = pk_part_7 + pk_o_35;
+                                        float pk_o_36 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 2);
+                                        pk_part_7 = pk_part_7 + pk_o_36;
+                                        float pk_o_37 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 4);
+                                        pk_part_7 = pk_part_7 + pk_o_37;
+                                        float pk_o_38 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 8);
+                                        pk_part_7 = pk_part_7 + pk_o_38;
+                                        float pk_o_39 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 16);
+                                        pk_part_7 = pk_part_7 + pk_o_39;
+                                        if (w == 0 && pk_x0 - 1 - 7 >= 0) {
+                                            pk_acc = pk_acc + pk_part_7;
+                                            int pk_hit_7 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            if (pk_hit_7 != 0) {
+                                                w = pk_b * 8 + 7 + 1;
+                                            }
+                                        }
+                                        pk_b = pk_b + 1;
+                                        pk_go = ((w == 0 && pk_b < 16 && pk_x0 - 8 > 0) ? 1 : 0);
                                     }
-                                    int pk_row_1 = (pk_x0 - 1) * 64 + pk_lane + 32;
-                                    int pk_tok_1 = pk_row_1 / num_hh;
-                                    pk_cnt[1] = ((pk_x0 - 1 >= 0 && pk_row_1 - pk_tok_1 * num_hh == 0 && pk_tok_1 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[1] = 1.0f;
-                                    if (pk_cnt[1] != 0) {
-                                        pk_g[1] = gate[(pj_s0 + pk_tok_1) * num_heads + pj_head];
+                                    pj_w = w;
+                                }
+                                if (pj_fw > 0) {
+                                    int pj_inc = ((pj_prev > 0 && pj_x <= 128) ? 1 : 0);
+                                    int pj_wlo = ((pj_inc != 0) ? pj_prev : 0);
+                                    float pj_wacc = ((pj_inc != 0) ? pj_tot : 0.0f);
+                                    int pw_lane = lane;
+                                    int pw_c0 = pj_x - 128;
+                                    if (pw_c0 < pj_wlo) {
+                                        pw_c0 = pj_wlo;
                                     }
-                                    int pk_row_2 = (pk_x0 - 1 - 1) * 64 + pk_lane;
-                                    int pk_tok_2 = pk_row_2 / num_hh;
-                                    pk_cnt[2] = ((pk_x0 - 1 - 1 >= 0 && pk_row_2 - pk_tok_2 * num_hh == 0 && pk_tok_2 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[2] = 1.0f;
-                                    if (pk_cnt[2] != 0) {
-                                        pk_g[2] = gate[(pj_s0 + pk_tok_2) * num_heads + pj_head];
+                                    int pw_tlo = (pw_c0 * 64 + num_hh - 1) / num_hh;
+                                    int pw_thi = (pj_x * 64 + num_hh - 1) / num_hh;
+                                    if (pw_thi > pj_e0 - pj_s0) {
+                                        pw_thi = pj_e0 - pj_s0;
                                     }
-                                    int pk_row_3 = (pk_x0 - 1 - 1) * 64 + pk_lane + 32;
-                                    int pk_tok_3 = pk_row_3 / num_hh;
-                                    pk_cnt[3] = ((pk_x0 - 1 - 1 >= 0 && pk_row_3 - pk_tok_3 * num_hh == 0 && pk_tok_3 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[3] = 1.0f;
-                                    if (pk_cnt[3] != 0) {
-                                        pk_g[3] = gate[(pj_s0 + pk_tok_3) * num_heads + pj_head];
+                                    float pw_acc = pj_wacc;
+                                    int hit = 0;
+                                    int pw_b = pw_thi;
+                                    float pw_g[8];
+                                    float pw_n[8];
+                                    int pw_t_0 = pw_b - 256 + pw_lane;
+                                    pw_g[0] = 1.0f;
+                                    if (pw_t_0 >= pw_tlo) {
+                                        pw_g[0] = gate[(pj_s0 + pw_t_0) * num_heads + pj_head];
                                     }
-                                    int pk_row_4 = (pk_x0 - 1 - 2) * 64 + pk_lane;
-                                    int pk_tok_4 = pk_row_4 / num_hh;
-                                    pk_cnt[4] = ((pk_x0 - 1 - 2 >= 0 && pk_row_4 - pk_tok_4 * num_hh == 0 && pk_tok_4 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[4] = 1.0f;
-                                    if (pk_cnt[4] != 0) {
-                                        pk_g[4] = gate[(pj_s0 + pk_tok_4) * num_heads + pj_head];
+                                    int pw_t_1 = pw_b - 256 + 32 + pw_lane;
+                                    pw_g[1] = 1.0f;
+                                    if (pw_t_1 >= pw_tlo) {
+                                        pw_g[1] = gate[(pj_s0 + pw_t_1) * num_heads + pj_head];
                                     }
-                                    int pk_row_5 = (pk_x0 - 1 - 2) * 64 + pk_lane + 32;
-                                    int pk_tok_5 = pk_row_5 / num_hh;
-                                    pk_cnt[5] = ((pk_x0 - 1 - 2 >= 0 && pk_row_5 - pk_tok_5 * num_hh == 0 && pk_tok_5 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[5] = 1.0f;
-                                    if (pk_cnt[5] != 0) {
-                                        pk_g[5] = gate[(pj_s0 + pk_tok_5) * num_heads + pj_head];
+                                    int pw_t_2 = pw_b - 256 + 64 + pw_lane;
+                                    pw_g[2] = 1.0f;
+                                    if (pw_t_2 >= pw_tlo) {
+                                        pw_g[2] = gate[(pj_s0 + pw_t_2) * num_heads + pj_head];
                                     }
-                                    int pk_row_6 = (pk_x0 - 1 - 3) * 64 + pk_lane;
-                                    int pk_tok_6 = pk_row_6 / num_hh;
-                                    pk_cnt[6] = ((pk_x0 - 1 - 3 >= 0 && pk_row_6 - pk_tok_6 * num_hh == 0 && pk_tok_6 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[6] = 1.0f;
-                                    if (pk_cnt[6] != 0) {
-                                        pk_g[6] = gate[(pj_s0 + pk_tok_6) * num_heads + pj_head];
+                                    int pw_t_3 = pw_b - 256 + 96 + pw_lane;
+                                    pw_g[3] = 1.0f;
+                                    if (pw_t_3 >= pw_tlo) {
+                                        pw_g[3] = gate[(pj_s0 + pw_t_3) * num_heads + pj_head];
                                     }
-                                    int pk_row_7 = (pk_x0 - 1 - 3) * 64 + pk_lane + 32;
-                                    int pk_tok_7 = pk_row_7 / num_hh;
-                                    pk_cnt[7] = ((pk_x0 - 1 - 3 >= 0 && pk_row_7 - pk_tok_7 * num_hh == 0 && pk_tok_7 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[7] = 1.0f;
-                                    if (pk_cnt[7] != 0) {
-                                        pk_g[7] = gate[(pj_s0 + pk_tok_7) * num_heads + pj_head];
+                                    int pw_t_4 = pw_b - 256 + 128 + pw_lane;
+                                    pw_g[4] = 1.0f;
+                                    if (pw_t_4 >= pw_tlo) {
+                                        pw_g[4] = gate[(pj_s0 + pw_t_4) * num_heads + pj_head];
                                     }
-                                    int pk_row_8 = (pk_x0 - 1 - 4) * 64 + pk_lane;
-                                    int pk_tok_8 = pk_row_8 / num_hh;
-                                    pk_cnt[8] = ((pk_x0 - 1 - 4 >= 0 && pk_row_8 - pk_tok_8 * num_hh == 0 && pk_tok_8 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[8] = 1.0f;
-                                    if (pk_cnt[8] != 0) {
-                                        pk_g[8] = gate[(pj_s0 + pk_tok_8) * num_heads + pj_head];
+                                    int pw_t_5 = pw_b - 256 + 160 + pw_lane;
+                                    pw_g[5] = 1.0f;
+                                    if (pw_t_5 >= pw_tlo) {
+                                        pw_g[5] = gate[(pj_s0 + pw_t_5) * num_heads + pj_head];
                                     }
-                                    int pk_row_9 = (pk_x0 - 1 - 4) * 64 + pk_lane + 32;
-                                    int pk_tok_9 = pk_row_9 / num_hh;
-                                    pk_cnt[9] = ((pk_x0 - 1 - 4 >= 0 && pk_row_9 - pk_tok_9 * num_hh == 0 && pk_tok_9 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[9] = 1.0f;
-                                    if (pk_cnt[9] != 0) {
-                                        pk_g[9] = gate[(pj_s0 + pk_tok_9) * num_heads + pj_head];
+                                    int pw_t_6 = pw_b - 256 + 192 + pw_lane;
+                                    pw_g[6] = 1.0f;
+                                    if (pw_t_6 >= pw_tlo) {
+                                        pw_g[6] = gate[(pj_s0 + pw_t_6) * num_heads + pj_head];
                                     }
-                                    int pk_row_10 = (pk_x0 - 1 - 5) * 64 + pk_lane;
-                                    int pk_tok_10 = pk_row_10 / num_hh;
-                                    pk_cnt[10] = ((pk_x0 - 1 - 5 >= 0 && pk_row_10 - pk_tok_10 * num_hh == 0 && pk_tok_10 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[10] = 1.0f;
-                                    if (pk_cnt[10] != 0) {
-                                        pk_g[10] = gate[(pj_s0 + pk_tok_10) * num_heads + pj_head];
+                                    int pw_t_7 = pw_b - 256 + 224 + pw_lane;
+                                    pw_g[7] = 1.0f;
+                                    if (pw_t_7 >= pw_tlo) {
+                                        pw_g[7] = gate[(pj_s0 + pw_t_7) * num_heads + pj_head];
                                     }
-                                    int pk_row_11 = (pk_x0 - 1 - 5) * 64 + pk_lane + 32;
-                                    int pk_tok_11 = pk_row_11 / num_hh;
-                                    pk_cnt[11] = ((pk_x0 - 1 - 5 >= 0 && pk_row_11 - pk_tok_11 * num_hh == 0 && pk_tok_11 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[11] = 1.0f;
-                                    if (pk_cnt[11] != 0) {
-                                        pk_g[11] = gate[(pj_s0 + pk_tok_11) * num_heads + pj_head];
-                                    }
-                                    int pk_row_12 = (pk_x0 - 1 - 6) * 64 + pk_lane;
-                                    int pk_tok_12 = pk_row_12 / num_hh;
-                                    pk_cnt[12] = ((pk_x0 - 1 - 6 >= 0 && pk_row_12 - pk_tok_12 * num_hh == 0 && pk_tok_12 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[12] = 1.0f;
-                                    if (pk_cnt[12] != 0) {
-                                        pk_g[12] = gate[(pj_s0 + pk_tok_12) * num_heads + pj_head];
-                                    }
-                                    int pk_row_13 = (pk_x0 - 1 - 6) * 64 + pk_lane + 32;
-                                    int pk_tok_13 = pk_row_13 / num_hh;
-                                    pk_cnt[13] = ((pk_x0 - 1 - 6 >= 0 && pk_row_13 - pk_tok_13 * num_hh == 0 && pk_tok_13 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[13] = 1.0f;
-                                    if (pk_cnt[13] != 0) {
-                                        pk_g[13] = gate[(pj_s0 + pk_tok_13) * num_heads + pj_head];
-                                    }
-                                    int pk_row_14 = (pk_x0 - 1 - 7) * 64 + pk_lane;
-                                    int pk_tok_14 = pk_row_14 / num_hh;
-                                    pk_cnt[14] = ((pk_x0 - 1 - 7 >= 0 && pk_row_14 - pk_tok_14 * num_hh == 0 && pk_tok_14 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[14] = 1.0f;
-                                    if (pk_cnt[14] != 0) {
-                                        pk_g[14] = gate[(pj_s0 + pk_tok_14) * num_heads + pj_head];
-                                    }
-                                    int pk_row_15 = (pk_x0 - 1 - 7) * 64 + pk_lane + 32;
-                                    int pk_tok_15 = pk_row_15 / num_hh;
-                                    pk_cnt[15] = ((pk_x0 - 1 - 7 >= 0 && pk_row_15 - pk_tok_15 * num_hh == 0 && pk_tok_15 < pj_e0 - pj_s0) ? 1 : 0);
-                                    pk_g[15] = 1.0f;
-                                    if (pk_cnt[15] != 0) {
-                                        pk_g[15] = gate[(pj_s0 + pk_tok_15) * num_heads + pj_head];
-                                    }
-                                    float pk_part_0 = 0.0f;
-                                    float pk_lg_0;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_0) : "f"(pk_g[0] + 1e-10f));
-                                    pk_part_0 = pk_part_0 + ((pk_cnt[0] != 0) ? pk_lg_0 : 0.0f);
-                                    float pk_lg_1;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_1) : "f"(pk_g[1] + 1e-10f));
-                                    pk_part_0 = pk_part_0 + ((pk_cnt[1] != 0) ? pk_lg_1 : 0.0f);
-                                    float pk_o_0 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 1);
-                                    pk_part_0 = pk_part_0 + pk_o_0;
-                                    float pk_o_1 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 2);
-                                    pk_part_0 = pk_part_0 + pk_o_1;
-                                    float pk_o_2 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 4);
-                                    pk_part_0 = pk_part_0 + pk_o_2;
-                                    float pk_o_3 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 8);
-                                    pk_part_0 = pk_part_0 + pk_o_3;
-                                    float pk_o_4 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 16);
-                                    pk_part_0 = pk_part_0 + pk_o_4;
-                                    if (w == 0 && pk_x0 - 1 >= 0) {
-                                        pk_acc = pk_acc + pk_part_0;
-                                        int pk_hit_0 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_0 != 0) {
-                                            w = pk_b * 8 + 1;
+                                    int pw_go = ((pw_b > pw_tlo) ? 1 : 0);
+                                    while (pw_go != 0) {
+                                        int pw_tn_0 = pw_b - 512 + pw_lane;
+                                        pw_n[0] = 1.0f;
+                                        if (pw_tn_0 >= pw_tlo) {
+                                            pw_n[0] = gate[(pj_s0 + pw_tn_0) * num_heads + pj_head];
+                                        }
+                                        int pw_tn_1 = pw_b - 512 + 32 + pw_lane;
+                                        pw_n[1] = 1.0f;
+                                        if (pw_tn_1 >= pw_tlo) {
+                                            pw_n[1] = gate[(pj_s0 + pw_tn_1) * num_heads + pj_head];
+                                        }
+                                        int pw_tn_2 = pw_b - 512 + 64 + pw_lane;
+                                        pw_n[2] = 1.0f;
+                                        if (pw_tn_2 >= pw_tlo) {
+                                            pw_n[2] = gate[(pj_s0 + pw_tn_2) * num_heads + pj_head];
+                                        }
+                                        int pw_tn_3 = pw_b - 512 + 96 + pw_lane;
+                                        pw_n[3] = 1.0f;
+                                        if (pw_tn_3 >= pw_tlo) {
+                                            pw_n[3] = gate[(pj_s0 + pw_tn_3) * num_heads + pj_head];
+                                        }
+                                        int pw_tn_4 = pw_b - 512 + 128 + pw_lane;
+                                        pw_n[4] = 1.0f;
+                                        if (pw_tn_4 >= pw_tlo) {
+                                            pw_n[4] = gate[(pj_s0 + pw_tn_4) * num_heads + pj_head];
+                                        }
+                                        int pw_tn_5 = pw_b - 512 + 160 + pw_lane;
+                                        pw_n[5] = 1.0f;
+                                        if (pw_tn_5 >= pw_tlo) {
+                                            pw_n[5] = gate[(pj_s0 + pw_tn_5) * num_heads + pj_head];
+                                        }
+                                        int pw_tn_6 = pw_b - 512 + 192 + pw_lane;
+                                        pw_n[6] = 1.0f;
+                                        if (pw_tn_6 >= pw_tlo) {
+                                            pw_n[6] = gate[(pj_s0 + pw_tn_6) * num_heads + pj_head];
+                                        }
+                                        int pw_tn_7 = pw_b - 512 + 224 + pw_lane;
+                                        pw_n[7] = 1.0f;
+                                        if (pw_tn_7 >= pw_tlo) {
+                                            pw_n[7] = gate[(pj_s0 + pw_tn_7) * num_heads + pj_head];
+                                        }
+                                        float pw_part = 0.0f;
+                                        int pw_tc_0 = pw_b - 256 + pw_lane;
+                                        float pw_lg_0;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_0) : "f"(pw_g[0] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_0 >= pw_tlo) ? pw_lg_0 : 0.0f);
+                                        int pw_tc_1 = pw_b - 256 + 32 + pw_lane;
+                                        float pw_lg_1;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_1) : "f"(pw_g[1] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_1 >= pw_tlo) ? pw_lg_1 : 0.0f);
+                                        int pw_tc_2 = pw_b - 256 + 64 + pw_lane;
+                                        float pw_lg_2;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_2) : "f"(pw_g[2] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_2 >= pw_tlo) ? pw_lg_2 : 0.0f);
+                                        int pw_tc_3 = pw_b - 256 + 96 + pw_lane;
+                                        float pw_lg_3;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_3) : "f"(pw_g[3] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_3 >= pw_tlo) ? pw_lg_3 : 0.0f);
+                                        int pw_tc_4 = pw_b - 256 + 128 + pw_lane;
+                                        float pw_lg_4;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_4) : "f"(pw_g[4] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_4 >= pw_tlo) ? pw_lg_4 : 0.0f);
+                                        int pw_tc_5 = pw_b - 256 + 160 + pw_lane;
+                                        float pw_lg_5;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_5) : "f"(pw_g[5] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_5 >= pw_tlo) ? pw_lg_5 : 0.0f);
+                                        int pw_tc_6 = pw_b - 256 + 192 + pw_lane;
+                                        float pw_lg_6;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_6) : "f"(pw_g[6] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_6 >= pw_tlo) ? pw_lg_6 : 0.0f);
+                                        int pw_tc_7 = pw_b - 256 + 224 + pw_lane;
+                                        float pw_lg_7;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_7) : "f"(pw_g[7] + 1e-10f));
+                                        pw_part = pw_part + ((pw_tc_7 >= pw_tlo) ? pw_lg_7 : 0.0f);
+                                        float pw_o_0 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 1);
+                                        pw_part = pw_part + pw_o_0;
+                                        float pw_o_1 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 2);
+                                        pw_part = pw_part + pw_o_1;
+                                        float pw_o_2 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 4);
+                                        pw_part = pw_part + pw_o_2;
+                                        float pw_o_3 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 8);
+                                        pw_part = pw_part + pw_o_3;
+                                        float pw_o_4 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 16);
+                                        pw_part = pw_part + pw_o_4;
+                                        pw_acc = pw_acc + pw_part;
+                                        int pw_hit = __any_sync(0xFFFFFFFF, pw_acc <= -14.43f);
+                                        hit = ((pw_hit != 0) ? 1 : 0);
+                                        pw_b = pw_b - 256;
+                                        pw_go = ((hit == 0 && pw_b > pw_tlo) ? 1 : 0);
+                                        if (pw_go != 0) {
+                                            pw_g[0] = pw_n[0];
+                                            pw_g[1] = pw_n[1];
+                                            pw_g[2] = pw_n[2];
+                                            pw_g[3] = pw_n[3];
+                                            pw_g[4] = pw_n[4];
+                                            pw_g[5] = pw_n[5];
+                                            pw_g[6] = pw_n[6];
+                                            pw_g[7] = pw_n[7];
                                         }
                                     }
-                                    float pk_part_1 = 0.0f;
-                                    float pk_lg_2;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_2) : "f"(pk_g[2] + 1e-10f));
-                                    pk_part_1 = pk_part_1 + ((pk_cnt[2] != 0) ? pk_lg_2 : 0.0f);
-                                    float pk_lg_3;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_3) : "f"(pk_g[3] + 1e-10f));
-                                    pk_part_1 = pk_part_1 + ((pk_cnt[3] != 0) ? pk_lg_3 : 0.0f);
-                                    float pk_o_5 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 1);
-                                    pk_part_1 = pk_part_1 + pk_o_5;
-                                    float pk_o_6 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 2);
-                                    pk_part_1 = pk_part_1 + pk_o_6;
-                                    float pk_o_7 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 4);
-                                    pk_part_1 = pk_part_1 + pk_o_7;
-                                    float pk_o_8 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 8);
-                                    pk_part_1 = pk_part_1 + pk_o_8;
-                                    float pk_o_9 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 16);
-                                    pk_part_1 = pk_part_1 + pk_o_9;
-                                    if (w == 0 && pk_x0 - 1 - 1 >= 0) {
-                                        pk_acc = pk_acc + pk_part_1;
-                                        int pk_hit_1 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_1 != 0) {
-                                            w = pk_b * 8 + 1 + 1;
-                                        }
+                                    pj_w = hit;
+                                    if (hit == 0 && pj_x <= 128) {
+                                        pj_prev = pj_x;
+                                        pj_tot = pw_acc;
                                     }
-                                    float pk_part_2 = 0.0f;
-                                    float pk_lg_4;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_4) : "f"(pk_g[4] + 1e-10f));
-                                    pk_part_2 = pk_part_2 + ((pk_cnt[4] != 0) ? pk_lg_4 : 0.0f);
-                                    float pk_lg_5;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_5) : "f"(pk_g[5] + 1e-10f));
-                                    pk_part_2 = pk_part_2 + ((pk_cnt[5] != 0) ? pk_lg_5 : 0.0f);
-                                    float pk_o_10 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 1);
-                                    pk_part_2 = pk_part_2 + pk_o_10;
-                                    float pk_o_11 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 2);
-                                    pk_part_2 = pk_part_2 + pk_o_11;
-                                    float pk_o_12 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 4);
-                                    pk_part_2 = pk_part_2 + pk_o_12;
-                                    float pk_o_13 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 8);
-                                    pk_part_2 = pk_part_2 + pk_o_13;
-                                    float pk_o_14 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 16);
-                                    pk_part_2 = pk_part_2 + pk_o_14;
-                                    if (w == 0 && pk_x0 - 1 - 2 >= 0) {
-                                        pk_acc = pk_acc + pk_part_2;
-                                        int pk_hit_2 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_2 != 0) {
-                                            w = pk_b * 8 + 2 + 1;
-                                        }
-                                    }
-                                    float pk_part_3 = 0.0f;
-                                    float pk_lg_6;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_6) : "f"(pk_g[6] + 1e-10f));
-                                    pk_part_3 = pk_part_3 + ((pk_cnt[6] != 0) ? pk_lg_6 : 0.0f);
-                                    float pk_lg_7;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_7) : "f"(pk_g[7] + 1e-10f));
-                                    pk_part_3 = pk_part_3 + ((pk_cnt[7] != 0) ? pk_lg_7 : 0.0f);
-                                    float pk_o_15 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 1);
-                                    pk_part_3 = pk_part_3 + pk_o_15;
-                                    float pk_o_16 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 2);
-                                    pk_part_3 = pk_part_3 + pk_o_16;
-                                    float pk_o_17 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 4);
-                                    pk_part_3 = pk_part_3 + pk_o_17;
-                                    float pk_o_18 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 8);
-                                    pk_part_3 = pk_part_3 + pk_o_18;
-                                    float pk_o_19 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 16);
-                                    pk_part_3 = pk_part_3 + pk_o_19;
-                                    if (w == 0 && pk_x0 - 1 - 3 >= 0) {
-                                        pk_acc = pk_acc + pk_part_3;
-                                        int pk_hit_3 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_3 != 0) {
-                                            w = pk_b * 8 + 3 + 1;
-                                        }
-                                    }
-                                    float pk_part_4 = 0.0f;
-                                    float pk_lg_8;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_8) : "f"(pk_g[8] + 1e-10f));
-                                    pk_part_4 = pk_part_4 + ((pk_cnt[8] != 0) ? pk_lg_8 : 0.0f);
-                                    float pk_lg_9;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_9) : "f"(pk_g[9] + 1e-10f));
-                                    pk_part_4 = pk_part_4 + ((pk_cnt[9] != 0) ? pk_lg_9 : 0.0f);
-                                    float pk_o_20 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 1);
-                                    pk_part_4 = pk_part_4 + pk_o_20;
-                                    float pk_o_21 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 2);
-                                    pk_part_4 = pk_part_4 + pk_o_21;
-                                    float pk_o_22 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 4);
-                                    pk_part_4 = pk_part_4 + pk_o_22;
-                                    float pk_o_23 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 8);
-                                    pk_part_4 = pk_part_4 + pk_o_23;
-                                    float pk_o_24 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 16);
-                                    pk_part_4 = pk_part_4 + pk_o_24;
-                                    if (w == 0 && pk_x0 - 1 - 4 >= 0) {
-                                        pk_acc = pk_acc + pk_part_4;
-                                        int pk_hit_4 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_4 != 0) {
-                                            w = pk_b * 8 + 4 + 1;
-                                        }
-                                    }
-                                    float pk_part_5 = 0.0f;
-                                    float pk_lg_10;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_10) : "f"(pk_g[10] + 1e-10f));
-                                    pk_part_5 = pk_part_5 + ((pk_cnt[10] != 0) ? pk_lg_10 : 0.0f);
-                                    float pk_lg_11;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_11) : "f"(pk_g[11] + 1e-10f));
-                                    pk_part_5 = pk_part_5 + ((pk_cnt[11] != 0) ? pk_lg_11 : 0.0f);
-                                    float pk_o_25 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 1);
-                                    pk_part_5 = pk_part_5 + pk_o_25;
-                                    float pk_o_26 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 2);
-                                    pk_part_5 = pk_part_5 + pk_o_26;
-                                    float pk_o_27 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 4);
-                                    pk_part_5 = pk_part_5 + pk_o_27;
-                                    float pk_o_28 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 8);
-                                    pk_part_5 = pk_part_5 + pk_o_28;
-                                    float pk_o_29 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 16);
-                                    pk_part_5 = pk_part_5 + pk_o_29;
-                                    if (w == 0 && pk_x0 - 1 - 5 >= 0) {
-                                        pk_acc = pk_acc + pk_part_5;
-                                        int pk_hit_5 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_5 != 0) {
-                                            w = pk_b * 8 + 5 + 1;
-                                        }
-                                    }
-                                    float pk_part_6 = 0.0f;
-                                    float pk_lg_12;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_12) : "f"(pk_g[12] + 1e-10f));
-                                    pk_part_6 = pk_part_6 + ((pk_cnt[12] != 0) ? pk_lg_12 : 0.0f);
-                                    float pk_lg_13;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_13) : "f"(pk_g[13] + 1e-10f));
-                                    pk_part_6 = pk_part_6 + ((pk_cnt[13] != 0) ? pk_lg_13 : 0.0f);
-                                    float pk_o_30 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 1);
-                                    pk_part_6 = pk_part_6 + pk_o_30;
-                                    float pk_o_31 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 2);
-                                    pk_part_6 = pk_part_6 + pk_o_31;
-                                    float pk_o_32 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 4);
-                                    pk_part_6 = pk_part_6 + pk_o_32;
-                                    float pk_o_33 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 8);
-                                    pk_part_6 = pk_part_6 + pk_o_33;
-                                    float pk_o_34 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 16);
-                                    pk_part_6 = pk_part_6 + pk_o_34;
-                                    if (w == 0 && pk_x0 - 1 - 6 >= 0) {
-                                        pk_acc = pk_acc + pk_part_6;
-                                        int pk_hit_6 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_6 != 0) {
-                                            w = pk_b * 8 + 6 + 1;
-                                        }
-                                    }
-                                    float pk_part_7 = 0.0f;
-                                    float pk_lg_14;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_14) : "f"(pk_g[14] + 1e-10f));
-                                    pk_part_7 = pk_part_7 + ((pk_cnt[14] != 0) ? pk_lg_14 : 0.0f);
-                                    float pk_lg_15;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_15) : "f"(pk_g[15] + 1e-10f));
-                                    pk_part_7 = pk_part_7 + ((pk_cnt[15] != 0) ? pk_lg_15 : 0.0f);
-                                    float pk_o_35 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 1);
-                                    pk_part_7 = pk_part_7 + pk_o_35;
-                                    float pk_o_36 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 2);
-                                    pk_part_7 = pk_part_7 + pk_o_36;
-                                    float pk_o_37 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 4);
-                                    pk_part_7 = pk_part_7 + pk_o_37;
-                                    float pk_o_38 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 8);
-                                    pk_part_7 = pk_part_7 + pk_o_38;
-                                    float pk_o_39 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 16);
-                                    pk_part_7 = pk_part_7 + pk_o_39;
-                                    if (w == 0 && pk_x0 - 1 - 7 >= 0) {
-                                        pk_acc = pk_acc + pk_part_7;
-                                        int pk_hit_7 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
-                                        if (pk_hit_7 != 0) {
-                                            w = pk_b * 8 + 7 + 1;
-                                        }
-                                    }
-                                    pk_b = pk_b + 1;
-                                    pk_go = ((w == 0 && pk_b < 16 && pk_x0 - 8 > 0) ? 1 : 0);
                                 }
                                 if (pj_fw == 0) {
-                                    pj_warm = w;
-                                    pj_sat = ((w != 0) ? 1 : 0);
+                                    pj_warm = pj_w;
+                                    pj_sat = ((pj_w != 0) ? 1 : 0);
                                     pj_go = pj_sat;
                                 }
-                                if (pj_fw > 0 && w != 0) {
+                                if (pj_fw > 0 && pj_w != 0) {
                                     pj_wend = pj_x;
                                     pj_go = 0;
                                 }

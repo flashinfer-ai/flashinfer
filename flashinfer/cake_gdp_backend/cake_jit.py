@@ -13655,7 +13655,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_f108e105bd1ec635650f": {
+    "cake_gdp_26a79828ab8713b466c5": {
         "arches": [
             "sm_103a",
         ],
@@ -13687,7 +13687,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -13717,8 +13717,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_f108e105bd1ec635650f",
-        "kernel_symbol": "kernel_cake_gdp_f108e105bd1ec635650f",
+        "kernel": "cake_gdp_26a79828ab8713b466c5",
+        "kernel_symbol": "kernel_cake_gdp_26a79828ab8713b466c5",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -13726,7 +13726,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_f108e105bd1ec635650f",
+        "library": "cake_gdp_26a79828ab8713b466c5",
         "logical": {
             "K": "k",
             "O": "o",
@@ -13756,7 +13756,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_88c5777dabbda5e1e5a8": {
+    "cake_gdp_04160875e0e65fe60026": {
         "arches": [
             "sm_103a",
         ],
@@ -13788,7 +13788,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -13818,8 +13818,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_88c5777dabbda5e1e5a8",
-        "kernel_symbol": "kernel_cake_gdp_88c5777dabbda5e1e5a8",
+        "kernel": "cake_gdp_04160875e0e65fe60026",
+        "kernel_symbol": "kernel_cake_gdp_04160875e0e65fe60026",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -13827,7 +13827,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_88c5777dabbda5e1e5a8",
+        "library": "cake_gdp_04160875e0e65fe60026",
         "logical": {
             "K": "k",
             "O": "o",
@@ -14079,7 +14079,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_6f505b4fb9199bf89c96": {
+    "cake_gdp_f40413c9ea5f77600699": {
         "arches": [
             "sm_103a",
         ],
@@ -14115,7 +14115,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -14147,8 +14147,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_6f505b4fb9199bf89c96",
-        "kernel_symbol": "kernel_cake_gdp_6f505b4fb9199bf89c96",
+        "kernel": "cake_gdp_f40413c9ea5f77600699",
+        "kernel_symbol": "kernel_cake_gdp_f40413c9ea5f77600699",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -14156,7 +14156,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_6f505b4fb9199bf89c96",
+        "library": "cake_gdp_f40413c9ea5f77600699",
         "logical": {
             "K": "k",
             "O": "o",
@@ -14190,7 +14190,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_1d27e13364ddfad0595c": {
+    "cake_gdp_c39ce0efb75d6240b1d4": {
         "arches": [
             "sm_103a",
         ],
@@ -14226,7 +14226,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -14258,8 +14258,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_1d27e13364ddfad0595c",
-        "kernel_symbol": "kernel_cake_gdp_1d27e13364ddfad0595c",
+        "kernel": "cake_gdp_c39ce0efb75d6240b1d4",
+        "kernel_symbol": "kernel_cake_gdp_c39ce0efb75d6240b1d4",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -14267,7 +14267,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_1d27e13364ddfad0595c",
+        "library": "cake_gdp_c39ce0efb75d6240b1d4",
         "logical": {
             "K": "k",
             "O": "o",
@@ -14533,7 +14533,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_0ad4bbaf5ef274640c3a": {
+    "cake_gdp_a12e8746d7541ad471ac": {
         "arches": [
             "sm_103a",
         ],
@@ -14571,7 +14571,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -14604,8 +14604,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_0ad4bbaf5ef274640c3a",
-        "kernel_symbol": "kernel_cake_gdp_0ad4bbaf5ef274640c3a",
+        "kernel": "cake_gdp_a12e8746d7541ad471ac",
+        "kernel_symbol": "kernel_cake_gdp_a12e8746d7541ad471ac",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -14613,7 +14613,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_0ad4bbaf5ef274640c3a",
+        "library": "cake_gdp_a12e8746d7541ad471ac",
         "logical": {
             "K": "k",
             "O": "o",
@@ -14649,7 +14649,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_25d81fdd5cf38d846a0d": {
+    "cake_gdp_326b3128513266c6f402": {
         "arches": [
             "sm_103a",
         ],
@@ -14687,7 +14687,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -14720,8 +14720,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_25d81fdd5cf38d846a0d",
-        "kernel_symbol": "kernel_cake_gdp_25d81fdd5cf38d846a0d",
+        "kernel": "cake_gdp_326b3128513266c6f402",
+        "kernel_symbol": "kernel_cake_gdp_326b3128513266c6f402",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -14729,7 +14729,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_25d81fdd5cf38d846a0d",
+        "library": "cake_gdp_326b3128513266c6f402",
         "logical": {
             "K": "k",
             "O": "o",
@@ -14997,7 +14997,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_2765b8c0ae143504657e": {
+    "cake_gdp_c6c640ba25906f3b851a": {
         "arches": [
             "sm_103a",
         ],
@@ -15035,7 +15035,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -15068,8 +15068,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_2765b8c0ae143504657e",
-        "kernel_symbol": "kernel_cake_gdp_2765b8c0ae143504657e",
+        "kernel": "cake_gdp_c6c640ba25906f3b851a",
+        "kernel_symbol": "kernel_cake_gdp_c6c640ba25906f3b851a",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -15077,7 +15077,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_2765b8c0ae143504657e",
+        "library": "cake_gdp_c6c640ba25906f3b851a",
         "logical": {
             "K": "k",
             "O": "o",
@@ -15113,7 +15113,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_68d934c41a0fbe0fb027": {
+    "cake_gdp_13b07ddf43faaf58b7d1": {
         "arches": [
             "sm_103a",
         ],
@@ -15151,7 +15151,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -15184,8 +15184,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_68d934c41a0fbe0fb027",
-        "kernel_symbol": "kernel_cake_gdp_68d934c41a0fbe0fb027",
+        "kernel": "cake_gdp_13b07ddf43faaf58b7d1",
+        "kernel_symbol": "kernel_cake_gdp_13b07ddf43faaf58b7d1",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -15193,7 +15193,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_68d934c41a0fbe0fb027",
+        "library": "cake_gdp_13b07ddf43faaf58b7d1",
         "logical": {
             "K": "k",
             "O": "o",
@@ -15435,14 +15435,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_717ce3c684b41c37e673",
         ],
         "prefill": [
-            "cake_gdp_f108e105bd1ec635650f",
-            "cake_gdp_88c5777dabbda5e1e5a8",
-            "cake_gdp_6f505b4fb9199bf89c96",
-            "cake_gdp_1d27e13364ddfad0595c",
-            "cake_gdp_0ad4bbaf5ef274640c3a",
-            "cake_gdp_25d81fdd5cf38d846a0d",
-            "cake_gdp_2765b8c0ae143504657e",
-            "cake_gdp_68d934c41a0fbe0fb027",
+            "cake_gdp_26a79828ab8713b466c5",
+            "cake_gdp_04160875e0e65fe60026",
+            "cake_gdp_f40413c9ea5f77600699",
+            "cake_gdp_c39ce0efb75d6240b1d4",
+            "cake_gdp_a12e8746d7541ad471ac",
+            "cake_gdp_326b3128513266c6f402",
+            "cake_gdp_c6c640ba25906f3b851a",
+            "cake_gdp_13b07ddf43faaf58b7d1",
         ],
     },
     "sm_107a": {
