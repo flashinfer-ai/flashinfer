@@ -34,6 +34,11 @@ if [[ ! "${PYTHON_VERSION}" =~ ^3\.[0-9]+$ ]]; then
   echo "Invalid Python version in ${PYTHON_VERSION_FILE}: ${PYTHON_VERSION}" >&2
   exit 2
 fi
+# The wheels are cp39-abi3, so the build interpreter does not change them. PyTorch's
+# nightly/cu134 index has no Python 3.10 torch, so build with 3.11 at least.
+if [[ "${PYTHON_VERSION}" == "3.10" ]]; then
+  PYTHON_VERSION=3.11
+fi
 PYTHON_ABI="cp${PYTHON_VERSION//./}"
 
 BUILD_TARGET=${FLASHINFER_JIT_CACHE_BUILD_TARGET:-}
