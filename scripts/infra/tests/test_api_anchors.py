@@ -99,3 +99,27 @@ class AnchorTest(unittest.TestCase):
                 anchor = select_anchor(case["finding"], [case["file"]])
                 self.assertTrue(anchor.get("line"))
                 self.assertNotIn("subject_type", anchor)
+
+    def test_chained_renames_match_original_filename_on_left(self):
+        files = [
+            {
+                "filename": "b.py",
+                "previous_filename": "a.py",
+                "patch": "@@ -1 +1 @@\n-old_a\n+new_b",
+            },
+            {
+                "filename": "c.py",
+                "previous_filename": "b.py",
+                "patch": "@@ -1 +1 @@\n-old_b\n+new_c",
+            },
+        ]
+        self.assertEqual(
+            select_anchor({"anchors": [["b.py", "LEFT", 1, 1]]}, files),
+            {"path": "c.py", "side": "LEFT", "line": 1},
+        )
+        for f in files:
+            f.pop("patch")
+        self.assertEqual(
+            select_anchor({"anchors": [["b.py", "LEFT", 1, 1]]}, files),
+            {"path": "c.py", "subject_type": "file"},
+        )

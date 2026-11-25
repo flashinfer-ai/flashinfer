@@ -43,8 +43,12 @@ def select_anchor(finding: dict, files: list[dict]) -> dict | None:
             (
                 f
                 for f in files
-                if f["filename"] == source
-                or (side == "LEFT" and f.get("previous_filename") == source)
+                if (
+                    f.get("previous_filename", f["filename"])
+                    if side == "LEFT"
+                    else f["filename"]
+                )
+                == source
             ),
             None,
         )
@@ -64,12 +68,19 @@ def select_anchor(finding: dict, files: list[dict]) -> dict | None:
         )
         return {k: best[k] for k in ("path", "side", "line")}
     # Preserve the explanation without inventing an unrelated line number.
-    sources = {r[0] for r in ranges}
     file = next(
         (
             f
             for f in files
-            if f["filename"] in sources or f.get("previous_filename") in sources
+            if any(
+                (
+                    f.get("previous_filename", f["filename"])
+                    if side == "LEFT"
+                    else f["filename"]
+                )
+                == source
+                for source, side, _, _ in ranges
+            )
         ),
         None,
     )

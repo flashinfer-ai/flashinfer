@@ -271,3 +271,46 @@ class ReviewRegressionTest(unittest.TestCase):
                     self.assertEqual(
                         any(f.classification == "BREAKING" for f in findings), broken
                     )
+
+
+class FollowupReviewTest(unittest.TestCase):
+    def test_recursive_union_requires_nonrecursive_members(self):
+        for after, compatible in [("Tree | str", False), ("Tree | int | str", True)]:
+            with self.subTest(after=after):
+                self.assertEqual(
+                    checker.is_compatible_annotation(
+                        "Tree", "Tree", {"Tree": "Tree | int"}, {"Tree": after}
+                    ),
+                    compatible,
+                )
+
+    def test_package_shadows_unchanged_module(self):
+        path = "flashinfer/example.py"
+        for edit_old in (False, True):
+            for new_signature, expected in [("x, y", "BREAKING"), ("x", None)]:
+                with self.subTest(edit_old=edit_old, signature=new_signature):
+                    old = {path: "@flashinfer_api\ndef api(x): pass\n"}
+                    new = {
+                        path: old[path] + ("\n# unrelated edit\n" if edit_old else ""),
+                        "flashinfer/example/__init__.py": "@flashinfer_api\ndef api("
+                        + new_signature
+                        + "): pass\n",
+                    }
+                    findings = compare_snapshots(old, new)
+                    self.assertEqual(
+                        next(
+                            (
+                                f.classification
+                                for f in findings
+                                if f.api == "flashinfer.example.api"
+                            ),
+                            None,
+                        ),
+                        expected,
+                    )
+
+    def test_lazy_dependencies_rebound_after_table_are_unknown(self):
+        import ast
+
+        source = 'NAMES={"api"}\n_LAZY_EXPORTS={name:(".example",name) for name in sorted(NAMES)}\nNAMES={"other"}\n'
+        self.assertIsNone(checker.lazy_keys(ast.parse(source)))

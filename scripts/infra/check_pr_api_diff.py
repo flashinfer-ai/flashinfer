@@ -225,22 +225,28 @@ def union_annotation_members(
     node = expand_annotation_alias(node, aliases)
     key = ast.dump(node)
     if key in seen:
-        return None
+        # A union referring to itself adds no concrete member. Tuple recursion
+        # stays opaque here and is compared structurally by annotation_accepts.
+        return ()
     seen = seen | {key}
+    members = None
     if isinstance(node, ast.Subscript):
-        annotation_name = typing_annotation_name(node.value)
-        if annotation_name == "Optional":
-            return (node.slice, ast.Constant(value=None))
-        if annotation_name == "Union":
-            elements = (
+        name = typing_annotation_name(node.value)
+        if name == "Optional":
+            members = (node.slice, ast.Constant(value=None))
+        elif name == "Union":
+            members = (
                 node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
             )
-            return tuple(elements)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        left = union_annotation_members(node.left, aliases, seen) or (node.left,)
-        right = union_annotation_members(node.right, aliases, seen) or (node.right,)
-        return (*left, *right)
-    return None
+    elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        members = (node.left, node.right)
+    if members is None:
+        return None
+    result = []
+    for member in members:
+        expanded = union_annotation_members(member, aliases, seen)
+        result.extend(expanded if expanded is not None else (member,))
+    return tuple(result)
 
 
 def subscript_arguments(node: ast.Subscript) -> tuple[ast.expr, ...]:
@@ -296,8 +302,8 @@ def annotation_accepts(
     before_members = union_annotation_members(before, before_aliases)
     after_members = union_annotation_members(after, after_aliases)
     if before_members is not None or after_members is not None:
-        old_members = before_members or (before,)
-        new_members = after_members or (after,)
+        old_members = before_members if before_members is not None else (before,)
+        new_members = after_members if after_members is not None else (after,)
         return all(
             any(
                 annotation_accepts(
@@ -733,12 +739,12 @@ def module_apis(
         # still re-exported.
         cache[module] = {}
         return cache[module]
-    for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
-        source = git_file(revision, candidate)
-        if source is not None:
-            cache[module] = extract_public_apis(candidate, source)
-            return cache[module]
-    cache[module] = {}
+    candidate = module_source_path(revision, module)
+    cache[module] = (
+        extract_public_apis(candidate, git_file(revision, candidate))
+        if candidate
+        else {}
+    )
     return cache[module]
 
 
@@ -892,7 +898,7 @@ def module_source_path(revision: str, module: str) -> str | None:
     return next(
         (
             candidate
-            for candidate in (f"{path}.py", f"{path}/__init__.py")
+            for candidate in (f"{path}/__init__.py", f"{path}.py")
             if git_file(revision, candidate) is not None
         ),
         None,
@@ -930,6 +936,13 @@ def lazy_keys(tree: ast.Module) -> set[str] | None:
             ):
                 related.add(child.id)
                 pending.append(bindings[child.id])
+    table = bindings.get("_LAZY_EXPORTS")
+    if table is not None and any(
+        bindings[name].lineno > table.lineno for name in related if name in bindings
+    ):
+        # Names used by comprehensions are evaluated when the table is built.
+        # A later binding cannot establish that an earlier key was absent.
+        return None
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
@@ -1112,21 +1125,26 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
         )
 
     target_cache: dict[str, dict[str, ApiFunction]] = {}
-    api_changes: dict[
-        ChangedFile, tuple[dict[str, ApiFunction], dict[str, ApiFunction]]
-    ] = {}
-
-    python_changes = sorted(
-        (
-            change
+    old_module_apis: dict[str, dict[str, ApiFunction]] = {}
+    # Resolve logical modules at both revisions. Adding a package can shadow
+    # an unchanged .py file, which is not itself present in git's changed paths.
+    modules = sorted(
+        {
+            module_name_from_path(path)
             for change in changes
-            if any(
-                path and path.startswith("flashinfer/") and path.endswith(".py")
-                for path in (change.old_path, change.new_path)
-            )
-        ),
-        key=lambda change: (change.new_path or change.old_path or ""),
+            for path in (change.old_path, change.new_path)
+            if path
+            and path.startswith("flashinfer/")
+            and path.endswith(".py")
+            and not is_experimental_path(path)
+        }
     )
+    python_changes = [
+        ChangedFile(
+            "M", module_source_path(base, module), module_source_path(head, module)
+        )
+        for module in modules
+    ]
     for change in python_changes:
         old_path, new_path = change.old_path, change.new_path
         old = (
@@ -1139,7 +1157,8 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
             if new_path and not is_experimental_path(new_path)
             else {}
         )
-        api_changes[change] = (old, new)
+        if old_path:
+            old_module_apis[module_name_from_path(old_path)] = old
 
         remaining_path = (
             module_source_path(head, module_name_from_path(old_path))
@@ -1266,7 +1285,11 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                     ),
                 )
     for change in changes:
-        old_apis, new_apis = api_changes.get(change, ({}, {}))
+        old_apis = (
+            old_module_apis.get(module_name_from_path(change.old_path), {})
+            if change.old_path
+            else {}
+        )
         old_module = public_module(change.old_path, has_decorated_api=bool(old_apis))
         if not old_module:
             continue
@@ -1299,7 +1322,7 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
             )
         elif change.status.startswith("R"):
             new_module = public_module(
-                change.new_path, has_decorated_api=bool(new_apis)
+                change.new_path, has_decorated_api=bool(old_apis)
             )
             if git_file(head, change.old_path or "") is None:
                 surface(
