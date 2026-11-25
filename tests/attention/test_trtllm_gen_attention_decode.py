@@ -1092,6 +1092,7 @@ def _test_trtllm_batch_decode(
             multi_ctas_kv_counter_buffer,
         ):
             before = tuple(getattr(workspace_buffer, _WORKSPACE_COUNTERS_ATTR, ()))
+            reused_out.fill_(math.nan)
             reused_output = run_with_counter(counter)
             assert reused_output.data_ptr() == reused_out.data_ptr()
             actual = reused_output.float() * o_scale
@@ -1882,20 +1883,46 @@ def test_trtllm_workspace_counter_graph_ownership_and_growth():
         assert output.item() == value * size
 
 
-def test_trtllm_workspace_counter_capture_first_isolation():
+@pytest.mark.parametrize("warm_cache", [False, True], ids=["cold", "undersized"])
+def test_trtllm_workspace_counter_capture_first_isolation(warm_cache):
     device = torch.device(GPU_DEVICE)
     sm_count = get_device_sm_count(device)
     owner = torch.empty(1, device=device)
+    num_qo_heads = 16
+    batch_size = 1
+    warm_bytes = 0
+    if warm_cache:
+        warm = _get_trtllm_gen_workspace_counter_buffer(
+            owner, 2, num_qo_heads, sm_count, device
+        )
+        warm_bytes = warm.numel()
+        batch_size = warm_bytes // (4 * num_qo_heads) + 1
+    required_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if warm_cache:
+        # Choose a size that distinguishes exact allocation from eager doubling.
+        assert warm_bytes < required_bytes < 2 * warm_bytes
+    cache_before = tuple(getattr(owner, _WORKSPACE_COUNTERS_ATTR, ()))
+
     torch.zeros(16, device=device, dtype=torch.uint8).sum()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = _get_trtllm_gen_workspace_counter_buffer(
-            owner, 1, 16, sm_count, device
+            owner, batch_size, num_qo_heads, sm_count, device
         )
         observed = captured.sum()
+    assert captured.numel() == required_bytes
+    cache_after = tuple(getattr(owner, _WORKSPACE_COUNTERS_ATTR, ()))
+    assert len(cache_after) == len(cache_before)
+    assert all(a is b for a, b in zip(cache_after, cache_before, strict=True))
+
     # The capture's zero has not executed; eager use needs its own initialized storage.
-    eager = _get_trtllm_gen_workspace_counter_buffer(owner, 1, 16, sm_count, device)
+    eager = _get_trtllm_gen_workspace_counter_buffer(
+        owner, batch_size, num_qo_heads, sm_count, device
+    )
+    assert eager.numel() == max(required_bytes, 2 * warm_bytes)
     assert eager.data_ptr() != captured.data_ptr()
     assert torch.count_nonzero(eager).item() == 0
     eager.fill_(7)

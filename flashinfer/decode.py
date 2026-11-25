@@ -4636,15 +4636,16 @@ def trtllm_batch_decode_with_kv_cache(
 
     multi_ctas_kv_counter_buffer : Optional[torch.Tensor] = None
         Optional separate counter buffer for ``trtllm-gen`` multi-CTA KV mode.
-        When omitted, FlashInfer caches a zero-initialized internal buffer on
-        the supplied ``workspace_buffer`` tensor. Reuse the same workspace
-        object and warm up before CUDA graph capture with a call that needs
-        at least as much counter capacity as the captured call. This avoids
-        a counter fill on each replay. A cache miss during capture uses a
-        graph-local buffer. Serialize GPU work that shares a workspace,
-        including graph replays. Use an event or stream wait when switching
-        streams. Keep the workspace tensor alive for every graph that uses it,
-        until its final replay has completed.
+        For non-DCP calls routed to ``trtllm-gen``, omitting the counter
+        caches a zero-initialized buffer on the supplied ``workspace_buffer``
+        tensor. Reuse the same workspace object and warm up before CUDA graph
+        capture with a call that needs at least as much counter capacity as
+        the captured call. This avoids a counter fill on each replay. A cache
+        miss during capture uses a graph-local buffer. Serialize GPU work that
+        shares a workspace, including graph replays. Use an event or stream
+        wait when switching streams. Keep the workspace tensor alive until
+        the last replay of every graph that uses it has completed.
+        DCP Split-KV requires a caller-provided counter buffer.
         When provided, it must be zero-initialized at allocation (e.g. via
         ``torch.zeros``); the kernel self-resets the counters at the end of each
         launch, so it does not need to be re-zeroed between calls.

@@ -1076,6 +1076,7 @@ def _get_trtllm_gen_workspace_counter_buffer(
     required_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
         batch_size, num_qo_heads, sm_count
     )
+    eager_bytes = required_bytes
     if counters:
         counter = counters[-1]
         if counter.device == device:
@@ -1104,11 +1105,14 @@ def _get_trtllm_gen_workspace_counter_buffer(
             # Retain old graph pointers without accumulating an allocation for
             # every small batch increase. All retained capacities sum to less
             # than twice the newest capacity on this workspace's device.
-            required_bytes = max(required_bytes, 2 * counter.numel())
+            eager_bytes = max(required_bytes, 2 * counter.numel())
 
-    counter = torch.zeros(required_bytes, dtype=torch.uint8, device=device)
     with torch.cuda.device(device):
         capturing = torch.cuda.is_current_stream_capturing()
+    # A capture miss is private to the graph, so spare capacity cannot be reused.
+    counter = torch.zeros(
+        required_bytes if capturing else eager_bytes, dtype=torch.uint8, device=device
+    )
     if not capturing:
         setattr(
             counter,
