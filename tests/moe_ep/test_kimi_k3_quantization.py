@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from flashinfer import moe_ep
-from flashinfer.moe_ep.kernel_src.sm100 import _kimi_k3_megamoe as provider
+from flashinfer.moe_ep.shims.sm100 import kimi_k3 as provider
 
 pytestmark = [pytest.mark.arch_blackwell, pytest.mark.gpu_exclusive]
 

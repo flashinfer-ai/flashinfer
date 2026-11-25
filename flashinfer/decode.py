@@ -1327,6 +1327,14 @@ def single_decode_with_kv_cache(
         return out
 
 
+def _batch_invariant_decode_causal(
+    q_len_per_req: int, is_causal: Optional[bool]
+) -> bool:
+    """The mask mode of the batch-invariant decode class: a single token per request is the causal class whatever
+    ``is_causal`` says; multi-token decode is causal unless ``is_causal=False``."""
+    return True if q_len_per_req <= 1 or is_causal is None else bool(is_causal)
+
+
 class BatchDecodeWithPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with a paged KV cache (first proposed in
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
@@ -1507,8 +1515,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            requires ``backend="auto"``. The mask mode is a class dimension: multi-token decode (``q_len_per_req > 1``) runs the
+            causal class (bottom-right aligned, optional ``window_left``) or, with ``is_causal=False``, the non-causal class (every
+            token sees its request's whole key range; no window); a single token per request is the causal class either way.
+            Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window with
+            ``is_causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
@@ -1737,7 +1748,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
     @property
     def resolved_backend(self) -> str:
-        r"""What the last :meth:`plan` resolved ``backend="auto"`` to: ``"cudnn"``
+        r"""The backend reported by this wrapper.
+
+        The last :meth:`plan` resolves ``backend="auto"`` to ``"cudnn"``
         when the auto rule picked cuDNN, the tensor-core pick (``"fa2"`` / ``"fa3"``)
         otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
         reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
@@ -1815,6 +1828,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        is_causal: Optional[bool] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -1824,6 +1838,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
         :meth:`plan`.  The wrapper's float workspace buffer is only used as the
         device/stream selector for the underlying module query.  This method
         does not allocate buffers and does not mutate cached plan state.
+
+        This query is not available for ``cute-dsl``, ``trtllm-gen``, ``cudnn``,
+        or ``cutile`` backends and raises ``NotImplementedError`` for them.
+
+        Under ``batch_invariant=True`` the size is that of the split-KV plan of
+        the mask mode :meth:`plan` will run, so pass the same ``q_len_per_req``,
+        ``is_causal`` and ``window_left`` as to :meth:`plan`: the two classes
+        plan different units for the same batch, and an input :meth:`plan`
+        refuses raises the same
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` here.
 
         Parameters
         ----------
@@ -1875,9 +1899,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size : Optional[int]
             The fixed split size for FA2 split-kv decode, in pages.
         disable_split_kv : bool
-            Whether to disable the split-kv for determinism in CUDA Graph. Defaults to ``False``.
+            Whether to disable split-KV on the ``fa2`` tensor-core path.
+            Defaults to ``False``. CUDA-core decode raises ``ValueError``
+            when this is ``True``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
+        is_causal : Optional[bool]
+            Whether the mask is causal within each request block, as in :meth:`plan`.
+            Defaults to ``None``, which derives it from ``q_len_per_req > 1``. Values
+            that differ from that default are not supported by this wrapper, except
+            under ``batch_invariant=True``, where ``is_causal=False`` with
+            ``q_len_per_req > 1`` sizes the non-causal batch-invariant class and a
+            single token per request is the causal class either way.
 
         Returns
         -------
@@ -1904,7 +1937,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 page_size,
                 window_left,
                 q_len_per_req,
+                causal=_batch_invariant_decode_causal(q_len_per_req, is_causal),
             ), 0
+        if is_causal is not None and is_causal != (q_len_per_req > 1):
+            raise NotImplementedError(
+                f"backend={self._backend!r} derives the decode mask from "
+                "q_len_per_req; an explicit is_causal override is not supported"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -1945,9 +1984,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             disable_split_kv=disable_split_kv,
         ):
             backend = "cudnn"
-        if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
+        if backend in ("cute-dsl", "trtllm-gen", "cudnn", "cutile"):
             raise NotImplementedError(
                 f"workspace_size is not available for decode backend {backend!r}"
+            )
+
+        if disable_split_kv and not self.use_tensor_cores:
+            raise ValueError(
+                "disable_split_kv is not supported by CUDA-core decode; "
+                "use use_tensor_cores=True with backend='fa2'."
             )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
@@ -2213,7 +2258,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
-            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+            Whether to disable split-KV on the ``fa2`` tensor-core or
+            ``cute-dsl`` backend. Defaults to ``False``. CUDA-core decode
+            raises ``ValueError`` when this is ``True``. The ``cutile``
+            backend currently ignores this flag.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``. This
             must be set at :meth:`plan` time to enable the XQA MTP decode fast
@@ -2230,7 +2278,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         is_causal : Optional[bool]
             Whether the mask is causal within each request block. Defaults to ``None``,
             which derives it from ``q_len_per_req > 1``. Values that differ from
-            that default are not supported by this wrapper.
+            that default are not supported by this wrapper, except under
+            ``batch_invariant=True``, where ``is_causal=False`` with ``q_len_per_req > 1``
+            runs the non-causal batch-invariant class (every token sees its request's
+            whole key range) and a single token per request is the causal class either way.
         use_token_head_sf : bool
             Whether the FP8 KV cache uses the per-(token, head) scale layout: a separate
             ``float32`` scale tensor (passed via ``kv_cache_sf`` in :meth:`run`) dequantizes
@@ -2332,14 +2383,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._batch_invariant.refuse(
                 window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
             )
-            if is_causal is not None and is_causal != (q_len_per_req > 1):
-                from .batch_invariant.support import unsupported
-
-                raise unsupported(
-                    self._batch_invariant.CLASS,
-                    f"is_causal={is_causal} with q_len_per_req={q_len_per_req}",
-                    "the bottom-right causal mask (is_causal follows q_len_per_req > 1)",
-                )
+            causal = _batch_invariant_decode_causal(q_len_per_req, is_causal)
             self._batch_invariant.plan(
                 qo_indptr=None,
                 kv_indptr=indptr,
@@ -2350,7 +2394,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim_qk=head_dim,
                 head_dim_vo=None,
                 page_size=page_size,
-                causal=True,
+                causal=causal,
                 window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 pos_encoding_mode=pos_encoding_mode,
@@ -2457,7 +2501,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
-        self._cudnn_auto = self._auto_prefers_cudnn(
+        cudnn_auto = self._auto_prefers_cudnn(
             q_data_type,
             kv_data_type,
             o_data_type,
@@ -2474,6 +2518,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        if (
+            disable_split_kv
+            and not self.use_tensor_cores
+            and not (self._backend == "cudnn" or cudnn_auto)
+            and self._backend != "cutile"
+        ):
+            raise ValueError(
+                "disable_split_kv is not supported by CUDA-core decode; "
+                "use use_tensor_cores=True with backend='fa2'."
+            )
+        # A rejected split option must leave the previous plan's route intact.
+        self._cudnn_auto = cudnn_auto
         if self.is_cuda_graph_enabled:
             # The resolved backend is part of the frozen CUDA-graph shape: a
             # captured graph replays the kernels it was captured with, and
@@ -4507,7 +4563,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
-        When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
+        When set to ``None``, PDL is enabled automatically on supported device architectures.
 
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa``/``trtllm-gen`` or
@@ -4565,8 +4621,8 @@ def trtllm_batch_decode_with_kv_cache(
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
     lse : Optional[torch.Tensor] = None
-        Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, only supported
-        by the ``trtllm-gen`` backend. Must have shape ``[num_tokens, num_qo_heads]``
+        Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, supported
+        by the ``trtllm-gen`` and ``cake`` backends. Must have shape ``[num_tokens, num_qo_heads]``
         and dtype ``torch.float32``. If provided, the tensor is filled regardless of
         :attr:`return_lse`. If ``return_lse`` is True and this is None, a buffer will
         be allocated internally.
@@ -5691,6 +5747,11 @@ def fast_decode_plan(
     cuDNN uses the regular planner to refresh its KV lengths and block table;
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
+
+    Outside CUDA graphs, ``indptr``, ``indices`` and ``last_page_len`` become the
+    wrapper's buffers without copying, so they must already be on the wrapper's
+    device; a ``ValueError`` is raised otherwise. Use
+    :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
     """
     # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
     indptr = indptr.contiguous()
@@ -5782,6 +5843,11 @@ def fast_decode_plan(
             disable_split_kv=disable_split_kv,
             q_len_per_req=q_len_per_req,
         )
+    if disable_split_kv and not self.use_tensor_cores:
+        raise ValueError(
+            "disable_split_kv is not supported by CUDA-core decode; "
+            "use use_tensor_cores=True with backend='fa2'."
+        )
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
     if q_len_per_req > 1 and not self.use_tensor_cores:
@@ -5823,6 +5889,22 @@ def fast_decode_plan(
                 f"this wrapper was planned with {frozen_q_len}, got "
                 f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
             )
+    if not self.is_cuda_graph_enabled:
+        # Outside CUDA graphs the metadata tensors become the wrapper's
+        # buffers as-is and run() hands their pointers to the kernel, so they
+        # must already be on the wrapper's device; plan() is the path that
+        # copies host metadata over. Checked before any plan state changes.
+        for name, tensor in (
+            ("indptr", indptr),
+            ("indices", indices),
+            ("last_page_len", last_page_len),
+        ):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} must be on the wrapper's device {self.device}, got "
+                    f"{tensor.device}; plan host metadata with "
+                    "BatchDecodeWithPagedKVCacheWrapper.plan(wrapper, ...)"
+                )
     is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:

@@ -62,6 +62,8 @@ class _BatchProgress:
     completed: int = 0
     current_nodeid: str | None = None
     current_started_at: float | None = None
+    # Unlike current_nodeid, finish() does not clear this.
+    last_started_nodeid: str | None = None
     last_function: str | None = None
     outcomes: Counter[str] = field(default_factory=Counter)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -71,6 +73,7 @@ class _BatchProgress:
         with self._lock:
             self.current_nodeid = nodeid
             self.current_started_at = started_at
+            self.last_started_nodeid = nodeid
             should_print = function != self.last_function
             if should_print:
                 self.last_function = function
@@ -87,6 +90,10 @@ class _BatchProgress:
     def current(self) -> tuple[str | None, float | None, int]:
         with self._lock:
             return self.current_nodeid, self.current_started_at, self.completed
+
+    def last_started(self) -> str | None:
+        with self._lock:
+            return self.last_started_nodeid
 
     def totals(self) -> tuple[int, Counter[str]]:
         with self._lock:
@@ -445,6 +452,8 @@ class _ProcessOutcome:
     output_error: str
     samples: tuple[_ResourceSample, ...]
     progress: _BatchProgress
+    # Byte offset in the batch log where this execution's output begins.
+    log_offset: int = 0
 
 
 def _batch_artifacts(request: BatchExecutionRequest) -> _BatchArtifacts:
@@ -478,6 +487,12 @@ def _pytest_command(
         f"--flashinfer-result-json={artifacts.temporary_results}",
         f"--flashinfer-telemetry-json={artifacts.temporary_telemetry}",
         f"--junitxml={artifacts.temporary_xml}",
+        # pytest's default capture holds a test's output until the test
+        # reports, so a test that ends the process (a native exit()) loses it.
+        # tee-sys also writes it to the batch log as it is printed, and still
+        # attaches Python output to failure reports. Writes to the file
+        # descriptors, from native code, go straight to the log.
+        "--capture=tee-sys",
         request.batch.source_file,
     ]
 
@@ -499,6 +514,9 @@ def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
         if pythonpath
         else str(request.repo_root)
     )
+    # os._exit() and a native exit() skip flushing Python's stdout buffer, so
+    # without this, output the test printed just before exiting is lost.
+    env.setdefault("PYTHONUNBUFFERED", "1")
     if request.device is not None:
         env["CUDA_VISIBLE_DEVICES"] = request.device
     # Isolate each concurrent worker's rendezvous and sibling TCPStore ports.
@@ -531,6 +549,9 @@ def _run_pytest(
         f"master_port={environment['MASTER_PORT']}"
     )
     with artifacts.log.open("a", encoding="utf-8") as log:
+        # The log keeps earlier executions of this batch; remember where this
+        # one starts so a failure tail cannot show their output.
+        log_offset = log.tell()
         log.write(f"command: {' '.join(command)}\n")
         log.flush()
         process = start_process_group(
@@ -634,6 +655,7 @@ def _run_pytest(
         output_error="; ".join(output_errors),
         samples=tuple(samples),
         progress=progress,
+        log_offset=log_offset,
     )
 
 
@@ -680,6 +702,38 @@ def _resource_csv(samples: tuple[_ResourceSample, ...]) -> str:
             ]
         )
     return resource_stream.getvalue()
+
+
+_LOG_TAIL_LINES = 40
+_LOG_TAIL_BYTES = 16384
+
+
+def _print_log_tail(
+    request: BatchExecutionRequest, artifacts: _BatchArtifacts, outcome: _ProcessOutcome
+) -> None:
+    """Print the end of this execution's batch log so the job trace holds the cause.
+
+    The batch log lives in the job's JUnit directory, which is not always
+    retained; the console line is. Reads a bounded snapshot of what is on disk
+    now and never reads before this execution's starting offset.
+    """
+    try:
+        with artifacts.log.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            end = log.tell()
+            log.seek(max(outcome.log_offset, end - _LOG_TAIL_BYTES))
+            tail = log.read(_LOG_TAIL_BYTES).decode("utf-8", errors="replace")
+    except OSError as error:
+        write_console(
+            f"PYTEST LOG TAIL worker={request.worker_index} batch={request.batch.id} "
+            f"unavailable: {type(error).__name__}: {error}"
+        )
+        return
+    lines = tail.splitlines()[-_LOG_TAIL_LINES:]
+    write_console(
+        f"PYTEST LOG TAIL worker={request.worker_index} batch={request.batch.id} "
+        f"source={request.batch.source_file} lines={len(lines)}\n" + "\n".join(lines)
+    )
 
 
 def _timeout_result(
@@ -766,6 +820,7 @@ def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
     outcome = _run_pytest(request, artifacts, _pytest_command(request, artifacts))
     if outcome.output_error:
         _discard_temporary_artifacts(*artifacts.temporary)
+        _print_log_tail(request, artifacts, outcome)
         return BatchExecution("infrastructure", outcome.output_error)
     if outcome.aborted:
         _discard_temporary_artifacts(*artifacts.temporary)
@@ -778,16 +833,24 @@ def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
         return _timeout_result(request, artifacts, outcome)
     if outcome.returncode not in {0, 1}:
         _discard_temporary_artifacts(*artifacts.temporary)
+        _print_log_tail(request, artifacts, outcome)
         return BatchExecution(
             "infrastructure",
             f"pytest exited with infrastructure exit code {outcome.returncode}; "
             f"log={artifacts.log}",
         )
     if not artifacts.temporary_xml.exists():
+        # pytest writes JUnit XML at session end, so a process that exits 0 or 1
+        # without it ended before then: a native library called exit(), or
+        # os._exit() ran. Report the exit code and the last node that started,
+        # and print the log tail, which carries the native error message.
+        last_nodeid = outcome.progress.last_started()
         _discard_temporary_artifacts(*artifacts.temporary)
+        _print_log_tail(request, artifacts, outcome)
         return BatchExecution(
             "infrastructure",
-            f"pytest did not produce JUnit XML; log={artifacts.log}",
+            f"pytest did not produce JUnit XML (exit code {outcome.returncode}; "
+            f"last started node={last_nodeid or 'unknown'}); log={artifacts.log}",
         )
     validation = validate_batch_xml(artifacts.temporary_xml, request.batch.nodeids)
     if not validation.valid:

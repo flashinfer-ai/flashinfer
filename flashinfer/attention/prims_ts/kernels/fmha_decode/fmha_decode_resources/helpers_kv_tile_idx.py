@@ -175,21 +175,36 @@ def _runtime_effective_seq_len_kv(
     return cute.math.max(visible_k_end - skipped_tokens, Int32(0))
 
 
+def cta_caches_visible_kv_interval(cfg: FmhaDecodeConfig) -> bool:
+    """Return whether a Q CTA caches the keys all its rows see, per work tile.
+
+    Grouped per-row causal rows and sliding windows need the intersection of
+    several row intervals, computed once per work tile. Otherwise the single
+    right bound (``seq_len_kv`` or the uniform causal end) is already live in
+    the softmax and compared in key space per tile.
+    """
+    return cfg.uses_per_row_causal_mask or cfg.use_sliding_window_causal
+
+
+def cta_visible_kv_interval_words(cfg: FmhaDecodeConfig) -> int:
+    """Return the task-cache words of the cached interval: its end, then its
+    begin when a sliding window bounds it on the left."""
+    return 2 if cfg.use_sliding_window_causal else 1
+
+
 @cute.jit
-def _kv_tile_is_fully_unmasked_for_q_group(
+def cta_visible_kv_interval(
     cfg: FmhaDecodeConfig,
-    tile_offset_k: Int32,
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
-    tile_has_valid_scores: cutlass.Boolean,
-) -> cutlass.Boolean:
-    """Return whether a KV tile needs no score mask for any active Q row.
+) -> tuple[Int32, Int32]:
+    """Return the keys ``[begin, end)`` visible to every active row of one Q CTA.
 
-    Grouped causal rows expose an intersection bounded on the right by the
-    earliest Q token.  A sliding window also bounds it on the left by the
-    latest active Q token.  Tiles outside that intersection retain the exact
-    per-row boundary path.
+    Computed once per work tile (``DecodeGenTask.get_domain``) and read by
+    softmax from the task cache. Grouped causal rows are bounded on the right
+    by the earliest Q token, and a sliding window bounds them on the left by
+    the latest Q token. Tiles not wholly inside take the exact per-row path.
     """
     visible_k_begin = Int32(0)
     visible_k_end = seq_len_kv
@@ -217,11 +232,53 @@ def _kv_tile_is_fully_unmasked_for_q_group(
                 latest_causal_end - Int32(cfg.attention_window_size),
                 Int32(0),
             )
-    return tile_has_valid_scores and kv_tile_is_fully_visible(
-        tile_offset_k,
-        Int32(cfg.tile_size_kv),
-        visible_k_begin,
-        visible_k_end,
+    return visible_k_begin, visible_k_end
+
+
+def task_cache_visible_kv_interval_index(cfg: FmhaDecodeConfig) -> int:
+    """Return the task-cache slot of the cached interval's ``end`` word.
+
+    The interval words are appended after the stable task-cache words (and
+    the runtime split count), and only in softmax tasks of configs that
+    cache it.
+    """
+    return 11 if cfg.runtime_split_kv else 10
+
+
+@cute.jit
+def kv_tile_is_unmasked(
+    cfg: FmhaDecodeConfig,
+    stage_info: StageInfo,
+    tile_offset_k: Int32,
+    seq_len_kv: Int32,
+    seq_len_q: Int32,
+    q_token_base: Int32,
+) -> cutlass.Boolean:
+    """Return whether the K tile at ``tile_offset_k`` needs no score mask.
+
+    The tile must lie inside the keys every active row of the Q CTA sees.
+    Configs that cache that interval (``cta_caches_visible_kv_interval``) read
+    it from the task cache; a task without it masks every tile, which is
+    always exact. Other configs have one right bound and compute it here.
+    """
+    if cutlass.const_expr(cta_caches_visible_kv_interval(cfg)):
+        end_idx = task_cache_visible_kv_interval_index(cfg)
+        words = cta_visible_kv_interval_words(cfg)
+        if cutlass.const_expr(
+            stage_info.task_cache is None
+            or len(stage_info.task_cache) < end_idx + words
+        ):
+            return cutlass.Boolean(False)
+        visible_k_begin = Int32(0)
+        if cutlass.const_expr(words == 2):
+            visible_k_begin = Int32(stage_info.task_cache[end_idx + 1])
+        visible_k_end = Int32(stage_info.task_cache[end_idx])
+    else:
+        visible_k_begin, visible_k_end = cta_visible_kv_interval(
+            cfg, seq_len_kv, seq_len_q, q_token_base
+        )
+    return kv_tile_is_fully_visible(
+        tile_offset_k, Int32(cfg.tile_size_kv), visible_k_begin, visible_k_end
     )
 
 
@@ -521,13 +578,8 @@ def resolve_keeps_tile_context(
         and (tile_offset_k < seq_len_kv)
         and not is_masked_final_wave
     )
-    tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
-        cfg,
-        tile_offset_k,
-        seq_len_kv,
-        seq_len_q,
-        q_token_base,
-        tile_has_valid_scores,
+    tile_is_unmasked = tile_has_valid_scores and kv_tile_is_unmasked(
+        cfg, stage_info, tile_offset_k, seq_len_kv, seq_len_q, q_token_base
     )
     # Flattened SQ=1 QToken-KvBlock-Sparse-Attention routes use their compacted causal length as
     # seq_len_kv. At or above the 2048-token budget this marks all first
