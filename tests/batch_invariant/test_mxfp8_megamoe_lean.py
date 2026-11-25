@@ -10,7 +10,7 @@ from .test_megamoe_lean import _lake, needs_lake
 
 
 def test_generated_mxfp8_megamoe_cases_are_current():
-    committed = Path(mxfp8_lean_cases.CASES_PATH).read_text()
+    committed = Path(mxfp8_lean_cases.CASES_PATH).read_text(encoding="utf-8")
     assert committed == mxfp8_lean_cases.render()
     assert "sorry" not in committed and "native_decide" not in committed
     cases = mxfp8_lean_cases.conformance_cases()

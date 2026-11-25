@@ -49,7 +49,7 @@ def test_generated_cases_are_current():
     assert committed.count("native_decide") == len(lean_cases.DECIDED_THEOREMS)
     for name in lean_cases.DECIDED_THEOREMS:
         assert f"theorem {name} " in committed
-    with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
+    with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean"), encoding="utf-8") as f:
         axioms = f.read()
     for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
