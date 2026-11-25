@@ -2247,6 +2247,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                 and k2_ready_queue_state is not None
             ):
                 queue_running = cutlass.Boolean(True)
+                t0_pending = cutlass.Boolean(True)
                 while queue_running:
                     queue_idx = cutlass.Int32(0)
                     if cute.arch.lane_idx() == cutlass.Int32(0):
@@ -2261,6 +2262,57 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         mask=0xFFFFFFFF,
                         mask_and_clamp=31,
                     )
+                    if cutlass.const_expr(getattr(self, "k1_t0_prefetch", 0) > 0):
+                        # t=0 FC1 weight prefetch (static queue order): while
+                        # the dispatch runs, pull the weight tile this first
+                        # claim is expected to hold into L2. Position p holds
+                        # M tile p % m_tiles of the (p // m_tiles)-th
+                        # dispatched (expert, token tile) block; assume every
+                        # local expert has exactly one token tile (decode).
+                        if t0_pending:
+                            t0_m_tiles = cutlass.Int32(self.k1_ready_queue_m_tiles)
+                            t0_expert = queue_idx // t0_m_tiles
+                            t0_tile_m = queue_idx - t0_expert * t0_m_tiles
+                            t0_elems_per_line = 1024 // self.a_dtype.width
+                            t0_k_elems = cutlass.min(
+                                cutlass.Int32(self.k1_t0_prefetch * self.mma_tiler[2]),
+                                cutlass.Int32(fc1_weight_gemm.shape[1]),
+                            )
+                            t0_lines = (
+                                t0_k_elems + cutlass.Int32(t0_elems_per_line - 1)
+                            ) // cutlass.Int32(t0_elems_per_line)
+                            # One 512 B scale atom: 128 rows x 4 scale columns
+                            # (4 * sf_vec_size K elements).
+                            t0_atom_k = 4 * self.sf_vec_size
+                            t0_katoms = (
+                                t0_k_elems + cutlass.Int32(t0_atom_k - 1)
+                            ) // cutlass.Int32(t0_atom_k)
+                            if t0_expert < cutlass.Int32(fc1_weight_gemm.shape[2]):
+                                for t0_half in cutlass.range_constexpr(self.mma_tiler[0] // 32):
+                                    t0_row = (
+                                        t0_tile_m * cutlass.Int32(self.mma_tiler[0])
+                                        + cute.arch.lane_idx()
+                                        + cutlass.Int32(t0_half * 32)
+                                    )
+                                    if t0_row < cutlass.Int32(fc1_weight_gemm.shape[0]):
+                                        for t0_line in cutlass.range(0, t0_lines, 1, unroll=4):
+                                            t0_ptr = cute.domain_offset(
+                                                (t0_row, t0_line * cutlass.Int32(t0_elems_per_line), t0_expert),
+                                                fc1_weight_gemm,
+                                            ).iterator
+                                            prefetch_global_l2(t0_ptr.toint())
+                                # Weight scales of this tile's 128-row block.
+                                t0_sf_row = (
+                                    t0_tile_m * cutlass.Int32(self.mma_tiler[0])
+                                ) // cutlass.Int32(128) * cutlass.Int32(128)
+                                for t0_ka in cutlass.range(cute.arch.lane_idx(), t0_katoms, 32, unroll=1):
+                                    t0_sf = cute.domain_offset(
+                                        (t0_sf_row, t0_ka * cutlass.Int32(t0_atom_k), t0_expert),
+                                        fc1_weight_sf_gemm,
+                                    ).iterator.toint()
+                                    for t0_q in cutlass.range_constexpr(4):
+                                        prefetch_global_l2(t0_sf + cutlass.Int64(128 * t0_q))
+                            t0_pending = cutlass.Boolean(False)
                     if cute.arch.lane_idx() == cutlass.Int32(0):
                         spin_wait(
                             k2_ready_queue_ready.iterator

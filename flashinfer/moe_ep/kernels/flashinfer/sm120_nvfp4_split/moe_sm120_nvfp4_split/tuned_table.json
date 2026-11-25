@@ -39,34 +39,58 @@
      "tokens": 32,
      "knobs": {
       "backend": "p2p_split",
-      "k1_n": 32,
       "k2_n": 64,
-      "weight_prefetch_ahead": 4
+      "fc1_utility_postprocess": "on",
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4,
+      "k1_n": 16,
+      "k2_warps": 8
      },
-     "p50_us": 743.8,
-     "default_us": 786.6
+     "p50_us": 700.9,
+     "default_us": 783.8,
+     "confirm": {
+      "best_us": 725.3,
+      "default_us": 790.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 64,
      "knobs": {
       "backend": "p2p_split",
-      "k2_n": 64,
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3,
       "k2_launch_factor": 1,
-      "k1_stages": 3,
-      "weight_prefetch_ahead": 4
+      "fc1_utility_postprocess": "on"
      },
-     "p50_us": 806.6,
-     "default_us": 832.1
+     "p50_us": 713.3,
+     "default_us": 799.3,
+     "confirm": {
+      "best_us": 721.6,
+      "default_us": 811.6,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 128,
      "knobs": {
       "backend": "p2p_split",
-      "k1_ctas_per_sm": 2,
+      "k2_n": 64,
+      "k2_launch_factor": 1,
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4,
       "k2_stages": 3
      },
-     "p50_us": 906.8,
-     "default_us": 969.9
+     "p50_us": 829.9,
+     "default_us": 910.3,
+     "confirm": {
+      "best_us": 835.6,
+      "default_us": 915.8,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 256,
@@ -115,9 +139,18 @@
     },
     {
      "tokens": 32,
-     "knobs": {},
-     "p50_us": 1507.3,
-     "default_us": 1507.3
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3
+     },
+     "p50_us": 1730.5,
+     "default_us": 1740.8,
+     "confirm": {
+      "best_us": 1855.9,
+      "default_us": 1859.6,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 64,
@@ -239,35 +272,57 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
+      "fc1_utility_postprocess": "on",
       "weight_prefetch_ahead": 4,
-      "xnuma_fsplit": 4
+      "xnuma_fsplit": 4,
+      "k1_n": 16
      },
-     "p50_us": 1029.7,
-     "default_us": 1128.3
+     "p50_us": 939.0,
+     "default_us": 1077.2,
+     "confirm": {
+      "best_us": 942.1,
+      "default_us": 1074.2,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 32,
      "knobs": {
       "backend": "p2p_split",
-      "k1_n": 64,
       "k2_n": 64,
+      "fc1_utility_postprocess": "on",
       "weight_prefetch_ahead": 4,
-      "xnuma_fsplit": 4
+      "xnuma_fsplit": 4,
+      "k1_n": 16
      },
-     "p50_us": 1241.7,
-     "default_us": 1282.6
+     "p50_us": 1030.1,
+     "default_us": 1169.1,
+     "confirm": {
+      "best_us": 1031.5,
+      "default_us": 1168.4,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 64,
      "knobs": {
       "backend": "p2p_split",
-      "k1_n": 64,
       "k2_n": 64,
       "weight_prefetch_ahead": 4,
-      "xnuma_fsplit": 4
+      "xnuma_fsplit": 4,
+      "k1_n": 16,
+      "push_dispatch": "off"
      },
-     "p50_us": 1309.7,
-     "default_us": 1351.8
+     "p50_us": 1066.0,
+     "default_us": 1204.1,
+     "confirm": {
+      "best_us": 1063.5,
+      "default_us": 1201.2,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 128,
@@ -427,27 +482,50 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "weight_prefetch_ahead": 4
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "dispatch_rank_cache": "on"
      },
-     "p50_us": 495.6,
-     "default_us": 504.3
+     "p50_us": 453.6,
+     "default_us": 496.7,
+     "confirm": {
+      "best_us": 454.5,
+      "default_us": 497.8,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 64,
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "k1_ctas_per_sm": 2,
+      "k1_stages": 4,
       "sms": [
-       64,
+       72,
        0,
        0,
-       46
+       38
       ],
-      "xnuma_fsplit": 4
+      "fc1_utility_postprocess": "on",
+      "xnuma_fsplit": 2,
+      "k1_ctas_per_sm": 1,
+      "push_dispatch": "on"
      },
-     "p50_us": 565.2,
-     "default_us": 609.2
+     "p50_us": 506.4,
+     "default_us": 582.6,
+     "confirm": {
+      "best_us": 521.6,
+      "default_us": 598.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 128,
@@ -464,16 +542,24 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "k1_stages": 3,
+      "k1_stages": 4,
       "sms": [
        72,
        0,
        0,
        38
-      ]
+      ],
+      "weight_prefetch_ahead": 4,
+      "k2_stages": 2
      },
-     "p50_us": 984.1,
-     "default_us": 1064.5
+     "p50_us": 882.5,
+     "default_us": 983.6,
+     "confirm": {
+      "best_us": 882.6,
+      "default_us": 983.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     }
    ]
   },
@@ -617,22 +703,49 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
       "fc1_utility_postprocess": "on",
-      "weight_prefetch_ahead": 4
+      "xnuma_fsplit": 4
      },
-     "p50_us": 657.3,
-     "default_us": 707.6
+     "p50_us": 591.9,
+     "default_us": 688.1,
+     "confirm": {
+      "best_us": 590.0,
+      "default_us": 683.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 32,
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "weight_prefetch_ahead": 4,
-      "xnuma_fsplit": 4
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "xnuma_fsplit": 4,
+      "k1_n": 16
      },
-     "p50_us": 690.1,
-     "default_us": 733.8
+     "p50_us": 600.1,
+     "default_us": 707.6,
+     "confirm": {
+      "best_us": 600.1,
+      "default_us": 697.3,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 64,
@@ -665,10 +778,19 @@
        0,
        38
       ],
-      "xnuma_fsplit": 4
+      "xnuma_fsplit": 4,
+      "weight_prefetch_ahead": 4,
+      "k1_stages": 3,
+      "push_dispatch": "on"
      },
-     "p50_us": 785.3,
-     "default_us": 942.6
+     "p50_us": 706.6,
+     "default_us": 938.9,
+     "confirm": {
+      "best_us": 710.7,
+      "default_us": 939.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
     },
     {
      "tokens": 512,

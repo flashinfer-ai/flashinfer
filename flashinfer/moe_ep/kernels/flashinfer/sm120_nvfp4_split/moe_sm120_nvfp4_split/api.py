@@ -39,7 +39,7 @@ from .jit_config import Sm120JitConfig
 # Rank-local combine now reserves a source-generated contributor-plan plane.
 # Version 22 refreshes generated code for whole-warp rank-local reduction;
 # the workspace layout and completion protocol are unchanged.
-KERNEL_CACHE_ABI = 2814542011117  # proxy fence before K2 stage release
+KERNEL_CACHE_ABI = 2814542011118  # FlashInfer delivery of standalone 281454205 (push dispatch, t0 prefetch, packed EP16 dispatch)
 
 
 @dataclass(frozen=True)
@@ -284,6 +284,8 @@ def select_compile_spec(
     hardware: Optional[str] = None,
     jit: Optional[Sm120JitConfig] = None,
     build: Optional[SplitKernelBuildOptions] = None,
+    transport_overlay=None,
+    generic_decode_preset: bool = True,
 ) -> MegaMoECompileSpec:
     """Resolve and reuse an immutable compile spec (bounded process-local cache).
 
@@ -316,7 +318,8 @@ def select_compile_spec(
         if not is_calibrated_execution(build=build, jit=jit) else
         select_megamoe_config(heuristic_input, overrides,
             numerical_contract=numerical_contract, host_expert_counts=host_expert_counts,
-            tuning_config=tuning_config, hardware=hardware)
+            tuning_config=tuning_config, hardware=hardware,
+            generic_decode_preset=generic_decode_preset)
     )
     from .ep8_resource_policy import select_ep8_resources
     selected = select_ep8_resources(
@@ -333,7 +336,7 @@ def select_compile_spec(
     )
     if resolved_jit.fc1_utility_postprocess is None and numerical_contract is not None:
         from .tuned_table import utility_for
-        tabulated = utility_for(heuristic_input)
+        tabulated = utility_for(heuristic_input, generic_decode_preset, selected)
         if tabulated is not None:
             resolved_jit = replace(resolved_jit, fc1_utility_postprocess=tabulated)
     if resolved_jit.fc1_utility_postprocess is None:
@@ -345,6 +348,8 @@ def select_compile_spec(
                       and problem.gate_up_clamp == 10.0),
         )
         resolved_jit = replace(resolved_jit, fc1_utility_postprocess=enabled)
+    from .heuristic import select_transport_overlay
+    selected = select_transport_overlay(heuristic_input, selected, transport_overlay)
     return MegaMoECompileSpec(
         problem=problem,
         kernel=selected,
@@ -515,6 +520,12 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     for kernel in (k1, k2, k2_drain):
         if kernel is not None:
             kernel.weight_prefetch_ahead = config.weight_prefetch_ahead
+    # t=0 FC1 weight prefetch: the K1 sched warp prefetches the weight tile of
+    # its first queue claim; the dispatch publishes at static queue positions.
+    t0_prefetch = (config.k1_t0_prefetch
+                   if config.k1_ready_queue and config.kernel_comm_backend == "p2p_direct" else 0)
+    k1.k1_t0_prefetch = t0_prefetch
+    k1.token_comm.k1_static_order = t0_prefetch > 0
     expected_threads = 32 * (11 if dual_n16 else config.k2_warps)
     if k2.threads_per_cta != expected_threads:
         raise RuntimeError(

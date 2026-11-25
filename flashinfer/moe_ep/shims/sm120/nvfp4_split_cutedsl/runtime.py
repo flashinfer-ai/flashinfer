@@ -660,6 +660,7 @@ class MegaMoESm120Nvfp4Frontend:
 
         workspace, cfg, bucket = self.workspace, self.config, self.compile_bucket
         region = workspace._xnuma_region
+        spec = workspace._execution_plans[bucket][0]
         layout = XnumaLayout(
             fsplit=workspace._xnuma_fsplit,
             world=cfg.world_size,
@@ -668,6 +669,7 @@ class MegaMoESm120Nvfp4Frontend:
             tokens_per_rank=bucket,
             topk=cfg.num_topk,
             hidden=cfg.hidden,
+            pack=_xnuma_pack(spec.kernel) and region.pack,
         )
         inputs = (
             workspace.x[:bucket],
@@ -1081,20 +1083,33 @@ class MegaMoESm120Nvfp4Frontend:
         return self._compiled
 
     def _reset_execution(self, execution: _ExecutionBuffers) -> None:
+        from moe_sm120_nvfp4_split.runtime import fused_fill
+
         kernel = execution.bundle.k1
+        # MEGA_SPLIT_FUSED_RESET (default on): one fill kernel instead of one
+        # memset node per region in front of K1.
+        ops = []
         for name in self._LOCAL_RESET_REGIONS:
             if name not in kernel._local_offsets:
                 continue
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
-            execution.local_workspace[offset : offset + size].zero_()
+            ops.append((execution.local_workspace[offset : offset + size], 0))
         if "rank_combine_route_map" in kernel._local_offsets:
             name = "rank_combine_route_map"
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
-            execution.local_workspace[offset : offset + size].view(torch.int32).fill_(
-                -1
+            ops.append(
+                (
+                    execution.local_workspace[offset : offset + size].view(torch.int32),
+                    -1,
+                )
             )
+        if ops and ops[0][0].is_cuda and fused_fill.enabled():
+            fused_fill.launch_fused_fill(ops, torch.cuda.current_stream())
+        else:
+            for tensor, value in ops:
+                tensor.fill_(value)
         if execution.rank_combine_ready is not None:
             # Shared by all layers using this bucket. A device increment also
             # advances on every outer-graph replay, unlike a captured fill_(n).
@@ -1189,6 +1204,8 @@ def allocate_workspace(
     ]
     split_shared_bytes = {}
     split_fsplits: list[int] = []
+    split_packs: list[bool] = []
+    push_buckets: list[int] = []
     for bucket in buckets:
         frontend = MegaMoESm120Nvfp4Frontend(
             planned, compile_bucket=bucket, control_group=control_group
@@ -1203,6 +1220,13 @@ def allocate_workspace(
         if bucket in split_buckets:
             split_shared_bytes[bucket] = bundle.shared_workspace_bytes
             split_fsplits.append(spec.kernel.xnuma_fsplit)
+            split_packs.append(_xnuma_pack(spec.kernel))
+        if (
+            getattr(spec.kernel, "push_dispatch", False)
+            and spec.kernel.kernel_comm_backend == "p2p_direct"
+            and not _no_dist()
+        ):
+            push_buckets.append(bucket)
         sizes += [
             bundle.shared_workspace_bytes,
             bucket * config.num_topk * config.hidden * 2,
@@ -1213,6 +1237,13 @@ def allocate_workspace(
     def page(n):
         return (n + 4095) // 4096 * 4096
 
+    # Push dispatch: world shadows of the input span (x | x_scale | topk ids |
+    # topk weights) right after it, each with the span's layout; source s's
+    # rows land at x + (s + 1) * stride on the owner.
+    push_stride = sum(page(n) for n in sizes[:4]) if push_buckets else 0
+    if push_buckets:
+        sizes.insert(4, config.world_size * push_stride)
+    n_prefix = 6 if push_buckets else 5
     capacity = sum(page(n) for n in sizes)
     shadow = region = None
     shadow_bytes = reserved_bytes = 0
@@ -1232,11 +1263,12 @@ def allocate_workspace(
             tokens_per_rank=max(split_buckets),
             topk=config.num_topk,
             hidden=config.hidden,
+            pack=any(split_packs),
         )
         reserved_bytes = region.reserved_bytes
         # Shadows cover the inputs and output, then each p2p_split bucket's
         # combine output and shared workspace, allocated first below.
-        shadow_bytes = sum(page(n) for n in sizes[:5]) + sum(
+        shadow_bytes = sum(page(n) for n in sizes[:n_prefix]) + sum(
             page(bucket * config.num_topk * config.hidden * 2)
             + page(split_shared_bytes[bucket])
             for bucket in sorted(split_buckets)
@@ -1276,6 +1308,24 @@ def allocate_workspace(
         (config.max_tokens_per_rank, config.num_topk), torch.float32, session=session
     )
     roots.append(topk_weights)
+    push_shadow = None
+    if push_buckets:
+        push_shadow = sym_zeros(
+            (config.world_size * push_stride,), torch.uint8, session=session
+        )
+        roots.append(push_shadow)
+        stride = int(push_shadow.data_ptr()) - int(x.data_ptr())
+        span_end = int(topk_weights.data_ptr()) + topk_weights.numel() * 4
+        if stride != push_stride or span_end - int(x.data_ptr()) > stride:
+            raise RuntimeError("push dispatch shadow must follow the input span")
+        from moe_sm120_nvfp4_split.token_comm import PushDispatchConfig
+
+        for bucket in push_buckets:
+            tc = planned._execution_plans[bucket][1].k1.token_comm
+            mask = tc.barrier_peer_mask & ~(1 << config.rank)
+            peers = tuple(r for r in range(config.world_size) if (mask >> r) & 1)
+            if peers:
+                tc.push = PushDispatchConfig(stride=stride, peers=peers, peer_mask=mask)
     output, root = sym_byte_view(
         (config.max_tokens_per_rank, config.hidden), torch.bfloat16, session=session
     )
@@ -1325,6 +1375,14 @@ def allocate_workspace(
         _xnuma_fsplit=xnuma_fsplit if split_buckets else 2,
     )
     return workspace
+
+
+def _xnuma_pack(kernel_config) -> bool:
+    """p2p_split packed dispatch (MEGAMOE_XNUMA_PACK=0|1 overrides the config)."""
+    env = os.environ.get("MEGAMOE_XNUMA_PACK", "")
+    if env in ("0", "1"):
+        return env == "1"
+    return bool(getattr(kernel_config, "xnuma_pack", False))
 
 
 def _uniform_xnuma_fsplit(selected: list[int]) -> int:

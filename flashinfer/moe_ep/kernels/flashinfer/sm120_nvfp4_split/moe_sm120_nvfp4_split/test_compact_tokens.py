@@ -14,7 +14,7 @@ def fixture():
 def test_cache_separates_both_specializations():
  shape,cfg=fixture();problem=MegaMoEProblemSpec(tokens_per_rank=512,num_topk=8,num_total_experts=288,hidden=4096,intermediate=4096,expert_parallel_size=4,expert_parallel_rank=0)
  specs=[MegaMoECompileSpec(problem,replace(cfg,k1_compact_tokens=a,k2_compact_tokens=b)) for a,b in [(False,False),(True,False),(True,True),(False,True)]]
- assert KERNEL_CACHE_ABI==2814542011117  # FlashInfer delivery ABI (standalone 281454201)
+ assert KERNEL_CACHE_ABI==2814542011118  # FlashInfer delivery ABI (standalone 281454205)
  assert len({s.cache_key for s in specs})==4
  assert len({s.canonical_dict()['kernel']['k1_tile'] for s in specs})==1
 

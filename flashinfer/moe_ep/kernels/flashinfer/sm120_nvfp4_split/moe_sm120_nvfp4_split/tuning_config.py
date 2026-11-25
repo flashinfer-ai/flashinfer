@@ -115,7 +115,9 @@ def config_from_dict(values, shape, contract):
                             semantic_errors, correctness_qualification_errors)
     if isinstance(values, dict):
         # Records written before the residency knobs existed use their defaults.
-        values = {"k1_ctas_per_sm": 1, "k2_launch_factor": 1, "weight_prefetch_ahead": 0, "xnuma_fsplit": 2, **values}
+        values = {"k1_ctas_per_sm": 1, "k2_launch_factor": 1, "weight_prefetch_ahead": 0, "xnuma_fsplit": 2,
+                  "k1_t0_prefetch": 0, "push_dispatch": False,
+                  "xnuma_pack": False, **values}
     if not isinstance(values, dict) or set(values) != {f.name for f in fields(MegaMoEKernelConfig)}:
         raise ValueError('incomplete or unknown kernel config fields')
     # Enforce JSON types before arithmetic/legality validation. In particular,

@@ -98,11 +98,15 @@ class ShadowSession:
  segment_offset=staticmethod(segment_offset)
  reserved_view=staticmethod(reserved_view)
 
-def p2p_capacity(tokens, hidden, topk, experts, world, rank_local):
+def p2p_capacity(tokens, hidden, topk, experts, world, rank_local, push_shadow=False):
  # Inputs, BF16 top-k output, shared dispatch metadata, rank-combine flags.
  # Mirrors the public shared region layout; include per-region alignment slack.
  sizes=[tokens*hidden//2, tokens*hidden//16, tokens*topk*8,
         tokens*topk*4, tokens*topk*hidden*2]
+ if push_shadow:
+  inputs=[tokens*hidden//2, tokens*((hidden//16+3)//4*4), tokens*topk*8, tokens*topk*4]
+  # Push dispatch: one shadow of the (page-aligned) input span per EP rank.
+  sizes.append(world*sum((n+4095)//4096*4096 for n in inputs))
  shared=experts*tokens*topk*4+experts*8+(experts//world)*8+34*world*4
  if rank_local:shared+=(2*world*tokens+world)*4
  sizes.append(shared+6*16)

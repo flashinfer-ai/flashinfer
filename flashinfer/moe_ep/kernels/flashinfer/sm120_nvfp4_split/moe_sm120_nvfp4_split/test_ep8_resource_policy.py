@@ -128,7 +128,7 @@ class Ep8ResourcePolicyTests(unittest.TestCase):
     def test_anchor_fields_and_other_overrides_exclude_rule(self):
         a=args();s=shape(a);base=select_megamoe_config(s,numerical_contract='owner_bf16')
         for field,value in vars(base).items():
-            if field in ('k1_ctas_per_sm','k2_launch_factor','weight_prefetch_ahead','xnuma_fsplit'):continue  # validated at construction
+            if field in ('k1_ctas_per_sm','k2_launch_factor','weight_prefetch_ahead','xnuma_fsplit','k1_t0_prefetch','push_dispatch','xnuma_pack'):continue  # validated at construction; overlay knobs are resolved after the policies
             changed=(not value if isinstance(value,bool) else value+1 if isinstance(value,(int,float))
                      else 'different' if isinstance(value,str) else (64,16,128) if isinstance(value,tuple) else 3)
             other=replace(base,**{field:changed})

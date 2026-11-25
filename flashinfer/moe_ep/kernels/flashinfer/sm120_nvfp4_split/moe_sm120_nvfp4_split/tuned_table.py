@@ -49,10 +49,25 @@ def _load() -> dict:
 _SPLIT_LAYOUTS = {8: ("ep8_2numa", 3, 4), 16: ("ep16_2x2numa", 3, 12)}
 
 
+# The tables were measured on 110-SM RTX PRO 5000 GPUs (8-SM Green Context
+# partition granularity); other devices use the rules only.
+TABLE_DEVICE = (110, 8, 8)
+
+
+def device_of(shape) -> Tuple[int, int, int]:
+    return (shape.num_sms, shape.sm_min_partition, shape.sm_partition_alignment)
+
+
 def topology_of(shape) -> Optional[str]:
     """Topology key of a heuristic input, or None if no table can apply."""
-    if (shape.data_parallel_size, shape.tensor_parallel_size, shape.num_sms,
-            shape.sm_min_partition, shape.sm_partition_alignment) != (1, 1, 110, 8, 8):
+    if device_of(shape) != TABLE_DEVICE:
+        return None
+    return layout_of(shape)
+
+
+def layout_of(shape) -> Optional[str]:
+    """Topology key of a heuristic input on any device (DP1/TP1), or None."""
+    if (shape.data_parallel_size, shape.tensor_parallel_size) != (1, 1):
         return None
     ep, same, cross = (shape.expert_parallel_size, shape.ep_same_numa_peer_count,
                        shape.ep_cross_numa_peer_count)
@@ -86,6 +101,11 @@ def nearest_entry(signature: Tuple[int, int, int, int], topology: str, tokens: i
     return None
 
 
+def has_table(signature: Tuple[int, int, int, int], topology: str) -> bool:
+    """Whether (signature, topology) has a table with anchors."""
+    return nearest_entry(signature, topology, 1) is not None
+
+
 def lookup(shape) -> Optional[dict]:
     """The anchor entry for this shape and its effective backend, or None."""
     topology = topology_of(shape)
@@ -102,30 +122,71 @@ def lookup(shape) -> Optional[dict]:
     return entry
 
 
-# Rule for untabulated signatures, from the default-configuration measurements of
-# both tuned NVFP4 signatures: p2p_split is 28-40% faster up to 128 tokens/rank
-# and 1.3-2.9x faster at 2048-4096 (where gin_hybrid degrades); 512-1024 are
-# within about 20% either way; gin_hybrid leads from 8192 on (one exception).
-SPLIT_RULE_MAX_TOKENS = 4096
 SPLIT_MAX_EXPERTS_PER_RANK = 64  # forwarder completion mask is 64-bit
+
+# Backend rule for a cross-NUMA EP world without an explicit backend and
+# without a table anchor (any device): p2p_split (LSA + cross-NUMA shadow
+# transport) up to SPLIT_RULE_MAX_TOKENS tokens per rank, gin_hybrid above
+# when the driver can run it (``runtime.driver_caps``), else p2p_split. The
+# hybrid rings are validated on one host only (EP <= HYBRID_MAX_EP); EP16 is
+# always p2p_split. Measured on 110-SM EP8 (default knobs, EP8 tables
+# bypassed, cold L2, ABBA p50, gin_hybrid vs p2p_split): DSv4.1 T512/1024/
+# 2048/4096/8192/16384/24576 +22/-9/+206/+77/-24/-25/-27 %, GLM5.3
+# -4/-14/+121/+187/-6/-20/-27 %, DSv4-Flash +4/-11/+3/+167/+44/-7/-23 %:
+# the hybrid collapses (and jitters) at 2048-4096 and wins near 1024 and above
+# 8192 for all three; at 8192 it wins DSv4.1/GLM5.3 (-24/-6 %) but loses
+# DSv4-Flash (+44 %), so the rule switches above 8192. RESULTS.md has the table.
+SPLIT_RULE_MAX_TOKENS = 8192
+HYBRID_MAX_EP = 8
+
+
+def hybrid_available(shape) -> bool:
+    """Whether the GIN-ring hybrid can run for this world on this driver."""
+    if shape.expert_parallel_size > HYBRID_MAX_EP:
+        return False
+    from .runtime.driver_caps import hybrid_sm_split_available
+
+    return hybrid_sm_split_available()
+
+
+def rule_backend(shape) -> Optional[str]:
+    """The untabulated cross-NUMA rule: ``p2p_split`` up to
+    ``SPLIT_RULE_MAX_TOKENS`` tokens per rank (every size at EP16),
+    ``gin_hybrid`` above when the hybrid can run, else ``p2p_split``; None
+    when neither can serve the world (more than 64 experts per rank and no
+    hybrid)."""
+    split_ok = shape.num_total_experts // shape.expert_parallel_size <= SPLIT_MAX_EXPERTS_PER_RANK
+    if split_ok and (shape.tokens_per_rank <= SPLIT_RULE_MAX_TOKENS
+                     or shape.expert_parallel_size > HYBRID_MAX_EP):
+        return "p2p_split"
+    if hybrid_available(shape):
+        return "gin_hybrid"
+    return "p2p_split" if split_ok else None
 
 
 def preferred_ep8_backend(shape) -> Optional[str]:
     """``p2p_split`` / ``gin_hybrid`` for a real NUMA-split EP shape (EP8 on
-    2 x 4 GPUs or EP16 on two such hosts, network peers not yet folded): the
-    nearest table anchor's backend, else the rule above; None otherwise."""
-    topology = topology_of(shape)
-    if topology is None or topology == "ep4_1numa" or _folded(shape):
+    2 x 4 GPUs or EP16 on two such hosts, network peers not yet folded) on any
+    device: the nearest 110-SM table anchor's
+    backend (a ``gin_hybrid`` anchor reads ``p2p_split`` where the hybrid
+    cannot run), else ``rule_backend``. None when the shape is not a
+    cross-NUMA world or no backend can serve it."""
+    if shape.ep_cross_numa_peer_count <= 0 or _folded(shape):
         return None
-    signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
-    entry = nearest_entry(signature, topology, shape.tokens_per_rank)
-    if entry is not None:
-        return entry["knobs"].get("backend", "gin_hybrid")
-    experts_per_rank = shape.num_total_experts // shape.expert_parallel_size
-    if (shape.tokens_per_rank <= SPLIT_RULE_MAX_TOKENS
-            and experts_per_rank <= SPLIT_MAX_EXPERTS_PER_RANK):
-        return "p2p_split"
-    return "gin_hybrid"
+    if layout_of(shape) not in ("ep8_2numa", "ep16_2x2numa"):
+        return None  # only the validated NUMA-split layouts
+    topology = topology_of(shape)
+    if topology is not None:
+        signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
+        entry = nearest_entry(signature, topology, shape.tokens_per_rank)
+        if entry is not None:
+            backend = entry["knobs"].get("backend", "gin_hybrid")
+            if backend == "gin_hybrid" and not hybrid_available(shape):
+                split_ok = (shape.num_total_experts // shape.expert_parallel_size
+                            <= SPLIT_MAX_EXPERTS_PER_RANK)
+                return "p2p_split" if split_ok else None
+            return backend
+    return rule_backend(shape)
 
 
 def overrides_for(knobs: dict) -> dict:
@@ -154,12 +215,23 @@ def overrides_for(knobs: dict) -> dict:
     return out
 
 
-def utility_for(shape) -> Optional[bool]:
-    """FC1 utility postprocess measured with the anchor's configuration, or None."""
+def utility_for(shape, generic_decode_preset: bool = True, config=None) -> Optional[bool]:
+    """FC1 utility postprocess measured with the anchor's configuration (or
+    set by the generic decode preset, where the resolved ``config`` has an
+    N16/N32 K1 tile), or None."""
     entry = lookup(shape)
-    if entry is None or entry["knobs"].get("fc1_utility_postprocess") is None:
+    knobs = entry["knobs"] if entry is not None else None
+    if knobs is None and generic_decode_preset:
+        from .heuristic import generic_decode_knobs
+
+        knobs = generic_decode_knobs(shape)
+        if knobs is not None and (config is None or config.k1_tile[1] not in (16, 32)
+                                  or config.k1_compact_tokens):
+            return None
+    if knobs is None or knobs.get("fc1_utility_postprocess") is None:
         return None
-    return entry["knobs"]["fc1_utility_postprocess"] == "on"
+    return knobs["fc1_utility_postprocess"] == "on"
 
 
-__all__ = ["lookup", "nearest_entry", "overrides_for", "preferred_ep8_backend", "topology_of", "utility_for"]
+__all__ = ["SPLIT_RULE_MAX_TOKENS", "TABLE_DEVICE", "device_of", "hybrid_available", "layout_of", "lookup",
+           "nearest_entry", "overrides_for", "preferred_ep8_backend", "rule_backend", "topology_of", "utility_for"]

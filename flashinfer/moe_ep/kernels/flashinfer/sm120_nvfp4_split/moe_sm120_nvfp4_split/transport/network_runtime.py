@@ -979,7 +979,7 @@ class NetworkTransportRuntime:
                 checked(cuda.cuFuncLoad(function))
 
 
-    def _reset_local_counters(self) -> None:
+    def _reset_local_counters(self, *, fused: bool = False) -> None:
         """Zero only the local flag/counter regions between back-to-back
         launches.  The caller must first drain the preceding replay because
         these regions are also consumed by persistent dispatch/combine CTAs.
@@ -1002,6 +1002,15 @@ class NetworkTransportRuntime:
         kernel = self._kernel
         if kernel is None or self.local_workspace is None:
             return
+        # fused=True (graph-owned reset): collect the constant fills and issue
+        # them as one kernel instead of one fill node per region.
+        fused_ops = [] if fused else None
+
+        def _fill(t, value):
+            if fused_ops is not None and isinstance(value, int):
+                fused_ops.append((t, value))
+            else:
+                t.fill_(value)
         for name in (
             "l1_arrival_count",
             "expert_send_count",
@@ -1019,13 +1028,13 @@ class NetworkTransportRuntime:
             if name in kernel._local_offsets:
                 off = kernel._local_offsets[name]
                 nbytes = kernel._local_region_by_name[name].nbytes
-                self.local_workspace[off:off + nbytes].zero_()
+                _fill(self.local_workspace[off:off + nbytes], 0)
         if "rank_combine_route_map" in kernel._local_offsets:
             off = kernel._local_offsets["rank_combine_route_map"]
             nbytes = kernel._local_region_by_name[
                 "rank_combine_route_map"
             ].nbytes
-            self.local_workspace[off:off + nbytes].view(torch.int32).fill_(-1)
+            _fill(self.local_workspace[off:off + nbytes].view(torch.int32), -1)
         if self.rank_combine_ready is not None:
             if self.device_epoch is None:
                 self._rank_combine_epoch += 1
@@ -1050,41 +1059,45 @@ class NetworkTransportRuntime:
                 if name in kernel._shared_offsets:
                     off = kernel._shared_offsets[name]
                     nbytes = kernel._shared_region_by_name[name].nbytes
-                    self.shared_workspace[off:off + nbytes].zero_()
+                    _fill(self.shared_workspace[off:off + nbytes], 0)
         if self.comm_backend == "gin":
             ready_bytes = (
                 self._kernel.token_comm.ibgda_dispatch_ready_words
                 + self._kernel.token_comm.ibgda_owner_plan_ready_words
             ) * 4
             ready_off = self._kernel._local_offsets["ibgda_sf_staging"]
-            self.local_workspace[
+            _fill(self.local_workspace[
                 ready_off:ready_off + ready_bytes
-            ].zero_()
+            ], 0)
             counts = self._byte_workspace_view(
                 self.shared_workspace,
                 kernel._shared_offsets["expert_recv_count"],
                 torch.int64,
                 kernel._shared_region_by_name["expert_recv_count"].shape,
             )
-            counts.zero_()
-            self._transport.dispatch_send_counts.zero_()
-            self._transport.dispatch_send_work_queue.zero_()
-            self._transport.dispatch_recv_work_queue.zero_()
-            self._transport.combine_send_work_queue.zero_()
-            self._transport.combine_recv_work_queue.zero_()
-            self._transport.dispatch_owner_token_counts.zero_()
-            self._transport.dispatch_owner_token_cursors.zero_()
-            self._transport.ring_send_counts.zero_()
-            self._transport.owner_plan_count_tx.zero_()
-            self._transport.owner_plan_route_cursors_tx.zero_()
+            _fill(counts, 0)
+            _fill(self._transport.dispatch_send_counts, 0)
+            _fill(self._transport.dispatch_send_work_queue, 0)
+            _fill(self._transport.dispatch_recv_work_queue, 0)
+            _fill(self._transport.combine_send_work_queue, 0)
+            _fill(self._transport.combine_recv_work_queue, 0)
+            _fill(self._transport.dispatch_owner_token_counts, 0)
+            _fill(self._transport.dispatch_owner_token_cursors, 0)
+            _fill(self._transport.ring_send_counts, 0)
+            _fill(self._transport.owner_plan_count_tx, 0)
+            _fill(self._transport.owner_plan_route_cursors_tx, 0)
         if self._split_green_trace is not None:
-            self._split_green_trace.zero_()
+            _fill(self._split_green_trace, 0)
         if self._transport.combine_ready_queue_done is not None:
-            self._transport.combine_ready_queue_done.zero_()
+            _fill(self._transport.combine_ready_queue_done, 0)
         if self._transport.combine_ready_queue_probe is not None:
-            self._transport.combine_ready_queue_probe.fill_(-1)
+            _fill(self._transport.combine_ready_queue_probe, -1)
         if self._transport.combine_ready_queue_selected is not None:
-            self._transport.combine_ready_queue_selected.fill_(-1)
+            _fill(self._transport.combine_ready_queue_selected, -1)
+        if fused_ops:
+            from moe_sm120_nvfp4_split.runtime.fused_fill import launch_fused_fill
+
+            launch_fused_fill(fused_ops, torch.cuda.current_stream())
 
 
     def _ibgda_streaming_dispatch_begin(self) -> None:

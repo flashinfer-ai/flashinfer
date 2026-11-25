@@ -6,7 +6,9 @@ tile-ordered dispatch publication, dispatch/compute overlap, and lane-strided
 token-back stores.
 """
 
-from typing import Literal
+import os
+from dataclasses import dataclass
+from typing import Literal, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -27,6 +29,7 @@ from .config import (
     _rank_local_vector_reduce_supported,
 )
 from .moe_utils import spin_wait
+from .split_timestamp import read_globaltimer as _gt
 from .sm120_ptx_helpers import atomic_cas_gpu_i32_raw, lds_b32_raw, red_add_relaxed_sys_v2_bf16x2_raw
 from moe_sm120_nvfp4_split.support.src.flag_batch import GpuReleaseFlagBatchTracker
 from moe_sm120_nvfp4_split.support.src.grid_sync import software_grid_sync
@@ -43,6 +46,37 @@ from moe_sm120_nvfp4_split.support.src.ptx_helpers import (
 from moe_sm120_nvfp4_split.support.src.sf_swizzle import sf_atom_int32_offset
 from moe_sm120_nvfp4_split.support.src.token_comm import CombineFormat, TokenInPullTokenBackPush, TokenSrcMetadata
 
+# Default on (MEGA_SPLIT_FENCED_PUBLISH=0 restores a release per store):
+# publish a K1 ready tile with the one GPU fence that precedes it and relaxed
+# stores / counter adds (fence + relaxed RMW is the release pattern; the last
+# producer's fence before the ready stores is its acquire pattern).
+_FENCED_PUBLISH = os.environ.get("MEGA_SPLIT_FENCED_PUBLISH", "1") == "1"
+_PUBLISH_SEM = "relaxed" if _FENCED_PUBLISH else "release"
+_PUBLISH_RMW_SEM = "relaxed" if _FENCED_PUBLISH else "acq_rel"
+# Diagnostics only: per-call pseudo-random delays (0..N us) in K1, CTA 0 before
+# the reset barrier (late producer) and every dispatch warp before its pull
+# (late consumer), to exercise cross-rank buffer reuse.
+_DIAG_JITTER_US = int(os.environ.get("MEGA_SPLIT_DIAG_JITTER_US", "0"))
+# Diagnostic (MEGA_SPLIT_K1_STATIC_ORDER=1): static K1 ready-queue positions
+# without the t=0 weight prefetch (see ``k1_static_order``).
+_K1_STATIC_ORDER_ENV = os.environ.get("MEGA_SPLIT_K1_STATIC_ORDER", "0") == "1"
+
+
+@dataclass(frozen=True)
+class PushDispatchConfig:
+    """Compile-time constants of the push dispatch (``token_comm.push``).
+
+    The activation, scale, top-k id and top-k weight buffers lie inside one
+    span that starts at the activation buffer; ``stride`` (>= the span)
+    separates the span from the shadow of source ``s``, which starts at
+    ``activation + (s + 1) * stride`` with the span's layout, on every rank.
+    ``peers``: same-NUMA peers this rank pushes to and whose rows it pulls
+    from its shadows (``peer_mask``: the same set as a bit mask)."""
+
+    stride: int
+    peers: Tuple[int, ...]
+    peer_mask: int
+
 
 class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
     """Specialize common token communication for the SM120 SYSMEM path."""
@@ -53,6 +87,14 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
     _barrier_peer_mask = None
     # p2p_split: transport.xnuma.XnumaK1Config (compile-time constants) or None.
     xnuma = None
+    # t=0 FC1 weight prefetch: publish K1 ready tiles at static (expert-major)
+    # queue positions instead of in publish order (compile-time constant).
+    k1_static_order = False
+    # Push dispatch: PushDispatchConfig (compile-time constants) or None. Each
+    # source writes the rows routed to a same-NUMA peer into that peer's local
+    # shadow of the source's inputs; the owner then pulls locally instead of
+    # issuing PCIe P2P reads.
+    push = None
 
     @property
     def barrier_peer_mask(self) -> int:
@@ -437,6 +479,15 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             mask=0xFFFFFFFF,
             mask_and_clamp=31,
         )
+        if cutlass.const_expr(self.k1_static_order or _K1_STATIC_ORDER_ENV):
+            # Static order: the (expert, token tile) block lands at its dense
+            # expert-major position (task tiles before it x M tiles), so the
+            # first queue claims are known before dispatch (t=0 weight
+            # prefetch). The counter above still advances by the same amount,
+            # so the DONE sentinels land right after the last tile.
+            queue_begin = (
+                cumulative_token_block + tile_n_idx
+            ) * Int32(self.k1_ready_queue_m_tiles)
         for work_batch in cutlass.range_constexpr(
             0, (self.k1_ready_queue_m_tiles + 31) // 32
         ):
@@ -473,13 +524,15 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         ):
             tile_m_idx = Int32(work_batch * 32) + lane_idx
             if tile_m_idx < Int32(self.k1_ready_queue_m_tiles):
+                # fence_acq_rel_gpu above + a strong store = release pattern;
+                # a per-store release would fence once per descriptor batch.
                 cute.arch.store(
                     queue_ready.iterator
                     + Int32(self.k1_ready_queue_base)
                     + queue_begin
                     + tile_m_idx,
                     Int32(1),
-                    sem="release",
+                    sem=_PUBLISH_SEM,
                     scope="gpu",
                 )
 
@@ -940,14 +993,61 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     cur_peer_offset = peer_rank_ptr_mapper.map(
                         Int64(0), current_rank_in_expert_idx, Int64(0)
                     )
+                    if cutlass.const_expr(self.push is not None):
+                        # Same-NUMA remote source: read its pushed rows from
+                        # the local shadow (cross-NUMA sources keep their
+                        # xnuma shadow segment, this rank its own inputs).
+                        if current_rank_in_expert_idx != Int32(self.local_rank):
+                            if (Int32(self.push.peer_mask) >> current_rank_in_expert_idx) & Int32(1) == Int32(1):
+                                cur_peer_offset = (
+                                    Int64(current_rank_in_expert_idx) + Int64(1)
+                                ) * Int64(self.push.stride)
+                        # Peer-written (generic proxy) rows feed a TMA load.
+                        cute.arch.fence_proxy("async.global")
                     inp_tok_local_base = input_token_buffer.iterator.toint()
                     inp_sf_local_base = input_sf_buffer.iterator.toint()
                     inp_w_local_base = input_topk_weights_buffer.iterator.toint()
-                    tma_src_addr = (
-                        inp_tok_local_base
-                        + cur_peer_offset
-                        + Int64(src_token * Int32(self.hidden_bytes))
-                    )
+                    _xpack = self.xnuma is not None and getattr(self.xnuma, "pack", False)
+                    sf_row_addr = Int64(0)
+                    w_row_addr = Int64(0)
+                    if cutlass.const_expr(_xpack):
+                        # Packed cross-NUMA dispatch: the source shadow holds
+                        # only its rows routed here (see XnumaK1Config.pack).
+                        row_tok = src_token
+                        sf_row_addr = (
+                            inp_sf_local_base
+                            + cur_peer_offset
+                            + Int64(src_token * Int32(self.sf_uint32_per_token * 4))
+                        )
+                        w_row_addr = (
+                            inp_w_local_base
+                            + cur_peer_offset
+                            + Int64(src_token * Int32(self.num_topk * 4))
+                        )
+                        if (Int64(self.xnuma.cross_mask) >> Int64(current_rank_in_expert_idx)) & Int64(1) == Int64(1):
+                            pack_small = inp_sf_local_base + cur_peer_offset
+                            row_tok = ldg_b32_raw(pack_small + Int64(src_token * Int32(4)))
+                            w_row_addr = (
+                                pack_small
+                                + Int64(self.xnuma.tokens_per_rank * 4)
+                                + Int64(row_tok * Int32(self.num_topk * 4))
+                            )
+                            sf_row_addr = (
+                                pack_small
+                                + Int64(self.xnuma.tokens_per_rank * 4 * (1 + self.num_topk))
+                                + Int64(row_tok * Int32(self.sf_uint32_per_token * 4))
+                            )
+                        tma_src_addr = (
+                            inp_tok_local_base
+                            + cur_peer_offset
+                            + Int64(row_tok * Int32(self.hidden_bytes))
+                        )
+                    else:
+                        tma_src_addr = (
+                            inp_tok_local_base
+                            + cur_peer_offset
+                            + Int64(src_token * Int32(self.hidden_bytes))
+                        )
                     if cache_old > Int32(0):
                         tma_src_addr = (
                             fc1_input_token_buffer.iterator.toint()
@@ -980,32 +1080,38 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                                 )
                                 sf_value = fc1_input_sf_buffer[cached_sf_pos]
                             else:
-                                sf_addr = (
-                                    inp_sf_local_base
-                                    + cur_peer_offset
-                                    + Int64(
-                                        (
-                                            src_token
-                                            * Int32(self.sf_uint32_per_token)
-                                            + j
+                                if cutlass.const_expr(_xpack):
+                                    sf_addr = sf_row_addr + Int64(j * Int32(4))
+                                else:
+                                    sf_addr = (
+                                        inp_sf_local_base
+                                        + cur_peer_offset
+                                        + Int64(
+                                            (
+                                                src_token
+                                                * Int32(self.sf_uint32_per_token)
+                                                + j
+                                            )
+                                            * Int32(4)
                                         )
-                                        * Int32(4)
                                     )
-                                )
                                 sf_value = ldg_b32_raw(sf_addr)
                             sf_vals[i] = sf_value
                     if lane_idx == Int32(0):
-                        weight_addr = (
-                            inp_w_local_base
-                            + cur_peer_offset
-                            + Int64(
-                                (
-                                    src_token * Int32(self.num_topk)
-                                    + src_topk
+                        if cutlass.const_expr(_xpack):
+                            weight_addr = w_row_addr + Int64(src_topk * Int32(4))
+                        else:
+                            weight_addr = (
+                                inp_w_local_base
+                                + cur_peer_offset
+                                + Int64(
+                                    (
+                                        src_token * Int32(self.num_topk)
+                                        + src_topk
+                                    )
+                                    * Int32(4)
                                 )
-                                * Int32(4)
                             )
-                        )
                         weight = ldg_f32_raw(weight_addr)
 
                 for i in cutlass.range_constexpr(0, sf_passes, 1):
@@ -1114,8 +1220,11 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                             Int32(1),
                             # The last token producer publishes all K1 work
                             # for this tile.  Acquire the preceding producers'
-                            # release sequence before exposing the descriptor.
-                            sem="acq_rel",
+                            # release sequence before exposing the descriptor
+                            # (fenced publish: the fence_acq_rel_gpu above is
+                            # this add's release, the one before the ready
+                            # stores in _push_k1_ready_work_tiles its acquire).
+                            sem=_PUBLISH_RMW_SEM,
                             scope="gpu",
                         )
                         if old_count + Int32(1) == valid_tokens_in_tile:
@@ -1559,6 +1668,77 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
 
 
     @cute.jit
+    def _diag_jitter(self, salt: cutlass.Constexpr):
+        if cutlass.const_expr(_DIAG_JITTER_US > 0):
+            t0 = _gt()
+            h = (t0 >> Int64(10)) * Int64(2654435761) + Int64(self.local_rank * 40503 + salt * 977)
+            h = h ^ (h >> Int64(15))
+            d = (h & Int64(0x7FFFFFFF)) % Int64(_DIAG_JITTER_US * 1000)
+            t = _gt()
+            while t - t0 < d:
+                t = _gt()
+
+    @cute.jit
+    def push_inputs(self, token_comm_args, sm_idx, warp_idx, lane_idx):
+        """Push dispatch, after the reset barrier: copy each token's activation,
+        scale and top-k weight rows into the shadow-of-this-rank of every
+        same-NUMA peer that one of its experts lives on. One warp per
+        (peer, token); 8-byte stores (posted PCIe writes). The reset barrier
+        orders these writes after the peer's previous-call pull, and the
+        dispatch barrier (fence + grid sync + peer barrier) orders them before
+        this call's pull."""
+        c = self.push
+        n_peers = len(c.peers)
+        topk_idx = token_comm_args.topk_idx
+        mapper = token_comm_args.peer_rank_ptr_mapper
+        tokens = Int32(token_comm_args.input_token_buffer.shape[0])
+        rows = (
+            (token_comm_args.input_token_buffer.iterator.toint(), self.hidden_bytes),
+            (token_comm_args.input_sf_buffer.iterator.toint(), self.sf_uint32_per_token * 4),
+            (token_comm_args.input_topk_weights_buffer.iterator.toint(), self.num_topk * 4),
+        )
+        my_shadow = Int64((self.local_rank + 1) * c.stride)
+        task = sm_idx * Int32(self.num_dispatch_warps) + warp_idx
+        stride = token_comm_args.sm_count * Int32(self.num_dispatch_warps)
+        n_tasks = Int32(n_peers) * tokens
+        while task < n_tasks:
+            pi = task // tokens
+            t = task - pi * tokens
+            peer = Int32(c.peers[0])
+            for q in cutlass.range_constexpr(1, n_peers):
+                if pi == Int32(q):
+                    peer = Int32(c.peers[q])
+            routed = Int32(0)
+            if lane_idx < Int32(self.num_topk):
+                e = Int32(topk_idx[t, lane_idx])
+                if e >= Int32(0):
+                    if e // Int32(self.num_experts_per_rank) == peer:
+                        routed = Int32(1)
+            any_routed = Int32(cute.arch.vote_ballot_sync(routed != Int32(0)))
+            if any_routed != Int32(0):
+                for buf in cutlass.range_constexpr(3):
+                    base, row = rows[buf]
+                    n8 = row // 8
+                    src = Int64(base) + Int64(t) * Int64(row)
+                    dst = mapper.map(src + my_shadow, peer, Int64(0))
+                    st = cute.make_tensor(
+                        cute.make_ptr(Int64, src, cute.AddressSpace.gmem, assumed_align=8), cute.make_layout(n8)
+                    )
+                    for k0 in cutlass.range_constexpr(0, (n8 + 31) // 32, 4):
+                        vals = []
+                        for k in cutlass.range_constexpr(k0, min(k0 + 4, (n8 + 31) // 32)):
+                            v = Int64(0)
+                            if lane_idx + Int32(32 * k) < Int32(n8):
+                                v = st[lane_idx + Int32(32 * k)]
+                            vals.append(v)
+                        for k in cutlass.range_constexpr(k0, min(k0 + 4, (n8 + 31) // 32)):
+                            if lane_idx + Int32(32 * k) < Int32(n8):
+                                stg_b64_raw(dst + Int64(8 * (lane_idx + Int32(32 * k))), vals[k - k0])
+            task = task + stride
+        # Each writer orders its peer stores before the dispatch barrier.
+        cute.arch.fence_acq_rel_sys()
+
+    @cute.jit
     def dispatch_warp_body(
         self,
         token_comm_args,
@@ -1601,6 +1781,12 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             # before the first peer write, even when RLC is disabled.
             # This transfers epoch ownership; it does not wait for activation
             # dispatch to finish or change the tile-level FC1 ready protocol.
+            if cutlass.const_expr(_DIAG_JITTER_US > 0):
+                if cta_linear_id == Int32(0):
+                    if local_warp_idx == Int32(0):
+                        if lane_idx == Int32(0):
+                            self._diag_jitter(1)
+                cute.arch.sync_warp()
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -1614,6 +1800,8 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            if cutlass.const_expr(self.push is not None):
+                self.push_inputs(token_comm_args, cta_linear_id, local_warp_idx, lane_idx)
 
             self.dispatch_prep(
                 token_comm_storage,
@@ -1769,6 +1957,10 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         if iket_active:
             _iket.range_pop()
             _iket.range_push("Dispatch_Pull")
+        if cutlass.const_expr(_DIAG_JITTER_US > 0):
+            if lane_idx == Int32(0):
+                self._diag_jitter(2)
+            cute.arch.sync_warp()
 
         phase_bit, stored_num_tokens_per_expert = self.dispatch_pull(
             token_comm_storage,

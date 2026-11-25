@@ -117,6 +117,67 @@ torchrun --standalone --nproc_per_node=4 \
 covers EP8 route distributions plus dynamic/static 100-replay transport
 checks.
 
+## Decode transport options
+
+Resolved after every other selection layer by
+`heuristic.select_transport_overlay` (API and runner; explicit value > tuned
+table knob > default rule) and part of the kernel config / cache key:
+
+- `push_dispatch` (default: one host, EP <= 8, up to 64 tokens per rank;
+  `--push_dispatch on|off`, `MEGA_SPLIT_PUSH_DISPATCH=0|1`, table knob).
+  PCIe peer reads are slow, so right after the reset barrier every source K1
+  writes the activation, scale and top-k weight rows of each token routed to
+  a same-NUMA peer into that peer's local shadow of the source's inputs
+  (posted 8-byte peer stores) and the owner's token-strided pull reads its
+  shadows. The reset barrier orders a source's writes after the owner's pull
+  of the previous call, the dispatch barrier orders them before this call's
+  pull. Callers allocate the shadows: `world * stride` symmetric bytes placed
+  directly after the input span (activation, scales, top-k ids, top-k
+  weights), where `stride` is the page-aligned span size, so source `s`'s
+  shadow starts at `activation + (s + 1) * stride`; then set
+  `k1.token_comm.push = token_comm.PushDispatchConfig(stride, peers, peer_mask)`
+  before compiling K1 (`peers`: the same-NUMA ranks of the dispatch barrier).
+  `gin_bridge.p2p_capacity(..., push_shadow=True)` sizes the arena for it.
+- `k1_t0_prefetch` (K tiles; default: the whole tile wherever push dispatch
+  is on; `--k1_t0_prefetch N`, `MEGA_SPLIT_K1_T0_PREFETCH`, table knob): the
+  dispatch publishes each (expert, token tile) block at its static
+  expert-major position of the K1 ready queue, so the position a K1 scheduler
+  warp claims at kernel entry names the weight tile it most likely runs
+  first; the warp prefetches that tile and its scale atoms into L2 while the
+  reset barrier, push and dispatch barrier run. Without push dispatch the
+  static order makes K1 wait on slow pulls, so it follows push.
+- `xnuma_pack` (p2p_split; default EP16 from 64 tokens per rank;
+  `--xnuma_pack on|off`, `MEGAMOE_XNUMA_PACK=0|1`, table knob): each sender
+  CTA stages only the rows routed to its cross-NUMA owner (ballot scan in
+  token order) and puts those plus a `map[token] -> packed row | weights |
+  scales` block instead of the whole input span; the owner's pull reads the
+  map for cross sources.
+
+Default-on front path (`=0` restores the old form): `MEGA_SPLIT_FUSED_RESET`
+issues the graph-owned replay reset as one fill kernel instead of a chain of
+fill nodes; `MEGA_SPLIT_FENCED_PUBLISH` publishes a K1 ready tile with the one
+GPU fence that precedes it and relaxed stores / counter adds. Opt-in:
+`MEGA_SPLIT_LATE_FORWARDER_JOIN=1` joins the p2p_split forwarder after the K2
+finalizer (measured neutral). Diagnostics: `MEGA_SPLIT_DIAG_JITTER_US=N`
+injects per-call 0..N us delays in K1 before the reset barrier and before the
+pull; `MEGA_SPLIT_K1_STATIC_ORDER=1` gives the static queue order without the
+prefetch.
+
+Backend default for cross-NUMA worlds without `--comm_backend`: the 110-SM
+table anchor's backend, else `p2p_split` up to 8192 tokens per rank and
+`gin_hybrid` above (any device; EP16 always `p2p_split`). `gin_hybrid` needs
+the CUDA 13.1 structured SM split (`runtime/driver_caps.py`,
+`MEGAMOE_HYBRID_SM_SPLIT=0|1` forces the answer); without it table anchors
+fall back to `p2p_split` and an explicit `--comm_backend gin_hybrid` fails.
+Untabulated EP8 `p2p_split` decode shapes (<= 128 tokens per rank) get the
+generic decode preset (`heuristic.generic_decode_knobs`;
+`--generic_decode_preset off` / `MEGAMOE_GENERIC_DECODE_PRESET=0` disables
+it).
+
+`heuristic.check_launch_safety` (run by the overlay) rejects
+`k2_launch_factor=2` with K2 tail reclaim off on an 8-warp K2 N16 tile, which
+never finishes its first launch.
+
 ## Production API and cache
 
 Framework integrations should import `api.py`, not `mega_runner.py`:

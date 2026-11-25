@@ -16,6 +16,13 @@ _OVERLAP_MODE = os.environ.get("MEGAMOE_XNUMA_OVERLAP_MODE", "overlap")
 JITTER_US = float(os.environ.get("MEGAMOE_XNUMA_JITTER_US", "0"))
 # Diagnostics only: per-launch CUDA-event phase times, printed at close().
 _PHASES = os.environ.get("MEGAMOE_LAUNCH_PHASES", "0") == "1"
+# p2p_split, opt-in (MEGA_SPLIT_LATE_FORWARDER_JOIN=1): join the cross-NUMA
+# forwarder after the K2 finalizer instead of before it. Measured neutral on
+# NVFP4 (EP8 DSv4.1/GLM5.3 T16-64 within +-0.3 %, EP16 within the run-to-run
+# spread), so the default keeps the original order.
+# FlashInfer runs the K2 finalizer after this graph (primary context), so the
+# late join has no position to move to; the opt-in is not ported.
+_LATE_FORWARDER_JOIN = False
 _CYCLES_PER_US = None
 
 
@@ -130,6 +137,16 @@ class NativeGreenContextResources:
         num_comm_streams: int = 4,
         device: Optional[int] = None,
     ) -> "NativeGreenContextResources":
+        from .driver_caps import driver_cuda_version, hybrid_sm_split_available
+
+        if not hybrid_sm_split_available():
+            version = driver_cuda_version()
+            raise RuntimeError(
+                "the GIN-ring hybrid (gin_hybrid) needs four Green Contexts from "
+                "the CUDA 13.1 structured SM split (cuDevSmResourceSplit); this "
+                f"driver reports CUDA {version // 1000}.{version % 1000 // 10}. Use "
+                "p2p_split (the cross-NUMA default without --comm_backend) or a "
+                "driver >= 13.1.")
         from cuda.bindings import driver as cuda
         from cuda.core import Device, SMResourceOptions
 
@@ -546,7 +563,7 @@ class NativeGreenContextGraph:
                 # releases that Green partition and then joins the main K2
                 # worker grid through the shared atomic queue.
                 launch_k2_drain()
-            if forwarder_done is not None:
+            if forwarder_done is not None and not _LATE_FORWARDER_JOIN:
                 k1_stream.wait_event(forwarder_done)
             if not serialize_k2:
                 k1_done.record(k1_stream)

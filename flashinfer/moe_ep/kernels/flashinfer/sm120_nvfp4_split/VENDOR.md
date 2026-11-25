@@ -2,8 +2,8 @@
 
 The raw source under `moe_sm120_nvfp4_split/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
-`b2fd4cac1d28d6a9be0cdfaf303ccd072ce21f54`. The FlashInfer
-delivery uses ABI `2814542011117` (standalone source ABI `281454201`).
+`7ce815e` (on top of `b2fd4cac1d28d6a9be0cdfaf303ccd072ce21f54`). The FlashInfer
+delivery uses ABI `2814542011118` (standalone source ABI `281454205`).
 This revision includes continuous decode policies, M128 workers, utility
 defaults, DATA TMA eviction hints and the NCCL memory/transport runtime.
 It adds the measured anchor table (`tuned_table.json`, DSV4.1-Flash and
@@ -186,3 +186,24 @@ layer pooling retains the arena until all associated frontends are destroyed.
 Packed FP4 weight interleave uses byte views so it is bit-preserving on PyTorch
 versions without native FP4 `copy_` support. CuTe DLPack conversion uses the
 vendored low-precision wrapper where Torch does not export FP4/FP8 DLPack.
+
+Drop `7ce815e` (local, not yet committed) adds the one-host decode front path
+(push dispatch into same-NUMA peers' local shadows, t=0 FC1 weight L2 prefetch,
+fused replay reset, fenced K1 ready publish), the packed p2p_split cross
+dispatch at EP16 from 64 tokens per rank, the device-independent cross-NUMA
+backend rule with a generic decode preset for untabulated shapes, the K2
+launch-factor safety check and retuned EP8/EP16 anchors. FlashInfer adaptations:
+the frontend allocates the push shadows (world x the page-rounded input span)
+right after the input span and installs `token_comm.push` on every push bucket's
+K1; the shared xnuma control region is laid out with packing when any p2p_split
+bucket packs, and the packed sender addresses the input span inside the owner's
+shadow segment (FlashInfer's sender table holds segment bases); without packing
+the sender keeps the FlashInfer per-tensor puts. The frontend replay reset uses
+the fused fill kernel (`MEGA_SPLIT_FUSED_RESET=0` restores per-region memsets).
+The opt-in late forwarder join is not ported: FlashInfer runs the K2 finalizer
+after the Green Context graph, so `MEGA_SPLIT_LATE_FORWARDER_JOIN` is ignored.
+`runtime/driver_caps.hybrid_sm_split_available()` also reports the hybrid as
+available on CUDA 13.0 drivers: FlashInfer's `NativeGreenContextResources`
+builds the four partitions there from equal SM units
+(`cuDevSmResourceSplitByCount`), so the standalone CUDA 13.1 requirement does
+not apply (`MEGAMOE_HYBRID_SM_SPLIT=0|1` still forces the answer).

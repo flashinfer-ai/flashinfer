@@ -17,6 +17,8 @@ rank's segment 0 (symmetric), right after the P2P arena allocations:
   sscr  [n_cross][experts][128] i32 sender scratch (per-thread route counts / write cursors)
   ret   [n_cross][fsplit][max_routes][slot]  packed return rows (receive)
   stage [n_cross][fsplit][max_routes][slot]  packed return rows (send)
+  pscr  [n_cross][128 + tokens] i32  (pack) sender scan scratch + packed-row -> token
+  pstage [n_cross][pack_stride]  (pack) routed activation rows | map | weights | scales
 
 record = i32 counts[experts] + i32 lists[experts][tokens_per_rank], where a list
 entry is ``token * topk + slot``. slot = 16 B header (int64 entry) + one BF16
@@ -47,6 +49,9 @@ class XnumaLayout:
     hidden: int
     # Forwarder CTAs per cross source (experts split by id modulo fsplit).
     fsplit: int = 2
+    # Packed dispatch: the sender stages only the rows routed to each cross
+    # owner (pstage) and puts those instead of its whole input span.
+    pack: bool = False
 
     def __post_init__(self):
         if self.fsplit not in (1, 2, 4):
@@ -77,6 +82,28 @@ class XnumaLayout:
         return self.tokens_per_rank * self.topk
 
     @property
+    def act_row_bytes(self) -> int:
+        return self.hidden // 2  # NVFP4 activation row (two E2M1 values per byte)
+
+    @property
+    def sf_row_bytes(self) -> int:
+        return _up((self.hidden + 15) // 16, 4)  # E4M3 scale per 16 values, padded to 4 B
+
+    @property
+    def pack_act_bytes(self) -> int:
+        return _up(self.tokens_per_rank * self.act_row_bytes, 256)
+
+    @property
+    def pack_small_bytes(self) -> int:
+        # map[T] i32 | weights[T][topk] f32 (packed rows) | scales[T][sf_row] (packed rows)
+        T = self.tokens_per_rank
+        return T * 4 + T * self.topk * 4 + T * self.sf_row_bytes
+
+    @property
+    def pack_stride(self) -> int:
+        return _up(self.pack_act_bytes + self.pack_small_bytes, 4096)
+
+    @property
     def scratch_bytes(self) -> int:
         return _up((self.experts_per_rank + 2) * 4, 256)
 
@@ -94,10 +121,13 @@ class XnumaLayout:
         o["k2meta"] = o["k2tot"] + _up(self.experts_per_rank * 4, 256)
         o["fscr"] = o["k2meta"] + 64
         o["sscr"] = o["fscr"] + self.n_cross * self.fsplit * self.scratch_bytes
-        o["ret"] = _up(o["sscr"] + self.n_cross * self.experts_per_rank * SENDER_THREADS * 4, 4096)
+        o["pscr"] = o["sscr"] + self.n_cross * self.experts_per_rank * SENDER_THREADS * 4
+        pscr_bytes = self.n_cross * (SENDER_THREADS + self.tokens_per_rank) * 4 if self.pack else 0
+        o["ret"] = _up(o["pscr"] + pscr_bytes, 4096)
         ret_bytes = self.n_cross * self.fsplit * self.max_routes * self.slot_bytes
         o["stage"] = o["ret"] + _up(ret_bytes, 4096)
-        o["end"] = o["stage"] + _up(ret_bytes, 4096)
+        o["pstage"] = o["stage"] + _up(ret_bytes, 4096)
+        o["end"] = o["pstage"] + (self.n_cross * self.pack_stride if self.pack else 0)
         return o
 
     @property

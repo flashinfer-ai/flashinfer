@@ -41,6 +41,50 @@ class MegaMoEHeuristicOverrides(_LegacyOverrides):
 RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT = 32.0
 _KNOB_FIELDS = ("k1_ctas_per_sm", "k2_launch_factor", "weight_prefetch_ahead", "xnuma_fsplit")
 _KNOB_DEFAULTS = {"k1_ctas_per_sm": 1, "k2_launch_factor": 1, "weight_prefetch_ahead": 0, "xnuma_fsplit": 2}
+# Transport overlay knobs: resolved after every selection layer by
+# ``select_transport_overlay`` (explicit value > tuned-table knob > default) and
+# invisible to the policy records while at their defaults.
+_OVERLAY_DEFAULTS = {"k1_t0_prefetch": 0, "push_dispatch": False, "xnuma_pack": False}
+
+# Packed p2p_split dispatch (``XnumaLayout.pack``): each source sends a cross
+# owner only the rows routed to it (staged in token order, plus a token ->
+# row map) instead of its whole input span. The span puts are NIC-bandwidth
+# bound (EP16: 12 network peers per rank), while only 1 - (1 - 1/ep)^topk of
+# the tokens reach a given owner. Staging costs the sender (which precedes
+# K1) a few us, so small calls keep the span put (NVFP4 rows are half the
+# MXFP8 bytes, so the span put is cheaper and the crossover later than W4A8's
+# 32). EP16 ABBA, packed vs span put: DSv4.1 T32/64/128/256 -0.3/-1.8/-6.2/
+# -8.8 %, GLM5.3 +1.1/-2.0/-5.6/-6.7 %. Minimum tokens per rank per EP size;
+# EP sizes not listed never pack.
+XNUMA_PACK_MIN_TOKENS = {16: 64}
+
+
+def select_xnuma_pack(tokens_per_rank: int, expert_parallel_size: int) -> bool:
+    """Default packed p2p_split dispatch for a call size and EP size."""
+    lo = XNUMA_PACK_MIN_TOKENS.get(int(expert_parallel_size))
+    return lo is not None and int(tokens_per_rank) >= lo
+
+# Push dispatch (``MegaMoEKernelConfig.push_dispatch``): each source writes the
+# rows routed to a same-NUMA peer into a local shadow on that peer, so K1 pulls
+# from local memory instead of issuing PCIe P2P reads. Costs one input span per
+# EP rank of symmetric memory. On by default on one host (EP <= 8) up to this
+# many tokens per rank, where it enables the t=0 FC1 prefetch (static K1 queue
+# order); alone it is within +-1 % (NVFP4 rows are half the MXFP8 bytes), with
+# the prefetch and the decode front path DSv4.1/GLM5.3 EP4/EP8 T16-64 gain up
+# to 1.6/4.0 %. Above 64 tokens it measured neutral (T96) to +1.4 % (T128). At
+# EP16 it measured mixed (DSv4.1 T32 -1.7 %, GLM5.3 T32/T64 +1.2/+1.3 %), so
+# EP16 uses it only where a table anchor sets it.
+PUSH_DISPATCH_MAX_TOKENS = 64
+PUSH_DISPATCH_MAX_EP = 8
+
+# t=0 FC1 weight prefetch (``MegaMoEKernelConfig.k1_t0_prefetch``), in K tiles
+# of the K1 MMA tile; values above the K extent prefetch the whole tile. The
+# default prefetches each K1 CTA's whole expected first weight tile (and its
+# scales) for decode calls on one host (EP <= 8) with the p2p_direct kernel
+# transport (p2p_direct or p2p_split) and the K1 ready queue.
+K1_T0_PREFETCH_MAX_K_TILES = 64
+K1_T0_PREFETCH_DEFAULT_K_TILES = K1_T0_PREFETCH_MAX_K_TILES
+K1_T0_PREFETCH_MAX_EP = 8
 
 
 @dataclass(frozen=True)
@@ -58,6 +102,18 @@ class MegaMoEKernelConfig(_LegacyConfig):
     weight_prefetch_ahead: int = 0
     # p2p_split forwarder CTAs per cross source (experts split by id modulo).
     xnuma_fsplit: int = 2
+    # t=0 FC1 weight prefetch: K1 ready-queue positions become static
+    # (expert-major order of the dispatched (expert, token-tile) blocks instead
+    # of publish order), and at K1 entry each K1 CTA prefetches into L2 the
+    # first ``k1_t0_prefetch`` K tiles of the weight tile its first claimed
+    # queue position is expected to hold (0 = off: dynamic publish order).
+    k1_t0_prefetch: int = 0
+    # Sources push the routed input rows into same-NUMA owners' local shadows
+    # (p2p_direct kernel transport only; the caller allocates the shadows).
+    push_dispatch: bool = False
+    # p2p_split: send each cross-NUMA owner only its routed rows (packed
+    # dispatch) instead of the whole input span (no effect on other backends).
+    xnuma_pack: bool = False
 
     def __post_init__(self):
         parent = getattr(_LegacyConfig, "__post_init__", None)
@@ -71,6 +127,8 @@ class MegaMoEKernelConfig(_LegacyConfig):
             raise ValueError("weight_prefetch_ahead must be 0, 4 or 8")
         if self.xnuma_fsplit not in (1, 2, 4):
             raise ValueError("xnuma_fsplit must be 1, 2 or 4")
+        if not 0 <= self.k1_t0_prefetch <= K1_T0_PREFETCH_MAX_K_TILES:
+            raise ValueError(f"k1_t0_prefetch must be 0..{K1_T0_PREFETCH_MAX_K_TILES} K tiles")
         if self.k1_ctas_per_sm == 2 and self.dispatch_warps != 1:
             raise ValueError("k1_ctas_per_sm=2 needs one dispatch warp")
         if self.k2_launch_factor == 2 and (self.k2_warps == 12 or self.k2_tile[1] > 32):
@@ -774,7 +832,108 @@ def policy_asdict(c):
     for k in _KNOB_FIELDS:
         if d.get(k) == _KNOB_DEFAULTS[k]:
             d.pop(k)
+    for k in _OVERLAY_DEFAULTS:
+        # Resolved after every policy layer; never part of a policy record.
+        d.pop(k, None)
     return d
+
+
+@dataclass(frozen=True)
+class TransportOverlay:
+    """Explicit transport-overlay knobs (None: tuned-table knob, else default).
+
+    Kept out of ``MegaMoEHeuristicOverrides`` so the selection layers (and
+    their qualified policy records) see the same inputs with or without them."""
+
+    k1_t0_prefetch: Optional[int] = None
+    push_dispatch: Optional[bool] = None
+    xnuma_pack: Optional[bool] = None
+
+
+def _default_push_dispatch(shape, config) -> bool:
+    return bool(
+        config.kernel_comm_backend == "p2p_direct"
+        and 1 < shape.expert_parallel_size <= PUSH_DISPATCH_MAX_EP
+        and shape.ep_same_numa_peer_count > 0
+        and shape.tokens_per_rank <= PUSH_DISPATCH_MAX_TOKENS
+    )
+
+
+def _default_k1_t0_prefetch(shape, config, push: bool) -> int:
+    # The static queue order only pays with push dispatch: with PCIe peer-read
+    # pulls the expert-major order makes K1 CTAs wait on slow tiles (DSv4.1
+    # EP8 T32/T64 +3.4/+2.1 % without push).
+    return (K1_T0_PREFETCH_DEFAULT_K_TILES if (
+        push
+        and config.kernel_comm_backend == "p2p_direct"
+        and config.k1_ready_queue
+        and 1 < shape.expert_parallel_size <= K1_T0_PREFETCH_MAX_EP
+        and shape.ep_cross_numa_peer_count == 0
+    ) else 0)
+
+
+def select_transport_overlay(shape, config, overlay=None):
+    """Resolve the transport overlay knobs on a selected configuration.
+
+    Runs after every other selection layer (API and runner). Per knob: an
+    explicit value wins, then the tuned-table anchor's knob, then the default
+    rule; a knob the configuration cannot use falls back to off."""
+    from . import tuned_table
+
+    overlay = overlay or TransportOverlay()
+    entry = tuned_table.lookup(shape)
+    knobs = entry["knobs"] if entry is not None else {}
+    push = overlay.push_dispatch
+    if push is None and knobs.get("push_dispatch") is not None:
+        push = knobs["push_dispatch"] == "on"
+    if push is None:
+        push = _default_push_dispatch(shape, config)
+    if push and (config.kernel_comm_backend != "p2p_direct" or shape.expert_parallel_size <= 1):
+        if overlay.push_dispatch:
+            raise ValueError("push_dispatch needs the p2p_direct kernel transport and EP peers")
+        push = False
+    t0 = overlay.k1_t0_prefetch
+    if t0 is None and knobs.get("k1_t0_prefetch") is not None:
+        t0 = int(knobs["k1_t0_prefetch"])
+    if t0 is None:
+        t0 = _default_k1_t0_prefetch(shape, config, push)
+    if t0 and (config.kernel_comm_backend != "p2p_direct" or not config.k1_ready_queue):
+        if overlay.k1_t0_prefetch:
+            raise ValueError("k1_t0_prefetch needs the p2p_direct kernel transport and the K1 ready queue")
+        t0 = 0
+    pack = overlay.xnuma_pack
+    if pack is None and knobs.get("xnuma_pack") is not None:
+        pack = knobs["xnuma_pack"] == "on"
+    if pack is None:
+        pack = (config.kernel_comm_backend == "p2p_direct"
+                and select_xnuma_pack(shape.tokens_per_rank, shape.expert_parallel_size))
+    if config.kernel_comm_backend != "p2p_direct":
+        pack = False
+    if (t0, push, pack) != (config.k1_t0_prefetch, config.push_dispatch, config.xnuma_pack):
+        config = replace(config, k1_t0_prefetch=t0, push_dispatch=push, xnuma_pack=pack)
+    check_launch_safety(shape, config)
+    return config
+
+
+def check_launch_safety(shape, config) -> None:
+    """Reject resolved configurations known to hang at the first launch.
+
+    ``select_transport_overlay`` is the last layer of every selection (API and
+    runner: heuristic defaults, table entries and caller overrides), so this
+    is the single gate.
+
+    ``k2_launch_factor=2`` with ``k2_tail_reclaim`` off never finishes its
+    first launch with an 8-warp K2 N16 tile (DSv4.1, T16, K1 N32 dual: EP4
+    p2p_direct and EP8 p2p_split, 300 s timeouts, 2026-11-25; the W4A8 port
+    hangs the same way). Unlike W4A8, the same knobs with a K2 N32 tile run
+    and pass the reference check on NVFP4 p2p_split EP8, so only the N16 tile
+    is rejected. Likely the second K2 CTA per SM is not co-resident while the
+    non-reclaim K2 tail waits for the whole grid; not analysed further.
+    """
+    if config.k2_launch_factor == 2 and not config.k2_tail_reclaim and config.k2_tile[1] == 16:
+        raise ValueError(
+            "k2_launch_factor=2 with k2_tail_reclaim off hangs at the first launch with a "
+            "K2 N16 tile; set k2_tail_reclaim=on, k2_launch_factor=1 or a K2 N32 tile")
 
 
 def _apply_knobs(c, overrides):
@@ -789,6 +948,44 @@ def _apply_knobs(c, overrides):
     return replace(c, **knobs)
 
 
+# Generic decode preset for shapes without a table (another model, SM count or
+# device), applied like a table entry at the call's token count: knobs
+# relative to the rule-based selection, explicit overrides win. Scope: EP8
+# p2p_split (ep8_2numa, folded) up to GENERIC_DECODE_MAX_TOKENS tokens per
+# rank and RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT expected rows per expert,
+# never where a table exists for the (signature, topology) on the table
+# device. EP4 in one NUMA node keeps the calibrated candidate selector, whose
+# domain is a shape range rather than a model list. See RESULTS.md for the
+# held-out GLM-5.3 / DSv4-Flash measurements behind the knobs.
+GENERIC_DECODE_MAX_TOKENS = 128
+GENERIC_DECODE_TOPOLOGIES = ("ep8_2numa",)
+GENERIC_DECODE_KNOBS = dict(k2_n=64, weight_prefetch_ahead=4, xnuma_fsplit=4, fc1_utility_postprocess="on")
+# Three K1 stages help above this many tokens per rank and hurt below.
+GENERIC_DECODE_K1_STAGES3_MIN_TOKENS = 64
+
+
+def generic_decode_knobs(shape) -> Optional[dict]:
+    """Table-format knobs of the generic decode preset for ``shape``, or None."""
+    from . import tuned_table
+
+    if not (1 <= shape.tokens_per_rank <= GENERIC_DECODE_MAX_TOKENS
+            and shape.expected_rows_per_expert <= RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT
+            and shape.ep_cross_numa_peer_count == 0):
+        return None
+    topology = tuned_table.layout_of(shape)
+    if topology not in GENERIC_DECODE_TOPOLOGIES:
+        return None
+    signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
+    if tuned_table.device_of(shape) == tuned_table.TABLE_DEVICE and tuned_table.has_table(signature, topology):
+        return None
+    knobs = dict(GENERIC_DECODE_KNOBS)
+    if shape.tokens_per_rank > GENERIC_DECODE_K1_STAGES3_MIN_TOKENS:
+        knobs["k1_stages"] = 3
+    if topology == "ep8_2numa":
+        knobs["backend"] = "p2p_split"
+    return knobs
+
+
 def select_megamoe_config(
     shape,
     overrides=None,
@@ -797,11 +994,17 @@ def select_megamoe_config(
     host_expert_counts=None,
     tuning_config=None,
     hardware=None,
+    generic_decode_preset=True,
 ):
-    """Return a complete config. Callers must explicitly permit owner BF16 order."""
+    """Return a complete config. Callers must explicitly permit owner BF16 order.
+
+    ``generic_decode_preset=False`` keeps the rule-based selection where the
+    generic decode preset would apply (the tuner measures table knobs against
+    it)."""
     _validate_counts(shape, host_expert_counts)
     if tuning_config is None and host_expert_counts is None:
-        overrides = _with_tuned_table(shape, overrides, numerical_contract)
+        overrides = _with_tuned_table(shape, overrides, numerical_contract,
+                                      generic_decode_preset=generic_decode_preset)
     return _select_with_profiles(shape, overrides, numerical_contract, host_expert_counts,
                                  tuning_config, hardware)[0]
 
@@ -815,7 +1018,7 @@ _PINNED_FROM_ANCHOR = (
 )
 
 
-def _with_tuned_table(shape, overrides, contract):
+def _with_tuned_table(shape, overrides, contract, *, generic_decode_preset=True):
     """Fill unset overrides from the ``tuned_table.json`` anchor entry.
 
     Knobs are the runner flags the tuner measured on top of the built-in
@@ -827,6 +1030,11 @@ def _with_tuned_table(shape, overrides, contract):
     from . import tuned_table
 
     entry = tuned_table.lookup(shape)
+    if entry is None and generic_decode_preset:
+        knobs = generic_decode_knobs(shape)
+        if knobs is not None:
+            # Applied exactly like a table anchor at this token count.
+            entry = dict(tokens=shape.tokens_per_rank, knobs=knobs)
     if entry is None:
         return overrides
     table = tuned_table.overrides_for(entry["knobs"])
@@ -949,6 +1157,16 @@ def explain_selection(
 
 
 __all__ = [
+    "K1_T0_PREFETCH_DEFAULT_K_TILES",
+    "PUSH_DISPATCH_MAX_TOKENS",
+    "XNUMA_PACK_MIN_TOKENS",
+    "select_xnuma_pack",
+    "K1_T0_PREFETCH_MAX_K_TILES",
+    "TransportOverlay",
+    "check_launch_safety",
+    "GENERIC_DECODE_KNOBS",
+    "generic_decode_knobs",
+    "select_transport_overlay",
     "MegaMoEHeuristicInput",
     "MegaMoEHeuristicOverrides",
     "MegaMoEKernelConfig",

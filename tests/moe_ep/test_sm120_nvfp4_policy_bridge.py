@@ -265,10 +265,10 @@ def test_ep8_p2p_split_bucket_uses_folded_selection(monkeypatch):
     frontend.workspace._topology = _ep8_topology()
     frontend.workspace._bucket_backends = {32: "p2p_split"}
     split = frontend._select_spec(32).kernel
-    # DSV4.1-Flash EP8 T32 anchor: p2p_split with K1/K2 N64.
+    # DSV4.1-Flash EP8 T32 anchor (retuned at 7ce815e): p2p_split, K1 N16, K2 N64.
     assert split.comm_backend == "p2p_direct"
     assert not split.rank_local_combine
-    assert (split.k1_tile[1], split.k2_tile[1], split.k2_warps) == (64, 64, 8)
+    assert (split.k1_tile[1], split.k2_tile[1], split.k2_warps) == (16, 64, 8)
     assert (split.tx_sms, split.rx_sms) == (0, 0)
     gin = frontend._select_spec(1024).kernel
     assert gin.comm_backend == "gin"

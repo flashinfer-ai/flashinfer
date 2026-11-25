@@ -45,11 +45,20 @@ def test_ep8_backend_selection_and_folded_view():
 
 
 def test_rule_without_table():
-    with patch.object(tuned_table, "_load", return_value=dict(schema=1, tables=[])):
-        real = shape(64, ep=8, same=3, cross=4)
-        assert tuned_table.preferred_ep8_backend(real) == "p2p_split"
-        assert tuned_table.preferred_ep8_backend(replace(real, tokens_per_rank=4096)) == "p2p_split"
-        assert tuned_table.preferred_ep8_backend(replace(real, tokens_per_rank=4097)) == "gin_hybrid"
+    import os
+    from .runtime import driver_caps
+
+    x = tuned_table.SPLIT_RULE_MAX_TOKENS
+    driver_caps.hybrid_sm_split_available.cache_clear()
+    try:
+        with patch.object(tuned_table, "_load", return_value=dict(schema=1, tables=[])), \
+                patch.dict(os.environ, {driver_caps.HYBRID_SM_SPLIT_ENV: "1"}):
+            real = shape(64, ep=8, same=3, cross=4)
+            assert tuned_table.preferred_ep8_backend(real) == "p2p_split"
+            assert tuned_table.preferred_ep8_backend(replace(real, tokens_per_rank=x)) == "p2p_split"
+            assert tuned_table.preferred_ep8_backend(replace(real, tokens_per_rank=x + 1)) == "gin_hybrid"
+    finally:
+        driver_caps.hybrid_sm_split_available.cache_clear()
 
 
 def test_overrides_mapping():
@@ -107,3 +116,29 @@ def test_ep16_two_host_topology_uses_the_split_rule():
         assert tuned_table.preferred_ep8_backend(folded) is None
         assert tuned_table.lookup(folded) is None  # nothing tabulated for EP16
         assert tuned_table.topology_of(shape(64, ep=16, same=7, cross=8)) is None
+
+
+def test_every_shipped_entry_resolves_and_passes_the_launch_guard():
+    """Shipped anchors (this module sees the real table): every entry resolves
+    through the selection and the transport overlay (which runs
+    check_launch_safety) without error."""
+    from .heuristic import select_transport_overlay
+
+    folded = {"ep4_1numa": (4, 3, 0), "ep8_2numa": (8, 7, 0), "ep16_2x2numa": (16, 15, 0)}
+    real = {"ep8_2numa": (8, 3, 4)}
+    count = 0
+    for table in tuned_table._load()["tables"]:
+        h, i, k, e = table["signature"]
+        for entry in table["entries"]:
+            backend = entry["knobs"].get("backend")
+            ep, same, cross = (real[table["topology"]] if backend == "gin_hybrid"
+                               else folded[table["topology"]])
+            shp = MegaMoEHeuristicInput(
+                tokens_per_rank=entry["tokens"], hidden=h, intermediate=i, num_topk=k, num_total_experts=e,
+                data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=ep,
+                ep_same_numa_peer_count=same, ep_cross_numa_peer_count=cross, num_sms=110,
+                sm_min_partition=8, sm_partition_alignment=8)
+            o = MegaMoEHeuristicOverrides(rank_local_combine=False) if backend == "p2p_split" else None
+            select_transport_overlay(shp, select_megamoe_config(shp, o))
+            count += 1
+    assert count >= 50

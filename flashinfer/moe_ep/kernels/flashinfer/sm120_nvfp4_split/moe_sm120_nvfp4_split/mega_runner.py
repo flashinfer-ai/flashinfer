@@ -1125,6 +1125,33 @@ class MegaMoETester(NetworkTransportRuntime):
             group=self._ep_group,
         )
 
+    def _push_shadow_stride(self) -> int:
+        """Bytes of one source's input span (activation .. top-k weights)."""
+        bufs = (self.my_activation, self.my_activation_sf, self.my_topk_idx, self.my_topk_weights)
+        lo = min(int(t.data_ptr()) for t in bufs)
+        hi = max(int(t.data_ptr()) + t.numel() * t.element_size() for t in bufs)
+        if int(self.my_activation.data_ptr()) != lo:
+            return 0
+        return (hi - lo + 4095) // 4096 * 4096
+
+    def _setup_push_dispatch(self) -> None:
+        """Configure K1's push dispatch (compile-time constants)."""
+        from moe_sm120_nvfp4_split.token_comm import PushDispatchConfig
+
+        if getattr(self, "_push_shadow", None) is None or self.comm_backend == "gin":
+            return
+        tc = self._kernel_k1.token_comm
+        stride = int(self._push_shadow.data_ptr()) - int(self.my_activation.data_ptr())
+        if stride != self._push_shadow_stride():
+            raise RuntimeError("push dispatch shadow must follow the input span")
+        mask = tc.barrier_peer_mask & ~(1 << self.rank)
+        peers = tuple(r for r in range(self.world_size) if (mask >> r) & 1)
+        if not peers:
+            return
+        tc.push = PushDispatchConfig(stride=stride, peers=peers, peer_mask=mask)
+        if self.rank == 0:
+            print(f"[push dispatch] peers={peers} stride={stride}", flush=True)
+
     def _setup_xnuma(self) -> None:
         """p2p_split: build the cross-NUMA transport and wire its K1/K2 hooks
         (compile-time constants, so this runs before the kernels compile)."""
@@ -1139,6 +1166,7 @@ class MegaMoETester(NetworkTransportRuntime):
         session = gin_bridge.ShadowSession()
         layout = XnumaLayout(
             fsplit=_xnuma_fsplit(self.kernel_config),
+            pack=_xnuma_pack(self.kernel_config),
             world=self.world_size,
             n_cross=session.shadow.num_cross,
             experts_per_rank=self.problem.num_experts_per_rank,
@@ -1152,6 +1180,8 @@ class MegaMoETester(NetworkTransportRuntime):
         if os.environ.get("MEGAMOE_XNUMA_WATCHDOG"):
             self._xnuma.start_debug_watchdog(float(os.environ["MEGAMOE_XNUMA_WATCHDOG"]))
         self._kernel_k1.token_comm.xnuma = self._xnuma.k1_config()
+        if self.rank == 0:
+            print(f"[xnuma] n_cross={layout.n_cross} fsplit={layout.fsplit} pack={layout.pack}", flush=True)
         for kernel in (self._kernel_k2, self._kernel_k2_drain):
             if kernel is not None:
                 kernel.xnuma_progress_addr = self._xnuma.k2_progress_addr
@@ -1516,6 +1546,14 @@ class MegaMoETester(NetworkTransportRuntime):
             tuple(own_topk_weights.shape), torch.float32
         )
         self.my_topk_weights.copy_(own_topk_weights)
+        # Push dispatch: one local shadow of every rank's input span, written
+        # by that rank's K1 (same allocation order on every rank), right after
+        # the span: source s's shadow starts at activation + (s + 1) * stride.
+        self._push_shadow = None
+        if getattr(self.kernel_config, "push_dispatch", False) and self._push_shadow_stride() > 0:
+            self._push_shadow = _sym_zeros(
+                (self.world_size * self._push_shadow_stride(),), torch.uint8
+            )
         if self._save_routing_dir:
             # FlashInfer MegaMoE benchmark --load-routing format.
             os.makedirs(self._save_routing_dir, exist_ok=True)
@@ -1846,6 +1884,10 @@ class MegaMoETester(NetworkTransportRuntime):
         # not clear the full direct-stage map between replays: the memset is
         # unnecessary and turns rank-local launch skew into remote wait time
         # at large token counts.
+        if fused_ops:
+            from moe_sm120_nvfp4_split.runtime.fused_fill import launch_fused_fill
+
+            launch_fused_fill(fused_ops, torch.cuda.current_stream())
 
     def _reset_before_launch(self) -> None:
         """Reset state not owned by an in-graph finalization protocol.
@@ -3188,6 +3230,8 @@ class MegaMoETester(NetworkTransportRuntime):
         self._xnuma = None
         if getattr(self, "_p2p_split", False):
             self._setup_xnuma()
+        if getattr(self, "_push_shadow", None) is not None:
+            self._setup_push_dispatch()
         if self.rank == 0:
             print(f"[SM120 JIT cache key] {self._kernel_cache_key}")
 
@@ -3593,6 +3637,19 @@ class MegaMoETester(NetworkTransportRuntime):
                 else None
             )
             graph_topk_runtime_kwargs = topk_reduce_runtime_kwargs
+            # The graph-owned replay reset is one fill kernel instead of a
+            # chain of fill nodes in front of K1 (MEGA_SPLIT_FUSED_RESET=0
+            # restores the chain).
+            from moe_sm120_nvfp4_split.runtime import fused_fill
+
+            fused_graph_reset = fused_fill.enabled()
+            if fused_graph_reset and (
+                self.k2_tail_reclaim or k2_finalizer_executor is not None
+            ):
+                # Compile outside the capture (same reset the replay starts with).
+                with torch.cuda.stream(self._graph_root_stream):
+                    self._reset_local_counters(fused=True)
+                torch.cuda.synchronize()
             self._native_green_graph = NativeGreenContextGraph.capture(
                 root_stream=self._graph_root_stream,
                 k1_stream=self._k1_torch_stream,
@@ -3640,7 +3697,7 @@ class MegaMoETester(NetworkTransportRuntime):
                     else None
                 ),
                 launch_reset=(
-                    self._reset_local_counters
+                    (lambda: self._reset_local_counters(fused=fused_graph_reset))
                     if (
                         self.k2_tail_reclaim
                         or k2_finalizer_executor is not None
@@ -4234,6 +4291,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--weight_prefetch_ahead", type=int, choices=[0, 4, 8], default=None,
         help="K tiles ahead for the K1/K2 weight-producer L2 prefetch (0 = off).")
     parser.add_argument(
+        "--k1_t0_prefetch", type=int,
+        default=(int(os.environ["MEGA_SPLIT_K1_T0_PREFETCH"])
+                 if os.environ.get("MEGA_SPLIT_K1_T0_PREFETCH") else None),
+        help="t=0 FC1 weight L2 prefetch: static K1 ready-queue order and, at K1 "
+             "entry, prefetch of this many K tiles of each K1 CTA's expected first "
+             "weight tile (0 = off; default: heuristic; env MEGA_SPLIT_K1_T0_PREFETCH).")
+    parser.add_argument(
+        "--push_dispatch", choices=["on", "off"],
+        default={"1": "on", "on": "on", "0": "off", "off": "off"}.get(
+            os.environ.get("MEGA_SPLIT_PUSH_DISPATCH", "")),
+        help="Push dispatch: sources write routed input rows into same-NUMA "
+             "owners' local shadows so K1 pulls locally (default: heuristic; env "
+             "MEGA_SPLIT_PUSH_DISPATCH=0/1 sets the default).")
+    parser.add_argument(
+        "--generic_decode_preset", choices=["on", "off"],
+        default={"1": "on", "on": "on", "0": "off", "off": "off"}.get(
+            os.environ.get("MEGAMOE_GENERIC_DECODE_PRESET", "")),
+        help="Generic decode preset for shapes without a tuned table (default: on "
+             "where it applies, see heuristic.generic_decode_knobs; 'off' is the "
+             "rule-based selection the tuner measures table knobs against; env "
+             "MEGAMOE_GENERIC_DECODE_PRESET=0/1).")
+    parser.add_argument(
+        "--xnuma_pack", choices=["on", "off"], default=None,
+        help="p2p_split packed dispatch: send each cross owner only its routed "
+             "rows (default: heuristic, EP16 from 64 tokens per rank; env "
+             "MEGAMOE_XNUMA_PACK=0/1).")
+    parser.add_argument(
         "--xnuma_fsplit", type=int, choices=[1, 2, 4], default=None,
         help="p2p_split forwarder CTAs per cross source.")
     parser.add_argument(
@@ -4282,6 +4366,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=1234)
     return parser
+
+
+def _xnuma_pack(kernel_config) -> bool:
+    """p2p_split packed dispatch (MEGAMOE_XNUMA_PACK=0|1 overrides the config)."""
+    env = os.environ.get("MEGAMOE_XNUMA_PACK", "")
+    if env in ("0", "1"):
+        return env == "1"
+    return bool(getattr(kernel_config, "xnuma_pack", False))
 
 
 def _xnuma_fsplit(kernel_config) -> int:
@@ -4346,7 +4438,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         cross_numa_remote_peers = topology.cross_numa_peer_count
         if args.comm_backend is None and cross_numa_remote_peers > 0:
             # No explicit backend: a cross-NUMA EP takes the backend of the
-            # tuned table's nearest anchor (or the rule for untabulated shapes).
+            # tuned table's nearest anchor, else the rule (p2p_split up to
+            # SPLIT_RULE_MAX_TOKENS tokens per rank, gin_hybrid above where
+            # the driver can run it; p2p_split at EP16).
             from moe_sm120_nvfp4_split.runtime.green_context import query_sm_resource_info as _sm_info
             from moe_sm120_nvfp4_split.tuned_table import preferred_ep8_backend
             _sms, _min_part, _align = _sm_info()
@@ -4361,6 +4455,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 num_sms=_sms, sm_min_partition=_min_part, sm_partition_alignment=_align)
             if preferred_ep8_backend(_probe) == "p2p_split":
                 args.comm_backend = "p2p_split"
+        if args.comm_backend == "gin_hybrid":
+            from moe_sm120_nvfp4_split.runtime.driver_caps import (
+                driver_cuda_version, hybrid_sm_split_available)
+
+            if not hybrid_sm_split_available():
+                version = driver_cuda_version()
+                parser.error(
+                    "--comm_backend gin_hybrid needs the CUDA 13.1 structured "
+                    "SM split (cuDevSmResourceSplit); this driver reports CUDA "
+                    f"{version // 1000}.{version % 1000 // 10}")
         if args.comm_backend == "p2p_split":
             if cross_numa_remote_peers == 0:
                 parser.error("p2p_split needs cross-NUMA EP peers")
@@ -4473,7 +4577,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         else select_compatibility_config
     )
-    profile_kwargs = (dict(tuning_config=offline_tuning, hardware=offline_hardware)
+    generic_preset = getattr(args, "generic_decode_preset", None) != "off"
+    profile_kwargs = (dict(tuning_config=offline_tuning, hardware=offline_hardware,
+                           generic_decode_preset=generic_preset)
                       if select_for_execution is select_megamoe_config else {})
     kernel_config = select_for_execution(
         heuristic_input, heuristic_overrides,
@@ -4494,7 +4600,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if selection_jit.fc1_utility_postprocess is None:
         from dataclasses import replace as _replace_jit
         from moe_sm120_nvfp4_split.tuned_table import utility_for
-        tabulated = utility_for(heuristic_input)
+        tabulated = utility_for(heuristic_input, generic_preset, kernel_config)
         if tabulated is not None:
             selection_jit = _replace_jit(selection_jit, fc1_utility_postprocess=tabulated)
     if selection_jit.fc1_utility_postprocess is None:
@@ -4506,6 +4612,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                       and offline_tuning is None and args.gate_up_clamp == 10.0),
         )
         selection_jit = replace_jit(selection_jit, fc1_utility_postprocess=enabled)
+    from moe_sm120_nvfp4_split.heuristic import TransportOverlay, select_transport_overlay
+    kernel_config = select_transport_overlay(
+        heuristic_input, kernel_config,
+        TransportOverlay(
+            k1_t0_prefetch=getattr(args, "k1_t0_prefetch", None),
+            push_dispatch=(None if getattr(args, "push_dispatch", None) is None
+                           else args.push_dispatch == "on"),
+            xnuma_pack=(None if getattr(args, "xnuma_pack", None) is None
+                        else args.xnuma_pack == "on"),
+        ),
+    )
     from dataclasses import replace as resolve_cache_jit
     selection_jit = resolve_cache_jit(
         selection_jit,
@@ -4530,7 +4647,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             from moe_sm120_nvfp4_split.heuristic import explain_selection
             print("Offline tuning selection:", explain_selection(
                 heuristic_input, heuristic_overrides,
-                numerical_contract=args.numerical_contract, **profile_kwargs)['profiles'])
+                numerical_contract=args.numerical_contract,
+                tuning_config=offline_tuning, hardware=offline_hardware)['profiles'])
         else:
             print("Offline tuning ignored: nondefault execution requires compatibility fallback")
     if rank == 0 and kernel_config.rank_local_combine:
@@ -4564,14 +4682,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             shadow = ShadowLayout.from_topology(
                 parallel_context.ep_transport_topology, parallel_context.ep_rank)
             split_kwargs = dict(shadow=shadow, reserved_bytes=XnumaLayout(
-                fsplit=_xnuma_fsplit(kernel_config),
+                fsplit=_xnuma_fsplit(kernel_config), pack=_xnuma_pack(kernel_config),
                 world=world_size, n_cross=shadow.num_cross,
                 experts_per_rank=args.num_total_experts // world_size,
                 tokens_per_rank=args.num_tokens_per_rank, topk=args.num_topk,
                 hidden=args.hidden).reserved_bytes)
         parallel_context = init_nccl_memory(parallel_context, gin_bridge.p2p_capacity(
             args.num_tokens_per_rank, args.hidden, args.num_topk,
-            args.num_total_experts, world_size, kernel_config.rank_local_combine),
+            args.num_total_experts, world_size, kernel_config.rank_local_combine,
+            push_shadow=kernel_config.push_dispatch),
             **split_kwargs)
 
     if args.intermediate % tensor_parallel_size != 0:
@@ -4605,6 +4724,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"K1_ctas_per_sm={kernel_config.k1_ctas_per_sm}, "
             f"K2_launch_factor={kernel_config.k2_launch_factor}, "
             f"prefetch_ahead={kernel_config.weight_prefetch_ahead}, "
+            f"k1_t0_prefetch={kernel_config.k1_t0_prefetch}, "
+            f"push_dispatch={kernel_config.push_dispatch}, "
+            f"xnuma_pack={kernel_config.xnuma_pack}, "
             f"K1_stages={kernel_config.k1_stages}, "
             f"rows_per_expert={kernel_config.expected_rows_per_expert:.2f}, "
             f"backend={kernel_config.comm_backend}, "

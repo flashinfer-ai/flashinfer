@@ -175,7 +175,13 @@ def test_p2p_dispatch_admission_does_not_depend_on_rank_local_combine() -> None:
         if isinstance(node, ast.If) and "gin" in ast.unparse(node.test)
     )
     # These must be direct statements in the P2P branch, not RLC-conditional.
-    admission, preparation = backend.orelse[:2]
+    # Push dispatch (compile-time optional) sits between them: it writes peer
+    # shadows only after the admission barrier and before dispatch_prep.
+    body = [n for n in backend.orelse
+            if not (isinstance(n, ast.If) and "_DIAG_JITTER_US" in ast.unparse(n.test))]
+    admission, push, preparation = body[:3]
+    assert isinstance(push, ast.If) and "self.push" in ast.unparse(push.test)
+    assert [n.value.func.attr for n in push.body if isinstance(n, ast.Expr)] == ["push_inputs"]
     assert isinstance(admission, ast.Expr) and isinstance(admission.value, ast.Call)
     assert admission.value.func.attr == "nvlink_barrier"
     assert isinstance(preparation, ast.Expr) and isinstance(preparation.value, ast.Call)

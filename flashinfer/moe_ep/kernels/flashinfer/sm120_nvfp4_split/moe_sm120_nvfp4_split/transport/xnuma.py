@@ -47,7 +47,7 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass.cutlass_dsl import Int32, Int64
 
-from .xnuma_layout import XnumaLayout
+from .xnuma_layout import SENDER_THREADS, XnumaLayout
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,12 @@ class XnumaK1Config:
     tokens_per_rank: int
     k2tot_addr: int
     k2meta_addr: int
+    # Packed dispatch (``XnumaLayout.pack``): the shadow of a cross source holds
+    # only the rows it routed here: activation row p at the shadow activation
+    # base, and map[T] i32 | weights[T][topk] | scales[T][sf_row] (rows by
+    # packed index p) at the shadow scale base; map[token] = p.
+    pack: bool = False
+    cross_mask: int = 0
 
 
 _TABLE_FIELDS = 8  # per cross peer j: peer, send_span_dst, inbox_dst, dsig_dst, shadow_comb, ret_dst, done_dst, -
@@ -147,7 +153,23 @@ class XnumaTransport:
         # (source address, offset inside segment 0, bytes).
         self.input_regions = tuple((lo, lo - arena, n) for lo, n in regions if n > 0)
         self.span_lo, self.span_bytes = span_lo, span_hi - span_lo
+        # FlashInfer: sender-table field 1 is the owner's shadow-of-me segment
+        # base; the packed dispatch addresses the input span inside it.
+        self.span_seg_off = span_lo - arena
         self.combine_addr = co_lo
+        self.sf_addr = int(tester.my_activation_sf.data_ptr())
+        self.w_addr = int(tester.my_topk_weights.data_ptr())
+        if layout.pack:
+            sf = tester.my_activation_sf
+            sf_off = self.sf_addr - span_lo
+            act = tester.my_activation
+            if not (int(act.data_ptr()) == span_lo
+                    and act.view(torch.uint8).shape[-1] == layout.act_row_bytes
+                    and sf.view(torch.uint8).shape[-1] == layout.sf_row_bytes
+                    and layout.act_row_bytes % 8 == 0
+                    and sf_off % 16 == 0 and sf_off >= layout.tokens_per_rank * layout.act_row_bytes
+                    and sf_off + layout.pack_small_bytes <= self.span_bytes):
+                raise RuntimeError("xnuma pack: unsupported input span layout")
 
         stride = region.max_routes * region.slot_bytes
         rows = []
@@ -184,6 +206,7 @@ class XnumaTransport:
             epoch_addr=int(self.epoch.data_ptr()), dsig_addr=self.addr["dsig"], inbox_addr=self.addr["inbox"],
             record_bytes=self.region.record_bytes, cross_sources=tuple(self.cross), experts_per_rank=L.experts_per_rank,
             tokens_per_rank=L.tokens_per_rank, k2tot_addr=self.addr["k2tot"], k2meta_addr=self.addr["k2meta"],
+            pack=L.pack, cross_mask=sum(1 << p for p in self.cross),
         )
 
     @property
@@ -203,6 +226,8 @@ class XnumaTransport:
         ROW, SLOT = L.row_bytes, L.slot_bytes
         STRIDE = G.max_routes * SLOT
         REGIONS = self.input_regions
+        SPAN_LO = self.span_lo
+        SPAN_SEG_OFF = self.span_seg_off
         HTNW = self.hidden_tiles * self.compute_warps
         A = dict(self.addr)
         TABLE = int(self.table.data_ptr())
@@ -284,6 +309,122 @@ class XnumaTransport:
         def bump(stream: cuda.CUstream):
             bump_kernel().launch(grid=[1, 1, 1], block=[128, 1, 1], stream=stream)
 
+        # Packed dispatch constants (layout.pack).
+        PACK = L.pack
+        CT = (T + 127) // 128  # 128-token scan rounds
+        HB = L.act_row_bytes
+        H8 = HB // 8
+        WPT = (H8 + 127) // 128  # 8-byte words per thread per activation row
+        RB = 8  # activation rows in flight per pass
+        SFB = L.sf_row_bytes
+        SF4 = SFB // 4
+        SMALL_FIX = T * 4 + T * TOPK * 4
+        ACT_REG = L.pack_act_bytes
+        PSTRIDE = L.pack_stride
+        SF_SRC, W_SRC = self.sf_addr, self.w_addr
+        SF_OFF = self.sf_addr - SPAN_LO
+
+        @cute.jit
+        def routed(t, owner):
+            tk = cute.make_tensor(ptr(Int64, Int64(TOPK_ADDR), 8), cute.make_layout(T * TOPK))
+            hit = Int32(0)
+            for k in cutlass.range_constexpr(TOPK):
+                ex = tk[t * Int32(TOPK) + Int32(k)]
+                if ex >= Int64(0):
+                    if Int32(ex // Int64(E)) == owner:
+                        hit = Int32(1)
+            return hit
+
+        @cute.jit
+        def pack_send(j, tid, owner):
+            """Stage the rows routed to ``owner`` (ascending token order) and put
+            them: activation rows to the owner's shadow-of-me activation base,
+            map | weights | scales to its scale base."""
+            pst = Int64(A["pstage"]) + Int64(j) * Int64(PSTRIDE)
+            small = pst + Int64(ACT_REG)
+            pscr = cute.make_tensor(ptr(Int32, Int64(A["pscr"]) + Int64(j) * Int64((SENDER_THREADS + T) * 4), 4),
+                                    cute.make_layout(SENDER_THREADS + T))
+            mp = cute.make_tensor(ptr(Int32, small, 4), cute.make_layout(T))
+            # Ballot scan over rounds of 128 tokens (token r*128 + tid), so the
+            # packed order is the token order.
+            lane = tid % Int32(32)
+            warp = tid // Int32(32)
+            below_mask = (Int32(1) << lane) - Int32(1)
+            n = Int32(0)
+            r = Int32(0)
+            while r < Int32(CT):
+                t = r * Int32(128) + tid
+                hit = Int32(0)
+                if t < Int32(T):
+                    hit = routed(t, owner)
+                mask = Int32(cute.arch.vote_ballot_sync(hit == Int32(1)))
+                if lane == Int32(0):
+                    pscr[warp] = Int32(cute.arch.popc(mask))
+                cute.arch.barrier(barrier_id=0, number_of_threads=128)
+                woff = Int32(0)
+                tot = Int32(0)
+                for w in cutlass.range_constexpr(4):
+                    cw = pscr[Int32(w)]
+                    if Int32(w) < warp:
+                        woff = woff + cw
+                    tot = tot + cw
+                if hit == Int32(1):
+                    q = n + woff + Int32(cute.arch.popc(mask & below_mask))
+                    mp[t] = q
+                    pscr[Int32(128) + q] = t
+                n = n + tot
+                cute.arch.barrier(barrier_id=0, number_of_threads=128)
+                r = r + Int32(1)
+            src = cute.make_tensor(ptr(Int64, Int64(SPAN_LO), 16), cute.make_layout(T * H8))
+            dst = cute.make_tensor(ptr(Int64, pst, 16), cute.make_layout(T * H8))
+            p0 = Int32(0)
+            while p0 < n:
+                rows = []
+                for rr in cutlass.range_constexpr(RB):
+                    pr = p0 + Int32(rr)
+                    if pr >= n:
+                        pr = n - Int32(1)
+                    rows.append(pr)
+                vals = []
+                for rr in cutlass.range_constexpr(RB):
+                    ts = pscr[Int32(128) + rows[rr]]
+                    for k in cutlass.range_constexpr(WPT):
+                        v = Int64(0)
+                        if cutlass.const_expr(H8 % 128 == 0 or k < WPT - 1):
+                            v = src[ts * Int32(H8) + tid + Int32(128 * k)]
+                        else:
+                            if tid + Int32(128 * k) < Int32(H8):
+                                v = src[ts * Int32(H8) + tid + Int32(128 * k)]
+                        vals.append(v)
+                for rr in cutlass.range_constexpr(RB):
+                    for k in cutlass.range_constexpr(WPT):
+                        if cutlass.const_expr(H8 % 128 == 0 or k < WPT - 1):
+                            dst[rows[rr] * Int32(H8) + tid + Int32(128 * k)] = vals[rr * WPT + k]
+                        else:
+                            if tid + Int32(128 * k) < Int32(H8):
+                                dst[rows[rr] * Int32(H8) + tid + Int32(128 * k)] = vals[rr * WPT + k]
+                p0 = p0 + Int32(RB)
+            sfs = cute.make_tensor(ptr(Int32, Int64(SF_SRC), 4), cute.make_layout(T * SF4))
+            sfd = cute.make_tensor(ptr(Int32, small + Int64(SMALL_FIX), 4), cute.make_layout(T * SF4))
+            x = tid
+            while x < n * Int32(SF4):
+                pr = x // Int32(SF4)
+                sfd[x] = sfs[pscr[Int32(128) + pr] * Int32(SF4) + (x - pr * Int32(SF4))]
+                x = x + Int32(128)
+            ws = cute.make_tensor(ptr(Int32, Int64(W_SRC), 4), cute.make_layout(T * TOPK))
+            wd = cute.make_tensor(ptr(Int32, small + Int64(T * 4), 4), cute.make_layout(T * TOPK))
+            x = tid
+            while x < n * Int32(TOPK):
+                pr = x // Int32(TOPK)
+                wd[x] = ws[pscr[Int32(128) + pr] * Int32(TOPK) + (x - pr * Int32(TOPK))]
+                x = x + Int32(128)
+            cute.arch.fence_acq_rel_sys()
+            cute.arch.barrier(barrier_id=0, number_of_threads=128)
+            if n > Int32(0):
+                gin.put_nbi_block(tx, u8(tbl(j, 1) + Int64(SPAN_SEG_OFF), n * Int32(HB)), u8(pst, n * Int32(HB)), owner)
+            gin.put_nbi_block(tx, u8(tbl(j, 1) + Int64(SPAN_SEG_OFF + SF_OFF), Int32(SMALL_FIX) + n * Int32(SFB)),
+                              u8(small, Int32(SMALL_FIX) + n * Int32(SFB)), owner)
+
         @cute.kernel
         def sender_kernel():
             j, _, _ = cute.arch.block_idx()
@@ -301,10 +442,14 @@ class XnumaTransport:
                 if epoch % Int64(QUIET_EVERY) == Int64(0):
                     gin.quiet(tx)
             smark(j, tid, 1)
-            # Data first; the record build overlaps the transfer.
-            for r in cutlass.range_constexpr(len(REGIONS)):
-                gin.put_nbi_block(tx, u8(tbl(j, 1) + Int64(REGIONS[r][1]), REGIONS[r][2]),
-                                  u8(Int64(REGIONS[r][0]), REGIONS[r][2]), owner)
+            if cutlass.const_expr(PACK):
+                pack_send(j, tid, owner)
+            else:
+                # Data first; the record build overlaps the transfer.
+                # FlashInfer: one put per input tensor, sized to the bucket.
+                for r in cutlass.range_constexpr(len(REGIONS)):
+                    gin.put_nbi_block(tx, u8(tbl(j, 1) + Int64(REGIONS[r][1]), REGIONS[r][2]),
+                                      u8(Int64(REGIONS[r][0]), REGIONS[r][2]), owner)
             smark(j, tid, 2)
             rec_addr = Int64(A["txrec"]) + Int64(j) * Int64(REC_B)
             rec = cute.make_tensor(ptr(Int32, rec_addr, 4), cute.make_layout(REC_I32))
