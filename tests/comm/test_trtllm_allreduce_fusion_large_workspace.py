@@ -8,6 +8,8 @@ gets new inputs, so a sub-buffer left with the data of an earlier call shows.
 
 import multiprocessing as mp
 import socket
+import sys
+import time
 
 import pytest
 import torch
@@ -25,6 +27,9 @@ TOKENS = 16
 NUM_CALLS = 9
 # Lamport sub-buffers (3 * comm_size) plus the two-shot buffer (comm_size).
 REQUIRED_BYTES_PER_RANK = 4 * WORLD_SIZE * MAX_TOKEN_NUM * HIDDEN * 2
+# Exit code of a rank whose TCPStore port was taken between _get_open_port and its own bind.
+PORT_IN_USE_EXIT_CODE = 98
+MAX_PORT_ATTEMPTS = 3
 
 
 def _get_open_port() -> int:
@@ -33,15 +38,53 @@ def _get_open_port() -> int:
         return sock.getsockname()[1]
 
 
+def _init_process_group(rank: int, port: int, backend: str = "nccl") -> None:
+    try:
+        dist.init_process_group(
+            backend=backend,
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=WORLD_SIZE,
+        )
+    except RuntimeError as error:
+        if "EADDRINUSE" in str(error) or "address already in use" in str(error):
+            sys.exit(PORT_IN_USE_EXIT_CODE)
+        raise
+
+
+def _run_ranks(worker) -> None:
+    """Run one process per rank; on a taken port, start over on a new one."""
+    ctx = mp.get_context("spawn")
+    for _ in range(MAX_PORT_ATTEMPTS):
+        port = _get_open_port()
+        procs = [
+            ctx.Process(target=worker, args=(rank, port)) for rank in range(WORLD_SIZE)
+        ]
+        for proc in procs:
+            proc.start()
+        port_in_use = False
+        while any(proc.is_alive() for proc in procs) and not port_in_use:
+            port_in_use = any(p.exitcode == PORT_IN_USE_EXIT_CODE for p in procs)
+            time.sleep(0.2)
+        port_in_use = port_in_use or any(
+            p.exitcode == PORT_IN_USE_EXIT_CODE for p in procs
+        )
+        if not port_in_use:
+            break
+        # The other ranks are still waiting to connect to the store.
+        for proc in procs:
+            if proc.is_alive():
+                proc.kill()
+            proc.join()
+    for rank, proc in enumerate(procs):
+        proc.join()
+        assert proc.exitcode == 0, f"rank {rank} failed with exit code {proc.exitcode}"
+
+
 def _worker(rank: int, port: int) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD_SIZE,
-    )
+    _init_process_group(rank, port)
     group = dist.group.WORLD
     workspace = None
     try:
@@ -86,12 +129,7 @@ def _moe_finalize_worker(rank: int, port: int) -> None:
     """The MoE finalize all-reduce, which has its own copy of the Lamport helper."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD_SIZE,
-    )
+    _init_process_group(rank, port)
     group = dist.group.WORLD
     ipc_handles = None
     try:
@@ -176,13 +214,4 @@ def test_oneshot_comm_size_above_1gib(worker) -> None:
             pytest.skip(
                 f"requires {REQUIRED_BYTES_PER_RANK / 2**30:.1f} GiB free on cuda:{rank}"
             )
-    port = _get_open_port()
-    ctx = mp.get_context("spawn")
-    procs = [
-        ctx.Process(target=worker, args=(rank, port)) for rank in range(WORLD_SIZE)
-    ]
-    for proc in procs:
-        proc.start()
-    for rank, proc in enumerate(procs):
-        proc.join()
-        assert proc.exitcode == 0, f"rank {rank} failed with exit code {proc.exitcode}"
+    _run_ranks(worker)
