@@ -305,6 +305,10 @@ def test_per_token(recipe, gated, tokens):
     torch.testing.assert_close(written, s, atol=0, rtol=0)
     torch.testing.assert_close(bf16, out, atol=0, rtol=0)
     torch.testing.assert_close(cute, out, atol=0, rtol=0)
+    wide = torch.empty(tokens, 2 * H, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="contiguous"):  # GEMM2's, before the prep's
+        _trt(m, x, base, *args, per_token_scale=written.fill_(-1), output=wide[:, ::2])
+    assert written.eq(-1).all()
     if recipe:  # the recipe reached the kernels
         std = _trt(m, codes, sf8, *args, per_token_scale=s, nvfp4_4over6=None)[0]
         assert not torch.equal(std, out)
@@ -528,12 +532,11 @@ def test_fc2_input_out():
     fo = [torch.full((tokens + 3, K, ip // n), 9, dtype=torch.uint8, device="cuda")
           for n in (2, 16)] + [torch.full((tokens + 3, K), 9.0, device="cuda")]  # fmt: skip
 
-    def run(fo, **kw):
+    def run(fo, g=m["w1_g"][:half], **kw):
         return _trt(
             sub, codes, sf.view(torch.float8_e4m3fn), ids, weights,
-            torch.ones(half, device="cuda"), m["w1_g"][:half], m["w2_g"][:half], num_experts=E,
-            local=half, inter=ip, valid_intermediate_size=I, per_token_scale=s, fc2_input_out=fo,
-            **kw,
+            torch.ones(half, device="cuda"), g, m["w2_g"][:half], num_experts=E, local=half,
+            inter=ip, valid_intermediate_size=I, per_token_scale=s, fc2_input_out=fo, **kw,
         )[0]  # fmt: skip
 
     out = run(fo)
@@ -553,6 +556,11 @@ def test_fc2_input_out():
     bad = [t.clone().fill_(9) for t in fo]
     with pytest.raises(ValueError, match="BF16 or FP16"):  # the records' check
         run(bad, output=torch.empty(tokens, H, device="cuda"))
+    with pytest.raises(ValueError, match="alphas FP32"):  # GEMM1's, before the zeroing
+        run(bad, m["w1_g"][:half].half())
+    wide = torch.empty(tokens, 2 * H, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="contiguous"):  # GEMM2's, before row_quant's
+        run(bad, output=wide[:, ::2])
     assert all(t.eq(9).all() for t in bad)
     bad[2] = bad[2].cpu()  # one off the device
     with pytest.raises(ValueError, match="input's device"):
@@ -762,6 +770,9 @@ def test_mxfp4_w4a16(gated, split):
     ids, weights = _routing(tokens)
     trt = _trt(m, x, None, ids, weights, None, m["w1_g"], m["w2_g"])[0]
     _close(trt, _reference(m, x.float(), ids, weights, lambda a: a.float()), 2e-2)
+    if split:  # [num_experts, 2], not its transpose of as many values
+        with pytest.raises(ValueError, match="num_experts, 2"):
+            _trt(m, x, None, ids, weights, None, m["w1_g"].t().contiguous(), m["w2_g"])
     if get_compute_capability(x.device)[0] < 9:
         scales = [m["r1"], m["w1_g"], m["r2"], m["w2_g"]]
         out = cutlass_fused_moe(

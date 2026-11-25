@@ -2316,15 +2316,14 @@ class _RecordsExt:
     BF16 [tokens * top_k, I] receives the activation (before ``rw``); ``up`` FP32 [E] the gated
     linear half's alpha over alpha1 (alpha1 [E, 2]); ``fc2_out`` per token SM100's
     ``fc2_input_out`` as uint8 [entries, I' / 2], [entries, I' / 16] and FP32 [entries] (I' >= I;
-    not in the key: the autotuner's runs drop it), zeroed first if ``fc2_zero``; ``x_fmt`` 1, 2,
-    3 an MXFP8, FP8 (its scale in alpha1) or MXFP4 ``x`` (uint8) under E8M0 ``x_scale`` per 32,
-    restored by the prep; ``fq`` 1, 2, 3 GEMM2's input MXFP8, MXFP4 or FP8 (its scale in alpha2)
-    of GEMM1's output times ``fq_inv`` (FP32 [E], or None), quantized and restored in place;
-    both 4 (with ``per_token_scale``): FP8 E4M3 as SM90's Humming path, of a 16-bit ``x`` per
-    token (``x_scale`` unread) and of GEMM2's input per row, under dynamic scales. ``alpha_den``
-    FP32 [1] each: alpha1 and alpha2 are weights' global scales, the GEMM alphas them over
-    these, divided by the prep each call. Swiglu at the default ``scalars`` and Relu2, without
-    tensors, run the base module's GEMM1."""
+    not in the key: the autotuner's runs drop it); ``x_fmt`` 1, 2, 3 an MXFP8, FP8 (its scale in
+    alpha1) or MXFP4 ``x`` (uint8) under E8M0 ``x_scale`` per 32, restored by the prep; ``fq`` 1,
+    2, 3 GEMM2's input MXFP8, MXFP4 or FP8 (its scale in alpha2) of GEMM1's output times ``fq_inv``
+    (FP32 [E], or None), quantized and restored in place; both 4 (with ``per_token_scale``): FP8
+    E4M3 as SM90's Humming path, of a 16-bit ``x`` per token (``x_scale`` unread) and of GEMM2's
+    input per row, under dynamic scales. ``alpha_den`` FP32 [1] each: alpha1 and alpha2 are
+    weights' global scales, the GEMM alphas them over these, divided by the prep each call. Swiglu
+    at the default ``scalars`` and Relu2, without tensors, run the base module's GEMM1."""
 
     act: int
     params: Tuple[Optional[torch.Tensor], ...] = (None, None, None)
@@ -2338,7 +2337,6 @@ class _RecordsExt:
     act_out: Optional[torch.Tensor] = None
     up: Optional[torch.Tensor] = None
     fc2_out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
-    fc2_zero: bool = False
     x_fmt: int = 0
     fq: int = 0
     fq_inv: Optional[torch.Tensor] = None
@@ -2507,9 +2505,34 @@ def _w4a16_moe_sm80(
         mx = _w4a16_moe_sm80_module(recipe, exact, xa, f16)
         m1, e1 = (mx, g1) if g1 is not None else (m1, e1)
         m2, e2 = (mx, g2) if g2 is not None else (m2, e2)
-    if ext is not None and ext.fc2_zero and ext.fc2_out is not None:  # after the checks
-        for t in ext.fc2_out:
-            t.zero_()
+    if pt and (not codes or ext is not None and ext.fc2_out is not None):
+        # The prep (per_token_scale) or row_quant (fc2_out) writes the caller's tensors before
+        # the GEMMs check theirs: those checks first.
+        e = ext or _RecordsExt(0)
+        scales: List[Tuple[Optional[torch.Tensor], Tuple[int, ...]]] = [
+            (fc2_scale, (1, num_experts)), (fc2_den, (1,)),
+            *((t, (1, num_experts)) for t in e.params),
+        ]  # fmt: skip
+        # per expert, GEMM1's (gated: both halves) and GEMM2's output rows
+        bias = [(e.bias1, inter * (2 if gated else 1)), (e.bias2, hidden)]
+        given = [r1, r2, alpha1, alpha2, *(t for t, _ in scales), *(t for t, _ in bias)]
+        given += [out, topk_weights] if finalize else []
+        bt = (torch.float32, torch.bfloat16, torch.float16)  # the biases'
+        if (
+            any(t is not None and not t.is_contiguous() for t in given)
+            or any(t is not None and (t.dtype != torch.float32 or t.numel() not in n)
+                   for t, n in scales)
+            or any(t is not None and (t.dtype not in bt or t.numel() != num_experts * n)
+                   for t, n in bias)
+            or r1.data_ptr() % 16 or r2.data_ptr() % 16 or per_token_scale.data_ptr() % 8
+            or finalize and (out.dim() != 2 or out.shape[1] != hidden or out.data_ptr() % 16)
+        ):  # fmt: skip
+            raise ValueError(
+                "Below SM100 per token the records' tensors are contiguous: the scales FP32 [1] "
+                "or [num_experts] (fc2_den [1]), the biases FP32, BF16 or FP16 [num_experts, N], "
+                "the records and output 16 B and per_token_scale 8 B aligned, the output "
+                "[num_tokens, hidden]."
+            )
     # MX inputs: the extension module's prep
     (_w4a16_moe_sm80_module(recipe, exact, xa, f16) if xf else module).prep(
         topk_ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks,
@@ -2708,14 +2731,16 @@ def _records_moe(
     if (
         (tuple(r1.shape), tuple(r2.shape)) != expected
         or (r1.dtype, r2.dtype) != (torch.uint8, torch.uint8)
-        or alpha1.numel() not in (experts, 2 * experts if gated else experts)
+        or (alpha1.dtype, alpha2.dtype) != (torch.float32, torch.float32)
+        or not (alpha1.numel() == experts or gated and alpha1.shape == (experts, 2))
         or alpha2.numel() != experts
     ):
         raise ValueError(
             f"Below SM100 the FP4 block scales are the uint8 records {expected} of "
             "prepare_records_nvfp4_weights (or _mxfp4_) at the valid (unpadded) sizes and the "
             "alphas FP32 [num_experts] (alpha1 gated also [num_experts, 2]), got "
-            f"{r1.dtype} {tuple(r1.shape)}, {r2.dtype} {tuple(r2.shape)}."
+            f"{r1.dtype} {tuple(r1.shape)}, {r2.dtype} {tuple(r2.shape)}, alphas {alpha1.dtype} "
+            f"{tuple(alpha1.shape)} and {alpha2.dtype} {tuple(alpha2.shape)}."
         )
     exact = (len(inputs) > 8 and inputs[8] is not None) and any(
         env_flag_enabled(f"{p}_DISABLE_FP4_QUANT_FAST_MATH")
@@ -2932,9 +2957,6 @@ def _trtllm_fp4_records_moe(
     if act == ActivationType.SwigluStep:  # its limit only, as on SM100
         if p["1_alpha"] is not None or p["1_beta"] is not None:
             raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
-    fz = fo is not None and (  # skipped slots zero, as on SM100
-        experts < a["num_experts"] or a.get("routing_logits") is None
-    )
     if fo is not None:  # by (token, k) entry
         fo = (fo[0][:tokens].flatten(0, 1), fo[1][:tokens].view(torch.uint8).flatten(0, 1),
               fo[2][:tokens].view(-1))  # fmt: skip
@@ -2949,7 +2971,6 @@ def _trtllm_fp4_records_moe(
         lora,
         act_out=act_out,
         fc2_out=fo,
-        fc2_zero=fz,
         x_fmt=(2 if x_scale is x else 1) if fp8 else 0,
         fq=(3 if x_scale is x else 1) if fp8 else 0,
         fq_inv=inv,
@@ -2974,6 +2995,14 @@ def _trtllm_fp4_records_moe(
         recipe=recipe,
         ext=ext,
     )
+    if fo is not None and (
+        experts < a["num_experts"] or a.get("routing_logits") is None
+    ):  # once the call ran, what the records skip zero as on SM100: the other experts'
+        # entries and the padded columns
+        skip = ((ids < 0) | (ids >= experts)).view(-1, 1)
+        for t, n in zip((*fo[:2], fo[2][:, None]), (iv // 2, iv // 16, 1), strict=True):
+            t[:, n:].zero_()
+            t[:, :n].masked_fill_(skip, 0)
     pad = torch.nn.functional.pad  # to the padded widths, as on SM100
     y = y if finalize or hv == hidden else pad(y, (0, hidden - hv))
     act_out = (
