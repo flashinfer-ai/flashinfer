@@ -491,6 +491,40 @@ def classify_signature(before: ApiFunction, after: ApiFunction) -> PrFinding:
     classification = (
         "BREAKING" if errors else "LIKELY_BREAKING" if warnings else "NON_BREAKING"
     )
+    before_text, after_text = before.signature, after.signature
+    if before_text == after_text and warnings:
+
+        def used_aliases(api: ApiFunction) -> dict[str, str]:
+            parameters = (
+                *api.positional_only,
+                *api.positional_or_keyword,
+                *api.keyword_only,
+            )
+            annotations = [p.annotation for p in parameters]
+            annotations.extend(p.annotation for p in (api.vararg, api.kwarg) if p)
+            annotations.append(api.return_annotation)
+            nodes = ast.Tuple(
+                elts=[ast.parse(a, mode="eval").body for a in annotations if a],
+                ctx=ast.Load(),
+            )
+            return reachable_aliases(nodes, annotation_aliases(api))
+
+        previous, current = used_aliases(before), used_aliases(after)
+        changed = sorted(
+            name
+            for name in previous.keys() | current.keys()
+            if previous.get(name) != current.get(name)
+        )
+        if changed:
+            # Show the actual declaration change, keeping impact prose inline.
+            def aliases_text(aliases):
+                return "; ".join(
+                    f"{name} = {aliases.get(name, '(no local alias)')}"
+                    for name in changed
+                )
+
+            before_text += "  # " + aliases_text(previous)
+            after_text += "  # " + aliases_text(current)
     return PrFinding(
         "public_api_signature_changed",
         after.path,
@@ -503,8 +537,8 @@ def classify_signature(before: ApiFunction, after: ApiFunction) -> PrFinding:
         }[classification],
         classification=classification,
         api=f"{before.module}.{before.qualified_name}",
-        before=before.signature,
-        after=after.signature,
+        before=before_text,
+        after=after_text,
         rule_id="signature_changed",
         anchors=(source_anchor(after, "RIGHT"), source_anchor(before, "LEFT")),
     )

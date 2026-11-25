@@ -314,3 +314,16 @@ class FollowupReviewTest(unittest.TestCase):
 
         source = 'NAMES={"api"}\n_LAZY_EXPORTS={name:(".example",name) for name in sorted(NAMES)}\nNAMES={"other"}\n'
         self.assertIsNone(checker.lazy_keys(ast.parse(source)))
+
+    def test_alias_only_summary_contains_the_actual_type_change(self):
+        old = {
+            "flashinfer/example.py": "Mode = int | str\n@flashinfer_api\ndef api(x: Mode): pass\n"
+        }
+        new = {
+            "flashinfer/example.py": "Mode = int\n@flashinfer_api\ndef api(x: Mode): pass\n"
+        }
+        finding = compare_snapshots(old, new)[0]
+        self.assertEqual(finding.classification, "LIKELY_BREAKING")
+        self.assertIn("Mode = int | str", finding.before)
+        self.assertIn("Mode = int", finding.after)
+        self.assertNotEqual(finding.before, finding.after)

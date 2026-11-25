@@ -193,5 +193,6 @@ rollout mismatch, not evidence that the trusted API scan failed. Do not fabricat
 an empty API report to hide it.
 
 The sticky API summary intentionally lists changes only; detailed reasons remain
-in inline comments. Invalid anchors receive individual retry only for positively
+in inline comments. When only a local type alias changes, the diff includes the
+alias declarations so the summary does not show two identical signatures. Invalid anchors receive individual retry only for positively
 identified anchor-validation errors; spam/rate-limit responses never fan out.
