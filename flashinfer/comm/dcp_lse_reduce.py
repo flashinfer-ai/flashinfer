@@ -314,12 +314,16 @@ def _resolve_layout(
                 f"layout must be 'dst_major', 'head_major' or None, got {layout!r}"
             )
         return layout
-    if partial_o.dim() == 2:
+    # One .shape read: each Tensor.dim()/size() call is a C++ round trip, and
+    # this runs on every eager decode call.
+    shape = partial_o.shape
+    ndim = len(shape)
+    if ndim == 2:
         return "head_major"  # only the head-major contract had 2-D inputs
-    if partial_o.dim() < 2:
+    if ndim < 2:
         return "dst_major"  # let the kernel's shape checks report it
-    dst = partial_o.size(-3) == cp_size
-    head = partial_o.size(-2) == cp_size
+    dst = shape[-3] == cp_size
+    head = shape[-2] == cp_size
     if dst and head and cp_size > 1:
         raise ValueError(
             "decode_cp_a2a_lse_reduce cannot infer the input layout because "
