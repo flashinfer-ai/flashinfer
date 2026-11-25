@@ -3,7 +3,7 @@ name: PR API Compatibility
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 
 permissions:
   contents: read
@@ -14,12 +14,13 @@ permissions:
 
 jobs:
   api:
+    if: github.event.action != 'edited' || github.event.changes.base.ref != null
     name: Trusted API compatibility scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
       group: api-compatibility-${{ github.repository }}-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
+      queue: max
     steps:
       - name: Mark current API gate pending
         uses: actions/github-script@v7
