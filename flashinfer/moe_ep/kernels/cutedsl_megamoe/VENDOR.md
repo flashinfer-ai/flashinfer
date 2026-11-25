@@ -156,7 +156,7 @@ Source provenance does not imply GPU qualification on every supported device.
 Retain each measurement's source revision, workload and timing boundary when
 refreshing these records.
 
-## Clamped squared ReLU overlay
+## Clamped squared ReLU
 
 `activation='clamped_relu2'` selects `(16*tanh(relu(x)/16))**2` with hardware
 tanh and nongated FC1 weights. It supports MXFP8 E4M3 GenPhase with BF16 combine,
@@ -168,7 +168,20 @@ Canonical FC1 weights have shape `[E, I, H]`, without gate/up interleaving;
 FC2 remains `[E, H, I]`. Prequantized weights retain their payload bytes.
 Low-level preprocessing helpers require `gated=False`.
 
-These changes are applied directly to the vendored source. The original
-`export_manifest.json` still describes the pristine export;
-`activation_overlay_manifest.json` records the before/after hashes of modified
-provider files. Preserve this overlay when refreshing the vendor drop.
+On a vendor refresh, after release preparation, reapply the Rubin activation
+changes from [FlashInfer #9729](https://github.com/flashinfer-ai/flashinfer/pull/9729)
+to `sources/kernel_src/rubin/inference/mega/`:
+
+- `block_scaled_swap_ab_fc12_epilogue.py`: preserve the nongated FC1 layout,
+  hardware-tanh activation, and E4M3 in-thread quantization guard.
+- `block_scaled_swap_ab_fc12_mainloop_gen_specialized.py`: preserve the
+  activation-dependent FC1 staging and shared-memory budget.
+- `block_scaled_swap_ab_mega_moe_kernel.py`: retain the unsupported-activation
+  guard for the standard variant.
+- `block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py`: preserve activation
+  validation, nongated intermediate geometry, and distinct compiled identity.
+
+Update these files' SHA-256 entries in `export_manifest.json` after reapplying
+the changes; it records the final vendored bytes. Run
+`tests/moe_ep/test_provider_package.py` and the affected SM107 activation and
+EP4 graph-replay tests before accepting the refresh.
