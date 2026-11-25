@@ -459,6 +459,23 @@ def test_rope_quant_graph(
         assert torch.count_nonzero(actual[0]) == 0
 
 
+def _plan_with_deferred_compilation(wrapper, *args, **kwargs):
+    cache_info = mla_decode_module._get_compiled_mla_decode.cache_info()
+    wrapper.plan(*args, **kwargs, compile=False)
+    spec = wrapper._state["compile_spec"]
+    assert wrapper._state["compiled"] is None
+    assert mla_decode_module._get_compiled_mla_decode.cache_info() == cache_info
+    with pytest.raises(RuntimeError, match=r"plan\(compile=True\)"):
+        wrapper.run(None, None, None, None, validate=False)
+    wrapper.plan(*args, **kwargs)
+    compiled = wrapper._state["compiled"]
+    assert compiled is not None and wrapper._state["compile_spec"] == spec
+    wrapper.plan(*args, **kwargs, compile=False)
+    assert wrapper._state["compiled"] is None
+    wrapper.plan(*args, **kwargs)
+    assert wrapper._state["compiled"] is compiled
+
+
 @pytest.mark.parametrize("block", [32, 128])
 @pytest.mark.parametrize("fmt", ["fp32", "ue8m0"])
 def test_rope_quant_scales_and_contract(block, fmt):
@@ -476,7 +493,8 @@ def test_rope_quant_scales_and_contract(block, fmt):
         device="cuda",
     )
     wrapper = BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(
+    _plan_with_deferred_compilation(
+        wrapper,
         "cuda",
         1,
         8,
@@ -1126,7 +1144,9 @@ def test_retained_nvfp4_keep_ab_rejects_v_split(monkeypatch):
         )
 
 
-def test_caller_workspace_single_source_and_eager_api():
+def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
+    from flashinfer.jit import cute_dsl_core
+
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device="cuda", dtype=torch.bfloat16)
     kv[1] *= 2
@@ -1137,7 +1157,19 @@ def test_caller_workspace_single_source_and_eager_api():
     size = get_prims_ts_sparse_mla_decode_workspace_size(**args)
     workspace = torch.empty(size, device=q.device, dtype=torch.uint8)
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace)
-    wrapper.plan(**args)
+    with monkeypatch.context() as empty_cache:
+        empty_cache.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+        discovery = BatchSparseMLADecodePagedTSWrapper()
+        allocations = torch.cuda.memory_stats(q.device)["allocation.all.allocated"]
+        discovery.plan(**args, compile=False)
+        assert (
+            torch.cuda.memory_stats(q.device)["allocation.all.allocated"] == allocations
+        )
+        assert discovery.workspace_size_bytes == size
+        assert not discovery.is_kernel_cached()
+        assert not list(tmp_path.iterdir())
+    _plan_with_deferred_compilation(wrapper, **args)
+    assert wrapper.is_kernel_cached() == (not cute_dsl_core.cute_dsl_cache_disabled())
     metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
     result, lse = wrapper.run(q, kv, **metadata)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
@@ -1154,8 +1186,9 @@ def test_caller_workspace_single_source_and_eager_api():
     torch.testing.assert_close(next_lse, torch.zeros_like(next_lse), atol=0, rtol=0)
     torch.testing.assert_close(lse, first_lse, atol=0, rtol=0)
     short = BatchSparseMLADecodePagedTSWrapper(workspace[:-1])
-    with pytest.raises(ValueError, match="workspace"):
-        short.plan(**args)
+    for compile_kernel in (False, True):
+        with pytest.raises(ValueError, match="workspace"):
+            short.plan(**args, compile=compile_kernel)
     bad = indices.clone()
     bad[..., 0] = 2
     with pytest.raises(ValueError, match="outside pool"):
