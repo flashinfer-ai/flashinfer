@@ -27,8 +27,7 @@ class CustomCommunicator(CommBackend):
         return dist.get_world_size(self._group)
 
     def allgather(self, data: Any) -> tuple[Any, ...]:
-        # CommBackend.allgather takes any picklable object: MnnvlMemory gathers
-        # ints, bytes and tuples.
+        # CommBackend.allgather takes any picklable object.
         gathered = [None] * self.Get_size()
         dist.all_gather_object(gathered, data, group=self._group)
         return tuple(gathered)
