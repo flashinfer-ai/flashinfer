@@ -22,7 +22,6 @@ from cutlass import Int32
 from cutlass.cute.nvgpu import tcgen05
 
 from ..blocks.mma import chunk_blk, zero_v_tail
-from ..blocks.operands import IN_DTYPE
 
 
 # P^T in smem, QK(n + 2) needs only warpgroup n % 2's copy-out of S^T(n) (early in its tile),
@@ -126,7 +125,7 @@ def mma_loop(
     kv_len: Int32,
 ):
     TPC = st.tpc
-    zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), IN_DTYPE)
+    zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), st.in_dtype)
     zeros8.fill(0.0)
     qh = q_cons.wait_and_advance()
     qs = qh.index

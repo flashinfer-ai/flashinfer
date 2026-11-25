@@ -38,6 +38,7 @@ def kernel_name(
     cap: int = 0,
     *,
     causal: bool = True,
+    fmt: str = "bf16",
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
@@ -46,6 +47,7 @@ def kernel_name(
         + ("_hwm" if hw_rowmax else "")
         + (f"_c{cap >> 10}" if cap else "")
         + ("" if causal else "_nc")
+        + ("" if fmt == "bf16" else f"_{fmt}")
     )
 
 
@@ -62,27 +64,29 @@ def get_compiled_attention(
     cap: int = 0,
     *,
     causal: bool = True,
+    fmt: str = "bf16",
 ):
-    """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
+    """``fmt``: the class's operand format (``spec.OPERAND_FMTS``: bf16, or f16 for the fp16 class), the element type of Q, K, V and
+    the output and of both MMAs. ``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
     ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0).
     ``causal``: the mask mode, a compile-time constant of the body (the non-causal kernel is a separate object, ``_nc``; the causal
     body's code is unchanged)."""
-    from .operands import arch_smem_cap
+    from .operands import arch_smem_cap, in_dtype_of
 
     cap = cap or arch_smem_cap()
     name = kernel_name(
-        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal=causal
+        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal=causal, fmt=fmt
     )
 
     def compile_fn():
-        bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
+        op16, f32, i32 = in_dtype_of(fmt), cutlass.Float32, cutlass.Int32
         s_hq, s_tq, s_npages, s_nunits, s_hkv = (cute.sym_int(32) for _ in range(5))
         s_ws = (
             cute.sym_int64()
         )  # fp32 elements of the workspace: beyond 2^31 on large batches
         s_nb1, s_nidx = cute.sym_int(32), cute.sym_int(32)
         q_fake = cute.runtime.make_fake_tensor(
-            bf16,
+            op16,
             (D, s_hq, s_tq),
             (1, cute.sym_int64(divisibility=8), cute.sym_int64(divisibility=8)),
             assumed_align=16,
@@ -91,7 +95,7 @@ def get_compiled_attention(
             cute.sym_int(32) if ragged else page
         )  # the ragged pool: one page of total_kv (dynamic) tokens
         k_fake = cute.runtime.make_fake_tensor(
-            bf16,
+            op16,
             (D, kv_tok, s_hkv, s_npages),
             (
                 1,
@@ -102,7 +106,7 @@ def get_compiled_attention(
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            bf16,
+            op16,
             (D, kv_tok, s_hkv, s_npages),
             (
                 1,
@@ -113,7 +117,7 @@ def get_compiled_attention(
             assumed_align=16,
         )
         o_fake = cute.runtime.make_fake_tensor(
-            bf16,
+            op16,
             (cute.sym_int(32), D),
             (cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
@@ -139,7 +143,17 @@ def get_compiled_attention(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         k = AttentionKernel(
-            D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal=causal
+            D,
+            g,
+            page,
+            kv_slots,
+            n_wg,
+            q2,
+            ragged,
+            hw_rowmax,
+            cap,
+            causal=causal,
+            fmt=fmt,
         )
         return cute.compile(
             k,

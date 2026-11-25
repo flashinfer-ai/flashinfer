@@ -36,6 +36,7 @@ from ..blocks.operands import (
     HALF,
     IN_DTYPE,
     SMEM_CAP,
+    in_dtype_of,
 )
 
 N_PADS = (
@@ -98,6 +99,7 @@ def shared_storage_struct(
     q_stage_elems: int,
     p_stage_elems: int,
     kv_slot_elems: int,
+    in_dtype=IN_DTYPE,
 ):
     """The kernel's ``SharedStorage`` for a ring of ``n_slots`` (the barriers, the stats and exchange payload, then the 1 KB-aligned Q, P
     and K/V tiles); built here so the ring budget below can measure the exact footprint instead of estimating the payload."""
@@ -127,9 +129,9 @@ def shared_storage_struct(
         s_hm=mr[f32, N_SOFTMAX_WGS * 32],
         s_ab=mr[f32, 2 * 128],
         s_inv=mr[f32, 128],
-        sQ=cute.struct.Align[mr[IN_DTYPE, q_stages * q_stage_elems], 1024],
-        sP=cute.struct.Align[mr[IN_DTYPE, p_stages * p_stage_elems], 1024],
-        sKV=cute.struct.Align[mr[IN_DTYPE, n_slots * kv_slot_elems], 1024],
+        sQ=cute.struct.Align[mr[in_dtype, q_stages * q_stage_elems], 1024],
+        sP=cute.struct.Align[mr[in_dtype, p_stages * p_stage_elems], 1024],
+        sKV=cute.struct.Align[mr[in_dtype, n_slots * kv_slot_elems], 1024],
     )
     return cute.struct(type("SharedStorage", (), {"__annotations__": fields}))
 
@@ -232,6 +234,7 @@ class SwapsPlan:
         cap: int = 0,
         *,
         causal: bool = True,
+        fmt: str = "bf16",
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
         self.causal = causal  # the mask mode (blocks/operands.StaticPlan.causal)
@@ -239,6 +242,9 @@ class SwapsPlan:
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
         self.D, self.g, self.page, self.n_pad = D, g, page, n_pad
+        # the class's operand format (blocks/operands.StaticPlan.fmt): Q, K, V, P^T and the output row
+        self.fmt = fmt
+        self.in_dtype = in_dtype_of(fmt)
         self.ragged = (
             ragged  # the packed-token KV view (blocks/operands.StaticPlan.ragged)
         )
@@ -269,8 +275,8 @@ class SwapsPlan:
         cta_group = tcgen05.CtaGroup.ONE
         # S^T = K Q^T: A = K slot (M = 128 keys, K-major), B = Q (N = n_pad rows, K-major); the instruction's K extent is one slot's dims
         self.qk_tiled_mma = utils.sm100.make_trivial_tiled_mma(
-            IN_DTYPE,
-            IN_DTYPE,
+            self.in_dtype,
+            self.in_dtype,
             OperandMajorMode.K,
             OperandMajorMode.K,
             ACC_DTYPE,
@@ -279,8 +285,8 @@ class SwapsPlan:
         )
         # O^T = V^T P^T: A = V slot as (M = slot_dims dims, K = 128 keys) MN-major, B = P^T (N = n_pad rows, K = 128 keys) K-major
         self.pv_tiled_mma = utils.sm100.make_trivial_tiled_mma(
-            IN_DTYPE,
-            IN_DTYPE,
+            self.in_dtype,
+            self.in_dtype,
             OperandMajorMode.MN,
             OperandMajorMode.K,
             ACC_DTYPE,
@@ -291,16 +297,16 @@ class SwapsPlan:
         self.q_tiler = (self.T, n_pad, D)  # the whole Q (all slots' K-steps)
         self.pv_tiler = (self.M_pv, n_pad, self.T)
         self.k_smem_layout = utils.sm100.make_smem_layout_a(
-            self.qk_tiled_mma, self.qk_tiler, IN_DTYPE, self.n_slots
+            self.qk_tiled_mma, self.qk_tiler, self.in_dtype, self.n_slots
         )  # (128 keys x slot_dims) per slot
         self.q_smem_layout = utils.sm100.make_smem_layout_b(
-            self.qk_tiled_mma, self.q_tiler, IN_DTYPE, self.q_stages
+            self.qk_tiled_mma, self.q_tiler, self.in_dtype, self.q_stages
         )  # (n_pad x D) per stage
         self.v_smem_layout = utils.sm100.make_smem_layout_a(
-            self.pv_tiled_mma, self.pv_tiler, IN_DTYPE, self.n_slots
+            self.pv_tiled_mma, self.pv_tiler, self.in_dtype, self.n_slots
         )  # (slot_dims x 128 keys) per slot
         self.p_smem_layout = utils.sm100.make_smem_layout_b(
-            self.pv_tiled_mma, self.pv_tiler, IN_DTYPE, self.p_stages
+            self.pv_tiled_mma, self.pv_tiler, self.in_dtype, self.p_stages
         )  # (n_pad x 128 keys) per stage
         k_one = cute.select(self.k_smem_layout, mode=[0, 1, 2])
         v_one = cute.select(self.v_smem_layout, mode=[0, 1, 2])

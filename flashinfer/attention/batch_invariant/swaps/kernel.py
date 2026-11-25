@@ -77,8 +77,10 @@ class SwapsKernel:
         pdl: bool = False,
         *,
         causal: bool = True,
+        fmt: str = "bf16",
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
+        self.fmt = fmt  # the class's operand format (bf16, or f16 for the fp16 class)
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
         self.causal = causal  # the mask mode (a class dimension; compile-time)
@@ -110,6 +112,7 @@ class SwapsKernel:
             self.ragged,
             self.cap,
             causal=self.causal,
+            fmt=self.fmt,
         )
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
@@ -122,6 +125,7 @@ class SwapsKernel:
             st.q_stage_elems,
             st.p_stage_elems,
             st.kv_slot_elems,
+            st.in_dtype,
         )
         self.kernel(
             tma.atom_q,

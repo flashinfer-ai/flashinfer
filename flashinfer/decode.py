@@ -1518,7 +1518,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             requires ``backend="auto"``. The mask mode is a class dimension: multi-token decode (``q_len_per_req > 1``) runs the
             causal class (bottom-right aligned, optional ``window_left``) or, with ``is_causal=False``, the non-causal class (every
             token sees its request's whole key range; no window); a single token per request is the causal class either way.
-            Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window with
+            Inputs outside the classes (dtypes other than bf16 or fp16 for q, K, V and the output alike, head dims other than 64 / 128 / 256, a window with
             ``is_causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture

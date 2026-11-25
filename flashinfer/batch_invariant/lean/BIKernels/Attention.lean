@@ -4,7 +4,7 @@ import BIKernels.GEMM
 import BIKernels.Export
 
 /-!
-# Paged-KV attention: the classes `attention.bf16` (per head dim and mask mode) and the batch-invariance guarantees
+# Paged-KV attention: the classes `attention.bf16` / `attention.fp16` (per head dim and mask mode) and the batch-invariance guarantees
 
 Mirrors `flashinfer/attention/batch_invariant/spec.py`. The model is per logical row: the row's identity (its query token and
 head, hence its own K / V) is the leaf index of every score and value term, so rows of different KV heads or requests are
@@ -22,6 +22,13 @@ and output column `d` the dataflow is
 * the **row**: the present chunks merged in index order from the init state (`merge`);
 * the epilogue `cvt_bf16(add(mul(O, div(1, l)), +0))`.
 
+The fp16 class (`Params.fmt = "f16"`; `"bf16"` is the bf16 class) is the same dataflow over binary16 operands: the Q, K and
+V leaves are binary16 values, every score and PV step is the binary16 variant of the 16-wide step (`mma16f16`, a different
+opaque primitive from `mma16`), the probabilities handed to the PV product are rounded to binary16 (`cvt f16`) and so is the
+output (`cvt_f16(add(mul(O, div(1, l)), +0))`). A different step and different roundings: a different term at every position
+(`output_depends_on_fmt`), hence a different class; every theorem below holds for both formats (the format is a field of the
+row's fixed data, never of the batch or the configuration).
+
 Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only: the term of
 a token depends on its position `p` and the window (causal) or its request's key count (non-causal), and on the head, never
 on the batch, the page table (paged or ragged KV) or the configuration. What is modelled: the per-row dataflow, the split kernel's
@@ -36,14 +43,15 @@ the Python spec's terms node for node by `native_decide`.
 namespace BIK.Attn
 open BIK.GEMM
 
-/-- Dataflow terms of the attention class. `score row k steps` is the GEMM `kfold` of `steps`
-`mma16` K-steps (printed through `GTerm.sexpr`); `mma acc pslice vt d` is one PV K-step, its bf16 P
-slice carried as the printed list of its 16 probability terms (the slice is opaque to the fold).
+/-- Dataflow terms of the attention class. `score fmt row k steps` is the GEMM `kfold` of `steps`
+`mma16` K-steps (printed through `GTerm.sexpr`) for the bf16 class and the same fold with the binary16 step for the fp16
+class (`scoreF16`); `mma fmt acc pslice vt d` is one PV K-step of the class's format, its P slice (rounded to that format)
+carried as the printed list of its 16 probability terms (the slice is opaque to the fold).
 Commutative nodes print their operands sorted, as the Python printer does. -/
 inductive ATerm where
   | const (c : String)
   | sym (s : String)
-  | score (row k steps : Nat)
+  | score (fmt : String) (row k steps : Nat)
   | add (a b : ATerm)
   | mul (a b : ATerm)
   | fma (a b c : ATerm)
@@ -51,13 +59,23 @@ inductive ATerm where
   | fmax (a b : ATerm)
   | ex2 (a : ATerm)
   | cvt (fmt : String) (a : ATerm)
-  | mma (acc : ATerm) (pslice : String) (vt d : Nat)
+  | mma (fmt : String) (acc : ATerm) (pslice : String) (vt d : Nat)
   deriving DecidableEq, Repr, Inhabited
+
+/-- The printed name of the class's opaque 16-wide K-step (`spec.MMA_OP_OF` through `term.sexpr`): `mma16` on bf16 operands,
+`mma16f16` on binary16 operands. -/
+def mmaName (fmt : String) : String := if fmt == "f16" then "mma16f16" else "mma16"
+
+/-- The score fold of the fp16 class: the slices of the GEMM's `kfold` (`steps` K-steps from +0) folded with the binary16
+step. -/
+def scoreF16 (row k : Nat) : Nat → String
+  | 0 => "(const 0.0)"
+  | n+1 => s!"(mma16f16 {scoreF16 row k n} (ab (a {row} {n}) (b {n} {k})))"
 
 def ATerm.sexpr : ATerm → String
   | .const c => s!"(const {c})"
   | .sym s => s!"(sym {s})"
-  | .score row k steps => (kfold ⟨row⟩ ⟨k⟩ steps).sexpr
+  | .score fmt row k steps => if fmt == "f16" then scoreF16 row k steps else (kfold ⟨row⟩ ⟨k⟩ steps).sexpr
   | .add a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(add {p} {q})"
   | .mul a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(mul {p} {q})"
   | .fma a b c => let (p, q) := sortPair a.sexpr b.sexpr; s!"(fma {p} {q} {c.sexpr})"
@@ -65,7 +83,7 @@ def ATerm.sexpr : ATerm → String
   | .fmax a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(fmax {p} {q})"
   | .ex2 a => s!"(ex2 {a.sexpr})"
   | .cvt f a => s!"(cvt {f} {a.sexpr})"
-  | .mma acc ps vt d => s!"(mma16 {acc.sexpr} (op:pv_kslice (op:p_slice{ps}) (op:v_slice {vt} {d})))"
+  | .mma fmt acc ps vt d => s!"({mmaName fmt} {acc.sexpr} (op:pv_kslice (op:p_slice{ps}) (op:v_slice {vt} {d})))"
 
 /-! ## Pairwise trees over the key digit (`canon._pairwise`: adjacent pairs, low index first,
 absent leaves dropped) -/
@@ -88,8 +106,9 @@ def ptree (f : ATerm → ATerm → ATerm) : Nat → List (Option ATerm) → Opti
 
 /-- The fixed data of one logical row's dataflow: head dim as `steps = D/16`, tile `T = 2^tbits`,
 chunk `C`, the row's position `p`, FlashInfer's `window_left` (negative = none), the row id of the Q
-leaves, the output column `d`, and the mask mode: `causal = true` gives the visible keys `[lo, p + 1)`,
-`causal = false` gives `[0, kvLen)` (every key of the request; `p` and `win` do not enter). -/
+leaves, the output column `d`, the mask mode: `causal = true` gives the visible keys `[lo, p + 1)`,
+`causal = false` gives `[0, kvLen)` (every key of the request; `p` and `win` do not enter), and the class's operand format
+`fmt` (`"bf16"` or `"f16"`: the format of Q, K, V, the probabilities of the PV product and the output). -/
 structure Params where
   steps : Nat
   tbits : Nat
@@ -100,6 +119,7 @@ structure Params where
   d : Nat
   causal : Bool
   kvLen : Nat
+  fmt : String
 
 /-! The geometry of a row (visible keys, present tiles, present chunks) as functions of its visible range `[lo, L)`, which is
 a function of `(causal, p, win, kvLen)` alone: the page table, the batch and the configuration do not enter. -/
@@ -138,10 +158,11 @@ structure Core where
   L : Nat
   row : Nat
   d : Nat
+  fmt : String
 
 def Params.lo (P : Params) : Nat := loMode P.causal P.p P.win
 def Params.L (P : Params) : Nat := LMode P.causal P.p P.kvLen
-def Params.core (P : Params) : Core := ⟨P.steps, P.tbits, P.C, P.lo, P.L, P.row, P.d⟩
+def Params.core (P : Params) : Core := ⟨P.steps, P.tbits, P.C, P.lo, P.L, P.row, P.d, P.fmt⟩
 
 def Core.T (G : Core) : Nat := 2 ^ G.tbits
 def Core.visible (G : Core) (k : Nat) : Bool := visibleR G.lo G.L k
@@ -166,18 +187,18 @@ def initState : State := ⟨.const "-inf", .const "0.0", .const "0.0"⟩
 /-- `spec.alpha_term`: `ex2(add(mul(m_old, c), mul(m_new, nc)))`. -/
 def alphaTerm (mOld mNew : ATerm) : ATerm := .ex2 (.add (.mul mOld c) (.mul mNew nc))
 
-/-- The PV fold of one tile from `o0`: one opaque step per 16 keys, the slice's bf16 probabilities
+/-- The PV fold of one tile from `o0`: one opaque step of the class's format per 16 keys, the slice's rounded probabilities
 printed into the step (the Python term carries them as the `p_slice` operands). -/
-def pvFold (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
+def pvFold (fmt : String) (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
   let n := pbf.length / 16
   (List.range n).foldl (fun acc j =>
     let slice := (pbf.drop (16 * j)).take 16
-    .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
+    .mma fmt acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
 
 /-- `spec.tile_step` on a present tile `t`. -/
 def tileStep (P : Core) (st : State) (t : Nat) : State :=
   let scores : List (Option ATerm) :=
-    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.row (t * P.T + i) P.steps) else none)
+    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.fmt P.row (t * P.T + i) P.steps) else none)
   let mT := (ptree ATerm.fmax P.tbits scores).getD (.const "-inf")
   let mNew := ATerm.fmax st.m mT
   let alpha := alphaTerm st.m mNew
@@ -185,8 +206,8 @@ def tileStep (P : Core) (st : State) (t : Nat) : State :=
   let probs : List (Option ATerm) := scores.map (fun s => s.map (fun s => .ex2 (.fma s c nms)))
   let rT := (ptree ATerm.add P.tbits probs).getD (.const "0.0")
   let lNew := ATerm.fma st.l alpha rT
-  let pbf := probs.map (fun q => ATerm.cvt "bf16" (q.getD (.const "0.0")))
-  let oNew := pvFold (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
+  let pbf := probs.map (fun q => ATerm.cvt P.fmt (q.getD (.const "0.0")))
+  let oNew := pvFold P.fmt (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
   ⟨mNew, lNew, oNew⟩
 
 /-- `spec.merge`: the running state `a` with the finished chunk `b`. -/
@@ -203,10 +224,10 @@ def chunkState (P : Core) (j : Nat) : State := (P.tilesOfChunk j).foldl (tileSte
 /-- The fused (one-CTA) path: present chunks merged in index order from the init state. -/
 def fused (P : Core) : State := P.presentChunks.foldl (fun acc j => merge acc (chunkState P j)) initState
 
-/-- `spec.output_elem`. -/
-def epilogue (st : State) : ATerm := .cvt "bf16" (.add (.mul st.o (.div (.const "1.0") st.l)) (.const "0.0"))
+/-- `spec.output_elem`: the single rounding to the class's format. -/
+def epilogue (fmt : String) (st : State) : ATerm := .cvt fmt (.add (.mul st.o (.div (.const "1.0") st.l)) (.const "0.0"))
 
-def outputCore (P : Core) : ATerm := epilogue (fused P)
+def outputCore (P : Core) : ATerm := epilogue P.fmt (fused P)
 
 /-- The term of one output element of a row: the dataflow over the row's visible range. -/
 def output (P : Params) : ATerm := outputCore P.core
@@ -230,7 +251,7 @@ def workspace (P : Params) (_σ : Nat → Nat) (j : Nat) : State := chunkState P
 fold by the last-arriving CTA is the same fold). -/
 def fixup (ws : Nat → State) (js : List Nat) : State := js.foldl (fun acc j => merge acc (ws j)) initState
 
-def splitKernel (P : Params) (σ : Nat → Nat) : ATerm := epilogue (fixup (workspace P σ) P.presentChunks)
+def splitKernel (P : Params) (σ : Nat → Nat) : ATerm := epilogue P.fmt (fixup (workspace P σ) P.presentChunks)
 
 /-- **The split kernel computes the fused class**, for every assignment of chunks to CTAs (and hence
 for every unit kind, ring depth and grid the planner may choose). -/
@@ -256,9 +277,9 @@ structure Row where
   row : Nat
   deriving DecidableEq, Repr
 
-/-- The term of a row under the class of mask mode `causal`. -/
-def rowOutput (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Row) : ATerm :=
-  output ⟨steps, tbits, C, r.p, win, r.row, d, causal, r.kvLen⟩
+/-- The term of a row under the class of mask mode `causal` and operand format `fmt`. -/
+def rowOutput (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) (r : Row) : ATerm :=
+  output ⟨steps, tbits, C, r.p, win, r.row, d, causal, r.kvLen, fmt⟩
 
 /-- A prefill request: `q_len` tokens whose last one sits at position `kv_len - 1`; token `i` is at
 `kv_len - q_len + i` (bottom-right causal). -/
@@ -271,64 +292,80 @@ def decodeRow (kv_len h row : Nat) : Row := ⟨kv_len - 1, kv_len, h, row⟩
 a prefill request (`kv_len = p + 1 + (q_len - 1 - i)`) or the decode step of a request with
 `p + 1` keys: the request's key count does not reach the causal term. The paged and the ragged KV layouts hand the
 kernel the same keys at the same positions, so they are the same rows of this model. -/
-theorem prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len q_len i h row : Nat)
+theorem prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) (kv_len q_len i h row : Nat)
     (hi : i < q_len) (hq : q_len ≤ kv_len) :
-    rowOutput true steps tbits C win d (prefillRow kv_len q_len i h row)
-      = rowOutput true steps tbits C win d (decodeRow (kv_len - q_len + i + 1) h row) := by
+    rowOutput true steps tbits C win d fmt (prefillRow kv_len q_len i h row)
+      = rowOutput true steps tbits C win d fmt (decodeRow (kv_len - q_len + i + 1) h row) := by
   unfold rowOutput prefillRow decodeRow
   simp [output, Params.core, Params.L, Params.lo, LMode, loMode]
 
 /-- **Prefill == multi-token decode (R4), non-causal class.** Every token of a request with `kv_len` keys has the same term
 whichever token of whichever query length it is (its position does not reach the non-causal term), so a prefill row and the
 rows of a multi-token decode step of the same request agree. -/
-theorem prefill_decode_agree_noncausal (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len q_len q_len' i j h row : Nat) :
-    rowOutput false steps tbits C win d (prefillRow kv_len q_len i h row)
-      = rowOutput false steps tbits C win d (prefillRow kv_len q_len' j h row) := by
+theorem prefill_decode_agree_noncausal (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) (kv_len q_len q_len' i j h row : Nat) :
+    rowOutput false steps tbits C win d fmt (prefillRow kv_len q_len i h row)
+      = rowOutput false steps tbits C win d fmt (prefillRow kv_len q_len' j h row) := by
   unfold rowOutput prefillRow
   simp [output, Params.core, Params.L, Params.lo, LMode, loMode]
 
 /-- The launch applies the per-row term to every row; there is no batch parameter inside. -/
-def launch (causal : Bool) (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
-  rowOutput causal steps tbits C win d (rows r)
+def launch (causal : Bool) (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) (r : Fin M) : ATerm :=
+  rowOutput causal steps tbits C win d fmt (rows r)
 
 /-- **Determinism (R1)**: the same inputs give the same term (both classes). -/
-theorem determinism (causal : Bool) (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) :
-    launch causal M rows steps tbits C win d r = launch causal M rows steps tbits C win d r := rfl
+theorem determinism (causal : Bool) (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) (r : Fin M) :
+    launch causal M rows steps tbits C win d fmt r = launch causal M rows steps tbits C win d fmt r := rfl
 
 /-- **Batch invariance (R2)**: equal rows give equal outputs whatever the batch size, position or
 neighbours (both classes). -/
-theorem batch_invariance (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) {M₁ M₂ : Nat}
+theorem batch_invariance (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) {M₁ M₂ : Nat}
     (rows₁ : Fin M₁ → Row) (rows₂ : Fin M₂ → Row) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
-    launch causal M₁ rows₁ steps tbits C win d r₁ = launch causal M₂ rows₂ steps tbits C win d r₂ := by
+    launch causal M₁ rows₁ steps tbits C win d fmt r₁ = launch causal M₂ rows₂ steps tbits C win d fmt r₂ := by
   simp only [launch, h]
 
 /-- **Permutation invariance**: permuting the rows permutes the outputs row-wise (both classes). -/
-theorem permutation_invariance (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) {M : Nat} (rows : Fin M → Row) (σ : Fin M → Fin M) (r : Fin M) :
-    launch causal M (rows ∘ σ) steps tbits C win d r = launch causal M rows steps tbits C win d (σ r) := rfl
+theorem permutation_invariance (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) {M : Nat} (rows : Fin M → Row) (σ : Fin M → Fin M) (r : Fin M) :
+    launch causal M (rows ∘ σ) steps tbits C win d fmt r = launch causal M rows steps tbits C win d fmt (σ r) := rfl
 
 /-- **Sub-batch invariance**: any selection of rows reproduces exactly those rows' outputs (both classes). -/
-theorem subbatch_invariance (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) {M k : Nat} (rows : Fin M → Row) (sel : Fin k → Fin M) (i : Fin k) :
-    launch causal k (rows ∘ sel) steps tbits C win d i = launch causal M rows steps tbits C win d (sel i) := rfl
+theorem subbatch_invariance (causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) (fmt : String) {M k : Nat} (rows : Fin M → Row) (sel : Fin k → Fin M) (i : Fin k) :
+    launch causal k (rows ∘ sel) steps tbits C win d fmt i = launch causal M rows steps tbits C win d fmt (sel i) := rfl
 
 /-- **The chunk length must not depend on the batch or the request's total length**: the same
 position under `C` and `2C` is a different term (stated on a concrete toy row, decided). -/
 theorem output_depends_on_C :
-    output ⟨1, 2, 8, 9, -1, 0, 0, true, 10⟩ ≠ output ⟨1, 2, 16, 9, -1, 0, 0, true, 10⟩ := by native_decide
+    output ⟨1, 2, 8, 9, -1, 0, 0, true, 10, "bf16"⟩ ≠ output ⟨1, 2, 16, 9, -1, 0, 0, true, 10, "bf16"⟩ := by native_decide
 
 /-- **One class per head dim**: the same position under `D = 128` (8 MMA K-steps per score) and `D = 256` (16 steps) is a
 different term (the score fold differs; everything else -- `T`, `C`, the folds, the merge, the epilogue -- is shared). Stated
 on a concrete toy row, decided. The classes at D = 64 / 128 / 256 are therefore three fingerprints. -/
 theorem output_depends_on_D :
-    output ⟨8, 2, 8, 9, -1, 0, 0, true, 10⟩ ≠ output ⟨16, 2, 8, 9, -1, 0, 0, true, 10⟩ := by native_decide
+    output ⟨8, 2, 8, 9, -1, 0, 0, true, 10, "bf16"⟩ ≠ output ⟨16, 2, 8, 9, -1, 0, 0, true, 10, "bf16"⟩ := by native_decide
 
 theorem output_depends_on_D_64 :
-    output ⟨4, 2, 8, 9, -1, 0, 0, true, 10⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, true, 10⟩ := by native_decide
+    output ⟨4, 2, 8, 9, -1, 0, 0, true, 10, "bf16"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, true, 10, "bf16"⟩ := by native_decide
+
+/-- **One class per operand format**: the same position over bf16 and over binary16 operands is a different term (the
+step of every score and of every PV slice, the rounding of the probabilities and the rounding of the output all name the
+format), under either mask mode. Stated on concrete toy rows, decided. -/
+theorem output_depends_on_fmt :
+    output ⟨8, 2, 8, 9, -1, 0, 0, true, 10, "bf16"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, true, 10, "f16"⟩ := by native_decide
+
+theorem output_depends_on_fmt_noncausal :
+    output ⟨8, 2, 8, 9, -1, 0, 0, false, 12, "bf16"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, false, 12, "f16"⟩ := by native_decide
+
+/-- **The operand format is orthogonal to the mask mode**: the visible keys, the tiles and the chunks of a row do not depend
+on the format (it names the steps and the roundings of the dataflow, never the key set), so each format has a causal and a
+non-causal class over the same geometry. -/
+theorem geometry_ignores_fmt (P : Params) (f : String) (j : Nat) :
+    ({ P with fmt := f }).presentChunks = P.presentChunks ∧ ({ P with fmt := f }).tilesOfChunk j = P.tilesOfChunk j :=
+  ⟨rfl, rfl⟩
 
 /-- **The mask mode is a class dimension**: the token at position 9 of a request with 12 keys sees the keys `0..9` under the
 causal class and `0..11` under the non-causal one -- a different term (stated on a concrete toy row, decided), hence a
 different fingerprint per head dim. -/
 theorem output_depends_on_mode :
-    output ⟨1, 2, 8, 9, -1, 0, 0, true, 12⟩ ≠ output ⟨1, 2, 8, 9, -1, 0, 0, false, 12⟩ := by native_decide
+    output ⟨1, 2, 8, 9, -1, 0, 0, true, 12, "bf16"⟩ ≠ output ⟨1, 2, 8, 9, -1, 0, 0, false, 12, "bf16"⟩ := by native_decide
 
 /-- The visible keys, the tiles and the chunks of a row depend on `(causal, p, win, kvLen, T, C)` only: the page
 table, the batch and the configuration do not appear. -/
