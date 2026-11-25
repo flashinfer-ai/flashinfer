@@ -287,6 +287,7 @@ def test_the_chosen_plan_and_the_plan_of_record_agree(H, lengths, monkeypatch):
     inputs = _inputs(lengths, H, with_state, seed=13)
     out, state = _call(inputs, "cake")
     ref_out, ref_state = _call(inputs, "cudnn")
+
     def record_launch(cu, *, state_dtype="f32", pool=False, **kw):
         offsets = cu.tolist() if isinstance(cu, torch.Tensor) else list(cu)
         plan = loader.prefill_v6_record_plan(offsets, **kw)

@@ -16884,7 +16884,9 @@ def lpt_counts(loads, cost: int, k: int) -> list[int]:
     counts = [t - x if x < t else 0 for x in q]
     rest = k - sum(counts)
     if rest:
-        for x in sorted((loads[b] - q[b] * cost) * G + b for b in range(G) if q[b] <= t)[:rest]:
+        for x in sorted(
+            (loads[b] - q[b] * cost) * G + b for b in range(G) if q[b] <= t
+        )[:rest]:
             counts[x % G] += 1
     return counts
 
@@ -16893,7 +16895,7 @@ def lpt_place(loads, cost: int, rows, lists) -> None:
     """Append ``rows`` (in order) to the CTA ``lists`` by :func:`lpt_rounds` and add their cost to ``loads``."""
     G = len(loads)
     head, phase, full, tail = lpt_rounds(loads, cost, len(rows))
-    for row, b in zip(rows, head):
+    for row, b in zip(rows, head, strict=False):
         lists[b].append(row)
         loads[b] += cost
     at = len(head)
@@ -16903,7 +16905,7 @@ def lpt_place(loads, cost: int, rows, lists) -> None:
             lists[b].extend(rows[at + j : end : G])
             loads[b] += full * cost
         at = end
-    for row, b in zip(rows[at:], tail):
+    for row, b in zip(rows[at:], tail, strict=False):
         lists[b].append(row)
         loads[b] += cost
 
@@ -16922,7 +16924,10 @@ def inference_lists(long_rows, long_costs, short_groups, grid: int, flags=None):
     else:
         full, rest = divmod(count, grid)
         bounds = range(0, full * grid, grid)
-        lists = [list(cta) for cta in zip(*(long_rows[at : at + grid] for at in bounds))]
+        lists = [
+            list(cta)
+            for cta in zip(*(long_rows[at : at + grid] for at in bounds), strict=False)
+        ]
         for b in range(rest):
             lists[b].append(long_rows[full * grid + b])
         loads = _v6_rr_loads(long_costs, grid)
@@ -16939,7 +16944,9 @@ def inference_lists(long_rows, long_costs, short_groups, grid: int, flags=None):
             b = (fix & -fix).bit_length() - 1
             fix &= fix - 1
             cta = lists[b]
-            lists[b] = [row for row in cta if not row[2]] + [row for row in cta if row[2]]
+            lists[b] = [row for row in cta if not row[2]] + [
+                row for row in cta if row[2]
+            ]
     for cost, rows in short_groups:
         lpt_place(loads, cost, rows, lists)
     return lists
@@ -17091,7 +17098,9 @@ V6_PLAN_ROBUST_PERCENT = 5
 V6_PLAN_WARMUP_CAP = 128  # chunks: the ``split_warmup`` of the Blackwell split builds
 V6_PLAN_CACHE_SIZE = 256  # plans (and launches) kept per cache
 V6_PLAN_CACHE_ROWS = 1 << 20  # plan rows kept in the ``prefill_v6_plan`` cache
-V6_LAUNCH_CACHE_BYTES = 64 << 20  # item-table bytes kept in the ``prefill_v6_launch`` cache
+V6_LAUNCH_CACHE_BYTES = (
+    64 << 20
+)  # item-table bytes kept in the ``prefill_v6_launch`` cache
 V6_PLAN_COSTS = {
     "sm_100a": {
         "chunk": 158,
@@ -17121,11 +17130,18 @@ V6_PLAN_SPLIT_SPECS = (
     *((f"f{F}nb", F, False) for F in V6_PLAN_FLOORS_UNIFORM),
     ("exact", None, False),
 )
-V6_PLAN_CANDIDATES = (*(name for name, _F, _bal in V6_PLAN_SPLIT_SPECS), "main", "block", "blockbal")
+V6_PLAN_CANDIDATES = (
+    *(name for name, _F, _bal in V6_PLAN_SPLIT_SPECS),
+    "main",
+    "block",
+    "blockbal",
+)
 
 
 @functools.lru_cache(maxsize=65536)
-def v6_split_count(chunks: int, H: int, n: int, sm_count: int, span_min: int) -> tuple[int, int]:
+def v6_split_count(
+    chunks: int, H: int, n: int, sm_count: int, span_min: int
+) -> tuple[int, int]:
     """``split_count`` (auto) with the least span ``span_min`` in place of ``split_span_min(H, arch)``."""
     if chunks <= 0:
         return 1, 0
@@ -17169,7 +17185,12 @@ def _v6_count_scan(chunks, H, n, sm_count, span_min):
             break
         p_eff = -(-chunks // span)
         out.append(
-            (span, p_eff, -(-(H * p_eff) // sm_count) * ((span + 1) * SPLIT_COST_CHUNK + SPLIT_COST_ITEM))
+            (
+                span,
+                p_eff,
+                -(-(H * p_eff) // sm_count)
+                * ((span + 1) * SPLIT_COST_CHUNK + SPLIT_COST_ITEM),
+            )
         )
     return out
 
@@ -17194,7 +17215,10 @@ def _v6_decisions(chunks, H, n, sm_count, arch):
     if chunks < SPLIT_MIN_CHUNKS:
         return (((1, chunks) if chunks > 0 else (1, 0)),) * len(V6_PLAN_SPLIT_SPECS)
     record = split_span_min(H, arch)
-    least = min(record, *(floor for _name, floor, _bal in V6_PLAN_SPLIT_SPECS if floor is not None))
+    least = min(
+        record,
+        *(floor for _name, floor, _bal in V6_PLAN_SPLIT_SPECS if floor is not None),
+    )
     scan = _v6_count_scan(chunks, H, n, sm_count, least)
     slot = 0
     if arch in SPLIT_BAL_SLOTS:
@@ -17207,14 +17231,20 @@ def _v6_decisions(chunks, H, n, sm_count, arch):
     bal_scan = None
     if slot:
         slots = SPLIT_BAL_SLOTS[arch]
-        bal_scan = scan if sm_count == slots else _v6_count_scan(chunks, H, n, slots, least)
+        bal_scan = (
+            scan if sm_count == slots else _v6_count_scan(chunks, H, n, slots, least)
+        )
     out = []
     for _name, floor, bal in V6_PLAN_SPLIT_SPECS:
         if floor is None:
             out.append((1, chunks))
             continue
         span_min = min(floor, record)
-        if bal and slot and 2 * SPLIT_BAL_SLOTS[arch] <= H * _v6_scan_best(bal_scan, span_min)[0]:
+        if (
+            bal
+            and slot
+            and 2 * SPLIT_BAL_SLOTS[arch] <= H * _v6_scan_best(bal_scan, span_min)[0]
+        ):
             out.append((0, slot))
             continue
         out.append(_v6_scan_best(scan, span_min))
@@ -17237,7 +17267,11 @@ def _v6_split_row_cost(row, chunks: int, tokens: int, n: int, costs) -> int:
         end = min(cut + span, chunks)
     if tokens == 1:
         return costs["decode"]
-    return max(end - cut, 0) * costs["chunk"] + costs["item"] + (costs["warmup"] if cut > 0 else 0)
+    return (
+        max(end - cut, 0) * costs["chunk"]
+        + costs["item"]
+        + (costs["warmup"] if cut > 0 else 0)
+    )
 
 
 def _v6_block_row_cost(tokens: int, n: int, costs) -> int:
@@ -17264,7 +17298,9 @@ def _v6_cut_shape(chunks, decision, H, n, arch):
                 head, cut = divmod(lo, padded)
                 end = min(hi, (head + 1) * padded)
                 if cut < chunks:
-                    pieces.append(((0, head, cut, -slot), min(end - head * padded, chunks) - cut))
+                    pieces.append(
+                        ((0, head, cut, -slot), min(end - head * padded, chunks) - cut)
+                    )
                 lo = end
             pad = ((0, min(k * slot // padded, H - 1), chunks, -slot), 0)
             if len(pieces) == 2 and pieces[1][0][2] == 0:
@@ -17293,7 +17329,10 @@ def _v6_cut_costs(chunks, decision, H, n, arch, record):
     else:
         c = V6_PLAN_COSTS[arch]
         a, item, warm = c["chunk"], c["item"], c["warmup"]
-    return tuple(0 if kind < 0 else k * a + item + (warm if kind else 0) for k, kind in zip(ks, kinds))
+    return tuple(
+        0 if kind < 0 else k * a + item + (warm if kind else 0)
+        for k, kind in zip(ks, kinds, strict=False)
+    )
 
 
 @functools.lru_cache(maxsize=4096)
@@ -17305,7 +17344,9 @@ def _v6_cut_stats(chunks, decision, H, n, arch):
         return len(costs), sum(costs), max(costs)
     c = V6_PLAN_COSTS[arch]
     each = [
-        max(min(span, chunks - j * span), 0) * c["chunk"] + c["item"] + (c["warmup"] if j else 0)
+        max(min(span, chunks - j * span), 0) * c["chunk"]
+        + c["item"]
+        + (c["warmup"] if j else 0)
         for j in range(p)
     ]
     return H * p, H * sum(each), max(each)
@@ -17343,7 +17384,10 @@ def _v6_cut_loads(chunks, decision, H, n, arch, grid, record):
         else:
             c = V6_PLAN_COSTS[arch]
             a, item, warm = c["chunk"], c["item"], c["warmup"]
-        runs = [(H, max(min(span, chunks - j * span), 0) * a + item + (warm if j else 0)) for j in range(p)]
+        runs = [
+            (H, max(min(span, chunks - j * span), 0) * a + item + (warm if j else 0))
+            for j in range(p)
+        ]
         return _v6_runs_loads(runs, grid)
     return _v6_rr_loads(_v6_cut_costs(chunks, decision, H, n, arch, record), grid)
 
@@ -17354,7 +17398,12 @@ def _v6_rr_loads(costs, grid):
     if count <= grid:
         return list(costs) + [0] * (grid - count)
     full, rest = divmod(count, grid)
-    loads = [sum(cta) for cta in zip(*(costs[at : at + grid] for at in range(0, full * grid, grid)))]
+    loads = [
+        sum(cta)
+        for cta in zip(
+            *(costs[at : at + grid] for at in range(0, full * grid, grid)), strict=False
+        )
+    ]
     for b in range(rest):
         loads[b] += costs[full * grid + b]
     return loads
@@ -17367,7 +17416,18 @@ def _rotated(values, shift):
 class _V6Batch:
     """The host view of one call: lengths, chunks and the sequences of each length (ascending)."""
 
-    __slots__ = ("H", "n", "sm", "arch", "costs", "lens", "chunks", "by_len", "chunk_of", "empty")
+    __slots__ = (
+        "H",
+        "n",
+        "sm",
+        "arch",
+        "costs",
+        "lens",
+        "chunks",
+        "by_len",
+        "chunk_of",
+        "empty",
+    )
 
     def __init__(self, cu, H, n, sm, arch, total):
         self.H, self.n, self.sm, self.arch = H, n, sm, arch
@@ -17433,10 +17493,14 @@ class _V6Split:
             chunks = bt.chunks[q]
             decision = self.dec[chunks]
             shift = at % G
-            vec = _rotated(_v6_cut_loads(chunks, decision, H, bt.n, bt.arch, G, False), shift)
+            vec = _rotated(
+                _v6_cut_loads(chunks, decision, H, bt.n, bt.arch, G, False), shift
+            )
             cloads = vec if cloads is None else list(map(operator.add, cloads, vec))
             if self.record:
-                vec = _rotated(_v6_cut_loads(chunks, decision, H, bt.n, bt.arch, G, True), shift)
+                vec = _rotated(
+                    _v6_cut_loads(chunks, decision, H, bt.n, bt.arch, G, True), shift
+                )
                 ploads = vec if ploads is None else list(map(operator.add, ploads, vec))
             at += _v6_cut_stats(chunks, decision, H, bt.n, bt.arch)[0]
         if cloads is None:
@@ -17452,17 +17516,23 @@ class _V6Split:
                 cc = ccs.pop()
                 counts = lpt_counts(ploads, pc, k)
                 if self.record:
-                    ploads = [load + x * pc for load, x in zip(ploads, counts)]
-                    cloads = [load + x * cc for load, x in zip(cloads, counts)]
+                    ploads = [
+                        load + x * pc for load, x in zip(ploads, counts, strict=False)
+                    ]
+                    cloads = [
+                        load + x * cc for load, x in zip(cloads, counts, strict=False)
+                    ]
                 else:
-                    cloads = ploads = [load + x * cc for load, x in zip(cloads, counts)]
+                    cloads = ploads = [
+                        load + x * cc for load, x in zip(cloads, counts, strict=False)
+                    ]
                 continue
             # one placement cost, several calibrated costs: follow the rows
             per_seq = sorted((q, cc) for seqs, cc in groups for q in seqs)
             head, phase, full, tail = lpt_rounds(ploads, pc, k)
             slots = head + phase * full + tail
             costs = [cc for _q, cc in per_seq for _head in range(H)]
-            for b, cc in zip(slots, costs):
+            for b, cc in zip(slots, costs, strict=False):
                 cloads[b] += cc
                 ploads[b] += pc
         self.loads = cloads
@@ -17488,11 +17558,23 @@ class _V6Split:
             if len(self.short[pc]) > 1:
                 seqs.sort()
             short.append(
-                (pc, list(itertools.chain.from_iterable(_v6_head_rows(q, bt.chunks[q], H) for q in seqs)))
+                (
+                    pc,
+                    list(
+                        itertools.chain.from_iterable(
+                            _v6_head_rows(q, bt.chunks[q], H) for q in seqs
+                        )
+                    ),
+                )
             )
         lists = inference_lists(long_rows, long_costs, short, G, flags)
         offsets = (0, *itertools.accumulate(map(len, lists)))
-        return V6Plan(rows=tuple(itertools.chain.from_iterable(lists)), split=True, grid=G, offsets=offsets)
+        return V6Plan(
+            rows=tuple(itertools.chain.from_iterable(lists)),
+            split=True,
+            grid=G,
+            offsets=offsets,
+        )
 
 
 @functools.lru_cache(maxsize=4096)
@@ -17505,7 +17587,9 @@ def _v6_cut_rows(seq, chunks, decision, H, n, arch):
 @functools.lru_cache(maxsize=4096)
 def _v6_cut_flags(chunks, decision, H, n, arch):
     """Per row of a cut sequence: 1 for a row of cut > 0 (a pad row included), else 0."""
-    return tuple(1 if kind else 0 for kind in _v6_cut_shape(chunks, decision, H, n, arch)[2])
+    return tuple(
+        1 if kind else 0 for kind in _v6_cut_shape(chunks, decision, H, n, arch)[2]
+    )
 
 
 @functools.lru_cache(maxsize=4096)
@@ -17527,7 +17611,9 @@ class _V6Block:
             by_blocks: dict[int, list] = {}
             for length, seqs in bt.by_len.items():
                 if length > 0:
-                    by_blocks.setdefault(-(-length // 64), []).extend((q, length) for q in seqs)
+                    by_blocks.setdefault(-(-length // 64), []).extend(
+                        (q, length) for q in seqs
+                    )
             total = top = 0
             for blocks in sorted(by_blocks, reverse=True):
                 group = by_blocks[blocks]
@@ -17570,15 +17656,21 @@ class _V6Block:
         heap = [(self.cap[b] * least, b) for b in range(G)]
         heapq.heapify(heap)
         self.assign = []  # the CTA of each row above the least cost, rows by cost descending (stable)
-        for rows, cost in sorted(((r, c) for r, c in runs if c > least), key=lambda rc: -rc[1]):
+        for rows, cost in sorted(
+            ((r, c) for r, c in runs if c > least), key=lambda rc: -rc[1]
+        ):
             for _ in range(rows):
                 _key, b = heapq.heappop(heap)
                 used[b] += 1
                 loads[b] += cost
                 self.assign.append(b)
                 if used[b] < self.cap[b]:
-                    heapq.heappush(heap, (loads[b] + (self.cap[b] - used[b]) * least, b))
-        self.loads = [load + (self.cap[b] - used[b]) * least for b, load in enumerate(loads)]
+                    heapq.heappush(
+                        heap, (loads[b] + (self.cap[b] - used[b]) * least, b)
+                    )
+        self.loads = [
+            load + (self.cap[b] - used[b]) * least for b, load in enumerate(loads)
+        ]
         self.least = least
         return self.bt.costs["block_fixed"] + max(self.loads)
 
@@ -17596,16 +17688,21 @@ class _V6Block:
             self.cost()
         n, costs = bt.n, bt.costs
         cost_of = [_v6_block_row_cost(bt.lens[r[0]], n, costs) for r in rows]
-        big = sorted((i for i in range(len(rows)) if cost_of[i] > self.least), key=lambda i: -cost_of[i])
+        big = sorted(
+            (i for i in range(len(rows)) if cost_of[i] > self.least),
+            key=lambda i: -cost_of[i],
+        )
         lists = [[] for _ in range(G)]
-        for i, b in zip(big, self.assign):
+        for i, b in zip(big, self.assign, strict=False):
             lists[b].append(rows[i])
         rest = iter(rows[i] for i in range(len(rows)) if cost_of[i] <= self.least)
         for b in range(G):
             while len(lists[b]) < self.cap[b]:
                 lists[b].append(next(rest))
         rounds = max(len(x) for x in lists)
-        placed = [lists[b][r] for r in range(rounds) for b in range(G) if r < len(lists[b])]
+        placed = [
+            lists[b][r] for r in range(rounds) for b in range(G) if r < len(lists[b])
+        ]
         return V6Plan(rows=tuple(placed), split=False, grid=G)
 
 
@@ -17621,9 +17718,11 @@ def _v6_candidates(bt):
             alias[name] = seen[key]
             continue
         seen[key] = alias[name] = name
-        out.append(_V6Split(name, bt, dict(zip(distinct, key))))
+        out.append(_V6Split(name, bt, dict(zip(distinct, key, strict=False))))
     record = next(c for c in out if c.name == alias["f48"]).dec
-    if bt.empty or any(record[c][0] != 1 for c in distinct):  # launch_split of the table of record
+    if bt.empty or any(
+        record[c][0] != 1 for c in distinct
+    ):  # launch_split of the table of record
         out.append(_V6Split("main", bt, record, record=True))
         alias["main"] = "main"
     else:
@@ -17664,7 +17763,10 @@ def _v6_scenario_time(plan, bt, cut_map, W):
     ``W`` is at most V6_PLAN_WARMUP_CAP (``W`` None: no cut saturates); see the PLAN CHOOSER."""
     c = bt.costs
     if not plan.split:
-        loads = [sum(_v6_block_row_cost(bt.lens[r[0]], bt.n, c) for r in cta) for cta in _v6_plan_ctas(plan)]
+        loads = [
+            sum(_v6_block_row_cost(bt.lens[r[0]], bt.n, c) for r in cta)
+            for cta in _v6_plan_ctas(plan)
+        ]
         return c["block_fixed"] + max(loads, default=0)
     live = W is not None and W <= V6_PLAN_WARMUP_CAP
     warm = max(c["warmup"], W * c["chunk"]) if live else 0
@@ -17695,9 +17797,21 @@ def _v6_scenarios(plan: V6Plan, ref: V6Plan, bt) -> list[tuple[int | None, int, 
     """``(W, time of plan, time of ref)`` per warm-up need of the robustness rule (PLAN CHOOSER): every cut of
     either plan up to V6_PLAN_WARMUP_CAP, then None (no cut saturates); modeled hundredths of a microsecond."""
     maps = (_v6_cut_map(plan, bt), _v6_cut_map(ref, bt))
-    needs = sorted({cut for m in maps for cuts in m.values() for cut in cuts if 0 < cut <= V6_PLAN_WARMUP_CAP})
+    needs = sorted(
+        {
+            cut
+            for m in maps
+            for cuts in m.values()
+            for cut in cuts
+            if 0 < cut <= V6_PLAN_WARMUP_CAP
+        }
+    )
     return [
-        (W, _v6_scenario_time(plan, bt, maps[0], W), _v6_scenario_time(ref, bt, maps[1], W))
+        (
+            W,
+            _v6_scenario_time(plan, bt, maps[0], W),
+            _v6_scenario_time(ref, bt, maps[1], W),
+        )
         for W in (*needs, None)
     ]
 
@@ -17748,7 +17862,9 @@ def _v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_toke
 def _v6_check_grid(grid: int, sm_count: int) -> None:
     # every CTA of the launch is resident at once (one CTA per SM): the seed-done wait of the split build needs it
     if not 1 <= grid <= sm_count:
-        raise RuntimeError(f"Blackwell prefill plan grid {grid} outside 1..{sm_count} (the SM count)")
+        raise RuntimeError(
+            f"Blackwell prefill plan grid {grid} outside 1..{sm_count} (the SM count)"
+        )
 
 
 def _v6_reference(cu, H, n, sm_count, arch, total):
@@ -17770,7 +17886,9 @@ def prefill_v6_plan_reference(
 ) -> V6Plan:
     """The launch plan of the PLAN CHOOSER computed in Python (uncached): the reference of the native chooser."""
 
-    return _v6_reference(*_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens))[1]
+    return _v6_reference(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )[1]
 
 
 def prefill_v6_plan(
@@ -17787,15 +17905,27 @@ def prefill_v6_plan(
     (the native chooser when it builds, else the Python reference; cached, see NATIVE PLAN CHOOSER)."""
 
     # the key: a tensor's offsets as bytes, a sequence's as a tuple (width 0)
+    data: bytes | tuple[int, ...]
     if isinstance(cu_seqlens, torch.Tensor):
         data, width = _v6_offset_bytes(cu_seqlens)
         if total_tokens is None:
             total_tokens = int.from_bytes(data[-width:], "little", signed=True)
     else:
-        data, width = (cu_seqlens if type(cu_seqlens) is tuple else tuple(cu_seqlens)), 0
+        data, width = (
+            (cu_seqlens if type(cu_seqlens) is tuple else tuple(cu_seqlens)),
+            0,
+        )
         if total_tokens is None:
             total_tokens = data[-1]
-    key = (data, width, int(num_heads), int(num_householder), int(sm_count), arch, int(total_tokens))
+    key = (
+        data,
+        width,
+        int(num_heads),
+        int(num_householder),
+        int(sm_count),
+        arch,
+        int(total_tokens),
+    )
     plan = _V6_PLANS.lookup(key)
     if plan is not None:
         return plan
@@ -17811,12 +17941,18 @@ def prefill_v6_plan(
         cu = tuple(array.array("q" if width == 8 else "i", data))
         plan = _v6_reference(cu, H, n, sm, arch, total)[1]
     else:
-        out = native.v6_launch(data, width, H, n, sm, total, _v6_native_params(arch, H), 1)
+        out = native.v6_launch(
+            data, width, H, n, sm, total, _v6_native_params(arch, H), 1
+        )
         _cand, split, grid, count, _words = _V6_NATIVE_HEADER.unpack_from(out)
         words = array.array("i", out[4 * V6_NATIVE_HEAD :])
         it = iter(words[: 4 * count])
-        rows = tuple(zip(it, it, it, it))
-        offsets = tuple(words[4 * max(count, 1) : 4 * max(count, 1) + grid + 1]) if split else None
+        rows = tuple(zip(it, it, it, it, strict=False))
+        offsets = (
+            tuple(words[4 * max(count, 1) : 4 * max(count, 1) + grid + 1])
+            if split
+            else None
+        )
         plan = V6Plan(rows=rows, split=bool(split), grid=grid, offsets=offsets)
     _V6_PLANS.put(key, plan, max(len(plan.rows), 1))
     return plan
@@ -17833,7 +17969,9 @@ def prefill_v6_plan_choice(
 ) -> str:
     """The name of the candidate :func:`prefill_v6_plan` launches for the batch (computed afresh)."""
 
-    bt = _V6Batch(*_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens))
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
     return _v6_choose(bt).name
 
 
@@ -17849,10 +17987,16 @@ def prefill_v6_plan_candidates(
     """Every applicable candidate name of the batch -> (the distinct candidate of its plan, its modeled time in
     hundredths of a microsecond), every candidate modeled."""
 
-    bt = _V6Batch(*_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens))
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
     cands, alias = _v6_candidates(bt)
     cost = {c.name: c.cost() for c in cands}
-    return {name: (alias[name], cost[alias[name]]) for name in V6_PLAN_CANDIDATES if name in alias}
+    return {
+        name: (alias[name], cost[alias[name]])
+        for name in V6_PLAN_CANDIDATES
+        if name in alias
+    }
 
 
 def prefill_v6_plan_scenarios(
@@ -17869,10 +18013,14 @@ def prefill_v6_plan_scenarios(
     modeled time of the candidate, modeled time of the plan of record)`` per warm-up need ``W`` (None: no cut
     saturates), hundredths of a microsecond."""
 
-    bt = _V6Batch(*_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens))
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
     cands, alias = _v6_candidates(bt)
     if name not in alias:
-        raise ValueError(f"candidate {name!r} does not apply to the batch; it takes {sorted(alias)}")
+        raise ValueError(
+            f"candidate {name!r} does not apply to the batch; it takes {sorted(alias)}"
+        )
     cand = next(c for c in cands if c.name == alias[name])
     ref = next(c for c in cands if c.name == alias["main"])
     return _v6_scenarios(cand.plan(), ref.plan(), bt)
@@ -17891,10 +18039,14 @@ def prefill_v6_candidate_plan(
     """The launch plan of candidate ``name`` (V6_PLAN_CANDIDATES) for the batch; ValueError when it does not apply
     (a block candidate with an empty sequence)."""
 
-    bt = _V6Batch(*_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens))
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
     cands, alias = _v6_candidates(bt)
     if name not in alias:
-        raise ValueError(f"candidate {name!r} does not apply to the batch; it takes {sorted(alias)}")
+        raise ValueError(
+            f"candidate {name!r} does not apply to the batch; it takes {sorted(alias)}"
+        )
     return next(c for c in cands if c.name == alias[name]).plan()
 
 
@@ -17912,7 +18064,9 @@ def prefill_v6_candidate_plan(
 # (least recently used out), the ``prefill_v6_plan`` cache at most V6_PLAN_CACHE_ROWS rows.  ``clear_plan_caches``
 # empties every planner cache (a batch the process has not planned before).
 V6_NATIVE_SOURCE = "cake_gdp_v6_plan.cpp"
-V6_NATIVE_HEAD = 5  # header words of the native result: candidate, split, grid, rows, item words
+V6_NATIVE_HEAD = (
+    5  # header words of the native result: candidate, split, grid, rows, item words
+)
 _V6_NATIVE_HEADER = struct.Struct(f"<{V6_NATIVE_HEAD}i")
 _V6_NATIVE: list = []  # [module or None] once loaded
 
@@ -17923,7 +18077,8 @@ class _V6Cache(collections.OrderedDict):
 
     def __init__(self, budget: int):
         super().__init__()
-        self.budget, self.weights, self.total = budget, {}, 0
+        self.budget, self.total = budget, 0
+        self.weights: dict[object, int] = {}
 
     def lookup(self, key):
         value = self.get(key)
@@ -17935,7 +18090,9 @@ class _V6Cache(collections.OrderedDict):
         self[key] = value
         self.weights[key] = weight
         self.total += weight
-        while len(self) > 1 and (len(self) > V6_PLAN_CACHE_SIZE or self.total > self.budget):
+        while len(self) > 1 and (
+            len(self) > V6_PLAN_CACHE_SIZE or self.total > self.budget
+        ):
             old, _value = self.popitem(last=False)
             self.total -= self.weights.pop(old)
 
@@ -18065,7 +18222,9 @@ def _v6_launch_builds(arch: str, state_dtype: str, pool: bool):
     for split, shift in ((True, 0), (False, 2)):
         if split in builds:
             build = MODULES[builds[split]]["build"]
-            flags |= (int(bool(build.get("csr"))) | 2 * int(bool(build.get("plan_guard")))) << shift
+            flags |= (
+                int(bool(build.get("csr"))) | 2 * int(bool(build.get("plan_guard")))
+            ) << shift
     return builds, flags
 
 
@@ -18083,16 +18242,27 @@ def _v6_words(flags: int, plan: V6Plan, cu: Sequence[int]) -> list[int]:
 
 
 def v6_launch_of_plan(
-    arch: str, plan: V6Plan, cu_seqlens: Sequence[int], *, state_dtype: str = "f32", pool: bool = False
+    arch: str,
+    plan: V6Plan,
+    cu_seqlens: Sequence[int],
+    *,
+    state_dtype: str = "f32",
+    pool: bool = False,
 ) -> V6Launch:
     """The launch of a given ``plan`` (a candidate's, the plan of record) for the host offsets ``cu_seqlens``, on the
     program of a state form: what ``prefill_v6_launch`` returns for the chooser's plan."""
 
     builds, flags = _v6_launch_builds(arch, state_dtype, bool(pool))
     if plan.split not in builds:
-        raise ValueError(f"no Blackwell prefill program on {arch} with split_items={plan.split} for that form")
-    words = array.array("i", _v6_words(flags, plan, [int(c) for c in cu_seqlens])).tobytes()
-    return V6Launch(builds[plan.split], "given", plan.split, plan.grid, len(plan.rows), words)
+        raise ValueError(
+            f"no Blackwell prefill program on {arch} with split_items={plan.split} for that form"
+        )
+    words = array.array(
+        "i", _v6_words(flags, plan, [int(c) for c in cu_seqlens])
+    ).tobytes()
+    return V6Launch(
+        builds[plan.split], "given", plan.split, plan.grid, len(plan.rows), words
+    )
 
 
 def _v6_offset_bytes(cu_seqlens) -> tuple[bytes, int]:
@@ -18100,7 +18270,9 @@ def _v6_offset_bytes(cu_seqlens) -> tuple[bytes, int]:
     if isinstance(cu_seqlens, torch.Tensor):
         width = cu_seqlens.element_size()
         if cu_seqlens.is_cpu and cu_seqlens.is_contiguous():
-            return ctypes.string_at(cu_seqlens.data_ptr(), cu_seqlens.numel() * width), width
+            return ctypes.string_at(
+                cu_seqlens.data_ptr(), cu_seqlens.numel() * width
+            ), width
         return cu_seqlens.numpy().tobytes(), width
     return array.array("q", cu_seqlens).tobytes(), 8
 
@@ -18122,7 +18294,12 @@ def prefill_v6_launch(
     data, width = _v6_offset_bytes(cu_seqlens)
     if total_tokens is None:
         total_tokens = int.from_bytes(data[-width:], "little", signed=True)
-    H, n, sm, total = int(num_heads), int(num_householder), int(sm_count), int(total_tokens)
+    H, n, sm, total = (
+        int(num_heads),
+        int(num_householder),
+        int(sm_count),
+        int(total_tokens),
+    )
     key = (data, width, H, n, sm, arch, total, state_dtype, bool(pool))
     launch = _V6_LAUNCHES.lookup(key)
     if launch is not None:
@@ -18134,9 +18311,15 @@ def prefill_v6_launch(
     builds, flags = _v6_launch_builds(arch, state_dtype, bool(pool))
     native = _v6_native_module()
     if native is not None:
-        out = native.v6_launch(data, width, H, n, sm, total, _v6_native_params(arch, H), flags)
+        out = native.v6_launch(
+            data, width, H, n, sm, total, _v6_native_params(arch, H), flags
+        )
         cand, split, grid, count, _words = _V6_NATIVE_HEADER.unpack_from(out)
-        candidate, split, words = V6_PLAN_CANDIDATES[cand], bool(split), out[4 * V6_NATIVE_HEAD :]
+        candidate, split, words = (
+            V6_PLAN_CANDIDATES[cand],
+            bool(split),
+            out[4 * V6_NATIVE_HEAD :],
+        )
     else:
         cu = array.array("q" if width == 8 else "i", data).tolist()
         candidate, plan = _v6_reference(tuple(cu), H, n, sm, arch, total)

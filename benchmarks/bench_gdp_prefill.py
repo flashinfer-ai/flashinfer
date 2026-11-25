@@ -156,9 +156,7 @@ def set_cells(spec):
     """The cells of ``--set``: ``union`` (147), ``extras`` (40) or ``union+extras`` (187), in group order."""
     cells, seen = [], set()
     for H in (10, 20, 40, 80):
-        cells += workloads(
-            "ABC", [H], [8192, 16384, 32768, 65536], [0, 1, 4, 8, 15]
-        )
+        cells += workloads("ABC", [H], [8192, 16384, 32768, 65536], [0, 1, 4, 8, 15])
     cells += (workload("A", 24, L) for L in (8192, 16384, 32768))
     for H in (80, 40, 24, 20):
         for L in (1024, 2048, 4096):

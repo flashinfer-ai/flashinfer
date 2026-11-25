@@ -2166,7 +2166,10 @@ def _item_table_and_zeros(key: bytes, device: torch.device, zero_bytes: int):
 
 
 def _item_table(
-    words: Optional[tuple[int, ...]], device: torch.device, *, key: Optional[bytes] = None
+    words: Optional[tuple[int, ...]],
+    device: torch.device,
+    *,
+    key: Optional[bytes] = None,
 ) -> torch.Tensor:
     """The int32 ``items`` buffer ``words`` (the flat split items on SM90) on ``device`` (read only): a cached
     complete buffer, else an upload from pinned host memory (a pageable copy would synchronize the compute stream,
@@ -2314,7 +2317,9 @@ def _run_blackwell_v6(
         "initial_state": initial_in if initial_in is not None else placeholder,
         "output_state": output_in if output_in is not None else placeholder,
         "tensormap_workspace": torch.empty(
-            (launch.grid * _loader.V6_TENSORMAP_BYTES,), dtype=torch.uint8, device=device
+            (launch.grid * _loader.V6_TENSORMAP_BYTES,),
+            dtype=torch.uint8,
+            device=device,
         ),
         "split_workspace": split_ws,
         "state_stride_slot": H * _STATE_ELEMENTS,

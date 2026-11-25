@@ -309,9 +309,7 @@ def test_every_cta_runs_its_seed_rows_first(arch):
                 per[(seq, head)] = per.get((seq, head), 0) + 1
             for cta in _cta_lists(plan):
                 kinds = [
-                    0 if row[2] == 0 else 1
-                    for row in cta
-                    if per[(row[0], row[1])] > 1
+                    0 if row[2] == 0 else 1 for row in cta if per[(row[0], row[1])] > 1
                 ]
                 assert kinds == sorted(kinds), (H, lengths, name, cta)
 
@@ -518,7 +516,9 @@ def test_the_bulk_placement_is_the_one_row_at_a_time_rule():
         lists = [[("x", b)] for b in range(G)]
         placed = list(loads)
         loader.lpt_place(placed, cost, list(range(k)), lists)
-        assert placed == [load + x * cost for load, x in zip(loads, counts)], case
+        assert placed == [
+            load + x * cost for load, x in zip(loads, counts, strict=False)
+        ], case
         for b in range(G):
             assert lists[b] == [("x", b), *(i for i in range(k) if want[i] == b)], case
 
@@ -534,9 +534,9 @@ def test_inference_csr_is_the_one_row_at_a_time_rule(arch):
         if not table:
             continue
         grid = max(1, min(sm, len(table)))
-        assert loader.inference_csr(table, _cu(lengths), N_HH, grid) == _old_inference_csr(
+        assert loader.inference_csr(
             table, _cu(lengths), N_HH, grid
-        ), (H, lengths, sm)
+        ) == _old_inference_csr(table, _cu(lengths), N_HH, grid), (H, lengths, sm)
 
 
 @pytest.mark.cpu_only
@@ -642,7 +642,11 @@ def test_the_modeled_time_is_the_most_loaded_cta_of_the_plan(arch):
                     loads.append(
                         sum(
                             loader._v6_split_row_cost(
-                                row, batch.chunks[row[0]], batch.lens[row[0]], N_HH, costs
+                                row,
+                                batch.chunks[row[0]],
+                                batch.lens[row[0]],
+                                N_HH,
+                                costs,
                             )
                             for row in cta
                         )
@@ -663,7 +667,9 @@ def _robust(name, cu, H, arch):
     tol = loader.V6_PLAN_ROBUST_PERCENT
     return all(
         100 * mine <= (100 + tol) * theirs
-        for _W, mine, theirs in loader.prefill_v6_plan_scenarios(name, cu, **_kw(H, arch))
+        for _W, mine, theirs in loader.prefill_v6_plan_scenarios(
+            name, cu, **_kw(H, arch)
+        )
     )
 
 
@@ -711,7 +717,9 @@ def test_the_robustness_scenarios(arch):
         scenarios = loader.prefill_v6_plan_scenarios("main", cu, **_kw(H, arch))
         assert scenarios[-1][0] is None
         needs = [W for W, _mine, _theirs in scenarios[:-1]]
-        assert needs == sorted(set(needs)) and all(0 < W <= loader.V6_PLAN_WARMUP_CAP for W in needs)
+        assert needs == sorted(set(needs)) and all(
+            0 < W <= loader.V6_PLAN_WARMUP_CAP for W in needs
+        )
         assert all(mine == theirs for _W, mine, theirs in scenarios)
         if "block" in loader.prefill_v6_plan_candidates(cu, **_kw(H, arch)):
             block = loader.prefill_v6_plan_scenarios("block", cu, **_kw(H, arch))
@@ -766,9 +774,9 @@ def test_the_plan_is_a_pure_function_of_the_batch(arch):
         assert again[i] == first[i]
         cu = _cu(lengths)
         assert loader.prefill_v6_plan(tuple(cu), **_kw(H, arch)) == first[i]
-        assert loader.prefill_v6_plan(
-            cu, total_tokens=cu[-1], **_kw(H, arch)
-        ) == first[i]
+        assert (
+            loader.prefill_v6_plan(cu, total_tokens=cu[-1], **_kw(H, arch)) == first[i]
+        )
         assert loader.prefill_v6_plan(torch.tensor(cu), **_kw(H, arch)) == first[i]
         assert loader.prefill_v6_plan_reference(cu, **_kw(H, arch)) == first[i]
         name = loader.prefill_v6_plan_choice(cu, **_kw(H, arch))
@@ -860,11 +868,19 @@ def test_the_native_chooser_is_the_python_chooser(arch):
     """The native chooser launches the Python chooser's pick, plan and item words bit for bit: on the union set, the
     request's and the mixed batches, and 1500 random batches of any H and SM count."""
     _native()
-    batches = [(_cu(lengths), _cu(lengths)[-1], H, SMS[arch]) for H, lengths in _all_batches()]
+    batches = [
+        (_cu(lengths), _cu(lengths)[-1], H, SMS[arch]) for H, lengths in _all_batches()
+    ]
     batches += list(_stress_batches(11 + len(arch), 1500))
     for cu, total, H, sm in batches:
         loader.clear_plan_caches()
-        kw = dict(num_heads=H, num_householder=N_HH, sm_count=sm, arch=arch, total_tokens=total)
+        kw = dict(
+            num_heads=H,
+            num_householder=N_HH,
+            sm_count=sm,
+            arch=arch,
+            total_tokens=total,
+        )
         ref = loader.prefill_v6_plan_reference(cu, **kw)
         pick = loader.prefill_v6_plan_choice(cu, **kw)
         assert loader.prefill_v6_plan(cu, **kw) == ref, (cu, total, H, sm)
@@ -914,7 +930,11 @@ def test_the_launch_cache_is_bounded(arch):
         other = _cu([1] * (extra % 5) + [500 + extra])
         _native_launch(other, 40, arch, SMS[arch], other[-1])
     assert len(cache) == loader.V6_PLAN_CACHE_SIZE
-    assert cache.total == sum(len(x.words) for x in cache.values()) <= loader.V6_LAUNCH_CACHE_BYTES
+    assert (
+        cache.total
+        == sum(len(x.words) for x in cache.values())
+        <= loader.V6_LAUNCH_CACHE_BYTES
+    )
     loader.clear_plan_caches()
     assert len(cache) == 0 and cache.total == 0
     memo = [
