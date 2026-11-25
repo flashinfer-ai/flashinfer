@@ -3,13 +3,42 @@
 """The delegate behind ``batch_invariant=True`` on ``BatchDecodeWithPagedKVCacheWrapper``, ``BatchPrefillWithPagedKVCacheWrapper`` and
 ``BatchPrefillWithRaggedKVCacheWrapper``: the wrappers' ``plan`` / ``run`` hand their arguments here, the class's typed checks raise
 :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for everything the class does not cover (nothing falls back), and the
-engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim and mask mode: under the causal
-class a token's output bits depend on its KV position, its head and the window alone; under the non-causal class (``causal=False`` on
-the prefill wrappers, ``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) on its request's key count and its head
-alone. The three wrappers compute the same bits for the same token of the same class.
+engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim, mask mode and KV cache format:
+under the causal class a token's output bits depend on its KV position, its head and the window alone; under the non-causal class
+(``causal=False`` on the prefill wrappers, ``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) on its request's key
+count and its head alone; for the low-bit KV classes also on their scales (below). The three wrappers compute the same bits for the
+same token of the same class.
 Chunked prefill: under the causal class a request cut into chunks (each later chunk over the keys cached so far) reproduces the
 one-shot bits; under the non-causal class only query chunks planned over the request's full key set do -- a chunk run while the
 KV is still growing is that chunk's view of the keys present at the time, and a different ``kv_len`` is a different term.
+
+The fp8-KV classes take ``plan(kv_data_type=torch.float8_e4m3fn | torch.float8_e5m2)`` with bf16 queries and output, and at
+``run()`` the caches of that dtype with FlashInfer's ``k_scale`` / ``v_scale`` (Python numbers, or 1-element tensors: a device
+tensor is read back once per tensor version, ``neutral.resolve_scale``) in the chain the specification states (``spec.py``): ``c = fp32(sm_scale * k_scale * log2 e)`` and one
+``mul.rn`` by ``v_scale`` before the output rounding. The NVFP4-KV class ``attention.nvfp4kv`` takes ``plan(kv_data_type=torch.uint8)``
+(FlashInfer's packed NVFP4 cache, ``head_dim // 2`` bytes per row) and at ``run()`` the ``kv_cache_sf`` block scales in the wrappers'
+forms (a ``(k_sf, v_sf)`` tuple, or the single 5-D tensor of the paged wrappers; e4m3 bytes, ``head_dim // 16`` per row) with the
+same two per-tensor scales. The K block scales are linear; the V block scales are in the layout ``plan(v_sf_swizzled=)``
+states -- ``False`` (the default): linear, what ``nvfp4_quantize_append_paged_kv_cache`` writes; ``True``: the 4-token swizzle
+trtllm-gen reads, which serving engines write for it. The layout cannot be detected from the tensors: a cache read in the
+other layout gives wrong values with no error, so the caller must state it.
+
+The token-head-scale classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th`` take ``plan(kv_data_type=<fp8>,
+use_token_head_sf=True)`` and at ``run()`` ``kv_cache_sf=(k_sf, v_sf)``: float32 tensors of the cache's shape minus the head dim,
+one scale per (token, KV head), with any strides (e.g. views into an inline slot tensor). K and V stay the exactly widened fp8
+values and each scale enters once per key (``spec.py``): the score of key ``j`` is ``mul.rn(S_j, k_sf_j)`` before the softmax
+step, and the PV operand of key ``j`` is ``cvt.rn.bf16(mul.rn(p_j, v_sf_j))`` while the normaliser adds the unscaled ``p_j``; no
+scale enters ``c`` or the epilogue. The scale values are inputs and are not inspected: zero, negative, tiny and huge scales
+follow the two multiplies; the classes are stated for finite scales on visible keys (a non-finite one gives what the
+arithmetic gives, as a non-finite K / V does), and the scales of masked keys -- past a request's length, outside the window,
+junk pages -- reach no output.
+
+Unit scales (``neutral.py``): the query and the output are unscaled bf16 in every class, so ``q_scale`` / ``o_scale`` are accepted
+at ``None`` or exactly ``1.0`` (what a serving engine passes on every call) and refused at any other value; ``k_scale`` /
+``v_scale`` follow the same rule for a bf16 KV cache and for the token-head-scale classes (whose scales are the per-key
+tensors: a unit per-tensor scale multiplies nothing), and are operands of the per-tensor low-bit KV classes. Every scale is
+a Python number or a one-element floating-point tensor; a device tensor is read back once per tensor version, not per
+``run()``, and a ``run()`` captured into a CUDA graph must have seen it before the capture (``neutral.resolve_scale``).
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -28,19 +57,46 @@ from typing import Optional, Tuple
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
-from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from . import engine, neutral
+from .spec import HEAD_DIMS, TH_KV_FMTS, scale_log2
+from .spec import class_name as _class_name
 
 CLASS = "attention.bf16"
+#: The KV cache dtypes of the attention classes: bf16 (the bf16 class), the two fp8 formats (the fp8-KV classes).
+KV_DTYPES = {
+    torch.bfloat16: "bf16",
+    torch.float8_e4m3fn: "e4m3",
+    torch.float8_e5m2: "e5m2",
+    torch.uint8: "nvfp4",  # FlashInfer's packed NVFP4 KV cache (block scales in kv_cache_sf)
+}
+if hasattr(torch, "float4_e2m1fn_x2"):
+    KV_DTYPES[torch.float4_e2m1fn_x2] = "nvfp4"
+_SF_BLOCK = 16
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 ATTENTION_ARCHS = ((10, 0), (10, 3), (10, 7))
 _MAX_PAGE = 128
 
 
-def _dtype(x) -> torch.dtype:
+#: The name of the family in a typed error raised before the KV cache format (hence the class) of a plan is known.
+FAMILY = "attention"
+
+
+def _dtype(x, name: str, cls: str) -> torch.dtype:
+    """A ``plan()`` dtype argument (a ``torch.dtype``, a torch dtype name, or None for bf16); anything that does not name a torch
+    dtype raises the typed error of ``cls``."""
     from ...utils import canonicalize_torch_dtype
 
-    return canonicalize_torch_dtype(x) if x is not None else torch.bfloat16
+    if x is None:
+        return torch.bfloat16
+    try:
+        dt = canonicalize_torch_dtype(x)
+    except (AttributeError, TypeError):
+        dt = None
+    if not isinstance(dt, torch.dtype):
+        raise unsupported(
+            cls, f"{name} {x!r}", "a torch.dtype or the name of one (e.g. torch.uint8)"
+        )
+    return dt
 
 
 class BatchInvariantAttention:
@@ -98,6 +154,9 @@ class BatchInvariantAttention:
         self._page = 1
         self._max_page = -1  # the largest page index the plan references (paged kinds)
         self._total_kv = 0  # the planned packed token count (ragged)
+        self._kv_fmt = "bf16"  # the planned KV cache format (spec.KV_FMTS): the class the plan belongs to
+        self._kv_dtype = torch.bfloat16
+        self._v_sf_swizzled = False  # the planned layout of an NVFP4 cache's V block scales (engine.check_v_sf_layout)
 
     def reset_workspace(self, float_workspace_buffer: torch.Tensor) -> None:
         """The wrappers' ``reset_workspace_buffer``: the next ``plan()`` sizes its split-KV partials in this buffer (the current plan
@@ -144,6 +203,12 @@ class BatchInvariantAttention:
                 name if isinstance(value, torch.Tensor) else f"{name}={value}",
                 self._PLAN_ARGS_OUTSIDE_THE_CLASS.get(name, "the class's own inputs"),
             )
+
+    def check_dtype_args(self, **dtypes) -> None:
+        """The wrappers call this with their ``plan()`` dtype arguments (``name=value``) before they canonicalize them: a value that
+        names no torch dtype (a string such as ``"nvfp4"``) raises the typed error instead of the lookup's ``AttributeError``."""
+        for name, value in dtypes.items():
+            _dtype(value, name, FAMILY)
 
     def workspace_bytes(
         self,
@@ -393,8 +458,14 @@ class BatchInvariantAttention:
         use_token_head_sf: bool = False,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        v_sf_swizzled: bool = False,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work.
+
+        ``v_sf_swizzled`` (the NVFP4-KV class on the paged wrappers) states the layout of the V block scales ``run()`` will be
+        given, which the bytes cannot tell: ``False`` is the linear layout ``nvfp4_quantize_append_paged_kv_cache`` writes,
+        ``True`` the 4-token swizzle trtllm-gen reads (``engine.check_v_sf_layout``). The K block scales are linear either way.
+        The layout is an address of the same scale bytes: the class, its terms and its fingerprint do not depend on it."""
         D = self._check_head_dim(head_dim_qk)
         if head_dim_vo is not None and int(head_dim_vo) != D:
             raise unsupported(
@@ -404,18 +475,41 @@ class BatchInvariantAttention:
             )
         self._check_heads(num_qo_heads, num_kv_heads)
         g = num_qo_heads // num_kv_heads
+        # the KV cache format selects the class; until it is known the typed errors name the family
+        kv_dtype = _dtype(kv_data_type, "kv_data_type", FAMILY)
+        if kv_dtype not in KV_DTYPES:
+            raise unsupported(
+                FAMILY,
+                f"kv_data_type {kv_dtype}",
+                "a bf16, float8_e4m3fn, float8_e5m2 or uint8 (packed NVFP4) KV cache",
+            )
+        kv_fmt = KV_DTYPES[kv_dtype]
+        if kv_fmt == "nvfp4":
+            kv_dtype = torch.uint8  # the packed cache's storage dtype (a float4_e2m1fn_x2 cache is viewed as its bytes)
+        cls = _class_name(kv_fmt)
         for name, dt in (
             ("q_data_type", q_data_type),
-            ("kv_data_type", kv_data_type),
             ("o_data_type", o_data_type),
         ):
-            if _dtype(dt) != torch.bfloat16:
+            if _dtype(dt, name, cls) != torch.bfloat16:
                 raise unsupported(
-                    CLASS,
-                    f"{name} {_dtype(dt)}",
-                    "bf16 queries, keys, values and output",
+                    cls,
+                    f"{name} {_dtype(dt, name, cls)}",
+                    "bf16 queries and output (the KV cache may be bf16, float8_e4m3fn, float8_e5m2 or packed NVFP4)",
                 )
         page_size = self._check_page_size(page_size)
+        try:
+            engine.check_v_sf_layout(
+                v_sf_swizzled, kv_fmt, self.kind == "ragged", page_size
+            )
+        except ValueError as e:
+            raise unsupported(
+                cls,
+                f"v_sf_swizzled={v_sf_swizzled!r}",
+                "False (linear V block scales, the layout nvfp4_quantize_append_paged_kv_cache writes) for every class, or "
+                "True (the 4-token swizzle of trtllm-gen) for a packed NVFP4 cache on the paged wrappers with a page size "
+                f"that is a multiple of {engine.V_SF_SWIZZLE_TOKENS} ({e})",
+            ) from None
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
                 CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
@@ -447,21 +541,24 @@ class BatchInvariantAttention:
                 "the class's own split rule (a function of the SM count only)",
             )
         if use_token_head_sf:
-            raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
+            if kv_fmt + "th" not in TH_KV_FMTS:
+                raise unsupported(
+                    cls,
+                    f"use_token_head_sf with kv_data_type {kv_dtype}",
+                    "per-(token, head) scales over a float8_e4m3fn or float8_e5m2 KV cache",
+                )
+            kv_fmt += "th"
+            cls = _class_name(kv_fmt)
         causal, window_left = self._check_mask_mode(causal, window_left)
         if sm_scale is not None:
-            ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
-            if ok:
-                try:
-                    ok = scale_log2(float(sm_scale)) != 0.0
-                except OverflowError:
-                    ok = False
-            if not ok:
+            try:
+                engine.check_sm_scale(sm_scale)
+            except (ValueError, TypeError):
                 raise unsupported(
                     CLASS,
                     f"sm_scale {sm_scale}",
-                    "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
-                )
+                    "a positive finite sm_scale whose log2 scale is a normal binary32 number",
+                ) from None
         qo_host, kv_indptr_host = self._host_offsets(
             qo_indptr, kv_indptr, q_len_per_req
         )
@@ -498,11 +595,12 @@ class BatchInvariantAttention:
                     )
                 max_page = hi  # checked against the cache at run()
         self._check_requests(qo_host, kv_indptr_host, last_host, page_size, causal)
-        config = engine.default_config(D=D)
+        config = engine.default_config(D=D, kv_fmt=kv_fmt)
         if (
             D in engine.Q2_DEFAULT_DIMS
             and self.kind != "decode"
             and g >= engine.Q2_DEFAULT_MIN_GROUP[D]
+            and kv_fmt == "bf16"
         ):
             from dataclasses import replace
 
@@ -529,6 +627,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                kv_fmt=kv_fmt,
                 causal=causal,
             )
         except engine.WorkspaceTooSmall:
@@ -551,6 +650,7 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    kv_fmt=kv_fmt,
                     causal=causal,
                 )
             except engine.WorkspaceTooSmall as e:
@@ -586,6 +686,10 @@ class BatchInvariantAttention:
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
+        self._kv_fmt = kv_fmt
+        self._kv_dtype = kv_dtype
+        self._v_sf_swizzled = v_sf_swizzled
+        self.CLASS = cls  # the planned class names the typed errors from here on
 
     def validate_forward_options(
         self,
@@ -611,7 +715,7 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS,
                 f"sm_scale {sm_scale}",
-                "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
+                "a positive finite sm_scale whose log2 scale is a normal binary32 number",
             ) from None
         # The kernel consumes a binary32 log2 scale, not the caller's Python float.
         if c != self._scale_log2:
@@ -684,14 +788,40 @@ class BatchInvariantAttention:
                 "return_lse",
                 "the attention output alone (the class has no LSE member yet)",
             )
-        if any(s is not None for s in scales):
-            raise unsupported(
-                CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
-            )
+        cls = self.CLASS
+        lowbit = self._kv_fmt != "bf16"
+        th = self._kv_fmt in TH_KV_FMTS
+        # the query and the output are unscaled bf16 for every class, K / V for a bf16 cache: a scale of None or exactly 1.0 is
+        # that operand (serving engines pass 1.0 on every call), any other value is refused; the per-tensor low-bit KV classes
+        # take the K / V scales as operands; the token-head-scale classes have their scales per key, so a per-tensor K / V
+        # scale is unit-only there too
+        neutral.check_unit_scales(
+            cls, scales, free=("k_scale", "v_scale") if lowbit and not th else ()
+        )
+        k_scale = self._scalar(scales[1] if len(scales) > 1 else None, "k_scale", cls)
+        v_scale = self._scalar(scales[2] if len(scales) > 2 else None, "v_scale", cls)
         if sinks is not None:
-            raise unsupported(CLASS, "attention sinks", "plain softmax")
-        if kv_cache_sf is not None:
-            raise unsupported(CLASS, "a scaled (fp8 / fp4) KV cache", "a bf16 KV cache")
+            raise unsupported(cls, "attention sinks", "plain softmax")
+        fp4 = self._kv_fmt == "nvfp4"
+        if kv_cache_sf is not None and not (fp4 or th):
+            raise unsupported(
+                cls,
+                "kv_cache_sf on a plan without scale tensors",
+                "a bf16 KV cache, an fp8 KV cache with the per-tensor k_scale / v_scale, an fp8 KV cache planned with "
+                "use_token_head_sf=True, or an NVFP4 cache (kv_data_type uint8)",
+            )
+        if th and (not isinstance(kv_cache_sf, (tuple, list)) or len(kv_cache_sf) != 2):
+            raise unsupported(
+                cls,
+                "a use_token_head_sf plan without kv_cache_sf=(k_sf, v_sf)",
+                "the (k_sf, v_sf) tuple of float32 per-(token, head) scales with the cache",
+            )
+        if fp4 and kv_cache_sf is None:
+            raise unsupported(
+                cls,
+                "an NVFP4 KV cache without kv_cache_sf",
+                "the (k_sf, v_sf) e4m3 block scales (one per 16 elements of the head dim) with the cache",
+            )
         if skip_softmax_threshold_scale_factor is not None:
             raise unsupported(
                 CLASS, "skip_softmax_threshold_scale_factor", "the full softmax"
@@ -713,14 +843,22 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"{q.shape[0]} query rows", f"the planned {self._total_q}"
             )
+        if fp4:  # a float4_e2m1fn_x2 cache is the same bytes
+            k, v = (
+                t.view(torch.uint8) if KV_DTYPES.get(t.dtype) == "nvfp4" else t
+                for t in (k, v)
+            )
         if (
             q.dtype != torch.bfloat16
-            or k.dtype != torch.bfloat16
-            or v.dtype != torch.bfloat16
+            or k.dtype != self._kv_dtype
+            or v.dtype != self._kv_dtype
         ):
             raise unsupported(
-                CLASS, f"dtypes ({q.dtype}, {k.dtype}, {v.dtype})", "bf16 q, k and v"
+                cls,
+                f"dtypes ({q.dtype}, {k.dtype}, {v.dtype})",
+                f"bf16 q and the planned {self._kv_dtype} k and v",
             )
+        W = D // 2 if fp4 else D  # the cache row: D elements, or D / 2 packed bytes
         if (
             q.device != self.device
             or k.device != self.device
@@ -737,16 +875,16 @@ class BatchInvariantAttention:
         for name, t in (("k", k), ("v", v)):
             if self.kind == "ragged":
                 ok = t.dim() == 3 and (
-                    tuple(t.shape[1:]) == (Hkv, D)
+                    tuple(t.shape[1:]) == (Hkv, W)
                     if nhd
-                    else (t.shape[0] == Hkv and t.shape[2] == D)
+                    else (t.shape[0] == Hkv and t.shape[2] == W)
                 )
-                want = f"(total_kv, {Hkv}, {D})" if nhd else f"({Hkv}, total_kv, {D})"
+                want = f"(total_kv, {Hkv}, {W})" if nhd else f"({Hkv}, total_kv, {W})"
                 if ok and (t.shape[0] if nhd else t.shape[1]) < self._total_kv:
                     ok = False
                     want += f" with at least the planned {self._total_kv} tokens"
             else:
-                inner = (self._page, Hkv, D) if nhd else (Hkv, self._page, D)
+                inner = (self._page, Hkv, W) if nhd else (Hkv, self._page, W)
                 ok = t.dim() == 4 and tuple(t.shape[1:]) == inner
                 want = f"(num_pages, {', '.join(map(str, inner))})"
                 if ok and t.shape[0] <= self._max_page:
@@ -755,9 +893,12 @@ class BatchInvariantAttention:
             if ok and t.stride(-1) != 1:
                 ok = False
                 want += " with a unit stride along the head dim (the kernels are compiled for it)"
-            if ok and (t.data_ptr() % 16 or any(s % 8 for s in t.stride()[:-1])):
+            if ok and (
+                t.data_ptr() % 16
+                or any(s % (16 // t.element_size()) for s in t.stride()[:-1])
+            ):
                 ok = False
-                want += " 16-byte aligned (base address and outer strides: the TMA descriptors)"
+                want += " 16-byte aligned (base address and outer strides: the TMA descriptors and the 16-byte loads)"
             if not ok:
                 raise unsupported(
                     CLASS,
@@ -788,10 +929,38 @@ class BatchInvariantAttention:
             )
         elif engine._output_overlaps_kv(out, k, v):
             raise unsupported(
-                CLASS,
+                cls,
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
+        k_sf = v_sf = None
+        if fp4:
+            k_sf, v_sf = self._block_scales(kv_cache_sf, k, v, D, cls)
+        if th:
+            k_sf, v_sf = kv_cache_sf
+            try:
+                engine.check_token_head_scales(k_sf, v_sf, k, v, out)
+            except ValueError as e:
+                raise unsupported(
+                    cls,
+                    f"kv_cache_sf of this form ({e})",
+                    "float32 (k_sf, v_sf) on the wrapper's device, each of its cache's shape minus the head dim, disjoint "
+                    "from out",
+                ) from None
+        c, vs = self._scale_log2, 1.0
+        if lowbit and not th:
+            # the fp8-KV chain: the key scale inside the one log2 constant (formed in double, rounded once), the value scale as the
+            # epilogue's binary32 multiplier
+            try:
+                c = engine.check_sm_scale(self._sm_scale, k_scale)
+                vs = engine.check_v_scale(v_scale)
+            except ValueError as e:
+                raise unsupported(
+                    cls,
+                    f"k_scale {k_scale} / v_scale {v_scale}",
+                    "a positive k_scale within the binary32 range whose log2 scale with sm_scale is a normal binary32 number, "
+                    f"and a finite v_scale that is nonzero in binary32 ({e})",
+                ) from None
         engine._run_attention_validated(
             self._planned,
             q,
@@ -799,12 +968,77 @@ class BatchInvariantAttention:
             v,
             self._kv_indptr,
             self._kv_indices,
-            self._scale_log2,
+            c,
             self._window_left,
             self.kv_layout,
             out,
             self._config,
             ragged=self.kind == "ragged",
+            kv_fmt=self._kv_fmt,
+            vs=vs,
+            k_sf=k_sf,
+            v_sf=v_sf,
             enable_pdl=enable_pdl,
+            v_sf_swizzled=self._v_sf_swizzled,
         )
         return out
+
+    def _block_scales(self, kv_cache_sf, k, v, D: int, cls: str):
+        """The NVFP4-KV class's ``kv_cache_sf`` in the wrappers' forms -- a ``(k_sf, v_sf)`` tuple of tensors of the cache's
+        leading dimensions with ``D / 16`` scales per row, or (paged kinds) one 5-D tensor with K and V scales on dim 1 -- as two
+        byte tensors (e4m3 or uint8 storage); anything else raises."""
+        from ...utils import _unpack_paged_kv_cache
+
+        try:
+            if isinstance(kv_cache_sf, torch.Tensor) and self.kind == "ragged":
+                raise ValueError("the ragged wrapper takes a (k_sf, v_sf) tuple")
+            if isinstance(kv_cache_sf, (tuple, list)) and len(kv_cache_sf) != 2:
+                raise ValueError("two scale tensors")
+            if self.kind == "ragged":
+                k_sf, v_sf = kv_cache_sf
+            else:
+                k_sf, v_sf = _unpack_paged_kv_cache(
+                    tuple(kv_cache_sf)
+                    if isinstance(kv_cache_sf, list)
+                    else kv_cache_sf,
+                    self.kv_layout,
+                )
+        except (ValueError, KeyError, TypeError) as e:
+            raise unsupported(
+                cls,
+                f"kv_cache_sf of this form ({e})",
+                "a (k_sf, v_sf) tuple of block-scale tensors (or the paged wrappers' single 5-D tensor)",
+            ) from None
+        out = []
+        for name, sf, cache in (("k_sf", k_sf, k), ("v_sf", v_sf, v)):
+            if not isinstance(sf, torch.Tensor) or sf.dtype not in (
+                torch.float8_e4m3fn,
+                torch.uint8,
+            ):
+                raise unsupported(
+                    cls,
+                    f"{name} of dtype {getattr(sf, 'dtype', type(sf).__name__)}",
+                    "e4m3 (float8_e4m3fn or uint8 bytes) block scales",
+                )
+            if (
+                sf.device != self.device
+                or sf.dim() != cache.dim()
+                or tuple(sf.shape[:-1]) != tuple(cache.shape[:-1])
+                or sf.shape[-1] != D // _SF_BLOCK
+                or sf.stride(-1) != 1
+            ):
+                raise unsupported(
+                    cls,
+                    f"{name} of shape {tuple(sf.shape)} (strides {tuple(sf.stride())}) on {sf.device} for a cache of shape "
+                    f"{tuple(cache.shape)}",
+                    f"the cache's leading dimensions with {D // _SF_BLOCK} unit-stride block scales per row, on the wrapper's device",
+                )
+            out.append(sf.view(torch.uint8))
+        return out[0], out[1]
+
+    @staticmethod
+    def _scalar(x, name: str, cls: str) -> float:
+        """A per-tensor scale as FlashInfer's wrappers take it: None (1.0), a Python number, or a 1-element floating-point tensor
+        (a device tensor is read back once per tensor version and must be known before a CUDA-graph capture:
+        ``neutral.resolve_scale``)."""
+        return neutral.scale_value(x, name, cls)

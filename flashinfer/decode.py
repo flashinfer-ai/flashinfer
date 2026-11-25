@@ -1517,10 +1517,27 @@ class BatchDecodeWithPagedKVCacheWrapper:
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. The mask mode is a class dimension: multi-token decode (``q_len_per_req > 1``) runs the
             causal class (bottom-right aligned, optional ``window_left``) or, with ``is_causal=False``, the non-causal class (every
-            token sees its request's whole key range; no window); a single token per request is the causal class either way.
-            Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window with
-            ``is_causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            token sees its request's whole key range; no window); a single token per request is the causal class either way. Both
+            mask modes are available for every KV cache format below (the non-causal class of a format has its own fingerprint). The
+            KV cache is bf16 (the class ``attention.bf16``), fp8 (``kv_data_type`` ``torch.float8_e4m3fn`` / ``torch.float8_e5m2``
+            at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``, with the per-tensor ``k_scale`` / ``v_scale`` of
+            ``run()`` as the only scales; the fp8 values are widened exactly, the key scale enters the softmax constant and the
+            value scale multiplies once before the output rounding) or packed NVFP4 (``kv_data_type=torch.uint8``: the class
+            ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` plus the same per-tensor scales; each value
+            times its block scale is an exact bf16 leaf; the K block scales are linear and the V block scales are linear unless
+            ``plan(v_sf_swizzled=True)`` states TRT-LLM's 4-token interleaved layout -- the layout is not detectable, so a cache
+            written for ``trtllm-gen`` must be planned with it). An fp8 cache planned with ``use_token_head_sf=True`` runs the
+            classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32``
+            scale per (token, KV head) (the cache's shape minus the head dim; any strides); the fp8 values are widened exactly and
+            each scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the softmax and its softmax weight
+            by ``v_sf_j`` before the bf16 rounding that forms the P operand of the PV product (the normaliser sums the unscaled
+            weights). Inputs outside the classes (q / o dtypes other than bf16, non-unit scales of an unscaled operand, head dims
+            other than 64 / 128 / 256, a window with ``is_causal=False``, logits soft cap, custom masks, RoPE, LSE output) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales: ``q_scale`` (and
+            the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is accepted, as are
+            ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any other value
+            raises. A scale is a number or a one-element floating-point tensor; a device tensor is read back once per tensor version
+            (not per call) and must have been passed to a call before a CUDA-graph capture of ``run()``. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -2289,6 +2306,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
+        v_sf_swizzled : bool
+            Keyword-only, read under ``batch_invariant=True`` with a packed NVFP4 KV cache (``kv_data_type=torch.uint8``): the
+            layout of the V block scales that :meth:`run` receives in ``kv_cache_sf``. ``False`` (default): linear, what
+            :func:`flashinfer.page.nvfp4_quantize_append_paged_kv_cache` writes. ``True``: TRT-LLM's 4-token interleaved
+            layout (what the ``trtllm-gen`` backend reads, and what serving engines write for it); ``page_size`` must then be
+            a multiple of four. The K block scales are linear in both. The layout cannot be detected from the tensors, so
+            the caller must state it: scales read in the other layout give wrong outputs with no error. Without
+            ``batch_invariant=True`` the layout is fixed by the backend and ``True`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2365,8 +2390,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        v_sf_swizzled: bool = False,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
+        if v_sf_swizzled and self._batch_invariant is None:
+            raise ValueError(
+                "v_sf_swizzled is an option of batch_invariant=True; the regular backends fix the layout of the NVFP4 V "
+                "block scales (fa2: linear, trtllm-gen: the 4-token interleaved layout)"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2409,6 +2440,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                v_sf_swizzled=v_sf_swizzled,
             )
             self._batch_size = len(indptr) - 1
             self._num_qo_heads = num_qo_heads
