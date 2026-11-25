@@ -169,11 +169,18 @@ store, ...; the split programs spell ``split_items`` too).
 
 from __future__ import annotations
 
+import array
+import bisect
 import collections
+import ctypes
 import functools
+import hashlib
 import heapq
 import itertools
 import operator
+import struct
+import warnings
+from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
 import torch
@@ -17067,10 +17074,24 @@ def prefill_v6_record_plan(
 # device memory (a CUDA graph captures the plan of its batch), and it is cached (V6_PLAN_CACHE_SIZE plans, least
 # recently used out).  A sequence's cuts may change with its batch: the inference builds agree with the exact
 # recurrence within FlashInfer's tolerance for any cut.
+# The model above is the time with the FI default gates, whose cuts saturate within a few chunks.  A cut saturates
+# only where its gates decay (the device reads them; the host does not), so a candidate is taken only when it is
+# robust: for every warm-up need W -- a cut saturates iff it lies at least W chunks into its sequence and W is at
+# most the split builds' warm-up cap V6_PLAN_WARMUP_CAP; W runs over the cuts of the candidate and of the plan of
+# record up to the cap, and "no cut saturates" -- its modeled time is at most V6_PLAN_ROBUST_PERCENT above the plan
+# of record's (``prefill_v6_plan_scenarios``).  Under a need W a saturated cut's row runs ``max(warmup, W chunk)``
+# of warm-up and its chunks up to the next saturated cut of its (sequence, head), a cut-0 row runs up to the first
+# saturated cut, and an unsaturated cut's row costs ``item`` (its scan); the block build does not depend on W.
+# Candidates are tried in order of modeled time (then the first in order) and the first robust one at least
+# V6_PLAN_MARGIN_PERCENT faster than the plan of record is the plan.
 V6_PLAN_FLOORS = (48, 36, 24, 18, 12)
 V6_PLAN_FLOORS_UNIFORM = (48, 24, 12)
 V6_PLAN_MARGIN_PERCENT = 3
-V6_PLAN_CACHE_SIZE = 256
+V6_PLAN_ROBUST_PERCENT = 5
+V6_PLAN_WARMUP_CAP = 128  # chunks: the ``split_warmup`` of the Blackwell split builds
+V6_PLAN_CACHE_SIZE = 256  # plans (and launches) kept per cache
+V6_PLAN_CACHE_ROWS = 1 << 20  # plan rows kept in the ``prefill_v6_plan`` cache
+V6_LAUNCH_CACHE_BYTES = 64 << 20  # item-table bytes kept in the ``prefill_v6_launch`` cache
 V6_PLAN_COSTS = {
     "sm_100a": {
         "chunk": 158,
@@ -17448,6 +17469,11 @@ class _V6Split:
         return bt.costs["fixed"] + max(cloads)
 
     def plan(self):
+        if getattr(self, "_plan", None) is None:
+            self._plan = self._build()
+        return self._plan
+
+    def _build(self):
         bt, G, H, n, arch = self.bt, self.grid, self.bt.H, self.bt.n, self.bt.arch
         long_rows, long_costs, flags = [], [], []
         for q in self.long:
@@ -17482,7 +17508,7 @@ def _v6_cut_flags(chunks, decision, H, n, arch):
     return tuple(1 if kind else 0 for kind in _v6_cut_shape(chunks, decision, H, n, arch)[2])
 
 
-@functools.lru_cache(maxsize=65536)
+@functools.lru_cache(maxsize=4096)
 def _v6_head_rows(seq, span, H):
     """The rows ``(seq, head, 0, span)`` of an unsplit sequence, heads in order."""
     return tuple((seq, h, 0, span) for h in range(H))
@@ -17557,6 +17583,11 @@ class _V6Block:
         return self.bt.costs["block_fixed"] + max(self.loads)
 
     def plan(self):
+        if getattr(self, "_plan", None) is None:
+            self._plan = self._build()
+        return self._plan
+
+    def _build(self):
         bt, G, H = self.bt, self.grid, self.bt.H
         rows = [(q, h, 0, -(-bt.lens[q] // 64)) for q in self.order for h in range(H)]
         if not self.balanced:
@@ -17608,25 +17639,94 @@ def _v6_candidates(bt):
     return out, alias
 
 
+def _v6_plan_ctas(plan):
+    """Per CTA of ``plan``, the rows it runs: the split build's row lists, the block build's stride positions."""
+    rows, G = plan.rows, plan.grid
+    if plan.split:
+        o = plan.offsets
+        return [rows[o[b] : o[b + 1]] for b in range(G)]
+    return [rows[b::G] for b in range(G)]
+
+
+def _v6_cut_map(plan, bt):
+    """``(seq, head) -> ascending cuts`` of every (sequence, head) of more than one row of a split plan (pad rows
+    and state copies excluded): the cut sequences."""
+    cuts: dict[tuple[int, int], list[int]] = {}
+    if plan.split:
+        for seq, head, cut, span in plan.rows:
+            if span != 0 and cut < bt.chunks[seq]:
+                cuts.setdefault((seq, head), []).append(cut)
+    return {key: sorted(v) for key, v in cuts.items() if len(v) > 1}
+
+
+def _v6_scenario_time(plan, bt, cut_map, W):
+    """The modeled time of ``plan`` when a cut saturates iff it lies at least ``W`` chunks into its sequence and
+    ``W`` is at most V6_PLAN_WARMUP_CAP (``W`` None: no cut saturates); see the PLAN CHOOSER."""
+    c = bt.costs
+    if not plan.split:
+        loads = [sum(_v6_block_row_cost(bt.lens[r[0]], bt.n, c) for r in cta) for cta in _v6_plan_ctas(plan)]
+        return c["block_fixed"] + max(loads, default=0)
+    live = W is not None and W <= V6_PLAN_WARMUP_CAP
+    warm = max(c["warmup"], W * c["chunk"]) if live else 0
+    top = 0
+    for cta in _v6_plan_ctas(plan):
+        load = 0
+        for row in cta:
+            seq, head, cut, span = row
+            cuts = cut_map.get((seq, head))
+            chunks = bt.chunks[seq]
+            if cuts is None or span == 0 or cut >= chunks:
+                load += _v6_split_row_cost(row, chunks, bt.lens[seq], bt.n, c)
+                continue
+            if cut and not (live and cut >= W):
+                load += c["item"]  # an unsaturated cut: its scan
+                continue
+            end = chunks
+            if live:
+                at = bisect.bisect_right(cuts, max(cut, W - 1))
+                if at < len(cuts):
+                    end = cuts[at]
+            load += (end - cut) * c["chunk"] + c["item"] + (warm if cut else 0)
+        top = max(top, load)
+    return c["fixed"] + top
+
+
+def _v6_scenarios(plan: V6Plan, ref: V6Plan, bt) -> list[tuple[int | None, int, int]]:
+    """``(W, time of plan, time of ref)`` per warm-up need of the robustness rule (PLAN CHOOSER): every cut of
+    either plan up to V6_PLAN_WARMUP_CAP, then None (no cut saturates); modeled hundredths of a microsecond."""
+    maps = (_v6_cut_map(plan, bt), _v6_cut_map(ref, bt))
+    needs = sorted({cut for m in maps for cuts in m.values() for cut in cuts if 0 < cut <= V6_PLAN_WARMUP_CAP})
+    return [
+        (W, _v6_scenario_time(plan, bt, maps[0], W), _v6_scenario_time(ref, bt, maps[1], W))
+        for W in (*needs, None)
+    ]
+
+
+def _v6_robust(cand, ref, bt) -> bool:
+    return all(
+        100 * mine <= (100 + V6_PLAN_ROBUST_PERCENT) * theirs
+        for _W, mine, theirs in _v6_scenarios(cand.plan(), ref.plan(), bt)
+    )
+
+
 def _v6_choose(bt):
-    """The candidate of least modeled time (then the first in order) if V6_PLAN_MARGIN_PERCENT below the plan of
-    record's, else the plan of record.  Candidates are modeled in the order of their lower bounds and those whose
-    bound cannot win are skipped, which never changes the pick."""
+    """The robust candidate of least modeled time (then the first in order) among those V6_PLAN_MARGIN_PERCENT
+    below the plan of record's time, else the plan of record.  Candidates whose lower bound cannot come below that
+    limit are not modeled, which never changes the pick."""
     cands, alias = _v6_candidates(bt)
     ref = next(c for c in cands if c.name == alias["main"])
     limit = (100 - V6_PLAN_MARGIN_PERCENT) * ref.cost()
-    best, best_key = ref, None
-    for at in sorted(range(len(cands)), key=lambda i: (cands[i].bound(), i)):
-        cand = cands[at]
-        if cand is ref:
+    fast = []
+    for at, cand in enumerate(cands):
+        if cand is ref or 100 * cand.bound() >= limit:
             continue
-        bound = cand.bound()
-        if 100 * bound >= limit or (best_key is not None and (bound, at) > best_key):
-            break
         cost = cand.cost()
-        if 100 * cost < limit and (best_key is None or (cost, at) < best_key):
-            best, best_key = cand, (cost, at)
-    return best
+        if 100 * cost < limit:
+            fast.append((cost, at))
+    for _cost, at in sorted(fast):
+        if _v6_robust(cands[at], ref, bt):
+            return cands[at]
+    return ref
 
 
 def _v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens):
@@ -17635,17 +17735,42 @@ def _v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_toke
     sm_count = int(sm_count)
     if sm_count <= 0:
         raise ValueError(f"sm_count must be positive, got {sm_count}")
-    cu = cu_seqlens if isinstance(cu_seqlens, tuple) else tuple(int(x) for x in cu_seqlens)
+    if type(cu_seqlens) is tuple:
+        cu = cu_seqlens
+    elif isinstance(cu_seqlens, torch.Tensor):
+        cu = tuple(cu_seqlens.tolist())
+    else:
+        cu = tuple(cu_seqlens)
     total = int(cu[-1]) if total_tokens is None else int(total_tokens)
     return cu, int(num_heads), int(num_householder), sm_count, arch, total
 
 
-@functools.lru_cache(maxsize=V6_PLAN_CACHE_SIZE)
-def _v6_plan_cached(cu, H, n, sm_count, arch, total) -> V6Plan:
-    plan = _v6_choose(_V6Batch(cu, H, n, sm_count, arch, total)).plan()
+def _v6_check_grid(grid: int, sm_count: int) -> None:
     # every CTA of the launch is resident at once (one CTA per SM): the seed-done wait of the split build needs it
-    assert 1 <= plan.grid <= sm_count, (plan.grid, sm_count)
-    return plan
+    if not 1 <= grid <= sm_count:
+        raise RuntimeError(f"Blackwell prefill plan grid {grid} outside 1..{sm_count} (the SM count)")
+
+
+def _v6_reference(cu, H, n, sm_count, arch, total):
+    """The PLAN CHOOSER's pick and its plan, in Python."""
+    cand = _v6_choose(_V6Batch(cu, H, n, sm_count, arch, total))
+    plan = cand.plan()
+    _v6_check_grid(plan.grid, sm_count)
+    return cand.name, plan
+
+
+def prefill_v6_plan_reference(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> V6Plan:
+    """The launch plan of the PLAN CHOOSER computed in Python (uncached): the reference of the native chooser."""
+
+    return _v6_reference(*_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens))[1]
 
 
 def prefill_v6_plan(
@@ -17659,11 +17784,42 @@ def prefill_v6_plan(
 ) -> V6Plan:
     """The launch plan of the Blackwell prefill body for the host offsets ``cu_seqlens`` (``N + 1`` integers;
     ``total_tokens`` defaults to the last) on a device of ``sm_count`` SMs: the candidate the PLAN CHOOSER picks
-    (cached by its arguments)."""
+    (the native chooser when it builds, else the Python reference; cached, see NATIVE PLAN CHOOSER)."""
 
-    return _v6_plan_cached(
-        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
-    )
+    # the key: a tensor's offsets as bytes, a sequence's as a tuple (width 0)
+    if isinstance(cu_seqlens, torch.Tensor):
+        data, width = _v6_offset_bytes(cu_seqlens)
+        if total_tokens is None:
+            total_tokens = int.from_bytes(data[-width:], "little", signed=True)
+    else:
+        data, width = (cu_seqlens if type(cu_seqlens) is tuple else tuple(cu_seqlens)), 0
+        if total_tokens is None:
+            total_tokens = data[-1]
+    key = (data, width, int(num_heads), int(num_householder), int(sm_count), arch, int(total_tokens))
+    plan = _V6_PLANS.lookup(key)
+    if plan is not None:
+        return plan
+    _data, _width, H, n, sm, _arch, total = key
+    if width == 0:
+        data, width = array.array("q", data).tobytes(), 8
+    if arch not in V6_ARCHES:
+        raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
+    if sm <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm}")
+    native = _v6_native_module()
+    if native is None:
+        cu = tuple(array.array("q" if width == 8 else "i", data))
+        plan = _v6_reference(cu, H, n, sm, arch, total)[1]
+    else:
+        out = native.v6_launch(data, width, H, n, sm, total, _v6_native_params(arch, H), 1)
+        _cand, split, grid, count, _words = _V6_NATIVE_HEADER.unpack_from(out)
+        words = array.array("i", out[4 * V6_NATIVE_HEAD :])
+        it = iter(words[: 4 * count])
+        rows = tuple(zip(it, it, it, it))
+        offsets = tuple(words[4 * max(count, 1) : 4 * max(count, 1) + grid + 1]) if split else None
+        plan = V6Plan(rows=rows, split=bool(split), grid=grid, offsets=offsets)
+    _V6_PLANS.put(key, plan, max(len(plan.rows), 1))
+    return plan
 
 
 def prefill_v6_plan_choice(
@@ -17699,6 +17855,29 @@ def prefill_v6_plan_candidates(
     return {name: (alias[name], cost[alias[name]]) for name in V6_PLAN_CANDIDATES if name in alias}
 
 
+def prefill_v6_plan_scenarios(
+    name: str,
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> list[tuple[int | None, int, int]]:
+    """The robustness scenarios of candidate ``name`` against the plan of record (see the PLAN CHOOSER): ``(W,
+    modeled time of the candidate, modeled time of the plan of record)`` per warm-up need ``W`` (None: no cut
+    saturates), hundredths of a microsecond."""
+
+    bt = _V6Batch(*_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens))
+    cands, alias = _v6_candidates(bt)
+    if name not in alias:
+        raise ValueError(f"candidate {name!r} does not apply to the batch; it takes {sorted(alias)}")
+    cand = next(c for c in cands if c.name == alias[name])
+    ref = next(c for c in cands if c.name == alias["main"])
+    return _v6_scenarios(cand.plan(), ref.plan(), bt)
+
+
 def prefill_v6_candidate_plan(
     name: str,
     cu_seqlens: Sequence[int],
@@ -17720,6 +17899,261 @@ def prefill_v6_candidate_plan(
 
 
 # ---- END PLAN CHOOSER ----
+
+
+# ---- NATIVE PLAN CHOOSER (the host time of an eager call) ----
+# ``csrc/cake_gdp_v6_plan.cpp`` is the PLAN CHOOSER in native code: a line-by-line port of the Python chooser above
+# (the reference, ``prefill_v6_plan_reference``) that takes every constant from this file (``_v6_native_params``)
+# and returns the launch and the int32 words of its item table at once.  FlashInfer's JIT builds it on first use
+# (a host library, no device code); when it cannot be built the Python chooser plans every call (one warning).
+# ``prefill_v6_launch`` is what a call launches: the program of the call's state form, the build, the grid, the row
+# count and the item words, cached by the call's host offsets (their bytes), H, n, the SM count, the arch, the token
+# count and the state form; the cache keeps V6_PLAN_CACHE_SIZE launches and at most V6_LAUNCH_CACHE_BYTES of words
+# (least recently used out), the ``prefill_v6_plan`` cache at most V6_PLAN_CACHE_ROWS rows.  ``clear_plan_caches``
+# empties every planner cache (a batch the process has not planned before).
+V6_NATIVE_SOURCE = "cake_gdp_v6_plan.cpp"
+V6_NATIVE_HEAD = 5  # header words of the native result: candidate, split, grid, rows, item words
+_V6_NATIVE_HEADER = struct.Struct(f"<{V6_NATIVE_HEAD}i")
+_V6_NATIVE: list = []  # [module or None] once loaded
+
+
+class _V6Cache(collections.OrderedDict):
+    """A least-recently-used cache of at most V6_PLAN_CACHE_SIZE entries whose summed weight stays at most
+    ``budget`` (one entry always stays)."""
+
+    def __init__(self, budget: int):
+        super().__init__()
+        self.budget, self.weights, self.total = budget, {}, 0
+
+    def lookup(self, key):
+        value = self.get(key)
+        if value is not None:
+            self.move_to_end(key)
+        return value
+
+    def put(self, key, value, weight: int) -> None:
+        self[key] = value
+        self.weights[key] = weight
+        self.total += weight
+        while len(self) > 1 and (len(self) > V6_PLAN_CACHE_SIZE or self.total > self.budget):
+            old, _value = self.popitem(last=False)
+            self.total -= self.weights.pop(old)
+
+    def clear(self) -> None:
+        super().clear()
+        self.weights.clear()
+        self.total = 0
+
+
+_V6_PLANS = _V6Cache(V6_PLAN_CACHE_ROWS)
+_V6_LAUNCHES = _V6Cache(V6_LAUNCH_CACHE_BYTES)
+
+
+class V6Launch(NamedTuple):
+    """One launch of the Blackwell prefill body: the program ``name``, the chooser's candidate, the build (``split``),
+    the grid, the item-table row count and the int32 ``words`` of the ``items`` formal (``v6_item_words``)."""
+
+    name: str
+    candidate: str
+    split: bool
+    grid: int
+    num_items: int
+    words: bytes
+
+
+def clear_plan_caches() -> None:
+    """Empty every cache of the Blackwell launch planner: the launches, the plans and the chooser's memo tables (the
+    native library stays loaded)."""
+    _V6_PLANS.clear()
+    _V6_LAUNCHES.clear()
+    for fn in (
+        v6_split_count,
+        v6_split_bal_slot,
+        _v6_decisions,
+        _v6_cut_shape,
+        _v6_cut_costs,
+        _v6_cut_stats,
+        _v6_cut_loads,
+        _v6_cut_rows,
+        _v6_cut_flags,
+        _v6_head_rows,
+        _v6_launch_builds,
+    ):
+        fn.cache_clear()
+
+
+def _v6_native_path() -> Path | None:
+    """The native chooser's source: the ``csrc`` of the tree this package runs from, else of the installed
+    FlashInfer."""
+    here = Path(__file__).resolve().parents[2] / "csrc" / V6_NATIVE_SOURCE
+    if here.is_file():
+        return here
+    try:
+        from flashinfer.jit import env as jit_env
+    except ImportError:
+        return None
+    path = Path(jit_env.FLASHINFER_CSRC_DIR) / V6_NATIVE_SOURCE
+    return path if path.is_file() else None
+
+
+def _v6_native_module():
+    """The loaded native chooser, or None when it cannot be built (then the Python chooser plans every call)."""
+    if _V6_NATIVE:
+        return _V6_NATIVE[0]
+    module = None
+    try:
+        path = _v6_native_path()
+        if path is None:
+            raise RuntimeError(f"{V6_NATIVE_SOURCE} not found")
+        from flashinfer.jit.core import gen_jit_spec
+
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        module = gen_jit_spec(f"cake_gdp_v6_plan_{digest}", [path]).build_and_load()
+    except Exception as exc:  # noqa: BLE001 -- any build failure keeps the (slower, equal) Python chooser
+        warnings.warn(
+            f"the native Cake GDP prefill planner is not available ({type(exc).__name__}: {exc}); "
+            "the Python chooser plans every call",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    _V6_NATIVE.append(module)
+    return module
+
+
+def _v6_native_param_parts(arch: str) -> tuple[bytes, bytes]:
+    """The int64 parameter words of the native chooser around ``split_span_min`` (the layout of ``Param`` in its
+    source), from this file's constants."""
+    c = V6_PLAN_COSTS[arch]
+    head = [
+        *(c[k] for k in ("chunk", "warmup", "item", "decode", "fixed")),
+        *(c[k] for k in ("block_chunk", "block_item", "block_decode", "block_fixed")),
+        V6_PLAN_MARGIN_PERCENT,
+        V6_PLAN_ROBUST_PERCENT,
+        V6_PLAN_WARMUP_CAP,
+        SPLIT_MIN_CHUNKS,
+        SPLIT_MAX,
+        SPLIT_COST_CHUNK,
+        SPLIT_COST_ITEM,
+        SPLIT_BAL_MIN_SLOT,
+        SPLIT_BAL_SLOTS.get(arch, 0),
+        INFERENCE_ITEM_COST,
+        INFERENCE_WARMUP_COST,
+    ]
+    tail = [len(V6_PLAN_SPLIT_SPECS)]
+    for _name, floor, bal in V6_PLAN_SPLIT_SPECS:
+        tail += [-1 if floor is None else floor, int(bal)]
+    return array.array("q", head).tobytes(), array.array("q", tail).tobytes()
+
+
+_V6_NATIVE_PARAM_PARTS = {arch: _v6_native_param_parts(arch) for arch in V6_PLAN_COSTS}
+_V6_INT64 = struct.Struct("<q")
+
+
+def _v6_native_params(arch: str, H: int) -> bytes:
+    """The int64 parameter words of the native chooser for ``H`` heads on ``arch`` (the parts are computed once,
+    at import, from this file's constants)."""
+    head, tail = _V6_NATIVE_PARAM_PARTS[arch]
+    return head + _V6_INT64.pack(split_span_min(H, arch)) + tail
+
+
+@functools.lru_cache(maxsize=64)
+def _v6_launch_builds(arch: str, state_dtype: str, pool: bool):
+    """``(split -> program, flags)`` of a state form: flags bit 0 / 1 = the split build reads CTA row offsets /
+    the planned offsets (``csr`` / ``plan_guard``), bits 2 / 3 the same for the block build."""
+    builds = v6_route_builds(arch, state_dtype, pool)
+    flags = 0
+    for split, shift in ((True, 0), (False, 2)):
+        if split in builds:
+            build = MODULES[builds[split]]["build"]
+            flags |= (int(bool(build.get("csr"))) | 2 * int(bool(build.get("plan_guard")))) << shift
+    return builds, flags
+
+
+def _v6_words(flags: int, plan: V6Plan, cu: Sequence[int]) -> list[int]:
+    """``v6_item_words`` for the build flags of ``_v6_launch_builds``."""
+    shift = 0 if plan.split else 2
+    words = [int(w) for row in (plan.rows or ((0, 0, 0, 0),)) for w in row]
+    if flags >> shift & 1:
+        if plan.offsets is None:
+            raise ValueError("the csr build runs a plan with row offsets")
+        words.extend(int(o) for o in plan.offsets)
+    if flags >> shift & 2:
+        words.extend((len(cu) - 1, *(int(c) for c in cu)))
+    return words
+
+
+def v6_launch_of_plan(
+    arch: str, plan: V6Plan, cu_seqlens: Sequence[int], *, state_dtype: str = "f32", pool: bool = False
+) -> V6Launch:
+    """The launch of a given ``plan`` (a candidate's, the plan of record) for the host offsets ``cu_seqlens``, on the
+    program of a state form: what ``prefill_v6_launch`` returns for the chooser's plan."""
+
+    builds, flags = _v6_launch_builds(arch, state_dtype, bool(pool))
+    if plan.split not in builds:
+        raise ValueError(f"no Blackwell prefill program on {arch} with split_items={plan.split} for that form")
+    words = array.array("i", _v6_words(flags, plan, [int(c) for c in cu_seqlens])).tobytes()
+    return V6Launch(builds[plan.split], "given", plan.split, plan.grid, len(plan.rows), words)
+
+
+def _v6_offset_bytes(cu_seqlens) -> tuple[bytes, int]:
+    """The host offsets as (bytes, element width): a CPU int32 / int64 tensor as is, else int64."""
+    if isinstance(cu_seqlens, torch.Tensor):
+        width = cu_seqlens.element_size()
+        if cu_seqlens.is_cpu and cu_seqlens.is_contiguous():
+            return ctypes.string_at(cu_seqlens.data_ptr(), cu_seqlens.numel() * width), width
+        return cu_seqlens.numpy().tobytes(), width
+    return array.array("q", cu_seqlens).tobytes(), 8
+
+
+def prefill_v6_launch(
+    cu_seqlens,
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+    state_dtype: str = "f32",
+    pool: bool = False,
+) -> V6Launch:
+    """The launch of a call (see NATIVE PLAN CHOOSER): ``cu_seqlens`` the host offsets as a CPU int32 / int64 tensor
+    or a sequence of integers, the state form as in ``selected_v6_module``."""
+
+    data, width = _v6_offset_bytes(cu_seqlens)
+    if total_tokens is None:
+        total_tokens = int.from_bytes(data[-width:], "little", signed=True)
+    H, n, sm, total = int(num_heads), int(num_householder), int(sm_count), int(total_tokens)
+    key = (data, width, H, n, sm, arch, total, state_dtype, bool(pool))
+    launch = _V6_LAUNCHES.lookup(key)
+    if launch is not None:
+        return launch
+    if arch not in V6_ARCHES:
+        raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
+    if sm <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm}")
+    builds, flags = _v6_launch_builds(arch, state_dtype, bool(pool))
+    native = _v6_native_module()
+    if native is not None:
+        out = native.v6_launch(data, width, H, n, sm, total, _v6_native_params(arch, H), flags)
+        cand, split, grid, count, _words = _V6_NATIVE_HEADER.unpack_from(out)
+        candidate, split, words = V6_PLAN_CANDIDATES[cand], bool(split), out[4 * V6_NATIVE_HEAD :]
+    else:
+        cu = array.array("q" if width == 8 else "i", data).tolist()
+        candidate, plan = _v6_reference(tuple(cu), H, n, sm, arch, total)
+        split, grid, count = plan.split, plan.grid, len(plan.rows)
+        words = array.array("i", _v6_words(flags, plan, cu)).tobytes()
+    _v6_check_grid(grid, sm)
+    if split not in builds:
+        raise ValueError(
+            f"no Blackwell prefill program on {arch} with split_items={split}, state_dtype={state_dtype!r} and "
+            f"pool={bool(pool)}; the route ships the forms {sorted(v6_state_forms(arch))}"
+        )
+    launch = V6Launch(builds[split], candidate, split, grid, count, words)
+    _V6_LAUNCHES.put(key, launch, len(words))
+    return launch
+
+
+# ---- END NATIVE PLAN CHOOSER ----
 
 
 def v6_item_words(
@@ -17998,6 +18432,7 @@ __all__ = [
     "STATE_ALIGNMENT_BYTES",
     "STATE_DTYPES",
     "STATE_STRIDE_ELEMENTS",
+    "V6Launch",
     "V6Plan",
     "V6Sm90Plan",
     "V6_ARCHES",
@@ -18006,7 +18441,10 @@ __all__ = [
     "V6_PLAN_COSTS",
     "V6_PLAN_FLOORS",
     "V6_PLAN_MARGIN_PERCENT",
+    "V6_PLAN_ROBUST_PERCENT",
+    "V6_PLAN_WARMUP_CAP",
     "arch_for_capability",
+    "clear_plan_caches",
     "device_arch",
     "inference_csr",
     "inference_lists",
@@ -18030,9 +18468,12 @@ __all__ = [
     "prefill_route_modules",
     "prefill_split_table",
     "prefill_v6_candidate_plan",
+    "prefill_v6_launch",
     "prefill_v6_plan",
     "prefill_v6_plan_candidates",
     "prefill_v6_plan_choice",
+    "prefill_v6_plan_reference",
+    "prefill_v6_plan_scenarios",
     "prefill_v6_record_plan",
     "prefill_v6_sm90_plan",
     "route_applies",
@@ -18050,6 +18491,7 @@ __all__ = [
     "state_dtype_key",
     "supported_num_householder",
     "v6_householders",
+    "v6_launch_of_plan",
     "v6_sm90_item_words",
     "v6_sm90_serial_load",
     "v6_split_bal_slot",

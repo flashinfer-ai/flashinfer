@@ -262,7 +262,7 @@ CHOSEN_SHAPES = [
     (20, [1] * 16 + [1024]),
     (40, [1] * 8 + [1024]),
     (24, [1] * 16 + [2048]),
-    (80, [4096]),
+    (80, [1] * 4 + [2048]),
     (20, [2500, 1596]),
 ]
 
@@ -280,7 +280,14 @@ def test_the_chosen_plan_and_the_plan_of_record_agree(H, lengths, monkeypatch):
     inputs = _inputs(lengths, H, with_state, seed=13)
     out, state = _call(inputs, "cake")
     ref_out, ref_state = _call(inputs, "cudnn")
-    monkeypatch.setattr(loader, "prefill_v6_plan", loader.prefill_v6_record_plan)
+    def record_launch(cu, *, state_dtype="f32", pool=False, **kw):
+        offsets = cu.tolist() if isinstance(cu, torch.Tensor) else list(cu)
+        plan = loader.prefill_v6_record_plan(offsets, **kw)
+        return loader.v6_launch_of_plan(
+            kw["arch"], plan, offsets, state_dtype=state_dtype, pool=pool
+        )
+
+    monkeypatch.setattr(loader, "prefill_v6_launch", record_launch)
     rec_out, rec_state = _call(inputs, "cake")
     monkeypatch.undo()
     for name, a, b in (

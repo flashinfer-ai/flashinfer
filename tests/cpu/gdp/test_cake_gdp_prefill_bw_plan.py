@@ -30,10 +30,13 @@ for any cut: ``tests/gdp/test_cake_gdp_prefill_bw.py``).
 
 from __future__ import annotations
 
+import array
+import functools
 import itertools
 import random
 
 import pytest
+import torch
 
 from tests.cake.test_helpers.cake_package import cake_package
 
@@ -655,12 +658,21 @@ def test_the_modeled_time_is_the_most_loaded_cta_of_the_plan(arch):
             assert cost == fixed + max(loads), (cand.name, H, lengths)
 
 
+def _robust(name, cu, H, arch):
+    """The robustness rule of the PLAN CHOOSER for candidate ``name``, from its scenarios."""
+    tol = loader.V6_PLAN_ROBUST_PERCENT
+    return all(
+        100 * mine <= (100 + tol) * theirs
+        for _W, mine, theirs in loader.prefill_v6_plan_scenarios(name, cu, **_kw(H, arch))
+    )
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", sorted(SMS))
-def test_the_chooser_takes_the_least_modeled_candidate(arch):
-    """The launched plan is the candidate of least modeled time (the first in V6_PLAN_CANDIDATES order on a tie) when
-    it is V6_PLAN_MARGIN_PERCENT below the plan of record's, else the plan of record; every candidate modeled, no
-    pruning."""
+def test_the_chooser_takes_the_least_modeled_robust_candidate(arch):
+    """The launched plan is the robust candidate of least modeled time (the first in V6_PLAN_CANDIDATES order on a
+    tie) among those V6_PLAN_MARGIN_PERCENT below the plan of record's time, else the plan of record; every
+    candidate modeled, no pruning."""
     order = {name: at for at, name in enumerate(loader.V6_PLAN_CANDIDATES)}
     margin = loader.V6_PLAN_MARGIN_PERCENT
     picks = set()
@@ -669,16 +681,41 @@ def test_the_chooser_takes_the_least_modeled_candidate(arch):
         choices = loader.prefill_v6_plan_candidates(cu, **_kw(H, arch))
         ref = choices["main"][1]
         distinct = {alias: cost for alias, cost in choices.values()}
-        # the distinct candidates in the chooser's order: the split specs, main, block, blockbal
-        best = min(distinct, key=lambda name: (distinct[name], order[name]))
-        want = best if 100 * distinct[best] < (100 - margin) * ref else choices["main"][0]
+        fast = sorted(
+            (cost, order[name])
+            for name, cost in distinct.items()
+            if name != choices["main"][0] and 100 * cost < (100 - margin) * ref
+        )
+        names = {order[name]: name for name in distinct}
+        want = next(
+            (names[at] for _cost, at in fast if _robust(names[at], cu, H, arch)),
+            choices["main"][0],
+        )
         got = loader.prefill_v6_plan_choice(cu, **_kw(H, arch))
         assert got == want, (H, lengths, choices)
-        assert _plan(lengths, H, arch) == loader.prefill_v6_candidate_plan(
-            got, cu, **_kw(H, arch)
-        )
+        assert loader.prefill_v6_plan_reference(
+            cu, **_kw(H, arch)
+        ) == loader.prefill_v6_candidate_plan(got, cu, **_kw(H, arch))
         picks.add(got)
-    assert {"main", "f12", "f36"} <= picks, picks
+    assert {"main", "f12", "f18", "f24", "f36"} <= picks, picks
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", sorted(SMS))
+def test_the_robustness_scenarios(arch):
+    """Every warm-up need W of the rule (the cuts up to V6_PLAN_WARMUP_CAP, then None) is modeled; the plan of record
+    against itself is equal under every W; a cut sequence's time grows when no cut saturates, a block plan's does
+    not depend on W."""
+    for H, lengths in [*UNION.values(), *RANDOM[:30]]:
+        cu = _cu(lengths)
+        scenarios = loader.prefill_v6_plan_scenarios("main", cu, **_kw(H, arch))
+        assert scenarios[-1][0] is None
+        needs = [W for W, _mine, _theirs in scenarios[:-1]]
+        assert needs == sorted(set(needs)) and all(0 < W <= loader.V6_PLAN_WARMUP_CAP for W in needs)
+        assert all(mine == theirs for _W, mine, theirs in scenarios)
+        if "block" in loader.prefill_v6_plan_candidates(cu, **_kw(H, arch)):
+            block = loader.prefill_v6_plan_scenarios("block", cu, **_kw(H, arch))
+            assert len({mine for _W, mine, _theirs in block}) == 1
 
 
 @pytest.mark.cpu_only
@@ -686,18 +723,29 @@ def test_the_chooser_takes_the_least_modeled_candidate(arch):
 @pytest.mark.parametrize(
     "name,pick",
     [
-        ("A_H20_L1024_d16", "f12"),
+        ("A_H20_L1024_d0", "f12"),
+        ("A_H20_L1024_d1", "f12"),
         ("A_H24_L1024_d1", "f12"),
-        ("A_H40_L1024_d8", "f18"),
-        ("A_H80_L4096_d0", "f36"),
+        ("A_H40_L1024_d1", "f18"),
+        ("A_H40_L1024_d8", "f24"),
+        ("A_H80_L2048_d4", "f48"),
+        ("A_H80_L1024_d0", "block"),
+        ("A_H80_L4096_d0", "main"),
+        ("A_H40_L8192_d0", "main"),
         ("A_H80_L65536_d0", "main"),
         ("B_H80", "main"),
     ],
 )
 def test_the_calibrated_picks_of_the_short_prefill_report(arch, name, pick):
-    """The picks of record on shapes of the short-prefill report: a 1K-4K prefill is cut below floor 48 (the plan of
-    record runs it as one serial chain per head), a full-grid 64K prefill keeps the plan of record."""
-    H, lengths = UNION[name]
+    """The picks of record on shapes of the short-prefill report: a 1K-2K prefill of few heads is cut below floor
+    48 (the plan of record runs it as one serial chain per head); a wide batch whose cut rows would share CTAs
+    keeps the plan of record (its time when the gates decay slowly, the robustness rule); a full-grid 64K prefill
+    keeps the plan of record."""
+    if name.startswith("B_"):
+        H, lengths = int(name[3:]), [65536]
+    else:
+        H, L, d = (int(x[1:]) for x in name.split("_")[1:])
+        lengths = [1] * d + [min(L, 65536 - d)]
     assert loader.prefill_v6_plan_choice(_cu(lengths), **_kw(H, arch)) == pick
 
 
@@ -705,12 +753,12 @@ def test_the_calibrated_picks_of_the_short_prefill_report(arch, name, pick):
 @pytest.mark.parametrize("arch", sorted(SMS))
 def test_the_plan_is_a_pure_function_of_the_batch(arch):
     """The launched plan depends on the host offsets, the head count, n, the SM count, the arch and the token count
-    only: the same plan in any call order, from a list or a tuple, with or without the plan cache, and the same as
-    the uncached pick."""
+    only: the same plan in any call order, from a list, a tuple or a tensor, with or without the plan cache, and the
+    same as the Python reference and the uncached pick."""
     batches = [*UNION.values(), *RANDOM[:40]]
-    loader._v6_plan_cached.cache_clear()
+    loader.clear_plan_caches()
     first = [_plan(lengths, H, arch) for H, lengths in batches]
-    loader._v6_plan_cached.cache_clear()
+    loader.clear_plan_caches()
     shuffled = list(range(len(batches)))
     random.Random(3).shuffle(shuffled)
     again = {i: _plan(batches[i][1], batches[i][0], arch) for i in shuffled}
@@ -721,6 +769,8 @@ def test_the_plan_is_a_pure_function_of_the_batch(arch):
         assert loader.prefill_v6_plan(
             cu, total_tokens=cu[-1], **_kw(H, arch)
         ) == first[i]
+        assert loader.prefill_v6_plan(torch.tensor(cu), **_kw(H, arch)) == first[i]
+        assert loader.prefill_v6_plan_reference(cu, **_kw(H, arch)) == first[i]
         name = loader.prefill_v6_plan_choice(cu, **_kw(H, arch))
         assert loader.prefill_v6_candidate_plan(name, cu, **_kw(H, arch)) == first[i]
 
@@ -729,15 +779,14 @@ def test_the_plan_is_a_pure_function_of_the_batch(arch):
 @pytest.mark.parametrize("arch", sorted(SMS))
 def test_the_plan_cache_keeps_the_least_recently_used_plans(arch):
     """A repeated batch is a cache hit returning the same plan object; the key holds every argument; the cache keeps
-    V6_PLAN_CACHE_SIZE plans."""
-    cached = loader._v6_plan_cached
-    cached.cache_clear()
+    V6_PLAN_CACHE_SIZE plans of at most V6_PLAN_CACHE_ROWS rows; clear_plan_caches empties it."""
+    cache = loader._V6_PLANS
+    loader.clear_plan_caches()
     lengths = [1] * 16 + [1024]
     plan = _plan(lengths, 20, arch)
-    hits = cached.cache_info().hits
     assert _plan(lengths, 20, arch) is plan
     assert loader.prefill_v6_plan(tuple(_cu(lengths)), **_kw(20, arch)) is plan
-    assert cached.cache_info().hits == hits + 2
+    assert len(cache) == 1
     others = (
         loader.prefill_v6_plan(_cu(lengths), **_kw(24, arch)),
         loader.prefill_v6_plan(_cu(lengths), **_kw(20, arch, sm_count=64)),
@@ -746,8 +795,134 @@ def test_the_plan_cache_keeps_the_least_recently_used_plans(arch):
         ),
     )
     assert all(other is not plan for other in others)
-    assert cached.cache_info().maxsize == loader.V6_PLAN_CACHE_SIZE
     for extra in range(loader.V6_PLAN_CACHE_SIZE + 4):
         _plan([1] * (extra % 7) + [2000 + extra], 20, arch)
-    assert cached.cache_info().currsize == loader.V6_PLAN_CACHE_SIZE
+    assert len(cache) == loader.V6_PLAN_CACHE_SIZE
+    assert cache.total == sum(cache.weights.values()) <= loader.V6_PLAN_CACHE_ROWS
     assert _plan(lengths, 20, arch) == plan  # recomputed after eviction, equal
+    loader.clear_plan_caches()
+    assert len(cache) == 0 and cache.total == 0
+    big = _plan([1] * 1280, 80, arch)  # 102400 rows
+    assert cache.total == len(big.rows)
+
+
+@functools.cache
+def _native():
+    native = loader._v6_native_module()
+    if native is None:
+        pytest.skip("the native Blackwell prefill planner does not build here")
+    return native
+
+
+def _stress_batches(seed, count):
+    """Random batches for the native chooser: lengths of every class, 1 to 96 heads, any SM count, offsets past the
+    token count (clamped) and empty batches of sequences."""
+    rng = random.Random(seed)
+    for _ in range(count):
+        lengths = []
+        for _seq in range(rng.choice((1, 1, 2, 3, 5, 9, 17, 40, 70))):
+            kind = rng.random()
+            if kind < 0.3:
+                lengths.append(1)
+            elif kind < 0.36:
+                lengths.append(0)
+            elif kind < 0.6:
+                lengths.append(rng.randint(2, 1500))
+            elif kind < 0.85:
+                lengths.append(rng.randint(1500, 9000))
+            else:
+                lengths.append(rng.randint(9000, 70000))
+        if sum(lengths) == 0:
+            lengths.append(rng.randint(1, 3000))
+        cu = _cu(lengths)
+        total = cu[-1] - (rng.randint(0, 50) if rng.random() < 0.1 else 0)
+        H = rng.choice((1, 2, 4, 8, 10, 12, 13, 16, 20, 24, 32, 40, 48, 64, 80, 96))
+        sm = rng.choice((8, 33, 64, 132, 148, 152))
+        yield cu, max(total, 1), H, sm
+
+
+def _native_launch(cu, H, arch, sm, total, state_dtype="f32", pool=False):
+    return loader.prefill_v6_launch(
+        cu,
+        num_heads=H,
+        num_householder=N_HH,
+        sm_count=sm,
+        arch=arch,
+        total_tokens=total,
+        state_dtype=state_dtype,
+        pool=pool,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", sorted(SMS))
+def test_the_native_chooser_is_the_python_chooser(arch):
+    """The native chooser launches the Python chooser's pick, plan and item words bit for bit: on the union set, the
+    request's and the mixed batches, and 1500 random batches of any H and SM count."""
+    _native()
+    batches = [(_cu(lengths), _cu(lengths)[-1], H, SMS[arch]) for H, lengths in _all_batches()]
+    batches += list(_stress_batches(11 + len(arch), 1500))
+    for cu, total, H, sm in batches:
+        loader.clear_plan_caches()
+        kw = dict(num_heads=H, num_householder=N_HH, sm_count=sm, arch=arch, total_tokens=total)
+        ref = loader.prefill_v6_plan_reference(cu, **kw)
+        pick = loader.prefill_v6_plan_choice(cu, **kw)
+        assert loader.prefill_v6_plan(cu, **kw) == ref, (cu, total, H, sm)
+        launch = _native_launch(cu, H, arch, sm, total)
+        assert (launch.candidate, launch.split, launch.grid, launch.num_items) == (
+            pick,
+            ref.split,
+            ref.grid,
+            len(ref.rows),
+        ), (cu, total, H, sm)
+        assert launch.name == loader.selected_v6_module(arch, ref)
+        words = array.array("i", launch.words).tolist()
+        assert words == list(loader.v6_item_words(arch, ref, cu)), (cu, total, H, sm)
+        tensor = _native_launch(torch.tensor(cu, dtype=torch.int32), H, arch, sm, total)
+        assert tensor.words == launch.words
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", sorted(SMS))
+def test_the_launch_names_the_program_of_the_state_form(arch):
+    """A launch runs the program of its state form and build; its words carry the build's CTA offsets and planned
+    offsets, the same for every form."""
+    for H, lengths in [*UNION.values(), *itertools.product((3, 24), MIXED)]:
+        cu = _cu(lengths)
+        dense = _native_launch(cu, H, arch, SMS[arch], cu[-1])
+        for dtype, pool in sorted(loader.v6_state_forms(arch)):
+            launch = _native_launch(cu, H, arch, SMS[arch], cu[-1], dtype, pool)
+            plan = loader.prefill_v6_plan(cu, **_kw(H, arch))
+            assert launch.name == loader.selected_v6_module(
+                arch, plan, state_dtype=dtype, pool=pool
+            )
+            assert launch.words == dense.words
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", sorted(SMS))
+def test_the_launch_cache_is_bounded(arch):
+    """The launch cache keeps V6_PLAN_CACHE_SIZE launches of at most V6_LAUNCH_CACHE_BYTES item words; a hit is the
+    same object; clear_plan_caches empties it and every memo table of the chooser."""
+    cache = loader._V6_LAUNCHES
+    loader.clear_plan_caches()
+    cu = _cu([1] * 8 + [3000])
+    first = _native_launch(cu, 40, arch, SMS[arch], cu[-1])
+    assert _native_launch(cu, 40, arch, SMS[arch], cu[-1]) is first
+    assert _native_launch(tuple(cu), 40, arch, SMS[arch], cu[-1]) is first
+    for extra in range(loader.V6_PLAN_CACHE_SIZE + 3):
+        other = _cu([1] * (extra % 5) + [500 + extra])
+        _native_launch(other, 40, arch, SMS[arch], other[-1])
+    assert len(cache) == loader.V6_PLAN_CACHE_SIZE
+    assert cache.total == sum(len(x.words) for x in cache.values()) <= loader.V6_LAUNCH_CACHE_BYTES
+    loader.clear_plan_caches()
+    assert len(cache) == 0 and cache.total == 0
+    memo = [
+        fn
+        for name, fn in vars(loader).items()
+        if callable(getattr(fn, "cache_info", None))
+        and (name.startswith(("_v6_", "v6_split")) or name == "_v6_launch_builds")
+    ]
+    assert memo and all(fn.cache_info().currsize == 0 for fn in memo), [
+        fn.__name__ for fn in memo if fn.cache_info().currsize
+    ]

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import array
 import collections
+import ctypes
 import functools
 import threading
 from typing import Any, NamedTuple, Optional, Union
@@ -1543,10 +1544,10 @@ def cake_chunk_gated_delta_product(
         raise ValueError(
             f"cu_seqlens_cpu must hold the {N + 1} entries of cu_seqlens, got {cu_seqlens_cpu.numel()}"
         )
-    cu_cpu: tuple[int, ...] = tuple(int(x) for x in cu_seqlens_cpu.tolist())
     if not blackwell:
+        bounds = cu_seqlens_cpu.tolist()
         longest = max(
-            (b - a for a, b in zip(cu_cpu, cu_cpu[1:], strict=False)), default=0
+            (b - a for a, b in zip(bounds, bounds[1:], strict=False)), default=0
         )
         if longest > _SM90_MAX_SEQ_LEN:
             raise ValueError(
@@ -1576,7 +1577,7 @@ def cake_chunk_gated_delta_product(
             T,
             H,
             n,
-            cu_cpu,
+            cu_seqlens_cpu,
         )
     elif v6_state is not None:
         _run_hopper_pool(
@@ -1598,9 +1599,10 @@ def cake_chunk_gated_delta_product(
             T,
             H,
             n,
-            cu_cpu,
+            tuple(int(x) for x in cu_seqlens_cpu.tolist()),
         )
     else:
+        cu_cpu: tuple[int, ...] = tuple(int(x) for x in cu_seqlens_cpu.tolist())
         _run_single_pass(
             arch,
             device,
@@ -2108,18 +2110,73 @@ _ITEM_TABLES_IN_GRAPHS: list[tuple[torch.Tensor, torch.Tensor]] = []
 _COPY_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
+def _copy_stream(index: int, device: torch.device) -> torch.cuda.Stream:
+    copy = _COPY_STREAMS.get(index)
+    if copy is None:
+        copy = _COPY_STREAMS[index] = torch.cuda.Stream(device=device)
+    return copy
+
+
+# A zeroed split workspace of at most this many bytes rides on the first upload of an eager call's item table
+_ZEROS_WITH_TABLE_MAX = 1 << 16
+
+
+def _item_table_and_zeros(key: bytes, device: torch.device, zero_bytes: int):
+    """``(_item_table(None, device, key=key), zeros)``: ``zeros`` a ``zero_bytes`` uint8 device buffer of zeros that
+    the table's upload cleared (one host-to-device copy instead of a fill launch), when the call uploads the table
+    (eager, not cached) and the buffer is small; else None.  The cached table is the word prefix of the upload."""
+
+    index = device.index or 0
+    cache_key = (index, key)
+    if (
+        zero_bytes <= 0
+        or zero_bytes > _ZEROS_WITH_TABLE_MAX
+        or zero_bytes % 4
+        or cache_key in _ITEM_TABLES_CAPTURED
+        or cache_key in _ITEM_TABLES_EAGER
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return _item_table(None, device, key=key), None
+    n, z = len(key) // 4, zero_bytes // 4
+    at = -(-n // 64) * 64  # the zeros start 256-byte aligned
+    pinned = torch.empty((at + z,), dtype=torch.int32, pin_memory=True)
+    ctypes.memmove(pinned.data_ptr(), key, len(key))
+    ctypes.memset(pinned.data_ptr() + len(key), 0, 4 * (at + z) - len(key))
+    upload = torch.empty((at + z,), dtype=torch.int32, device=device)
+    copy = _copy_stream(index, device)
+    with torch.cuda.stream(copy):
+        upload.copy_(pinned, non_blocking=True)
+    copy.synchronize()  # the table and the zeros are complete before any stream reads them
+    table = upload[:n]
+    _ITEM_TABLES_EAGER[cache_key] = table
+    if len(_ITEM_TABLES_EAGER) > _ITEM_TABLES_EAGER_MAX:
+        _ITEM_TABLES_EAGER.popitem(last=False)
+    return table, upload[at:].view(torch.uint8)
+
+
 def _item_table(
-    words: tuple[int, ...], device: torch.device, *, key: Optional[bytes] = None
+    words: Optional[tuple[int, ...]], device: torch.device, *, key: Optional[bytes] = None
 ) -> torch.Tensor:
-    """The int32 ``items`` buffer ``words`` (``v6_item_words`` on SM100 / SM103, the flat split items on SM90) on
-    ``device`` (read only): a cached complete buffer, else an upload from pinned host memory (a pageable copy would
-    synchronize the compute stream, which CUDA Graph capture refuses).  ``key`` is the bytes of ``words`` as int32
-    when the caller has them already."""
+    """The int32 ``items`` buffer ``words`` (the flat split items on SM90) on ``device`` (read only): a cached
+    complete buffer, else an upload from pinned host memory (a pageable copy would synchronize the compute stream,
+    which CUDA Graph capture refuses).  ``key`` is the bytes of ``words`` as int32 when the caller has them already;
+    ``words`` None reads the words from ``key`` (the item words of ``prefill_v6_launch`` on SM100 / SM103)."""
 
     host = None
     if key is None:
         host = torch.tensor(words, dtype=torch.int32)
         key = host.numpy().tobytes()
+
+    def pinned_words() -> torch.Tensor:
+        if host is not None:
+            return host.pin_memory()
+        if words is None:
+            # the bytes straight into pinned memory
+            pinned = torch.empty((len(key) // 4,), dtype=torch.int32, pin_memory=True)
+            ctypes.memmove(pinned.data_ptr(), key, len(key))
+            return pinned
+        return torch.tensor(words, dtype=torch.int32).pin_memory()
+
     index = device.index or 0
     cache_key = (index, key)
     table = _ITEM_TABLES_CAPTURED.get(cache_key)
@@ -2131,9 +2188,8 @@ def _item_table(
             # a complete table: the graph reads it at every replay, so it is kept and served from now on
             _ITEM_TABLES_CAPTURED[cache_key] = table
             return table
-        host = torch.tensor(words, dtype=torch.int32) if host is None else host
-        pinned = host.pin_memory()
-        table = torch.empty((len(words),), dtype=torch.int32, device=device)
+        pinned = pinned_words()
+        table = torch.empty((pinned.numel(),), dtype=torch.int32, device=device)
         table.copy_(pinned, non_blocking=True)
         _ITEM_TABLES_IN_GRAPHS.append((pinned, table))
         return table
@@ -2141,11 +2197,11 @@ def _item_table(
     if table is not None:
         _ITEM_TABLES_EAGER.move_to_end(cache_key)
         return table
-    host = torch.tensor(words, dtype=torch.int32) if host is None else host
-    table = torch.empty((len(words),), dtype=torch.int32, device=device)
-    copy = _COPY_STREAMS.setdefault(index, torch.cuda.Stream(device=device))
+    pinned = pinned_words()
+    table = torch.empty((pinned.numel(),), dtype=torch.int32, device=device)
+    copy = _copy_stream(index, device)
     with torch.cuda.stream(copy):
-        table.copy_(host.pin_memory(), non_blocking=True)
+        table.copy_(pinned, non_blocking=True)
     copy.synchronize()  # the table is complete before any stream reads it
     _ITEM_TABLES_EAGER[cache_key] = table
     if len(_ITEM_TABLES_EAGER) > _ITEM_TABLES_EAGER_MAX:
@@ -2177,10 +2233,11 @@ def _run_blackwell_v6(
     n,
     cu_cpu,
 ) -> None:
-    """One launch of the Blackwell prefill body over the item table of ``prefill_v6_plan``: the split build over
-    per-CTA row lists, or the block build (see the BLACKWELL V6 LAUNCH PLAN and its PLAN CHOOSER in the
-    registry), of the program of the call's state form (``state``: the dense FP32 programs, or the pool programs of
-    its dtype with the slot tables, the pools' slot strides and the rounding).  Every input is prepared on the
+    """One launch of the Blackwell prefill body over the item table of ``prefill_v6_launch`` (``cu_cpu``: the CPU
+    offsets tensor): the split build over per-CTA row lists, or the block build (see the BLACKWELL V6 LAUNCH PLAN,
+    its PLAN CHOOSER and the NATIVE PLAN CHOOSER in the registry), of the program of the call's state form
+    (``state``: the dense FP32 programs, or the pool programs of its dtype with the slot tables, the pools' slot
+    strides and the rounding).  Every input is prepared on the
     device or uploaded from pinned memory: the call issues no synchronization and captures into a CUDA graph (the
     item table cached on the device after an eager call of the same batch, the split build's workspace cleared in
     the graph, then the kernel)."""
@@ -2197,28 +2254,29 @@ def _run_blackwell_v6(
         else:
             output_in.zero_()
         return
-    plan = _loader.prefill_v6_plan(
+    launch = _loader.prefill_v6_launch(
         cu_cpu,
         num_heads=H,
         num_householder=n,
         sm_count=sm_count,
         arch=arch,
         total_tokens=T,
+        state_dtype=state.dtype,
+        pool=state.pool,
     )
-    name = _loader.selected_v6_module(
-        arch, plan, state_dtype=state.dtype, pool=state.pool
-    )
+    name = launch.name
     if mask & _CU_SEQLENS_INT64:
         # the body reads int32 offsets: one small copy of the N + 1 entries
         cu_in = cu_in.view(torch.int64).to(torch.int32)
     # the rows, the CTAs' row offsets and the planned offsets the kernel checks against the device ``cu_seqlens``
-    items = _item_table(_loader.v6_item_words(arch, plan, cu_cpu), device)
-    if plan.split:
+    if launch.split:
         # the N x H seed-done flags (the kernel leaves them zero) and two plan-echo words per row, zero at launch
-        split_ws = torch.zeros(
-            (4 * (N * H + 2 * len(plan.rows)),), dtype=torch.uint8, device=device
-        )
+        ws_bytes = 4 * (N * H + 2 * launch.num_items)
+        items, split_ws = _item_table_and_zeros(launch.words, device, ws_bytes)
+        if split_ws is None:
+            split_ws = torch.zeros((ws_bytes,), dtype=torch.uint8, device=device)
     else:
+        items = _item_table(None, device, key=launch.words)
         split_ws = torch.empty(
             (_loader.V6_SPLIT_WS_PLACEHOLDER,), dtype=torch.uint8, device=device
         )
@@ -2245,12 +2303,12 @@ def _run_blackwell_v6(
         "initial_state": initial_in if initial_in is not None else placeholder,
         "output_state": output_in if output_in is not None else placeholder,
         "tensormap_workspace": torch.empty(
-            (plan.grid * _loader.V6_TENSORMAP_BYTES,), dtype=torch.uint8, device=device
+            (launch.grid * _loader.V6_TENSORMAP_BYTES,), dtype=torch.uint8, device=device
         ),
         "split_workspace": split_ws,
         "state_stride_slot": H * _STATE_ELEMENTS,
         "scale": scale_value,
-        "num_items": len(plan.rows),
+        "num_items": launch.num_items,
         "total_tokens": T,
         "num_heads": H,
         "num_householder": n,
@@ -2274,7 +2332,7 @@ def _run_blackwell_v6(
             heads=H,
             device_index=device_index,
             # the plan's grid (min(SM count, grid) == grid)
-            tiles=plan.grid,
+            tiles=launch.grid,
             sm_count=sm_count,
         )
 
