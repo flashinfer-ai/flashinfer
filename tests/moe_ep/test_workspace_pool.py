@@ -29,6 +29,8 @@ def _pool():
 
 @pytest.fixture(autouse=True)
 def _isolate_pool(monkeypatch):
+    # A parallel tuner must not change the configuration between warmups.
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     wp = _pool()
     monkeypatch.setattr(wp, "_POOL", {})
     monkeypatch.setattr(wp, "_KEY_BY_ID", {})

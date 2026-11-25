@@ -503,6 +503,7 @@ def test_mm_bf16_cute_dsl_warp_splitk_pdl_waits_for_bias():
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
     bias = torch.randn((n,), device="cuda", dtype=torch.bfloat16)
+    bias[:2] = 8.0
     tactic = default_tactic(m, n, k)
 
     def run():
@@ -511,11 +512,15 @@ def test_mm_bf16_cute_dsl_warp_splitk_pdl_waits_for_bias():
 
     expected = run()
 
-    # The first two bias elements are what the previous kernel is still producing.
-    # No other kernel may run between that producer and the GEMM.
     words = bias.view(torch.int32)[:1]
     value = words.item()
     words.fill_(0)
+    stale_bias_out = run()
+    # BF16 rounding must not hide a premature read of the zeroed bias word.
+    assert not torch.equal(stale_bias_out[:, :2], expected[:, :2])
+
+    # The first two bias elements are what the previous kernel is still producing.
+    # No other kernel may run between that producer and the GEMM.
     late_store(words, value)
     out = run()
 

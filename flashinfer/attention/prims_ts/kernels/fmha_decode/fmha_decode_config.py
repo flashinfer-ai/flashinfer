@@ -1082,6 +1082,23 @@ class FmhaDecodeConfig:
         return self.share_pattern_across_kv_heads
 
     @property
+    def uses_longest_first_route_order(self) -> bool:
+        """Persistent grouped QToken routes take CLC work longest first.
+
+        The metadata kernel then writes ``route_order`` (route IDs by
+        descending KV128 tiles) right after the per-route lengths, and the
+        work queue maps CLC index i to ``route_order[i]``: long routes start
+        in the first wave instead of extending the last.
+        """
+        return (
+            self.balanced_scheduler
+            and self.use_q_token_kv_block_sparse_route
+            and self.use_persistent_scheduler
+            and self.shares_sparse_pattern
+            and not self.fixed_seqlen
+        )
+
+    @property
     def widens_sparse_metadata_rows_per_head(self) -> bool:
         """Whether a nonpersistent CTA offsets per-head metadata to its KV head
         and widens the row strides to ``Hkv`` rows (one row per batch)."""
@@ -1801,9 +1818,46 @@ class FmhaDecodeConfig:
         Fragments of at least 128 bytes stay dense.
         """
         live_bytes = self.num_tokens_per_page * self.smem_kv_sf_bytes_per_token
-        if not self.use_paged_kv or live_bytes % 128 == 0:
+        if (
+            not self.use_paged_kv
+            or live_bytes % 128 == 0
+            or self.uses_nvfp4_scale_gather4
+        ):
             return live_bytes
         return (live_bytes + 127) // 128 * 128
+
+    @property
+    def uses_nvfp4_scale_gather4(self) -> bool:
+        """Whether the Keeps raw ring gathers four fragments' scales per copy.
+
+        Compact scale tensors make each page fragment's scale rows one
+        contiguous row of a flat 2-D map (D256 four-token fragments: 64
+        bytes), so one TMA gather4 stages four selected fragments back to back
+        where 4-D copies need one instruction per fragment. With separate
+        scale tensors those copies doubled the raw ring's TMA issues, which
+        bound the one-stage Q128 ring (GB300, 16 Q heads per KV head, G8:
+        about 7% of the attention time). Each lane-parallel loader warp
+        stages a multiple of four fragments; gather4 slots are the live 64
+        bytes, 256-byte aligned per copy.
+        """
+        if not (
+            self.flat_nvfp4_scale_num_heads > 0
+            and self.uses_keeps_transformed_kv
+            and self.uses_nvfp4_scale_tensors
+            and self.use_paged_kv
+            and self.sf_tma_reshape_factor == 1
+            and self.load_num_warps > 1
+        ):
+            return False
+        fragments = self.tile_size_kv // self.num_tokens_per_page
+        per_warp = fragments // min(fragments, self.load_num_warps)
+        fragment_bytes = self.num_tokens_per_page * self.smem_kv_sf_bytes_per_token
+        return (
+            per_warp % 4 == 0
+            and per_warp <= 32
+            and fragment_bytes % 32 == 0
+            and fragment_bytes // 4 <= 256
+        )
 
     @property
     def smem_kv_sf_tile_bytes(self) -> int:
@@ -2390,6 +2444,10 @@ class FmhaDecodeConfig:
     # Enable persistent scheduling: one physical worker may consume multiple
     # logical work tiles. Mutually exclusive with split-KV mode.
     use_persistent_scheduler: bool = False
+    # Balanced persistent scheduling: CLC hands out work tiles longest first
+    # (QToken routes: the metadata kernel writes their order after seq_lens).
+    # Resolved by the plan; part of the compile signature.
+    balanced_scheduler: bool = False
     # Split-KV: split the K-sequence across several CTAs that produce partial
     # O/stats, with a GMEM reduction epilogue.
     use_split_kv: bool = False
@@ -2419,6 +2477,10 @@ class FmhaDecodeConfig:
     use_flat_native_kv_tma: bool = False
     # Prepared locators count the complete physical head span between pages.
     flat_native_kv_num_heads: int = 1
+    # KV heads of compact NVFP4 scale tensors viewed as one 2-D map of page
+    # fragment rows (FmhaDecodeConfig.uses_nvfp4_scale_gather4); 0 keeps the
+    # 4-D per-fragment scale copies.
+    flat_nvfp4_scale_num_heads: int = 0
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
     max_num_pages_per_seq_kv: int = 1
