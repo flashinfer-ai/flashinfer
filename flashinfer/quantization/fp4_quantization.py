@@ -188,6 +188,9 @@ def _e2m1_and_ufp8sf_scale_to_float_cpu(
     # Map 4-bit codes to float via LUT
     float_vals = _get_e2m1_values(device)[fp4_vals.long()]  # [M, K]
 
+    # [M, K / sf_vec_size] scales, or flat as the host module takes them
+    ufp8_scale_tensor = ufp8_scale_tensor.reshape(m, k // sf_vec_size)
+
     # Decode UFP8 scale factors
     if ufp8_type == 1:
         # E4M3: interpret raw bytes as float8_e4m3fn
@@ -1559,7 +1562,7 @@ def e2m1_and_ufp8sf_scale_to_float(
     major, minor = get_compute_capability(
         torch.device("cuda:0")
     )  # select any cuda device to get a compute capability
-    if major < 8:
+    if major * 10 + minor < 90 and (major < 8 or not is_sf_swizzled_layout):
         # No kernel available; use pure-PyTorch fallback
         return _e2m1_and_ufp8sf_scale_to_float_cpu(
             e2m1_tensor,
@@ -1570,7 +1573,7 @@ def e2m1_and_ufp8sf_scale_to_float(
             is_sf_swizzled_layout,
         )
     if major < 10 and global_scale_tensor is None:
-        # As in the host fallback SM80 to SM89 took before: no global scale is 1.0.
+        # As in the host fallback above: no global scale is 1.0.
         global_scale_tensor = torch.ones(1, dtype=torch.float32)
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(

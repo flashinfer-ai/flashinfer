@@ -2069,13 +2069,13 @@ def cutlass_fused_moe(
         if codes and not swizzled_input_sf:
             # NVFP4's K / 16 bytes a token, MXFP8's K / 32: the leading tokens', as SM100 reads
             tokens, cols = input.shape[0], input.shape[1] // (32 if fp8 else 8)
-            x_sf = input_sf.view(torch.uint8).reshape(-1)
-            if x_sf.numel() < tokens * cols:
+            if input_sf.element_size() != 1 or input_sf.numel() < tokens * cols:
                 raise ValueError(
-                    f"input_sf holds {x_sf.numel()} linear block scales, fewer than "
-                    f"{tokens} tokens of {cols}."
+                    f"input_sf must hold a byte per linear block scale, {tokens} tokens of "
+                    f"{cols} at least; got {input_sf.dtype} {tuple(input_sf.shape)}."
                 )
-            x_sf = x_sf[: tokens * cols].view(tokens, cols)
+            x_sf = input_sf.view(torch.uint8).reshape(-1)[: tokens * cols]
+            x_sf = x_sf.view(tokens, cols)
         inputs = [x, ids, token_final_scales, r1, alpha1, r2, alpha2, dst]
         if w4a4:
             inputs += [x_sf if codes else quant_scales[0], quant_scales[3]]
@@ -2674,6 +2674,13 @@ def _records_moe(
     activations) the quantizers run the 4over6 ``recipe``, without fast math under
     FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH (or TRTLLM_...), read each call as on SM100."""
     x, r1, alpha1, r2, alpha2 = (inputs[i] for i in (0, 3, 4, 5, 6))
+    given = [*inputs, *(() if ext is None else vars(ext).values())]
+    if any(  # as SM100's launchers: every tensor on the input's device
+        isinstance(t, torch.Tensor) and t.device != x.device
+        for v in given
+        for t in (v if isinstance(v, tuple) else (v,))
+    ):
+        raise ValueError("Below SM100 the MoE's tensors must be on the input's device.")
     experts = r1.shape[0]
     hidden = (ext or _RecordsExt(0)).hidden(x)
     rows1 = intermediate_size * (2 if gated else 1)

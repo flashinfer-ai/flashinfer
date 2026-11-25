@@ -219,6 +219,8 @@ def test_w4a4(recipe, gated, tokens):
     outs = [cutlass(codes, input_sf=sf, swizzled_input_sf=False)]
     # the leading tokens of a longer buffer, at K / 16 bytes a token as SM100 reads them
     outs.append(cutlass(codes, input_sf=torch.cat((sf, sf)), swizzled_input_sf=False))
+    with pytest.raises(ValueError, match="a byte per linear block scale"):
+        cutlass(codes, input_sf=sf.float(), swizzled_input_sf=False)
     outs.append(cutlass(codes, input_sf=swizzled))
     if tokens == 37 and not recipe:  # tuned, the E4M3 scales as vLLM passes them
         with autotune():
@@ -466,7 +468,7 @@ def test_valid_sizes(gated):
 @pytest.mark.parametrize("width", [H - 128, H - 2])
 def test_narrow_output(width):
     """Without valid sizes a narrower TRT-LLM output receives the leading columns, as on SM100;
-    an output, input or record one off 16 B, a CuTe-DSL output of other rows or type and routing of
+    an output on another device, an output, input or record one off 16 B, a CuTe-DSL output of other rows or type and routing of
     other shapes (CuTe-DSL, TRT-LLM, cutlass) are refused."""
     m = _model(True)
     tokens = 37
@@ -480,6 +482,8 @@ def test_narrow_output(width):
     off = x.new_empty(tokens * H + 1)[1:].view(tokens, H)  # one element off 16 B
     with pytest.raises(RuntimeError, match="16 B aligned"):
         _trt(*args, output=off)
+    with pytest.raises(ValueError, match="input's device"):
+        _trt(*args, output=buf.cpu())
     with pytest.raises(RuntimeError, match="act and records must be 16 B aligned"):
         _trt(m, off.copy_(x), *args[2:])
     r1 = m["r1"].new_empty(m["r1"].numel() + 1)[1:].view(m["r1"].shape).copy_(m["r1"])

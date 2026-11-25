@@ -1236,6 +1236,8 @@ def test_nvfp4_quantize_roundtrip(
         ufp8_type=1,
         is_sf_swizzled_layout=is_swizzled,
     )
+    if not is_swizzled and get_compute_capability(torch.device(device))[0] < 9:
+        assert dq_out.device == quant_out.device  # upstream's fallback below SM90
     dq_out = dq_out.to(device)
     if per_token_activation:
         dq_out *= per_token_scale.view(-1, 1)
