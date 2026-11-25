@@ -326,12 +326,22 @@ The 128-row policy is based on SM100 measurements; SM103 is supported by the
 upstream kernel but has not been performance-qualified for this policy.
 
 ``block_tables`` contains physical token indices into the flattened packed KV
-pool, with one selected list per query row. The caller must encode request
-boundaries and causality in these lists. Invalid indices are masked; duplicate
-indices count as separate softmax slots. Optional ``sparse_mla_top_k_lens``
-limits the active prefix of each list. The backend views contiguous Q/KV
-without gathering the cache and handles selected widths not divisible by 64.
-Empty selections return zero output and positive-infinity LSE.
+pool, with one selected list per query row. Invalid indices are masked. Duplicate
+indices count as separate softmax slots. For QK576, when
+``sparse_mla_top_k_lens`` is omitted and ``seq_lens`` is supplied, cuDNN uses
+at most the first ``max(seq_lens[b] - q_len + t + 1, 0)`` slots of the list
+for query position ``t`` (zero-based) in request ``b``. The request's query
+length ``q_len`` is ``q_len_per_request`` for fixed queries and comes from
+``cum_seq_lens_q`` for compact queries. This bound applies to slot positions
+in the list. The caller must encode request boundaries and causality in the
+listed physical token IDs.
+
+An explicit ``sparse_mla_top_k_lens`` tensor supplies the active prefix
+length for each query row and overrides the QK576 bound from ``seq_lens``.
+QK512 uses all valid slots when explicit lengths are omitted. The backend
+views contiguous Q/KV without gathering the cache and handles selected
+widths not divisible by 64. Empty selections return zero output and
+positive-infinity LSE.
 
 Pass the model's attention scale as ``bmm1_scale`` (for example, ``1/16`` for
 GLM-5.3). ``bmm2_scale`` must be 1. Sinks, DCP, explicit PDL, skip-softmax,

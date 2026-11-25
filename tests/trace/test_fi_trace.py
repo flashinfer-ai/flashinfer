@@ -1827,6 +1827,65 @@ def test_trtllm_mla_sparse_fi_trace_selected_prefix(
         assert regenerated["name"] == serialized["name"]
 
 
+@pytest.mark.parametrize("explicit_lengths", [False, True])
+def test_sparse_mla_exported_init_matches_definition(explicit_lengths):
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    prefix = "trtllm_batch_decode_mla_sparse"
+    if explicit_lengths:
+        prefix += "_with_lengths"
+    path = (
+        Path(__file__).parent
+        / "fi_trace_out"
+        / f"{prefix}_h64_d_qk576_ckv512_kpe64_nope192_ps32_topk2048.json"
+    )
+    definition = json.loads(path.read_text())
+    namespace = {}
+    exec(definition["init"], namespace)
+    axes = dict(batch_size=2, q_len_per_request=3, num_pages=2, workspace_size=4096)
+    if explicit_lengths:
+        axes["num_query_rows"] = 6
+    inputs = namespace["_trtllm_batch_decode_mla_sparse_init"](device="cpu", **axes)
+    assert inputs["query"].shape == (2, 3, 64, 576)
+    assert inputs["kv_cache"].shape == (2, 1, 32, 576)
+    assert inputs["qk_nope_head_dim"] == 192
+    assert trtllm_batch_decode_with_kv_cache_mla.fi_trace(**inputs) == definition
+
+
+@pytest.mark.parametrize(
+    ("qk_rope_head_dim", "rows", "backend"),
+    [(64, 127, "cudnn"), (64, 128, "auto"), (0, 127, "auto")],
+)
+def test_sparse_mla_explicit_length_init_replay_route(qk_rope_head_dim, rows, backend):
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    from flashinfer.trace.templates.attention import (
+        trtllm_batch_decode_mla_sparse_with_lengths_trace,
+    )
+
+    inputs = trtllm_batch_decode_mla_sparse_with_lengths_trace.init(
+        batch_size=rows,
+        q_len_per_request=1,
+        num_query_rows=rows,
+        num_heads=64,
+        head_dim_qk=512 + qk_rope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=192 if qk_rope_head_dim else 512,
+        num_pages=1,
+        page_size=32,
+        sparse_mla_top_k=4,
+        workspace_size=1 << 20,
+        device="cpu",
+    )
+    if backend == "cudnn":
+        # On CPU, the real explicit dispatch reaches cuDNN's device gate. Auto
+        # skips cuDNN below the crossover and rejects the QK576 lengths instead.
+        with pytest.raises(
+            ValueError, match="cudnn sparse MLA requires an SM100 or SM103 GPU"
+        ):
+            trtllm_batch_decode_with_kv_cache_mla(**inputs)
+    assert inputs.get("backend", "auto") == backend
+
+
 def test_trtllm_mla_prefill_fi_trace_only_changes_public_api_tag():
     import flashinfer.mla
     import flashinfer.prefill

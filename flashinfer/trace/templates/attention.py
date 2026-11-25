@@ -4889,7 +4889,23 @@ def _trtllm_batch_decode_mla_sparse_init(
         )
         lengths[1::2] = sparse_mla_top_k // 2
         inputs["sparse_mla_top_k_lens"] = lengths
+        # Only cuDNN accepts explicit lengths at QK576. Auto skips it below
+        # the 128-row crossover in flashinfer.mla._cudnn_sparse.
+        if head_dim_qk == 576 and num_query_rows < 128:
+            inputs["backend"] = "cudnn"
     return inputs
+
+
+_trtllm_batch_decode_mla_sparse_init._trace_init_const_axes = (  # type: ignore[attr-defined]
+    "num_heads",
+    "head_dim_qk",
+    "kv_lora_rank",
+    "qk_rope_head_dim",
+    "qk_nope_head_dim",
+    "kv_pad_dim",
+    "page_size",
+    "sparse_mla_top_k",
+)
 
 
 def _trtllm_batch_decode_mla_ragged_init(

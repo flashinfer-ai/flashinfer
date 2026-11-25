@@ -31,13 +31,16 @@ _operations: dict[tuple, Any] = {}
 
 @functools.cache
 def _get_sparse_attention_forward():
-    # cuDNN is optional. Missing/older installations must not break auto or
-    # import FlashInfer's dense cuDNN graph backend on this path.
+    # cuDNN is optional. Keep the probe local to the sparse backend.
     try:
         import cudnn
         from packaging.version import Version
 
-        if Version(cudnn.__version__) < Version("1.32.0"):
+        try:
+            frontend_version = Version(cudnn.__version__)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if frontend_version < Version("1.32.0"):
             return None
         from cudnn import DSA
 
