@@ -2381,6 +2381,7 @@ kernel_cake_gdp_245414df8449fb1825a1(const __grid_constant__ CUtensorMap Q, cons
                         float beta_m = smem_beta[gate_elem_base + m_col];
                         nv[j_4] = __fmaf_rn(-beta_m, v_val, nv[j_4]);
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                     v_stage_cg1 += 1;
                     if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
@@ -3154,6 +3155,7 @@ kernel_cake_gdp_245414df8449fb1825a1(const __grid_constant__ CUtensorMap Q, cons
                         float beta_m_1 = smem_beta[gate_elem_base_0 + m_col_1];
                         nv[j_7] = __fmaf_rn(-beta_m_1, v_val_1, nv[j_7]);
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                     v_stage_cg1 += 1;
                     if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
@@ -3929,6 +3931,7 @@ kernel_cake_gdp_245414df8449fb1825a1(const __grid_constant__ CUtensorMap Q, cons
                             float beta_m_2 = smem_beta[gate_elem_base_1 + m_col_2];
                             nv[j_10] = __fmaf_rn(-beta_m_2, v_val_2, nv[j_10]);
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                         v_stage_cg1 += 1;
                         if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
@@ -4702,6 +4705,7 @@ kernel_cake_gdp_245414df8449fb1825a1(const __grid_constant__ CUtensorMap Q, cons
                             float beta_m_3 = smem_beta[gate_elem_base_2 + m_col_3];
                             nv[j_13] = __fmaf_rn(-beta_m_3, v_val_3, nv[j_13]);
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                         v_stage_cg1 += 1;
                         if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
