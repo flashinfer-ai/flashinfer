@@ -17,7 +17,7 @@ name = "flashinfer-python"
 dynamic = ["version", "dependencies"]
 description = "FlashInfer: Kernel Library for LLM Serving"
 # Keep the lower bound in sync with .python-version.
-requires-python = ">=3.10,<4.0"
+requires-python = ">=3.11,<4.0"
 authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
@@ -135,6 +135,7 @@ exclude = [
   "_build_meta.py",
   "mla_kv_pack_fp8_workloads.json",
   "top_p_renorm_probs_specialized_workloads.json",
+  "mm_mxfp8_specialized_sm107_workloads.json",
 ]
 # Provider export records and retained patch files accompany their sources.
 "flashinfer.moe_ep.kernels.cutedsl_megamoe" = ["*.md", "*.json", "patches/*.patch"]
@@ -220,7 +221,7 @@ exclude = [
 [tool.mypy]
 files = ["flashinfer"]
 # Keep this literal in sync with .python-version.
-python_version = "3.10"
+python_version = "3.11"
 ignore_missing_imports = true
 show_column_numbers = true
 show_error_context = true

@@ -374,6 +374,47 @@ def _keeps_tcgen05_ld(
 
 
 @cute.jit
+def _keeps_o_tail_tcgen05_ld(
+    cfg: Constexpr[FmhaDecodeConfig],
+    tmem_addr,
+    *,
+    num: Constexpr[int],
+    offset: Constexpr[int],
+):
+    """Load final Keeps O columns owned by a correction lane.
+
+    Contiguous O uses the tileSizeQ-specific shape with the headdim/2 half
+    split. Lane-panel D512 O keeps logical columns [256, 512) in lanes 16-31
+    at the physical columns of [0, 256), so a 32x32b load gives threads 0-15
+    and 16-31 the same logical column ownership as that half split.
+    """
+    if cutlass.const_expr(cfg.keeps_o_uses_lane_panels):
+        vals = prims.tcgen05_ld("32x32b", tmem_addr, num=num)
+        if cutlass.const_expr(cfg.uses_permuted_packed_v_order):
+            return _EvenOddColumns(vals, num)
+        return vals
+    return _keeps_tcgen05_ld(cfg, tmem_addr, num=num, offset=offset)
+
+
+class _EvenOddColumns:
+    """Logical-order view of O columns stored even-then-odd per group of 8.
+
+    Physical position 8g + j holds logical column 8g + 2j (j < 4) or
+    8g + 2(j - 4) + 1. Indexing is compile-time only, so the reorder is free
+    register renaming, and elements are read where the caller reads them
+    (after its tcgen05 wait).
+    """
+
+    def __init__(self, vals, num: int) -> None:
+        assert num % 8 == 0
+        self._vals = vals
+
+    def __getitem__(self, col: int):
+        group, r = divmod(col, 8)
+        return self._vals[group * 8 + r // 2 + 4 * (r % 2)]
+
+
+@cute.jit
 def _keeps_tcgen05_st(
     cfg: Constexpr[FmhaDecodeConfig],
     tmem_addr,
@@ -975,6 +1016,35 @@ def load_nvfp4_row_scale_words(
     of page fragments below 128 bytes.
     """
     sf_tile_bytes = cfg.smem_kv_sf_tile_bytes
+    if cutlass.const_expr(cfg.uses_stage_sliced_nvfp4_sf):
+        # Stage-sliced scales (dense page fragments): K keeps the 16 B half
+        # row per token, V the stage's 32 B per 4-token group.
+        if cutlass.const_expr(not is_v):
+            k_scales = cutlass.Array(
+                src_sf_base.data_ptr(),
+                dtype=Int64,
+                shape=(cfg.sf_stage_tile_bytes(False) // 8,),
+                addrspace=3,
+            )
+            pair = k_scales[row * Int32(2) + (Int32(head_dim_stage_idx) & Int32(1))]
+            return Int32(pair), Int32(pair >> Int64(32))
+        v_scales = cutlass.Array(
+            src_sf_base.data_ptr(),
+            dtype=Int32,
+            shape=(cfg.sf_stage_tile_bytes(True) // 4,),
+            addrspace=3,
+        )
+        v_base = (row >> Int32(2)) * Int32(8)
+        v_words = [v_scales[v_base + Int32(i)] for i in range(8)]
+        v_token = row & Int32(3)
+        return (
+            gather_byte_of_words(
+                v_words[0], v_words[1], v_words[2], v_words[3], v_token
+            ),
+            gather_byte_of_words(
+                v_words[4], v_words[5], v_words[6], v_words[7], v_token
+            ),
+        )
     if cutlass.const_expr(not is_v):
         scales = cutlass.Array(
             src_sf_base.data_ptr(),

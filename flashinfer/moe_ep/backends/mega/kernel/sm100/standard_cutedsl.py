@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,11 +20,16 @@ from .....core.validation.common import (
     validate_mega_fleet_params,
 )
 from .....weights import PrequantizedMoEWeights
+from ..weight_validation import check_transformed_mega_weights_structure
 from .genphase_config import GenphaseConfigMixin
 
 from .common.activation_batch_invariant import batch_invariant_numerical_metadata
 
 if TYPE_CHECKING:
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+        Sm100BlockScaledMoeConfig,
+    )
+
     from .mxfp8_mxfp4_bf16_cutedsl.config import (
         Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
@@ -43,6 +49,8 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     )
     supports_output_view = True
     supports_auto_workspaces = True
+    supports_live_token_tuning = True
+    _workspace_mismatch = "Standard configuration differs across EP ranks"
     quant_kind: str | None = None
 
     def __init__(self, config):
@@ -58,7 +66,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             )
         if config.kernel_variant == "genphase":
             self._init_genphase_config()
-        self.supports_live_token_tuning = config.kernel_variant == "genphase"
+        self._standard_profiles: dict[tuple, Sm100BlockScaledMoeConfig] = {}
         if config.knobs not in (None, "auto") and not isinstance(config.knobs, dict):
             raise MoEEpConfigError("knobs must be a dictionary, 'auto', or None.")
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
@@ -79,18 +87,36 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return get_tuned_knobs(workspace)
 
     def live_token_buckets(self, fleet_params):
-        if (
-            self._config.kernel_variant != "genphase"
-            or self._config.knobs is not None
-            or self._genphase_constraints()
-            or not torch.cuda.is_available()
-        ):
+        if self._config.knobs is not None or not torch.cuda.is_available():
             return []
+        if self._config.kernel_variant == "genphase":
+            if self._genphase_constraints():
+                return []
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+                genphase_live_token_buckets,
+            )
+
+            return genphase_live_token_buckets(self._genphase_base_config(fleet_params))
         from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
-            genphase_live_token_buckets,
+            knob_cache,
         )
 
-        return genphase_live_token_buckets(self._genphase_base_config(fleet_params))
+        config = self._standard_base_config(fleet_params)
+        return knob_cache.live_token_buckets(
+            config, constraints=self._standard_cache_constraints(config, fleet_params)
+        )
+
+    def _standard_cache_constraints(self, config, fleet):
+        if not self._config.enable_in_kernel_fc2_reduce:
+            return {"reduce_topk_in_kernel": False}
+        # Turning off in-kernel reduction would require a different finalizer
+        # and therefore a different cache key for a persistent request.
+        if (
+            config.reduce_topk_in_kernel
+            and self._finalize_mode(fleet) is FinalizeMode.PERSISTENT
+        ):
+            return {"reduce_topk_in_kernel": True}
+        return None
 
     def _finalize_mode(self, fleet):
         """Resolve AUTO for inference; GenPhase requires default finalization."""
@@ -144,6 +170,42 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         )
         self._workspace_config(fleet_params)
 
+    def _gather_workspace_proposals(self, error, proposal=None):
+        """Share preparation errors before returning the ranks' proposals."""
+        import torch.distributed as dist
+
+        reports = [None] * self.ep_world_size
+        dist.all_gather_object(reports, (error, proposal), group=self.ep_comm_group)
+        failures = [
+            f"rank {rank}: {error}"
+            for rank, (error, _) in enumerate(reports)
+            if error is not None
+        ]
+        if failures:
+            raise MoEEpConfigError(
+                "Workspace preparation failed on EP ranks: " + "; ".join(failures)
+            )
+        return [proposal for _, proposal in reports]
+
+    def _workspace_proposal(self, fleet_params):
+        config = self._workspace_config(fleet_params)
+        return dataclasses.replace(config, rank=0)
+
+    def _workspace_pool_request(self, fleet_params):
+        """Agree on tuning mode and geometry before any rank checks the pool."""
+        if self._config.kernel_variant == "inference" and self.ep_world_size > 1:
+            error, proposal = None, None
+            try:
+                knobs = self._config.knobs
+                mode = "explicit" if isinstance(knobs, dict) else knobs
+                proposal = mode, self._workspace_proposal(fleet_params)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            proposals = self._gather_workspace_proposals(error, proposal)
+            if any(p != proposal for p in proposals):
+                raise MoEEpConfigError(self._workspace_mismatch)
+        return super()._workspace_pool_request(fleet_params)
+
     def _default_knobs(self, fleet):
         """Return the inherited block-scaled profile for this buffer capacity."""
         if getattr(self._config, "batch_invariant", False):
@@ -166,11 +228,34 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         )
 
     def _workspace_config(self, fleet):
-        """Resolve GenPhase geometry or translate inference knobs to native options."""
+        """Resolve a fixed profile or the initial geometry for automatic tuning."""
         if self._config.kernel_variant == "genphase":
             config = self._genphase_config(fleet)
             self._check_genphase_selection(config)
             return config
+        config = self._standard_base_config(fleet)
+        if self._config.knobs is not None or not torch.cuda.is_available():
+            return config
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            knob_cache,
+        )
+
+        key = (config, fleet.tuning_live_tokens, torch.cuda.current_device())
+        # Workspace pooling and allocation must use the same selection even if
+        # another process updates the cache after this profile is resolved.
+        if key not in self._standard_profiles:
+            knobs = knob_cache.lookup_knobs(
+                config,
+                live_tokens=fleet.tuning_live_tokens,
+                constraints=self._standard_cache_constraints(config, fleet),
+            )
+            self._standard_profiles[key] = (
+                dataclasses.replace(config, **knobs) if knobs is not None else config
+            )
+        return self._standard_profiles[key]
+
+    def _standard_base_config(self, fleet):
+        """Translate fixed overrides or capacity defaults to native options."""
         from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             Sm100BlockScaledMoeConfig,
         )
@@ -713,6 +798,22 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
 class StandardNvfp4Backend(_StandardBlockScaledBackend):
     quant_kind = "nvfp4"
 
+    def prepare_transformed_weights(self, transformed_weights, bootstrap, fleet_params):
+        check_transformed_mega_weights_structure(transformed_weights)
+        prepared = []
+        for leg in transformed_weights:
+            weight, scale = leg
+            # Older callers supplied E4M3 scales as byte views.
+            if isinstance(scale, torch.Tensor) and scale.dtype == torch.uint8:
+                leg = (weight, scale.view(torch.float8_e4m3fn))
+            prepared.append(leg)
+        fc1, fc2 = prepared
+        if fc1 is not transformed_weights[0] or fc2 is not transformed_weights[1]:
+            transformed_weights = (fc1, fc2)
+        return super().prepare_transformed_weights(
+            transformed_weights, bootstrap, fleet_params
+        )
+
     @classmethod
     def kernel_name(cls):
         return "sm100_nvfp4_nvfp4_bf16_cutedsl"
@@ -728,6 +829,9 @@ class StandardMxfp8Backend(_StandardBlockScaledBackend):
 @register_mega_kernel("sm100_mxfp8_mxfp4_bf16_cutedsl")
 class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
     quant_kind = "mxfp4_mxfp8"
+    _workspace_mismatch = (
+        "MXFP4 configuration or active cluster count differs across EP ranks"
+    )
 
     # Expected rows per expert = world_size * capacity * top_k / num_experts.
     # Capacity determines the profile, including underfilled graph replays.
@@ -753,23 +857,6 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
             torch.cuda.current_stream()
             return max_active_clusters(cluster_size)
 
-    def _gather_workspace_proposals(self, error, proposal=None):
-        """Share preparation errors before returning the ranks' proposals."""
-        import torch.distributed as dist
-
-        reports = [None] * self.ep_world_size
-        dist.all_gather_object(reports, (error, proposal), group=self.ep_comm_group)
-        failures = [
-            f"rank {rank}: {error}"
-            for rank, (error, _) in enumerate(reports)
-            if error is not None
-        ]
-        if failures:
-            raise MoEEpConfigError(
-                "MXFP4 workspace preparation failed on EP ranks: " + "; ".join(failures)
-            )
-        return [proposal for _, proposal in reports]
-
     def validate_init(self, bootstrap, fleet_params):
         """Coordinate validation failures when the EP group is available."""
         self._ensure_ep_bootstrap(bootstrap)
@@ -788,30 +875,10 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
             error = f"{type(exc).__name__}: {exc}"
         self._gather_workspace_proposals(error)
 
-    def prepare_workspace(self, bootstrap, fleet_params):
-        """Agree on workspace proposals or local failures before pool lookup."""
-        self._ensure_ep_bootstrap(bootstrap)
-        if self._config.kernel_variant == "inference" and self.ep_world_size > 1:
-            import dataclasses
-
-            error, proposal = None, None
-            try:
-                config = self._workspace_config(fleet_params)
-                cluster = config.cluster_shape_mn
-                proposal = (
-                    dataclasses.replace(config, rank=0),
-                    self._active_clusters(cluster[0] * cluster[1]),
-                )
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            # Agree before pool lookup so every rank participates even when
-            # a peer's probe failed or another layer owns a matching workspace.
-            proposals = self._gather_workspace_proposals(error, proposal)
-            if any(p != proposal for p in proposals):
-                raise MoEEpConfigError(
-                    "MXFP4 configuration or active cluster count differs across EP ranks"
-                )
-        return super().prepare_workspace(bootstrap, fleet_params)
+    def _workspace_proposal(self, fleet_params):
+        config = super()._workspace_proposal(fleet_params)
+        m, n = config.cluster_shape_mn
+        return config, self._active_clusters(m * n)
 
     def _default_knobs(self, fleet):
         """Choose MXFP4 defaults by expert fill and FC1 work per cluster."""

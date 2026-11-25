@@ -74,7 +74,6 @@ from ...helpers.math import (
     smem_atomic_max_u32,
     u32_to_float_for_atomic_max,
 )
-from ...helpers.mask import MaskType
 from ...helpers.gather import invalid_sparse_token, cache_sparse_mask
 from ...helpers.ops import (
     float_to_u32_bits,
@@ -89,7 +88,9 @@ from ...helpers.tile import (
     batch_idx_for_stage_cfg,
     cta_idx_kv_for_stage,
     cta_idx_q_for_stage,
+    cta_rows_have_distinct_kv_prefix,
     global_kv_tile_idx,
+    kv_tile_needs_mask,
     runtime_seq_len_kv_for_query_row,
     runtime_seq_len_kv_from_task_cache,
     softmax_kv_tile_idx,
@@ -525,7 +526,6 @@ class TmemSResource(MlaResource):
             task_cache=task_cache,
         )
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
-        next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         raw_mask_routes = (
             self.page_offsets.select_source_tile(
                 tile_offset_k, batch_idx, for_mask=True
@@ -618,26 +618,13 @@ class TmemSResource(MlaResource):
                 for i in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     s_vals[i] *= scale
 
-        should_apply_dense_mask = (
-            (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
-        ) or (next_tile_offset_k > seq_len_kv)
         needs_row_prefix_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
-            and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
+            cta_rows_have_distinct_kv_prefix(cfg)
         )
-        if cutlass.const_expr(needs_row_prefix_mask):
-            min_seq_len_kv = runtime_seq_len_kv_for_query_row(
-                cfg,
-                self.cache_seqs,
-                batch_idx,
-                cta_idx_q,
-                Int32(0),
-                self.cu_seqlens_q,
-                self.cp_rank,
-            )
-            should_apply_dense_mask = should_apply_dense_mask or (
-                next_tile_offset_k > min_seq_len_kv
-            )
+        # Only K tiles reaching past the keys every row sees take the mask.
+        should_apply_dense_mask = kv_tile_needs_mask(
+            cfg, task_cache, tile_offset_k, seq_len_kv
+        )
         if cutlass.const_expr(cfg.num_tokens_per_page == 1):
             if cutlass.const_expr(
                 (cfg.fixed_seqlen and cfg.logical_seq_len_q == 1)

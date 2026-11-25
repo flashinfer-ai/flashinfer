@@ -145,19 +145,21 @@ def _entries(config, device=None) -> list[dict]:
     ]
 
 
-def _decode(entry, config):
+def _decode(entry, config, constraints=None):
     """Restore knob tuples and reject malformed or inadmissible cached values."""
     raw = entry.get("knobs")
     if not isinstance(raw, dict) or set(raw) != set(knob_keys(config)):
         return None
     knobs = {k: tuple(v) if isinstance(v, list) else v for k, v in raw.items()}
+    if constraints and any(knobs[k] != v for k, v in constraints.items()):
+        return None
     try:
         return knobs if is_valid_sm100_knobs(knobs, config) else None
     except (TypeError, ValueError):
         return None
 
 
-def live_token_buckets(config, *, device=None) -> list[int]:
+def live_token_buckets(config, *, constraints=None, device=None) -> list[int]:
     """List valid cached live-token counts for this capacity and device identity."""
     return sorted(
         {
@@ -165,9 +167,21 @@ def live_token_buckets(config, *, device=None) -> list[int]:
             for e in _entries(config, device)
             if type(e.get("live_tokens")) is int
             and 0 <= e["live_tokens"] <= config.max_tokens_per_rank
-            and _decode(e, config) is not None
+            and _decode(e, config, constraints) is not None
         }
     )
+
+
+def lookup_knobs(config, *, live_tokens=None, constraints=None, device=None):
+    """Return an exact profile for this workload, or None on a cache miss."""
+    tokens = config.max_tokens_per_rank if live_tokens is None else live_tokens
+    for entry in reversed(_entries(config, device)):
+        if type(entry.get("live_tokens")) is not int or entry["live_tokens"] != tokens:
+            continue
+        knobs = _decode(entry, config, constraints)
+        if knobs is not None:
+            return knobs
+    return None
 
 
 def resolve_knobs(
@@ -193,19 +207,12 @@ def resolve_knobs(
             config, allow_nondeterministic=config.reduce_topk_in_kernel
         )
     )
-    tokens = config.max_tokens_per_rank if live_tokens is None else live_tokens
     if use_cache:
-        for entry in reversed(_entries(config, device)):
-            if (
-                type(entry.get("live_tokens")) is not int
-                or entry["live_tokens"] != tokens
-            ):
-                continue
-            knobs = _decode(entry, config)
-            if knobs is not None and all(
-                knobs[k] == v for k, v in (constraints or {}).items()
-            ):
-                return knobs, "cache"
+        knobs = lookup_knobs(
+            config, live_tokens=live_tokens, constraints=constraints, device=device
+        )
+        if knobs is not None:
+            return knobs, "cache"
     return candidates[0], "heuristic"
 
 
