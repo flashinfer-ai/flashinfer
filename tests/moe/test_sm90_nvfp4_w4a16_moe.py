@@ -266,6 +266,36 @@ def test_prefill_kernel_matches_reference(shape, num_tokens, chunk):
     assert_in_band(y, reference_moe(ckpt, x, ids, w))
 
 
+@pytest.mark.parametrize(
+    "min_tokens,chunk",
+    [(1 << 30, 8192), (1, 8192), (1, 128)],
+    ids=["decode", "prefill", "prefill_chunked"],
+)
+def test_repeated_expert_ids(min_tokens, chunk):
+    """A token may name an expert in several slots; each route counts with its own
+    weight. Experts 0 and 31 get two or more routes from every token, more routes
+    than tokens: the large-batch kernel's route list of an expert must hold them
+    without running into the next expert's list or the per-route ranks."""
+    ckpt, packed = checkpoint(SHAPES[1])
+    H, I, E, top_k = SHAPES[1]
+    num_tokens = 300
+    ws = Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)
+    x = torch.randn(num_tokens, H, device="cuda").bfloat16()
+    ids, w = routing(num_tokens, E, top_k, "cuda", seed=23)
+    ids[:, :2] = 0
+    ids[:, -2:] = E - 1
+    y = run(
+        packed,
+        x,
+        ids,
+        w,
+        workspace=ws,
+        prefill_min_tokens=min_tokens,
+        prefill_chunk_tokens=chunk,
+    )
+    assert_in_band(y, reference_moe(ckpt, x, ids, w))
+
+
 @pytest.mark.parametrize("num_tokens", [255, 256, 300])
 def test_auto_kernel_choice(num_tokens):
     """Without ``prefill_min_tokens`` the call runs the kernel the shape rule picks

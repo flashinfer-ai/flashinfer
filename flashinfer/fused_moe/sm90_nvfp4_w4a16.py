@@ -852,7 +852,8 @@ def sm90_nvfp4_w4a16_moe(
     topk_ids : torch.Tensor
         ``[num_tokens, top_k]`` int32 or int64, ``top_k <= 8``: expert ids local
         to ``w13`` / ``w2``. Ids outside ``[0, E)`` (for example the experts of
-        other ranks under expert parallelism, or -1) contribute nothing.
+        other ranks under expert parallelism, or -1) contribute nothing. An id
+        may repeat within a token; each of its routes counts with its own weight.
     topk_weights : torch.Tensor
         ``[num_tokens, top_k]`` routing weights (any float dtype; used as FP32).
     w13, w13_global_scale, w2, w2_global_scale : torch.Tensor
@@ -907,8 +908,8 @@ def sm90_nvfp4_w4a16_moe(
 
     Memory: besides the workspace, every large-batch call allocates the
     per-route down rows ``[8, num_tokens, hidden]`` BF16 (``16 * num_tokens *
-    hidden`` bytes, about 1 GiB at 16384 tokens and hidden 4096) and small
-    routing buffers. They are sized by the whole call, not by
+    hidden`` bytes, about 1 GiB at 16384 tokens and hidden 4096) and routing
+    buffers of about 1 KiB per token. They are sized by the whole call, not by
     ``prefill_chunk_tokens``; split very large batches to bound them.
 
     Reproducibility: each kernel is deterministic (the same inputs give the
@@ -956,8 +957,12 @@ def sm90_nvfp4_w4a16_moe(
     if use_prefill:
         workspace.reserve_prefill(prefill_chunk_tokens)
         recv = torch.empty((TOPK_SLOTS, M, H), dtype=torch.bfloat16, device=device)
+        # a route list of up to 8 * M entries per expert (ids may repeat within a
+        # token), then the rank of every route
         rev = torch.empty(
-            ((MAX_LOCAL_EXPERTS + TOPK_SLOTS) * M,), dtype=torch.int32, device=device
+            ((MAX_LOCAL_EXPERTS + 1) * TOPK_SLOTS * M,),
+            dtype=torch.int32,
+            device=device,
         )
         ucnt = torch.empty((((M + 127) // 128) * 64,), dtype=torch.int32, device=device)
         if torch.cuda.is_current_stream_capturing():

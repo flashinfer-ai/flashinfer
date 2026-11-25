@@ -197,7 +197,8 @@ void sm90_nvfp4_w4a16_moe_prefill_run(TensorView hidden_states, TensorView topk_
       << "xt must be [slots, hidden] with the rows the chunk needs";
   TVM_FFI_ICHECK_GE(maps.numel(), (int64_t)(kNumMaps * sizeof(pf::Tmap)))
       << "maps must come from prefill_init";
-  TVM_FFI_ICHECK_GE(rev.numel(), (int64_t)(pf::NE + kTopKSlots) * M);
+  TVM_FFI_ICHECK_GE(rev.numel(), (int64_t)(pf::NE + 1) * kTopKSlots * M)
+      << "rev must hold (num_local_experts + 1) * 8 * M entries";
   TVM_FFI_ICHECK_GE(unit_counts.numel(), (M + 127) / 128 * 64);
   TVM_FFI_ICHECK_GE(counters.numel(), (int64_t)pf::kCounterWords);
   TVM_FFI_ICHECK_LT(M, (int64_t)1 << 28) << "token count";
