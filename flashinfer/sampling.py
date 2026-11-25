@@ -232,12 +232,15 @@ def _validate_top_k(top_k: Union[torch.Tensor, int, Real]) -> None:
     """Validate top_k threshold parameter.
 
     Raises ValueError if top_k is degenerate (zero or negative, excluding sentinel -1).
+    For CUDA tensors, avoids host-device synchronization (.item()) to preserve
+    CUDA graph capture compatibility and eliminate GPU pipeline stalls.
     """
     if isinstance(top_k, torch.Tensor):
-        if bool(torch.any(top_k == 0).item()):
-            raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
-        if bool(torch.any(top_k < -1).item()):
-            raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
+        if not top_k.is_cuda:
+            if bool(torch.any(top_k == 0).item()):
+                raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
+            if bool(torch.any(top_k < -1).item()):
+                raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
     elif isinstance(top_k, (int, torch.SymInt)):
         if top_k == 0 or top_k < -1:
             raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
@@ -253,10 +256,13 @@ def _validate_top_p(top_p: Union[torch.Tensor, float, Real]) -> None:
     """Validate top_p threshold parameter.
 
     Raises ValueError if top_p is degenerate (<= 0.0).
+    For CUDA tensors, avoids host-device synchronization (.item()) to preserve
+    CUDA graph capture compatibility and eliminate GPU pipeline stalls.
     """
     if isinstance(top_p, torch.Tensor):
-        if bool(torch.any(top_p <= 0.0).item()):
-            raise ValueError(f"top_p must be positive, got {top_p}")
+        if not top_p.is_cuda:
+            if bool(torch.any(top_p <= 0.0).item()):
+                raise ValueError(f"top_p must be positive, got {top_p}")
     elif isinstance(top_p, Real) and not isinstance(top_p, bool):
         if top_p <= 0.0:
             raise ValueError(f"top_p must be positive, got {top_p}")
