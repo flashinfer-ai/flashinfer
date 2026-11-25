@@ -390,6 +390,17 @@ def test_fp4_mla_decode_rejects_mismatched_tensors():
         _run(decode, dict(case, vsf=case["vsf"][:, :2048]), out, 0.1)
     with pytest.raises(ValueError, match="v_scale_cache"):
         _run(decode, dict(case, vsf=case["vsf"][:-1]), out, 0.1)
+    # A V-scale pool with padding between its pages is not TensorRT-LLM's layout.
+    padded = torch.zeros(
+        (case["vsf"].shape[0], 2 * case["vsf"].shape[1]),
+        dtype=case["vsf"].dtype,
+        device=device,
+    )[:, : case["vsf"].shape[1]]
+    padded.copy_(case["vsf"])
+    with pytest.raises(ValueError, match="v_scale_cache: page stride"):
+        _run(decode, dict(case, vsf=padded), out, 0.1)
+    with pytest.raises(ValueError, match="every tensor must be on"):
+        _run(decode, dict(case, q_gs=case["q_gs"].cpu()), out, 0.1)
 
 
 def test_short_build_gives_the_long_builds_bits_on_short_rows():

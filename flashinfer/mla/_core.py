@@ -7642,6 +7642,9 @@ def prepare_fp4_mla_decode(
     pool), the step's prequantized query and scales, the page table, the KV
     lengths and the FP32 global scales writes the caller-owned
     BF16 output ``[batch * q_len * num_heads, 512]`` with no CUDA allocation.
+    The decode reads its V scales from the V-scale pool (TensorRT-LLM's
+    ``v_pool``: 4,096-byte pages at a 4,096-byte stride, addressed by the page
+    ids of the KV pages); a pool in any other layout is refused.
     ``max_kv``, when given, bounds every KV length of every call of the
     runner (it selects the decode build, never the split count).
     Requires compute capability 10.0 or 10.3.  See
