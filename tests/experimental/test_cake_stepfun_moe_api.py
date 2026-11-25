@@ -110,6 +110,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     moe_args,
     routing_reference_renormalize,
 )
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 from tests.experimental.test_helpers import cake_stepfun_moe_reference as ref
 
 H, I, E, K = ref.HIDDEN_SIZE, ref.INTERMEDIATE_SIZE, ref.NUM_EXPERTS, ref.TOP_K
@@ -1533,6 +1534,7 @@ def test_full_path_finalize_matches_native_kernel(num_tokens, cache_permute_indi
         True,
         False,
         None,
+        True,
     )
     _sync()
     assert not torch.isnan(theirs).any()
@@ -1694,24 +1696,6 @@ def test_full_path_requant_matches_native_kernel(
 # ---------------------------------------------------------------------------------------------
 
 
-def _profiled_kernel_names(runner, packed, kwargs, tactic) -> list[str]:
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-    ) as profile:
-        runner.forward(packed, tactic=tactic, **kwargs)
-        _sync()
-        profile.step()
-        runner.forward(packed, tactic=tactic, **kwargs)
-        _sync()
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-        and not event.name.startswith(("Memcpy", "Memset"))
-    ]
-
-
 @pytest.mark.parametrize("num_tokens", TOKENS)
 @pytest.mark.parametrize("precision", list(PRECISIONS))
 def test_full_path_launches_only_cake_kernels_from_topk_ids(
@@ -1735,7 +1719,9 @@ def test_full_path_launches_only_cake_kernels_from_topk_ids(
     for tactic in tactics:
         tile = _tactic_tile(tactic)
         _forward(runner, packed, kwargs, tactic)
-        names = _profiled_kernel_names(runner, packed, kwargs, tactic)
+        names = cuda_kernel_names(
+            lambda: runner.forward(packed, tactic=tactic, **kwargs)
+        )
         assert names, "the profiler captured no kernel"
         offenders = [name for name in names if CAKE_KERNEL_SYMBOL.search(name) is None]
         assert not offenders, (

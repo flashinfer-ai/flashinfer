@@ -8,14 +8,14 @@ from ......core.validation.common import MoEEpConfigError
 from ......weights import MoEWeightPack
 
 if TYPE_CHECKING:
-    from ......kernel_src.sm90.cake_bf16_megamoe import Sm90CakeBf16Weights
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import Sm90CakeBf16Weights
 
     TransformedMegaWeights: TypeAlias = Sm90CakeBf16Weights
 
 
 def __getattr__(name: str) -> object:
     if name == "TransformedMegaWeights":
-        from ......kernel_src.sm90.cake_bf16_megamoe import Sm90CakeBf16Weights
+        from flashinfer.moe_ep.shims.sm90.cake_bf16 import Sm90CakeBf16Weights
 
         return Sm90CakeBf16Weights
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -30,7 +30,7 @@ def validate_transformed_mega_weights(
 ) -> None:
     import torch
 
-    from ......kernel_src.sm90.cake_bf16_megamoe import Sm90CakeBf16Weights
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import Sm90CakeBf16Weights
 
     if not isinstance(transformed_weights, Sm90CakeBf16Weights):
         raise MoEEpConfigError(
@@ -81,7 +81,7 @@ def preprocess_mega_weights(
     """
     import torch
 
-    from ......kernel_src.sm90.cake_bf16_megamoe import make_sm90_cake_bf16_weights
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import make_sm90_cake_bf16_weights
 
     if not isinstance(weights, MoEWeightPack):
         raise MoEEpConfigError(
@@ -121,7 +121,7 @@ def preprocess_mega_weights(
         weights.w13.contiguous(), weights.w2.contiguous()
     )
     if wcx:
-        from ......kernel_src.sm90.cake_bf16_megamoe.shim.cake_weights import (
+        from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_weights import (
             encode_sm90_cake_wcx,
         )
 

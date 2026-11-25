@@ -9,8 +9,7 @@ vendored package.  Instead, it independently reverses the physical Humming
 interleave, unfolds offsets, constructs the exact E4M3 operand bytes, and
 models the two FP8 WGMMA legs and their hybrid scales.
 
-The SM90 and SM100 CuTeDSL trees use colliding top-level vendor module names,
-so this file is intended to run in an isolated Hopper pytest process::
+Run the single-GPU check on Hopper::
 
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 pytest -v -m arch_hopper \
         tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py
@@ -31,7 +30,7 @@ MMA_TILER_MNK = (128, 32, 128)
 def _sm90_tree():
     """Import only FlashInfer's public SM90 package boundary."""
     try:
-        import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as pkg
+        import flashinfer.moe_ep.shims.sm90.cutedsl_megamoe as pkg
     except RuntimeError as error:
         pytest.skip(f"SM90 kernel tree unavailable in this process: {error}")
     return pkg

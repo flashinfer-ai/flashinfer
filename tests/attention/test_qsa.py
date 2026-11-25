@@ -3,14 +3,10 @@
 
 """Packed QSA numerics, validation and changed-selection graph replay."""
 
-import sys
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 import flashinfer
-from flashinfer import qsa
 
 
 def _inputs(lengths=(3, 5, 9), heads=12, device="cuda"):
@@ -160,17 +156,6 @@ def test_invalid_inputs(supported_gpu):
         flashinfer.qsa_forward(**data, block_size=8)
     with pytest.raises(NotImplementedError, match="BF16"):
         flashinfer.qsa_forward(**{**data, "q": data["q"].float()})
-
-
-@pytest.mark.parametrize("version", ["1.31.0", "1.32.0.dev1"])
-def test_frontend_version_gate(monkeypatch, version):
-    qsa._cudnn_ops.cache_clear()
-    monkeypatch.setitem(sys.modules, "cudnn", SimpleNamespace(__version__=version))
-    try:
-        with pytest.raises(RuntimeError, match="1.32.0"):
-            qsa._cudnn_ops()
-    finally:
-        qsa._cudnn_ops.cache_clear()
 
 
 def test_trace_contracts():

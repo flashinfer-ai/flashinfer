@@ -12,7 +12,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cutedsl impor
     Sm120Mxfp4Mxfp8CutedslMegaKernelBackend,
     Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel.shim.weights import (
+from flashinfer.moe_ep.shims.sm120.split_cutedsl.weights import (
     interleave_gate_up_8,
     to_blocked,
 )
@@ -75,10 +75,11 @@ def test_production_modules_do_not_import_mega_runner() -> None:
     package = Path(__file__).parents[2] / "flashinfer" / "moe_ep"
     roots = (
         package / "backends" / "mega" / "kernel" / "sm120" / "mxfp4_mxfp8_bf16_cutedsl",
-        package / "kernel_src" / "sm120" / "split_cutedsl_megakernel" / "shim",
+        package / "shims" / "sm120" / "split_cutedsl",
     )
     offenders: list[str] = []
     for root in roots:
+        assert root.is_dir(), root
         for source in root.rglob("*.py"):
             tree = ast.parse(source.read_text())
             for node in ast.walk(tree):

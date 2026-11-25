@@ -143,6 +143,10 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     See :class:`NVLinkOneSidedConfig` for the sync protocols and timeouts.
     """
 
+    # Dispatch sends a token only to the ranks owning one of its valid expert
+    # ids. The fence combine reads the received rows of the slots it filled,
+    # the sentinel combine the rows whose ids row names this rank a target.
+    combine_reads_only_local_expert_rows: ClassVar[bool] = True
     # Workspaces shared by instances with the same layout, keyed by
     # (ep_rank, ep_size, layout).
     _WORKSPACES: ClassVar[dict[tuple, dict[str, Any]]] = {}

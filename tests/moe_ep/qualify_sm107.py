@@ -115,9 +115,7 @@ def _worker(args):
         ]
         os.chdir(output)
     import flashinfer
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        require_sm107_dsl,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import require_sm107_dsl
 
     package_file = Path(flashinfer.__file__).resolve()
     if args.installed_package and ROOT in package_file.parents:

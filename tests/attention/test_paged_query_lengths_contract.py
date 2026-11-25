@@ -60,7 +60,7 @@ def test_rejected_query_mask_preserves_accepted_plan(
         **opts,
     )
 
-    def plan(lengths, dtype):
+    def plan(lengths, **extra):
         w.plan(
             qo,
             kp,
@@ -71,16 +71,17 @@ def test_rejected_query_mask_preserves_accepted_plan(
             128,
             16,
             causal=True,
-            q_data_type=dtype,
+            q_data_type=q.dtype,
             seq_lens=kvlen,
             seq_lens_q=lengths,
             max_token_per_sequence=128,
             max_sequence_kv=8192,
             block_tables=indices.view(1, -1),
+            **extra,
         )
 
     valid_q = 1 if backend == "auto" else 128
-    plan(torch.tensor([valid_q], dtype=torch.int32), q.dtype)
+    plan(torch.tensor([valid_q], dtype=torch.int32))
     assert w._backend == ("cudnn" if backend == "auto" else "fa2")
     for _ in range(3):
         out, lse = w.run(q, kv, return_lse=True, lse_base="ln")
@@ -108,10 +109,10 @@ def test_rejected_query_mask_preserves_accepted_plan(
     prior_debug = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        # FP16 declines the BF16-only cuDNN auto rule. It must not silently use
-        # FA2 with Q128 masking, or mutate the previously accepted BF16 plan.
+        # A soft cap makes the cuDNN auto rule decline the plan. The plan must not
+        # silently use FA2 with Q128 masking, or mutate the previous plan.
         with pytest.raises(ValueError, match="seq_lens_q"):
-            plan(lengths, torch.float16)
+            plan(lengths, logits_soft_cap=30.0)
     finally:
         torch.cuda.set_sync_debug_mode(prior_debug)
     assert w.__dict__.keys() == state.keys()

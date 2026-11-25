@@ -131,7 +131,9 @@ def workspace(device, mb=128):
     return torch.empty(mb << 20, dtype=torch.uint8, device=device)
 
 
-def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
+def run_paged_prefill(
+    pr: Problem, layout="NHD", window_left=-1, ws=None, causal=True, **plan_kw
+):
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
     )
@@ -144,7 +146,7 @@ def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan
         pr.Hkv,
         pr.D,
         pr.page,
-        causal=True,
+        causal=causal,
         window_left=window_left,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
@@ -153,7 +155,9 @@ def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan
     return w.run(pr.q, pr.cache(layout))
 
 
-def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
+def run_ragged_prefill(
+    pr: Problem, layout="NHD", window_left=-1, ws=None, causal=True, **plan_kw
+):
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
     )
@@ -163,7 +167,7 @@ def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **pla
         pr.Hq,
         pr.Hkv,
         pr.D,
-        causal=True,
+        causal=causal,
         window_left=window_left,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
@@ -466,7 +470,7 @@ def test_forward_return_lse_rejection_preserves_plan(kind):
 # ------------------------------------------------------------------------------------------------------ device-free
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_fingerprint_is_a_function_of_the_head_dim(op):
-    fps = {D: bi.fingerprint(op, head_dim=D) for D in (64, 128, 256)}
+    fps = {D: bi.fingerprint(op, head_dim=D, causal=True) for D in (64, 128, 256)}
     assert len(set(fps.values())) == 3
     for D, fp in fps.items():
         assert fp.startswith("attn-bf16-d") and fp == bi.fingerprint(
@@ -474,7 +478,7 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
         )  # one class for the three wrappers
     assert bi.class_name(op) == "attention.bf16"
     with pytest.raises(TypeError):
-        bi.fingerprint(op, head_dim=128, page_size=16)
+        bi.fingerprint(op, head_dim=128, causal=True, page_size=16)
 
 
 def test_planner_unit_kind_rules():
@@ -1464,7 +1468,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     ws = workspace(pr.device)
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
     kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a window belongs to the causal class: refused with the non-causal one
         w.plan(
             pr.qo_indptr,
             pr.kv_indptr,
@@ -1475,6 +1481,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             128,
             16,
             causal=False,
+            window_left=8,
             **kw,
         )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
@@ -1610,7 +1617,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             **kw,
         )
     dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a window belongs to the causal class: refused with the non-causal one
         dec.plan(
             pr.kv_indptr,
             pr.kv_indices,
@@ -1621,6 +1630,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             16,
             q_len_per_req=2,
             is_causal=False,
+            window_left=16,
             **kw,
         )
     # inputs the kernels would read out of bounds or mis-address: typed refusals at plan() / run()
@@ -2048,3 +2058,815 @@ def test_hardware_row_max_is_a_head_dim_placement():
         == engine.hw_row_max_enabled(dev)
     )
     assert engine.hw_row_max_enabled(torch.device("cpu"), 64) is False
+
+
+# ------------------------------------------------------------------------------------------------------ the non-causal class
+def reference_noncausal(pr: Problem):
+    """fp32 non-causal attention per request (every token sees every key of its request), the yardstick for accuracy."""
+    outs = []
+    tok_q = tok_kv = 0
+    g = pr.Hq // pr.Hkv
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        q = pr.q[tok_q : tok_q + ql].float()
+        k = pr.k_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)
+        v = pr.v_rag[tok_kv : tok_kv + kl].float().repeat_interleave(g, dim=1)
+        s = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(pr.D)
+        p = torch.softmax(s, dim=-1)
+        outs.append(torch.einsum("hqk,khd->qhd", p, v))
+        tok_q += ql
+        tok_kv += kl
+    return torch.cat(outs)
+
+
+def run_decode_noncausal(pr: Problem, q_len: int, layout="NHD", ws=None):
+    """The decode wrapper with ``q_len_per_req = q_len`` and ``is_causal=False`` on the LAST ``q_len`` tokens of every request."""
+    assert all(ql >= q_len for ql in pr.q_lens)
+    rows = torch.cat(
+        [
+            torch.arange(
+                int(pr.qo_indptr[i + 1]) - q_len,
+                int(pr.qo_indptr[i + 1]),
+                device=pr.device,
+            )
+            for i in range(len(pr.q_lens))
+        ]
+    )
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+        is_causal=False,
+    )
+    return w.run(pr.q[rows].contiguous(), pr.cache(layout)), rows
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_noncausal_fingerprint_is_a_function_of_head_dim_and_mode(op):
+    """The mask mode is a class dimension: the non-causal fingerprint differs from the causal one at every head dim and each is
+    shared by the three wrappers."""
+    for D in (64, 128, 256):
+        nc = bi.fingerprint(op, head_dim=D, causal=False)
+        c = bi.fingerprint(op, head_dim=D, causal=True)
+        assert nc != c and nc.startswith(f"attn-bf16-d{D}-nc-")
+        assert c == bi.fingerprint(WRAPPERS[0], head_dim=D, causal=True)
+        assert nc == bi.fingerprint(WRAPPERS[0], head_dim=D, causal=False)
+    assert (
+        len({bi.fingerprint(op, head_dim=D, causal=False) for D in (64, 128, 256)}) == 3
+    )
+    # the pinned causal fingerprints are unchanged by the new class
+    from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
+
+    for D, fp in FINGERPRINTS.items():
+        assert bi.fingerprint(op, head_dim=D, causal=True) == fp
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("op", WRAPPERS[1:])
+def test_prefill_fingerprint_needs_the_mask_mode(op):
+    """The prefill wrappers' ``plan()`` defaults to ``causal=False``, the non-causal class: their receipt takes the mode as a
+    fixed dimension, so a receipt asked without it (or with ``None``) raises instead of naming the causal class."""
+    from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
+
+    for dims in (dict(head_dim=128), dict(head_dim=128, causal=None)):
+        with pytest.raises(TypeError, match="causal") as e:
+            bi.fingerprint(op, **dims)
+        assert "causal=True" in str(e.value) and "causal=False" in str(e.value)
+    with pytest.raises(TypeError, match="head_dim"):
+        bi.fingerprint(op, causal=True)
+    for D, fp in FINGERPRINTS.items():
+        assert bi.fingerprint(op, head_dim=D, causal=True) == fp
+        assert bi.fingerprint(op, head_dim=D, causal=False) != fp
+
+
+@pytest.mark.cpu_only
+def test_decode_fingerprint_defaults_to_the_causal_class():
+    """The decode wrapper's mode is optional: omitted or ``None`` is the causal class (its ``is_causal=None``), never the
+    truth value of ``None``."""
+    from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
+
+    op = WRAPPERS[0]
+    for D, fp in FINGERPRINTS.items():
+        assert bi.fingerprint(op, head_dim=D) == fp
+        assert bi.fingerprint(op, head_dim=D, causal=None) == fp
+        assert bi.fingerprint(op, head_dim=D, causal=True) == fp
+        nc = bi.fingerprint(op, head_dim=D, causal=False)
+        assert nc != fp and nc == bi.fingerprint(WRAPPERS[1], head_dim=D, causal=False)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
+def test_noncausal_matches_reference(D, Hq, Hkv):
+    """The non-causal class against fp32 non-causal attention (every token sees every key of its request), paged and ragged; a
+    request with more query tokens than keys is a member of the class."""
+    pr = Problem([300, 1000, 64, 40], [700, 2500, 3000, 17], Hq, Hkv, D, 16, seed=21)
+    ref = reference_noncausal(pr)
+    tol = 2e-2 + 1e-2 * ref.abs().max().item()
+    out = run_paged_prefill(pr, causal=False)
+    assert (out.float() - ref).abs().max().item() < tol
+    out = run_ragged_prefill(pr, causal=False)
+    assert (out.float() - ref).abs().max().item() < tol
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("page", [1, 16, 128])
+def test_noncausal_paged_equals_ragged(D, page):
+    """R4: the paged and the ragged KV layouts hand the kernel the same keys: the same bits under the non-causal class."""
+    pr = Problem(
+        [300, 1000, 64, 2048], [700, 2500, 3000, 2048], 32, 8, D, page, seed=22
+    )
+    assert torch.equal(
+        bits(run_paged_prefill(pr, causal=False)),
+        bits(run_ragged_prefill(pr, causal=False)),
+    )
+    assert torch.equal(
+        bits(run_paged_prefill(pr, "HND", causal=False)),
+        bits(run_ragged_prefill(pr, "HND", causal=False)),
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_query_chunks_equal_full(D):
+    """Chunked prefill under the non-causal class: a request's query rows run in chunks, each chunk planned over the request's
+    FULL key set, give the bits of the one-shot run row for row (a row's visible set is ``[0, kv_len)`` whatever the cut), paged and
+    ragged. Two requests cut at different points (inside a 512-key chunk and at a tile boundary); incremental KV growth is not
+    this test -- a chunk run over a shorter key set is that chunk's view of those keys, not a prefix of the full run."""
+    kv = [1700, 1000]
+    cut = [700, 512]
+    full = Problem(kv, kv, 32, 8, D, 16, seed=15)
+    out_full = bits(run_paged_prefill(full, causal=False))
+    assert torch.equal(out_full, bits(run_ragged_prefill(full, causal=False)))
+    rows = [slice(int(full.qo_indptr[i]), int(full.qo_indptr[i + 1])) for i in range(2)]
+    for part, q_lens in enumerate(([cut[0], cut[1]], [kv[0] - cut[0], kv[1] - cut[1]])):
+        prob = Problem(q_lens, kv, 32, 8, D, 16, seed=16 + part)
+        prob.q = torch.cat(
+            [
+                full.q[rows[i]][: cut[i]] if part == 0 else full.q[rows[i]][cut[i] :]
+                for i in range(2)
+            ]
+        ).contiguous()
+        prob.k_rag, prob.v_rag = full.k_rag.clone(), full.v_rag.clone()
+        prob = _repack(prob)
+        out_p = bits(run_paged_prefill(prob, causal=False))
+        out_r = bits(run_ragged_prefill(prob, causal=False))
+        off = 0
+        for i in range(2):
+            ref = (
+                out_full[rows[i]][: cut[i]]
+                if part == 0
+                else out_full[rows[i]][cut[i] :]
+            )
+            n = ref.shape[0]
+            assert torch.equal(out_p[off : off + n], ref), (D, part, i, "paged")
+            assert torch.equal(out_r[off : off + n], ref), (D, part, i, "ragged")
+            off += n
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_noncausal_prefill_equals_multi_token_decode(D, layout):
+    """R4: the decode wrapper with ``q_len_per_req = 4`` and ``is_causal=False`` gives, for the last four tokens of every request,
+    the bits of the non-causal prefill rows; and every token of a request has the bits of its position-independent class term
+    (the first four tokens' rows equal the last four's when their queries are the same)."""
+    q_len = 4
+    pr = Problem([256, 33, 1024, 7], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=23)
+    pre = bits(run_paged_prefill(pr, layout, causal=False))
+    dec, rows = run_decode_noncausal(pr, q_len, layout)
+    assert torch.equal(bits(dec), pre[rows])
+    # the position does not enter the non-causal term: the same query at another position of the same request gives the same bits
+    pr2 = Problem(pr.q_lens, pr.kv_lens, 32, 8, D, 16, seed=23)
+    for i in range(len(pr.q_lens)):
+        a, b = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+        pr2.q[a:b] = pr.q[a:b].flip(0)
+    pre2 = bits(run_paged_prefill(pr2, layout, causal=False))
+    for i in range(len(pr.q_lens)):
+        a, b = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+        assert torch.equal(pre2[a:b], pre[a:b].flip(0)), i
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_batch_permutation_and_subbatch_invariance(D):
+    """R2 under the non-causal class: a request's rows are the same bits in a batch of one, in a permuted batch and in a sub-batch;
+    paged prefill, ragged prefill and multi-token decode."""
+    q_lens, kv_lens = [300, 1, 1000, 64, 4], [700, 2500, 2500, 3000, 4]
+    pr = Problem(q_lens, kv_lens, 32, 8, D, 16, seed=24)
+    full_p = bits(run_paged_prefill(pr, causal=False))
+    full_r = bits(run_ragged_prefill(pr, causal=False))
+    assert torch.equal(full_p, full_r)
+    for sel in ([2], [4, 0], [3, 1, 2], [1, 0, 4, 3, 2]):
+        sub = Problem(
+            [q_lens[i] for i in sel], [kv_lens[i] for i in sel], 32, 8, D, 16, seed=25
+        )
+        for j, i in enumerate(sel):
+            qa, qb = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+            sa, sb = int(sub.qo_indptr[j]), int(sub.qo_indptr[j + 1])
+            sub.q[sa:sb] = pr.q[qa:qb]
+            ka, kb = int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1])
+            ta, tb = int(sub.kv_indptr_rag[j]), int(sub.kv_indptr_rag[j + 1])
+            sub.k_rag[ta:tb] = pr.k_rag[ka:kb]
+            sub.v_rag[ta:tb] = pr.v_rag[ka:kb]
+        sub = _repack(sub)
+        got_p = bits(run_paged_prefill(sub, causal=False))
+        got_r = bits(run_ragged_prefill(sub, causal=False))
+        for j, i in enumerate(sel):
+            qa, qb = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+            sa, sb = int(sub.qo_indptr[j]), int(sub.qo_indptr[j + 1])
+            assert torch.equal(got_p[sa:sb], full_p[qa:qb]), (D, sel, i, "paged")
+            assert torch.equal(got_r[sa:sb], full_r[qa:qb]), (D, sel, i, "ragged")
+    # multi-token decode of the whole batch against decode of a sub-batch (every request has at least 4 tokens)
+    pr4 = Problem(
+        [300, 8, 1000, 64, 4], [700, 2500, 2500, 3000, 4], 32, 8, D, 16, seed=26
+    )
+    dec, rows = run_decode_noncausal(pr4, 4)
+    dec = bits(dec)
+    sub = Problem([8, 4], [2500, 4], 32, 8, D, 16, seed=27)
+    for j, i in enumerate((1, 4)):
+        qa, qb = int(pr4.qo_indptr[i]), int(pr4.qo_indptr[i + 1])
+        sa, sb = int(sub.qo_indptr[j]), int(sub.qo_indptr[j + 1])
+        sub.q[sa:sb] = pr4.q[qa:qb]
+        ka, kb = int(pr4.kv_indptr_rag[i]), int(pr4.kv_indptr_rag[i + 1])
+        ta, tb = int(sub.kv_indptr_rag[j]), int(sub.kv_indptr_rag[j + 1])
+        sub.k_rag[ta:tb] = pr4.k_rag[ka:kb]
+        sub.v_rag[ta:tb] = pr4.v_rag[ka:kb]
+    sub = _repack(sub)
+    dsub, _ = run_decode_noncausal(sub, 4)
+    assert torch.equal(bits(dsub), torch.cat([dec[4:8], dec[16:20]]))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_config_agreement(D):
+    """R3 under the non-causal class: every member of the configuration space gives the bits of the wrapper's pick (the whole space
+    at D = 128 / 256, every 7th point at D = 64), and so does the paired placement: at D = 64, and at D = 128 on 328 KB parts
+    (pairing forced with an SM count of one; its rings, the split kind with both fold placements). Under this class the Q tiles
+    of a request share one chunk and tile range, so every pair's two tiles walk the same keys."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    if D == 64:
+        pr = Problem([2048, 2048, 1], [4096, 3000, 1000], 32, 8, D, 16, seed=28)
+    else:
+        pr = Problem([256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, D, 16, seed=28)
+    ref = bits(run_paged_prefill(pr, causal=False))
+    space = engine.all_valid_configs(D)
+    cfgs = list(space[::7] if D == 64 else space)
+    q2_sm = (
+        None  # the SM count the paired configurations plan with (None: the device's)
+    )
+    if D == 64:
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        rings = (2, 3) + ((4,) if arch_smem_cap(pr.device) >= (300 << 10) else ())
+        cfgs += [replace(two, kv_slots=s) for s in rings]
+    elif D == 128 and arch_smem_cap(pr.device) >= (300 << 10):
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        q2_sm = 1
+        cfgs += [
+            replace(two, kv_slots=s, split_policy=p, merge=m)
+            for s in (2, 3)
+            for p, m in (("auto", "auto"), ("split", "auto"), ("split", "inkernel"))
+        ]
+    for cfg in cfgs:
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            sm_count=q2_sm if cfg.q2 else None,
+            causal=False,
+        )
+        if cfg.q2:
+            assert planned.plan.num_launch is not None, (cfg, planned.plan.num_units)
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
+        assert torch.equal(bits(out), ref), cfg
+
+
+@needs_device
+def test_noncausal_refusals_and_single_token_decode():
+    """A window is not a parameter of the non-causal class (prefill and decode); a request with query tokens and no key has no
+    visible key and is refused; forward() must agree with the planned mask mode and a rejection preserves the plan; a single-token
+    decode step is the causal class whatever ``is_causal`` says (the same bits)."""
+    pr = Problem([64, 3], [700, 90], 32, 8, 128, 16, seed=29)
+    ws = workspace(pr.device)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
+    args = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.plan(*args, causal=False, window_left=32, **kw)
+    rag = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, "NHD", batch_invariant=True
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        rag.plan(
+            pr.qo_indptr,
+            pr.kv_indptr_rag,
+            32,
+            8,
+            128,
+            causal=False,
+            window_left=0,
+            **kw,
+        )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a request with query tokens and no key: a row without a visible key
+        rag.plan(
+            pr.qo_indptr,
+            torch.tensor([0, 700, 700], dtype=torch.int32, device=pr.device),
+            32,
+            8,
+            128,
+            causal=False,
+            **kw,
+        )
+    # forward() must agree with the planned class; a rejection leaves the plan in place
+    w.plan(*args, causal=False, **kw)
+    expected = bits(w.run(pr.q, pr.cache("NHD"))).clone()
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward(pr.q, pr.cache("NHD"), causal=True)
+    assert torch.equal(bits(w.run(pr.q, pr.cache("NHD"))), expected)
+    assert torch.equal(bits(w.forward(pr.q, pr.cache("NHD"), causal=False)), expected)
+    assert torch.equal(bits(w.forward(pr.q, pr.cache("NHD"))), expected)
+    assert not torch.equal(bits(run_paged_prefill(pr)), expected)
+    # the single-token decode step: is_causal=False and True (and the default) are one class
+    last = torch.tensor(
+        [int(pr.qo_indptr[i + 1]) - 1 for i in range(2)], device=pr.device
+    )
+    q1 = pr.q[last].contiguous()
+    outs = []
+    for is_causal in (None, True, False):
+        dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        dec.plan(
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            is_causal=is_causal,
+            **kw,
+        )
+        outs.append(bits(dec.run(q1, pr.cache("NHD"))).clone())
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+    assert torch.equal(outs[0], bits(run_paged_prefill(pr))[last])
+    # which is also the non-causal class's last row (the last token sees every key in both classes)
+    assert torch.equal(outs[0], expected[last])
+
+
+# ------------------------------------------------------------------------------------------------------ workspace sizing
+def _host_delegate(kind):
+    """The wrappers' delegate without a device: only its host-side sizing (``workspace_bytes``) is used, which reads the kind and
+    the device (the host planner's default SM count on the CPU)."""
+    from flashinfer.attention.batch_invariant.wrappers import BatchInvariantAttention
+
+    d = object.__new__(BatchInvariantAttention)
+    d.kind = kind
+    d.device = torch.device("cpu")
+    return d
+
+
+def _i32(values):
+    return torch.tensor(values, dtype=torch.int32)
+
+
+@pytest.mark.cpu_only
+def test_workspace_sizing_raises_what_plan_refuses():
+    """The sizing call runs the request and mask-mode checks of ``plan()``: every input the plan refuses is the class's typed error
+    here too, never an assertion of the host planner."""
+    paged = _host_delegate("prefill")
+    one = (
+        _i32([0, 100]),
+        _i32([0, 2]),
+        _i32([16]),
+        8,
+        8,
+        128,
+        16,
+    )  # 100 tokens, 32 keys
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="window_left 5"):
+        paged.workspace_bytes(*one, window_left=5, causal=False)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="100 query tokens"):
+        paged.workspace_bytes(*one, causal=True)
+    assert (
+        paged.workspace_bytes(*one, causal=False) >= 0
+    )  # q_len > kv_len is a member of the non-causal class
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="over no key"):
+        paged.workspace_bytes(
+            _i32([0, 5]), _i32([0, 0]), _i32([0]), 8, 8, 128, 16, causal=False
+        )
+    ok = (_i32([0, 5]), _i32([0, 1]), _i32([8]))
+    for heads_dim_page in ((7, 3, 128, 16), (8, 8, 128, 3), (8, 8, 96, 16)):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            paged.workspace_bytes(*ok, *heads_dim_page)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # one last-page length per request
+        paged.workspace_bytes(_i32([0, 5]), _i32([0, 1]), _i32([8, 8]), 8, 8, 128, 16)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):  # one KV range per request
+        paged.workspace_bytes(_i32([0, 5, 9]), _i32([0, 1]), _i32([8]), 8, 8, 128, 16)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        paged.workspace_bytes(None, _i32([0, 1]), _i32([8]), 8, 8, 128, 16)
+    ragged = _host_delegate("ragged")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="window_left 0"):
+        ragged.workspace_bytes(
+            _i32([0, 4]), _i32([0, 9]), None, 8, 8, 128, 1, window_left=0, causal=False
+        )
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="over no key"):
+        ragged.workspace_bytes(
+            _i32([0, 4]), _i32([0, 0]), None, 8, 8, 128, 1, causal=False
+        )
+    # multi-token decode over a request with one key: a member of the non-causal class, outside the causal one
+    decode = _host_delegate("decode")
+    one_key = (None, _i32([0, 1]), _i32([1]), 16, 8, 128, 16)
+    assert decode.workspace_bytes(*one_key, q_len_per_req=4, causal=False) == 0
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="4 query tokens"):
+        decode.workspace_bytes(*one_key, q_len_per_req=4, causal=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        decode.workspace_bytes(*one_key, q_len_per_req=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_workspace_size_is_a_function_of_the_mask_mode(D):
+    """The two classes plan different units for the same batch: under the causal class the tokens of the first chunk see one chunk
+    (fused units, no partials), under the non-causal class every token sees every chunk of its request, so the split plan of the
+    same request holds more partial rows. The sizing follows the mode it is given."""
+    from flashinfer.attention.batch_invariant.plan import ws_row
+    from flashinfer.attention.batch_invariant.spec import chunk_len
+
+    L = 2 * chunk_len(D)
+    # two heads: few enough wide units that the planner's rule splits them at every supported SM count
+    request = (_i32([0, L]), _i32([0, L // 16]), _i32([16]), 2, 2, D, 16)
+    paged = _host_delegate("prefill")
+    causal = paged.workspace_bytes(*request, causal=True)
+    noncausal = paged.workspace_bytes(*request, causal=False)
+    assert 0 < causal < noncausal
+    assert causal % (ws_row(D) * 4) == 0 and noncausal % (ws_row(D) * 4) == 0
+    ragged = _host_delegate("ragged")
+    packed = (_i32([0, L]), _i32([0, L]), None, 2, 2, D, 1)
+    assert ragged.workspace_bytes(*packed, causal=True) == causal
+    assert ragged.workspace_bytes(*packed, causal=False) == noncausal
+
+
+def _exact_workspace(need, device):
+    return torch.empty(need, dtype=torch.uint8, device=device)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_prefill_workspace_size_plans_both_classes_without_fallback(D):
+    """``workspace_size`` with the mask mode of the plan, then a buffer of exactly that many bytes: the plan of either class keeps its
+    split units (no fused fallback) and gives the bits of a large workspace; one byte row less falls back to fused units, the same
+    bits. The two classes need different sizes for this request."""
+    from flashinfer.attention.batch_invariant.spec import chunk_len
+
+    L = 2 * chunk_len(D)
+    # two heads: few enough wide units that the planner's rule splits them at every supported SM count
+    pr = Problem([L], [L], 2, 2, D, 16, seed=41)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    args = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 2, 2, D, 16)
+    sizer = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device, mb=8), "NHD", batch_invariant=True
+    )
+    needs = {}
+    for causal in (True, False):
+        need, int_need = sizer.workspace_size(*args, causal=causal, **kw)
+        assert need > 0 and int_need == 0
+        needs[causal] = need
+        ref = bits(run_paged_prefill(pr, causal=causal))
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            _exact_workspace(need, pr.device), "NHD", batch_invariant=True
+        )
+        w.plan(*args, causal=causal, **kw)
+        delegate = w._batch_invariant
+        assert delegate._config.split_policy == "auto"
+        assert delegate._planned.plan.ws_rows > 0 and delegate._planned.causal == causal
+        assert torch.equal(bits(w.run(pr.q, pr.cache("NHD"))), ref)
+        small = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            _exact_workspace(need - 16, pr.device), "NHD", batch_invariant=True
+        )
+        small.plan(*args, causal=causal, **kw)
+        assert small._batch_invariant._config.split_policy == "fused"
+        assert torch.equal(bits(small.run(pr.q, pr.cache("NHD"))), ref)
+    assert needs[True] < needs[False]
+    # the causal size does not hold the non-causal plan of the same request: sized with the wrong mode, the plan falls back
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        _exact_workspace(needs[True], pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(*args, causal=False, **kw)
+    assert w._batch_invariant._config.split_policy == "fused"
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_decode_workspace_size_plans_both_classes_without_fallback(D):
+    """The decode wrapper's ``workspace_size`` takes ``q_len_per_req`` and ``is_causal`` as ``plan()`` does: a buffer of exactly the
+    reported size plans the split units of the causal (``is_causal=None`` / ``True``) and of the non-causal (``is_causal=False``)
+    multi-token decode, with the bits of a large workspace."""
+    q_len = 4
+    pr = Problem([q_len] * 4, [8192] * 4, 32, 8, D, 16, seed=42)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    args = (pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, D, 16)
+    sizer = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device, mb=8), "NHD", batch_invariant=True
+    )
+    for is_causal in (None, True, False):
+        causal = is_causal is not False
+        mode = dict(q_len_per_req=q_len, is_causal=is_causal)
+        need, int_need = sizer.workspace_size(*args, **mode, **kw)
+        assert need > 0 and int_need == 0
+        big = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace(pr.device), "NHD", batch_invariant=True
+        )
+        big.plan(*args, **mode, **kw)
+        ref = bits(big.run(pr.q, pr.cache("NHD"))).clone()
+        w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            _exact_workspace(need, pr.device), "NHD", batch_invariant=True
+        )
+        w.plan(*args, **mode, **kw)
+        delegate = w._batch_invariant
+        assert delegate._config.split_policy == "auto"
+        assert delegate._planned.plan.ws_rows > 0 and delegate._planned.causal == causal
+        assert torch.equal(bits(w.run(pr.q, pr.cache("NHD"))), ref)
+        prefill = bits(run_paged_prefill(pr, causal=causal))
+        assert torch.equal(
+            ref, prefill
+        )  # every request's four tokens are its whole query block
+
+
+@needs_device
+def test_workspace_size_raises_the_typed_errors_of_plan():
+    """Through the wrappers: the sizing call refuses what ``plan()`` refuses with the class's typed error. The paged prefill
+    wrapper's ``causal`` defaults to ``False`` in both calls, so a windowed (causal) batch sized without ``causal=True`` is refused
+    like the plan it would size; the decode wrapper sizes a non-causal multi-token decode over a one-key request and refuses the
+    causal one."""
+    pr = Problem([64, 3], [700, 90], 32, 8, 128, 16, seed=43)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    args = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device, mb=8), "NHD", batch_invariant=True
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.workspace_size(*args, window_left=32, **kw)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.plan(*args, window_left=32, **kw)
+    float_bytes, int_bytes = w.workspace_size(*args, causal=True, window_left=32, **kw)
+    assert float_bytes >= 0 and int_bytes == 0
+    more_queries = Problem([40], [17], 32, 8, 128, 16, seed=44)
+    margs = (
+        more_queries.qo_indptr,
+        more_queries.kv_indptr,
+        more_queries.kv_indices,
+        more_queries.kv_last,
+        32,
+        8,
+        128,
+        16,
+    )
+    assert w.workspace_size(*margs, causal=False, **kw) == (0, 0)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.workspace_size(*margs, causal=True, **kw)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):  # query tokens over no key
+        w.workspace_size(
+            more_queries.qo_indptr,
+            torch.zeros(2, dtype=torch.int32, device=pr.device),
+            more_queries.kv_indices,
+            torch.zeros(1, dtype=torch.int32, device=pr.device),
+            32,
+            8,
+            128,
+            16,
+            causal=False,
+            **kw,
+        )
+    one_key = Problem([4], [1], 16, 8, 128, 16, seed=45)
+    dargs = (one_key.kv_indptr, one_key.kv_indices, one_key.kv_last, 16, 8, 128, 16)
+    dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device, mb=8), "NHD", batch_invariant=True
+    )
+    assert dec.workspace_size(*dargs, q_len_per_req=4, is_causal=False, **kw) == (0, 0)
+    for is_causal in (None, True):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            dec.workspace_size(*dargs, q_len_per_req=4, is_causal=is_causal, **kw)
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            dec.plan(*dargs, q_len_per_req=4, is_causal=is_causal, **kw)
+    dec.plan(*dargs, q_len_per_req=4, is_causal=False, **kw)
+    out = dec.run(one_key.q, one_key.cache("NHD"))
+    ref = reference_noncausal(one_key)
+    assert (out.float() - ref).abs().max().item() < 2e-2 + 1e-2 * ref.abs().max().item()
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a window is not a parameter of the non-causal class
+        dec.workspace_size(
+            *dargs, q_len_per_req=4, is_causal=False, window_left=8, **kw
+        )
+
+
+# ------------------------------------------------------------------------------------------------------ non-causal placements
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_multi_token_decode_on_the_swaps_body(D):
+    """Non-causal multi-token decode whose units all have at most ``SWAPS_MAX_ROWS`` live rows (``g x q_len = 2 x 4``) runs the
+    Swaps-AB kernel of the non-causal class: the bits of the non-causal prefill rows (the row body) for the same tokens, of the
+    row body's replicated placement of the same decode batch, and the fp32 reference within the class's tolerance. Requests of
+    one and of several chunks, and one with fewer keys than query tokens."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    assert D in engine.SWAPS_DIMS
+    q_len, Hq, Hkv = 4, 16, 8
+    assert (Hq // Hkv) * q_len <= engine.SWAPS_MAX_ROWS
+    pr = Problem(
+        [256, 33, 1024, 7, 4], [1500, 2500, 1024, 4096, 3], Hq, Hkv, D, 16, seed=51
+    )
+    rows = torch.cat(
+        [
+            torch.arange(
+                int(pr.qo_indptr[i + 1]) - q_len,
+                int(pr.qo_indptr[i + 1]),
+                device=pr.device,
+            )
+            for i in range(len(pr.q_lens))
+        ]
+    )
+    q = pr.q[rows].contiguous()
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        Hq,
+        Hkv,
+        D,
+        16,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+        is_causal=False,
+    )
+    delegate = w._batch_invariant
+    plan = delegate._planned.plan
+    assert delegate._planned.causal is False
+    assert delegate._config.small == "swap"
+    assert max(d[2] for d in plan.desc) <= engine.SWAPS_MAX_ROWS
+    assert engine.swaps_n_pad(plan) > 0  # the plan runs the Swaps-AB kernel
+    assert plan.groups  # the multi-chunk requests are split
+    dec = w.run(q, pr.cache("NHD"))
+    pre = run_paged_prefill(pr, causal=False)
+    assert torch.equal(bits(dec), bits(pre)[rows])
+    ref = reference_noncausal(pr)[rows]
+    err = (dec.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    # the same decode batch through the engine on the row body (small = "rep": the replicated-row placement of small units)
+    # and on the Swaps body again: the same bits
+    qo = torch.arange(len(pr.q_lens) + 1, dtype=torch.int32, device=pr.device) * q_len
+    for small in ("rep", "swap"):
+        cfg = replace(engine.default_config(D=D), small=small)
+        planned = engine.plan_attention(
+            qo,
+            pr.kv_indptr,
+            pr.kv_last,
+            Hq,
+            Hkv,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            causal=False,
+        )
+        out = engine.run_attention(
+            planned,
+            q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
+        assert torch.equal(bits(out), bits(dec)), small
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_more_queries_than_keys_split_under_both_merges(D):
+    """Non-causal requests of several chunks with more query tokens than keys (and one short query block over more chunks), with
+    every multi-chunk unit split and the chunk fold placed in the fixup kernel, in-kernel, or by the planner's rule, and with
+    fused units: the bits of the wrapper's own plan, and the fp32 reference within the class's tolerance."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.spec import chunk_len
+
+    C = chunk_len(D)
+    q_lens = [1500, 700, 20]
+    kv_lens = [2 * C + 37, C + 150, 3 * C + 5]
+    assert q_lens[0] > kv_lens[0] > 2 * C and q_lens[1] > kv_lens[1] > C
+    Hq = Hkv = 8
+    pr = Problem(q_lens, kv_lens, Hq, Hkv, D, 16, seed=52)
+    out = run_paged_prefill(pr, causal=False)
+    ref = reference_noncausal(pr)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    assert torch.equal(bits(out), bits(run_ragged_prefill(pr, causal=False)))
+    for policy, merge in (
+        ("split", "fixup"),
+        ("split", "inkernel"),
+        ("split", "auto"),
+        ("fused", "auto"),
+    ):
+        cfg = replace(engine.default_config(D=D), split_policy=policy, merge=merge)
+        assert cfg.well_formed(D)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            Hq,
+            Hkv,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            causal=False,
+        )
+        plan = planned.plan
+        if policy == "fused":
+            assert not plan.groups and plan.ws_rows == 0
+        else:
+            # every (Q tile, KV head) of the three requests is a multi-chunk unit: one split group each
+            tiles = sum(-(-ql // plan.tokens_per_tile) for ql in q_lens) * Hkv
+            assert len(plan.groups) == tiles and plan.ws_rows > 0
+            assert (
+                max(gr[3] for gr in plan.groups) == 4
+            )  # the short block's four chunks
+            assert (
+                min(gr[1] for gr in plan.groups)
+                <= 32
+                < max(gr[1] for gr in plan.groups)
+            )
+            if merge == "fixup":
+                assert len(plan.fixup_groups) == len(plan.groups)
+            elif merge == "inkernel":
+                assert all(plan.group_inkernel) and not plan.fixup_groups
+        got = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
+        assert torch.equal(bits(got), bits(out)), (policy, merge)

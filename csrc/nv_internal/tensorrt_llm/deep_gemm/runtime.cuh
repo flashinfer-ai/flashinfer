@@ -64,8 +64,9 @@ class Runtime {
   }
 
   ~Runtime() {
+    // Destructors must not throw; an unload failure at teardown is not actionable.
     if (lib_ != nullptr) {
-      CHECK_CUDA(cuLibraryUnload(lib_));
+      cuLibraryUnload(lib_);
     }
   }
 
@@ -87,6 +88,9 @@ class Runtime {
         cubinPath /= kKernelName;
         std::ifstream cubinFile(cubinPath.string(), std::ios::binary);
         cubin_ = std::vector<char>(std::istreambuf_iterator<char>(cubinFile), {});
+        if (cubin_.empty()) {
+          throw std::runtime_error("DeepGEMM JIT cubin is missing or empty: " + cubinPath.string());
+        }
       }
 
       CHECK_CUDA(cuLibraryLoadData(&lib_, cubin_.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));

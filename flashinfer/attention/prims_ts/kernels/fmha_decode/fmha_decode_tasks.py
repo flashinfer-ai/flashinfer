@@ -76,6 +76,8 @@ from .fmha_decode_resources.helpers_common import (
     _warp_broadcast_i32,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
+    cta_caches_visible_kv_interval,
+    cta_visible_kv_interval,
     _runtime_last_valid_page_idx,
     _runtime_configured_local_kv_tiles,
     _runtime_total_kv_tiles,
@@ -199,6 +201,39 @@ class PackedDecodeWorkQueue(WorkQueue):
         self.cu_seqlens_q = cu_seqlens_q
         self.seqlens_kv = seqlens_kv
         self.num_heads_kv = num_heads_kv
+
+    @cute.jit
+    def _route_ordered(self, work_tile: Any) -> Any:
+        """Map CLC route index i to ``route_order[i]`` (longest first).
+
+        The metadata grid stores the order right after its per-route lengths;
+        TaskManager reads it after the attention grid's dependency wait. A
+        failed CLC cancel (drained queue) leaves the decoded coordinates
+        undefined, so invalid tiles read entry 0 instead (no branch).
+        """
+        if cutlass.const_expr(self.cfg.uses_longest_first_route_order):
+            q_group_idx, h_idx, route_idx = work_tile.tile_idx
+            valid = cutlass.Int32(work_tile.is_valid_tile)
+            routes = cutlass.Int32(cute.arch.grid_dim()[2])
+            route_idx = cutlass.Int32(
+                self.seqlens_kv[routes + cutlass.Int32(route_idx) * valid]
+            )
+            return type(work_tile)(
+                (q_group_idx, h_idx, route_idx), work_tile.is_valid_tile
+            )
+        return work_tile
+
+    @cute.jit
+    def initial_work_tile_info(self) -> Any:
+        """Return this CTA's first work tile in longest-first route order."""
+        return self._route_ordered(self._make_initial_work_tile())
+
+    @cute.jit
+    def _work_tile_info_from_clc_response(self, response_ptr: Any) -> Any:
+        """Decode a CLC response, then apply the longest-first route order."""
+        return self._route_ordered(
+            WorkQueue._work_tile_info_from_clc_response(self, response_ptr)
+        )
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
@@ -401,6 +436,13 @@ def _issue_score_seed(
         tmem_s.seed_scores_loop()
 
 
+def _transformed_kv_slot_stages(cfg: FmhaDecodeConfig) -> int:
+    """Head-dim stages per transformed TMEM ring slot (1 for other K/V rings)."""
+    if cfg.store_transformed_kv_in_tmem:
+        return cfg.transformed_kv_hd_stages_per_slot
+    return 1
+
+
 def _consume_staged_qk_mma(
     smem_kv: MemoryResource,
     tmem_s: MemoryResource,
@@ -419,20 +461,32 @@ def _consume_staged_qk_mma(
     """
     tmem_s.acquire()
     _issue_score_seed(tmem_s, section, cfg)
-    for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+    # One transformed ring slot may hold several head-dim stages: wait and
+    # release once per slot (see transformed_kv_hd_stages_per_slot).
+    slot_stages = _transformed_kv_slot_stages(cfg)
+    if cfg.uses_fused_slot_mma_issue:
         smem_kv.wait()
         kv_desc = getattr(smem_kv, k_desc_label)()
-        if cfg.uses_q_desc_ref:
-            getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
-                kv_desc=kv_desc,
-                head_dim_stage_idx=head_dim_stage_idx,
-            )
-        else:
-            getattr(tmem_s, qk_mma_label)(
-                q_desc=q_desc,
-                kv_desc=kv_desc,
-                head_dim_stage_idx=head_dim_stage_idx,
-            )
+        getattr(tmem_s, f"{qk_mma_label}_slot")(q_desc=q_desc, kv_desc=kv_desc)
+        smem_kv.release()
+        tmem_s.commit()
+        return
+    for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
+        smem_kv.wait()
+        kv_desc = getattr(smem_kv, k_desc_label)()
+        for sub_stage in range(slot_stages):
+            head_dim_stage_idx = slot_idx * slot_stages + sub_stage
+            if cfg.uses_q_desc_ref:
+                getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
+                    kv_desc=kv_desc,
+                    head_dim_stage_idx=head_dim_stage_idx,
+                )
+            else:
+                getattr(tmem_s, qk_mma_label)(
+                    q_desc=q_desc,
+                    kv_desc=kv_desc,
+                    head_dim_stage_idx=head_dim_stage_idx,
+                )
         smem_kv.release()
     tmem_s.commit()
 
@@ -498,19 +552,29 @@ def _consume_staged_pv_mma(
     p_desc = p_desc_0 if p_desc_idx == KV_INST0 else p_desc_1
     p_tmem_addr = p_tmem_addr_0 if p_desc_idx == KV_INST0 else p_tmem_addr_1
     tmem_o.acquire()
-    for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+    slot_stages = _transformed_kv_slot_stages(cfg)
+    if cfg.uses_fused_slot_mma_issue:
         smem_kv.wait()
         v_desc = getattr(smem_kv, v_desc_label)()
-        getattr(tmem_o, vp_mma_label)(
-            v_desc_0=v_desc,
-            v_desc_1=v_desc,
-            p_desc_0=p_desc,
-            p_desc_1=p_desc,
-            p_tmem_addr_0=p_tmem_addr,
-            p_tmem_addr_1=p_tmem_addr,
-            inst_idx=p_desc_idx,
-            head_dim_stage_idx=head_dim_stage_idx,
-        )
+        getattr(tmem_o, f"{vp_mma_label}_slot")(v_desc=v_desc, p_desc=p_desc)
+        smem_kv.release()
+        tmem_o.commit()
+        tmem_p.release()
+        return
+    for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
+        smem_kv.wait()
+        v_desc = getattr(smem_kv, v_desc_label)()
+        for sub_stage in range(slot_stages):
+            getattr(tmem_o, vp_mma_label)(
+                v_desc_0=v_desc,
+                v_desc_1=v_desc,
+                p_desc_0=p_desc,
+                p_desc_1=p_desc,
+                p_tmem_addr_0=p_tmem_addr,
+                p_tmem_addr_1=p_tmem_addr,
+                inst_idx=p_desc_idx,
+                head_dim_stage_idx=slot_idx * slot_stages + sub_stage,
+            )
         smem_kv.release()
     tmem_o.commit()
     tmem_p.release()
@@ -713,6 +777,10 @@ class DecodeGenTask(Task):
         # bound must already count scaled iterations.
         self.domain_scale = kwargs.pop("domain_scale", 1)
         self.q_bound_resources = kwargs.pop("q_bound_resources", ())
+        # Only the softmax tasks read the keys every row of a work tile sees.
+        self.consumes_visible_kv_interval = kwargs.pop(
+            "consumes_visible_kv_interval", False
+        )
         super().__init__(**kwargs)
         self._tmem_base_offset = cutlass.Int32(0)
         self._warp_grp_thread_idx = cutlass.Int32(0)
@@ -724,6 +792,11 @@ class DecodeGenTask(Task):
         self._kv_raw_tile_base = cutlass.Int32(0)
         self._kv_valid_tile_end = cutlass.Int32(0)
         self._kv_window_start = cutlass.Int32(0)
+        if self.caches_visible_kv_interval:
+            # Appended to the task cache only for configs that cache it. An
+            # empty interval masks every tile, which is always exact.
+            self._kv_visible_begin = cutlass.Int32(0)
+            self._kv_visible_end = cutlass.Int32(0)
         # Keep the DSL loop-carried task structure stable. Persistent loops
         # assign this liveness marker on every path, so it must exist before
         # the first dynamic ``while`` is lowered by the stock compiler.
@@ -773,6 +846,12 @@ class DecodeGenTask(Task):
                 else self.requested_splits
             )
             values = (*values, count)
+        if cutlass.const_expr(self.caches_visible_kv_interval):
+            # Slot task_cache_visible_kv_interval_index(cfg), then the
+            # sliding window's begin.
+            values = (*values, self._kv_visible_end)
+            if cutlass.const_expr(self.cfg.use_sliding_window_causal):
+                values = (*values, self._kv_visible_begin)
         return values
 
     @cute.jit
@@ -831,6 +910,7 @@ class DecodeGenTask(Task):
         context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
+        queue_work_tile = work_tile
         if cutlass.const_expr(self.cfg is not None and self.cfg.runtime_split_kv):
             work_tile = WorkTileInfo(
                 split_kv_grid_coord(self.cfg, work_tile.tile_idx),
@@ -851,20 +931,10 @@ class DecodeGenTask(Task):
             # task graph.  Keep all persistent tasks on the same logical tile
             # until that tail has drained.  KV256's shared-KV alias instead
             # uses a narrow Load/Correction credit in the captured schedule.
-            if cutlass.const_expr(
-                self.cfg.use_variable_seqlens_q and self.cfg.use_persistent_scheduler
-            ):
-                assert isinstance(self.work_queue, PackedDecodeWorkQueue)
-                q_group_cta_idx, _, b_idx = work_tile.tile_idx
-                _, seq_len_q = _q_seq_bounds(
-                    self.cfg,
-                    self.work_queue.cu_seqlens_q,
-                    cutlass.Int32(b_idx),
-                )
-                q_group_idx = cutlass.Int32(q_group_cta_idx)
-                if _q_group_token_base(self.cfg, q_group_idx) < seq_len_q:
-                    prims.barrier_cta_sync(12, thread_count=16 * 32)
-            else:
+            # Tasks with ``skip_if`` reach this barrier only on tiles the work
+            # queue keeps, so tasks without it test the same predicate.
+            assert isinstance(self.work_queue, PackedDecodeWorkQueue)
+            if not self.work_queue.skip_work_tile_if(queue_work_tile):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
 
     @cute.jit
@@ -942,6 +1012,49 @@ class DecodeGenTask(Task):
             self.work_queue.producer_tail()
         self.dummy = cutlass.Boolean(True)
 
+    @property
+    def caches_visible_kv_interval(self) -> bool:
+        """Return whether this task computes and carries the visible K interval.
+
+        Only softmax tasks consume it, and only configs whose bounds need a
+        multi-row intersection cache it; every other task keeps the plain
+        task-cache layout and get_domain work.
+        """
+        return (
+            self.consumes_visible_kv_interval
+            and self.cfg is not None
+            and cta_caches_visible_kv_interval(self.cfg)
+        )
+
+    def _cache_visible_kv_interval(
+        self, tile_coord: cute.Coord, seq_len_kv: cutlass.Int32
+    ) -> None:
+        """Cache the keys every row of the work tile sees, for softmax.
+
+        Softmax compares each K tile against this interval instead of
+        rebuilding the CTA's causal/window/tail bounds per tile.
+        """
+        cfg = self.cfg
+        if cfg.uses_compact_split_grid:
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % cfg.num_q_ctas
+        elif cfg.has_single_q_cta:
+            q_group_idx = cutlass.Int32(0)
+        elif cfg.use_split_kv:
+            q_group_idx = cutlass.Int32(tile_coord[0]) // cutlass.Int32(cfg.splits_kv)
+        else:
+            q_group_idx = cutlass.Int32(tile_coord[0])
+        seq_len_q = (
+            cutlass.Int32(cfg.max_seq_len_q)
+            if self.seq_len_q is None
+            else cutlass.Int32(self.seq_len_q)
+        )
+        self._kv_visible_begin, self._kv_visible_end = cta_visible_kv_interval(
+            cfg,
+            seq_len_kv,
+            seq_len_q,
+            _q_group_token_base(cfg, q_group_idx),
+        )
+
     def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
         """Return this task's loop domain for one static or persistent tile.
 
@@ -1009,6 +1122,10 @@ class DecodeGenTask(Task):
             self._kv_raw_tile_base = cutlass.Int32(0)
             self._kv_valid_tile_end = route_count
             self._kv_window_start = cutlass.Int32(0)
+            if self.caches_visible_kv_interval:
+                # Sparse routes carry their own masks; no tile skips them.
+                self._kv_visible_begin = cutlass.Int32(0)
+                self._kv_visible_end = cutlass.Int32(0)
 
             loop_domain = _loop_domain_after_head(
                 route_count,
@@ -1035,6 +1152,8 @@ class DecodeGenTask(Task):
                 ) + cutlass.Int64(tile_coord[1])
             seq_len_kv = cutlass.Int32(self.seqlens_kv[metadata_row])
         self._seq_len_kv = seq_len_kv
+        if self.caches_visible_kv_interval:
+            self._cache_visible_kv_interval(tile_coord, seq_len_kv)
         if cutlass.const_expr(self.cfg.use_paged_kv):
             # Native paged KV uses a fixed-stride dense page table. The row's
             # live extent therefore comes from seq_lens; padded entries beyond
@@ -3115,22 +3234,29 @@ def create_transform_kv_task(
                 # One raw stage holds every head-dim slice: convert all of
                 # them before returning it to the loader.
                 source.wait()
-                for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+                slot_stages = cfg.transformed_kv_hd_stages_per_slot
+                for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
                     smem_transformed_kv.acquire()
-                    getattr(smem_transformed_kv, label)(
-                        head_dim_stage_idx=head_dim_stage_idx
-                    )
+                    for sub_stage in range(slot_stages):
+                        getattr(smem_transformed_kv, label)(
+                            head_dim_stage_idx=slot_idx * slot_stages + sub_stage
+                        )
                     smem_transformed_kv.commit()
                 source.release()
                 return
-            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+            # One ring slot covers slot_stages head-dim stages: acquire and
+            # commit once per slot; raw stages are still waited and released
+            # one head-dim stage at a time.
+            slot_stages = cfg.transformed_kv_hd_stages_per_slot
+            for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
                 smem_transformed_kv.acquire()
-                source.wait()
-                getattr(smem_transformed_kv, label)(
-                    head_dim_stage_idx=head_dim_stage_idx
-                )
+                for sub_stage in range(slot_stages):
+                    source.wait()
+                    getattr(smem_transformed_kv, label)(
+                        head_dim_stage_idx=slot_idx * slot_stages + sub_stage
+                    )
+                    source.release()
                 smem_transformed_kv.commit()
-                source.release()
 
         for label in head_labels:
             transform_one(label)
@@ -3919,6 +4045,7 @@ def create_softmax0_task(
         schedule=schedule_result,
         num_registers=cfg.softmax_task_num_registers,
         name="Softmax0Task",
+        consumes_visible_kv_interval=True,
         **kw,
     )
 
@@ -4016,6 +4143,7 @@ def create_softmax1_task(
         schedule=schedule_result,
         num_registers=cfg.softmax_task_num_registers,
         name="Softmax1Task",
+        consumes_visible_kv_interval=True,
         **kw,
     )
 

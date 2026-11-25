@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Cake Gated DeltaProduct (GDP) decode and MTP verification
-(SM90 / SM100 / SM103).
+(SM90 / SM100 / SM103 / SM107).
 
 GDP (arXiv:2502.10297) generalizes the gated delta rule from one Householder
 update per token to ``n = num_householder`` of them, with one per-head scalar
@@ -35,10 +35,10 @@ state pool uses FlashInfer's K-last layout ``[pool_size, HV, V, K]``; batch
 rows read the slot ``initial_state_indices[b]`` and write the slot
 ``output_state_indices[b]`` (the read slot by default) after their last
 token, or scatter the state after every token to ``ssm_state_indices[b, t]``.
-The pool is FP32, or FP16 on SM100 / SM103: an FP16 pool is widened to FP32 on
-load and each store rounds the FP32 state to FP16, to nearest even or, with a
-``rand_seed``, stochastically (Philox random bits and the hardware ``cvt.rs``
-conversion).
+The pool is FP32, or FP16 on SM100 / SM103 / SM107: an FP16 pool is widened to
+FP32 on load and each store rounds the FP32 state to FP16, to nearest even or,
+with a ``rand_seed``, stochastically (Philox random bits and the hardware
+``cvt.rs`` conversion).
 
 Usage::
 
@@ -118,7 +118,7 @@ def cake_gated_delta_product_mtp(
         must equal ``H`` (no GQA / GVA).
     initial_state : torch.Tensor
         State pool ``[pool_size, HV, 64, 128]`` (K-last), float32 or (SM100 /
-        SM103 only) float16, read and written in place.  Its rows must be
+        SM103 / SM107 only) float16, read and written in place.  Its rows must be
         dense, its strides multiples of four elements and its base address
         16-byte (float32) or 8-byte (float16) aligned; a non-contiguous pool
         with these properties (padding between heads or slots) is used as
@@ -206,10 +206,10 @@ def cake_gated_delta_product_mtp(
 
     Notes
     -----
-    - Requires an SM90, SM100 or SM103 device (``sm_90a`` / ``sm_100a`` /
-      ``sm_103a`` programs); a float16 pool requires SM100 or SM103 (the
-      hardware ``cvt.rs`` conversion) and is refused with ``ValueError`` on
-      SM90.
+    - Requires an SM90, SM100, SM103 or SM107 device (``sm_90a`` /
+      ``sm_100a`` / ``sm_103a`` / ``sm_107a`` programs); a float16 pool
+      requires SM100, SM103 or SM107 (the hardware ``cvt.rs`` conversion) and
+      is refused with ``ValueError`` on SM90.
     - ``T`` is a runtime value up to the exported maximum (16); ``T`` of 1 to 8
       and 16 with ``num_householder == 3`` run programs compiled for that token
       count, selected by ``B x HV``.

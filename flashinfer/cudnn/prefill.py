@@ -45,7 +45,7 @@ _CUDNN_NATIVE_HN_SUPPORTED = bool(
 def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -> bool:
     """Whether the backend supports token-unit offsets for this graph.
 
-    FlashInfer's FE >=1.32 floor supplies the cumulative-length inputs and
+    The required frontend supplies the cumulative-length inputs and
     ragged-offset multipliers. The backend still needs 9.24 for fp16/bf16,
     or 9.25 for FP8 and mixed cumulative/per-batch mask lengths.
     """
@@ -78,7 +78,7 @@ def _cudnn_supports_paged_token_offsets(
 
 @functools.cache
 def _cudnn_supports_paged_auto() -> bool:
-    """The qualified paged prefill selection requires FE 1.32 / cuDNN 9.24."""
+    """The qualified paged prefill selection requires the packed-split runtime and cuDNN 9.24+."""
     if not CUDNN_AVAILABLE:
         return False
     try:
@@ -94,24 +94,28 @@ def _cudnn_supports_paged_auto() -> bool:
 
 @functools.cache
 def _cudnn_supports_paged_gqa_auto(head_dim: int) -> bool:
-    """D256 needs FE 1.33 placement and matching native split origins."""
+    """D256 placement requires native packed splits and physical origins."""
     if head_dim != 256 or not _cudnn_supports_paged_auto():
         return False
     try:
-        from packaging.version import Version
-
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
-        return (
-            Version(cudnn.__version__) >= Version("1.33.0")
-            and bool(getattr(binder, f"supports_paged_d{head_dim}_packed_split", False))
-            and bool(
-                getattr(
-                    binder, f"supports_paged_d{head_dim}_split_physical_origins", False
-                )
-            )
+        return bool(
+            getattr(binder, f"supports_paged_d{head_dim}_packed_split", False)
+        ) and bool(
+            getattr(binder, f"supports_paged_d{head_dim}_split_physical_origins", False)
         )
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+@functools.cache
+def _cudnn_supports_paged_full_prefill_auto(head_dim: int) -> bool:
+    """Check the native capabilities required by full-prefill placement."""
+    return (
+        head_dim in (128, 256)
+        and _cudnn_supports_paged_auto()
+        and (head_dim == 128 or _cudnn_supports_paged_gqa_auto(head_dim))
+    )
 
 
 # Execute-time shape override for the ragged (token-indptr) path. cuDNN

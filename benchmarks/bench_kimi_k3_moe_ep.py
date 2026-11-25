@@ -204,7 +204,7 @@ def main():
                     )
                     if args.provider == "kimi"
                     else moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+                        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
                         fast_math=False,
                         **options,
                     )
