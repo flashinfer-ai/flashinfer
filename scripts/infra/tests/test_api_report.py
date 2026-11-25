@@ -305,6 +305,14 @@ class ReportTest(unittest.TestCase):
                 if status
                 else TimeoutError("timeout")
             )
+            if status == 422:
+                api.routes[("POST", ROOT + "/pulls/3/reviews")].errors = [
+                    {
+                        "resource": "PullRequestReviewComment",
+                        "field": "line",
+                        "code": "invalid",
+                    }
+                ]
             api.routes[("POST", ROOT + "/pulls/3/comments")] = {}
             result = self.publish(api, pr, report)
             individual = [
@@ -314,3 +322,88 @@ class ReportTest(unittest.TestCase):
             ]
             self.assertEqual(len(individual), 2 if status == 422 else 0)
             self.assertEqual(result["failed"], 0 if status == 422 else 2)
+
+    def test_retarget_during_inline_updates_stops_later_writes(self):
+        from copy import deepcopy
+
+        api, pr, report = fixture([make(), make("bar")])
+        snapshot = deepcopy(pr)
+        api.routes[("GET", ROOT + "/pulls/3/comments")] = [
+            {
+                "id": i,
+                "user": {"login": "github-actions[bot]"},
+                "body": f"<!-- flashinfer-api-inline --><!-- key:{inline_key(f)} -->",
+                "path": f["path"],
+                "line": 12,
+            }
+            for i, f in zip([7, 8], report["findings"], strict=True)
+        ]
+
+        def advance(_):
+            pr["base"]["sha"] = "c" * 40
+            return {}
+
+        api.routes[("PATCH", ROOT + "/pulls/comments/7")] = advance
+        api.routes[("PATCH", ROOT + "/pulls/comments/8")] = {}
+        self.publish(api, snapshot, report)
+        self.assertFalse(
+            any(c[0] == "PATCH" and c[1].endswith("/8") for c in api.calls)
+        )
+
+    def test_retarget_after_last_anchor_prevents_batch_review(self):
+        from copy import deepcopy
+        from unittest.mock import patch
+        from pr_checks.api_anchors import select_anchor
+
+        api, pr, report = fixture()
+        snapshot = deepcopy(pr)
+
+        def advance(finding, files):
+            result = select_anchor(finding, files)
+            pr["base"]["sha"] = "c" * 40
+            return result
+
+        with patch("pr_checks.api_report.select_anchor", side_effect=advance):
+            self.publish(api, snapshot, report)
+        self.assertFalse(
+            any(c[0] == "POST" and c[1].endswith("/reviews") for c in api.calls)
+        )
+
+    def test_spam_rejection_does_not_fan_out(self):
+        api, pr, report = fixture([make(), make("bar")])
+        error = GitHubError(422, "spam rejection")
+        error.errors = [
+            {
+                "resource": "PullRequestReview",
+                "code": "custom",
+                "message": "You have submitted too quickly",
+            }
+        ]
+        api.routes[("POST", ROOT + "/pulls/3/reviews")] = error
+        api.routes[("POST", ROOT + "/pulls/3/comments")] = {}
+        result = self.publish(api, pr, report)
+        self.assertEqual(result["failed"], 2)
+        self.assertFalse(
+            any(
+                c[0] == "POST" and c[1].endswith("/pulls/3/comments") for c in api.calls
+            )
+        )
+
+    def test_individual_rejection_stops_further_fallback(self):
+        api, pr, report = fixture([make(), make("bar")])
+        error = GitHubError(422, "invalid line")
+        error.errors = [
+            {"resource": "PullRequestReviewComment", "field": "line", "code": "invalid"}
+        ]
+        api.routes[("POST", ROOT + "/pulls/3/reviews")] = error
+        api.routes[("POST", ROOT + "/pulls/3/comments")] = GitHubError(
+            403, "rate limited"
+        )
+        result = self.publish(api, pr, report)
+        self.assertEqual(result["failed"], 2)
+        self.assertEqual(
+            sum(
+                c[0] == "POST" and c[1].endswith("/pulls/3/comments") for c in api.calls
+            ),
+            1,
+        )

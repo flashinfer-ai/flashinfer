@@ -63,3 +63,25 @@ class GitHubTest(unittest.TestCase):
             SameOriginRedirect().redirect_request(
                 request, None, 302, "redirect", {}, "https://other.example/path"
             )
+
+    def test_validation_details_survive_http_error_translation(self):
+        errors = [
+            {"resource": "PullRequestReviewComment", "field": "line", "code": "invalid"}
+        ]
+        api = GitHub("test-token")
+        api.opener.open = Mock(
+            side_effect=HTTPError(
+                "https://api.github.com/reviews",
+                422,
+                "invalid",
+                {},
+                io.BytesIO(
+                    json.dumps(
+                        {"message": "Validation Failed", "errors": errors}
+                    ).encode()
+                ),
+            )
+        )
+        with self.assertRaises(GitHubError) as caught:
+            api.request("POST", "repos/org/repo/pulls/3/reviews", {})
+        self.assertEqual(caught.exception.errors, errors)

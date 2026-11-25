@@ -5,7 +5,7 @@ import html
 from urllib.parse import quote
 
 from .api_anchors import select_anchor
-from .github_api import warning as emit_warning
+from .github_api import anchor_validation_error, warning as emit_warning
 
 MARKER = "<!-- flashinfer-api-compatibility -->"
 INLINE = "<!-- flashinfer-api-inline -->"
@@ -259,6 +259,8 @@ def publish_report(
     for finding in group_findings(report.get("findings", [])):
         if finding["classification"] == "NON_BREAKING":
             continue
+        if not current():
+            return None
         delivery["total"] += 1
         anchor = select_anchor(finding, files)
         if not anchor:
@@ -308,6 +310,8 @@ def publish_report(
             delivery["failed"] += 1
             warning(f"API review comment failed for {finding.get('api')}: {error}")
     if pending:
+        if not current():
+            return None
         try:
             api.request(
                 "POST",
@@ -323,8 +327,10 @@ def publish_report(
             delivery["line"] += len(pending)
         except Exception as error:
             # Validation errors get per-line fallback; never amplify rate limits.
-            if getattr(error, "status", None) == 422:
-                for comment in pending:
+            if anchor_validation_error(error):
+                for index, comment in enumerate(pending):
+                    if not current():
+                        return None
                     try:
                         api.request(
                             "POST",
@@ -336,6 +342,9 @@ def publish_report(
                     except Exception as individual:
                         delivery["failed"] += 1
                         warning(f"API inline comment failed: {individual}")
+                        if not anchor_validation_error(individual):
+                            delivery["failed"] += len(pending) - index - 1
+                            break
             else:
                 delivery["failed"] += len(pending)
                 warning(f"API inline review failed: {error}")

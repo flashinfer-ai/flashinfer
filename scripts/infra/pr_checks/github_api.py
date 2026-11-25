@@ -7,8 +7,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 class GitHubError(RuntimeError):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, errors: list | None = None):
         self.status = status
+        self.errors = errors or []
         super().__init__(message)
 
 
@@ -47,9 +48,15 @@ class GitHub:
                 body = response.read()
                 return json.loads(body) if body else None
         except HTTPError as error:
-            error.close()
+            try:
+                details = json.load(error)
+            except (ValueError, TypeError):
+                details = {}
+            finally:
+                error.close()
+            errors = details.get("errors", []) if isinstance(details, dict) else []
             raise GitHubError(
-                error.code, f"GitHub {method} {path} failed (HTTP {error.code})"
+                error.code, f"GitHub {method} {path} failed (HTTP {error.code})", errors
             ) from error
 
     def paginate(self, path: str) -> list:
@@ -72,3 +79,42 @@ def warning(message: str) -> None:
     # Escape untrusted source text before emitting workflow commands.
     escaped = str(message).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
     print(f"::warning::{escaped}")
+
+
+def anchor_validation_error(error: Exception) -> bool:
+    """Retry only positively identified diff-anchor errors, never spam limits."""
+    errors = getattr(error, "errors", [])
+    if (
+        getattr(error, "status", None) != 422
+        or not isinstance(errors, list)
+        or not errors
+    ):
+        return False
+    for item in errors:
+        if not isinstance(item, dict):
+            return False
+        field = item.get("field")
+        if (
+            item.get("resource") == "PullRequestReviewComment"
+            and field
+            in {"path", "line", "side", "position", "start_line", "start_side"}
+            and item.get("code") in {"invalid", "missing_field", "unprocessable"}
+        ):
+            continue
+        if (
+            item.get("resource") == "PullRequestReview"
+            and field == "comments"
+            and any(
+                text in str(item.get("message", "")).lower()
+                for text in (
+                    "line could not",
+                    "path is invalid",
+                    "line is invalid",
+                    "diff hunk",
+                    "position is invalid",
+                )
+            )
+        ):
+            continue
+        return False
+    return True
