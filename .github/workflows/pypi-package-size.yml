@@ -14,8 +14,9 @@
 # are not uploaded to PyPI by release.yml. A manual dispatch from another
 # branch measures that branch but never posts to Slack.
 #
-# Requires the SLACK_BOT_TOKEN repository secret: a bot token with chat:write
-# whose app has been added to the channel.
+# Requires the SLACK_BOT_PYPI_SIZE_CHECKER_TOKEN repository secret: a bot token
+# with chat:write whose app has been added to the channel. The check step
+# passes it to the script as SLACK_BOT_TOKEN.
 name: PyPI Package Size
 
 on:
@@ -74,7 +75,7 @@ jobs:
 
       - name: Check size and alert Slack
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_PYPI_SIZE_CHECKER_TOKEN }}
           # Alert only for main; dispatches from other branches are dry runs.
           DRY_RUN: ${{ github.ref != 'refs/heads/main' || inputs.dry_run == true }}
         run: |
