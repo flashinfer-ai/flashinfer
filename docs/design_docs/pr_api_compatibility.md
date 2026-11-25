@@ -1,6 +1,9 @@
 # Per-PR API compatibility gate
 
 The API checker compares a PR's merge base with its head using Python ASTs.
+The scanner, gate, report publisher, inline anchor selection, REST client, and
+regression tests all use Python and its standard library. No Node.js runtime or
+third-party Python package is required by this API check.
 The required status is **API compatibility**. Static compatibility does not
 establish numerical or runtime equivalence, and the decorated surface does not
 cover every public class contract.
@@ -128,7 +131,6 @@ another PR. The required check name remains **API compatibility**.
 
 ```sh
 python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
-node --test scripts/infra/tests/test_api_*.cjs
 pre-commit run --files <changed-paths>
 ```
 

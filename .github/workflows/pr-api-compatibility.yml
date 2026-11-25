@@ -23,14 +23,27 @@ jobs:
       queue: max
     steps:
       - name: Mark current API gate pending
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const pr = context.payload.pull_request;
-            const target_url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            for (const name of ['API compatibility', `api-scan/pr-${pr.number}`]) {
-              await github.rest.repos.createCommitStatus({ ...context.repo, sha: pr.head.sha, context: name, state: 'pending', description: 'Preparing trusted API scan', target_url });
-            }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_GATE_STATE: pending
+          API_GATE_DESCRIPTION: Preparing trusted API scan
+        run: &api-gate-status |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          pr = event["pull_request"]
+          root = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"]
+          target = os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"]
+          for name in ("API compatibility", f"api-scan/pr-{pr['number']}"):
+              data = {"context": name, "state": os.environ["API_GATE_STATE"], "description": os.environ["API_GATE_DESCRIPTION"], "target_url": target}
+              request = Request(root + "/statuses/" + pr["head"]["sha"], data=json.dumps(data).encode(), method="POST", headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json", "Content-Type": "application/json"})
+              with urlopen(request, timeout=60) as response:
+                  response.read()
+          PYTHON
       # Never checkout or execute the PR head in this privileged workflow.
       - uses: actions/checkout@v4
         with:
@@ -40,13 +53,10 @@ jobs:
       - name: Test trusted API policy and gate
         run: |
           python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
-          node --test scripts/infra/tests/test_api_*.cjs
       - name: Scan git objects and publish API gate
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const gate = require('./scripts/infra/pr_checks/api_gate.cjs');
-            await gate.runScan({ github, core, context });
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/infra/pr_checks/api_gate.py scan
       - name: Upload trusted API evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -56,10 +66,8 @@ jobs:
           if-no-files-found: warn
       - name: Fail API gate if workflow execution failed
         if: failure()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const pr = context.payload.pull_request;
-            for (const name of ['API compatibility', `api-scan/pr-${pr.number}`]) {
-              await github.rest.repos.createCommitStatus({ ...context.repo, sha: pr.head.sha, context: name, state: 'error', description: 'Trusted API workflow did not complete', target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}` });
-            }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_GATE_STATE: error
+          API_GATE_DESCRIPTION: Trusted API workflow did not complete
+        run: *api-gate-status

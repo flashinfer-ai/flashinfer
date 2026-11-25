@@ -18,7 +18,6 @@ jobs:
           persist-credentials: false
       - run: |
           python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
-          node --test scripts/infra/tests/test_api_*.cjs
 
   documentation:
     name: Documentation checks (advisory)
