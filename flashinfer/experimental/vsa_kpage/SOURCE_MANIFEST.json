@@ -1,0 +1,37 @@
+{
+  "upstream": "NVIDIA/cudnn-frontend",
+  "snapshot": "b300_pr1996_retest_20261111/source",
+  "commit": "862a438c851b77305391916f7db61b14d8fdeb4e",
+  "files_sha256": {
+    "cudnn/_cutlass_compat.py": "502447c3fb9fba3e2ab6cca619a668ccfdd5cd793f9cac898742f5c105a79cda",
+    "cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_kpage.py": "e5d47f476a8df319405026b412337e9b82f29b008dc6e5e32be1641bef0d6d7c",
+    "cudnn/block_sparse_attention/csrc/fwd/sm100_blk128/bsa_fwd_sm100_kpage_q64.py": "0364ccf3eb16a636ef74efc0052096546969e9cc91d30d367e1ad28461bd6055",
+    "cudnn/block_sparse_attention/csrc/fwd/sm100_blk64/bsa_fwd_helpers.py": "24b941d6e8bd0e5981b907aeba6908315bbc3ecc484527a849dc65e410ade205",
+    "cudnn/block_sparse_attention/csrc/utils/block_sparse_tile_scheduler.py": "664986aaf60177ecbd1806aa13eaffa58bd89ee9a4fc1e9a18e0ada8ac81d5ab",
+    "cudnn/block_sparse_attention/csrc/utils/copy_utils.py": "9212ad29491df862de9b7e699a1c406472e91e6e0f3eb469e355010e4926d96c",
+    "cudnn/block_sparse_attention/csrc/utils/cute_dsl_utils.py": "7bed4fe11973fca3f667f99cc5847d415491e2c60dfe8987c9b789848075604e",
+    "cudnn/block_sparse_attention/csrc/utils/kernel_utils.py": "2f185f98d74b19fed18f6ddd43b955831e12d6cf46d6edff51f1161277fb88c3",
+    "cudnn/block_sparse_attention/csrc/utils/kpage_tile_scheduler.py": "29b73b222ef1ed400dcc98a8272df60870e69b8e76cebb137646de7333ac15ca",
+    "cudnn/block_sparse_attention/csrc/utils/kpage_utils.py": "497a17d86e0d4aba079d304accae256d8a91eaaf2dab797798365c5447a34f07",
+    "cudnn/block_sparse_attention/csrc/utils/layout_utils.py": "20d43876ff0ff41de7a95c6314e61451a8fbf907158840979032487b6f3ab259",
+    "cudnn/block_sparse_attention/csrc/utils/mma_sm100_desc.py": "2e32288b190559d3e5ca8d4f4ce8755001e849d4526aa37809a12593c15cc730",
+    "cudnn/block_sparse_attention/csrc/utils/named_barrier.py": "c5ec49ce67184b1b56e0afb613581ec3c7374ea7aa6166017f684c6d0a5d8cb7",
+    "cudnn/block_sparse_attention/csrc/utils/pipeline.py": "502243132a60b27497545f118d9f159800ce13b3021fe40dc82bcd9552981e29",
+    "cudnn/block_sparse_attention/csrc/utils/seqlen_info.py": "aa726afa30ea8091a30f294c58abc830b3f46a5c7eb589ec315c0ff4787fa43e",
+    "cudnn/block_sparse_attention/csrc/utils/softmax.py": "04fbe6cbe48b3cbcfa0d3bd0e139fdb96738297c1c5ca1b73a903771aa7d09bd",
+    "cudnn/block_sparse_attention/csrc/utils/subset_barrier.py": "399026f4b7ba8f21258a88a23c8c7a6fb9a8c3d06e049e020775ad64c9079f59",
+    "cudnn/block_sparse_attention/csrc/utils/tcgen05_mma_helpers.py": "e0c65d4564629ad636fd6389a91dafaeeee6029a1c7f20a4b3073466a6069420",
+    "cudnn/block_sparse_attention/csrc/utils/tile_scheduler.py": "fe01bde2ebc0c2968ca856186ff36de78e2c4234a5717c461e388be6dd059e69",
+    "cudnn/block_sparse_attention/kpage/_build.py": "e0b4e28c47a635d86f6c20b3e68ef4013662bdb8c9505513f2fd3a8479efedbe",
+    "cudnn/block_sparse_attention/kpage/_build_kernels.py": "8d627c5009968a09b4b38daa7bc3f24fece5681f70921f994baf7f25d3e6a7a3",
+    "cudnn/block_sparse_attention/kpage/_compile.py": "adeacec7ea41cc40699c7c57ec79cca3663c83b33be5b5c33e3b92178d1a2400",
+    "cudnn/block_sparse_attention/kpage/_interface.py": "150ac8764810855d8d08febc1fee511959ebc2f50e881e0a5eedffe879a9759c",
+    "cudnn/block_sparse_attention/kpage/_layout.py": "cd5687f90560ec11614e458f2a778409d706bdcb2fad4d7e84b86da6c58b314e"
+  },
+  "license_files_sha256": {
+    "LICENSING.md": "b92fa883c22441f4c2d2149035e4ef7b795892eefaa088c81b30f9cc55023dcb",
+    "LICENSE.txt": "a58e7a5653d57f4907c73b6ed3bde05119cd9fb96a985bc944b4239a22d8f7ea",
+    "LICENSE-MIT.txt": "6a1e5992580aadeeea1023b2594d415a87457a4af12162c4eb7e5e1168fd92af",
+    "THIRD_PARTY_LICENSES.txt": "67a70a88c4a61d4b4e56bf99cb0d9cefb55ac8b491c250d6f629bb30c55d6ed3"
+  }
+}

@@ -1,0 +1,158 @@
+{
+  "environment": {
+    "gpu": "NVIDIA B200",
+    "capability": [
+      10,
+      0
+    ],
+    "torch": "2.11.0a0+a6c236b9fd.nv26.03.46836102",
+    "cuda": "13.2",
+    "cutlass_dsl": "4.8.0"
+  },
+  "combined_pytest_run": {
+    "exit_code": 0,
+    "total": 83,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "groups": {
+      "tests.experimental.test_vsa_kpage": 47,
+      "tests.attention.test_cake_vsa_planning": 32,
+      "tests.attention.test_vsa_block_sparse": 4
+    }
+  },
+  "kpage_test_categories": [
+    {
+      "test": "test_reference_reuse_and_output_buffers",
+      "cases": 12,
+      "result": "passed"
+    },
+    {
+      "test": "test_sparse_input_conversion_and_switch_back",
+      "cases": 4,
+      "result": "passed"
+    },
+    {
+      "test": "test_invalid_metadata_and_failed_replan",
+      "cases": 2,
+      "result": "passed"
+    },
+    {
+      "test": "test_reject_other_backends",
+      "cases": 3,
+      "result": "passed"
+    },
+    {
+      "test": "test_reject_incompatible_options",
+      "cases": 1,
+      "result": "passed"
+    },
+    {
+      "test": "test_native_fi_shapes_and_cuda_graph",
+      "cases": 2,
+      "result": "passed"
+    },
+    {
+      "test": "test_blk128_active_query_tail",
+      "cases": 4,
+      "result": "passed"
+    },
+    {
+      "test": "test_blk128_gqa_multiple_kv_heads",
+      "cases": 1,
+      "result": "passed"
+    },
+    {
+      "test": "test_exact_empty_attention_and_query_padding",
+      "cases": 4,
+      "result": "passed"
+    },
+    {
+      "test": "test_sparse_conversion_against_independent_reference",
+      "cases": 6,
+      "result": "passed"
+    },
+    {
+      "test": "test_default_metadata_and_scale",
+      "cases": 6,
+      "result": "passed"
+    },
+    {
+      "test": "test_replan_changed_metadata_and_shape",
+      "cases": 2,
+      "result": "passed"
+    }
+  ],
+  "precision_criteria": {
+    "reference": "independent FP64",
+    "output_atol": 0.02,
+    "output_rtol": 0.02,
+    "lse_atol": 0.001,
+    "lse_rtol": 0.001,
+    "padding_output_and_lse": "exactly zero",
+    "empty_attention_output": "exactly zero",
+    "empty_attention_lse": "negative infinity"
+  },
+  "source_commit": "862a438c851b77305391916f7db61b14d8fdeb4e",
+  "source_equivalence": [
+    {
+      "block": 64,
+      "gqa": 1,
+      "tail": false,
+      "source_exact_match": true
+    },
+    {
+      "block": 128,
+      "gqa": 1,
+      "tail": false,
+      "source_exact_match": true
+    },
+    {
+      "block": 128,
+      "gqa": 2,
+      "tail": false,
+      "source_exact_match": true
+    },
+    {
+      "block": 128,
+      "gqa": 2,
+      "tail": true,
+      "source_exact_match": true
+    }
+  ],
+  "source_comparison_scope": "manual checks separate from CI; truncated sequence comparison does not replace active-query-tail reference cases",
+  "benchmarks": [
+    {
+      "block": 64,
+      "M": 8192,
+      "N": 8192,
+      "H": 8,
+      "D": 128,
+      "selected_blocks": 16,
+      "kv_valid_per_block": 40,
+      "plan_wall_ms": 0.658655000734143,
+      "source_gpu_ms": 0.08819200098514557,
+      "fi_gpu_ms": 0.0880960002541542
+    },
+    {
+      "block": 128,
+      "M": 8192,
+      "N": 8192,
+      "H": 8,
+      "D": 128,
+      "selected_blocks": 16,
+      "kv_valid_per_block": 40,
+      "plan_wall_ms": 0.6664000102318823,
+      "source_gpu_ms": 0.06547199934720993,
+      "fi_gpu_ms": 0.06540799885988235
+    }
+  ],
+  "timing": "warm JIT, reused layout; bench_gpu_time(enable_cupti=True), with CUDA-event fallback; plan measured separately with synchronized wall time; single run, unlocked B200",
+  "limits": [
+    "SM103 not tested",
+    "no broad Cake/ordinary-VSA performance matrix",
+    "not a model end-to-end benchmark",
+    "fixed-plan graph replay only",
+    "multi-GPU concurrency not tested"
+  ]
+}
