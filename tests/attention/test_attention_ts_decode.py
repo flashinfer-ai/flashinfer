@@ -34,7 +34,14 @@ pytest.importorskip(
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float4E2M1FN, Float8E4M3FN, Int32
+from cutlass import (
+    BFloat16,
+    Float16,
+    Float4E2M1FN,
+    Float8E4M3FN,
+    Float8E8M0FNU,
+    Int32,
+)
 from cutlass.cute.runtime import make_ptr
 from cutlass import utils as cutlass_utils
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
@@ -95,7 +102,9 @@ from flashinfer.utils import is_sm100a_supported
 from tests.attention.test_helpers.quant_output import (
     assert_mxfp8_matches_quantized,
     assert_mxfp8_output,
+    mxfp8_reference_quantize,
     swizzled_scale_rows,
+    unswizzle_mxfp8_scales,
     written_scale_mask,
 )
 
@@ -2701,7 +2710,11 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "max_kv_len",
         "validate",
+        "out_scale",
     )
+    one_shot_parameters = inspect.signature(batch_decode_with_paged_kv_cache).parameters
+    assert one_shot_parameters["out_scale"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert one_shot_parameters["out_scale"].default is None
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
         "kv_layout",
@@ -2734,7 +2747,11 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "initialize_workspace",
         "softmax_scale",
         "output_scale",
+        "out_scale_dtype",
     )
+    plan_parameters = inspect.signature(BatchDecodePagedTSWrapper.plan).parameters
+    assert plan_parameters["out_scale_dtype"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert plan_parameters["out_scale_dtype"].default is None
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
         "self",
@@ -2749,11 +2766,14 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "max_q_len",
         "max_kv_len",
         "out",
+        "out_scale",
         "lse",
         "return_lse",
         "attention_sinks",
         "validate",
     )
+    assert run_parameters["out_scale"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["out_scale"].default is None
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
 
@@ -10852,3 +10872,243 @@ def test_attention_ts_decode_mxfp8_output_contract():
             case.block_tables,
             out=torch.empty_like(case.q),
         )
+
+    # fi_trace has no schema for the scale output yet; it must refuse rather
+    # than describe a quantized call as a plain 16-bit output.
+    from flashinfer.fi_trace import fi_trace
+
+    scales = torch.empty(512, dtype=_E8M0, device="cuda")
+    with pytest.raises(NotImplementedError, match="quantized decode outputs"):
+        fi_trace(
+            wrapper.run,
+            q=case.q,
+            paged_kv_cache=case.paged_kv_cache,
+            seq_lens_kv=case.seq_lens_kv,
+            block_tables=case.block_tables,
+            out_scale=scales,
+        )
+    with pytest.raises(NotImplementedError, match="quantized decode outputs"):
+        fi_trace(
+            batch_decode_with_paged_kv_cache,
+            q=case.q,
+            paged_kv_cache=case.paged_kv_cache,
+            block_tables=case.block_tables,
+            seq_lens_kv=case.seq_lens_kv,
+            out_scale=scales,
+        )
+
+
+def _mxfp8_scale_buffer(tokens: int, cols: int) -> torch.Tensor:
+    """A 128x4 swizzled MXFP8 scale buffer, padding filled with 0xEE."""
+    rows = (tokens + 127) // 128 * 128
+    padded_cols = (cols // 32 + 3) // 4 * 4
+    return torch.full(
+        (rows * padded_cols,), 0xEE, dtype=torch.uint8, device="cuda"
+    ).view(_E8M0)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,split_kv_mode,page_size",
+    (
+        # Direct Q48+ Swaps tails drain O in 128-column bands
+        # (``copy_swaps_o_band``); a quantized output quantizes there.
+        (128, 48, 6, 65, 8, "disabled", 64),
+        (256, 64, 6, 65, 16, "disabled", 64),
+        (128, 128, 12, 769, 8, "disabled", 64),
+        # Split Q48 partials quantize in the standalone reducer.
+        (128, 48, 7, 769, 8, "gmem_reduction_with_separate_kernel", 64),
+    ),
+)
+def test_attention_ts_decode_mxfp8_output_large_tile_size_q(
+    monkeypatch,
+    head_dim: int,
+    tile_size_q: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    heads_q_per_kv: int,
+    split_kv_mode: str,
+    page_size: int,
+) -> None:
+    """MXFP8 output of Q48+ NVFP4 Swaps tiles, with a large output_scale."""
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    split = split_kv_mode != "disabled"
+    cfg = make_decode_config(
+        headdim=head_dim,
+        args={
+            "use_keeps_mma_ab": False,
+            "groups_tokens_heads_q": True,
+            "tile_size_q": tile_size_q,
+            "use_persistent_scheduler": False,
+        },
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        batch_size=2,
+        num_heads_q=heads_q_per_kv,
+        num_heads_kv=1,
+        q_dtype=Float8E4M3FN,
+        k_dtype=Float4E2M1FN,
+        v_dtype=Float4E2M1FN,
+        o_dtype=Float8E4M3FN,
+        out_sf_dtype=Float8E8M0FNU,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=page_size,
+        mask_type="causal",
+        split_kv_mode=split_kv_mode,
+        splits_kv=2 if split else -1,
+        max_splits_kv=2 if split else None,
+        auto_tuner=False,
+        split_kv=split,
+    )
+    assert cfg.quant_output is not None and cfg.tile_size_q == tile_size_q
+    spec = decode_module._decode_launch_spec_from_config(
+        cfg,
+        batch_size=2,
+        num_qo_heads=heads_q_per_kv,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        max_active_clusters=fmha_decode_config.get_max_active_clusters_for_cluster_size(
+            1
+        ),
+    )
+    monkeypatch.setattr(
+        decode_module, "_resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
+    )
+    case, scale_factors = _make_mixed_precision_decode_case(
+        batch_size=2,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=heads_q_per_kv,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+        seed=6979,
+        splits_kv=cfg.splits_kv,
+        num_insts_kv=cfg.num_insts_kv,
+        q_tokens_per_cta=cfg.q_tokens_per_cta,
+        mask_type="causal",
+    )
+    wrapper = _plan_case(
+        replace(case, out_dtype=_FP8),
+        max_kv_len=seq_len_kv,
+        kv_scale_factors=scale_factors,
+        out_scale_dtype=_E8M0,
+    )
+    # The case's reference is unscaled (output_scale=1); a scale beyond the
+    # FP16 range checks that O is quantized before any 16-bit narrowing.
+    output_scale = 1000.0
+    out = torch.full(case.q.shape, 0.0, device="cuda").to(_FP8)
+    tokens = case.q.numel() // (heads_q_per_kv * head_dim)
+    out_scale = _mxfp8_scale_buffer(tokens, heads_q_per_kv * head_dim)
+    wrapper.run(
+        case.q,
+        case.paged_kv_cache,
+        case.seq_lens_kv,
+        case.block_tables,
+        softmax_scale=case.softmax_scale,
+        output_scale=output_scale,
+        kv_scale_factors=scale_factors,
+        out=out,
+        out_scale=out_scale,
+    )
+    assert_mxfp8_output(
+        out,
+        out_scale,
+        case.reference_real * output_scale,
+        max_relative_l2=_mxfp8_relative_l2(_FP8),
+    )
+    padding = ~written_scale_mask(tokens, heads_q_per_kv * head_dim // 32, "cuda")
+    assert bool((out_scale.view(torch.uint8)[padding] == 0xEE).all())
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "qkv_dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16")
+)
+@pytest.mark.parametrize(
+    "tile_size_q,split_kv_mode",
+    (
+        (8, "disabled"),
+        (16, "disabled"),
+        (16, "gmem_reduction_with_separate_kernel"),
+    ),
+    ids=("swaps8-direct", "swaps16-direct", "swaps16-separate"),
+)
+def test_attention_ts_decode_mxfp8_output_scale_beyond_carrier(
+    monkeypatch, qkv_dtype: torch.dtype, tile_size_q: int, split_kv_mode: str
+) -> None:
+    """The block scale follows the FP32 output, not its 16-bit carrier.
+
+    With V = 1 every output equals ``output_scale``. At 1e5, past the FP16
+    maximum, the recipe stores exponent byte 127 + 16 - 8 = 135 and E4M3 code
+    384 (1e5 / 2**8 = 390.6 rounds to 384) for every block.
+    """
+    original = fmha_decode_config.make_decode_config
+    split = split_kv_mode != "disabled"
+
+    def configured(*args, **kwargs):
+        profile = dict(
+            use_keeps_mma_ab=False,
+            tile_size_q=tile_size_q,
+            tile_size_kv=128,
+            use_persistent_scheduler=False,
+        )
+        kwargs["args"] = (kwargs["args"], profile) if kwargs.get("args") else profile
+        kwargs.update(split_kv_mode=split_kv_mode, auto_tuner=False)
+        if split:
+            kwargs.update(splits_kv=2, max_splits_kv=2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        case = _make_decode_case(
+            kv_lens=(1024, 777),
+            num_qo_heads=tile_size_q,
+            num_kv_heads=1,
+            head_dim=128,
+            seq_len_q=1,
+            page_size=32,
+            qkv_dtype=qkv_dtype,
+            out_dtype=qkv_dtype,
+            cache_form="tuple",
+            mask_type="dense",
+            device="cuda",
+            seed=11,
+        )
+        case.paged_kv_cache[1].fill_(1.0)
+        wrapper = _plan_case(
+            replace(case, out_dtype=_FP8), max_kv_len=1024, out_scale_dtype=_E8M0
+        )
+        config = wrapper._plan_state.config
+        assert config.tile_size_q == tile_size_q
+        assert config.use_separate_reduction_kernel is split
+        cols = tile_size_q * 128
+        out = torch.zeros(case.q.shape, device="cuda").to(_FP8)
+        out_scale = _mxfp8_scale_buffer(2, cols)
+        wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            case.seq_lens_kv,
+            case.block_tables,
+            output_scale=1e5,
+            out=out,
+            out_scale=out_scale,
+        )
+        expected_data, expected_exponents = mxfp8_reference_quantize(
+            torch.full((2, cols), 1e5, device="cuda")
+        )
+        assert int(expected_exponents.unique().item()) == 135
+        exponents = unswizzle_mxfp8_scales(out_scale, 2, cols // 32)
+        assert torch.equal(exponents, expected_exponents)
+        assert torch.equal(
+            out.view(2, cols).view(torch.uint8), expected_data.view(torch.uint8)
+        )
+    finally:
+        _resolve_decode_launch_spec.cache_clear()

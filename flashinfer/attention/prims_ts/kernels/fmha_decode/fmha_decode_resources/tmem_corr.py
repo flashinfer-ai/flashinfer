@@ -632,6 +632,20 @@ class TmemCorrResource(DecodeGenResourceBase):
         return self.output_scale * self._safe_norm_rcp(sum_val)
 
     @cute.jit
+    def _staged_output_scale(self) -> Float32:
+        """Return the ``output_scale`` folded into O staged in SMEM.
+
+        A quantized output stages O in its 16-bit carrier without
+        ``output_scale``; the quantizing drains apply it in FP32 instead, so a
+        large scale cannot overflow FP16 or lose BF16 precision before the block
+        scale is chosen. A plain output folds it here as before, with unchanged
+        rounding.
+        """
+        if cutlass.const_expr(self.cfg.quant_output is not None):
+            return Float32(1.0)
+        return self.output_scale
+
+    @cute.jit
     def _split_partial_scale(self, denominator: Float32) -> Float32:
         """Return the scale applied to a split-KV partial O before it is stored.
 
@@ -2311,9 +2325,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                     dst_row_idx,
                     self.q_token_offset,
                 )
+                # Staged without ``output_scale`` (``_staged_output_scale``).
                 self._store_quant_columns(
                     staged_vals,
-                    None,
+                    self.output_scale,
                     Int64(physical_dst_row_idx) * Int64(cfg.headdim)
                     + Int64(dst_col_offset // Int32(cfg.o_dtype_bytes)),
                     count=8,
@@ -4047,7 +4062,45 @@ class TmemCorrResource(DecodeGenResourceBase):
                 + offset % Int32(128)
                 + Int32(head_band * 256)
             )
-            if _q_row_is_valid_for_seq(
+            if cutlass.const_expr(
+                cfg.quant_output is not None and not cfg.use_split_kv
+            ):
+                # As in the compact Swaps copy, four adjacent lanes hold the
+                # 16-byte fragments of one 32-column scale block of one row.
+                # Every lane quantizes, because the block maximum is a
+                # full-warp shuffle (``group_amax``), and validity predicates
+                # only the stores. The band is staged without
+                # ``output_scale`` (``_staged_output_scale``).
+                store_ok = _q_row_is_valid_for_seq(
+                    cfg, self.h_r, q_group, row, self.seq_len_q
+                ) & (col_bytes < Int32(cfg.headdim * 2))
+                staged_vals = _load_partial_o_vec8_as_f32(
+                    self._smem_base_o_i32.subview(
+                        (offset ^ ((smem_row & Int32(7)) * Int32(16))) >> Int32(2)
+                    )
+                    .data_ptr()
+                    .load(count=4, alignment=16),
+                    cfg.use_bf16_output,
+                )
+                physical_row = _q_physical_output_row(
+                    cfg,
+                    self.h_r,
+                    self.num_heads_kv,
+                    logical_b_idx,
+                    logical_h_k_idx,
+                    q_group,
+                    row,
+                    self.q_token_offset,
+                )
+                self._store_quant_columns(
+                    staged_vals,
+                    self.output_scale,
+                    Int64(physical_row) * Int64(cfg.headdim)
+                    + Int64(col_bytes // Int32(2)),
+                    count=8,
+                    store_ok=store_ok,
+                )
+            elif _q_row_is_valid_for_seq(
                 cfg, self.h_r, q_group, row, self.seq_len_q
             ) and col_bytes < Int32(cfg.headdim * 2):
                 src = self._smem_base_o_i32.subview(
@@ -4128,10 +4181,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                         scale0 = exp_scale[scale_base]
                         scale1 = exp_scale[scale_base + 1]
                         if cutlass.const_expr(not cfg.use_split_kv):
-                            scale0 *= self.output_scale * self._safe_norm_rcp(
+                            scale0 *= self._staged_output_scale() * self._safe_norm_rcp(
                                 reduced_sum[scale_base]
                             )
-                            scale1 *= self.output_scale * self._safe_norm_rcp(
+                            scale1 *= self._staged_output_scale() * self._safe_norm_rcp(
                                 reduced_sum[scale_base + 1]
                             )
                         elif cutlass.const_expr(
@@ -4599,7 +4652,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
             )
             norm_scale = (
-                self.output_scale
+                self._staged_output_scale()
                 * self._safe_norm_rcp(reduced_sum[scale_idx])
                 * final_weight
             )
@@ -5121,7 +5174,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
             )
             norm_scale = (
-                self.output_scale
+                self._staged_output_scale()
                 * self._safe_norm_rcp(reduced_sum[scale_idx])
                 * final_weight
             )

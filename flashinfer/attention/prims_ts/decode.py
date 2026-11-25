@@ -326,17 +326,19 @@ def _make_decode_workspace_layout(
     use_separate_reduction_kernel: bool,
     use_split_kv: bool = False,
     scratch_reserve: int = 0,
+    bf16_separate_partials: bool = False,
 ) -> _DecodeWorkspaceLayout:
     """Lay out partials first, then zero-at-rest state.
 
     The state (Q offsets, sinks, ``scratch_reserve`` split counters) comes
     last; binding anchors it to the buffer end (see ``_bind_decode_workspace``).
+    ``bf16_separate_partials`` is the config's ``use_bf16_separate_partial_o``
+    for outputs whose dtype alone does not imply it (quantized outputs).
     """
     partial_o_shape, partial_stats_shape, counter_shape = scratch_shapes
     partial_o_dtype = out_dtype
-    if use_separate_reduction_kernel and out_dtype in (
-        torch.bfloat16,
-        torch.float8_e4m3fn,
+    if use_separate_reduction_kernel and (
+        bf16_separate_partials or out_dtype in (torch.bfloat16, torch.float8_e4m3fn)
     ):
         partial_o_dtype = torch.bfloat16
     elif out_dtype == torch.float8_e4m3fn or partial_o_shape == (1, 1, 1, 1, 1):
@@ -1764,10 +1766,7 @@ def _get_compiled_decode(
     quant_output = cfg.quant_output
     carrier_dtype = cfg.out_dtype
     partial_dtype = carrier_dtype
-    if cfg.use_separate_reduction_kernel and carrier_dtype in (
-        cutlass.BFloat16,
-        cutlass.Float8E4M3FN,
-    ):
+    if cfg.use_separate_reduction_kernel and cfg.use_bf16_separate_partial_o:
         partial_dtype = cutlass.BFloat16
     elif carrier_dtype == cutlass.Float8E4M3FN or not cfg.use_split_kv:
         partial_dtype = cutlass.Float16
@@ -3102,13 +3101,15 @@ def _resolve_decode_workspace_layout(
     )
     import cutlass.torch as cutlass_torch
 
-    # Partials follow the config's out_dtype: a quantized output's carrier.
+    # Partials follow the config's out_dtype (a quantized output's carrier)
+    # and its separate-partial dtype.
     return _make_decode_workspace_layout(
         spec.scratch_shapes,
         cutlass_torch.dtype(spec.config.out_dtype),
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
         scratch_reserve=spec.scratch_reserve,
+        bf16_separate_partials=spec.config.use_bf16_separate_partial_o,
     )
 
 
@@ -4684,13 +4685,15 @@ class BatchDecodePagedTSWrapper:
         )
         import cutlass.torch as cutlass_torch
 
-        # Partials follow the config's out_dtype: a quantized output's carrier.
+        # Partials follow the config's out_dtype (a quantized output's carrier)
+        # and its separate-partial dtype.
         workspace_layout = _make_decode_workspace_layout(
             spec.scratch_shapes,
             cutlass_torch.dtype(spec.config.out_dtype),
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
             use_split_kv=spec.config.use_split_kv,
             scratch_reserve=spec.scratch_reserve,
+            bf16_separate_partials=spec.config.use_bf16_separate_partial_o,
         )
         if workspace_buffer is None:
             initialize_workspace = True

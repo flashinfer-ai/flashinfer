@@ -824,6 +824,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "k_dtype",
         "v_dtype",
         "out_dtype",
+        "out_scale_dtype",
         "page_size",
         "mask_type",
         "window_left",
@@ -851,6 +852,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "max_q_len",
         "max_kv_len",
         "out",
+        "out_scale",
         "lse",
         "return_lse",
         "attention_sinks",
@@ -860,6 +862,9 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     )
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+    assert plan_parameters["out_scale_dtype"].default is None
+    assert run_parameters["out_scale"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["out_scale"].default is None
     assert plan_parameters["uniform_packed_lengths"].default is False
     assert plan_parameters["has_q_offset"].default is True
     assert plan_parameters["paged_v_tail_is_zero"].default is False
@@ -916,6 +921,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "k_dtype",
         "v_dtype",
         "out_dtype",
+        "out_scale_dtype",
         "packed_query",
         "mask_type",
         "window_left",
@@ -946,6 +952,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "max_q_len",
         "max_kv_len",
         "out",
+        "out_scale",
         "lse",
         "return_lse",
         "attention_sinks",
@@ -956,6 +963,9 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "validate",
     )
     assert plan_parameters["head_dim_vo"].default is None
+    assert plan_parameters["out_scale_dtype"].default is None
+    assert run_parameters["out_scale"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["out_scale"].default is None
     assert plan_parameters["sage"].default is None
     assert run_parameters["sage"].default is None
     assert run_parameters["qo_indptr"].default is None
@@ -1076,6 +1086,7 @@ def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> N
         "output_scale": 1.0,
         "out_dtype": None,
         "out": None,
+        "out_scale": None,
         "lse": None,
         "return_lse": False,
         "attention_sinks": None,

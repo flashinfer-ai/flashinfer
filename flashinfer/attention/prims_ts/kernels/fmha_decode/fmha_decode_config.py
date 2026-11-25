@@ -2048,9 +2048,13 @@ class FmhaDecodeConfig:
         """Whether normalized separate-GMEM partial O uses BF16 storage.
 
         FP16 output keeps FP16 partials to preserve its mantissa/error
-        envelope. BF16 and FP8 output use BF16 partials for the wider range.
+        envelope. BF16 and FP8 output use BF16 partials for the wider range,
+        as does a quantized output: its partials carry ``output_scale``, which
+        must not overflow an FP16 carrier before the block scale is chosen.
         """
-        return self.use_bf16_output or self.use_fp8_output
+        return (
+            self.use_bf16_output or self.use_fp8_output or self.quant_output is not None
+        )
 
     @property
     def supports_reduction_dtypes(self) -> bool:

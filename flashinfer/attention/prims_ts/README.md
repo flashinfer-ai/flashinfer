@@ -796,10 +796,23 @@ never clips. An all-zero block stores exponent byte 0.
 Scales use the 128x4 swizzled layout of
 `mxfp8_quantize(..., is_sf_swizzled_layout=True)`: a buffer of
 `round_up(tokens, 128) * round_up(Hq * Dv / sf_vec_size, 4)` one-byte scales,
-so `mm_mxfp8(out.view(tokens, -1), weight, out_scale, weight_scale, ...)`
-consumes an MXFP8 attention output directly. Padding rows and columns are not
-written, and inactive decode requests leave their output rows and scale bytes
-untouched.
+so an MXFP8 attention output feeds `mm_mxfp8` directly:
+
+```python
+mm_mxfp8(
+    out.view(tokens, -1),
+    weight,
+    out_scale.view(torch.uint8).view(-1),
+    weight_scale,
+    ...,
+)
+```
+
+`mm_mxfp8` takes `uint8` scales as a flat swizzled buffer (it reads a rank-2
+scale tensor as the linear layout), while attention returns E8M0 scales and a
+caller's buffer in its original shape, hence the two views. Padding rows and
+columns are not written, and inactive decode requests leave their output rows
+and scale bytes untouched.
 
 `run(..., out_scale=None)` allocates a flat buffer of the planned
 `out_scale_dtype`. A caller buffer is any contiguous tensor of that dtype and
@@ -810,7 +823,7 @@ CUDA graphs with caller `out` and `out_scale` and `validate=False`.
 | Kernel | Inputs | Implementation |
 | --- | --- | --- |
 | Context | Every combination with a 16-bit or E4M3 output, except MXFP8 Q/K, Sage and VC plans (16-bit outputs) | The correction epilogue owns one O row per thread: it quantizes each scale block in registers, stages the data for the TMA store, and writes the row's scales. |
-| FMHA decode | Every combination with a 16-bit output | The plan is the FP16 (FP16 Q) or BF16 output plan, with the same policy, workspace and split-KV partials. Only the final stores quantize: Keeps and KV256 tails per lane, the Swaps staged copy and the fused, cluster and standalone split-KV reducers per scale block of adjacent 8-channel fragments. Prepared plans (`prepare_prims_ts_batch_decode_with_kv_cache`) keep their 16-bit/E4M3 outputs. |
+| FMHA decode | Every combination with a 16-bit output | The plan is the FP16 (FP16 Q) or BF16 output plan, with the same policy, workspace and split-KV partials. Only the final stores quantize: Keeps and KV256 tails per lane, the Swaps staged copy, the Q48+ Swaps band drain and the fused, cluster and standalone split-KV reducers per scale block of adjacent 8-channel fragments. `output_scale` applies in FP32 before the block scale is chosen: Swaps stages O in the carrier without it, and standalone split-KV partials are BF16, so an FP16 carrier cannot overflow. Prepared plans (`prepare_prims_ts_batch_decode_with_kv_cache`) keep their 16-bit/E4M3 outputs. |
 
 `fi_trace` templates do not describe quantized outputs yet.
 
