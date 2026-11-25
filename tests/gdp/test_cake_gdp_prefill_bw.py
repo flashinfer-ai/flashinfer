@@ -218,7 +218,12 @@ def _choice(lengths, H):
 @pytest.mark.parametrize(
     "H,lengths,split,record_split",
     [
-        (20, [64] * 64, False, False),  # short sequences: the block build, rows past the grid
+        (
+            20,
+            [64] * 64,
+            False,
+            False,
+        ),  # short sequences: the block build, rows past the grid
         (
             40,
             [1] * 15 + [1024],
@@ -269,7 +274,9 @@ CHOSEN_SHAPES = [
 
 @needs_cudnn
 @pytest.mark.parametrize(
-    "H,lengths", CHOSEN_SHAPES, ids=[f"H{H}_N{len(x)}_T{sum(x)}" for H, x in CHOSEN_SHAPES]
+    "H,lengths",
+    CHOSEN_SHAPES,
+    ids=[f"H{H}_N{len(x)}_T{sum(x)}" for H, x in CHOSEN_SHAPES],
 )
 def test_the_chosen_plan_and_the_plan_of_record_agree(H, lengths, monkeypatch):
     """The plan the chooser launches and the plan of record (a different cut of the long sequence) both match
@@ -320,7 +327,13 @@ def test_a_sequence_agrees_alone_and_in_a_batch():
     """A sequence the chooser cuts one way alone and another way in a batch (the batch's one-token sequences change
     the plan) gives the same output and state within FlashInfer's tolerance."""
     found = None
-    for H, L, d in ((20, 2048, 16), (20, 1024, 64), (24, 2048, 32), (40, 1024, 16), (20, 2048, 64)):
+    for H, L, d in (
+        (20, 2048, 16),
+        (20, 1024, 64),
+        (24, 2048, 32),
+        (40, 1024, 16),
+        (20, 2048, 64),
+    ):
         alone, batch = _plan([L], H), _plan([1] * d + [L], H)
         if _cuts(alone, 0) != _cuts(batch, d):
             found = (H, L, d)
@@ -617,3 +630,169 @@ def test_other_householder_counts_are_refused(n):
     inputs = _inputs([64], 4, [1], seed=2, n=n)
     with pytest.raises(ValueError, match=f"num_householder={n}"):
         _call(inputs, "cake")
+
+
+# ``use_qk_l2norm_in_kernel=True``: one pre-pass launch normalizes the raw q / k rows (FP32 sum and product, one
+# rounding to BF16), then the prefill runs on the normalized operands.
+L2NORM_EPS = 1e-6
+
+
+def _raw_qk(inputs, *, seed):
+    """Un-normalized q / k: the unit rows of ``inputs`` scaled per row by a magnitude in [0.05, 20)."""
+    g = torch.Generator(device=_device()).manual_seed(seed)
+    out = dict(inputs)
+    for key in ("q", "k"):
+        x = inputs[key].float()
+        magnitude = 0.05 + 20 * torch.rand(x.shape[:-1], generator=g, device=_device())
+        out[key] = (x * magnitude[..., None]).to(torch.bfloat16)
+    return out
+
+
+def _l2norm_ref(x):
+    """The normalization the pre-pass computes: ``x * rsqrt(sum(x^2) + eps)`` in FP32, rounded once to BF16."""
+    y = x.float()
+    return (y * torch.rsqrt((y * y).sum(-1, keepdim=True) + L2NORM_EPS)).to(
+        torch.bfloat16
+    )
+
+
+def _assert_within_one_ulp(name, actual, expected):
+    """BF16 rows equal to the FP32 reference within one BF16 unit in the last place (the reference's rsqrt and
+    summation order may differ in the last FP32 bits)."""
+    assert actual.dtype == torch.bfloat16 and actual.is_contiguous(), name
+    a, e = actual.float(), expected.float()
+    ulp = torch.where(
+        e == 0,
+        torch.zeros_like(e),
+        torch.ldexp(torch.ones_like(e), torch.frexp(e)[1] - 8),
+    )
+    assert ((a - e).abs() <= ulp).all(), f"{name}: max diff {(a - e).abs().max()}"
+    assert (a != e).float().mean() < 1e-3, (
+        f"{name}: {(a != e).float().mean():.2e} of the values differ"
+    )
+
+
+def _normalizer():
+    arch = loader.arch_for_capability(get_compute_capability(_device()))
+    return lambda q, k: backend._qk_l2norm.qk_l2norm(q, k, arch)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_the_l2norm_pre_pass_matches_the_fp32_normalization(dtype):
+    """Dense and strided rows (q a view into a wider projection), BF16 and FP16, row counts that leave partial
+    tiles, a zero row: every output row is the FP32 normalization within one BF16 ulp."""
+    normalize = _normalizer()
+    g = torch.Generator(device=_device()).manual_seed(31)
+    for T, H in ((1, 1), (3, 5), (257, 6), (4099, 20)):
+        q = (torch.randn(T, H, K, generator=g, device=_device()) * 7).to(dtype)
+        k = (torch.randn(T * N_HH, H, K, generator=g, device=_device()) * 0.01).to(
+            dtype
+        )
+        q[0, 0].zero_()
+        q_out, k_out = normalize(q, k)
+        _assert_within_one_ulp(f"q T={T} H={H}", q_out, _l2norm_ref(q))
+        _assert_within_one_ulp(f"k T={T} H={H}", k_out, _l2norm_ref(k))
+        assert torch.equal(q_out[0, 0], torch.zeros_like(q_out[0, 0]))
+        # strided: q and k as head slices of one [T, 2H(+pad), K] projection buffer, rows in place
+        wide = torch.randn(T * N_HH, 2 * H + 1, K, generator=g, device=_device()).to(
+            dtype
+        )
+        qs, ks = wide[:T, :H], wide[:, H + 1 :]
+        assert T == 1 or not (qs.is_contiguous() or ks.is_contiguous())
+        q_s, k_s = normalize(qs, ks)
+        q_d, k_d = normalize(qs.contiguous(), ks.contiguous())
+        assert torch.equal(q_s, q_d) and torch.equal(k_s, k_d)
+
+
+def test_the_l2norm_pre_pass_is_batch_invariant():
+    """A batch above the streaming size (q + k over 128 MiB: 8 threads a row, streaming loads and stores) and a few
+    of its rows alone (16 threads a row) give the same bits for every row."""
+    normalize = _normalizer()
+    g = torch.Generator(device=_device()).manual_seed(41)
+    T, H = 8192, 20
+    q = (torch.randn(T, H, K, generator=g, device=_device()) * 3).to(torch.bfloat16)
+    k = torch.randn(T * N_HH, H, K, generator=g, device=_device()).to(torch.bfloat16)
+    assert (q.numel() + k.numel()) * 2 > 128 << 20
+    q_all, k_all = normalize(q, k)
+    for lo, hi in ((0, 1), (77, 300), (T - 5, T)):
+        q_few, k_few = normalize(q[lo:hi], k[lo * N_HH : hi * N_HH])
+        assert torch.equal(q_few, q_all[lo:hi])
+        assert torch.equal(k_few, k_all[lo * N_HH : hi * N_HH])
+    _assert_within_one_ulp("q (streaming)", q_all, _l2norm_ref(q))
+    _assert_within_one_ulp("k (streaming)", k_all, _l2norm_ref(k))
+
+
+@needs_cudnn
+@pytest.mark.parametrize(
+    "H,lengths,with_state",
+    [
+        (10, [1] * 4 + [3000], [1] * 4 + [0]),
+        (20, [8192], [1]),
+        (20, [64] * 64, [1] * 64),
+        (40, [4608, 3584], [1, 0]),
+    ],
+    ids=["mixed", "long", "block", "two"],
+)
+def test_qk_l2norm_in_kernel_matches_cudnn(H, lengths, with_state):
+    """Raw q / k with ``use_qk_l2norm_in_kernel=True`` against cuDNN's in-kernel normalization, and equal to the
+    call on the pre-normalized operands with the flag off."""
+    inputs = _raw_qk(_inputs(lengths, H, with_state, seed=sum(lengths) + H), seed=H)
+    out, state = _call(inputs, "cake", use_qk_l2norm_in_kernel=True)
+    ref_out, ref_state = _call(inputs, "cudnn", use_qk_l2norm_in_kernel=True)
+    _check_close("output", out, ref_out, lengths)
+    _check_close("final state", state, ref_state, lengths)
+    q_n, k_n = _normalizer()(inputs["q"], inputs["k"])
+    pre_out, pre_state = _call({**inputs, "q": q_n, "k": k_n}, "cake")
+    assert torch.equal(out, pre_out) and torch.equal(state, pre_state)
+
+
+@needs_cudnn
+def test_qk_l2norm_in_kernel_with_fp16_and_strided_inputs():
+    """FP16 q / k / v and q / k as views into wider projection buffers take the one pre-pass launch."""
+    lengths, H = [1, 1, 2000], 8
+    inputs = _raw_qk(_inputs(lengths, H, [1, 1, 0], seed=5), seed=6)
+    ref_out, ref_state = _call(inputs, "cudnn", use_qk_l2norm_in_kernel=True)
+    half = {key: inputs[key].to(torch.float16) for key in ("q", "k", "v")}
+    out, state = _call({**inputs, **half}, "cake", use_qk_l2norm_in_kernel=True)
+    assert out.dtype == torch.float16
+    _check_close("output (fp16)", out, ref_out, lengths)
+    _check_close("state (fp16)", state, ref_state, lengths)
+    T = sum(lengths)
+    wq = torch.zeros(T, 2 * H, K, dtype=torch.bfloat16, device=_device())
+    wk = torch.zeros(T * N_HH, 3 * H, K, dtype=torch.bfloat16, device=_device())
+    wq[:, H:] = inputs["q"]
+    wk[:, :H] = inputs["k"]
+    strided = {**inputs, "q": wq[:, H:], "k": wk[:, :H]}
+    s_out, s_state = _call(strided, "cake", use_qk_l2norm_in_kernel=True)
+    d_out, d_state = _call(inputs, "cake", use_qk_l2norm_in_kernel=True)
+    assert torch.equal(s_out, d_out) and torch.equal(s_state, d_state)
+
+
+def test_qk_l2norm_in_kernel_captures_into_a_graph():
+    """The pre-pass and the prefill capture into one CUDA graph; a replay over new raw q / k values equals an
+    eager call on them."""
+    lengths, H = [1] * 3 + [4093], 20
+    inputs = _raw_qk(_inputs(lengths, H, [1] * 3 + [0], seed=21), seed=22)
+    out = torch.empty(sum(lengths), H, V, dtype=torch.bfloat16, device=_device())
+    state = torch.empty(len(lengths), H, V, K, device=_device())
+    stream = torch.cuda.Stream(device=_device())
+    stream.wait_stream(torch.cuda.current_stream(_device()))
+    with torch.cuda.stream(stream):
+        _call(
+            inputs, "cake", output=out, output_state=state, use_qk_l2norm_in_kernel=True
+        )
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _call(
+            inputs, "cake", output=out, output_state=state, use_qk_l2norm_in_kernel=True
+        )
+    fresh = _raw_qk(_inputs(lengths, H, [1] * 3 + [0], seed=23), seed=24)
+    for key in ("q", "k", "v", "g", "beta", "initial_state"):
+        inputs[key].copy_(fresh[key])
+    out.fill_(float("nan"))
+    state.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    eager_out, eager_state = _call(inputs, "cake", use_qk_l2norm_in_kernel=True)
+    assert torch.equal(out, eager_out) and torch.equal(state, eager_state)

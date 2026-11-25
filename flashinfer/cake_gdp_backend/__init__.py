@@ -37,6 +37,7 @@ from typing import Any, NamedTuple, Optional, Union
 
 import torch
 
+from . import _qk_l2norm
 from . import cake_jit as _loader
 from .cake_jit import (
     ARCH_BY_CAPABILITY,
@@ -1331,13 +1332,23 @@ def cake_chunk_gated_delta_product(
     blackwell = arch in _loader.V6_ARCHES
 
     # -- the model inputs
-    q_in = _tma_operand(q, "q", shape=(T, H, K), device=device, dtype=io_dtype)
-    k_in = _tma_operand(k, "k", shape=(T * n, H, K), device=device, dtype=io_dtype)
+    normalized = None
+    if use_qk_l2norm_in_kernel and T and blackwell:
+        # One launch normalizes q and k from the caller's tensors (BF16 or FP16, strided rows read in place) into
+        # dense BF16 rows, the operands the kernel reads (without FlashInfer's JIT: the FP32 torch form below).
+        _check_tensor(q, "q", shape=(T, H, K), device=device, dtypes=(io_dtype,))
+        _check_tensor(k, "k", shape=(T * n, H, K), device=device, dtypes=(io_dtype,))
+        normalized = _qk_l2norm.qk_l2norm(q, k, arch)
+    if normalized is not None:
+        q_in, k_in = normalized
+    else:
+        q_in = _tma_operand(q, "q", shape=(T, H, K), device=device, dtype=io_dtype)
+        k_in = _tma_operand(k, "k", shape=(T * n, H, K), device=device, dtype=io_dtype)
+        if use_qk_l2norm_in_kernel and T:
+            q_in, k_in = _l2norm(q_in), _l2norm(k_in)
     v_in = _tma_operand(
         v, "v", shape=(T * n, H, HEAD_SIZE_V), device=device, dtype=io_dtype
     )
-    if use_qk_l2norm_in_kernel and T:
-        q_in, k_in = _l2norm(q_in), _l2norm(k_in)
     # g=None runs the unit-gate program (no decay), beta=None the unit-beta program (unit update gates): those builds
     # never read the formal, which takes a one-row placeholder.  Both None is no exported program (its undamped
     # state leaves the final-state tolerance), so the call is refused rather than approximated.  An empty batch (no
