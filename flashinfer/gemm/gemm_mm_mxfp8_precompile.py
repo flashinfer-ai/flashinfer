@@ -78,8 +78,7 @@ def _mm_mxfp8_precompile_worker(payload):
             max_active_clusters=payload["max_active_clusters"],
         )
         spec = JitSpecCuteDsl("mm_mxfp8", name, compile_fn, payload["source_sha256"])
-        if not spec.is_compiled:
-            spec.compile_and_persist()
+        spec.compile_and_persist(force=False)
         return name, None
     except Exception as exc:  # noqa: BLE001 -- forward retries missing artifacts
         return name, f"{type(exc).__name__}: {exc}"
