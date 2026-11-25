@@ -194,40 +194,59 @@ def _plan(lengths, H):
     )
 
 
+def _record_plan(lengths, H):
+    return loader.prefill_v6_record_plan(
+        [0, *itertools.accumulate(lengths)],
+        num_heads=H,
+        num_householder=N_HH,
+        sm_count=loader.sm_count(_device().index or 0),
+        arch=loader.arch_for_capability(get_compute_capability(_device())),
+    )
+
+
+def _choice(lengths, H):
+    return loader.prefill_v6_plan_choice(
+        [0, *itertools.accumulate(lengths)],
+        num_heads=H,
+        num_householder=N_HH,
+        sm_count=loader.sm_count(_device().index or 0),
+        arch=loader.arch_for_capability(get_compute_capability(_device())),
+    )
+
+
 @needs_cudnn
 @pytest.mark.parametrize(
-    "H,lengths,split",
+    "H,lengths,split,record_split",
     [
+        (20, [64] * 64, False, False),  # short sequences: the block build, rows past the grid
         (
             40,
             [1] * 15 + [1024],
+            True,
             False,
-        ),  # an uncut sequence: the block build, rows past the grid
+        ),  # a 1K sequence the plan of record runs whole: the plan cuts it, the 1-token rows on the idle CTAs
         (
             10,
             [1] * 40 + [20000] + [1] * 3,
             True,
+            True,
         ),  # a cut sequence: the 1-token rows stack on the CTAs with room
-        (20, [0, 1, 0, 9000], True),  # empty sequences: their state copies
+        (20, [0, 1, 0, 9000], True, True),  # empty sequences: their state copies
     ],
-    ids=["block-wrap", "split-lists", "split-empty"],
+    ids=["block-wrap", "split-floor", "split-lists", "split-empty"],
 )
-def test_mixed_batches_of_both_builds(H, lengths, split):
+def test_mixed_batches_of_both_builds(H, lengths, split, record_split):
     """One-token, empty and long sequences in one call, on the build the plan picks, against cuDNN."""
     plan = _plan(lengths, H)
     assert plan.split == split and plan.grid <= loader.sm_count(_device().index or 0)
+    assert _record_plan(lengths, H).split == record_split
     if split:
-        table = loader.split_table(
-            [0, *itertools.accumulate(lengths)],
-            N_HH,
-            H,
-            loader.sm_count(_device().index or 0),
-            arch=loader.arch_for_capability(get_compute_capability(_device())),
-        )
-        # every row of the table once, as per-CTA lists (no pad row)
-        assert sorted(plan.rows) == sorted(table)
+        # every (sequence, head) of the batch in the per-CTA lists (no pad row)
         assert len(plan.offsets) == plan.grid + 1
         assert plan.offsets[-1] == len(plan.rows)
+        assert {(seq, head) for seq, head, _cut, _span in plan.rows} == {
+            (seq, head) for seq in range(len(lengths)) for head in range(H)
+        }
     else:
         assert len(plan.rows) > plan.grid
     with_state = [int(length == 1) for length in lengths]
@@ -236,6 +255,90 @@ def test_mixed_batches_of_both_builds(H, lengths, split):
     ref_out, ref_state = _call(inputs, "cudnn")
     _check_close("output", out, ref_out, lengths)
     _check_close("final state", state, ref_state, lengths)
+
+
+# Batches the chooser plans otherwise than the plan of record (another cut floor), on both arches.
+CHOSEN_SHAPES = [
+    (20, [1] * 16 + [1024]),
+    (40, [1] * 8 + [1024]),
+    (24, [1] * 16 + [2048]),
+    (80, [4096]),
+    (20, [2500, 1596]),
+]
+
+
+@needs_cudnn
+@pytest.mark.parametrize(
+    "H,lengths", CHOSEN_SHAPES, ids=[f"H{H}_N{len(x)}_T{sum(x)}" for H, x in CHOSEN_SHAPES]
+)
+def test_the_chosen_plan_and_the_plan_of_record_agree(H, lengths, monkeypatch):
+    """The plan the chooser launches and the plan of record (a different cut of the long sequence) both match
+    cuDNN within FlashInfer's tolerance, and each other, per sequence."""
+    assert _choice(lengths, H) != "main"
+    assert _plan(lengths, H) != _record_plan(lengths, H)
+    with_state = [int(length == 1) for length in lengths]
+    inputs = _inputs(lengths, H, with_state, seed=13)
+    out, state = _call(inputs, "cake")
+    ref_out, ref_state = _call(inputs, "cudnn")
+    monkeypatch.setattr(loader, "prefill_v6_plan", loader.prefill_v6_record_plan)
+    rec_out, rec_state = _call(inputs, "cake")
+    monkeypatch.undo()
+    for name, a, b in (
+        ("output", out, ref_out),
+        ("final state", state, ref_state),
+        ("output (plan of record)", rec_out, ref_out),
+        ("final state (plan of record)", rec_state, ref_state),
+        ("output (chosen vs record)", out, rec_out),
+        ("final state (chosen vs record)", state, rec_state),
+    ):
+        _check_close(name, a, b, lengths)
+    start = 0
+    for seq, length in enumerate(lengths):
+        _check_close(
+            f"output of sequence {seq}",
+            out[start : start + length],
+            rec_out[start : start + length],
+            lengths,
+        )
+        _check_close(f"state of sequence {seq}", state[seq], rec_state[seq], lengths)
+        start += length
+
+
+def _cuts(plan, seq):
+    return sorted({cut for s, head, cut, span in plan.rows if s == seq and head == 0})
+
+
+@needs_cudnn
+def test_a_sequence_agrees_alone_and_in_a_batch():
+    """A sequence the chooser cuts one way alone and another way in a batch (the batch's one-token sequences change
+    the plan) gives the same output and state within FlashInfer's tolerance."""
+    found = None
+    for H, L, d in ((20, 2048, 16), (20, 1024, 64), (24, 2048, 32), (40, 1024, 16), (20, 2048, 64)):
+        alone, batch = _plan([L], H), _plan([1] * d + [L], H)
+        if _cuts(alone, 0) != _cuts(batch, d):
+            found = (H, L, d)
+            break
+    assert found is not None, "no batch changes the long sequence's cuts"
+    H, L, d = found
+    long_in = _inputs([L], H, [1], seed=17)
+    short_in = _inputs([1] * d, H, [1] * d, seed=18)
+    cu = [0, *itertools.accumulate([1] * d + [L])]
+    batch_in = {
+        key: torch.cat([short_in[key], long_in[key]])
+        for key in ("q", "k", "v", "g", "beta", "initial_state")
+    }
+    batch_in.update(
+        num_householder=N_HH,
+        cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=_device()),
+        cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int32),
+    )
+    out_alone, state_alone = _call(long_in, "cake")
+    out_batch, state_batch = _call(batch_in, "cake")
+    _check_close("output alone vs in the batch", out_batch[d:], out_alone, [L])
+    _check_close("state alone vs in the batch", state_batch[d], state_alone[0], [L])
+    ref_out, ref_state = _call(batch_in, "cudnn")
+    _check_close("output in the batch", out_batch, ref_out, cu)
+    _check_close("state in the batch", state_batch, ref_state, cu)
 
 
 def _graph(inputs, out, state):

@@ -1222,8 +1222,9 @@ def cake_chunk_gated_delta_product(
     The body of ``flashinfer.gdp_prefill.chunk_gated_delta_product(..., backend="cake")``; see that function for
     the full documentation of the arguments and semantics.  Every check here reads shapes, dtypes, strides and
     Python scalars only.  On SM100 / SM103 the call is one launch of the Blackwell body over the item table of
-    ``prefill_v6_plan`` (the split rules read each sequence alone, short sequences' rows go to the least-loaded
-    CTAs; ``num_householder=3``; ``g=None`` / ``beta=None`` filled with ones) on the program of the call's state
+    ``prefill_v6_plan`` (the candidate plan of least modeled time for the batch -- the plan of record unless
+    another cut floor or row placement is modeled 3% faster -- cached per batch; short sequences' rows go to the
+    least-loaded CTAs; ``num_householder=3``; ``g=None`` / ``beta=None`` filled with ones) on the program of the call's state
     form: the dense FP32 programs, or the pool programs of the state dtype (FP32, BF16 or FP16) for a
     ``state_indices`` pool (``output_state_indices`` its write slots) and for a dense BF16 / FP16 state (identity
     slots); the plan is built from the host lengths, so a captured graph is valid only for the batch it captured
@@ -2176,8 +2177,8 @@ def _run_blackwell_v6(
     n,
     cu_cpu,
 ) -> None:
-    """One launch of the Blackwell prefill body over the item table of ``prefill_v6_plan``: the split build over the
-    per-CTA lists of the ``split_table`` rows, or the block build (see the BLACKWELL V6 LAUNCH PLAN of the
+    """One launch of the Blackwell prefill body over the item table of ``prefill_v6_plan``: the split build over
+    per-CTA row lists, or the block build (see the BLACKWELL V6 LAUNCH PLAN and its PLAN CHOOSER in the
     registry), of the program of the call's state form (``state``: the dense FP32 programs, or the pool programs of
     its dtype with the slot tables, the pools' slot strides and the rounding).  Every input is prepared on the
     device or uploaded from pinned memory: the call issues no synchronization and captures into a CUDA graph (the
