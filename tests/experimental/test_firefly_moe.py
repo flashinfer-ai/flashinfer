@@ -862,10 +862,11 @@ def test_firefly_preparation_builds_direct_descriptors():
 
 @pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
 def test_firefly_repeated_expert_ids_stay_in_bounds(fused):
-    """Tokens naming one expert in every slot (not a top-k, but accepted) on a
-    short batch that lists each expert's routes (block_m <= 32): the routes
-    past the list are dropped, nothing is written past it, the output is
-    finite and the next call is correct."""
+    """Tokens naming one expert in every slot, outside the contract (a token's
+    ids must name distinct experts; not checked, the result is unspecified), on
+    a short batch that lists each expert's routes (block_m <= 32): memory
+    safety only. Nothing is read or written past the list (the routes past it
+    are dropped), the output is finite and the next call is correct."""
     num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
     g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
     layer = _layer(num_experts, top_k, inter, act, 64, fused=fused)

@@ -9,7 +9,7 @@ never selects it. Once listed, it takes part in `MoELayer`'s selection like
 any listed backend: with other eligible candidates whose weight views are
 prepared, the layer times each one (CUDA graph replays) and keeps the fastest
 per input shape, which can be Firefly; the autotuner has a single tactic to
-choose for it. Tracking issue: pending.
+choose for it. Tracking issue: flashinfer-ai/flashinfer#9994.
 
 Firefly runs the routed experts of a MoE layer on datacenter Blackwell
 (SM100, SM103; tested on B200 only) from per-token or per-tensor NVFP4
@@ -22,7 +22,7 @@ batch size (from 1 token to `tune_max_num_tokens`).
 | --- | --- |
 | Weights x activations | NVFP4 x NVFP4, per-token (`QuantConfig(per_token_scale=True)`) or per-tensor (`per_token_scale=False` or `None`) activation scales |
 | Activation pack | `uint8 [M, H/2]` E2M1 values (even element in the low nibble), linear `float8_e4m3fn [M, H/16]` block scales; per-token: `float32 [M]` per-token scales, x ~ e2m1 * block scale * per-token scale; per-tensor: a unit global scale, x ~ e2m1 * block scale (a calibrated activation scale is folded into the view's per-expert `w1_gs`, as other backends fold it into `w1_alpha`) |
-| Routing | pre-routed (`PackedPrecomputed` or `UnpackedPrecomputed`): `int32 [M, top_k]` ids, `float32` / `bfloat16` / `float16 [M, top_k]` weights used as given; ids outside this rank's experts (negative ones included) are skipped |
+| Routing | pre-routed (`PackedPrecomputed` or `UnpackedPrecomputed`): `int32 [M, top_k]` ids, `float32` / `bfloat16` / `float16 [M, top_k]` weights used as given; ids outside this rank's experts (negative ones included) are skipped; each token's ids must name distinct experts, as a top-k selection does (not checked, which would take a device-to-host sync per call: repeated ids cause no out-of-bounds access, but their result is unspecified) |
 | Activations | `SwiGLU(alpha, beta, limit)`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU` (no `clamp_limit`), `ReLU2` |
 | Finalize | `do_finalize=True`; `use_fused_finalize=False` sums the top_k rows in a fixed FP32 order (deterministic), `True` adds them into the output from the down GEMM (BF16 atomics / bulk reductions, not deterministic) |
 | Expert parallelism | `local_expert_offset` / `local_num_experts` (the output is this rank's partial sum) |

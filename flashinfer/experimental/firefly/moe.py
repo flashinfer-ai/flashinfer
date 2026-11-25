@@ -1820,7 +1820,9 @@ class CuteMoE:
           FP16 (FlashInfer's PackedPrecomputed pack fields; used as given, no normalization; BF16 / FP16 converted to
           FP32 exactly, a separate ``Plan``). A route whose id is outside
           [0, E) is skipped, as FlashInfer's TRT-LLM routing skips ids outside the rank's experts (e.g. -1 for CUDA
-          graph padding): it adds nothing and its weight is not read; a token without valid routes gets a zero row."""
+          graph padding): it adds nothing and its weight is not read; a token without valid routes gets a zero row.
+          A token's ids must name distinct experts, as a top-k selection does (not checked: repeated ids cause no
+          out-of-bounds access, but their result is unspecified)."""
         m = q.shape[0]
         H, T = self.H, self.topk
         # every tensor the kernels touch on this object's device, checked before anything is launched (a kernel would

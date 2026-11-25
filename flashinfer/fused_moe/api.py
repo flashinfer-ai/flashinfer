@@ -2739,6 +2739,9 @@ class FireflyNvfp4Config:
     SwiGLU (alpha, beta, limit), SwiGLUStep, GeGLU, GeGLUTanh, SiTU without
     ``clamp_limit``, ReLU2. Expert parallelism; no NVFP4 4over6 recipe.
     Shapes: H % 256 == 0, I % 128 == 0, 1 <= top_k <= min(E, 32), E <= 1024.
+    Each token's ``topk_ids`` must name distinct experts, as a top-k selection
+    does (not checked: repeated ids cause no out-of-bounds access, but their
+    result is unspecified).
     The GEMM2 input is quantized with block scales only (no per-token scale),
     except on the per-token direct path, where it also gets one: M <= 4 with a
     gated activation, I = 512 or 768 and H >= 512.
