@@ -672,7 +672,7 @@ int64_t DomainCount(int64_t device) {
 #endif
 }
 
-Array<int64_t> DomainSmCounts(int64_t device) {
+int64_t DomainSmCount(int64_t device) {
 #if CUDA_VERSION >= 13040
   g_last_error.clear();
   RuntimeDeviceGuard guard(static_cast<int>(device));
@@ -688,16 +688,12 @@ Array<int64_t> DomainSmCounts(int64_t device) {
       << "failed to query locality-domain multiprocessor count: " << CuError(result);
   TVM_FFI_ICHECK(count > 0)
       << "device reported a non-positive locality-domain multiprocessor count";
-  Array<int64_t> counts;
-  for (int domain = 0; domain < kLocalityDomainCount; ++domain) {
-    counts.push_back(static_cast<int64_t>(count));
-  }
-  return counts;
+  return static_cast<int64_t>(count);
 #else
   static_cast<void>(device);
   TVM_FFI_ICHECK(false) << "locality domains require CUDA 13.4 headers; module CUDA_VERSION="
                         << CUDA_VERSION;
-  return {};
+  return 0;
 #endif
 }
 
@@ -825,7 +821,7 @@ extern "C" void flashinfer_locality_domain_free(void* ptr, size_t size, int devi
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(probe, Probe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(domain_count, DomainCount);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(domain_sm_counts, DomainSmCounts);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(domain_sm_count, DomainSmCount);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create_localized_streams, CreateLocalizedStreams);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pointer_domain, PointerDomain);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(last_error, LastError);

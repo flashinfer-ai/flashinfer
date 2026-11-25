@@ -3086,6 +3086,22 @@ def _ldgsts_sfb_producer_commit_prefetch_depth(cfg: BatchedGemmConfig) -> int:
     )
 
 
+def _resolved_ldgsts_sfb_producer_commit_prefetch_depth(
+    cfg: BatchedGemmConfig, *, num_k_tiles: int | None = None
+) -> int:
+    """Return a tail-safe delayed SFB commit depth for kernel construction."""
+    depth = _ldgsts_sfb_producer_commit_prefetch_depth(cfg)
+    if cfg._problem_k is None:
+        if num_k_tiles is not None:
+            return min(depth, num_k_tiles)
+        if depth > 1:
+            raise ValueError(
+                "LDGSTS SFB prefetch depth greater than one requires a host-known K; "
+                "call resolve_problem_config before constructing the kernel"
+            )
+    return depth
+
+
 def _validate_pipeline_stage_count(cfg: BatchedGemmConfig, field_name: str) -> None:
     """Reject zero-depth pipeline rings before deriving schedule constants."""
     value = getattr(cfg, field_name)
@@ -3229,6 +3245,14 @@ def validate_config(
         # Early-exit PDL ordering is the readiness contract for both values.
         if not cfg.use_early_exit:
             raise ValueError("locality_split requires early exit")
+        if cfg.fused_finalize_top_k:
+            raise ValueError("locality_split does not support fused finalize")
+        if cfg.has_bias_m:
+            raise ValueError("locality_split does not support per-channel bias")
+        if cfg.has_per_token_sf_a:
+            raise ValueError(
+                "locality_split does not support per-channel weight scale vectors"
+            )
         if cfg.splits_activation_operands:
             if cfg.route_act != int(RouteImpl.NONE):
                 raise ValueError(
@@ -3236,6 +3260,11 @@ def validate_config(
                 )
             if cfg.sf_route != int(RouteImpl.NONE):
                 raise ValueError("splitting activation operands requires sf_route=NONE")
+            if cfg.has_activation_side_effects:
+                raise ValueError(
+                    "splitting activation operands requires a linear, "
+                    "unquantized epilogue"
+                )
         if cfg.use_deepseek_fp8:
             raise ValueError("locality_split does not support DeepSeek FP8 scales")
 

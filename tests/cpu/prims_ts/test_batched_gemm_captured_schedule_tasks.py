@@ -61,6 +61,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     SfSmemToTmemCopy,
     TileScheduler,
     _ldgsts_sfb_producer_commit_prefetch_depth,
+    _resolved_ldgsts_sfb_producer_commit_prefetch_depth,
     compute_warp_layout,
     make_config,
     uniform_pipeline_stage_overrides,
@@ -1525,12 +1526,24 @@ def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
     )
 
     assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 3
+    assert _resolved_ldgsts_sfb_producer_commit_prefetch_depth(cfg, num_k_tiles=1) == 1
+    with pytest.raises(ValueError, match="resolve_problem_config"):
+        _resolved_ldgsts_sfb_producer_commit_prefetch_depth(cfg)
 
     validate_config(cfg, problem_mnk=(128, 128, 256))
 
     assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 3
     specialized = _runtime_config(cfg, 256)
     assert _ldgsts_sfb_producer_commit_prefetch_depth(specialized) == 1
+    assert _resolved_ldgsts_sfb_producer_commit_prefetch_depth(specialized) == 1
+    SmemSfLdgstsBResource(
+        cfg=specialized,
+        pipeline_config=_make_pipeline_configs(specialized)["smem_sfb"],
+        producer_commit_prefetch_depth=(
+            _resolved_ldgsts_sfb_producer_commit_prefetch_depth(specialized)
+        ),
+        name="SmemSfB",
+    )
 
 
 @pytest.mark.cpu_only

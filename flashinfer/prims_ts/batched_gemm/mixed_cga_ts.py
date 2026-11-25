@@ -108,11 +108,14 @@ class CgaTask(Task):
         atom, which would also select ranks 2, 4, ... in a wider CGA.  Used by TS
         releases that call this hook; older TS uses ``_is_producer_signaling_cta``.
         """
-        if cutlass.const_expr(
+        # Keep the short-circuit outside const_expr(...): see
+        # CgaPipelineAsyncUmma.producer_commit.
+        use_global_cta0_leader = (
             signaling.has_cta_leader()
             and not self._runs_on_single_cta()
             and self._is_global_cta0_producer_config(cfg)
-        ):
+        )
+        if cutlass.const_expr(use_global_cta0_leader):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             return cta_rank == Int32(0)
         return super()._leader_cta_gate(cfg, signaling)
@@ -343,10 +346,13 @@ class CgaPipelineAsyncUmma(TSPipelineAsyncUmma):
     """Async-to-UMMA pipeline with an atom-relative UMMA release mask."""
 
     def producer_commit(self, state, *, loc=None, ip=None) -> None:
-        if cutlass.const_expr(
+        # Keep the short-circuit outside const_expr(...): in this undecorated
+        # method PyIR only recognizes const_expr when no jump lands on its call.
+        arrive_on_atom_leader = (
             self.producer_op == pipeline.PipelineOp.AsyncThread
             and self.cta_group is cute.nvgpu.tcgen05.CtaGroup.TWO
-        ):
+        )
+        if cutlass.const_expr(arrive_on_atom_leader):
             # The stock TS shortcut clears SM100's peer-address bit.  That is
             # sufficient for a physical 2x1 cluster, but it does not encode
             # which later 2-CTA atom owns the destination in a wider CGA.

@@ -249,7 +249,7 @@ def _localized_partition(
             pointer_domain=resources.pools.pointer_domain,
             domain_count=resources.pools.domain_count,
             sm_split=sm_split,
-            sm_counts=resources.domain_sm_counts,
+            sm_counts=(resources.sm_count_per_domain,) * 2,
             remainder_sm_count=0,
             keepalive=(resources,),
         )

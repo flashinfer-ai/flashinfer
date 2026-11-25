@@ -57,9 +57,9 @@ def test_locality_tactic_overrides_split_only_tp_n_tp_k_fc2():
 @pytest.mark.cpu_only
 def test_single_kernel_topology_contains_domain_counts():
     resources = object.__new__(MoeLocalizedKernelResources)
-    resources.domain_sm_counts = (101, 97)
+    resources.sm_count_per_domain = 101
     assert _partition_stream_topology(resources) == (
-        ("single_kernel", 198, (101, 97), 1),
+        ("single_kernel", 202, (101, 101), 1),
     )
 
 

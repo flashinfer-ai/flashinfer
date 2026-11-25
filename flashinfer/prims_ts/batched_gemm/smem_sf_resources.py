@@ -898,10 +898,12 @@ class SmemSfLdgstsResource(MemoryResource):
         work call, threaded in by the work method from its constexpr work arg.
 
         Tail work runs after the K-tile loop, so its ``StageInfo`` carries no
-        loop bounds.  None are needed: the prefetch window is clamped to the
-        host-known K-tile count (``ldgsts_sfb_producer_commit_prefetch_depth``),
-        so the head issued every one of its ``producer_commit_prefetch_depth``
-        groups and each tail drain retires exactly one more.
+        loop bounds.  None are needed: kernel construction uses
+        ``_resolved_ldgsts_sfb_producer_commit_prefetch_depth`` to require a
+        host-known K whenever the prefetch window could otherwise exceed the
+        K-tile count.  The head therefore issued every one of its
+        ``producer_commit_prefetch_depth`` groups, and each tail drain retires
+        exactly one more.
         """
         return max(0, self.cp_async_wait_group_depth - prefetch_idx)
 

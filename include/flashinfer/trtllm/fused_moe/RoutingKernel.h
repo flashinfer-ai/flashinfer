@@ -130,8 +130,9 @@ struct DataBase {
   int16_t* mPtrRoutingReplayOut{nullptr};
   // optional: final token count for each expert, separate from histogram scratch
   int32_t* mPtrNumTokensPerExpert{nullptr};
-  // Optional domain-local scheduler counters. FC1 and FC2 counters are at offsets 0 and 32.
-  // Appended to preserve field offsets for existing routing kernels.
+  // Optional domain-local scheduler counters. The final routing kernel zeroes
+  // FC1 and FC2 at offsets 0 and 32 after its PDL wait; nullptr disables reset.
+  // Appended for the same field-offset reason as mPtrRoutingReplayOut.
   int32_t* mPtrLocalityCounters[2]{nullptr, nullptr};
 };
 
@@ -179,7 +180,8 @@ struct KernelParamsBase {
   bool mUseContiguousRouteWindows = false;
   // Optional final token count for each expert, separate from histogram scratch.
   int32_t* mPtrNumTokensPerExpert = nullptr;
-  // Optional domain-local scheduler counters. Appended to preserve existing field offsets.
+  // Optional domain-local scheduler counters. Appended for the same
+  // field-offset reason as mPtrRoutingReplayOut.
   int32_t* mPtrLocalityCounters[2]{nullptr, nullptr};
 
   // Public initialization function - make it a template to accept different Data types

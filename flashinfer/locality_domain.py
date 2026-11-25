@@ -49,7 +49,7 @@ class LocalityDomainPools:
 
     device: torch.device
     domain_count: int
-    sm_counts: tuple[int, int]
+    sm_count_per_domain: int
     pools: tuple[Any, Any]
     _module: Any = field(repr=False, compare=False)
     _allocators: tuple[Any, Any] = field(repr=False, compare=False)
@@ -418,20 +418,16 @@ def _get_locality_domain_pools(device_index: int) -> LocalityDomainPools:
             f"device {device_index} exposes only {domain_count} locality domains"
         )
     try:
-        sm_counts = tuple(int(v) for v in module.domain_sm_counts(device_index))
+        sm_count_per_domain = int(module.domain_sm_count(device_index))
     except Exception as exc:
         raise LocalityDomainError(
-            f"failed to query locality-domain SM counts: {exc}"
+            f"failed to query locality-domain SM count: {exc}"
         ) from exc
-    if len(sm_counts) != _DOMAIN_COUNT:
-        raise LocalityDomainError(
-            "locality-domain SM count query returned invalid data"
-        )
     pools = _domain_pools(device_index)
     return LocalityDomainPools(
         device=torch.device("cuda", device_index),
         domain_count=domain_count,
-        sm_counts=cast(tuple[int, int], sm_counts),
+        sm_count_per_domain=sm_count_per_domain,
         pools=pools.pools,
         _module=module,
         _allocators=pools.allocators,

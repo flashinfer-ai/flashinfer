@@ -326,7 +326,7 @@ class MoeLocalizedKernelResources:
         default=None, init=False, repr=False, compare=False
     )
     pools: Any = field(init=False, repr=False, compare=False)
-    domain_sm_counts: tuple[int, int] = field(init=False)
+    sm_count_per_domain: int = field(init=False)
     counters: tuple[torch.Tensor, torch.Tensor] = field(
         init=False, repr=False, compare=False
     )
@@ -342,7 +342,7 @@ class MoeLocalizedKernelResources:
             raise RuntimeError(reason)
         self.pools = get_locality_domain_pools(self.device)
         self.device = self.pools.device
-        self.domain_sm_counts = self.pools.sm_counts
+        self.sm_count_per_domain = self.pools.sm_count_per_domain
         self.counters = (
             self.pools.empty(0, (64,), torch.int32),
             self.pools.empty(1, (64,), torch.int32),

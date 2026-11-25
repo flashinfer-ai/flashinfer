@@ -82,25 +82,6 @@ import cutlass
 import cutlass.cute as cute
 
 
-@lru_cache(maxsize=None)
-def max_active_clusters(
-    device_index: int,
-    cluster_shape: tuple[int, int, int],
-) -> int:
-    """Return the cached active-cluster limit for one device and CGA shape."""
-    import cutlass.utils as cutlass_utils
-
-    cluster_size = math.prod(cluster_shape)
-    with torch.cuda.device(device_index):
-        result = int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
-    if result <= 0:
-        raise RuntimeError(
-            f"no active cluster supports cluster shape {cluster_shape} "
-            f"on CUDA device {device_index}"
-        )
-    return result
-
-
 from .batched_gemm_kernel import (
     build_batched_gemm_task_manager,
     gemm,
@@ -128,6 +109,25 @@ from .batched_gemm_quant import (
 )
 
 import cutlass.torch as _cutlass_torch
+
+
+@lru_cache(maxsize=None)
+def max_active_clusters(
+    device_index: int,
+    cluster_shape: tuple[int, int, int],
+) -> int:
+    """Return the cached active-cluster limit for one device and CGA shape."""
+    import cutlass.utils as cutlass_utils
+
+    cluster_size = math.prod(cluster_shape)
+    with torch.cuda.device(device_index):
+        result = int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
+    if result <= 0:
+        raise RuntimeError(
+            f"no active cluster supports cluster shape {cluster_shape} "
+            f"on CUDA device {device_index}"
+        )
+    return result
 
 
 def get_default_stream():
@@ -4829,7 +4829,9 @@ def _compile_for_launch(io: dict, stream) -> object:
             locality_domain_register_unsupported_reason,
         )
 
-        reason = locality_domain_register_unsupported_reason(io.get("device"))
+        reason = locality_domain_register_unsupported_reason(
+            torch.cuda.current_device()
+        )
         if reason is not None:
             raise RuntimeError(reason)
 

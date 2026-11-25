@@ -3324,10 +3324,47 @@ def test_locality_launch_rejects_tile_indices_that_do_not_fit_u16(problem_m, pro
         ({"fallback_cluster_dim_x": 1, "fallback_cluster_dim_y": 1}, "flexible"),
         ({"use_clc_fast_drain": 1}, "fast drain"),
         ({"use_early_exit": 0}, "early exit"),
+        ({"fused_finalize_top_k": 1}, "fused finalize"),
+        ({"bias_type": 1}, "per-channel bias"),
     ),
 )
 def test_locality_schedule_rejects_incompatible_options(overrides, match):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(_locality_config(**overrides))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("output_kind", ("activation", "fp8", "per_channel_scale"))
+def test_locality_schedule_rejects_unmerged_epilogue_inputs_and_outputs(output_kind):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        DType,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.config_types import LocalitySplit
+
+    overrides = {}
+    match = ""
+    if output_kind == "activation":
+        overrides["locality_split"] = int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+        overrides["act_kind"] = int(ActKind.RELU2)
+        match = "linear, unquantized epilogue"
+    else:
+        overrides.update(
+            dtype_a=int(DType.E4M3),
+            dtype_b=int(DType.E4M3),
+            dtype_c=int(DType.E4M3),
+            tile_k=32,
+            mma_k=32,
+        )
+        if output_kind == "fp8":
+            overrides["locality_split"] = int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+            match = "linear, unquantized epilogue"
+        else:
+            overrides["use_per_token_sf_a"] = 1
+            match = "per-channel weight scale"
 
     with pytest.raises(ValueError, match=match):
         validate_config(_locality_config(**overrides))

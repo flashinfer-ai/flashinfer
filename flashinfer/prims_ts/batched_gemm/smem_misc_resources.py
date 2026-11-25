@@ -116,20 +116,25 @@ class LocalityClcDynamicPersistentTileScheduler(ClcDynamicPersistentTileSchedule
         return values
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 10
-        rebuilt = super().__new_from_mlir_values__(values[:8])
-        home_side = new_from_mlir_values(self.home_side, [values[8]])
-        home_exhausted = new_from_mlir_values(self.home_exhausted, [values[9]])
-        return LocalityClcDynamicPersistentTileScheduler(
-            rebuilt.params,
-            rebuilt.cta_id_in_cluster,
-            rebuilt._num_tiles_executed,
-            rebuilt._clc_response_ptr,
-            rebuilt._block_idx,
-            rebuilt.insert_fence,
-            home_side=home_side,
-            home_exhausted=home_exhausted,
+        home_side_len = len(extract_mlir_values(self.home_side))
+        home_exhausted_len = len(extract_mlir_values(self.home_exhausted))
+        base_len = len(values) - home_side_len - home_exhausted_len
+        assert base_len >= 0
+        rebuilt = super().__new_from_mlir_values__(values[:base_len])
+        home_side = new_from_mlir_values(
+            self.home_side,
+            values[base_len : base_len + home_side_len],
         )
+        home_exhausted = new_from_mlir_values(
+            self.home_exhausted,
+            values[base_len + home_side_len :],
+        )
+        # The base class owns its constructor and private state. Preserve that
+        # reconstructed object instead of duplicating its field list here.
+        rebuilt.__class__ = LocalityClcDynamicPersistentTileScheduler
+        rebuilt.home_side = home_side
+        rebuilt.home_exhausted = home_exhausted
+        return rebuilt
 
 
 @dataclass(kw_only=True)
@@ -490,7 +495,19 @@ def _st_async_u64x2_to_peer(
 
 @dataclass(kw_only=True)
 class LocalityBatchedGemmWorkQueue(BatchedGemmWorkQueue):
-    """Atomic home-first, then steal, persistent locality scheduler."""
+    """Atomic home-first, then steal, persistent locality scheduler.
+
+    Each cluster claims from the counter for its inline-PTX-derived home side.
+    Its first out-of-range claim latches ``home_exhausted``; subsequent claims
+    only steal from the other side, which is encoded in the published work
+    response. Normal termination therefore costs one failed home claim and one
+    failed steal.
+
+    The first work tile is a dummy skip tile because the real first work ID
+    must come from the home-side counter. Once a single-wave grid has completed
+    that tile, its next fetch publishes an invalid response without another
+    atomic.
+    """
 
     locality_counter0_tensor: Any = None
     locality_counter1_tensor: Any = None
@@ -527,9 +544,9 @@ class LocalityBatchedGemmWorkQueue(BatchedGemmWorkQueue):
             self.tile_scheduler_config.response_ptr,
             (bidx, bidy, bidz),
             home_side=home_side,
-            # Materialized as IR: a literal ``Int32(0)`` is a trace-time
-            # constant in newer DSLs, and the latch is written under runtime
-            # control flow after ``_claim_tile`` has read it.
+            # Materialize a runtime IR value because this latch is assigned
+            # under runtime control flow. A plain Int32(0) may be treated as a
+            # trace-time constant by newer DSLs.
             home_exhausted=cutlass.Int32(cutlass.Int32(0).ir_value()),
         )
 
@@ -583,8 +600,9 @@ class LocalityBatchedGemmWorkQueue(BatchedGemmWorkQueue):
             linear_idx = self._atomic_claim(home_side)
             if linear_idx >= total_clusters:
                 self.tile_scheduler.home_exhausted = cutlass.Int32(1)
-        # Derived instead of reassigned under the latch: ``home_side`` may be a
-        # trace-time constant that ``_atomic_claim`` already branched on.
+        # Derive the side without assigning to ``home_side`` under runtime
+        # control flow: the ZERO test source makes ``home_side`` a trace-time
+        # constant when `_atomic_claim` traces its side branch.
         side = home_side ^ self.tile_scheduler.home_exhausted
         if self.tile_scheduler.home_exhausted != cutlass.Int32(0):
             linear_idx = self._atomic_claim(side)

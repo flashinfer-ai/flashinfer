@@ -62,7 +62,7 @@ from .batched_gemm_config import (
     RouteImpl,
     SfLayout,
     SfSmemToTmemCopy,
-    _ldgsts_sfb_producer_commit_prefetch_depth,
+    _resolved_ldgsts_sfb_producer_commit_prefetch_depth,
     compute_num_k_tiles,
     compute_warp_layout,
     make_config,
@@ -1097,7 +1097,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                     cfg=cfg,
                     pipeline_config=pcfgs["smem_sfb"],
                     producer_commit_prefetch_depth=(
-                        _ldgsts_sfb_producer_commit_prefetch_depth(cfg)
+                        _resolved_ldgsts_sfb_producer_commit_prefetch_depth(
+                            cfg, num_k_tiles=num_k_tiles
+                        )
                     ),
                     name="SmemSfB",
                 )
@@ -1942,7 +1944,7 @@ def _batched_gemm_kernel_bf16_body(
                     mn_limit=mn_limit_sf,
                     pipeline_config=pcfgs["smem_sfb"],
                     producer_commit_prefetch_depth=(
-                        _ldgsts_sfb_producer_commit_prefetch_depth(cfg)
+                        _resolved_ldgsts_sfb_producer_commit_prefetch_depth(cfg)
                     ),
                     name="SmemSfB",
                 )

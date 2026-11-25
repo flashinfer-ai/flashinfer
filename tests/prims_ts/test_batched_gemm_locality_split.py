@@ -19,6 +19,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     ActKind,
     BatchMode,
     BiasType,
+    CtaRasterOrder,
     DType,
     RouteImpl,
     SfLayout,
@@ -106,6 +107,54 @@ def test_bf16_locality_scheduler_matches_reference(
         locality_split=int(LocalitySplit.WEIGHTS_OUTPUT),
         locality_side_source=int(side_source),
         num_persistent_clusters=num_persistent_clusters,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_persistent_clusters",
+    (1, None),
+    ids=("forced_multiwave", "resident_grid"),
+)
+def test_bf16_domain_locality_scheduler_matches_reference(
+    num_persistent_clusters,
+):
+    from flashinfer.prims_ts.batched_gemm.locality_requirements import (
+        locality_domain_register_unsupported_reason,
+    )
+
+    reason = locality_domain_register_unsupported_reason()
+    if reason is not None:
+        pytest.skip(reason)
+    assert _bf16_persistent_reference_check(
+        "uniform",
+        repeat_launches=2,
+        locality_split=int(LocalitySplit.WEIGHTS_OUTPUT),
+        locality_side_source=int(LocalitySideSource.DOMAIN),
+        num_persistent_clusters=num_persistent_clusters,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {
+            "umma_cta_count": 2,
+            "mma_m": 256,
+            "num_persistent_clusters": 1,
+        },
+        # Wider CGAs keep the 2-CTA UMMA atom and add a second cluster row.
+        {"umma_cta_count": 2, "mma_m": 256, "cluster_dim_y": 2},
+        {"cta_raster_order": int(CtaRasterOrder.ALONG_N)},
+    ),
+    ids=("2cta_weights_output", "cluster_n2", "raster_along_n"),
+)
+def test_bf16_locality_scheduler_cluster_variants(overrides):
+    assert _bf16_persistent_reference_check(
+        "uniform",
+        repeat_launches=2,
+        locality_split=int(LocalitySplit.WEIGHTS_OUTPUT),
+        locality_side_source=int(LocalitySideSource.SMID_PARITY),
+        **overrides,
     )
 
 

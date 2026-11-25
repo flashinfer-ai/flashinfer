@@ -117,11 +117,12 @@ def _partition_stream_topology(
     if resources is None:
         return ()
     if isinstance(resources, MoeLocalizedKernelResources):
+        sm_count = resources.sm_count_per_domain
         return (
             (
                 "single_kernel",
-                sum(resources.domain_sm_counts),
-                resources.domain_sm_counts,
+                2 * sm_count,
+                (sm_count, sm_count),
                 1,
             ),
         )
@@ -1200,6 +1201,36 @@ class _PrimsTsMoERunnerMixin:
             ios: list[dict[str, Any]], counter_offset: int
         ) -> dict[str, Any]:
             primary, secondary = ios
+            side_specific = {
+                "a_dp",
+                "b_dp",
+                "sfa_dp",
+                "sfb_dp",
+                "c0_dp",
+                "sf_c_dp",
+                "sf_c_m_offset",
+                "_keepalive",
+            }
+            missing = object()
+            for key in primary.keys() | secondary.keys():
+                if key in side_specific:
+                    continue
+                primary_value = primary.get(key, missing)
+                secondary_value = secondary.get(key, missing)
+                is_scalar = (
+                    key == "cfg"
+                    or isinstance(primary_value, (bool, int))
+                    or isinstance(secondary_value, (bool, int))
+                )
+                if is_scalar and (
+                    primary_value is missing
+                    or secondary_value is missing
+                    or primary_value != secondary_value
+                ):
+                    raise ValueError(
+                        f"localized side IO field {key!r} must match: "
+                        f"{primary_value!r} != {secondary_value!r}"
+                    )
             counter0, counter1 = _locality_counter_views(partition, counter_offset)
             counter0_dp = make_ptr(
                 cutlass.Int32,
