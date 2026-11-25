@@ -16,12 +16,17 @@ class PrFinding:
     line: int
     message: str
     level: str = "warning"
+    classification: str = ""
+    api: str = ""
+    before: str = ""
+    after: str = ""
+    rule_id: str = ""
 
 
 def emit_finding(finding: PrFinding, github_actions: bool) -> None:
     """Print one finding, optionally as a GitHub Actions annotation."""
     if github_actions:
-        level = "error" if finding.level == "error" else "warning"
+        level = finding.level if finding.level in {"error", "notice"} else "warning"
         message = (
             finding.message.replace("%", "%25").replace("\n", " ").replace("\r", "")
         )
@@ -35,6 +40,9 @@ def write_report(
     base: str,
     head: str,
     findings: list[PrFinding],
+    *,
+    execution_status: str = "COMPLETE",
+    error: str = "",
 ) -> None:
     """Write the stable report artifact consumed by the comment workflow."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,6 +52,8 @@ def write_report(
                 "check": check,
                 "base": base,
                 "head": head,
+                "execution_status": execution_status,
+                "error": error,
                 "findings": [asdict(finding) for finding in findings],
             },
             indent=2,

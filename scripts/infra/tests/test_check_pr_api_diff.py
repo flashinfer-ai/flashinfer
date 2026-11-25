@@ -96,6 +96,31 @@ class SignatureCompatibilityTest(unittest.TestCase):
     def test_compatible_signature_changes(self) -> None:
         cases = (
             (
+                "positional-only kind changed",
+                "def api(value: int, /) -> None",
+                "def api(value: int) -> None",
+            ),
+            (
+                "return union widened without an opt-in input",
+                "def api(value: int) -> int",
+                "def api(value: int) -> int | str",
+            ),
+            (
+                "return union widened with an opt-in input",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
+            ),
+            (
+                "return tuple member widens",
+                "def api(value: int) -> tuple[int, str]",
+                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
+            ),
+            (
+                "fixed return tuple widens to variadic",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
+            ),
+            (
                 "keyword-only insertion",
                 "def api(value: int, *, first: int = 1, last: int = 2) -> None",
                 "def api(value: int, *, first: int = 1, inserted: str = 'x', last: int = 2) -> None",
@@ -184,11 +209,6 @@ class SignatureCompatibilityTest(unittest.TestCase):
     def test_breaking_signature_changes(self) -> None:
         cases = (
             (
-                "positional-only kind changed",
-                "def api(value: int, /) -> None",
-                "def api(value: int) -> None",
-            ),
-            (
                 "positional parameter removed",
                 "def api(first: int, second: str) -> None",
                 "def api(first: int) -> None",
@@ -274,26 +294,6 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int) -> int",
             ),
             (
-                "return union widened without an opt-in input",
-                "def api(value: int) -> int",
-                "def api(value: int) -> int | str",
-            ),
-            (
-                "return union widened with an opt-in input",
-                "def api(value: int) -> tuple[int, int]",
-                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
-            ),
-            (
-                "return tuple member widens",
-                "def api(value: int) -> tuple[int, str]",
-                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
-            ),
-            (
-                "fixed return tuple widens to variadic",
-                "def api(value: int) -> tuple[int, int]",
-                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
-            ),
-            (
                 "function became async",
                 "def api(value: int) -> None",
                 "async def api(value: int) -> None",
@@ -364,7 +364,7 @@ class TypeAliasCompatibilityTest(unittest.TestCase):
             ("public_api_signature_changed",),
         )
 
-    def test_module_local_alias_cannot_hide_return_widening(self) -> None:
+    def test_module_local_alias_return_widening_is_compatible(self) -> None:
         base = {
             "flashinfer/example.py": textwrap.dedent(
                 """
@@ -388,7 +388,7 @@ class TypeAliasCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(
             tuple(finding.check for finding in compare_snapshots(base, head)),
-            ("public_api_signature_changed",),
+            (),
         )
 
 

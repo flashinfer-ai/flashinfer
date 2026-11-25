@@ -9,8 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  api-policy-tests:
+    name: API policy tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
+          node --test scripts/infra/tests/test_api_*.cjs
+
   documentation:
-    name: Public API and documentation
+    name: Documentation checks (advisory)
     if: github.event.pull_request.draft == false
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -22,33 +33,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Test public API checker
-        id: public_api_tests
-        continue-on-error: true
-        run: python -m unittest discover -s scripts/infra/tests -p 'test_check_pr_api_diff.py' -v
-
-      - name: Check public API signature and export changes
-        id: public_api
-        continue-on-error: true
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -o pipefail
-          if python scripts/infra/check_pr_api_diff.py \
-              --base "$BASE_SHA" \
-              --head "$HEAD_SHA" \
-              --github-actions \
-              --report-json reports/public-api.json | tee api-doc-check.txt; then
-            status=0
-          else
-            status=$?
-          fi
-          # GitHub consumes ::warning lines as annotations. Do not also render
-          # those workflow commands as literal text in the human summary.
-          sed '/^::warning /d' api-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
 
       - name: Check all new static documentation drift
         id: static_documentation
@@ -73,8 +57,6 @@ jobs:
       - name: Record non-blocking checker status
         if: always()
         env:
-          PUBLIC_API_TEST_OUTCOME: ${{ steps.public_api_tests.outcome }}
-          PUBLIC_API_OUTCOME: ${{ steps.public_api.outcome }}
           STATIC_DOCUMENTATION_OUTCOME: ${{ steps.static_documentation.outcome }}
         run: |
           mkdir -p reports
@@ -84,8 +66,6 @@ jobs:
           from pathlib import Path
 
           outcomes = {
-              "public_api_tests": os.environ["PUBLIC_API_TEST_OUTCOME"],
-              "public_api": os.environ["PUBLIC_API_OUTCOME"],
               "static_documentation": os.environ["STATIC_DOCUMENTATION_OUTCOME"],
           }
           Path("reports/execution-status.json").write_text(

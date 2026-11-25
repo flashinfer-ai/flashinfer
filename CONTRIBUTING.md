@@ -126,6 +126,16 @@ FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVID
 > focused and inconclusive results only post advice for review. `run all` requests the
 > **full** suite, which is expensive and appropriate for a cross-cutting change or final check — tick the full-scope box in the PR template and say why.
 
+## API compatibility check
+
+The API check classifies public changes as `BREAKING` (error), `LIKELY_BREAKING`
+(warning), or `NON_BREAKING`. When configured as required, **API compatibility**
+blocks merging on errors or an incomplete scan. A non-author maintainer with
+`maintain`/`admin` permission can accept all API breaks for the current head by
+commenting `@flashinfer-bot API BREAK expected`. The bot reacts 👀 while processing
+and 👍 after successful unblock; a new push requires a new approval. See the
+[API policy, reports, exceptions and rollout guide](docs/design_docs/pr_api_compatibility.md).
+
 ## Public CI (GitHub Actions)
 
 Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.

@@ -483,3 +483,38 @@ jobs:
             -X POST \
             "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content='confused'
+
+  api-break-command:
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@flashinfer-bot')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+      statuses: write
+    concurrency:
+      group: api-compatibility-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Handle API BREAK expected or revoke
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const gate = require('./scripts/infra/pr_checks/api_gate.cjs');
+            await gate.handleCommand({ github, core, context });
+      - name: Upload trusted API evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusted-public-api-report
+          path: reports/public-api.json
+          if-no-files-found: warn
