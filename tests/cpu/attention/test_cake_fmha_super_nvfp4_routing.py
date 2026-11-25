@@ -573,7 +573,7 @@ def test_trtllm_gen_context_gets_trtllm_gen_arguments(module, trtllm_gen):
     assert all(a is b or a == b for a, b in zip(rest, expected, strict=True))
 
 
-def test_trtllm_gen_decode_gets_trtllm_gen_arguments(trtllm_gen):
+def _decode_trtllm_gen_adapter():
     # Cake's 33 decode arguments, plus lse_scale after lse and, at the end, the
     # BF16-query transform mode (0: none) and use_fp16_softmax.
     from flashinfer.cake_fmha import (
@@ -595,13 +595,69 @@ def test_trtllm_gen_decode_gets_trtllm_gen_arguments(trtllm_gen):
         page_size=128,
         super_nvfp4_kernel=TRTLLM_GEN,
     )
-    cake_args = [object() for _ in range(33)]
-    CakeFmhaSuperNvfp4TrtllmGenModule(route=route).cake_paged_attention_decode(
-        *cake_args
-    )
+    return CakeFmhaSuperNvfp4TrtllmGenModule(route=route)
+
+
+def _decode_fallback_args(call):
+    args = [object() for _ in range(33)]
+    args[0] = call["out"]
+    args[3:5] = [call["k_cache"], call["v_cache"]]
+    args[7:9] = [call["block_tables"], call["seq_lens"]]
+    args[23] = call["cum_seq_lens_q"]
+    return args
+
+
+def test_trtllm_gen_decode_gets_trtllm_gen_arguments(trtllm_gen):
+    cake_args = _decode_fallback_args(_call())
+    _decode_trtllm_gen_adapter().cake_paged_attention_decode(*cake_args)
     ((stage, args),) = trtllm_gen.calls
     assert stage == "decode"
     assert list(args) == [*cake_args[:29], 1.0, *cake_args[29:], 0, None]
+
+
+@pytest.mark.parametrize("stage", ["decode", "context"])
+def test_trtllm_gen_fallback_preserves_strided_layouts(
+    monkeypatch, module, trtllm_gen, stage
+):
+    call = _prefill_call(2)
+    output_storage = torch.full((4, 32, 128), 0xFF, dtype=torch.uint8)
+    call["out"] = output_storage[::2].view(torch.float8_e4m3fn)
+    call["k_cache"] = (
+        torch.arange(8, dtype=torch.uint8)[:, None, None, None]
+        .expand(8, 2, 128, 64)
+        .contiguous()[::2]
+    )
+    call["v_cache"].fill_(7)
+    call["block_tables"] = torch.arange(160, dtype=torch.int32).reshape(1, -1)[:, ::2]
+    call["cum_seq_lens_q"] = torch.tensor([0, -1, 2], dtype=torch.int32)[::2]
+
+    def packed_backend(*args):
+        assert args[0].is_contiguous()
+        assert args[3].stride() == args[4].stride()
+        assert torch.equal(args[3], call["k_cache"])
+        assert torch.equal(args[4], call["v_cache"])
+        assert args[7].is_contiguous()
+        assert torch.equal(args[7], call["block_tables"])
+        offsets = args[23 if stage == "decode" else 19]
+        assert offsets.is_contiguous()
+        assert torch.equal(offsets, call["cum_seq_lens_q"])
+        args[0][0].view(torch.uint8).fill_(0x38)
+
+    if stage == "decode":
+        monkeypatch.setattr(trtllm_gen, "trtllm_paged_attention_decode", packed_backend)
+        _decode_trtllm_gen_adapter().cake_paged_attention_decode(
+            *_decode_fallback_args(call)
+        )
+    else:
+        monkeypatch.setattr(
+            trtllm_gen, "trtllm_paged_attention_context", packed_backend
+        )
+        _context_module(module, TRTLLM_GEN).cake_paged_attention_context(
+            *_context_abi_args(call)
+        )
+    assert (output_storage[0] == 0x38).all()
+    assert (output_storage[2] == 0xFF).all()
+    assert (output_storage[1::2] == 0xFF).all()
 
 
 @pytest.mark.parametrize("kernel", [MTP, BASE, TRTLLM_GEN])

@@ -7684,20 +7684,43 @@ class CakeFmhaSuperNvfp4TrtllmGenModule:
 
     route: CakeFmhaDecodeRoute | CakeFmhaContextRoute
 
+    @staticmethod
+    def _pack_common_args(args: list[Any]) -> torch.Tensor:
+        out, key_cache, value_cache = args[0], args[3], args[4]
+        # TRT-LLM indexes output and metadata as packed, and derives both
+        # K and V data strides from K. Cake's API also accepts strided views.
+        # Preserve rows the kernel does not write, such as inactive graph rows.
+        args[0] = out.contiguous()
+        if key_cache.stride() != value_cache.stride():
+            args[3] = key_cache.contiguous()
+            args[4] = value_cache.contiguous()
+        args[7] = args[7].contiguous()  # block_tables
+        args[8] = args[8].contiguous()  # seq_lens
+        return out
+
     def cake_paged_attention_decode(self, *args: Any) -> None:
         from .decode import get_trtllm_gen_fmha_module
 
+        args_list = list(args)
+        out = self._pack_common_args(args_list)
+        if args_list[23] is not None:  # cum_seq_lens_q
+            args_list[23] = args_list[23].contiguous()
         # trtllm-gen also takes lse_scale after ``lse`` (argument 28), then the
         # BF16-query transform mode (0: none) and use_fp16_softmax at the end.
         lse_index = 28
         get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
-            *args[: lse_index + 1], 1.0, *args[lse_index + 1 :], 0, None
+            *args_list[: lse_index + 1], 1.0, *args_list[lse_index + 1 :], 0, None
         )
+        if args_list[0] is not out:
+            out.copy_(args_list[0])
 
     def cake_paged_attention_context(self, *args: Any) -> None:
         from .prefill import get_trtllm_gen_fmha_module
 
         args_list = list(args)
+        out = self._pack_common_args(args_list)
+        args_list[18] = args_list[18].contiguous()  # cum_seq_lens_q
+        args_list[19] = args_list[19].contiguous()  # cum_seq_lens_kv
         bmm1_scale = args_list[11]
         if isinstance(bmm1_scale, torch.Tensor):
             # Cake passes a device bmm1 scale raw; trtllm-gen reads its log2 form.
@@ -7716,6 +7739,8 @@ class CakeFmhaSuperNvfp4TrtllmGenModule:
             1.0,
             *args_list[32:],
         )
+        if args_list[0] is not out:
+            out.copy_(args_list[0])
 
 
 def _load_cake_fmha_super_nvfp4_module(

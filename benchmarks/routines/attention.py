@@ -1267,6 +1267,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         backend,
         q,
         kv_cache,
+        kv_cache_sf,
         k_cache,
         v_cache,
         workspace_buffer,
@@ -1277,10 +1278,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         out,
     ):
         if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen", "cudnn"]:
-            wrapper_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
             return backend_wrappers[backend].run(
                 q,
-                wrapper_kv,
+                kv_cache,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 q_len_per_req=s_qo,
@@ -1303,11 +1303,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 batch_offsets_o=ragged_q,
                 out=out,
             )
-        elif backend == "trtllm-native":
-            native_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
+        elif backend in ("trtllm-native", "cake"):
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q.contiguous(),
-                kv_cache=native_kv,
+                kv_cache=kv_cache,
                 workspace_buffer=workspace_buffer,
                 block_tables=block_tables,
                 seq_lens=actual_seq_lens_kv,
@@ -1315,29 +1314,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 kv_layout="HND",
-                backend="auto",
+                backend="cake" if backend == "cake" else "auto",
                 q_len_per_req=s_qo,
-                mask=speculative_mask,
-                kv_cache_sf=kv_cache_sf,
-                enable_pdl=args.enable_pdl,
-                multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
-                out=out,
-                out_dtype=o_data_type,
-            )
-        elif backend == "cake":
-            # As trtllm-native, without the explicit draft-block mask.
-            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=q.contiguous(),
-                kv_cache=kv_cache_nvfp4,
-                workspace_buffer=workspace_buffer,
-                block_tables=block_tables,
-                seq_lens=actual_seq_lens_kv,
-                max_seq_len=s_kv,
-                bmm1_scale=k_scale * scale,
-                bmm2_scale=v_scale,
-                kv_layout="HND",
-                backend="cake",
-                q_len_per_req=s_qo,
+                mask=None if backend == "cake" else speculative_mask,
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
                 multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
@@ -1372,7 +1351,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     for cur_backend in backends:
         # Clear workspace buffer to prevent unexpected interactions between backends.
         workspace_buffer.zero_()
-        runtime_kv_cache = prims_ts_kv_cache if cur_backend == "prims-ts" else kv_cache
+        # CUDA graph timing rotates the cache and its block scales together.
+        if cur_backend == "prims-ts":
+            runtime_kv_cache = prims_ts_kv_cache
+            runtime_kv_cache_sf = None
+        else:
+            runtime_kv_cache = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
+            runtime_kv_cache_sf = kv_cache_sf
         runtime_out = backend_outputs[cur_backend]
         runtime_k_cache = k_cache if cur_backend == "cudnn-native" else None
         runtime_v_cache = v_cache if cur_backend == "cudnn-native" else None
@@ -1383,6 +1368,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                     cur_backend,
                     q,
                     runtime_kv_cache,
+                    runtime_kv_cache_sf,
                     runtime_k_cache,
                     runtime_v_cache,
                     runtime_workspace,
@@ -1401,11 +1387,12 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 reference_backend = "fa2"
 
         # Unified benchmark entry: prefer graph if compatible and not using CUPTI
-        def run_timed_backend(q_arg, kv_arg, k_arg, v_arg, out_arg):
+        def run_timed_backend(q_arg, kv_arg, kv_sf_arg, k_arg, v_arg, out_arg):
             return run_backend_wrapper(
                 cur_backend,
                 q_arg,
                 kv_arg,
+                kv_sf_arg,
                 k_arg,
                 v_arg,
                 workspace_buffer,
@@ -1427,6 +1414,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             input_args=(
                 q,
                 runtime_kv_cache,
+                runtime_kv_cache_sf,
                 runtime_k_cache,
                 runtime_v_cache,
                 runtime_out,
@@ -2130,6 +2118,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         backend,
         q,
         kv_cache,
+        kv_cache_sf,
         k_cache,
         v_cache,
         workspace_buffer,
@@ -2292,6 +2281,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     cur_backend,
                     q,
                     runtime_kv_cache,
+                    kv_cache_sf,
                     runtime_k_cache,
                     runtime_v_cache,
                     runtime_workspace,
@@ -2312,11 +2302,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 reference_output = outputs[cur_backend]
                 reference_backend = "fa2"
 
-        def run_timed_backend(q_arg, kv_arg, k_arg, v_arg, out_arg):
+        def run_timed_backend(q_arg, kv_arg, kv_sf_arg, k_arg, v_arg, out_arg):
             return run_backend_wrapper(
                 cur_backend,
                 q_arg,
                 kv_arg,
+                kv_sf_arg,
                 k_arg,
                 v_arg,
                 workspace_buffer,
@@ -2341,6 +2332,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             input_args=(
                 q,
                 runtime_kv_cache,
+                kv_cache_sf,
                 runtime_k_cache,
                 runtime_v_cache,
                 runtime_out,

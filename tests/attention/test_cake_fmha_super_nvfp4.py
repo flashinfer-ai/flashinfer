@@ -615,7 +615,21 @@ def test_decode_declined_calls_run_trtllm_gen(q_len, declined):
         "bmm1_scale zero in float": dict(bmm1_scale=lambda: 1e-300),
         "bmm1_scale negative": dict(bmm1_scale=lambda: -inputs.bmm1_scale),
     }[declined]
-    _check_decode_fallback(inputs, q_len, **overrides)
+    if declined in (
+        "block_tables not contiguous",
+        "seq_lens not contiguous",
+        "out not packed",
+    ):
+        # The direct backend needs packed tensors. Compare to the original
+        # packed inputs so identical misaddressing cannot pass this check.
+        _reset_routes()
+        out = _run_decode(
+            CAKE, inputs, q_len, **{name: make() for name, make in overrides.items()}
+        )
+        assert _routes_taken() == _routes("decode", TRTLLM_GEN)
+        _assert_same_bytes(out, _run_decode(TRTLLM_GEN, inputs, q_len))
+    else:
+        _check_decode_fallback(inputs, q_len, **overrides)
     if declined == "workspace too small":
         # The kernel serves the call with exactly the workspace it asks for.
         kernel = super_nvfp4.select_decode_kernel(4, q_len, int(inputs.seq_lens.max()))
@@ -956,7 +970,19 @@ def test_prefill_declined_calls_run_trtllm_gen(declined):
         "query not packed": dict(query=lambda: _strided(inputs.query)),
         "bmm1_scale zero": dict(bmm1_scale=lambda: 0.0),
     }[declined]
-    _check_prefill_fallback(inputs, [512], required, **overrides)
+    if declined == "K and V strides differ":
+        _reset_routes()
+        out = _run_prefill(
+            CAKE,
+            inputs,
+            [512],
+            required,
+            kv_cache=overrides["kv_cache"](),
+        )
+        assert _routes_taken() == _routes("prefill", TRTLLM_GEN)
+        _assert_same_bytes(out, _run_prefill(TRTLLM_GEN, inputs, [512], required))
+    else:
+        _check_prefill_fallback(inputs, [512], required, **overrides)
 
 
 def test_prefill_features_run_trtllm_gen():
