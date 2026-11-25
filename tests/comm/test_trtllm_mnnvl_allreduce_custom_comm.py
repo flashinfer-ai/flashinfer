@@ -26,24 +26,12 @@ class CustomCommunicator(CommBackend):
     def Get_size(self) -> int:
         return dist.get_world_size(self._group)
 
-    def allgather(self, data: int | bytes):
-        device = f"cuda:{torch.cuda.current_device()}"
-        if isinstance(data, int):
-            local_tensor = torch.tensor([data], device=device, dtype=torch.int32)
-            world_size = self.Get_size()
-            gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
-
-            dist.all_gather(gathered, local_tensor, group=self._group)
-            return [int(x.item()) for x in gathered]
-
-        elif isinstance(data, bytes):
-            local_tensor = torch.ByteTensor(list(data)).unsqueeze(0).to(device)
-            world_size = self.Get_size()
-            gathered = [data] * self.Get_size()
-            dist.all_gather_object(gathered, data, group=self._group)
-            return gathered
-        else:
-            raise TypeError(f"Unsupported type for allgather: {type(data)}")
+    def allgather(self, data: Any) -> tuple[Any, ...]:
+        # CommBackend.allgather takes any picklable object: MnnvlMemory gathers
+        # ints, bytes and tuples.
+        gathered = [None] * self.Get_size()
+        dist.all_gather_object(gathered, data, group=self._group)
+        return tuple(gathered)
 
     def bcast(self, data, root: int = 0):
         """
