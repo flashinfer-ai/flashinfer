@@ -3856,13 +3856,20 @@ def _build_trtllm_moe_namespace(module):
         hidden_size = hidden_states.shape[-1]
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
+        dtype_act = deduce_trtllm_gen_tensor_dtype(
+            hidden_states, hidden_states_scale
+        )
+        if dtype_act == DtypeTrtllmGen.E2m1 and hidden_size % 256 != 0:
+            raise ValueError(
+                f"For NVFP4, hidden_size must be a multiple of 256, got {hidden_size}. "
+                "Zero-pad hidden_size to a multiple of 256 and declare the unpadded dimension "
+                "via valid_hidden_size (see pad_trtllm_moe_weights)."
+            )
         moe_runner = TrtllmMoERunner(
             moe_op,
             top_k=top_k,
             num_local_experts=num_local_experts,
-            dtype_act=deduce_trtllm_gen_tensor_dtype(
-                hidden_states, hidden_states_scale
-            ),
+            dtype_act=dtype_act,
             dtype_weights=deduce_trtllm_gen_tensor_dtype(
                 gemm1_weights, gemm1_weights_scale
             ),
@@ -5378,6 +5385,29 @@ def _validate_routing_replay_out(
         )
     if not routing_replay_out.is_contiguous():
         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
+
+
+def _validate_trtllm_fp4_hidden_size(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+) -> None:
+    """Validate hidden_size alignment for NVFP4 block-scaled MoE.
+
+    NvFP4 trtllm_fp4_block_scale_moe requires hidden_size to be a multiple of 256.
+    When hidden_size is not a multiple of 256 (e.g. 128 or 384), TMA scale factor
+    addressing pads scale factor rows to multiples of 16 scales (256 elements), causing
+    strided offset mismatch and corruption for all tokens > 0.
+    """
+    hidden_size = hidden_states.shape[-1]
+    if hidden_states.dtype == torch.uint8:
+        hidden_size *= 2
+    dtype_act = deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
+    if dtype_act == DtypeTrtllmGen.E2m1 and hidden_size % 256 != 0:
+        raise ValueError(
+            f"For NVFP4, hidden_size must be a multiple of 256, got {hidden_size}. "
+            "Zero-pad hidden_size to a multiple of 256 and declare the unpadded dimension "
+            "via valid_hidden_size (see pad_trtllm_moe_weights)."
+        )
 
 
 def _validate_fused_shared_experts(
@@ -7738,6 +7768,7 @@ def trtllm_fp4_block_scale_moe(
     nvfp4_4over6_code_value = _trtllm_fp4_nvfp4_4over6_code(
         nvfp4_4over6, per_token_scale, hidden_states
     )
+    _validate_trtllm_fp4_hidden_size(hidden_states, hidden_states_scale)
     _nfse = _validate_fused_shared_experts(
         num_fused_shared_experts,
         local_expert_offset,
@@ -8097,6 +8128,7 @@ def trtllm_fp4_block_scale_routed_moe(
     nvfp4_4over6_code_value = _trtllm_fp4_nvfp4_4over6_code(
         nvfp4_4over6, per_token_scale, hidden_states
     )
+    _validate_trtllm_fp4_hidden_size(hidden_states, hidden_states_scale)
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
     localized = _flatten_localized_moe_args(
         localized_weights, localized_streams, localized_sm_count, hidden_states.device
