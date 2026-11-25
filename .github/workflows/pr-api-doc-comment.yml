@@ -172,12 +172,29 @@ jobs:
             const publicApiFindings = [];
             const documentationFindings = [];
             const reportErrors = [];
+            let executionStatus = {};
+            if (fs.existsSync('reports/execution-status.json')) {
+              try {
+                const parsed = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected checker outcomes');
+                executionStatus = parsed;
+              } catch (error) {
+                reportErrors.push('execution-status.json is malformed');
+              }
+            } else {
+              reportErrors.push('execution-status.json is missing');
+            }
+            // New producers declare only documentation; legacy combined runs
+            // still require API evidence, including when that scan failed.
+            const documentationOnly = Object.keys(executionStatus).length === 1
+              && ['success', 'failure', 'cancelled', 'skipped'].includes(executionStatus.static_documentation);
             const reportTargets = [
               ['reports/public-api.json', publicApiFindings],
               ['reports/static-documentation.json', documentationFindings],
             ];
             for (const [file, target] of reportTargets) {
               if (!fs.existsSync(file)) {
+                if (file === 'reports/public-api.json' && documentationOnly) continue;
                 reportErrors.push(`${file} is missing`);
                 continue;
               }
@@ -188,16 +205,6 @@ jobs:
                 core.warning(`Ignoring malformed report ${file}: ${error.message}`);
                 reportErrors.push(`${file} is malformed`);
               }
-            }
-            let executionStatus = {};
-            if (fs.existsSync('reports/execution-status.json')) {
-              try {
-                executionStatus = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
-              } catch (error) {
-                reportErrors.push('execution-status.json is malformed');
-              }
-            } else {
-              reportErrors.push('execution-status.json is missing');
             }
             const failedChecks = Object.entries(executionStatus)
               .filter(([, outcome]) => outcome !== 'success')
