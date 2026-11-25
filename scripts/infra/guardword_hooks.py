@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import functools
 import importlib.util
 import os
@@ -53,6 +52,11 @@ import time
 from pathlib import Path
 from typing import Iterator
 from urllib.parse import urlparse
+
+# Native Windows has no fcntl. The commit check runs for every contributor
+# there too, so installs run unlocked instead.
+if sys.platform != "win32":
+    import fcntl
 
 PREFIX = "[guardwords]"
 NVIDIA_GITHUB_ORG = "NVIDIA"
@@ -85,10 +89,13 @@ if [ ! -f "$hook" ]; then
 fi
 exec python3 "$hook" pre-push "$@"
 """
-# The same, for a core.hooksPath hook that other repositories may share.
+# The same, for a core.hooksPath hook that other repositories may share. The
+# rest of that hook gets the ref updates on stdin too.
 HOOKS_PATH_LINE = (
     f'hook="$(git rev-parse --git-common-dir)/{HOOK_COPY}"; '
-    '[ ! -f "$hook" ] || python3 "$hook" pre-push "$@" || exit'
+    'if [ -f "$hook" ]; then refs="$(mktemp)" && cat > "$refs" && '
+    'python3 "$hook" pre-push "$@" < "$refs" || { rm -f "$refs"; exit 1; }; '
+    'exec < "$refs"; rm -f "$refs"; fi'
 )
 
 OPT_OUT_TIP = "Not an NVIDIA contributor: git config --global flashinfer.internal false"
@@ -136,6 +143,23 @@ def _repo_root(start: Path) -> Path | None:
     return Path(top) if top else None
 
 
+def _is_own_checkout(root: Path) -> bool:
+    """Whether `root` is the checkout this script is part of.
+
+    A source tree without its own git history can sit inside another
+    repository, whose hooks are not FlashInfer's to change. The push hook runs
+    a copy kept in the git directory, which serves any checkout.
+    """
+    here = Path(__file__).resolve()
+    if (here.parent.name, here.parent.parent.name) != ("infra", "scripts"):
+        return True
+    # The same directory, though paths may differ, as in case on macOS.
+    try:
+        return os.path.samefile(here.parents[2], root)
+    except OSError:
+        return False
+
+
 def _git_path(root: Path, name: str) -> Path:
     return root / _git(root, "rev-parse", "--git-path", name)
 
@@ -147,7 +171,8 @@ def _common_dir(root: Path) -> Path:
 @contextlib.contextmanager
 def _locked(root: Path) -> Iterator[None]:
     with open(_common_dir(root) / LOCK_FILE, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if sys.platform != "win32":
+            fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
 
@@ -157,6 +182,9 @@ def _read(path: Path) -> str:
 
 def _write_if_different(path: Path, content: str, *, executable: bool = False) -> None:
     if _read(path) == content:
+        # Git skips a hook that is not executable.
+        if executable and not os.access(path, os.X_OK):
+            path.chmod(0o755)
         return
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
     tmp.write_text(content)
@@ -213,8 +241,8 @@ def _scanner_link_target() -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     target = result.stdout.strip() if result.returncode == 0 else ""
-    url = urlparse(target)
     try:
+        url = urlparse(target)
         extras = url.query or url.fragment or "@" in url.netloc or url.port
     except ValueError:
         return ""
@@ -445,9 +473,15 @@ def _push_hook_installed(root: Path) -> bool:
     if not (_common_dir(root) / HOOK_COPY).is_file():
         return False
     hooks_dir = _git_path(root, "hooks")
+    # Git skips a hook that is not executable, as the pre-commit framework does
+    # for the one it runs from pre-push.legacy.
+    active = hooks_dir / "pre-push"
+    if not os.access(active, os.X_OK):
+        return False
     if _config(root, "core.hooksPath"):
-        return HOOK_COPY in _read(hooks_dir / "pre-push")
-    return SHIM_MARKER in _read(_push_hook_path(hooks_dir))
+        return HOOK_COPY in _read(active)
+    hook = _push_hook_path(hooks_dir)
+    return SHIM_MARKER in _read(hook) and os.access(hook, os.X_OK)
 
 
 def _install_push_hook(hooks_dir: Path) -> tuple[list[str], list[str]]:
@@ -737,7 +771,7 @@ def run_setup(root: Path, *, interactive: bool = True) -> int:
     ):
         _say("Nothing to set up.")
         return 0
-    # A setting in this clone stays there, and leaves the other clones alone.
+    # Opt in for every clone, unless a setting already applies to this one.
     if _config_bool(root, "flashinfer.internal") is None:
         _run_git(root, "config", "--global", "flashinfer.internal", "true")
 
@@ -772,9 +806,9 @@ def run_status(root: Path) -> int:
     if not _push_hook_installed(root):
         problems.append(
             f"core.hooksPath is set, and {hooks_dir / 'pre-push'} does not run "
-            "the guardword hook"
+            "the guardword hook, or is not executable"
             if hooks_path
-            else "the pre-push hook is not installed"
+            else "the pre-push hook is not installed, or not executable"
         )
     runner = _runner()
     if runner is None:
@@ -860,12 +894,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     root = _repo_root(Path.cwd())
-    if root is None:
-        # pip and pytest also run `ensure` in source trees without git
-        # history, such as the copies in the Docker images.
+    if root is None or not _is_own_checkout(root):
+        # pip and pytest also run `ensure` in source trees without their own
+        # git history, such as the copies in the Docker images.
         if args.command in ("ensure", "check-commit"):
             return 0
-        _say("not inside a git checkout")
+        _say(
+            "not inside a git checkout"
+            if root is None
+            else f"not inside a git checkout of this source tree; git finds {root}"
+        )
         return 1
     if args.command == "setup":
         return run_setup(root, interactive=not args.non_interactive)

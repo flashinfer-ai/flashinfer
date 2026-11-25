@@ -21,5 +21,8 @@ jobs:
     - name: Test compile cache lifecycle and S3 layer (CPU only)
       run: python3 -m unittest discover -s ci/tests -p 'test_compile_cache*.py' -v
     - name: Test guardword hooks (CPU only)
-      run: python3 -m unittest discover -s scripts/infra/tests -p 'test_guardword_hooks.py' -v
+      # With pre-commit, so the tests of the framework integration run.
+      run: |
+        python3 -m pip install pre-commit
+        python3 -m unittest discover -s scripts/infra/tests -p 'test_guardword_hooks.py' -v
     - uses: pre-commit/action@v3.0.1

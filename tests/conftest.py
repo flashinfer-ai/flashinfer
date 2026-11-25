@@ -185,6 +185,7 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    _install_guardword_checks(config)
     if os.environ.get("FLASHINFER_TEST_TORCH_COMPILE", "0") == "1":
         if torch_version < TorchVersion("2.4"):
             pytest.skip("torch.compile requires torch >= 2.4")
@@ -227,12 +228,20 @@ def pytest_configure(config):
     )
 
 
-def pytest_report_header(config):
+# What installing the guardword checks printed, for the report header.
+_GUARDWORD_LINES = []
+
+
+def _install_guardword_checks(config):
     # Does nothing outside NVIDIA; see "Guardword Hooks" in CONTRIBUTING.md.
+    # Not in the report header, which -q and --no-header skip; once per run,
+    # not in each pytest-xdist worker.
+    if hasattr(config, "workerinput"):
+        return
     root = Path(__file__).resolve().parents[1]
     script = root / "scripts" / "infra" / "guardword_hooks.py"
     if not script.is_file():
-        return None
+        return
     result = subprocess.run(
         [sys.executable, str(script), "ensure"],
         cwd=root,
@@ -240,7 +249,11 @@ def pytest_report_header(config):
         text=True,
         check=False,
     )
-    return result.stderr.splitlines() or None
+    _GUARDWORD_LINES[:] = result.stderr.splitlines()
+
+
+def pytest_report_header(config):
+    return _GUARDWORD_LINES or None
 
 
 def pytest_collection_modifyitems(config, items):

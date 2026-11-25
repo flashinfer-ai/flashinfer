@@ -192,12 +192,18 @@ class GuardwordHooksTest(unittest.TestCase):
         self._git(cwd, "add", "-A")
         self._git(cwd, "commit", "-q", "--no-verify", "-m", message)
 
+    def _script(self, tree: Path) -> Path:
+        """The script as it runs in `tree`: each checkout runs its own copy."""
+        copy = tree / "scripts" / "infra" / SCRIPT.name
+        return copy if copy.is_file() else SCRIPT
+
     def _hooks(
         self, *args: str, cwd: Path | None = None, stdin: str = "", **env: str
     ) -> subprocess.CompletedProcess:
+        tree = cwd or self.work
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *args],
-            cwd=cwd or self.work,
+            [sys.executable, str(self._script(tree)), *args],
+            cwd=tree,
             env=self._env(**env),
             input=stdin,
             capture_output=True,
@@ -208,11 +214,12 @@ class GuardwordHooksTest(unittest.TestCase):
     def _hooks_on_terminal(self, *args: str) -> str:
         """Run the script with a pseudo-terminal as its controlling terminal."""
         env = self._env()
+        script = self._script(self.work)
         pid, fd = pty.fork()
         if pid == 0:
             try:
                 os.chdir(self.work)
-                os.execve(sys.executable, [sys.executable, str(SCRIPT), *args], env)
+                os.execve(sys.executable, [sys.executable, str(script), *args], env)
             finally:
                 os._exit(127)
         output = b""
@@ -306,6 +313,39 @@ class GuardwordHooksTest(unittest.TestCase):
         status = self._hooks("status", cwd=tree)
         self.assertEqual(status.returncode, 1)
         self.assertIn("not inside a git checkout", status.stderr)
+
+    def test_a_copy_inside_another_repository_leaves_it_alone(self) -> None:
+        outer = self.tmp / "outer"
+        vendored = outer / "third_party" / "flashinfer"
+        (vendored / "scripts" / "infra").mkdir(parents=True)
+        shutil.copy(SCRIPT, vendored / "scripts" / "infra" / SCRIPT.name)
+        self._git(outer, "init", "-q", "-b", "main")
+        self._git(outer, "config", "flashinfer.internal", "true")
+        for command in ("ensure", "check-commit"):
+            result = self._hooks(command, cwd=vendored)
+            self.assertEqual((result.returncode, result.stderr), (0, ""), command)
+        hooks = [p.name for p in (outer / ".git" / "hooks").iterdir()]
+        self.assertEqual([name for name in hooks if not name.endswith(".sample")], [])
+        status = self._hooks("status", cwd=vendored)
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("not inside a git checkout of this source tree", status.stderr)
+
+    def test_a_push_hook_that_is_not_executable_is_reported_and_repaired(
+        self,
+    ) -> None:
+        self._set_up()
+        shim = next(
+            path
+            for path in (self.hooks / "pre-push.legacy", self.hooks / "pre-push")
+            if path.is_file() and "flashinfer-guardword-shim" in path.read_text()
+        )
+        shim.chmod(0o644)
+        status = self._hooks("status")
+        self.assertNotEqual(status.returncode, 0)
+        self.assertIn("not executable", status.stderr)
+        self._hooks("ensure")
+        self.assertTrue(os.access(shim, os.X_OK))
+        self.assertEqual(self._hooks("status").returncode, 0)
 
     def test_an_opt_out_is_kept_and_reported(self) -> None:
         self._git(self.work, "config", "--unset", "flashinfer.internal")
@@ -476,6 +516,7 @@ class GuardwordHooksTest(unittest.TestCase):
             "https://:secret@git.example.nvidia.com/team/scanner.git",
             "https://git.example.nvidia.com:8443/team/scanner.git",
             "file:///team/scanner.git",
+            "https://[git.example.nvidia.com/team/scanner.git",
         ):
             # Each answer would clone the stand-in scanner if it were accepted.
             self._answer_link(target)
@@ -483,6 +524,7 @@ class GuardwordHooksTest(unittest.TestCase):
             self.assertEqual(setup.returncode, 1, target)
             self.assertFalse(self.cache.exists(), target)
             self.assertIn("https://nv/flashinfer-scanner", setup.stderr)
+            self.assertNotIn("Traceback", setup.stderr, target)
 
     def test_setup_falls_back_when_the_short_link_does_not_answer(self) -> None:
         self.scan_url = ""
@@ -546,9 +588,13 @@ class GuardwordHooksTest(unittest.TestCase):
             for line in advice.splitlines()
             if "git-common-dir" in line
         )
-        self._write_hook(custom / "pre-push", f"#!/bin/sh\n{line}\n")
+        # The rest of the shared hook needs the ref updates on stdin too.
+        rest = 'cat >> "$FAKE_LOG.rest"'
+        self._write_hook(custom / "pre-push", f"#!/bin/sh\n{line}\n{rest}\n")
         self.assertEqual(self._hooks("ensure").stderr, "")
         self.assertEqual(self._hooks("status").returncode, 0)
+        self.assertEqual(self._push().returncode, 0)
+        self.assertIn("refs/heads/main", Path(f"{self.log}.rest").read_text())
         self._add("leak.txt", "CANARY\n")
         self._commit_all(self.work, "leak")
         self.assertNotEqual(self._push().returncode, 0)
@@ -565,6 +611,7 @@ class GuardwordHooksTest(unittest.TestCase):
             other, "push", "-q", "origin", "HEAD:refs/heads/o", check=False
         )
         self.assertEqual(push.returncode, 0, push.stderr)
+        self.assertIn("refs/heads/o", Path(f"{self.log}.rest").read_text())
 
     # -- pushes ---------------------------------------------------------------
 
@@ -657,6 +704,19 @@ class GuardwordHooksTest(unittest.TestCase):
         self._add("leak.txt", "CANARY\n")
         self._commit_all(self.work, "leak")
         self.assertNotEqual(self._push().returncode, 0)
+
+    @needs_pre_commit
+    def test_both_push_hooks_behind_the_framework_must_be_executable(self) -> None:
+        self._use_pre_commit_config()
+        self._set_up()
+        self._pre_commit("install", "--hook-type", "pre-push")
+        # Git skips a pre-push hook that is not executable, and the framework
+        # skips a pre-push.legacy that is not.
+        for hook in (self.hooks / "pre-push", self.hooks / "pre-push.legacy"):
+            hook.chmod(0o644)
+            self.assertNotEqual(self._hooks("status").returncode, 0, hook.name)
+            hook.chmod(0o755)
+        self.assertEqual(self._hooks("status").returncode, 0)
 
     # -- commits --------------------------------------------------------------
 
