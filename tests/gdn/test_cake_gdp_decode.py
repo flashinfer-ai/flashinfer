@@ -2628,7 +2628,7 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
     assert len(f16_kernels) == sum(
         1
         for record in loader.MODULES.values()
-        if record["build"].get("state_dtype") == "f16"
+        if record["role"] == "decode" and record["build"].get("state_dtype") == "f16"
     )
     for kernel in f16_kernels:
         text = kernel.read_text()
