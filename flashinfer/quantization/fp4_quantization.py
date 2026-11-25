@@ -1538,7 +1538,8 @@ def e2m1_and_ufp8sf_scale_to_float(
     ufp8_scale_tensor : torch.Tensor
         Scale-factor tensor in UFP8 format with dtype ``uint8``.
     global_scale_tensor : torch.Tensor, optional
-        Global scale factor of shape ``[1]`` and dtype ``float32``.
+        Global scale factor of shape ``[1]`` and dtype ``float32``.  On SM80
+        and newer it applies to E4M3 scales (``ufp8_type=1``) only.
     sf_vec_size : int
         Scale-factor vector size.  Defaults to ``16``.
     ufp8_type : int
