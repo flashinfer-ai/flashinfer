@@ -9644,12 +9644,23 @@ class _B12xRunner(MoERunner):
             source_format="modelopt",
         )
 
+    def _weight_view(self, weights: MoEWeightPack) -> dict[str, torch.Tensor]:
+        """The native view under ``backend_key``, or an identical-layout
+        alias (``weight_view_aliases``); the plain lookup's KeyError (listing
+        the available keys) is kept when none is registered."""
+        for key in self.weight_view_aliases:
+            if self.backend_key not in weights.native_views and key in (
+                weights.native_views
+            ):
+                return weights.get_view(key)
+        return weights.get_view(self.backend_key)
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        v = weights.get_view(self.backend_key)
+        v = self._weight_view(weights)
         self._validate_prepared_weights(v)
         # Only the packed weights are expert-major; SFs are swizzled, alphas may broadcast.
         for key in ("w1_weight", "w2_weight"):
@@ -9703,6 +9714,9 @@ class _B12xRunner(MoERunner):
         )
         if act.topk_weights.dtype != torch.float32:
             raise TypeError("b12x topk_weights must use torch.float32.")
+        return self._pack_validated(hidden_states, act, v)
+
+    def _pack_validated(self, hidden_states, act, v):
         self._prepared_weights = v
         self._ensure_inner(hidden_states.shape[1], hidden_states.shape[0])
         return [hidden_states, act.topk_ids, act.topk_weights]
@@ -9761,14 +9775,22 @@ class B12xW4A16Runner(_B12xRunner):
     Supports expert parallelism over a contiguous expert shard
     (``ExpertConfig.local_expert_offset`` / ``local_num_experts``): each rank
     computes a zero-filled partial that the caller sums across the EP group.
+
+    Weights: the ``b12x_w4a16`` view only (swizzled 128-row-padded block
+    scales). The ``specialized_w4a16`` view stores scales row-major and
+    unpadded, so it is NOT an alias: each candidate needs its own prepared
+    view.
     """
 
     backend_key = "b12x_w4a16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        ReLU2,
+    )
     supports_expert_parallelism = True
-    required_weight_keys = (
+    required_weight_keys: ClassVar[tuple[str, ...]] = (
         "w1_weight",
         "w1_weight_sf",
         "w1_alpha",
@@ -9776,6 +9798,267 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
+
+
+class SpecializedW4A16Runner(B12xW4A16Runner):
+    """Unified SM120 adapter that calls the specialized agent-generated
+    NVFP4-W4A16 MoE kernels' own module directly
+    (:mod:`flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120`); the
+    kernels are not b12x kernels and do not route through ``b12x_fused_moe``
+    or ``B12xMoEWrapper``.
+
+    The runner serves EXACTLY the kernels' measured domain:
+    ``check_support`` gates the fixed contract (E=128, top_k=6, hidden=2688,
+    intermediate=1856, ReLU^2, SM120, CUDA >= 13.2 toolkit) and
+    ``_accepts_shape`` admits only the allowlisted token counts, so
+    ``MoELayer``'s ``backend=auto`` per-token-bucket shootout times the
+    specialized kernels on matching buckets — as a first-class named
+    candidate, including under autotune tuning mode — and never routes an
+    out-of-allowlist call here. A refusal after acceptance raises (with the
+    CUDA-graph warmup instruction for capture-state refusals) rather than
+    silently serving the call with another kernel: a backend carries only
+    its own behavior.
+
+    The ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` kill switch rejects the
+    runner at support-check time and makes ``_accepts_shape`` decline every
+    call. Weights: the ``specialized_w4a16`` view only (row-major group-16
+    scales at the exact unpadded geometry, from
+    :meth:`SpecializedW4A16Config.prepare_weights`). The stock
+    ``b12x_w4a16`` view stores scales swizzled and 128-row-padded, so it is
+    NOT an alias; ``accepts`` additionally verifies the registered view's
+    shapes/dtypes/contiguity so an incompatible pack leaves this candidate
+    ineligible instead of raising while the shootout profiles it.
+
+    Weights travel with each packed call. Output and scratch are allocated
+    on the forward stream, including in the graph-private pool at capture.
+    """
+
+    backend_key = "specialized_w4a16"
+    single_flight_graph_replay: ClassVar[bool] = False
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
+    # The kernels' contract is the non-gated ReLU^2 geometry only.
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        ReLU2,
+    )
+    supports_expert_parallelism = False
+
+    def _check_support(self) -> None:
+        # Generic checks only (quant pair, activation class, routing mode,
+        # EP rejection): deliberately skip _B12xRunner's stock-path
+        # requirements — the specialized kernels need neither the CuTe DSL
+        # package nor SM121 support.
+        super(_B12xRunner, self)._check_support()
+
+        from ..utils import get_compute_capability
+        from .specialized_moe_nvfp4_w4a16_sm120 import _C, _disabled
+
+        if _disabled():
+            raise NotImplementedError(
+                "the specialized W4A16 backend is disabled by "
+                "FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1."
+            )
+        routing = self.config.routing
+        intermediate = self.config.experts.intermediate_size
+        if (
+            routing.num_experts != _C["num_experts"]
+            or routing.top_k != _C["top_k"]
+            or intermediate != _C["intermediate_size"]
+        ):
+            raise NotImplementedError(
+                f"the specialized W4A16 kernels serve only the contract "
+                f"E={_C['num_experts']}, top_k={_C['top_k']}, "
+                f"intermediate_size={_C['intermediate_size']}; got "
+                f"E={routing.num_experts}, top_k={routing.top_k}, "
+                f"intermediate_size={intermediate}."
+            )
+        if list(get_compute_capability(self.device)) != _C["compute_capability"]:
+            raise RuntimeError(
+                f"the specialized W4A16 kernels require "
+                f"SM{_C['compute_capability'][0]}{_C['compute_capability'][1]}."
+            )
+        # cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.2-line ptxas: reject the
+        # backend here so MoELayer reports the reason and auto selects among
+        # the remaining candidates instead of failing the JIT build later.
+        try:
+            from ..jit.cpp_ext import get_cuda_version
+
+            _v = get_cuda_version()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"{type(self).__name__}: CUDA toolkit version probe failed "
+                f"({type(exc).__name__})."
+            ) from exc
+        if (_v.major, _v.minor) < (13, 2):
+            raise RuntimeError(
+                f"{type(self).__name__} requires a CUDA >= 13.2 toolkit "
+                f"(cvt.rn.bf16x2.e2m1x2); got {_v.major}.{_v.minor}."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
+        self.activation = "relu2"
+
+    def _build(self) -> None:
+        """No b12x wrapper: forward drives the specialized module directly.
+        Build it at layer init, never inside a CUDA-graph capture; a failed
+        JIT build rejects the backend here, so MoELayer reports the reason
+        and selects among the remaining candidates."""
+        self._wrapper_cls = None
+        from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
+
+        if _spec._is_capturing(self.device):
+            raise RuntimeError(
+                "construct SpecializedW4A16Runner before CUDA-graph capture"
+            )
+        try:
+            _spec._module()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"{type(self).__name__}: specialized module build failed "
+                f"({type(exc).__name__}: {exc})."
+            ) from exc
+
+    @staticmethod
+    def _view_matches_contract(view: Any) -> bool:
+        """Cheap metadata check that ``view`` carries the kernels' documented
+        row-major unpadded layout (shapes, dtypes, contiguity). Memory
+        contents are unverifiable from metadata for any backend; this
+        excludes every structurally incompatible view (in particular the
+        swizzled 128-row-padded ``b12x_w4a16`` storage) at eligibility time."""
+        from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
+
+        c = _spec._C
+        E, H, I = c["num_experts"], c["hidden_size"], c["intermediate_size"]
+
+        def _ok(t: Any, shape: tuple, dtype: torch.dtype) -> bool:
+            return (
+                isinstance(t, torch.Tensor)
+                and tuple(t.shape) == shape
+                and t.dtype == dtype
+                and t.is_contiguous()
+            )
+
+        try:
+            return (
+                _ok(view["w1_weight"], (E, I, H // 2), torch.uint8)
+                and _ok(view["w1_weight_sf"], (E, I, H // 16), torch.float8_e4m3fn)
+                and _ok(view["w1_alpha"], (E,), torch.float32)
+                and _ok(view["w2_weight"], (E, H, I // 2), torch.uint8)
+                and _ok(view["w2_weight_sf"], (E, H, I // 16), torch.float8_e4m3fn)
+                and _ok(view["w2_alpha"], (E,), torch.float32)
+            )
+        except (KeyError, TypeError):
+            return False
+
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        """Eligible only with a registered, layout-compatible
+        ``specialized_w4a16`` view: an absent or incompatible view declines
+        the candidate before the cross-backend shootout profiles it."""
+        view = weights.native_views.get(self.backend_key)
+        if view is None or not self._view_matches_contract(view):
+            return False
+        return self._accepts_shape(act)
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
+
+        if _spec._disabled():
+            return False
+        # Decline any pack the call-time guard would refuse, so it is
+        # excluded before profiling and winner selection instead of raising
+        # in forward (NVFP4xBF16 packs carry raw bf16 [T, H] activations).
+        x = act.hidden_states_q
+        if (
+            x.dim() != 2
+            or x.shape[1] != _spec._C["hidden_size"]
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+        ):
+            return False
+        t = act.num_tokens
+        return t in _spec._T_EXACT or t >= _spec._T_MIN_LARGE
+
+    def supports_graph_capture_timing(self) -> bool:
+        """Keep the existing eager cross-backend shootout policy."""
+        return False
+
+    def _pack_validated(self, hidden_states, act, v):
+        return [
+            hidden_states,
+            act.topk_ids,
+            act.topk_weights,
+            *(v[key] for key in self.required_weight_keys),
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError(f"{self.backend_key} supports only tactic -1.")
+        if len(inputs) != 3 + len(self.required_weight_keys):
+            raise ValueError(f"{self.backend_key}: expected inputs from pack_inputs.")
+        x, expert_ids, routing_weights = inputs[:3]
+        v = dict(zip(self.required_weight_keys, inputs[3:], strict=True))
+        output = torch.empty_like(x)
+
+        from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
+
+        ok, reasons = _spec.specialized_support_reasons(
+            x,
+            v["w1_weight"],
+            v["w1_weight_sf"],
+            v["w2_weight"],
+            v["w2_weight_sf"],
+            expert_ids,
+            routing_weights,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            w1_alpha=v["w1_alpha"],
+            w2_alpha=v["w2_alpha"],
+            output=output,
+            activation=self.activation,
+            quant_mode="w4a16",
+            source_format="modelopt",
+        )
+        if ok:
+            _spec.dispatch_stats["specialized"] += 1
+            return _spec.run_specialized_moe_nvfp4_w4a16(
+                x,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                expert_ids,
+                routing_weights,
+                output,
+            )
+        if any(reason.startswith("graph_capture") for reason in reasons):
+            # Never dispatch an uncached/unwarmed variant under capture, and
+            # never silently capture the slow fallback in its place.
+            raise RuntimeError(
+                f"{self.backend_key}: cannot serve this call during CUDA-graph "
+                f"capture ({', '.join(reasons)}); run "
+                "flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120."
+                "warmup(...) before capturing."
+            )
+        # _accepts_shape and check_support admit only guard-passing calls,
+        # so any other refusal here is a call-time state change. Raising
+        # keeps the backend honest: it never serves a call with a different
+        # kernel (a backend carries only its own behavior).
+        _spec.fallback_reasons.append(tuple(reasons))
+        raise RuntimeError(
+            f"{self.backend_key}: the specialized kernels declined an "
+            f"accepted call ({', '.join(reasons)})."
+        )
 
 
 # ---------------------------------------------------------------------------

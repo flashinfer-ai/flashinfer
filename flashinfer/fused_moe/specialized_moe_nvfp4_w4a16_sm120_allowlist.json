@@ -1,0 +1,16 @@
+{
+  "comment": "Auto-routing allowlist for the specialized SM120 NVFP4-W4A16 routed-MoE backend. Every entry carries harness-verified wins against both the stock b12x route and the serving incumbent on RTX PRO 6000; shapes off this list keep the stock path.",
+  "backends": ["specialized"],
+  "contract": {
+    "num_experts": 128,
+    "top_k": 6,
+    "hidden_size": 2688,
+    "intermediate_size": 1856,
+    "activation": "relu2",
+    "quant_mode": "w4a16",
+    "source_format": "modelopt",
+    "compute_capability": [12, 0]
+  },
+  "token_counts_exact": [1, 4, 16, 64, 1024],
+  "token_counts_min_large": 4096
+}
