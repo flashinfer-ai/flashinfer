@@ -235,3 +235,86 @@ def test_signature_changed_by_preparation_retunes(setup, mode):
     with tuning(mode):
         assert tuner.choose_one("growing", [runner], config, inputs) == (runner, 2)
     assert (GrowingRunner, 2) in calls
+
+
+@pytest.mark.parametrize("mode", ["v1", "managed"])
+def test_rank_tactics_reranks_when_signature_changes(setup, monkeypatch, mode):
+    tuner, calls = setup
+    runner = PoolRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with tuning(mode):
+        assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == [3, 1]
+        assert (PoolRunner, 3) in calls
+
+        # Same identity, expanded pool: the stored shortlist must not be reused.
+        runner.tactics.append(2)
+        calls.clear()
+        assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == [2, 3]
+        assert (PoolRunner, 2) in calls
+
+        # An unchanged signature reuses the shortlist without enumerating.
+        calls.clear()
+        monkeypatch.setattr(
+            tuner, "_prepare_input_tensors", lambda *args: pytest.fail("warm synthesis")
+        )
+        monkeypatch.setattr(
+            PoolRunner,
+            "get_valid_tactics",
+            lambda *args: pytest.fail("warm enumeration"),
+        )
+        assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == [2, 3]
+        assert calls == []
+
+
+def test_rank_tactics_signature_changed_by_preparation_reranks(setup):
+    tuner, calls = setup
+
+    class GrowingRunner(PoolRunner):
+        def forward(self, inputs, tactic=-1, do_preparation=False):
+            if do_preparation and 2 not in self.tactics:
+                # The pool grows after enumeration, so tactic 2 was not ranked.
+                self.tactics.append(2)
+            return inputs[0]
+
+    runner = GrowingRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with autotune():
+        assert tuner.rank_tactics("growing", [runner], config, inputs, k=2) == [3, 1]
+        assert (GrowingRunner, 2) not in calls
+        calls.clear()
+        assert tuner.rank_tactics("growing", [runner], config, inputs, k=2) == [2, 3]
+        assert (GrowingRunner, 2) in calls
+
+
+def test_rank_tactics_without_signature_keeps_shortlist(setup):
+    tuner, calls = setup
+    runner = OtherRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with autotune():
+        assert tuner.rank_tactics("unsigned", [runner], config, inputs, k=2) == [3, 1]
+        # None keeps the identity-only contract: an undeclared expansion is
+        # not detected, and the shortlist is reused.
+        runner.tactics.append(2)
+        calls.clear()
+        assert tuner.rank_tactics("unsigned", [runner], config, inputs, k=2) == [3, 1]
+        assert calls == []
+
+
+def test_rank_tactics_shortlist_miss_fails_during_capture(setup, monkeypatch):
+    tuner, calls = setup
+    runner = PoolRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with autotune():
+        assert tuner.rank_tactics("captured", [runner], config, inputs, k=2) == [3, 1]
+        calls.clear()
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        monkeypatch.setattr(
+            tuner, "_prepare_input_tensors", lambda *args: pytest.fail("synthesis")
+        )
+        # An unchanged shortlist is safe to return during capture.
+        assert tuner.rank_tactics("captured", [runner], config, inputs, k=2) == [3, 1]
+        # A changed pool must fail rather than fall back to tactic -1.
+        runner.tactics.append(2)
+        with pytest.raises(RuntimeError, match="active outer CUDA Graph capture"):
+            tuner.rank_tactics("captured", [runner], config, inputs, k=2)
+        assert calls == []

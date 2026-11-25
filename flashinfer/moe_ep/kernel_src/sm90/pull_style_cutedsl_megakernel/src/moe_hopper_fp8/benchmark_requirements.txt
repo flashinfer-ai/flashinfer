@@ -1,2 +1,0 @@
-# Plotting dependency for run_token_sweep_benchmark.sh.
-matplotlib>=3.8

@@ -20,7 +20,7 @@ import torch
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _SOURCE_TREE_PACKAGE_ROOT = (
-    _PROJECT_ROOT / "flashinfer" / "moe_ep" / "kernel_src" / "blackwell_bf16_rank_major"
+    _PROJECT_ROOT / "flashinfer/moe_ep/kernels/flashinfer/bf16_rank_major"
 )
 _SESSION_PATH = _SOURCE_TREE_PACKAGE_ROOT / "session.py"
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
@@ -45,7 +45,7 @@ def _session_module():
     distribution = metadata.distribution("flashinfer-python")
     session_path = Path(
         distribution.locate_file(
-            "flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/session.py"
+            "flashinfer/moe_ep/kernels/flashinfer/bf16_rank_major/session.py"
         )
     )
     return load(session_path)
@@ -216,7 +216,7 @@ def test_package_data_declares_the_immutable_source_pair():
     if not pyproject_path.is_file():
         pytest.skip("pyproject.toml is only available in source-tree test runs")
     pyproject = pyproject_path.read_text(encoding="utf-8")
-    key = '"flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major" = ['
+    key = '"flashinfer.moe_ep.kernels.flashinfer.bf16_rank_major" = ['
     assert key in pyproject
     package_block = pyproject.split(key, maxsplit=1)[1].split("]", maxsplit=1)[0]
     assert '"*.md"' in package_block

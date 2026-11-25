@@ -25,7 +25,7 @@ import os
 import pytest
 import torch
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.shims.sm107.cutedsl_megamoe")
 
 from flashinfer.moe_ep import (  # noqa: E402
     BootstrapConfig,
@@ -390,7 +390,7 @@ def _torch_oracle(
     """Full-bank oracle for one rank's tokens over the layer's exact quant path."""
     if x_rank.shape[0] == 0:
         return torch.empty((0, HIDDEN), device=x_rank.device, dtype=torch.bfloat16)
-    import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
+    import flashinfer.moe_ep.shims.sm107.cutedsl_megamoe as pkg
 
     w13_interleaved = pkg.interleave_gate_up_16(
         w13.to(torch.float32), intermediate_size=INTERMEDIATE

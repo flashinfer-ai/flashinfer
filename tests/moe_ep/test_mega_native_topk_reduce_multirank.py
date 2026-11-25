@@ -120,7 +120,7 @@ def _allocate_reference_workspace(
     *,
     apply_routing_weights_before_fc2: bool = True,
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         get_symm_buffer_for_mega_moe,
     )
 
@@ -148,7 +148,9 @@ def _reference_forward(t, workspace, transformed_weights, problem: dict):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
         staging,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import nvfp4_mega_moe
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        nvfp4_mega_moe,
+    )
 
     # Allocate the owned output before staging.  Nothing that can allocate or
     # synchronize is inserted between the staged collective round and compute.
@@ -194,8 +196,15 @@ def _public_pointer_snapshot(workspace) -> tuple[int, ...]:
 def _custom_finalize_pointer_snapshot(
     workspace,
 ) -> tuple[int, int, tuple[int, ...]]:
-    partials, root, descriptor = workspace._frontend.custom_finalize_workspace()
-    return partials.data_ptr(), root.data_ptr(), tuple(descriptor["shape"])
+    if hasattr(workspace, "_frontend"):
+        partials, root, descriptor = workspace._frontend.custom_finalize_workspace()
+        return partials.data_ptr(), root.data_ptr(), tuple(descriptor["shape"])
+    partials = workspace.custom_finalize_workspace()
+    return (
+        partials.data_ptr(),
+        partials.untyped_storage().data_ptr(),
+        tuple(partials.shape),
+    )
 
 
 def _assert_close(actual, expected) -> None:
@@ -268,12 +277,15 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
             fc2_alpha=alpha2,
             fc1_norm_const=norm,
         )
+        # The legacy tuner below and the winner-knob check read the legacy
+        # frontend; the unsuffixed name selects the sources-backed kernel.
         config = _megakernel_config(
             problem,
             epilogue_via_config=True,
             apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             finalize_mode=FinalizeMode.NONE,
             knobs=None,
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
         )
     else:
         config_cls = (
@@ -304,7 +316,12 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
     reference_workspace = None
     reference_layer = None
     graph = None
+    failure_group = None
+    forward_failed = False
     try:
+        # Forward failures are shared on a CPU group: an NCCL collective would
+        # queue behind a peer launch that the failing rank never joined.
+        failure_group = dist.new_group(backend="gloo")
         if backend == "nvfp4":
             from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
                 tune_one,
@@ -436,7 +453,20 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
 
         for n in (9 if backend == "nvfp4" else 7, 0 if rank == 0 else 5, 0, 17):
             t = batch(n)
-            actual = forward(t)
+            error = None
+            try:
+                actual = forward(t)
+            except Exception as exc:
+                error = exc
+            # Exchange before any rank waits on its peers.
+            failed = [None] * world_size
+            dist.all_gather_object(failed, error is not None, group=failure_group)
+            if any(failed):
+                forward_failed = True
+                if error is not None:
+                    raise error
+                failing = [r for r, f in enumerate(failed) if f]
+                raise AssertionError(f"forward failed on rank(s) {failing}")
             torch.cuda.synchronize()
             dist.barrier()
             expected = reference_forward(t)
@@ -469,17 +499,29 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
             dist.barrier()
             assert_close(captured_output, expected, t)
     finally:
-        torch.cuda.synchronize()
-        if graph is not None:
-            graph.reset()
-        if reference_workspace is not None:
-            reference_workspace.destroy()
-        if reference_layer is not None:
-            reference_layer.destroy()
-        layer.destroy()
+        # After a failed forward, peers may spin in a launch the failing rank
+        # never joined, so synchronization and collective teardown would hang.
+        if not forward_failed:
+            torch.cuda.synchronize()
+            if graph is not None:
+                graph.reset()
+            if reference_workspace is not None:
+                reference_workspace.destroy()
+            if reference_layer is not None:
+                reference_layer.destroy()
+            layer.destroy()
+        if failure_group is not None:
+            dist.destroy_process_group(failure_group)
 
 
-def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "sm100_nvfp4_nvfp4_bf16_cutedsl",
+        "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
+    ],
+)
+def test_native_reducer_reusable_workspaces_four_rank_end_to_end(kernel_name):
     """Exercise the complete native-workspace contract in one EP session."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -495,6 +537,7 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        FinalizeMode,
         MegaConfig,
         MoEEpLayer,
         MoEEpMegaLayer,
@@ -514,7 +557,11 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         pytest.skip("native terminal reducer requires exact SM100a or SM103a")
 
     problem = _problem(rank, world_size)
-    megakernel = _megakernel_config(problem, epilogue_via_config=True)
+    megakernel = _megakernel_config(
+        problem,
+        epilogue_via_config=True,
+        kernel_name=kernel_name,
+    )
     runtime_kernel = create_mega_kernel(megakernel)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, runtime_kernel.runtime_requirements(bootstrap)
@@ -557,10 +604,10 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         assert small_raw is not large_raw
         assert small.max_tokens_per_rank == 256
         assert large.max_tokens_per_rank == 4096
-        assert layer._kernel._uses_native_topk_reduce(small._fleet_params)
-        assert layer._kernel._uses_native_topk_reduce(large._fleet_params)
-        assert small_raw._frontend.config.use_custom_finalize
-        assert large_raw._frontend.config.use_custom_finalize
+        assert layer._kernel._finalize_mode(small._fleet_params) is FinalizeMode.CAKE
+        assert layer._kernel._finalize_mode(large._fleet_params) is FinalizeMode.CAKE
+        assert getattr(small_raw, "_frontend", small_raw).config.use_custom_finalize
+        assert getattr(large_raw, "_frontend", large_raw).config.use_custom_finalize
         assert pooled_workspace_refcount(small_raw) == 1
         assert pooled_workspace_refcount(large_raw) == 1
         assert layer._preprocessing_count == 1
@@ -639,9 +686,10 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         torch.cuda.synchronize()
         dist.barrier()
         _assert_close(after_zero, references[(8, 256)])
-        assert side_stream.cuda_stream in {
-            key[3] for key in layer._kernel._thunk_states
-        }
+        if hasattr(layer._kernel, "_thunk_states"):
+            assert side_stream.cuda_stream in {
+                key[3] for key in layer._kernel._thunk_states
+            }
 
         # Capture one graph per explicit capacity profile.  Prewarm the exact
         # capture streams so no stream-bound launch thunk is created inside

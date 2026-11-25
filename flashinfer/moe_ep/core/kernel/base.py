@@ -434,6 +434,16 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional init-time validation for user-supplied kernel-ready weights."""
 
+    def prepare_transformed_weights(
+        self,
+        transformed_weights: Any,
+        bootstrap: "BootstrapConfig",
+        fleet_params: "FleetParams",
+    ) -> Any:
+        """Validate and return the kernel-ready weights the layer will retain."""
+        self.validate_transformed_weights(transformed_weights, bootstrap, fleet_params)
+        return transformed_weights
+
     def set_compile_tokens_per_rank(  # noqa: B027 - intentional no-op default
         self,
         workspace: Any,

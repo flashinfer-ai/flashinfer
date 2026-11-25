@@ -19,10 +19,7 @@ def mxfp8_quant_kind(config):
 def mxfp8_batch_invariant_implementation(config):
     if getattr(config, "kernel_variant", "inference") == "genphase":
         return "genphase"
-    if (
-        type(config).__name__ == "MegaMoEMxfp8Config"
-        or getattr(config, "kernel_name", None) == "sm100_mxfp8_mxfp8_bf16_cutedsl"
-    ):
+    if type(config).__name__ == "MegaMoEMxfp8Config":
         return "legacy"
     return "standard"
 

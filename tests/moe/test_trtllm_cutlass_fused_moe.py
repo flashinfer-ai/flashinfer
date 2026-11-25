@@ -1351,6 +1351,34 @@ def test_moe_nvfp4(
     use_4over6,
     use_autotune,
 ):
+    _run_moe_nvfp4(
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        otype,
+        wtype,
+        quantized_input,
+        activation_type,
+        use_4over6,
+        use_autotune,
+    )
+
+
+def _run_moe_nvfp4(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    otype,
+    wtype,
+    quantized_input,
+    activation_type,
+    use_4over6,
+    use_autotune,
+):
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -1499,6 +1527,94 @@ def test_moe_nvfp4(
         swiglu_limit=7.0 if activation_type == ActivationType.SwigluStep else None,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)),
+    reason="FINALIZE profiling coverage requires Blackwell SM100 or SM103",
+)
+def test_moe_nvfp4_autotune_profiles_finalize(monkeypatch):
+    """Cold autotuning must profile a real GEMM2 FINALIZE specialization."""
+    import math
+
+    from flashinfer.autotuner import AutoTuner
+    from torch.profiler import ProfilerActivity, profile
+
+    # Probe CUPTI separately so an unavailable profiler does not masquerade as
+    # a missing FINALIZE kernel. The original numerical tests still run normally.
+    probe = torch.ones(1, device="cuda")
+    with profile(activities=[ProfilerActivity.CUDA]) as trace:
+        probe.add_(1)
+        torch.cuda.synchronize()
+    if not any(
+        event.device_type == torch.autograd.DeviceType.CUDA for event in trace.events()
+    ):
+        pytest.skip("torch.profiler records no CUDA activity on this device")
+
+    # Isolate this cold-cache assertion from earlier tests and persisted winners.
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    original_profile = AutoTuner._profile_single_kernel
+    finalized_tactics = set()
+
+    def observe_profile(self, runner, inputs, tactic, tuning_config, *args, **kwargs):
+        if (
+            kwargs.get("gemm_idx") != 2
+            or not getattr(runner, "use_fused_finalize", False)
+            or finalized_tactics
+        ):
+            return original_profile(
+                self, runner, inputs, tactic, tuning_config, *args, **kwargs
+            )
+        # Observe the actual profiling invocation, not a later forward or an
+        # inference from tactic IDs. Keep candidates and returned timings intact.
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as trace:
+            elapsed = original_profile(
+                self, runner, inputs, tactic, tuning_config, *args, **kwargs
+            )
+        if math.isfinite(elapsed) and any(
+            event.device_type == torch.autograd.DeviceType.CUDA
+            # These are the two SwapAB variants of the Blackwell FINALIZE
+            # fusion op; an unfused finalizeMoeRoutingKernel must not count.
+            and any(
+                fusion_op in event.name
+                for fusion_op in (
+                    "ScaledAccPerRowBiasPerColScaleScatter",
+                    "ScaledAccPerColBiasPerRowScaleScatter",
+                )
+            )
+            for event in trace.events()
+        ):
+            finalized_tactics.add(tactic)
+        return elapsed
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", observe_profile)
+    was_deterministic = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(False)
+    try:
+        # Reuse the existing quantization-aware numerical oracle. One real token
+        # bucket is sufficient; the workspace bound also depends on the tactics.
+        with autotune(True, tuning_buckets=(1,)):
+            _run_moe_nvfp4(
+                batch_size=1,
+                hidden_size=128,
+                num_experts=2,
+                top_k=2,
+                intermediate_size=128,
+                otype=torch.float16,
+                wtype=torch.float8_e4m3fn,
+                quantized_input=False,
+                activation_type=ActivationType.Swiglu,
+                use_4over6=False,
+                use_autotune=True,
+            )
+    finally:
+        torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+
+    assert finalized_tactics, "Cold GEMM2 autotuning did not profile a FINALIZE kernel"
 
 
 def test_moe_nvfp4_pinned_4over6_requires_nvfp4():
