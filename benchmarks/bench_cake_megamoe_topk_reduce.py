@@ -62,6 +62,7 @@ _SHAPES = (
 _HIDDEN_SIZE = 4096
 _TOP_K = 6
 _GRID_CTAS_PER_TOKEN = 4
+_LEGACY_GRID_CTAS_PER_TOKEN = 8
 _LEGACY_BASELINE_CAPACITY = 4096
 _ATOL = 1e-2
 _RTOL = 1e-2
@@ -357,6 +358,15 @@ def _comparison_plan(num_tokens: int, baseline: str) -> dict[str, Any]:
     """Define timed work once for both runner construction and JSON output."""
 
     native_io_bytes = num_tokens * (_TOP_K + 1) * _HIDDEN_SIZE * 2
+    baseline_ctas_per_token = (
+        _LEGACY_GRID_CTAS_PER_TOKEN
+        if baseline
+        in (
+            "vendored-cutedsl-matched",
+            "vendored-cutedsl-fixed-capacity",
+        )
+        else _GRID_CTAS_PER_TOKEN
+    )
     if baseline == "vendored-cutedsl-fixed-capacity":
         baseline_work_tokens = _LEGACY_BASELINE_CAPACITY
         comparison_kind = "legacy_fixed_capacity_serving_scenario"
@@ -384,7 +394,7 @@ def _comparison_plan(num_tokens: int, baseline: str) -> dict[str, Any]:
         "same_reduction_work": same_reduction_work,
         "native_grid_ctas": _GRID_CTAS_PER_TOKEN * num_tokens,
         "baseline_grid_ctas": (
-            _GRID_CTAS_PER_TOKEN * baseline_work_tokens
+            baseline_ctas_per_token * baseline_work_tokens
             if baseline_work_tokens is not None
             else None
         ),

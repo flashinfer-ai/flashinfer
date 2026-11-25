@@ -12,6 +12,11 @@ cuda_13_required = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_knob_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+
+
 def _require_cuda():
     import torch
 

@@ -1,7 +1,6 @@
 """1/2/4/8-rank correctness for production SM90 Humming MXFP4 MegaMoE.
 
-Launch this file in its own process because the SM90 and SM100 CuTeDSL drops
-use colliding top-level module names::
+Run with one process per GPU::
 
     torchrun --nproc_per_node=2 -m pytest \
         tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py -v \

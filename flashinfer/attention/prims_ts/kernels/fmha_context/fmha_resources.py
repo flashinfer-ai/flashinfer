@@ -81,6 +81,12 @@ from cutlass import Float32, Int16, Int32, Int64
 from ..tensor_map import transform_ragged_coords
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
+from ..mask import (
+    kv_tile_needs_right_mask,
+    pack_kv_tile_range,
+    packed_kv_tile_in_range,
+    unmasked_kv_tile_range,
+)
 from ..stage import FmhaStage
 from cutlass.experimental.task_scheduling.memory import SmemAllocation, TmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
@@ -177,6 +183,10 @@ TmemPtr: TypeAlias = cutlass.Array
 
 # Keep masked scores finite: an all-masked tile must not form inf - inf.
 _SOFTMAX_MASK_VALUE = -3.4028234663852886e38  # -FLT_MAX, bits 0xff7fffff
+# Open right bound of a row's visible keys in LOOP coordinates.
+_UNBOUNDED_K = 0x3FFFFFFF
+# Warps in one softmax warp group; each owns one packed LOOP mask range.
+_NUM_SOFTMAX_WARPS = 4
 
 SoftmaxScalar: TypeAlias = Float32
 SoftmaxChunk: TypeAlias = cutlass.Vector
@@ -3063,6 +3073,12 @@ class TmemSPResource(MemoryResource):
     variable_window_end: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    # One packed ``end << 16 | begin`` word per softmax warp: the LOOP tiles
+    # that need no score mask for the warp's rows. Kept in SMEM rather than a
+    # loop-carried register, which the S tile's register budget cannot spare.
+    _mask_range_alloc: Constexpr[Optional[SmemAllocation]] = field(
+        init=False, default=None
+    )
     # VC-Attention-QK8 dequant scales in the flat layout: Q [Hq, numel] and K/V
     # tile [Hkv, numel], both fp32.
     vc_q_scale: cute.Tensor | None = field(init=False, default=None)
@@ -3261,16 +3277,28 @@ class TmemSPResource(MemoryResource):
         return [self._alloc]
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
-        """Allocate the INT32 score seed tile; the second instance shares the first's."""
+        """Allocate the LOOP mask ranges and the INT32 score seed tile.
+
+        The second instance shares the first's seed tile.
+        """
+        requirements = []
+        if self.uses_loop_unmasked_tile_range:
+            if self._mask_range_alloc is None:
+                self._mask_range_alloc = SmemAllocation(
+                    f"{self.name}_unmasked_tile_range",
+                    4 * _NUM_SOFTMAX_WARPS,
+                    alignment=16,
+                )
+            requirements.append(self._mask_range_alloc)
         if not self.cfg.uses_int32_scores or self.score_seed_owner is not None:
-            return []
+            return requirements
         if self._seed_alloc is None:
             self._seed_alloc = SmemAllocation(
                 f"{self.name}_score_seed",
                 self.cfg.sage_score_seed_tile_bytes,
                 alignment=128,
             )
-        return [self._seed_alloc]
+        return requirements + [self._seed_alloc]
 
     @cute.jit
     def _score_seed_words(self, context: Any) -> cutlass.Array:
@@ -3385,6 +3413,43 @@ class TmemSPResource(MemoryResource):
     def uses_query_paired_invalid_tail(self) -> bool:
         """Return whether peer0 needs the extra wholly-invalid tail slot."""
         return self.cfg.skip_causal_invalid_peer0 and self.q_half == 0
+
+    @property
+    def loop_mask_kind(self) -> Optional[str]:
+        """Return the LOOP-section score mask, in schedule dispatch order.
+
+        ``"variable_window"``, ``"left_window"``, ``"varlen_right"``,
+        ``"query_paired_causal"``, ``"fixed_dense_k_tail"``,
+        ``"packed_dense_k"``, or ``None`` for an unmasked loop. Every
+        softmax schedule dispatches its LOOP row max on this one value.
+        """
+        if self.uses_variable_window:
+            return "variable_window"
+        if self.uses_left_window_loop_mask:
+            return "left_window"
+        if self.uses_varlen_loop_right_mask:
+            return "varlen_right"
+        if self.uses_query_paired_q_offset_loop_mask:
+            return "query_paired_causal"
+        if self.uses_fixed_dense_k_tail_mask:
+            return "fixed_dense_k_tail"
+        if self.uses_packed_dense_k_mask:
+            return "packed_dense_k"
+        return None
+
+    @property
+    def uses_loop_unmasked_tile_range(self) -> bool:
+        """Return whether LOOP masks select tiles by an SMEM-cached unmasked range.
+
+        Two-sided (window) masks build their ``[begin, end)`` tile range once
+        per work tile in HEAD. Masks with a single right bound test it in key
+        space with ``kv_tile_needs_right_mask``, because their masked tiles
+        need that bound anyway: the query-paired causal mask builds it from
+        the cached ``q_offset`` (``_causal_k_end``) and the packed dense K mask
+        uses the cached ``seqlen_k``. A fixed dense K tail masks only the last
+        LOOP tile, which a constant tile-count test already selects.
+        """
+        return self.loop_mask_kind in ("variable_window", "left_window", "varlen_right")
 
     @cute.jit
     def _stage_col_offset(self, stage_info: StageInfo) -> Int32 | int:
@@ -4068,6 +4133,233 @@ class TmemSPResource(MemoryResource):
         )
 
     @cute.jit
+    def _row_window_geometry(
+        self,
+        stage_info: StageInfo,
+        q_offset: Int32,
+        row_in_tile: Optional[Int32] = None,
+    ) -> tuple[Int32, Int32, Int32]:
+        """Return a row's Q index, the window's first K/V tile and left bound.
+
+        ``row_in_tile`` defaults to this thread's row. LOOP tile ``i`` is K/V
+        tile ``kv_tile_start + i``; without a left window ``kv_tile_start`` is
+        zero. The left bound is inclusive.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(row_in_tile is None):
+            row_in_tile = (
+                cute.arch.warp_idx() % 4
+            ) * cute.arch.WARP_SIZE + cute.arch.lane_idx()
+        seq_tile_coord, _, _ = _resolve_work_tile_coords(
+            cfg, stage_info.work_tile.tile_idx
+        )
+        index_q = seq_tile_coord * cfg.q_tile_m + row_in_tile
+        kv_tile_start = Int32(0)
+        window_bound_left = Int32(0)
+        if cutlass.const_expr(cfg.window_size_left > 0):
+            if cutlass.const_expr(cfg.has_varlen or cfg.has_q_offset):
+                window_bound_left = bottom_right_window_left_bound(
+                    index_q,
+                    q_offset,
+                    cfg.window_size_left,
+                )
+                kv_tile_start = bottom_right_window_tile_start(
+                    seq_coord=seq_tile_coord,
+                    q_tile_m=cfg.q_tile_m,
+                    kv_tile_n=cfg.kv_tile_n,
+                    q_offset=q_offset,
+                    window_size_left=cfg.window_size_left,
+                )
+            else:
+                # Exact fixed equal-length fast path: q_offset is constexpr zero.
+                window_bound_left = index_q - Int32(cfg.window_size_left)
+                kv_tile_start = cute.math.max(
+                    Int32(0),
+                    (seq_tile_coord * cfg.q_tile_m - cfg.window_size_left)
+                    // cfg.kv_tile_n,
+                )
+        return index_q, kv_tile_start, window_bound_left
+
+    @cute.jit
+    def _loop_visible_k_interval(
+        self,
+        stage_info: StageInfo,
+        *,
+        q_offset: Int32,
+        window_start: Int32,
+        window_end: Int32,
+    ) -> tuple[Int32, Int32]:
+        """Return the keys ``[lo, hi)`` visible to all of this warp's rows.
+
+        LOOP tile ``i`` covers keys ``[i * kv_tile_n, (i + 1) * kv_tile_n)``
+        of the same coordinates the ``loop_mask_kind`` mask uses. Causal and
+        sliding-window bounds grow with the Q row, so the warp's first row
+        gives ``hi`` and its last row gives ``lo``; both come from
+        warp-uniform values, which keeps the cached range out of the vector
+        registers that hold the S tile. VariableWindow starts are unordered,
+        so its per-row bounds are reduced across the warp.
+        """
+        cfg = self.cfg
+        kind = self.loop_mask_kind
+        first_row = (
+            cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        ) * cute.arch.WARP_SIZE
+        last_row = first_row + Int32(cute.arch.WARP_SIZE - 1)
+        lo = Int32(0)
+        hi = Int32(_UNBOUNDED_K)
+        if cutlass.const_expr(kind == "variable_window"):
+            # Inclusive per-row bounds, relative to the CTA's first K/V tile.
+            lo = cute.arch.warp_reduction(
+                window_start, lambda a, b: cute.math.max(a, b)
+            )
+            hi = cute.arch.warp_reduction(
+                window_end + Int32(1), lambda a, b: cute.math.min(a, b)
+            )
+        elif cutlass.const_expr(kind == "left_window"):
+            first_q, kv_tile_start, _ = self._row_window_geometry(
+                stage_info, q_offset, first_row
+            )
+            _, _, last_window_left = self._row_window_geometry(
+                stage_info, q_offset, last_row
+            )
+            base_k = kv_tile_start * cfg.kv_tile_n
+            lo = last_window_left - base_k
+            if cutlass.const_expr(cfg.has_varlen or cfg.has_q_offset):
+                hi = first_q + q_offset + Int32(1) - base_k
+        elif cutlass.const_expr(kind == "varlen_right" and cfg.is_causal):
+            first_q, kv_tile_start, _ = self._row_window_geometry(
+                stage_info, q_offset, first_row
+            )
+            base_k = kv_tile_start * cfg.kv_tile_n
+            if cutlass.const_expr(self.needs_window_tail_left_mask):
+                _, _, last_window_left = self._row_window_geometry(
+                    stage_info, q_offset, last_row
+                )
+                lo = last_window_left - base_k
+            hi = first_q + q_offset + Int32(1) - base_k
+        return lo, hi
+
+    @cute.jit
+    def _unmasked_tile_range(
+        self,
+        stage_info: StageInfo,
+        *,
+        q_offset: Int32 = 0,
+        window_start: Int32 = 0,
+        window_end: Int32 = 0,
+    ) -> Int32:
+        """Return this warp's packed LOOP tiles ``[begin, end)`` needing no mask.
+
+        Tiles left of the range cross some row's left bound and tiles from
+        ``end`` on cross some row's right bound; the per-tile branch is
+        warp-uniform.
+        """
+        lo, hi = self._loop_visible_k_interval(
+            stage_info,
+            q_offset=Int32(q_offset),
+            window_start=Int32(window_start),
+            window_end=Int32(window_end),
+        )
+        begin, end = unmasked_kv_tile_range(lo, hi, Int32(self.cfg.kv_tile_n))
+        return pack_kv_tile_range(begin, end)
+
+    # The cache_unmasked_tile_range_* methods run once per work tile in the
+    # softmax HEAD; each LOOP mask then tests its tile against the cached
+    # range instead of rebuilding the row's bounds every iteration. Every
+    # work-method input is a required routed token, so each mask kind's
+    # inputs get their own entry point.
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def cache_unmasked_tile_range_q_offset(
+        self, stage_info: StageInfo, *, q_offset: Int32
+    ) -> None:
+        """Cache the unmasked LOOP range of q-offset causal/window masks."""
+        self._store_unmasked_tile_range(
+            stage_info, self._unmasked_tile_range(stage_info, q_offset=q_offset)
+        )
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def cache_unmasked_tile_range_window(
+        self, stage_info: StageInfo, *, window_start: Int32, window_end: Int32
+    ) -> None:
+        """Cache the unmasked LOOP range of the VariableWindow mask."""
+        self._store_unmasked_tile_range(
+            stage_info,
+            self._unmasked_tile_range(
+                stage_info, window_start=window_start, window_end=window_end
+            ),
+        )
+
+    @cute.jit
+    def _causal_k_end(self, stage_info: StageInfo, q_offset: Int32) -> Int32:
+        """Return the keys ``[0, end)`` visible to the Q tile's first row.
+
+        The query-paired causal right bound grows by one key per row, so row
+        ``r`` of the tile sees ``end + r`` keys and a tile whose keys all lie
+        below ``end`` needs no mask. Built from the per-work-tile ``q_offset``
+        and tile coordinates on the uniform datapath: caching ``end`` across
+        the LOOP instead measured 3-8% slower on the register-bound D256
+        LDTM.STAT softmax, whose S tile the allocator then copies every tile.
+        """
+        cfg = self.cfg
+        seq_coord, _, _ = _resolve_work_tile_coords(cfg, stage_info.work_tile.tile_idx)
+        return (
+            Int32(q_offset)
+            + seq_coord * cfg.cta_tiler[0]
+            + self.q_half * cfg.q_tile_m
+            + Int32(1)
+        )
+
+    @cute.jit
+    def _causal_k_end_needs_mask(
+        self, kv_tile_idx: Int32, causal_k_end: Int32
+    ) -> cutlass.Boolean:
+        """Return whether K/V tile ``kv_tile_idx`` crosses the tile's causal end."""
+        return kv_tile_needs_right_mask(
+            kv_tile_idx * self.cfg.kv_tile_n,
+            Int32(self.cfg.qk_mma_tiler[1]),
+            causal_k_end,
+        )
+
+    @cute.jit
+    def _causal_row_k_end(self, causal_k_end: Int32) -> Int32:
+        """Return the keys this thread's Q row sees: ``causal_k_end + row``."""
+        return (
+            causal_k_end
+            + (cute.arch.warp_idx() % _NUM_SOFTMAX_WARPS) * cute.arch.WARP_SIZE
+            + cute.arch.lane_idx()
+        )
+
+    @cute.jit
+    def _mask_range_word(self, stage_info: StageInfo) -> tuple[cutlass.Array, Int32]:
+        """Return the SMEM range words and this warp's slot in them."""
+        words = cutlass.Array(
+            stage_info.context.smem_base.data_ptr() + self._mask_range_alloc.offset,
+            dtype=Int32,
+            shape=(_NUM_SOFTMAX_WARPS,),
+            addrspace=3,
+        )
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % _NUM_SOFTMAX_WARPS
+        return words, warp
+
+    @cute.jit
+    def _store_unmasked_tile_range(self, stage_info: StageInfo, packed: Int32) -> None:
+        """Store this warp's packed range; every lane writes the same value."""
+        words, warp = self._mask_range_word(stage_info)
+        words[warp] = packed
+
+    @cute.jit
+    def _loop_tile_needs_mask(self, stage_info: StageInfo) -> cutlass.Boolean:
+        """Return whether the current LOOP tile lies outside the warp's cached range.
+
+        Each lane reads back the packed word it wrote in this work tile's HEAD.
+        """
+        words, warp = self._mask_range_word(stage_info)
+        return not packed_kv_tile_in_range(stage_info.loop_offset, words[warp])
+
+    @cute.jit
     def _load_s_chunks(self, stage_info: StageInfo) -> SoftmaxChunks:
         """Load ALL S chunks from TMEM into register vectors."""
         tmem_s_addr = self.tmem_s_addr_cached + self._stage_col_offset(stage_info)
@@ -4301,7 +4593,7 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
         *,
         causal_loop_mask: cutlass.Constexpr[bool] = False,
-        q_offset: Int32 = 0,
+        causal_k_end: Int32 = 0,
         tile_scale: SoftmaxScalar | None = None,
         dense_k_mask: cutlass.Constexpr[bool] = False,
         seqlen_k: Int32 = 0,
@@ -4344,31 +4636,22 @@ class TmemSPResource(MemoryResource):
         row_max = cute.math.max(row_max, tile_max)
         if cutlass.const_expr(causal_loop_mask or dense_k_mask):
             if cutlass.const_expr(causal_loop_mask):
-                seq_coord, _, _ = _resolve_work_tile_coords(
-                    self.cfg, stage_info.work_tile.tile_idx
-                )
-                q_min = (
-                    q_offset
-                    + seq_coord * self.cfg.cta_tiler[0]
-                    + self.q_half * self.cfg.q_tile_m
-                )
                 kv_base = stage_info.loop_offset * self.cfg.kv_tile_n
-                needs_mask = q_min < kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
+                needs_mask = self._causal_k_end_needs_mask(
+                    stage_info.loop_offset, causal_k_end
+                )
             else:
                 if cutlass.const_expr(section == FmhaStage.Loop):
                     kv_tile_idx = stage_info.loop_offset
                 else:
                     kv_tile_idx = stage_info.loop_end
                 kv_base = kv_tile_idx * self.cfg.kv_tile_n
-                needs_mask = seqlen_k < kv_base + Int32(self.cfg.kv_tile_n)
+                needs_mask = kv_tile_needs_right_mask(
+                    kv_base, Int32(self.cfg.kv_tile_n), seqlen_k
+                )
             if needs_mask:
                 if cutlass.const_expr(causal_loop_mask):
-                    right_bound = (
-                        q_min
-                        + (cute.arch.warp_idx() % 4) * cute.arch.WARP_SIZE
-                        + cute.arch.lane_idx()
-                        + Int32(1)
-                    )
+                    right_bound = self._causal_row_k_end(causal_k_end)
                 else:
                     right_bound = seqlen_k
                 # Invalid lanes can contain another request's scores or TMA
@@ -5459,8 +5742,7 @@ class TmemSPResource(MemoryResource):
             # Some schedules materialize their final score tile in TAIL.
             kv_tile_idx = stage_info.loop_end
         kv_base = kv_tile_idx * self.cfg.kv_tile_n
-        kv_end = kv_base + Int32(self.cfg.kv_tile_n)
-        if seqlen_k < kv_end:
+        if kv_tile_needs_right_mask(kv_base, Int32(self.cfg.kv_tile_n), seqlen_k):
             masked_values = cutlass.vector.full(
                 [tmem_x],
                 self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
@@ -5488,10 +5770,28 @@ class TmemSPResource(MemoryResource):
         window_start: Int32,
         window_end: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Mask S using inclusive per-row VariableWindow bounds."""
+        """Mask S using inclusive per-row VariableWindow bounds.
+
+        Only LOOP tiles outside the warp's cached unmasked range are masked.
+        """
+        s_data = self._load_s_chunks(stage_info)
+        if self._loop_tile_needs_mask(stage_info):
+            s_data = self._mask_variable_window_chunks(
+                stage_info, s_data, window_start, window_end
+            )
+        return self._reduce_row_max(s_data, row_max)
+
+    @cute.jit
+    def _mask_variable_window_chunks(
+        self,
+        stage_info: StageInfo,
+        s_data: SoftmaxChunks,
+        window_start: Int32,
+        window_end: Int32,
+    ) -> SoftmaxChunks:
+        """Mask keys outside the inclusive per-row VariableWindow bounds."""
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
-        s_data = self._load_s_chunks(stage_info)
         kv_tile_base = stage_info.loop_offset * self.cfg.kv_tile_n
         tile_n = self.cfg.qk_mma_tiler[1]
         left_oob = cute.math.min(
@@ -5529,7 +5829,7 @@ class TmemSPResource(MemoryResource):
             s_data[chunk_idx] = cutlass.Vector.from_elements(
                 tuple(masked_scores), self.cfg.qk_acc_dtype
             )
-        return self._reduce_row_max(s_data, row_max)
+        return s_data
 
     @cute.jit
     def _mask_window_chunks(
@@ -5612,46 +5912,24 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Apply the bottom-right-aligned sliding-window left mask."""
-        num_softmax_warps = 4
-        warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
-        tmem_row_id = warp_id_in_sg * cute.arch.WARP_SIZE
-        row_in_tile = tmem_row_id + cute.arch.lane_idx()
+        """Apply the bottom-right-aligned sliding-window left mask.
 
+        Only LOOP tiles outside the warp's cached unmasked range are masked.
+        """
         s_data = self._load_s_chunks(stage_info)
-
-        seq_tile_coord, _, _ = _resolve_work_tile_coords(
-            self.cfg, stage_info.work_tile.tile_idx
-        )
-        index_q = seq_tile_coord * self.cfg.q_tile_m + row_in_tile
-        if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
-            window_bound_left = bottom_right_window_left_bound(
-                index_q,
-                q_offset,
-                self.cfg.window_size_left,
+        if self._loop_tile_needs_mask(stage_info):
+            index_q, kv_tile_start, window_bound_left = self._row_window_geometry(
+                stage_info, q_offset
             )
-            kv_tile_start = bottom_right_window_tile_start(
-                seq_coord=seq_tile_coord,
-                q_tile_m=self.cfg.q_tile_m,
-                kv_tile_n=self.cfg.kv_tile_n,
-                q_offset=q_offset,
-                window_size_left=self.cfg.window_size_left,
+            base_k = (kv_tile_start + stage_info.loop_offset) * self.cfg.kv_tile_n
+            window_end = None
+            if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
+                # Packed requests share a worst-case window span, and fixed
+                # bottom-right windows can begin at a non-aligned Q/K offset.
+                window_end = index_q + q_offset + Int32(1)
+            s_data = self._mask_window_chunks(
+                s_data, base_k, window_bound_left, window_end
             )
-        else:
-            # Exact fixed equal-length fast path: q_offset is constexpr zero.
-            window_bound_left = index_q - Int32(self.cfg.window_size_left)
-            kv_tile_start = cute.math.max(
-                Int32(0),
-                (seq_tile_coord * self.cfg.q_tile_m - self.cfg.window_size_left)
-                // self.cfg.kv_tile_n,
-            )
-        base_k = (kv_tile_start + stage_info.loop_offset) * self.cfg.kv_tile_n
-        window_end = None
-        if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
-            # Packed requests share a worst-case window span, and fixed
-            # bottom-right windows can begin at a non-aligned Q/K offset.
-            window_end = index_q + q_offset + Int32(1)
-        s_data = self._mask_window_chunks(s_data, base_k, window_bound_left, window_end)
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -5666,7 +5944,10 @@ class TmemSPResource(MemoryResource):
         """Loop stage: apply causal masking for mixed Q right-offset batches."""
         if cutlass.const_expr(self.cfg.uses_ldtm_stat):
             return self._load_s_chunks_and_reduce_row_max(
-                stage_info, row_max, causal_loop_mask=True, q_offset=q_offset
+                stage_info,
+                row_max,
+                causal_loop_mask=True,
+                causal_k_end=self._causal_k_end(stage_info, q_offset),
             )
         s_data = self._load_s_chunks(stage_info)
         s_data = self._apply_causal_mask_for_kv_tile(
@@ -5914,52 +6195,34 @@ class TmemSPResource(MemoryResource):
         Unlike the query-paired tail mask, this keeps Q0/Q1 on the same
         sequence tile; q_half selects a Q head, not a later sequence tile.
         Sliding-window tails need both bounds because the final tile can also
-        contain keys to the left of the visible window.
+        contain keys to the left of the visible window. LOOP tiles inside the
+        warp's cached unmasked range skip the mask.
         """
-        num_softmax_warps = 4
-        warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
         s_data = self._load_s_chunks(stage_info)
         if cutlass.const_expr(self.cfg.is_causal):
-            seq_tile_coord, _, _ = _resolve_work_tile_coords(
-                self.cfg, stage_info.work_tile.tile_idx
-            )
-            tmem_row_id = warp_id_in_sg * cute.arch.WARP_SIZE
-            row_in_tile = tmem_row_id + cute.arch.lane_idx()
-            index_q = seq_tile_coord * self.cfg.q_tile_m + row_in_tile
-            if cutlass.const_expr(self.cfg.window_size_left > 0):
-                if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
-                    kv_tile_start = bottom_right_window_tile_start(
-                        seq_coord=seq_tile_coord,
-                        q_tile_m=self.cfg.q_tile_m,
-                        kv_tile_n=self.cfg.kv_tile_n,
-                        q_offset=q_offset,
-                        window_size_left=self.cfg.window_size_left,
-                    )
+            needs_mask = True
+            if cutlass.const_expr(
+                section == FmhaStage.Loop and self.uses_loop_unmasked_tile_range
+            ):
+                needs_mask = self._loop_tile_needs_mask(stage_info)
+            if needs_mask:
+                index_q, kv_tile_start, window_bound_left = self._row_window_geometry(
+                    stage_info, q_offset
+                )
+                if cutlass.const_expr(section == FmhaStage.Loop):
+                    kv_tile_idx = kv_tile_start + stage_info.loop_offset
                 else:
-                    kv_tile_start = cute.math.max(
-                        Int32(0),
-                        (seq_tile_coord * self.cfg.q_tile_m - self.cfg.window_size_left)
-                        // self.cfg.kv_tile_n,
-                    )
+                    # Tail uses the first tile after the loop domain.
+                    kv_tile_idx = kv_tile_start + stage_info.loop_end
+                window_start = None
                 if cutlass.const_expr(self.needs_window_tail_left_mask):
-                    window_bound_left = bottom_right_window_left_bound(
-                        index_q,
-                        q_offset,
-                        self.cfg.window_size_left,
-                    )
-            else:
-                kv_tile_start = Int32(0)
-            if cutlass.const_expr(section == FmhaStage.Loop):
-                base_k = (kv_tile_start + stage_info.loop_offset) * self.cfg.kv_tile_n
-            else:
-                # Tail uses the first tile after the loop domain.
-                base_k = (kv_tile_start + stage_info.loop_end) * self.cfg.kv_tile_n
-            window_start = None
-            if cutlass.const_expr(self.needs_window_tail_left_mask):
-                window_start = window_bound_left
-            s_data = self._mask_window_chunks(
-                s_data, base_k, window_start, index_q + q_offset + Int32(1)
-            )
+                    window_start = window_bound_left
+                s_data = self._mask_window_chunks(
+                    s_data,
+                    kv_tile_idx * self.cfg.kv_tile_n,
+                    window_start,
+                    index_q + q_offset + Int32(1),
+                )
         return self._reduce_row_max(s_data, row_max)
 
     @cute.jit

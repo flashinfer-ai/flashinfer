@@ -4662,6 +4662,7 @@ def test_fp8_gqa_pin_route_takes_long_static_plans_only():
             loader.persistent_stage(**kwargs)
 
 
+@requires_hopper
 def test_fp8_gqa_queue_kernel_matches_the_static_kernel_bit_exact(
     monkeypatch, record_property
 ):

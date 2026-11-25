@@ -3739,19 +3739,31 @@ def test_topk_clusters_exact_variable_seq_lens(batch_size, seq_len, k, dtype):
         assert row_accuracy >= acc, f"Row {i} accuracy {row_accuracy:.4f} < {acc}"
 
 
-@pytest.mark.parametrize("variant", ["exact", "page_table", "ragged"])
-def test_topk_clusters_pdl_waits_before_reading(variant):
+@pytest.mark.parametrize(
+    "variant,seq_len",
+    [
+        pytest.param("exact", 1000, id="exact"),
+        pytest.param("page_table", 1000, id="page_table"),
+        pytest.param("ragged", 1000, id="ragged"),
+        pytest.param("page_table", 4096, id="page_table_long_row"),
+        pytest.param("ragged", 4096, id="ragged_long_row"),
+    ],
+)
+def test_topk_clusters_pdl_waits_before_reading(variant, seq_len):
     _require_sm100_or_sm103()
     torch.manual_seed(42)
-    batch_size, top_k, seq_len = 4, 2048, 1000
+    batch_size, top_k = 4, 2048
     width = seq_len if variant == "exact" else 4096
     logits = torch.randn(batch_size, width, device="cuda")
+    if seq_len > top_k:
+        # Unique scores give the long-row selection an unambiguous reference.
+        logits = torch.randperm(width, device="cuda").float().repeat(batch_size, 1)
     seq_lens = torch.full((batch_size,), seq_len, device="cuda", dtype=torch.int32)
     page_table = torch.arange(
         batch_size * width, device="cuda", dtype=torch.int32
     ).view(batch_size, width)
     offsets = torch.arange(batch_size, device="cuda", dtype=torch.int32) * width
-    # Each row is shorter than top_k, so the kernel takes its copy-through path.
+    # Keep the original copy-through cases; long rows must select top_k instead.
     if variant == "exact":
         late_input, late_value, run = (
             logits,
@@ -3774,19 +3786,30 @@ def test_topk_clusters_pdl_waits_before_reading(variant):
         )
     else:
         late_input, late_value, run = (
-            offsets,
-            0,
+            seq_lens if seq_len > top_k else offsets,
+            seq_len if seq_len > top_k else 0,
             lambda: flashinfer.topk.topk_clusters_ragged_transform(
                 logits, seq_lens, offsets, top_k, pdl=True
             ),
         )
     expected = run()
+    if seq_len > top_k:
+        ref_indices = torch.topk(logits, top_k, dim=-1).indices
+        if variant == "page_table":
+            expected = page_table.gather(1, ref_indices)
+        else:
+            expected = ref_indices.to(offsets.dtype) + offsets[:, None]
+        # The cluster kernel does not promise sorted output.
+        expected = expected.sort(dim=-1).values
 
     # Row 0's first input is what the previous kernel is still producing.
     # No other kernel may run between that producer and the top-k kernel.
+    # For long rows, stale seq_lens=1 would incorrectly select copy-through.
     late_input.view(-1)[0] = 1
     late_store(late_input, late_value)
     out = run()
+    if seq_len > top_k:
+        out = out.sort(dim=-1).values
 
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
