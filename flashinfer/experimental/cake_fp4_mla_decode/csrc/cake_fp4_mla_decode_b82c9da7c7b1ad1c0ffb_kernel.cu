@@ -304,7 +304,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(480) __cluster_dims__(2,1,1) void
-kernel_cake_fp4_mla_decode_0180693993c8dcd16427(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
+kernel_cake_fp4_mla_decode_b82c9da7c7b1ad1c0ffb(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

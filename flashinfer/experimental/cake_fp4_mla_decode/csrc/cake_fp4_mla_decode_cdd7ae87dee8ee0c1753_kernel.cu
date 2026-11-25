@@ -304,7 +304,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(480) __cluster_dims__(2,1,1) void
-kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
+kernel_cake_fp4_mla_decode_cdd7ae87dee8ee0c1753(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1234,6 +1234,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 for (int _lr = 1; _lr < 8; _lr++) {
                     page_max = max_noftz(page_max, g[_lr]);
                 }
+#if __CUDA_ARCH__ == 1030
+#else
                 if (grp == 0) {
                     if (jj > 0) {
                         int _parity_m_ready = (int)((unsigned int)jj % 2) ^ 1;
@@ -1247,18 +1249,14 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 }
                 int move = page_max > -CUDART_INF_F && (m == -CUDART_INF_F || page_max > m + 3.0f);
                 int rescale = move != 0 && m > -CUDART_INF_F;
-#if __CUDA_ARCH__ == 1030
-                float _exp2_27 = approx_exp2(m - page_max);
-                float alpha = ((rescale != 0) ? _exp2_27 : 1.0f);
-#else
                 float _exp2_23 = approx_exp2(m - page_max);
                 float alpha = ((rescale != 0) ? _exp2_23 : 1.0f);
-#endif
                 if (move != 0) {
                     m = page_max;
                 }
                 xch_m[grp * 128 + mine] = m;
                 mbarrier_arrive(m_ready_addr + (grp) * 8);
+#endif
                 unsigned int codes[8];
                 unsigned int sf_pair[2];
                 float sf_fit[4];
@@ -1269,8 +1267,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 float qv[4];
                 float qq[4];
                 g_safe[0] = ((g[0] > -CUDART_INF_F) ? g[0] : 0.0f);
-                const float2 _fma_b2_28 = {c_log2, c_log2};
-                const float2 _fma_c2_29 = {-g_safe[0], -g_safe[0]};
+                const float2 _fma_b2_27 = {c_log2, c_log2};
+                const float2 _fma_c2_28 = {-g_safe[0], -g_safe[0]};
 #else
                 int g_live_0 = g[0] > -CUDART_INF_F;
                 float g_safe_0 = ((g_live_0 != 0) ? g[0] : 0.0f);
@@ -1280,7 +1278,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _lf = 0; _lf < 8; _lf++)
 #if __CUDA_ARCH__ == 1030
-                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_28, _fma_c2_29);
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_27, _fma_c2_28);
 #else
                     fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_24, _fma_c2_25);
 #endif
@@ -1300,7 +1298,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8)[_la], reinterpret_cast<const float2*>((t8 + 2))[_la]);
                 b_sums[0] = t8[0] + t8[1];
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_30 = {6.0f, 6.0f};
+                const float2 _scale2_29 = {6.0f, 6.0f};
 #else
                 float _exp2_26 = approx_exp2(g_safe_0 - m);
                 b_weights[0] = ((g_live_0 != 0) ? _exp2_26 : 0.0f);
@@ -1313,7 +1311,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_30);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_29);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_28);
 #endif
@@ -1322,7 +1320,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 float q_b[16];
                 unsigned int qn[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_31;
+                uint32_t _cvt_f16x2_e2m1x2_30;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_29;
 #endif
@@ -1330,8 +1328,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_31) : "r"((uint32_t)(codes[0] >> 0)));
-                qn[0] = _cvt_f16x2_e2m1x2_31;
+                : "=r"(_cvt_f16x2_e2m1x2_30) : "r"((uint32_t)(codes[0] >> 0)));
+                qn[0] = _cvt_f16x2_e2m1x2_30;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_29) : "r"((uint32_t)(codes[0] >> 0)));
                 qn[0] = _cvt_f16x2_e2m1x2_29;
@@ -1348,7 +1346,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b[0] = qw_0[0];
                 q_b[1] = qw_0[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_32;
+                uint32_t _cvt_f16x2_e2m1x2_31;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_30;
 #endif
@@ -1356,8 +1354,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_32) : "r"((uint32_t)(codes[0] >> 8)));
-                qn[1] = _cvt_f16x2_e2m1x2_32;
+                : "=r"(_cvt_f16x2_e2m1x2_31) : "r"((uint32_t)(codes[0] >> 8)));
+                qn[1] = _cvt_f16x2_e2m1x2_31;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_30) : "r"((uint32_t)(codes[0] >> 8)));
                 qn[1] = _cvt_f16x2_e2m1x2_30;
@@ -1374,7 +1372,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b[2] = qw_1[0];
                 q_b[3] = qw_1[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_33;
+                uint32_t _cvt_f16x2_e2m1x2_32;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_31;
 #endif
@@ -1382,8 +1380,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[0] >> 16)));
-                qn[2] = _cvt_f16x2_e2m1x2_33;
+                : "=r"(_cvt_f16x2_e2m1x2_32) : "r"((uint32_t)(codes[0] >> 16)));
+                qn[2] = _cvt_f16x2_e2m1x2_32;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_31) : "r"((uint32_t)(codes[0] >> 16)));
                 qn[2] = _cvt_f16x2_e2m1x2_31;
@@ -1400,7 +1398,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b[4] = qw_2[0];
                 q_b[5] = qw_2[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_34;
+                uint32_t _cvt_f16x2_e2m1x2_33;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_32;
 #endif
@@ -1408,8 +1406,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[0] >> 24)));
-                qn[3] = _cvt_f16x2_e2m1x2_34;
+                : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[0] >> 24)));
+                qn[3] = _cvt_f16x2_e2m1x2_33;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_32) : "r"((uint32_t)(codes[0] >> 24)));
                 qn[3] = _cvt_f16x2_e2m1x2_32;
@@ -1426,7 +1424,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b[6] = qw_3[0];
                 q_b[7] = qw_3[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_35;
+                uint32_t _cvt_f16x2_e2m1x2_34;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_33;
 #endif
@@ -1434,8 +1432,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[1] >> 0)));
-                qn[4] = _cvt_f16x2_e2m1x2_35;
+                : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[1] >> 0)));
+                qn[4] = _cvt_f16x2_e2m1x2_34;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[1] >> 0)));
                 qn[4] = _cvt_f16x2_e2m1x2_33;
@@ -1452,7 +1450,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b[8] = qw_4[0];
                 q_b[9] = qw_4[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_36;
+                uint32_t _cvt_f16x2_e2m1x2_35;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_34;
 #endif
@@ -1460,8 +1458,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[1] >> 8)));
-                qn[5] = _cvt_f16x2_e2m1x2_36;
+                : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[1] >> 8)));
+                qn[5] = _cvt_f16x2_e2m1x2_35;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[1] >> 8)));
                 qn[5] = _cvt_f16x2_e2m1x2_34;
@@ -1478,7 +1476,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b[10] = qw_5[0];
                 q_b[11] = qw_5[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_37;
+                uint32_t _cvt_f16x2_e2m1x2_36;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_35;
 #endif
@@ -1486,8 +1484,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_37) : "r"((uint32_t)(codes[1] >> 16)));
-                qn[6] = _cvt_f16x2_e2m1x2_37;
+                : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[1] >> 16)));
+                qn[6] = _cvt_f16x2_e2m1x2_36;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[1] >> 16)));
                 qn[6] = _cvt_f16x2_e2m1x2_35;
@@ -1504,7 +1502,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b[12] = qw_6[0];
                 q_b[13] = qw_6[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_38;
+                uint32_t _cvt_f16x2_e2m1x2_37;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_36;
 #endif
@@ -1512,8 +1510,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_38) : "r"((uint32_t)(codes[1] >> 24)));
-                qn[7] = _cvt_f16x2_e2m1x2_38;
+                : "=r"(_cvt_f16x2_e2m1x2_37) : "r"((uint32_t)(codes[1] >> 24)));
+                qn[7] = _cvt_f16x2_e2m1x2_37;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[1] >> 24)));
                 qn[7] = _cvt_f16x2_e2m1x2_36;
@@ -1574,23 +1572,21 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 qq[0] = w[0] + w[1];
 #if __CUDA_ARCH__ == 1030
                 g_safe[1] = ((g[1] > -CUDART_INF_F) ? g[1] : 0.0f);
-                const float2 _fma_b2_39 = {c_log2, c_log2};
-                const float2 _fma_c2_40 = {-g_safe[1], -g_safe[1]};
 #else
                 float _rcp_37 = approx_rcp(qq[0]);
                 sf_fit[0] = ((g_live_0 != 0 && qq[0] > 0.0f) ? sf_ex_0 * qv[0] * _rcp_37 : 0.0f);
                 int g_live_1 = g[1] > -CUDART_INF_F;
                 float g_safe_1 = ((g_live_1 != 0) ? g[1] : 0.0f);
+#endif
                 const float2 _fma_b2_38 = {c_log2, c_log2};
+#if __CUDA_ARCH__ == 1030
+                const float2 _fma_c2_39 = {-g_safe[1], -g_safe[1]};
+#else
                 const float2 _fma_c2_39 = {-g_safe_1, -g_safe_1};
 #endif
                 #pragma unroll
                 for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_39, _fma_c2_40);
-#else
                     fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_38, _fma_c2_39);
-#endif
                 #pragma unroll
                 for (int _le = 0; _le < 16; _le++) {
                     s_vals[_le + 16] = approx_exp2(s_vals[_le + 16]);
@@ -1607,7 +1603,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_1)[_la], reinterpret_cast<const float2*>((t8_1 + 2))[_la]);
                 b_sums[1] = t8_1[0] + t8_1[1];
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_41 = {6.0f, 6.0f};
+                const float2 _scale2_40 = {6.0f, 6.0f};
 #else
                 float _exp2_40 = approx_exp2(g_safe_1 - m);
                 b_weights[1] = ((g_live_1 != 0) ? _exp2_40 : 0.0f);
@@ -1620,7 +1616,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_41);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_40);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_42);
 #endif
@@ -1629,7 +1625,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 float q_b_0[16];
                 unsigned int qn_0[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_42;
+                uint32_t _cvt_f16x2_e2m1x2_41;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_43;
 #endif
@@ -1637,8 +1633,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_42) : "r"((uint32_t)(codes[2] >> 0)));
-                qn_0[0] = _cvt_f16x2_e2m1x2_42;
+                : "=r"(_cvt_f16x2_e2m1x2_41) : "r"((uint32_t)(codes[2] >> 0)));
+                qn_0[0] = _cvt_f16x2_e2m1x2_41;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_43) : "r"((uint32_t)(codes[2] >> 0)));
                 qn_0[0] = _cvt_f16x2_e2m1x2_43;
@@ -1655,7 +1651,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_0[0] = qw_8[0];
                 q_b_0[1] = qw_8[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_43;
+                uint32_t _cvt_f16x2_e2m1x2_42;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_44;
 #endif
@@ -1663,8 +1659,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_43) : "r"((uint32_t)(codes[2] >> 8)));
-                qn_0[1] = _cvt_f16x2_e2m1x2_43;
+                : "=r"(_cvt_f16x2_e2m1x2_42) : "r"((uint32_t)(codes[2] >> 8)));
+                qn_0[1] = _cvt_f16x2_e2m1x2_42;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_44) : "r"((uint32_t)(codes[2] >> 8)));
                 qn_0[1] = _cvt_f16x2_e2m1x2_44;
@@ -1681,7 +1677,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_0[2] = qw_9[0];
                 q_b_0[3] = qw_9[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_44;
+                uint32_t _cvt_f16x2_e2m1x2_43;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_45;
 #endif
@@ -1689,8 +1685,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_44) : "r"((uint32_t)(codes[2] >> 16)));
-                qn_0[2] = _cvt_f16x2_e2m1x2_44;
+                : "=r"(_cvt_f16x2_e2m1x2_43) : "r"((uint32_t)(codes[2] >> 16)));
+                qn_0[2] = _cvt_f16x2_e2m1x2_43;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_45) : "r"((uint32_t)(codes[2] >> 16)));
                 qn_0[2] = _cvt_f16x2_e2m1x2_45;
@@ -1707,7 +1703,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_0[4] = qw_10[0];
                 q_b_0[5] = qw_10[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_45;
+                uint32_t _cvt_f16x2_e2m1x2_44;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_46;
 #endif
@@ -1715,8 +1711,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_45) : "r"((uint32_t)(codes[2] >> 24)));
-                qn_0[3] = _cvt_f16x2_e2m1x2_45;
+                : "=r"(_cvt_f16x2_e2m1x2_44) : "r"((uint32_t)(codes[2] >> 24)));
+                qn_0[3] = _cvt_f16x2_e2m1x2_44;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_46) : "r"((uint32_t)(codes[2] >> 24)));
                 qn_0[3] = _cvt_f16x2_e2m1x2_46;
@@ -1733,7 +1729,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_0[6] = qw_11[0];
                 q_b_0[7] = qw_11[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_46;
+                uint32_t _cvt_f16x2_e2m1x2_45;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_47;
 #endif
@@ -1741,8 +1737,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_46) : "r"((uint32_t)(codes[3] >> 0)));
-                qn_0[4] = _cvt_f16x2_e2m1x2_46;
+                : "=r"(_cvt_f16x2_e2m1x2_45) : "r"((uint32_t)(codes[3] >> 0)));
+                qn_0[4] = _cvt_f16x2_e2m1x2_45;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[3] >> 0)));
                 qn_0[4] = _cvt_f16x2_e2m1x2_47;
@@ -1759,7 +1755,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_0[8] = qw_12[0];
                 q_b_0[9] = qw_12[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_47;
+                uint32_t _cvt_f16x2_e2m1x2_46;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_48;
 #endif
@@ -1767,8 +1763,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[3] >> 8)));
-                qn_0[5] = _cvt_f16x2_e2m1x2_47;
+                : "=r"(_cvt_f16x2_e2m1x2_46) : "r"((uint32_t)(codes[3] >> 8)));
+                qn_0[5] = _cvt_f16x2_e2m1x2_46;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[3] >> 8)));
                 qn_0[5] = _cvt_f16x2_e2m1x2_48;
@@ -1785,7 +1781,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_0[10] = qw_13[0];
                 q_b_0[11] = qw_13[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_48;
+                uint32_t _cvt_f16x2_e2m1x2_47;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_49;
 #endif
@@ -1793,8 +1789,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[3] >> 16)));
-                qn_0[6] = _cvt_f16x2_e2m1x2_48;
+                : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[3] >> 16)));
+                qn_0[6] = _cvt_f16x2_e2m1x2_47;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[3] >> 16)));
                 qn_0[6] = _cvt_f16x2_e2m1x2_49;
@@ -1811,7 +1807,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_0[12] = qw_14[0];
                 q_b_0[13] = qw_14[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_49;
+                uint32_t _cvt_f16x2_e2m1x2_48;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_50;
 #endif
@@ -1819,8 +1815,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[3] >> 24)));
-                qn_0[7] = _cvt_f16x2_e2m1x2_49;
+                : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[3] >> 24)));
+                qn_0[7] = _cvt_f16x2_e2m1x2_48;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_50) : "r"((uint32_t)(codes[3] >> 24)));
                 qn_0[7] = _cvt_f16x2_e2m1x2_50;
@@ -1885,8 +1881,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
 #if __CUDA_ARCH__ == 1030
                 qq[1] = w_0[0] + w_0[1];
                 g_safe[2] = ((g[2] > -CUDART_INF_F) ? g[2] : 0.0f);
-                const float2 _fma_b2_50 = {c_log2, c_log2};
-                const float2 _fma_c2_51 = {-g_safe[2], -g_safe[2]};
+                const float2 _fma_b2_49 = {c_log2, c_log2};
+                const float2 _fma_c2_50 = {-g_safe[2], -g_safe[2]};
 #else
                 qq_0[1] = w_0[0] + w_0[1];
                 float _rcp_51 = approx_rcp(qq_0[1]);
@@ -1899,7 +1895,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _lf = 0; _lf < 8; _lf++)
 #if __CUDA_ARCH__ == 1030
-                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_50, _fma_c2_51);
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_49, _fma_c2_50);
 #else
                     fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_52, _fma_c2_53);
 #endif
@@ -1919,7 +1915,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_3)[_la], reinterpret_cast<const float2*>((t8_3 + 2))[_la]);
                 b_sums[2] = t8_3[0] + t8_3[1];
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_52 = {6.0f, 6.0f};
+                const float2 _scale2_51 = {6.0f, 6.0f};
 #else
                 float _exp2_54 = approx_exp2(g_safe_2 - m);
                 b_weights[2] = ((g_live_2 != 0) ? _exp2_54 : 0.0f);
@@ -1932,7 +1928,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_52);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_51);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_56);
 #endif
@@ -1941,7 +1937,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 float q_b_1[16];
                 unsigned int qn_1[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_53;
+                uint32_t _cvt_f16x2_e2m1x2_52;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_57;
 #endif
@@ -1949,8 +1945,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_53) : "r"((uint32_t)(codes[4] >> 0)));
-                qn_1[0] = _cvt_f16x2_e2m1x2_53;
+                : "=r"(_cvt_f16x2_e2m1x2_52) : "r"((uint32_t)(codes[4] >> 0)));
+                qn_1[0] = _cvt_f16x2_e2m1x2_52;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[4] >> 0)));
                 qn_1[0] = _cvt_f16x2_e2m1x2_57;
@@ -1967,7 +1963,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_1[0] = qw_16[0];
                 q_b_1[1] = qw_16[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_54;
+                uint32_t _cvt_f16x2_e2m1x2_53;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_58;
 #endif
@@ -1975,8 +1971,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_54) : "r"((uint32_t)(codes[4] >> 8)));
-                qn_1[1] = _cvt_f16x2_e2m1x2_54;
+                : "=r"(_cvt_f16x2_e2m1x2_53) : "r"((uint32_t)(codes[4] >> 8)));
+                qn_1[1] = _cvt_f16x2_e2m1x2_53;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[4] >> 8)));
                 qn_1[1] = _cvt_f16x2_e2m1x2_58;
@@ -1993,7 +1989,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_1[2] = qw_17[0];
                 q_b_1[3] = qw_17[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_55;
+                uint32_t _cvt_f16x2_e2m1x2_54;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_59;
 #endif
@@ -2001,8 +1997,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_55) : "r"((uint32_t)(codes[4] >> 16)));
-                qn_1[2] = _cvt_f16x2_e2m1x2_55;
+                : "=r"(_cvt_f16x2_e2m1x2_54) : "r"((uint32_t)(codes[4] >> 16)));
+                qn_1[2] = _cvt_f16x2_e2m1x2_54;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_59) : "r"((uint32_t)(codes[4] >> 16)));
                 qn_1[2] = _cvt_f16x2_e2m1x2_59;
@@ -2019,7 +2015,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_1[4] = qw_18[0];
                 q_b_1[5] = qw_18[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_56;
+                uint32_t _cvt_f16x2_e2m1x2_55;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_60;
 #endif
@@ -2027,8 +2023,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_56) : "r"((uint32_t)(codes[4] >> 24)));
-                qn_1[3] = _cvt_f16x2_e2m1x2_56;
+                : "=r"(_cvt_f16x2_e2m1x2_55) : "r"((uint32_t)(codes[4] >> 24)));
+                qn_1[3] = _cvt_f16x2_e2m1x2_55;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_60) : "r"((uint32_t)(codes[4] >> 24)));
                 qn_1[3] = _cvt_f16x2_e2m1x2_60;
@@ -2045,7 +2041,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_1[6] = qw_19[0];
                 q_b_1[7] = qw_19[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_57;
+                uint32_t _cvt_f16x2_e2m1x2_56;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_61;
 #endif
@@ -2053,8 +2049,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[5] >> 0)));
-                qn_1[4] = _cvt_f16x2_e2m1x2_57;
+                : "=r"(_cvt_f16x2_e2m1x2_56) : "r"((uint32_t)(codes[5] >> 0)));
+                qn_1[4] = _cvt_f16x2_e2m1x2_56;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_61) : "r"((uint32_t)(codes[5] >> 0)));
                 qn_1[4] = _cvt_f16x2_e2m1x2_61;
@@ -2071,7 +2067,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_1[8] = qw_20[0];
                 q_b_1[9] = qw_20[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_58;
+                uint32_t _cvt_f16x2_e2m1x2_57;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_62;
 #endif
@@ -2079,8 +2075,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[5] >> 8)));
-                qn_1[5] = _cvt_f16x2_e2m1x2_58;
+                : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[5] >> 8)));
+                qn_1[5] = _cvt_f16x2_e2m1x2_57;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_62) : "r"((uint32_t)(codes[5] >> 8)));
                 qn_1[5] = _cvt_f16x2_e2m1x2_62;
@@ -2097,7 +2093,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_1[10] = qw_21[0];
                 q_b_1[11] = qw_21[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_59;
+                uint32_t _cvt_f16x2_e2m1x2_58;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_63;
 #endif
@@ -2105,8 +2101,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_59) : "r"((uint32_t)(codes[5] >> 16)));
-                qn_1[6] = _cvt_f16x2_e2m1x2_59;
+                : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[5] >> 16)));
+                qn_1[6] = _cvt_f16x2_e2m1x2_58;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_63) : "r"((uint32_t)(codes[5] >> 16)));
                 qn_1[6] = _cvt_f16x2_e2m1x2_63;
@@ -2123,7 +2119,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_1[12] = qw_22[0];
                 q_b_1[13] = qw_22[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_60;
+                uint32_t _cvt_f16x2_e2m1x2_59;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_64;
 #endif
@@ -2131,8 +2127,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_60) : "r"((uint32_t)(codes[5] >> 24)));
-                qn_1[7] = _cvt_f16x2_e2m1x2_60;
+                : "=r"(_cvt_f16x2_e2m1x2_59) : "r"((uint32_t)(codes[5] >> 24)));
+                qn_1[7] = _cvt_f16x2_e2m1x2_59;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[5] >> 24)));
                 qn_1[7] = _cvt_f16x2_e2m1x2_64;
@@ -2197,8 +2193,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
 #if __CUDA_ARCH__ == 1030
                 qq[2] = w_1[0] + w_1[1];
                 g_safe[3] = ((g[3] > -CUDART_INF_F) ? g[3] : 0.0f);
-                const float2 _fma_b2_61 = {c_log2, c_log2};
-                const float2 _fma_c2_62 = {-g_safe[3], -g_safe[3]};
+                const float2 _fma_b2_60 = {c_log2, c_log2};
+                const float2 _fma_c2_61 = {-g_safe[3], -g_safe[3]};
 #else
                 qq_1[2] = w_1[0] + w_1[1];
                 float _rcp_65 = approx_rcp(qq_1[2]);
@@ -2211,7 +2207,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _lf = 0; _lf < 8; _lf++)
 #if __CUDA_ARCH__ == 1030
-                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_61, _fma_c2_62);
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_60, _fma_c2_61);
 #else
                     fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_66, _fma_c2_67);
 #endif
@@ -2231,7 +2227,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_5)[_la], reinterpret_cast<const float2*>((t8_5 + 2))[_la]);
                 b_sums[3] = t8_5[0] + t8_5[1];
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_63 = {6.0f, 6.0f};
+                const float2 _scale2_62 = {6.0f, 6.0f};
 #else
                 float _exp2_68 = approx_exp2(g_safe_3 - m);
                 b_weights[3] = ((g_live_3 != 0) ? _exp2_68 : 0.0f);
@@ -2244,7 +2240,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_63);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_62);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_70);
 #endif
@@ -2253,7 +2249,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 float q_b_2[16];
                 unsigned int qn_2[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_64;
+                uint32_t _cvt_f16x2_e2m1x2_63;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_71;
 #endif
@@ -2261,8 +2257,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[6] >> 0)));
-                qn_2[0] = _cvt_f16x2_e2m1x2_64;
+                : "=r"(_cvt_f16x2_e2m1x2_63) : "r"((uint32_t)(codes[6] >> 0)));
+                qn_2[0] = _cvt_f16x2_e2m1x2_63;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[6] >> 0)));
                 qn_2[0] = _cvt_f16x2_e2m1x2_71;
@@ -2279,7 +2275,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_2[0] = qw_24[0];
                 q_b_2[1] = qw_24[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_65;
+                uint32_t _cvt_f16x2_e2m1x2_64;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_72;
 #endif
@@ -2287,8 +2283,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_65) : "r"((uint32_t)(codes[6] >> 8)));
-                qn_2[1] = _cvt_f16x2_e2m1x2_65;
+                : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[6] >> 8)));
+                qn_2[1] = _cvt_f16x2_e2m1x2_64;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_72) : "r"((uint32_t)(codes[6] >> 8)));
                 qn_2[1] = _cvt_f16x2_e2m1x2_72;
@@ -2305,7 +2301,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_2[2] = qw_25[0];
                 q_b_2[3] = qw_25[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_66;
+                uint32_t _cvt_f16x2_e2m1x2_65;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_73;
 #endif
@@ -2313,8 +2309,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_66) : "r"((uint32_t)(codes[6] >> 16)));
-                qn_2[2] = _cvt_f16x2_e2m1x2_66;
+                : "=r"(_cvt_f16x2_e2m1x2_65) : "r"((uint32_t)(codes[6] >> 16)));
+                qn_2[2] = _cvt_f16x2_e2m1x2_65;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_73) : "r"((uint32_t)(codes[6] >> 16)));
                 qn_2[2] = _cvt_f16x2_e2m1x2_73;
@@ -2331,7 +2327,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_2[4] = qw_26[0];
                 q_b_2[5] = qw_26[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_67;
+                uint32_t _cvt_f16x2_e2m1x2_66;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_74;
 #endif
@@ -2339,8 +2335,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_67) : "r"((uint32_t)(codes[6] >> 24)));
-                qn_2[3] = _cvt_f16x2_e2m1x2_67;
+                : "=r"(_cvt_f16x2_e2m1x2_66) : "r"((uint32_t)(codes[6] >> 24)));
+                qn_2[3] = _cvt_f16x2_e2m1x2_66;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_74) : "r"((uint32_t)(codes[6] >> 24)));
                 qn_2[3] = _cvt_f16x2_e2m1x2_74;
@@ -2357,7 +2353,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_2[6] = qw_27[0];
                 q_b_2[7] = qw_27[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_68;
+                uint32_t _cvt_f16x2_e2m1x2_67;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_75;
 #endif
@@ -2365,8 +2361,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_68) : "r"((uint32_t)(codes[7] >> 0)));
-                qn_2[4] = _cvt_f16x2_e2m1x2_68;
+                : "=r"(_cvt_f16x2_e2m1x2_67) : "r"((uint32_t)(codes[7] >> 0)));
+                qn_2[4] = _cvt_f16x2_e2m1x2_67;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_75) : "r"((uint32_t)(codes[7] >> 0)));
                 qn_2[4] = _cvt_f16x2_e2m1x2_75;
@@ -2383,7 +2379,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_2[8] = qw_28[0];
                 q_b_2[9] = qw_28[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_69;
+                uint32_t _cvt_f16x2_e2m1x2_68;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_76;
 #endif
@@ -2391,8 +2387,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_69) : "r"((uint32_t)(codes[7] >> 8)));
-                qn_2[5] = _cvt_f16x2_e2m1x2_69;
+                : "=r"(_cvt_f16x2_e2m1x2_68) : "r"((uint32_t)(codes[7] >> 8)));
+                qn_2[5] = _cvt_f16x2_e2m1x2_68;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_76) : "r"((uint32_t)(codes[7] >> 8)));
                 qn_2[5] = _cvt_f16x2_e2m1x2_76;
@@ -2409,7 +2405,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_2[10] = qw_29[0];
                 q_b_2[11] = qw_29[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_70;
+                uint32_t _cvt_f16x2_e2m1x2_69;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_77;
 #endif
@@ -2417,8 +2413,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_70) : "r"((uint32_t)(codes[7] >> 16)));
-                qn_2[6] = _cvt_f16x2_e2m1x2_70;
+                : "=r"(_cvt_f16x2_e2m1x2_69) : "r"((uint32_t)(codes[7] >> 16)));
+                qn_2[6] = _cvt_f16x2_e2m1x2_69;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_77) : "r"((uint32_t)(codes[7] >> 16)));
                 qn_2[6] = _cvt_f16x2_e2m1x2_77;
@@ -2435,7 +2431,7 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 q_b_2[12] = qw_30[0];
                 q_b_2[13] = qw_30[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_71;
+                uint32_t _cvt_f16x2_e2m1x2_70;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_78;
 #endif
@@ -2443,8 +2439,8 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[7] >> 24)));
-                qn_2[7] = _cvt_f16x2_e2m1x2_71;
+                : "=r"(_cvt_f16x2_e2m1x2_70) : "r"((uint32_t)(codes[7] >> 24)));
+                qn_2[7] = _cvt_f16x2_e2m1x2_70;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_78) : "r"((uint32_t)(codes[7] >> 24)));
                 qn_2[7] = _cvt_f16x2_e2m1x2_78;
@@ -2508,6 +2504,26 @@ kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensor
                     : "=&f"(w_2[0]), "=&f"(w_2[1]) : "r"(v_18), "f"(0.0f), "f"(0.0f));
 #if __CUDA_ARCH__ == 1030
                 qq[3] = w_2[0] + w_2[1];
+                if (grp == 0) {
+                    if (jj > 0) {
+                        int _parity_m_ready = (int)((unsigned int)jj % 2) ^ 1;
+                        mbarrier_wait(m_ready_addr + 8, _parity_m_ready);
+                        m = xch_m[128 + mine];
+                    }
+                } else {
+                    int _parity_m_ready_1 = (int)((unsigned int)jj % 2);
+                    mbarrier_wait(m_ready_addr, _parity_m_ready_1);
+                    m = xch_m[mine];
+                }
+                int move = page_max > -CUDART_INF_F && (m == -CUDART_INF_F || page_max > m + 3.0f);
+                int rescale = move != 0 && m > -CUDART_INF_F;
+                float _exp2_71 = approx_exp2(m - page_max);
+                float alpha = ((rescale != 0) ? _exp2_71 : 1.0f);
+                if (move != 0) {
+                    m = page_max;
+                }
+                xch_m[grp * 128 + mine] = m;
+                mbarrier_arrive(m_ready_addr + (grp) * 8);
                 float d_w[4];
                 const float2 _sub2_72 = {m, m};
                 #pragma unroll

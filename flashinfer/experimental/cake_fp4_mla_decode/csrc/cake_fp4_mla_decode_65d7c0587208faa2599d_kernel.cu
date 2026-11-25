@@ -293,7 +293,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(480) __cluster_dims__(2,1,1) void
-kernel_cake_fp4_mla_decode_f8293113b184446b2322(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
+kernel_cake_fp4_mla_decode_65d7c0587208faa2599d(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -5076,71 +5076,122 @@ kernel_cake_fp4_mla_decode_f8293113b184446b2322(const __grid_constant__ CUtensor
             int n_last_l = my_n_3 - 1;
             int pid = page_table[b_i_3 * page_stride + my_start_3];
             int phys = ((pid < 0) ? 0 : pid) + page_offset;
+#if __CUDA_ARCH__ == 1030
+            int page_n = phys;
+            if (my_n_3 > 1) {
+                int pid_0 = page_table[b_i_3 * page_stride + (my_start_3 + 1)];
+                int phys_0 = ((pid_0 < 0) ? 0 : pid_0) + page_offset;
+                page_n = phys_0;
+            }
+            int pid_1 = page_table[b_i_3 * page_stride + my_start_3];
+            int phys_1 = ((pid_1 < 0) ? 0 : pid_1) + page_offset;
+#else
+#endif
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_0 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_0 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_0;
                 _ivld_0 = *_ivptr_0;
                 kb_next[0 + 0] = _ivld_0.x;
                 kb_next[0 + 1] = _ivld_0.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_1 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 128 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_1 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 128 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_1;
                 _ivld_1 = *_ivptr_1;
                 kb_next[2 + 0] = _ivld_1.x;
                 kb_next[2 + 1] = _ivld_1.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_2 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 256 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_2 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 256 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_2;
                 _ivld_2 = *_ivptr_2;
                 kb_next[4 + 0] = _ivld_2.x;
                 kb_next[4 + 1] = _ivld_2.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_3 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 384 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_3 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 384 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_3;
                 _ivld_3 = *_ivptr_3;
                 kb_next[6 + 0] = _ivld_3.x;
                 kb_next[6 + 1] = _ivld_3.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_4 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 512 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_4 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 512 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_4;
                 _ivld_4 = *_ivptr_4;
                 kb_next[8 + 0] = _ivld_4.x;
                 kb_next[8 + 1] = _ivld_4.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_5 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 640 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_5 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 640 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_5;
                 _ivld_5 = *_ivptr_5;
                 kb_next[10 + 0] = _ivld_5.x;
                 kb_next[10 + 1] = _ivld_5.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_6 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 768 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_6 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 768 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_6;
                 _ivld_6 = *_ivptr_6;
                 kb_next[12 + 0] = _ivld_6.x;
                 kb_next[12 + 1] = _ivld_6.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_7 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 896 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_7 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 896 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_7;
                 _ivld_7 = *_ivptr_7;
                 kb_next[14 + 0] = _ivld_7.x;
                 kb_next[14 + 1] = _ivld_7.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_8 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 1024 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_8 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 1024 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_8;
                 _ivld_8 = *_ivptr_8;
                 kb_next[16 + 0] = _ivld_8.x;
                 kb_next[16 + 1] = _ivld_8.y;
             }
             {
+#if __CUDA_ARCH__ == 1030
+                const uint2* _ivptr_9 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 1152 + 4 * lane + 2) + 0);
+#else
                 const uint2* _ivptr_9 = reinterpret_cast<const uint2*>(kv_sf + (phys * 1280 + 1152 + 4 * lane + 2) + 0);
+#endif
                 uint2 _ivld_9;
                 _ivld_9 = *_ivptr_9;
                 kb_next[18 + 0] = _ivld_9.x;
@@ -5151,9 +5202,15 @@ kernel_cake_fp4_mla_decode_f8293113b184446b2322(const __grid_constant__ CUtensor
             unsigned int _phase_vs_empty = 1;
             #pragma unroll 1
             for (int j_2 = 0; j_2 < my_n_3; j_2++) {
+#if __CUDA_ARCH__ == 1030
+                int pid_2 = page_table[b_i_3 * page_stride + (my_start_3 + j_2)];
+                int phys_2 = ((pid_2 < 0) ? 0 : pid_2) + page_offset;
+                int page_l = phys_2;
+#else
                 int pid_0 = page_table[b_i_3 * page_stride + (my_start_3 + j_2)];
                 int phys_0 = ((pid_0 < 0) ? 0 : pid_0) + page_offset;
                 int page_l = phys_0;
+#endif
                 unsigned int kb[20];
                 kb[0] = kb_next[0];
                 kb[1] = kb_next[1];
@@ -5175,79 +5232,129 @@ kernel_cake_fp4_mla_decode_f8293113b184446b2322(const __grid_constant__ CUtensor
                 kb[17] = kb_next[17];
                 kb[18] = kb_next[18];
                 kb[19] = kb_next[19];
+#if __CUDA_ARCH__ == 1030
+#else
                 int j1 = j_2 + 1;
                 int pid_1 = page_table[b_i_3 * page_stride + (my_start_3 + ((j1 < n_last_l) ? j1 : n_last_l))];
                 int phys_1 = ((pid_1 < 0) ? 0 : pid_1) + page_offset;
+#endif
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_10 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_10 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_10;
                     _ivld_10 = *_ivptr_10;
                     kb_next[0 + 0] = _ivld_10.x;
                     kb_next[0 + 1] = _ivld_10.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_11 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 128 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_11 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 128 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_11;
                     _ivld_11 = *_ivptr_11;
                     kb_next[2 + 0] = _ivld_11.x;
                     kb_next[2 + 1] = _ivld_11.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_12 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 256 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_12 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 256 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_12;
                     _ivld_12 = *_ivptr_12;
                     kb_next[4 + 0] = _ivld_12.x;
                     kb_next[4 + 1] = _ivld_12.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_13 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 384 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_13 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 384 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_13;
                     _ivld_13 = *_ivptr_13;
                     kb_next[6 + 0] = _ivld_13.x;
                     kb_next[6 + 1] = _ivld_13.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_14 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 512 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_14 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 512 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_14;
                     _ivld_14 = *_ivptr_14;
                     kb_next[8 + 0] = _ivld_14.x;
                     kb_next[8 + 1] = _ivld_14.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_15 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 640 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_15 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 640 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_15;
                     _ivld_15 = *_ivptr_15;
                     kb_next[10 + 0] = _ivld_15.x;
                     kb_next[10 + 1] = _ivld_15.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_16 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 768 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_16 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 768 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_16;
                     _ivld_16 = *_ivptr_16;
                     kb_next[12 + 0] = _ivld_16.x;
                     kb_next[12 + 1] = _ivld_16.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_17 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 896 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_17 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 896 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_17;
                     _ivld_17 = *_ivptr_17;
                     kb_next[14 + 0] = _ivld_17.x;
                     kb_next[14 + 1] = _ivld_17.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_18 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 1024 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_18 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 1024 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_18;
                     _ivld_18 = *_ivptr_18;
                     kb_next[16 + 0] = _ivld_18.x;
                     kb_next[16 + 1] = _ivld_18.y;
                 }
                 {
+#if __CUDA_ARCH__ == 1030
+                    const uint2* _ivptr_19 = reinterpret_cast<const uint2*>(kv_sf + (page_n * 1280 + 1152 + 4 * lane + 2) + 0);
+#else
                     const uint2* _ivptr_19 = reinterpret_cast<const uint2*>(kv_sf + (phys_1 * 1280 + 1152 + 4 * lane + 2) + 0);
+#endif
                     uint2 _ivld_19;
                     _ivld_19 = *_ivptr_19;
                     kb_next[18 + 0] = _ivld_19.x;
                     kb_next[18 + 1] = _ivld_19.y;
                 }
+#if __CUDA_ARCH__ == 1030
+                int j2 = j_2 + 2;
+                int pid_3 = page_table[b_i_3 * page_stride + (my_start_3 + ((j2 < n_last_l) ? j2 : n_last_l))];
+                int phys_3 = ((pid_3 < 0) ? 0 : pid_3) + page_offset;
+                page_n = phys_3;
+#else
+#endif
                 mbarrier_wait(k_empty_addr + (k_l) * 8, _phase_k_empty);
                 if (elect_sync()) {
                     tma_3d_gmem2smem_cta2(smem_k_addr + (unsigned int)(k_l * 5 * 4096), (&kv_k), 0, cta_rank * 64, page_l, ((k_full_addr + (k_l) * 8) & 0xFEFFFFFF));

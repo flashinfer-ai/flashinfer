@@ -41,8 +41,8 @@ stem (its ``build.json`` entries are ``<library>_<arch>``), the architectures
 it is delivered for, the ``stage`` of the launch order it fills (``decode``,
 then ``merge`` when the plan has more than one split), the ``build`` keywords
 it was rendered from (the host plan picks a stage's record by them: the
-decode by ``long_rows`` and ``persistent``, the reducer by
-``warps_per_row``), its launch record, the argument
+decode by ``long_rows``, ``persistent``, ``early_exp`` and ``epi_x``, the
+reducer by ``warps_per_row``), its launch record, the argument
 plan of its ``run`` entry, the kernel-parameter -> logical-argument map, the
 grid rule :func:`launch_grid` evaluates and the workspace rule (the decode's
 split partials, which the caller owns; ``None``: no scratch).  What to compile
@@ -59,7 +59,10 @@ loader, states it.
 
 Tensor maps travel by value in the kernel parameters: the binding encodes a
 ``CUtensorMap`` from each tensor view per call, so a launch is self-contained
-and CUDA-graph capturable.
+and CUDA-graph capturable.  A library whose binding differs per architecture
+(the SM103 persistent decode without long rows stores its output through two
+more tensor maps, of ``out`` and of the split partials) compiles that
+architecture's own binding source, with the same ``run`` arguments.
 
 The derived leaves of a record (``kernel_symbol``, ``launch.block``,
 ``launch.cluster``, ``launch.cooperative``, ``launch.dynamic_smem_bytes``,
@@ -104,7 +107,7 @@ TILE_ROWS = 128
 # ``launch.use_pdl``, ``arg_plan`` and ``logical``) are rewritten by the
 # exporter from the rendered program; every other field is host plan.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_fp4_mla_decode_f8293113b184446b2322": {
+    "cake_fp4_mla_decode_65d7c0587208faa2599d": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -136,6 +139,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "build": {
+            "early_exp": True,
+            "epi_x": False,
             "long_rows": True,
             "persistent": False,
             "policy": "rnlsd",
@@ -147,8 +152,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "split_pairs",
             "tile_rows": 128,
         },
-        "kernel": "cake_fp4_mla_decode_f8293113b184446b2322",
-        "kernel_symbol": "kernel_cake_fp4_mla_decode_f8293113b184446b2322",
+        "kernel": "cake_fp4_mla_decode_65d7c0587208faa2599d",
+        "kernel_symbol": "kernel_cake_fp4_mla_decode_65d7c0587208faa2599d",
         "launch": {
             "block": (480, 1, 1),
             "cluster": (2, 1, 1),
@@ -156,7 +161,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 165888,
             "use_pdl": False,
         },
-        "library": "cake_fp4_mla_decode_f8293113b184446b2322",
+        "library": "cake_fp4_mla_decode_65d7c0587208faa2599d",
         "logical": {
             "batch": "batch",
             "kv_gs": "kv_gs",
@@ -186,7 +191,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "latent": 512,
         },
     },
-    "cake_fp4_mla_decode_0180693993c8dcd16427": {
+    "cake_fp4_mla_decode_b82c9da7c7b1ad1c0ffb": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -218,6 +223,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "build": {
+            "early_exp": True,
+            "epi_x": False,
             "long_rows": True,
             "persistent": True,
             "policy": "rnlsd",
@@ -229,8 +236,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "persistent_pairs",
             "tile_rows": 128,
         },
-        "kernel": "cake_fp4_mla_decode_0180693993c8dcd16427",
-        "kernel_symbol": "kernel_cake_fp4_mla_decode_0180693993c8dcd16427",
+        "kernel": "cake_fp4_mla_decode_b82c9da7c7b1ad1c0ffb",
+        "kernel_symbol": "kernel_cake_fp4_mla_decode_b82c9da7c7b1ad1c0ffb",
         "launch": {
             "block": (480, 1, 1),
             "cluster": (2, 1, 1),
@@ -238,7 +245,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 165888,
             "use_pdl": False,
         },
-        "library": "cake_fp4_mla_decode_0180693993c8dcd16427",
+        "library": "cake_fp4_mla_decode_b82c9da7c7b1ad1c0ffb",
         "logical": {
             "batch": "batch",
             "kv_gs": "kv_gs",
@@ -268,7 +275,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "latent": 512,
         },
     },
-    "cake_fp4_mla_decode_42a27c4a4f2cc133fe01": {
+    "cake_fp4_mla_decode_cdd7ae87dee8ee0c1753": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -300,6 +307,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "build": {
+            "early_exp": True,
+            "epi_x": False,
             "long_rows": False,
             "persistent": False,
             "policy": "rnlsd",
@@ -311,8 +320,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "split_pairs",
             "tile_rows": 128,
         },
-        "kernel": "cake_fp4_mla_decode_42a27c4a4f2cc133fe01",
-        "kernel_symbol": "kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01",
+        "kernel": "cake_fp4_mla_decode_cdd7ae87dee8ee0c1753",
+        "kernel_symbol": "kernel_cake_fp4_mla_decode_cdd7ae87dee8ee0c1753",
         "launch": {
             "block": (480, 1, 1),
             "cluster": (2, 1, 1),
@@ -320,7 +329,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 165888,
             "use_pdl": False,
         },
-        "library": "cake_fp4_mla_decode_42a27c4a4f2cc133fe01",
+        "library": "cake_fp4_mla_decode_cdd7ae87dee8ee0c1753",
         "logical": {
             "batch": "batch",
             "kv_gs": "kv_gs",
@@ -350,7 +359,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "latent": 512,
         },
     },
-    "cake_fp4_mla_decode_032f4dbae1b3e6c5522c": {
+    "cake_fp4_mla_decode_c3b4af0f7a2f5380a76a": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -382,6 +391,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "build": {
+            "early_exp": True,
+            "epi_x": False,
             "long_rows": False,
             "persistent": True,
             "policy": "rnlsd",
@@ -393,16 +404,182 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "persistent_pairs",
             "tile_rows": 128,
         },
-        "kernel": "cake_fp4_mla_decode_032f4dbae1b3e6c5522c",
-        "kernel_symbol": "kernel_cake_fp4_mla_decode_032f4dbae1b3e6c5522c",
+        "kernel": "cake_fp4_mla_decode_c3b4af0f7a2f5380a76a",
+        "kernel_symbol": "kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a",
         "launch": {
             "block": (480, 1, 1),
             "cluster": (2, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 165888,
+            "dynamic_smem_bytes": 198656,
             "use_pdl": False,
         },
-        "library": "cake_fp4_mla_decode_032f4dbae1b3e6c5522c",
+        "library": "cake_fp4_mla_decode_c3b4af0f7a2f5380a76a",
+        "logical": {
+            "batch": "batch",
+            "kv_gs": "kv_gs",
+            "kv_k": "kv_k",
+            "kv_lens": "kv_lens",
+            "kv_sf": "kv_sf",
+            "kv_v": "kv_v",
+            "num_heads": "num_heads",
+            "num_split": "num_split",
+            "out": "out",
+            "page_offset": "page_offset",
+            "page_stride": "page_stride",
+            "page_table": "page_table",
+            "partial_O": "partial_O",
+            "partial_max": "partial_max",
+            "partial_sum": "partial_sum",
+            "q": "q",
+            "q_gs": "q_gs",
+            "q_len": "q_len",
+            "q_sf": "q_sf",
+            "sm_scale": "sm_scale",
+            "v_pool": "v_pool",
+        },
+        "stage": "decode",
+        "workspace_rule": {
+            "kind": "split_partials",
+            "latent": 512,
+        },
+    },
+    "cake_fp4_mla_decode_5aa6655ec9f34da4235b": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "kv_k"],
+            ["buffer", "kv_v"],
+            ["buffer", "kv_sf"],
+            ["buffer", "v_pool"],
+            ["buffer", "q"],
+            ["buffer", "q_sf"],
+            ["buffer", "page_table"],
+            ["buffer", "kv_lens"],
+            ["buffer", "q_gs"],
+            ["buffer", "kv_gs"],
+            ["buffer", "out"],
+            ["buffer", "partial_O"],
+            ["buffer", "partial_max"],
+            ["buffer", "partial_sum"],
+            ["parameter", "sm_scale"],
+            ["parameter", "num_heads"],
+            ["parameter", "q_len"],
+            ["parameter", "num_split"],
+            ["parameter", "page_stride"],
+            ["parameter", "page_offset"],
+            ["parameter", "batch"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "early_exp": False,
+            "epi_x": False,
+            "long_rows": False,
+            "persistent": True,
+            "policy": "rnlsd",
+            "tau": 4,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_pair": 2,
+            "kind": "persistent_pairs",
+            "tile_rows": 128,
+        },
+        "kernel": "cake_fp4_mla_decode_5aa6655ec9f34da4235b",
+        "kernel_symbol": "kernel_cake_fp4_mla_decode_5aa6655ec9f34da4235b",
+        "launch": {
+            "block": (480, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198656,
+            "use_pdl": False,
+        },
+        "library": "cake_fp4_mla_decode_5aa6655ec9f34da4235b",
+        "logical": {
+            "batch": "batch",
+            "kv_gs": "kv_gs",
+            "kv_k": "kv_k",
+            "kv_lens": "kv_lens",
+            "kv_sf": "kv_sf",
+            "kv_v": "kv_v",
+            "num_heads": "num_heads",
+            "num_split": "num_split",
+            "out": "out",
+            "page_offset": "page_offset",
+            "page_stride": "page_stride",
+            "page_table": "page_table",
+            "partial_O": "partial_O",
+            "partial_max": "partial_max",
+            "partial_sum": "partial_sum",
+            "q": "q",
+            "q_gs": "q_gs",
+            "q_len": "q_len",
+            "q_sf": "q_sf",
+            "sm_scale": "sm_scale",
+            "v_pool": "v_pool",
+        },
+        "stage": "decode",
+        "workspace_rule": {
+            "kind": "split_partials",
+            "latent": 512,
+        },
+    },
+    "cake_fp4_mla_decode_a51beba17d362e4922e9": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "kv_k"],
+            ["buffer", "kv_v"],
+            ["buffer", "kv_sf"],
+            ["buffer", "v_pool"],
+            ["buffer", "q"],
+            ["buffer", "q_sf"],
+            ["buffer", "page_table"],
+            ["buffer", "kv_lens"],
+            ["buffer", "q_gs"],
+            ["buffer", "kv_gs"],
+            ["buffer", "out"],
+            ["buffer", "partial_O"],
+            ["buffer", "partial_max"],
+            ["buffer", "partial_sum"],
+            ["parameter", "sm_scale"],
+            ["parameter", "num_heads"],
+            ["parameter", "q_len"],
+            ["parameter", "num_split"],
+            ["parameter", "page_stride"],
+            ["parameter", "page_offset"],
+            ["parameter", "batch"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {
+            "early_exp": True,
+            "epi_x": True,
+            "long_rows": False,
+            "persistent": True,
+            "policy": "rnlsd",
+            "tau": 4,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_pair": 2,
+            "kind": "persistent_pairs",
+            "tile_rows": 128,
+        },
+        "kernel": "cake_fp4_mla_decode_a51beba17d362e4922e9",
+        "kernel_symbol": "kernel_cake_fp4_mla_decode_a51beba17d362e4922e9",
+        "launch": {
+            "block": (480, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 166912,
+            "use_pdl": False,
+        },
+        "library": "cake_fp4_mla_decode_a51beba17d362e4922e9",
         "logical": {
             "batch": "batch",
             "kv_gs": "kv_gs",
@@ -650,8 +827,8 @@ def sm_count(device_index: int) -> int:
 def record_for(stage: str, arch: str, **build: Any) -> str:
     """The name of the one record of ``stage`` delivered for ``arch`` whose
     ``build`` keywords include ``build`` (``RuntimeError`` when none or more
-    than one is): the decode by ``long_rows`` and ``persistent``, the reducer
-    by ``warps_per_row``."""
+    than one is): the decode by ``long_rows``, ``persistent``, ``early_exp``
+    and ``epi_x``, the reducer by ``warps_per_row``."""
     names = [
         name
         for name, record in MODULES.items()

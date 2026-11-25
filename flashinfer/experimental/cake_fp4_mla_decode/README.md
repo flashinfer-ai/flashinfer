@@ -58,11 +58,15 @@ Supported GPUs: SM100 (`sm_100a`) and SM103 (`sm_103a`).
 ## Package layout
 
 The backend is a self-contained package. `cake_jit.py` is the registry of the
-generated programs: one `MODULES` record per program, the two decode builds
-(with and without long rows) and the three builds of the split-KV reducer of
-their partials (one, two or four warps per output row), carrying the host plan
-(the architectures it
-is delivered for, its stage, its launch record, the argument plan of its `run`
+generated programs: one `MODULES` record per program, the decode builds and
+the three builds of the split-KV reducer of their partials (one, two or four
+warps per output row). The decode builds are with and without long rows, each
+per item (a cluster per work item) and persistent (at most a cluster per SM
+pair, looping over the items), plus two forms of the persistent build without
+long rows: a late form on SM103 and a form that runs each item's epilogue in
+the V transpose warps on SM100. Every build gives the same result; the runner
+picks one from the bucket and the device. A record carries the host plan
+(the architectures it is delivered for, its stage, its launch record, the argument plan of its `run`
 entry, the grid rule a launch follows, its workspace and the kernel-parameter
 to logical-argument map) and the loader glue (`record_for`, `launch_grid`,
 `launch_args`, `load`). What to compile is recorded once in `build.json`: the

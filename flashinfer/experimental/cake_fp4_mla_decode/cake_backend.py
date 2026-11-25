@@ -18,8 +18,9 @@ Host side of the Cake MLA decode over TensorRT-LLM's ``fp4_mla`` KV cache.
 :func:`plan_fp4_mla_decode` fixes one decode bucket (batch, query tokens per
 request, heads, page-table width, optionally a bound on the KV lengths) on one
 device, chooses the KV split count, the decode build (with or without long
-rows, per item or persistent) and the reducer build, and allocates the split
-partials once; the returned
+rows, per item or persistent, and the form of the persistent build without
+long rows) and the reducer build, and allocates the split partials once; the
+returned
 :class:`Fp4MlaDecodeRunner` reads TensorRT-LLM's own tensors in place on every
 call (no copy of the cache, the query or its scales) and writes the
 caller-owned BF16 output.  A call allocates no CUDA memory and reads no
@@ -82,10 +83,27 @@ MERGE_WARPS = 8
 # The persistent decode build runs at most one cluster per SM pair, each
 # looping over the work items (the same bits as one cluster per item); it
 # overlaps an item's loads with the previous item's last pages and epilogue.
-# sm_100a takes it for every bucket; on sm_103a, whose persistent loop runs
-# each page some 6 % slower, only a bucket without long rows whose items
-# take several waves and have at most PERSISTENT_PAGES_SM103 pages each.
-PERSISTENT_PAGES_SM103 = 32
+# sm_100a takes it for every bucket but one whose items all fit one wave of
+# the device's pairs with few pages each: at most
+# PER_ITEM_PAGES_ONE_SPLIT_SM100 pages at one split,
+# PER_ITEM_PAGES_FEW_SPLITS_SM100 at up to FEW_SPLITS_SM100 splits,
+# PER_ITEM_PAGES_SM100 at more (one item per cluster leaves nothing to
+# overlap).  sm_103a, whose persistent loop runs each page of the build with
+# long rows slower, takes it only for a bucket without long rows whose items
+# take several waves.
+PER_ITEM_PAGES_SM100 = 6
+PER_ITEM_PAGES_ONE_SPLIT_SM100 = 7
+PER_ITEM_PAGES_FEW_SPLITS_SM100 = 9
+FEW_SPLITS_SM100 = 4
+# Two forms of the persistent build without long rows, the same bits: on
+# sm_103a the late form (each page's exponentials after the hand-off of the
+# previous page's anchor) for more than two waves of items of at most
+# LATE_EXP_PAGES_SM103 pages, else the early form; on sm_100a the epi_x form
+# (each item's epilogue in the V transpose warps, so the softmax groups go on
+# to the next item) except for one wave of items of at most
+# EPI_X_PAGES_SM100 pages.
+LATE_EXP_PAGES_SM103 = 24
+EPI_X_PAGES_SM100 = 8
 # Views of the caller's tensors a runner keeps (their FFI tensors).
 VIEW_CACHE_ENTRIES = 256
 
@@ -128,20 +146,64 @@ def num_split_for(
 
 
 def persistent_for(
+    *,
+    arch: str | None,
+    items: int,
+    pairs: int,
+    pages_per_item: int,
+    long_rows: bool,
+    num_split: int = 1,
+) -> bool:
+    """Whether the bucket takes the persistent decode build: on ``sm_100a``
+    every bucket but one whose ``items`` (splits included) fit the device's
+    ``pairs`` with at most :func:`per_item_pages_sm100` pages each for its
+    ``num_split``; on ``sm_103a`` a bucket without long rows whose items
+    exceed the pairs; none on another architecture.  The choice changes
+    neither the split count nor the arithmetic."""
+    if arch == "sm_100a":
+        return not (
+            items <= pairs and pages_per_item <= per_item_pages_sm100(num_split)
+        )
+    if arch == "sm_103a":
+        return not long_rows and items > pairs
+    return False
+
+
+def per_item_pages_sm100(num_split: int) -> int:
+    """The most pages per item at which ``sm_100a`` keeps a one-wave bucket of
+    ``num_split`` splits per item on the per-item build."""
+    if num_split == 1:
+        return PER_ITEM_PAGES_ONE_SPLIT_SM100
+    if num_split <= FEW_SPLITS_SM100:
+        return PER_ITEM_PAGES_FEW_SPLITS_SM100
+    return PER_ITEM_PAGES_SM100
+
+
+def late_exp_for(
     *, arch: str | None, items: int, pairs: int, pages_per_item: int, long_rows: bool
 ) -> bool:
-    """Whether the bucket takes the persistent decode build: every bucket on
-    ``sm_100a``; on ``sm_103a`` a bucket without long rows whose ``items``
-    (splits included) exceed the device's ``pairs`` and whose items have at
-    most ``PERSISTENT_PAGES_SM103`` pages; none on another architecture.  The
-    choice changes neither the split count nor the arithmetic."""
-    if arch == "sm_100a":
-        return True
-    if arch == "sm_103a":
-        return (
-            not long_rows and items > pairs and pages_per_item <= PERSISTENT_PAGES_SM103
-        )
-    return False
+    """Whether a persistent bucket takes the late form of ``sm_103a``'s build
+    without long rows: more than two waves of the device's ``pairs`` of items
+    of at most ``LATE_EXP_PAGES_SM103`` pages."""
+    return (
+        arch == "sm_103a"
+        and not long_rows
+        and items > 2 * pairs
+        and pages_per_item <= LATE_EXP_PAGES_SM103
+    )
+
+
+def epi_x_for(
+    *, arch: str | None, items: int, pairs: int, pages_per_item: int, long_rows: bool
+) -> bool:
+    """Whether a persistent bucket takes the ``epi_x`` form of ``sm_100a``'s
+    build without long rows: several waves of the device's ``pairs`` of items,
+    or items of more than ``EPI_X_PAGES_SM100`` pages."""
+    return (
+        arch == "sm_100a"
+        and not long_rows
+        and (items > pairs or pages_per_item > EPI_X_PAGES_SM100)
+    )
 
 
 def merge_warps_per_row(rows: int) -> int:
@@ -173,6 +235,8 @@ class Fp4MlaDecodePlan:
     num_split: int
     long_rows: bool = True
     persistent: bool = False
+    early_exp: bool = True  # the persistent build's form on sm_103a
+    epi_x: bool = False  # the persistent build's form on sm_100a
 
     @property
     def pairs(self) -> int:
@@ -224,13 +288,14 @@ def _plan(
         max_splits=max_splits,
     )
     long_rows = long_rows_for(page_table_width=page_table_width, max_kv=max_kv)
-    persistent = persistent_for(
+    bucket = dict(
         arch=arch,
         items=splits * m_tiles * batch,
         pairs=sm_count // 2,
         pages_per_item=-(-page_table_width // splits),
         long_rows=long_rows,
     )
+    persistent = persistent_for(**bucket, num_split=splits)
     return Fp4MlaDecodePlan(
         batch,
         q_len,
@@ -240,6 +305,8 @@ def _plan(
         splits,
         long_rows,
         persistent,
+        early_exp=not (persistent and late_exp_for(**bucket)),
+        epi_x=persistent and epi_x_for(**bucket),
     )
 
 
@@ -339,6 +406,8 @@ class Fp4MlaDecodeRunner:
             self.arch,
             long_rows=plan.long_rows,
             persistent=plan.persistent,
+            early_exp=plan.early_exp,
+            epi_x=plan.epi_x,
         )
         self.merge = record_for(
             "merge", self.arch, warps_per_row=plan.merge_warps_per_row
@@ -684,9 +753,12 @@ def plan_fp4_mla_decode(
 __all__ = [
     "Fp4MlaDecodePlan",
     "Fp4MlaDecodeRunner",
+    "epi_x_for",
+    "late_exp_for",
     "long_rows_for",
     "merge_warps_per_row",
     "num_split_for",
+    "per_item_pages_sm100",
     "persistent_for",
     "plan_fp4_mla_decode",
 ]

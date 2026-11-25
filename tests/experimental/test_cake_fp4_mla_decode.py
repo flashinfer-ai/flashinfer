@@ -26,6 +26,7 @@ attention over the dequantized bytes.  The probabilities are NVFP4 in the
 kernel, so the bound is on the per-row relative L2 error.
 """
 
+import dataclasses
 import math
 
 import pytest
@@ -34,6 +35,8 @@ import torch
 from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_fp4_mla_decode")
+backend = cake_package("cake_fp4_mla_decode", "cake_backend")
+registry = cake_package("cake_fp4_mla_decode", "cake_jit")
 
 PAGE = 128
 ROW_BYTES = 320
@@ -425,6 +428,57 @@ def test_short_build_gives_the_long_builds_bits_on_short_rows():
     _run(short_rows, case, b, sm_scale)
     torch.cuda.synchronize()
     assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+@pytest.mark.parametrize("num_split", [1, 3])
+def test_every_decode_build_gives_the_per_item_builds_bits(num_split):
+    """Every decode build delivered for the device (per item and persistent,
+    with and without long rows, and the persistent build's forms) gives the
+    per-item build's bits, here over several waves of items of the device's
+    SM pairs, with one split (the output written directly) and with several
+    (the split partials and the reducer)."""
+    device = _device_or_skip()
+    arch = registry.device_arch(device.index)
+    heads, q_len, kv_lens, width = 128, 4, (900, 1300, 17, 0, 1500) * 8, 13
+    sm_scale = 1.0 / math.sqrt(192.0)
+    case = _write_case(5, heads, q_len, kv_lens, width, device)
+    base = pkg.plan_fp4_mla_decode(
+        batch=len(kv_lens),
+        q_len=q_len,
+        num_heads=heads,
+        page_table_width=width,
+        device=device,
+    ).plan
+    assert num_split * base.m_tiles * base.batch > base.pairs
+    builds = sorted(
+        (b["long_rows"], b["persistent"], b["early_exp"], b["epi_x"])
+        for b in (
+            record["build"]
+            for record in registry.MODULES.values()
+            if record["stage"] == "decode" and arch in record["arches"]
+        )
+    )
+    assert len(builds) == 5
+    rows = len(kv_lens) * q_len * heads
+    outs = {}
+    for long_rows, persistent, early_exp, epi_x in builds:
+        plan = dataclasses.replace(
+            base,
+            num_split=num_split,
+            long_rows=long_rows,
+            persistent=persistent,
+            early_exp=early_exp,
+            epi_x=epi_x,
+        )
+        decode = backend.Fp4MlaDecodeRunner(plan, device)
+        out = torch.full((rows, 512), float("nan"), dtype=torch.bfloat16, device=device)
+        _run(decode, case, out, sm_scale)
+        outs[(long_rows, persistent, early_exp, epi_x)] = out
+    torch.cuda.synchronize()
+    want = outs[(True, False, True, False)]
+    assert bool(torch.isfinite(want.float()).all())
+    for build, out in outs.items():
+        assert torch.equal(out.view(torch.int16), want.view(torch.int16)), build
 
 
 def test_plan_picks_the_builds_from_the_bucket():
