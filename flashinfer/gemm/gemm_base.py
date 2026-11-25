@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from collections import Counter, OrderedDict
+from contextlib import nullcontext
 from contextvars import ContextVar
 import logging
 import os
@@ -1036,14 +1037,12 @@ def mm_bf16(
         backends (requires ``backend="auto"`` and bf16 output): a
         row of the output is bit-identical whatever the number of rows, the
         row's position in the batch or the configuration chosen, and the
-        result is deterministic. Under autotuning the class's top
-        configurations for the shape are profiled; all of them compute the
-        same bits. ``b`` may be the row-major ``(k, n)`` tensor or the
-        transpose of a row-major ``(n, k)`` weight. A bf16 ``bias`` of shape
-        ``(n,)`` is added once, in fp32, to the fully reduced accumulator
-        before the single rounding to bf16 (a biased call is a different
-        specification: ``flashinfer.batch_invariant.fingerprint("mm_bf16", N=,
-        K=, bias=True)``). Unsupported inputs raise
+        result is deterministic. This mode requires a cuDNN Frontend with
+        the ``BATCH_INVARIANT`` numerical note. cuDNN selects the execution plan, including
+        inside ``flashinfer.autotune()``. ``b`` may be the row-major ``(k, n)``
+        tensor or the transpose of a row-major ``(n, k)`` weight. A bf16
+        ``bias`` of shape ``(n,)`` is added once, in fp32, to the fully reduced
+        accumulator before the single rounding to bf16. Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
@@ -5222,8 +5221,12 @@ def clear_cudnn_graph_cache() -> None:
         build_cudnn_bf16_fp4_graph_override_shape,
     )
 
+    from .batch_invariant.cudnn_gemm import build_quantized_graph, clear_bf16_layouts
+
+    clear_bf16_layouts()
     _cudnn_override_all_plans.clear()
     cached_builders = (
+        build_quantized_graph,
         build_cudnn_bf16_fp4_graph,
         build_cudnn_bf16_fp4_graph_override_shape,
         build_cudnn_gemm_fp4_graph,
@@ -6466,11 +6469,19 @@ def build_cudnn_gemm_bf16_graph(
     bias_shape,
     bias_stride,
     tactic=-1,
+    *,
+    batch_invariant: bool = False,
 ):
     _check_cudnn_availability()
 
-    stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
+    # The batch-invariant engine runs on the caller's current stream on its build device.
+    # A handle-less graph avoids sharing a mutable handle across callers.
+    handle = (
+        None
+        if batch_invariant
+        else _get_cudnn_handle(device, torch.cuda.current_stream(device))
+    )
+    with cudnn.graph(handle) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=cudnn.data_type.BFLOAT16
         )
@@ -6507,11 +6518,82 @@ def build_cudnn_gemm_bf16_graph(
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
         c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
+        if batch_invariant:
+            graph.select_numeric_notes([cudnn.numerical_note.BATCH_INVARIANT])
         _finalize_cudnn_graph_for_tactic(
             graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
         )
-
+        if batch_invariant:
+            graph._fi_bi_workspace_size = graph.get_workspace_size()
         return graph
+
+
+def _batch_invariant_plan_error(cls, reason):
+    from ..batch_invariant.support import BatchInvariantUnsupportedError
+
+    return BatchInvariantUnsupportedError(
+        f"batch_invariant=True for {cls} requires a supported cuDNN batch-invariant GEMM plan: {reason}"
+    )
+
+
+def _require_cudnn_batch_invariant(cls):
+    if not CUDNN_AVAILABLE or not hasattr(
+        getattr(cudnn, "numerical_note", None), "BATCH_INVARIANT"
+    ):
+        raise _batch_invariant_plan_error(
+            cls, "the installed cuDNN Frontend lacks the BATCH_INVARIANT numerical note"
+        )
+
+
+def _batch_invariant_device(device):
+    return (
+        nullcontext()
+        if device.index == torch.cuda.current_device()
+        else torch.cuda.device(device)
+    )
+
+
+def _execute_cudnn_batch_invariant(
+    graph, buffers, uids, out, workspace, cls, original_a=None, *, extra_reads=()
+):
+    # Each capture owns its scratch, including when two captures later
+    # replay concurrently. Ordinary allocations use the current stream.
+    size = graph._fi_bi_workspace_size
+    if size and workspace is None:
+        workspace = torch.empty(size, dtype=torch.uint8, device=out.device)
+    elif size:
+        if (
+            not isinstance(workspace, torch.Tensor)
+            or workspace.device != out.device
+            or workspace.dtype != torch.float32
+            or not workspace.is_contiguous()
+            or workspace.nbytes < size
+            or workspace.data_ptr() % 16
+        ):
+            from ..batch_invariant.support import unsupported
+
+            raise unsupported(
+                cls,
+                "the given workspace",
+                f"a contiguous, 16-byte-aligned fp32 tensor on A's device of at least {size // 4} elements",
+            )
+    else:
+        workspace = None
+    if original_a is not None or extra_reads:
+        # The plan sees materialized A rows and the declared prefix of each
+        # swizzled scale. Include the original buffers in the alias check.
+        from .batch_invariant.api import _require_disjoint
+
+        writes = [(out, "the output")]
+        if workspace is not None:
+            used = workspace.reshape(-1)[: size // workspace.element_size()]
+            writes.append((used, "the workspace"))
+        if original_a is not None:
+            extra_reads = (*extra_reads, (original_a, "A"))
+        _require_disjoint(cls, writes, extra_reads)
+    _retain_cudnn_graph_if_capturing(graph)
+    graph.execute(buffers, workspace, tensor_uids=uids)
+    return out
 
 
 def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=-1):
@@ -9123,11 +9205,11 @@ def mm_mxfp8(
         backends (requires ``backend="auto"``, the 128x4 swizzled scale layout
         and bf16 / fp16 output): a row of the output is bit-identical whatever
         the number of rows, the row's position in the batch or the
-        configuration chosen, and the result is deterministic. Under autotuning
-        the class's top configurations for the shape are profiled; all of them
-        compute the same bits. ``b`` must be the transpose of a row-major
-        ``(n, k)`` weight (the block-scaled instruction takes K-major operands
-        only). The class is the architecture's (the SM107 instruction folds 64
+        configuration chosen, and the result is deterministic. cuDNN selects the
+        batch-invariant plan directly, including inside FlashInfer autotuning. ``b`` must be
+        the transpose of a row-major ``(n, k)`` weight (the block-scaled
+        instruction takes K-major operands only). The class is the architecture's
+        (the SM107 instruction folds 64
         elements per step, the SM100 / SM103 one 32), so the specification is
         ``flashinfer.batch_invariant.fingerprint("mm_mxfp8", N=, K=, out_dtype=,
         arch=)``. Unsupported inputs raise
@@ -11519,9 +11601,8 @@ def mm_fp4(
         128x4 swizzled scale layout, a scalar ``alpha`` and bf16 / fp16
         output): a row of the output is bit-identical whatever the number of
         rows, the row's position in the batch or the configuration chosen, and
-        the result is deterministic. Under autotuning the class is profiled
-        like a backend; any tactic computes the class. The receipt of the
-        specification: ``flashinfer.batch_invariant.fingerprint("mm_fp4", N=,
+        the result is deterministic. cuDNN selects the batch-invariant plan directly.
+        The specification is ``flashinfer.batch_invariant.fingerprint("mm_fp4", N=,
         K=, out_dtype=, use_nvfp4=, arch=)``. Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
@@ -11939,14 +12020,11 @@ def bmm_fp8(
     batch_invariant: bool
         ``True`` runs the batch-invariant fp8 GEMM class in place of the
         backends (requires ``backend="auto"``, A and B of one fp8 dtype, bf16
-        or fp16 output): every batch element is one launch of the class, so a
-        row's bits are identical whatever the number of rows, the row's
-        position, the batch size, the element's position in the batch or the
-        configuration chosen, and the result is deterministic.
+        or fp16 output): a row's bits are identical whatever the number of
+        rows, the row's position, the batch size, the element's position in
+        the batch or the configuration chosen, and the result is deterministic.
         ``A_scale * B_scale`` is formed once on the device and applied after
-        the fold. Under autotuning the class's top configurations for the
-        shape are profiled; all of them compute the same bits. Unsupported
-        inputs raise
+        the fold. cuDNN selects the batch-invariant plan directly. Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
@@ -12323,8 +12401,7 @@ def gemm_fp8_nt_groupwise(
         output; both scale layouts are accepted): a row of the output is
         bit-identical whatever the number of rows, the row's position in the
         batch or the configuration chosen, and the result is deterministic.
-        Under autotuning the class's top configurations for the shape are
-        profiled; all of them compute the same bits. The specification is
+        cuDNN selects the batch-invariant plan directly. The specification is
         ``flashinfer.batch_invariant.fingerprint("gemm_fp8_nt_groupwise", K=,
         out_dtype=)``. Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`

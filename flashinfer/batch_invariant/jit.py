@@ -45,26 +45,6 @@ MODE_DIRS: Tuple[Path, ...] = (
 #: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
 #: relative-import closure of these files within the mode's directories.
 MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
-    # the GEMM kernels (both operand formats) and the split-K fixup share one module: both roots, so an edit to either
-    # invalidates its objects
-    "batch_invariant_gemm": (
-        "gemm/batch_invariant/blocks/compile.py",
-        "gemm/batch_invariant/fixup.py",
-    ),
-    # the block-scaled kernels (the MXFP8 classes): their own module, so an edit to the block-scaled body leaves the dense
-    # module's objects valid and vice versa (the split's fixup stays in the dense module)
-    "batch_invariant_gemm_blockscaled": (
-        "gemm/batch_invariant/blocks/compile_blockscaled.py",
-    ),
-    # the mixed MX classes (e2m1 weights x e4m3 activations) on the same body: their own module, so an edit to the mixed
-    # plans leaves the one-format block-scaled module's objects valid (an edit to the shared body moves both)
-    "batch_invariant_gemm_blockscaled_mixed": (
-        "gemm/batch_invariant/blocks/compile_blockscaled_mixed.py",
-    ),
-    # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
-    "batch_invariant_gemm_fp8_blockscale": (
-        "gemm/batch_invariant/blocks/compile_fp8bs.py",
-    ),
     # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
     "batch_invariant_attention": (
         "attention/batch_invariant/blocks/compile.py",
@@ -80,23 +60,6 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "fused_moe/batch_invariant/route_plan.py",
         "fused_moe/batch_invariant/permute.py",
         "fused_moe/batch_invariant/combine.py",
-    ),
-}
-
-#: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
-#: package: the relative-import closure cannot reach them, so they are keyed explicitly (a missing file is an error).
-MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
-    "batch_invariant_gemm": (
-        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
-    ),
-    "batch_invariant_gemm_blockscaled": (
-        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
-    ),
-    "batch_invariant_gemm_blockscaled_mixed": (
-        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
-    ),
-    "batch_invariant_gemm_fp8_blockscale": (
-        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
 }
 
@@ -170,11 +133,6 @@ def module_sources(module: str) -> Tuple[Path, ...]:
             if d in MODE_DIRS or not _in_mode(d):
                 break
             d = d.parent
-    for r in MODULE_EXTRA_SOURCES.get(module, ()):
-        p = (_FI_DIR / r).resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"{module}: cache key source {r} is missing")
-        seen.add(p)
     return tuple(sorted(seen))
 
 

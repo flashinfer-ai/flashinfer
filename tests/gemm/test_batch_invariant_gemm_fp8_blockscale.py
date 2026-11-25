@@ -1,42 +1,18 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant block-scale fp8 GEMM: ``flashinfer.gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, scale_major_mode,
-backend="auto", batch_invariant=True)``, the class ``gemm.e4m3.kblock128``.
-
-Per output element the class folds every 128-element K block with the 32-wide ``kind::f8f6f4`` step from +0 (the block
-partial ``P_kb``) and the block partials in block order from +0 with ``fma.rn(mul.rn(a_scale[m, kb], b_scale[n // 128, kb]),
-P_kb, acc)``, then converts once. The opaque part of the class is the block partial, which IS the per-tensor fp8 class at
-K = 128 with unit scales and an fp32 output (``x * 1.0`` is exact): ``block_partials`` computes it with
-``mm_fp8_batch_invariant`` block by block on the device. Everything after it is correctly rounded fp32 arithmetic the CPU
-reproduces bit for bit (``exact_promotion``), so GPU == exact model is a bitwise assertion here; then the launch-model
-properties R1 / R2 (the scales travelling with their rows), bit agreement across the enumerated configuration space (the
-hardware hypothesis for the fp8 instruction variants and the promotion's independence of the tile), both scale layouts,
-dispatcher membership, the persistent grid, the autotuner, Trace Apply, FlashInfer's own groupwise backends as a tolerance
-yardstick (their association is not the class's) and the error contract. Device-free tests cover the fingerprint, the
-space, the dispatcher and the tuner's tactic encoding; the GPU tests need SM100 / SM103 / SM107.
-"""
-
-import contextlib
-import dataclasses
+"""Batch-invariant groupwise FP8 GEMM, including an exact reference for scale promotion and both scale layouts."""
 
 import pytest
 import torch
 
 import flashinfer
 from flashinfer import batch_invariant as bi
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import autotune
 from flashinfer.batch_invariant.fp_interface import exact
-from flashinfer.gemm.batch_invariant import api as bi_api
-from flashinfer.gemm.batch_invariant import tuning
 from flashinfer.gemm.batch_invariant.api import (
-    GEMM_FP8BS_ARCHS,
     gemm_fp8_nt_groupwise_batch_invariant,
-    mm_fp8_batch_invariant,
-    native_k_staging,
 )
-from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
 from flashinfer.gemm.batch_invariant.generator import (
-    Knobs,
     enumerate_space,
     knob_product,
 )
@@ -55,13 +31,7 @@ from flashinfer.gemm.batch_invariant.spec import (
 
 E4, E5 = torch.float8_e4m3fn, torch.float8_e5m2
 FMT = "e4m3_bs"
-_supported = torch.cuda.is_available() and bi.is_supported_device(
-    torch.device("cuda"), GEMM_FP8BS_ARCHS
-)
-needs_device = pytest.mark.skipif(
-    not _supported,
-    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
-)
+needs_device = pytest.mark.usefixtures("cudnn_batch_invariant_device")
 
 #: The DeepSeek-V3 dense weight shapes (N, K) and the row counts the dispatcher is checked at.
 DS_PAIRS = (
@@ -83,13 +53,6 @@ EXACT_SHAPES = [
     (16, 7168, 7168),
     (2049, 136, 256),
 ]
-#: K = 128: one block (the instruction variants and one promotion alone); then several blocks at odd shapes.
-FULL_SPACE_SHAPES = [
-    (64, 4096, 128),
-    (200, 8192, 256),
-    (37, 2048, 1024),
-    (16, 8192, 8192),
-]
 #: A few rows in the K layout (the K-native staging) with a short last ring stage: K of one, two and three blocks (the short
 #: stage alone; a stage holds four blocks) and of six and seven (a whole stage, then the short one); the exact-model shapes at
 #: these row counts are whole stages.
@@ -100,20 +63,6 @@ NATIVE_TAIL_SHAPES = [
     (16, 2048, 768),
     (16, 576, 896),
 ]
-#: Hand-picked records: every tile N, both CTA groups, clusters to 4, both rasters, swizzles to 8.
-RECORDS = [
-    Knobs((128, 16), (1, 1), False, True, "m", 1),
-    Knobs((128, 32), (1, 4), False, True, "m", 1),
-    Knobs((128, 64), (1, 2), False, True, "n", 2),
-    Knobs((128, 128), (4, 1), False, True, "m", 8),
-    Knobs((256, 32), (2, 2), True, True, "n", 4),
-    Knobs((256, 64), (2, 1), True, True, "m", 1),
-    Knobs((256, 128), (2, 1), True, True, "m", 1),
-    Knobs((256, 128), (4, 1), True, True, "n", 2),
-]
-#: One record of the per-tensor fp8 class the block partials run with (every record computes the same bits, R3), so the exact
-#: model does not depend on that class's dispatcher.
-PARTIAL_RECORD = Knobs((128, 64), (1, 1), False, True, "m", 1)
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -145,10 +94,14 @@ def scales(rows: int, KB: int, seed: int, span: int = 6) -> torch.Tensor:
     return s.float().cuda()
 
 
-def operands(M: int, N: int, K: int, seed: int = 0):
+def operands(M: int, N: int, K: int, seed: int = 0, *, exact_blocks=False):
     """``a (M, K)``, the row-major weight ``w (N, K)``, ``sa (M, KB)`` and ``sb (ceil(N / 128), KB)`` in the K layout."""
     a = adv_fp8(M, K, seed=seed + 1)
     w = adv_fp8(N, K, seed=seed + 2, cancel=False)
+    if exact_blocks:
+        # Each 128-wide dot is then an exactly representable integer on both the MMA and the reference.
+        a = a.float().round().clamp(-4, 4).to(E4)
+        w = w.float().round().clamp(-4, 4).to(E4)
     KB = K // BLOCK_K
     return a, w, scales(M, KB, seed + 3), scales(-(-N // SCALE_BLOCK_N), KB, seed + 4)
 
@@ -184,32 +137,13 @@ def api(a, w, sa, sb, mode: str = "K", **kw):
 # ----------------------------------------------------------------------------------------------- the exact model
 
 
-def block_partials(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """``P[kb, m, n]`` (fp32, on the device): the per-tensor fp8 class's fold of block ``kb`` from +0, through
-    ``mm_fp8_batch_invariant`` with unit scales and an fp32 output on the (M, 128) x (128, N) slices, at one pinned record.
-    The weight is padded to a multiple of 16 columns with zero rows (every output element is its own fold, so the padding
-    changes nothing) and the padding dropped."""
-    M, K = a.shape
-    N = w.shape[0]
-    N16 = -(-N // 16) * 16
-    if N16 != N:
-        w = torch.cat([w, torch.zeros(N16 - N, K, dtype=w.dtype, device=w.device)], 0)
-    one = torch.ones(1, dtype=torch.float32, device=a.device)
-    P = torch.empty(K // BLOCK_K, M, N16, dtype=torch.float32, device=a.device)
-    for kb in range(K // BLOCK_K):
-        a_blk = a[:, kb * BLOCK_K : (kb + 1) * BLOCK_K].contiguous()
-        b_blk = w[:, kb * BLOCK_K : (kb + 1) * BLOCK_K].contiguous().t()
-        mm_fp8_batch_invariant(
-            a_blk,
-            b_blk,
-            one,
-            one,
-            out=P[kb],
-            out_dtype=torch.float32,
-            config=PARTIAL_RECORD,
-            chunks=1,
-        )
-    return P[:, :, :N] if N16 != N else P
+def block_partials(a, w):
+    """Exact, unscaled dot products of the integer-valued E4M3 blocks used by the promotion oracle."""
+    m, k = a.shape
+    n = w.shape[0]
+    lhs = a.double().reshape(m, k // BLOCK_K, BLOCK_K).transpose(0, 1)
+    rhs = w.double().reshape(n, k // BLOCK_K, BLOCK_K).permute(1, 2, 0)
+    return torch.bmm(lhs, rhs).float()
 
 
 def exact_promotion(
@@ -359,11 +293,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 assert pick.tile_m in (128, 256) and pick.tile_n >= 128, where
 
 
-def test_tactic_encoding_round_trips():
-    for k in RECORDS:
-        assert tuning.knobs_from_tactic(tuning.knobs_to_tactic(k)) == k
-
-
 def test_flag_bypasses_the_operator_backend_selection():
     """Under ``batch_invariant=True`` the operator's auto-backend heuristic yields a non-empty list whatever the backends'
     availability: the flag path runs the class, so a missing backend never turns into a backend error."""
@@ -393,9 +322,9 @@ def test_unsupported_device_raises_before_any_kernel():
 def test_gpu_equals_the_exact_model(M, N, K):
     """The kernel's output is bit for bit the exact model's in every output format and both scale layouts (the dispatcher's
     record for the shape)."""
-    a, w, sa, sb = operands(M, N, K, seed=11)
+    a, w, sa, sb = operands(M, N, K, seed=11, exact_blocks=True)
     P = block_partials(a, w)
-    for od in (torch.float32, torch.bfloat16, torch.float16):
+    for od in (torch.bfloat16, torch.float16):
         ref = bits(reference(a, w, sa, sb, od, P=P))
         got_k = ours(a, w, sa, sb, out_dtype=od)
         got_mn = gemm_fp8_nt_groupwise_batch_invariant(
@@ -406,11 +335,10 @@ def test_gpu_equals_the_exact_model(M, N, K):
 
 
 @needs_device
-def test_exact_model_over_records_and_scale_corners():
-    """Hand-picked records of the space (every tile N, both CTA groups, clusters, rasters, swizzles) on scales of a wide
-    exponent range, exact powers of two and ones, bit for bit the exact model."""
+def test_exact_model_over_scale_corners():
+    """Check wide, power-of-two and unit scales against an independently rounded promotion."""
     M, N, K = 300, 576, 1024
-    a, w, _, _ = operands(M, N, K, seed=21)
+    a, w, _, _ = operands(M, N, K, seed=21, exact_blocks=True)
     KB, NB = K // BLOCK_K, -(-N // SCALE_BLOCK_N)
     P = block_partials(a, w)
     corners = {
@@ -423,46 +351,19 @@ def test_exact_model_over_records_and_scale_corners():
     }
     for name, (sa, sb) in corners.items():
         ref = bits(reference(a, w, sa, sb, torch.bfloat16, P=P))
-        for k in RECORDS:
-            got = ours(a, w, sa, sb, config=k)
-            assert torch.equal(bits(got).cpu(), ref), (name, k.describe())
-
-
-@needs_device
-def test_block_fold_is_a_different_class_from_the_per_tensor_fold():
-    """With unit scales the class is ``fold_kb fma(1, P_kb, acc)``: the block partials summed in block order -- not the
-    per-tensor class's single fold over all K steps (a different association), as the fingerprints say; at K = 128 (one
-    block) the two agree up to the sign of an exact zero (``fma(1, -0, +0) = +0``)."""
-    M, N, K = 64, 1024, 2048
-    a, w, _, _ = operands(M, N, K, seed=9)
-    one_a = torch.ones(M, K // BLOCK_K, device="cuda")
-    one_b = torch.ones(N // SCALE_BLOCK_N, K // BLOCK_K, device="cuda")
-    unit = torch.ones(1, device="cuda")
-    blk = ours(a, w, one_a, one_b, out_dtype=torch.float32)
-    fold = mm_fp8_batch_invariant(a, w.t(), unit, unit, out_dtype=torch.float32)
-    assert not torch.equal(bits(blk), bits(fold))
-    a1, w1 = a[:, :BLOCK_K].contiguous(), w[:, :BLOCK_K].contiguous()
-    blk1 = ours(
-        a1,
-        w1,
-        one_a[:, :1].contiguous(),
-        one_b[:, :1].contiguous(),
-        out_dtype=torch.float32,
-    )
-    fold1 = mm_fp8_batch_invariant(a1, w1.t(), unit, unit, out_dtype=torch.float32)
-    diff = bits(blk1) != bits(fold1)
-    assert torch.all((fold1 == 0) | ~diff)
-    assert not diff.any() or torch.all(blk1[diff] == 0)
+        for mode in ("K", "MN"):
+            got = api(a, w, sa, sb, mode)
+            assert torch.equal(bits(got).cpu(), ref), (name, mode)
 
 
 @needs_device
 def test_public_api_runs_the_class_and_both_layouts_agree():
-    """``flashinfer.gemm_fp8_nt_groupwise(..., backend="auto", batch_invariant=True)`` is the class (the direct entry's bits),
+    """``flashinfer.gemm_fp8_nt_groupwise(..., backend="auto", batch_invariant=True)`` is checked against exact scale promotion,
     in the K and the MN scale layouts alike (R4), for both output dtypes."""
     for M, N, K in [(300, 576, 1024), (16, 7168, 7168)]:
-        a, w, sa, sb = operands(M, N, K, seed=31)
+        a, w, sa, sb = operands(M, N, K, seed=31, exact_blocks=True)
         for od in (torch.bfloat16, torch.float16):
-            ref = bits(ours(a, w, sa, sb, out_dtype=od))
+            ref = bits(reference(a, w, sa, sb, od)).to(a.device)
             assert torch.equal(bits(api(a, w, sa, sb, "K", out_dtype=od)), ref)
             assert torch.equal(bits(api(a, w, sa, sb, "MN", out_dtype=od)), ref)
             out = torch.empty(M, N, dtype=od, device="cuda")
@@ -472,89 +373,14 @@ def test_public_api_runs_the_class_and_both_layouts_agree():
 
 
 @needs_device
-def test_k_native_scale_staging_is_a_placement():
-    """The ``K`` layout's two stagings -- the K-native ring (four blocks per stage, a row's four scales one 16-byte copy from
-    the caller's tensor) and the per-block ring over the MN-major copy -- and the ``MN`` layout compute the same bits at
-    every shape of the DeepSeek grid, forced either way; the API's own choice (``native_k_staging``: a few rows) and a
-    K-layout tensor whose base is not 16-byte aligned (handed over as its copy) likewise. The staging changes which bytes
-    a ring stage holds, never the fold."""
-    for N, K in DS_PAIRS:
-        for M in DS_MS:
-            a, w, sa, sb = operands(M, N, K, seed=81)
-            ref = bits(
-                gemm_fp8_nt_groupwise_batch_invariant(
-                    a, w, sa.t().contiguous(), sb.t().contiguous(), "MN"
-                )
-            )
-            assert torch.equal(bits(ours(a, w, sa, sb, native_k=True)), ref), (
-                "native",
-                M,
-                N,
-                K,
-            )
-            assert torch.equal(bits(ours(a, w, sa, sb, native_k=False)), ref), (
-                "copy",
-                M,
-                N,
-                K,
-            )
-            assert torch.equal(bits(ours(a, w, sa, sb)), ref), ("default", M, N, K)
-            del a, w, sa, sb, ref
-    assert native_k_staging(64) and not native_k_staging(65)
-    M, N, K = 64, 7168, 7168
-    a, w, sa, sb = operands(M, N, K, seed=83)
-    # a 4-byte-aligned base (a column view): not the 16-byte copies'; the API hands the copy over
-    sa_off = torch.empty(M, K // BLOCK_K + 1, device="cuda")[:, 1:]
-    sa_off.copy_(sa)
-    assert sa_off.data_ptr() % 16 != 0
-    ref = bits(ours(a, w, sa, sb, native_k=True))
-    assert torch.equal(bits(ours(a, w, sa_off, sb)), ref)
-    assert torch.equal(bits(api(a, w, sa, sb, "K")), ref)
-    ref32 = bits(reference(a, w, sa, sb, torch.float32))
-    assert torch.equal(
-        bits(ours(a, w, sa, sb, native_k=True, out_dtype=torch.float32)).cpu(), ref32
-    )
-    # the operator (its autotuner path) takes the staging the rule names: the K layout as it is at a few rows, the MN
-    # copy at more, the MN layout never native
-    from flashinfer.gemm.batch_invariant.blocks import compile_fp8bs
-
-    seen = []
-    real = compile_fp8bs.get_compiled_fp8bs
-
-    def recording(cfg, out_fmt="bf16", family="", native_k=False):
-        seen.append(native_k)
-        return real(cfg, out_fmt, family, native_k)
-
-    compile_fp8bs.get_compiled_fp8bs = recording
-    try:
-        for M, mode, want in ((16, "K", True), (128, "K", False), (16, "MN", False)):
-            a, w, sa, sb = operands(M, 2048, 1024, seed=85)
-            seen.clear()
-            bi_api.clear_kernel_cache()  # the launch asks the compile again (its handle cache is per record and staging)
-            api(a, w, sa, sb, mode)
-            assert seen and all(v == want for v in seen), (M, mode, seen)
-    finally:
-        compile_fp8bs.get_compiled_fp8bs = real
-
-
-@needs_device
 @pytest.mark.parametrize("M,N,K", NATIVE_TAIL_SHAPES)
 def test_k_native_staging_short_last_stage_equals_the_exact_model(M, N, K):
-    """At a few rows the ``K`` layout's scales are staged natively, four blocks per ring stage and the short last group block by
-    block: a K of one, two or three blocks is that short group alone, six or seven a whole stage and then it. The kernel's
-    output is bit for bit the exact model's in every output format, the staging forced and the API's own choice."""
-    from flashinfer.gemm.batch_invariant.blocks.blockscale_fp8 import (
-        SCALE_GROUP_NATIVE_K,
-    )
-
-    assert native_k_staging(M) and (K // BLOCK_K) % SCALE_GROUP_NATIVE_K
-    a, w, sa, sb = operands(M, N, K, seed=13)
+    """One to three scale blocks in the final stage must give the same bits as exact promotion."""
+    a, w, sa, sb = operands(M, N, K, seed=13, exact_blocks=True)
     P = block_partials(a, w)
-    for od in (torch.float32, torch.bfloat16, torch.float16):
+    for od in (torch.bfloat16, torch.float16):
         ref = bits(reference(a, w, sa, sb, od, P=P))
-        got_forced = ours(a, w, sa, sb, native_k=True, out_dtype=od)
         got_default = ours(a, w, sa, sb, out_dtype=od)
-        assert torch.equal(bits(got_forced).cpu(), ref), (M, N, K, od, "native")
         assert torch.equal(bits(got_default).cpu(), ref), (M, N, K, od, "default")
 
 
@@ -621,84 +447,17 @@ def test_batch_permutation_subbatch_invariance():
 
 
 @needs_device
-@pytest.mark.parametrize("M,N,K", [(1000, 4096, 2048), (37, 2048, 1024)])
-def test_config_agreement(M, N, K):
-    """R3 (the hardware hypothesis): the dispatcher's candidates for every part and the hand-picked records compute the
-    exact model's bits."""
-    a, w, sa, sb = operands(M, N, K, seed=61)
-    ref = bits(reference(a, w, sa, sb))
-    seen = set()
-    for family, sm_count in PARTS:
-        seen.update(
-            rank_topk(M, N, K, 1, "k", sm_count, 10, family, in_fmt=FMT, nominal=True)
-        )
-    seen.update(k for k in RECORDS if can_implement(k, M, N, K, "k", 1, FMT))
-    for k in sorted(seen, key=lambda k: k.describe()):
-        assert torch.equal(bits(ours(a, w, sa, sb, config=k)).cpu(), ref), k.describe()
-    assert len(seen) >= 16
-
-
-@needs_device
-@pytest.mark.parametrize("M,N,K", FULL_SPACE_SHAPES)
-def test_whole_space_agreement(M, N, K, request):
-    """Every record of the enumerated space (336) computes the exact model's bits; the whole space under ``--full``, a
-    sample otherwise (the instruction variants are covered by `test_config_agreement` every run)."""
-    space = enumerate_space(M, N, K, b_major="k", in_fmt=FMT)
-    assert len(space) == 336
-    full = False
-    # registered by tests/conftest.py's parametrize plugin; absent when the file runs outside the repo's conftest
-    with contextlib.suppress(ValueError):
-        full = bool(request.config.getoption("--full"))
-    records = space if full else space[:: len(space) // 12]
-    a, w, sa, sb = operands(M, N, K, seed=71)
-    ref = bits(reference(a, w, sa, sb))
-    for k in records:
-        assert torch.equal(bits(ours(a, w, sa, sb, config=k)).cpu(), ref), k.describe()
-
-
-@needs_device
-def test_persistent_grid_size_does_not_change_bits():
-    """R2 for the SM count: a smaller persistent grid is what a smaller part, an SM carveout, MPS or a green context
-    produce; it only decides which CTA computes which tile."""
-    for M, N, K in [(1000, 4096, 2048), (64, 576, 7168)]:
-        a, w, sa, sb = operands(M, N, K, seed=91)
-        base = default_config(M, N, K, 1, "k", 204, "sm_107", FMT)
-        ref = bits(ours(a, w, sa, sb, config=base))
-        for g in (1, 3, 17, 74):
-            cfg = dataclasses.replace(base, grid_clusters=g)
-            assert torch.equal(bits(ours(a, w, sa, sb, config=cfg)), ref), f"grid={g}"
-
-
-@needs_device
 @pytest.mark.parametrize("N,K,mode", [(4096, 2048, "K"), (576, 7168, "MN")])
-def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, mode):
-    """Under ``autotune(True)`` the FlashInfer autotuner profiles the class's candidates (none may be dropped as
-    unsupported) and the tuned process computes the same bits as the untuned one, during and after tuning."""
+def test_public_rows_keep_their_bits_inside_autotune(N, K, mode):
+    """The public batch-invariant entry agrees before, during and after autotuning."""
     a, w, sa, sb = operands(300, N, K, seed=101)
 
     def run(M):
         return bits(api(a[:M].contiguous(), w, sa[:M].contiguous(), sb, mode))
 
     ref = [run(M) for M in (1, 16, 300)]
-    tuner = AutoTuner.get()
-    tuner.clear_cache()  # no earlier call answers the profiles from the cache: the candidates are profiled in this test
-
-    def failed():
-        return {
-            k: len(v)
-            for k, v in tuner.stats.failed_tactics.items()
-            if tuning.CUSTOM_OP_FP8BS in k
-        }
-
-    before = failed()
-    profiled = tuner.stats.tuned_op_successful_configs.get(tuning.CUSTOM_OP_FP8BS, 0)
     with autotune(True):
         tuned = [run(M) for M in (1, 16, 300)]
-    assert failed() == before, f"tactics failed while profiling: {failed()}"
-    assert (
-        tuner.stats.tuned_op_successful_configs.get(tuning.CUSTOM_OP_FP8BS, 0)
-        > profiled
-    )  # profiled here, not a cache hit
     post = [run(M) for M in (1, 16, 300)]
     for r, t, p in zip(ref, tuned, post, strict=True):
         assert torch.equal(r, t) and torch.equal(r, p)
@@ -804,12 +563,10 @@ def test_trace_apply_does_not_replace_the_class():
 
 @needs_device
 @pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (300, 576, 1024)])
-def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
-    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
-    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
-    (only the entry's own fresh output skips the aliasing check)."""
-    a, w, sa, sb = operands(M, N, K, seed=181)
-    ref = bits(ours(a, w, sa, sb))
+def test_public_output_buffer_and_graph_replay(M, N, K):
+    """A caller-provided output survives graph replay and must be disjoint from the inputs."""
+    a, w, sa, sb = operands(M, N, K, seed=181, exact_blocks=True)
+    ref = bits(reference(a, w, sa, sb)).to(a.device)
     for mode in ("K", "MN"):
         assert torch.equal(bits(api(a, w, sa, sb, mode)), ref)
         out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -859,12 +616,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ours(a, w, sa.to(torch.bfloat16), sb)
     with pytest.raises(E, match="device"):
         ours(a, w, sa.cpu(), sb)
+    with pytest.raises(E, match="cuDNN"):
+        ours(a, w, sa, sb, native_k=True)
     with pytest.raises(E, match="scale_major_mode"):
         gemm_fp8_nt_groupwise_batch_invariant(a, w, sa, sb, "NK")
     with pytest.raises(E, match="multiple of 8"):
         ours(a, adv_fp8(260, K, seed=5, cancel=False), sa, scales(3, 4, 6))
-    with pytest.raises(E, match="enumerated space"):
-        ours(a, w, sa, sb, config=Knobs((128, 192), (1, 1), False, True, "m", 1))
     with pytest.raises(E, match="scale_granularity_mnk"):
         flashinfer.gemm.gemm_fp8_nt_groupwise(
             a,

@@ -1,11 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Dispatch of the GEMM classes: the chunk rule (a function of the weight shape and the format only) and the heuristic
-dispatcher.
+"""Weight-shape arithmetic classes and the scheduling model used by Lean conformance.
 
-Every record of a configuration space computes the class (R3), so the choice here never reaches the bits; it only
-moves time. The choice is the heuristic's best record of the space (``heuristic.rank``); ``rank_topk`` is the autotuner's
-tactic list.
+Standalone GEMMs select their execution plans through cuDNN. The model below
+also supplies the arithmetic class used by the fingerprint and compatibility APIs.
 """
 
 from __future__ import annotations
@@ -29,13 +27,11 @@ def all_valid_configs(
     b_major: str = "n",
     in_fmt: str = "bf16",
 ) -> List[GemmConfig]:
-    """The configuration space for this shape, layout and class: the generator's knob product filtered by the kernel's
-    own ``can_implement``: the set R3 is claimed over. The GPU configuration-agreement tests check the dispatcher's
-    candidates and sampled records of it against each other bit for bit."""
+    """The shape, layout and format's configuration space in the conformance model."""
     return enumerate_space(M, N, K, chunks=chunks, b_major=b_major, in_fmt=in_fmt)
 
 
-#: How many records of a ranking are kept per (shape, layout, format, part): the autotuner's candidate count. A cached
+#: How many records of a ranking are kept per (shape, layout, format, part): the reference candidate count. A cached
 #: entry holds that prefix, not the whole ranked space (M changes almost every call in serving).
 RANK_CACHE_TOPK = 10
 SPLIT_MIN_CTAS = 256  # below this many N tiles at 32 wide, a K split is considered
@@ -124,13 +120,11 @@ def rank_topk(
     in_fmt: str = "bf16",
     nominal: bool = False,
 ) -> List[GemmConfig]:
-    """The dispatcher's ranked list (what FlashInfer's autotuner profiles under ``batch_invariant=True``): `heuristic.rank`'s
-    order (the heuristic's best first) with the raster twin of each of the best ceil(k/2) records inserted after it,
-    distinct records, at most ``k``; ``default_config(...) == rank_topk(...)[0]``. Every entry
-    is a member of the class's enumerated space, so an autotuner may pick among them freely without changing a single bit.
-    ``sm_count`` and ``family`` name the part (the operand device's); ``nominal`` ranks at the family's nominal table (the
-    generated Lean cases), never a device's queried numbers. Empty when nothing implements the shape. Memoised per
-    argument tuple (cleared with the rankings); each call returns its own list."""
+    """Return up to k reference configurations for a shape, layout, format and part.
+
+    Keep the alternate raster order of the best half of the list when the model accepts it.
+    The nominal part parameters are used to generate reproducible Lean cases.
+    """
     return list(
         _rank_topk_cached(
             M, N, K, chunks, b_major, sm_count, k, family, in_fmt, nominal
@@ -172,7 +166,7 @@ def _rank_topk_cached(
     seen: set = set()
     out: List[GemmConfig] = []
     # the best ceil(k/2) records, each followed by its raster twin when the space has it: the one knob the estimate does
-    # not price is hedged for free by the autotuner; then the rank order fills the list. The raster order is a knob of
+    # not price is represented in the candidate list; then the rank order fills the list. The raster order is a knob of
     # every enumerated record, so the twin is a member exactly when the body accepts it (`can_implement`); the truncated
     # ranking is not consulted for membership.
     for rec in ranked[: -(-k // 2)]:

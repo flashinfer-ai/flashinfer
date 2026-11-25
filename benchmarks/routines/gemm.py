@@ -190,8 +190,9 @@ def parse_gemm_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, mm_tf32, bmm_bf16; "
-            "the batch_invariant backend of those and of gemm_fp8_nt_groupwise, which profiles the class's top configurations)."
+            "Enable autotuner warmup for supported backends of mm_fp4, bmm_fp8, mm_fp8, "
+            "bmm_mxfp8, mm_mxfp8, mm_bf16, mm_tf32, and bmm_bf16. "
+            "The batch_invariant backend uses cuDNN plan selection and remains in the comparison."
         ),
     )
     parser.add_argument(
@@ -385,29 +386,6 @@ def testGemmFp8NtGroupwise(args):
         reference_output = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
         has_reference_output = True
 
-    # Autotune: only the batch_invariant backend goes through FlashInfer's autotuner here (the other
-    # backends of this routine have no autotune path; they are timed as they are).
-    autotune_supported_backends = ["batch_invariant"]
-    cache_path = getattr(args, "autotune_cache", None)
-    if getattr(args, "autotune", False):
-        warmup_iters = (
-            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
-        )
-        for cur_backend in backends:
-            if cur_backend in autotune_supported_backends:
-                if args.verbose >= 1:
-                    print(
-                        f"[INFO] Autotune warmup for gemm_fp8_nt_groupwise: {warmup_iters} iters"
-                    )
-                with autotune(True, cache=cache_path):
-                    for _ in range(warmup_iters):
-                        run_backend(cur_backend, a_fp8, b_fp8, a_scale, b_scale)
-            else:
-                print(f"[INFO] {cur_backend} backend does not support autotune")
-    elif cache_path:
-        with autotune(False, cache=cache_path):
-            pass
-
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
@@ -468,14 +446,6 @@ def testGemmFp8NtGroupwise(args):
         )
 
     for backend in backends:
-        backend_name = backend + (
-            "_autotune"
-            if (
-                getattr(args, "autotune", False)
-                and backend in autotune_supported_backends
-            )
-            else ""
-        )
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
             std_time = np.std(backend_times[backend])
@@ -486,7 +456,7 @@ def testGemmFp8NtGroupwise(args):
             ) * out_dtype.itemsize
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
-            print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
         if args.output_path is not None:
             cur_res = defaultdict(str)
@@ -502,7 +472,7 @@ def testGemmFp8NtGroupwise(args):
             cur_res["scale_major_mode"] = scale_major_mode
             cur_res["out_dtype"] = out_dtype
             cur_res["mma_sm"] = mma_sm
-            cur_res["backend"] = backend_name
+            cur_res["backend"] = backend
             cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
     return res
@@ -739,7 +709,6 @@ def testBmmFp8(args):
         "cudnn",
         "cublas",
         "auto",
-        "batch_invariant",
     ]
     res = []
 
@@ -808,6 +777,7 @@ def testBmmFp8(args):
     for backend in backends:
         if (
             getattr(args, "autotune", False)
+            and backend != "batch_invariant"
             and backend not in autotune_supported_backends
         ):
             print(f"[INFO] {backend} backend does not support autotune")
@@ -1478,7 +1448,6 @@ def testMmFp4(args):
         "cute-dsl",
         "b12x",
         "auto",
-        "batch_invariant",
     ]
     res = []
 
@@ -1593,9 +1562,9 @@ def testMmFp4(args):
     backends_to_remove = []
 
     for backend in backends:
-        # Skip autotune check for now (handled separately below)
         if (
             getattr(args, "autotune", False)
+            and backend != "batch_invariant"
             and backend not in autotune_supported_backends
         ):
             print(f"[INFO] {backend} backend does not support autotune")
@@ -1637,6 +1606,8 @@ def testMmFp4(args):
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
         )
         for cur_backend in backends:
+            if cur_backend not in autotune_supported_backends:
+                continue
             if args.verbose >= 1:
                 print(f"[INFO] Autotune warmup for mm_fp4: {warmup_iters} iters")
             with autotune(True, cache=cache_path):
@@ -2042,7 +2013,6 @@ def testMmMxfp8(args):
         "trtllm",
         "cudnn",
         "auto",
-        "batch_invariant",
     ]
     res = []
 
@@ -2061,7 +2031,10 @@ def testMmMxfp8(args):
     if getattr(args, "autotune", False):
         backends_to_remove = []
         for cur_backend in backends:
-            if cur_backend not in autotune_supported_backends:
+            if (
+                cur_backend != "batch_invariant"
+                and cur_backend not in autotune_supported_backends
+            ):
                 print(f"[INFO] {cur_backend} backend does not support autotune")
                 backends_to_remove.append(cur_backend)
         for cur_backend in backends_to_remove:
@@ -2330,7 +2303,6 @@ def testMmBf16(args):
         "tinygemm",
         "cute-dsl",
         "auto",
-        "batch_invariant",
     ]
     res = []
 
@@ -2395,9 +2367,9 @@ def testMmBf16(args):
     # Programmatically filter backends
     backends_to_remove = []
     for backend in backends:
-        # Skip autotune check for now (handled separately below)
         if (
             getattr(args, "autotune", False)
+            and backend != "batch_invariant"
             and backend not in autotune_supported_backends
         ):
             print(f"[INFO] {backend} backend does not support autotune")

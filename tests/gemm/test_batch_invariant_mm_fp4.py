@@ -1,41 +1,23 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant 4-bit GEMMs: ``flashinfer.mm_fp4(a, b, a_descale, b_descale, alpha, backend="auto",
-use_nvfp4=..., batch_invariant=True)``.
+"""Batch-invariant MXFP4 and NVFP4 GEMM: dequantized references, output scaling and row invariance."""
 
-NVFP4 (one e4m3 block scale per 16 elements): the classes ``gemm.nvfp4.kfold`` / ``kchunk[C]`` (the SM100 / SM103
-instruction: 64 e2m1 elements per step) and, on SM107, ``gemm.nvfp4.kfold128`` for the weight shapes the chunk rule leaves
-unsplit (the SM107 instruction: 128 per step). MXFP4 (one UE8M0 scale per 32): ``gemm.mxfp4.kfold`` / ``kchunk[C]`` and on
-SM107 ``gemm.mxfp4.kfold128`` / ``kchunk128[C]``. All are the dense K fold with a block-scaled step, the scales applied
-inside the instruction, and the chain ``cvt.rn(mul.rn(fold, alpha))`` with the caller's scalar alpha. There is no exact CPU
-oracle for the step, so the classes are checked by bit agreement across their configurations -- the dense records, the
-swapped decode records, the in-cluster split, the in-CTA chunk fold, the workspace split and (SM107) the B-reuse record,
-the hardware hypothesis of ``lean/BIKernels/GEMMConfig.lean`` -- by the launch-model properties R1-R2 on adversarial
-operands and scales, by the exactness of the alpha chain against the exposed fp32 fold, by bit equality with FlashInfer's
-own CuTe-DSL FP4 kernel (the same instruction, the same K order) and by an accuracy yardstick against the other backends.
-Device-free tests cover the fingerprints (``use_nvfp4`` and the architecture are dimensions; the SM107 NVFP4 class rule),
-the chunk rule, the spaces, the dispatcher and the tuner's tactic encoding; the GPU tests need SM100 / SM103 / SM107.
-"""
-
-import dataclasses
+from unittest.mock import patch
 
 import pytest
 import torch
 
 import flashinfer
 from flashinfer import batch_invariant as bi
-from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.gemm.batch_invariant import tuning
+from flashinfer.gemm import gemm_base
+from flashinfer.autotuner import autotune
 from flashinfer.gemm.batch_invariant.api import (
-    MM_FP4_ARCHS,
     fp4_format_for,
     mm_fp4_batch_invariant,
-    part_of,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
-    Knobs,
     enumerate_space,
     knob_product,
 )
@@ -56,13 +38,7 @@ from flashinfer.gemm.batch_invariant.spec import (
 
 E4 = torch.float8_e4m3fn
 FP4X2 = getattr(torch, "float4_e2m1fn_x2", None)
-_supported = torch.cuda.is_available() and bi.is_supported_device(
-    torch.device("cuda"), MM_FP4_ARCHS
-)
-needs_device = pytest.mark.skipif(
-    not _supported,
-    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
-)
+needs_device = pytest.mark.usefixtures("cudnn_batch_invariant_device")
 both_formats = pytest.mark.parametrize("nv", [True, False], ids=["nvfp4", "mxfp4"])
 #: The e2m1 values by nibble code (sign in bit 3).
 E2M1 = torch.tensor(
@@ -106,11 +82,6 @@ def swizzle_sf(sf_rows: torch.Tensor) -> torch.Tensor:
     flat = torch.empty(rt * 128 * kt * 4, dtype=torch.uint8)
     flat[off.reshape(-1)] = buf.reshape(-1)
     return flat.cuda()
-
-
-def unswizzle_sf(flat: torch.Tensor, rows: int, kb: int) -> torch.Tensor:
-    rt, kt, off = _sf_offsets(rows, kb)
-    return flat.cpu()[off.reshape(-1)].view(rt * 128, kt * 4)[:rows, :kb].clone()
 
 
 def sf_values(sf_rows: torch.Tensor, nv: bool) -> torch.Tensor:
@@ -410,27 +381,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count, nv):
                 assert cfg in space, cfg.describe()
 
 
-def test_tactic_encoding_round_trips():
-    for fmt, shape in (
-        ("nvfp4", (16, 128, 8192, 4)),
-        ("nvfp4_k128", (8, 4096, 4096, 1)),
-        ("mxfp4", (300, 4096, 4096, 1)),
-        ("mxfp4_k128", (16, 128, 4096, 2)),
-    ):
-        M, N, K, C = shape
-        for cfg in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)[::37]:
-            t = tuning.knobs_to_tactic(cfg)
-            assert (
-                len(t) == 13
-                and tuning.knobs_from_tactic(t) == cfg
-                and tuning.knobs_from_tactic(list(t)) == cfg
-            )
-    assert tuning.OUT_INDEX["mm_fp4"] == 5 and set(tuning.TUNING_CONFIG_MM_FP4) == {
-        "nvfp4",
-        "mxfp4",
-    }
-
-
 def test_flag_bypasses_the_operator_backend_selection():
     """Under ``batch_invariant=True`` the operator's auto-backend heuristic yields a non-empty list whatever the backends'
     availability: the flag path runs the class, so a missing FP4 backend never turns into a backend error."""
@@ -443,31 +393,6 @@ def test_flag_bypasses_the_operator_backend_selection():
     assert _heuristic_func_mm_fp4(
         [], a, b, sf, sf, use_nvfp4=False, batch_invariant=True
     )
-
-
-def test_runner_shape_matches_the_dispatcher_for_every_api():
-    """The autotuner's runner recovers the real (M, N, K) from its inputs for every API (K in elements: the 4-bit operands
-    are byte-packed, the others are not), so its default tactic is the dispatcher's own pick at the real shape."""
-    M, N, K = 300, 4096, 4096
-    a16 = torch.zeros(M, K, dtype=torch.bfloat16)
-    b16 = torch.zeros(K, N, dtype=torch.bfloat16)
-    a8, b8 = a16.to(torch.float8_e4m3fn), b16.to(torch.float8_e4m3fn)
-    a4 = torch.zeros(M, K // 2, dtype=torch.uint8)
-    b4 = torch.zeros(K // 2, N, dtype=torch.uint8)
-    sf = torch.zeros(1, dtype=torch.uint8)
-    cases = [
-        ("mm_bf16", "bf16", "n", [a16, b16, None, None]),
-        ("bmm_fp8", "e4m3", "k", [a8[None], b8[None], None, None, None]),
-        ("mm_mxfp8", "mxfp8", "k", [a8, b8, sf, sf, None]),
-        ("mm_fp4", "nvfp4", "k", [a4, b4, sf, sf, None, None]),
-        ("mm_fp4", "mxfp4", "k", [a4, b4, sf, sf, None, None]),
-    ]
-    for api, fmt, lay, inputs in cases:
-        runner = tuning.BatchInvariantGemmRunner(api, fmt, lay, 1, 148, "sm_100")
-        assert runner._shape(inputs) == (M, N, K), api
-        assert runner.config_for(inputs, -1) == default_config(
-            M, N, K, 1, lay, 148, "sm_100", fmt
-        ), api
 
 
 def test_unsupported_device_raises_before_any_kernel():
@@ -542,14 +467,14 @@ def test_matches_flashinfer_backends(M, N, K, od, nv):
 @both_formats
 @pytest.mark.parametrize("M,N,K", [(300, 4096, 4096), (37, 128, 8192)])
 def test_alpha_chain_is_one_mul_rn_then_one_cvt_rn(M, N, K, nv):
-    """The chain: the fp32 fold (exposed by the direct entry at alpha = 1), one ``mul.rn`` by alpha and one conversion; the
-    same in torch for a bf16 and an fp16 output and an alpha that is not a power of two; None is alpha 1.0; the swapped
-    decode record and the split placements apply it in the same place."""
-    a, sfa, _ = adv_fp4(M, K, 15, nv, span=1 if nv else 2)
-    b, sfb, _ = weight(N, K, 16, nv, span=1 if nv else 2)
-    f32 = direct(a, b, sfa, sfb, alpha_of(1.0), nv, out_dtype=torch.float32)
-    assert torch.equal(
-        bits(f32), bits(direct(a, b, sfa, sfb, None, nv, out_dtype=torch.float32))
+    """A single packed byte in each activation row makes the unscaled dot exact. Check alpha and final rounding."""
+    a, sfa, a_rows = adv_fp4(M, K, 15, nv, span=1)
+    b, sfb, b_rows = weight(N, K, 16, nv, span=1)
+    a[:, 1:] = 0
+    f32 = (
+        (dequant(a, a_rows, nv)[:, :2] @ dequant(b.t(), b_rows, nv)[:, :2].t())
+        .float()
+        .to(a.device)
     )
     for al in (0.3, 1.0 / 3.0, 2.0**-7):
         alpha = alpha_of(al)
@@ -558,21 +483,6 @@ def test_alpha_chain_is_one_mul_rn_then_one_cvt_rn(M, N, K, nv):
             assert torch.equal(
                 bits(bi_mm(a, b, sfa, sfb, alpha, nv, out_dtype=od)), bits(chain)
             ), (al, od)
-    alpha = alpha_of(0.3)
-    chain = (f32 * alpha).to(torch.bfloat16)
-    fmt = fp4_format_for(torch.device("cuda"), nv, N, K)
-    C = chunks_for(N, K, fmt)
-    picks = [
-        k
-        for k in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)
-        if (k.swap_ab or k.cluster_k == C or k.cta_chunks)
-        and can_implement(k, M, N, K, "k", C, fmt)
-    ]
-    assert picks
-    for k in picks[::5] + [picks[-1]]:
-        assert torch.equal(
-            bits(direct(a, b, sfa, sfb, alpha, nv, config=k, chunks=C)), bits(chain)
-        ), k.describe()
 
 
 @needs_device
@@ -589,18 +499,14 @@ def test_partial_last_step_reads_finite_scale_padding(K, nv):
     out = bi_mm(a, b, sfa, sfb, alpha, nv)
     assert torch.isfinite(out.float()).all()
     assert norm_rel_err(out, a, ra, b.t(), rb, alpha, nv) <= 2.0**-8
-    f32 = direct(a, b, sfa, sfb, alpha, nv, out_dtype=torch.float32)
-    assert torch.equal(bits(f32.to(torch.bfloat16)), bits(out))
 
 
 @needs_device
 @both_formats
 @pytest.mark.parametrize("M,N,K", [(300, 4096, 4096), (37, 128, 8192), (8, 4096, 4096)])
 def test_determinism_and_graph_replay(M, N, K, nv):
-    from flashinfer.gemm.batch_invariant import api
-
-    a, sfa, _ = adv_fp4(M, K, 21, nv)
-    b, sfb, _ = weight(N, K, 22, nv)
+    a, sfa, a_rows = adv_fp4(M, K, 21, nv)
+    b, sfb, b_rows = weight(N, K, 22, nv)
     alpha = alpha_of(0.7)
     ref = bits(bi_mm(a, b, sfa, sfb, alpha, nv)).clone()
     for _ in range(3):
@@ -621,29 +527,25 @@ def test_determinism_and_graph_replay(M, N, K, nv):
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
-    # alpha = None (1.0) captured first: the ones-tensor made under capture is not the cached one (its fill would only
-    # run on replay), so an eager call before the first replay is right, and the replay is too
-    ref1 = bits(bi_mm(a, b, sfa, sfb, alpha_of(1.0), nv)).clone()
-    saved = dict(api._ONES)
-    api._ONES.clear()
-    try:
-        out1 = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            g1 = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g1):
-                bi_mm(a, b, sfa, sfb, None, nv, out=out1)
-        torch.cuda.current_stream().wait_stream(s)
-        assert torch.equal(
-            bits(bi_mm(a, b, sfa, sfb, None, nv)), ref1
-        )  # eager, before any replay
-        out1.zero_()
-        g1.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(bits(out1), ref1)
-    finally:
-        api._ONES.clear()
-        api._ONES.update(saved)
+    # Leave two active K elements so the unscaled dot product has an exact independent oracle.
+    a_unit = a.clone()
+    a_unit[:, 1:] = 0
+    lhs = dequant(a_unit, a_rows, nv)[:, :2]
+    rhs = dequant(b.t(), b_rows, nv)[:, :2]
+    expected = bits((lhs @ rhs.t()).to(torch.bfloat16)).to(a.device)
+    # Capture the implicit unit scale, then check eager execution before the first replay.
+    out1 = torch.empty_like(out)
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        g1 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g1):
+            bi_mm(a_unit, b, sfa, sfb, None, nv, out=out1)
+    torch.cuda.current_stream().wait_stream(s)
+    assert torch.equal(bits(bi_mm(a_unit, b, sfa, sfb, None, nv)), expected)
+    out1.zero_()
+    g1.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out1), expected)
 
 
 @needs_device
@@ -667,21 +569,6 @@ def test_batch_invariance_along_rows(nv):
     x = torch.cat([x5, a[100:101], x7])
     sfx = swizzle_sf(torch.cat([r5, ra[100:101], r7]))
     assert torch.equal(bits(bi_mm(x, b, sfx, sfb, alpha, nv))[5], full[100])
-    # the dispatcher's picks for other row counts and parts compute the same bits
-    fmt = fp4_format_for(torch.device("cuda"), nv, N, K)
-    for M in (16, 1000):
-        for cfg in (
-            default_config(M, N, K, 1, "k", 204, "sm_107", fmt),
-            default_config(2049, N, K, 1, "k", 148, "sm_100", fmt),
-            default_config(1, N, K, 1, "k", 148, "sm_100", fmt),
-        ):
-            if can_implement(cfg, M, N, K, "k", 1, fmt):
-                got = bits(
-                    direct(
-                        a[:M].clone(), b, swizzle_sf(ra[:M]), sfb, alpha, nv, config=cfg
-                    )
-                )
-                assert torch.equal(got, full[:M]), (M, cfg.describe())
 
 
 @needs_device
@@ -711,220 +598,9 @@ def test_permutation_and_subbatch_invariance(N, K, nv):
 
 @needs_device
 @both_formats
-@pytest.mark.parametrize("M,N,K", [(1000, 4096, 4096), (37, 2048, 4000 + 96)])
-def test_config_agreement(M, N, K, nv):
-    """R3: every configuration the tuner may choose (the dispatcher's top candidates on every part that runs the class) and
-    a spread of hand-picked records (1- and 2-CTA MMA, the 64- / 128- / 192- / 256-wide tiles, clusters, both rasters,
-    swizzles, the B-reuse tile on SM107) give identical bits."""
-    fmt = fp4_format_for(torch.device("cuda"), nv, N, K)
-    a, sfa, _ = adv_fp4(M, K, 61, nv)
-    b, sfb, _ = weight(N, K, 62, nv)
-    alpha = alpha_of(0.6)
-    cfgs = []
-    for family, sm in PARTS:
-        if (
-            fp4_class_for(N, K, family) if nv else mx_class_for("mxfp4", family)
-        ) == fmt:
-            cfgs += rank_topk(M, N, K, 1, "k", sm, 10, family, fmt)
-    cfgs += [
-        Knobs((128, 64), (1, 1), False, True, "m", 1),
-        Knobs((128, 128), (1, 2), False, True, "n", 2),
-        Knobs((128, 192), (4, 1), False, True, "m", 8),
-        Knobs((128, 256), (2, 1), False, True, "m", 1),
-        Knobs((256, 64), (2, 2), True, True, "n", 4),
-        Knobs((256, 128), (2, 1), True, True, "m", 1),
-        Knobs((256, 192), (2, 2), True, True, "m", 2),
-        Knobs((256, 256), (4, 1), True, True, "n", 1),
-        Knobs((512, 128), (2, 1), True, True, "m", 1),  # B-reuse (SM107)
-        Knobs((512, 256), (2, 2), True, True, "n", 2),
-    ]
-    cfgs = list(dict.fromkeys(cfgs))
-    ref = None
-    checked = 0
-    for c in cfgs:
-        if not can_implement(c, M, N, K, "k", 1, fmt):
-            continue
-        got = bits(direct(a, b, sfa, sfb, alpha, nv, config=c))
-        if ref is None:
-            ref = got
-        assert torch.equal(got, ref), f"{c.describe()} differs"
-        checked += 1
-    assert checked >= 14
-
-
-@needs_device
-@both_formats
-def test_swapped_decode_records_compute_the_class(nv):
-    """The decode specialisation (``swap_ab``: the weights as the kernel's A, the tokens as its B, one token tile) on the
-    narrow 8 / 16 / 32 tiles (and the 64-wide one for MXFP4; the NVFP4 spaces have no swapped record above 32 rows), 1- and
-    2-CTA, clusters along M, every raster: the same bits as the dense records (the block-scaled step is symmetric in its
-    operands), at M = 1 .. 64 and for a bf16 and an fp16 output."""
-    N, K = 4096, 4096
-    fmt = fp4_format_for(torch.device("cuda"), nv, N, K)
-    for M, od in (
-        (1, torch.bfloat16),
-        (5, torch.float16),
-        (8, torch.bfloat16),
-        (16, torch.float16),
-        (33, torch.bfloat16),
-        (64, torch.bfloat16),
-    ):
-        span = None if od == torch.bfloat16 else (1 if nv else 2)
-        a, sfa, _ = adv_fp4(M, K, 70 + M, nv, span=span)
-        b, sfb, _ = weight(N, K, 71, nv, span=span)
-        alpha = alpha_of(0.5 if od == torch.bfloat16 else 2.0**-6)
-        dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
-        ref = bits(direct(a, b, sfa, sfb, alpha, nv, out_dtype=od, config=dense))
-        recs = [
-            k for k in enumerate_space(M, N, K, b_major="k", in_fmt=fmt) if k.swap_ab
-        ]
-        pick = {(k.tile_n, k.tile_m, k.cluster_m, k.raster_along): k for k in recs}
-        if nv and M > 32:
-            # no 64-wide token tile in the NVFP4 spaces: above 32 rows the decode shape runs the dense records
-            assert not recs
-            assert torch.equal(
-                bits(bi_mm(a, b, sfa, sfb, alpha, nv, out_dtype=od)), ref
-            )
-            continue
-        assert len(pick) >= 4, M
-        wide = [k for k in recs if k.tile_n == 64][:4]
-        assert bool(wide) == (not nv)  # the 64-wide token tile: the UE8M0 formats only
-        for k in list(pick.values())[::3] + wide:
-            got = bits(direct(a, b, sfa, sfb, alpha, nv, out_dtype=od, config=k))
-            assert torch.equal(got, ref), (M, k.describe())
-        assert torch.equal(
-            bits(bi_mm(a, b, sfa, sfb, alpha, nv, out_dtype=od)), ref
-        )  # the dispatcher's own pick
-
-
-@needs_device
-@both_formats
-@pytest.mark.parametrize(
-    "M,N,K,od",
-    [
-        (37, 128, 8192, torch.bfloat16),
-        (300, 128, 16384, torch.float16),
-        (16, 128, 4096, torch.bfloat16),
-    ],
-)
-def test_split_implementations_agree(M, N, K, od, nv):
-    """The split class ``kchunk[C]`` has three implementations: the workspace split (chunks on different CTAs, an fp32
-    workspace, a fixup fold in chunk order and the chain), the in-CTA chunk fold (one CTA folds every chunk of its tile
-    through a TMEM running sum) and the in-cluster split (the chunks on the CTAs of one cluster, the fold through
-    distributed shared memory). They are one term in Lean (``ctaSplitBS_eq_kchunkBS``, ``clusterSplitMX4_eq_kchunkMX4`` and
-    the SM107 twins) and one bit pattern here; and the split class is a different specification from the unsplit fold."""
-    fmt = fp4_format_for(torch.device("cuda"), nv, N, K)
-    C = chunks_for(N, K, fmt)
-    assert C > 1
-    span = None if od == torch.bfloat16 else (1 if nv else 2)
-    a, sfa, _ = adv_fp4(M, K, 81, nv, span=span)
-    b, sfb, _ = weight(N, K, 82, nv, span=span)
-    alpha = alpha_of(0.8 if od == torch.bfloat16 else 2.0**-7)
-    ws = Knobs((128, 64), (1, 1), False, True, "m", 1)
-    ref = bits(direct(a, b, sfa, sfb, alpha, nv, out_dtype=od, config=ws, chunks=C))
-    space = enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)
-    recs = [
-        k
-        for k in rank_topk(M, N, K, C, "k", 204, 10, "sm_107", fmt)
-        if k.cta_chunks or k.cluster_k > 1
-    ]
-    recs += [k for k in space if k.cluster_k > 1][::7]
-    recs += [k for k in space if k.cta_chunks][::29]
-    recs += [
-        Knobs((128, 64), (1, 4), False, True, "m", 1, 0, True),
-        Knobs((256, 128), (2, 1), True, True, "n", 2, 0, True),
-        Knobs((128, 128), (1, 1), False, True, "m", 1, 0, False, 2),
-        Knobs((128, 64), (1, 1), False, True, "n", 1, 0, False, 4),
-    ]
-    recs = [k for k in dict.fromkeys(recs) if can_implement(k, M, N, K, "k", C, fmt)]
-    assert any(k.cta_chunks for k in recs)
-    assert C not in (2, 4) or any(k.cluster_k > 1 for k in recs)
-    for k in recs:
-        got = bits(direct(a, b, sfa, sfb, alpha, nv, out_dtype=od, config=k, chunks=C))
-        assert torch.equal(got, ref), k.describe()
-    assert torch.equal(bits(bi_mm(a, b, sfa, sfb, alpha, nv, out_dtype=od)), ref)
-    if od == torch.bfloat16:
-        # a different specification from the unsplit fold: the fp32 folds differ wherever the fold rounds (the fp16 cases run
-        # narrow scales for a finite output, under which a 4-bit fold can be exact in fp32 and the association cannot show)
-        f32 = dict(out_dtype=torch.float32, config=ws)
-        assert not torch.equal(
-            bits(direct(a, b, sfa, sfb, alpha, nv, chunks=1, **f32)),
-            bits(direct(a, b, sfa, sfb, alpha, nv, chunks=C, **f32)),
-        )
-
-
-@needs_device
-@both_formats
-def test_persistent_grid_size_does_not_change_bits(nv):
-    """R2 for the SM count: a smaller persistent grid is what a smaller part, an SM carveout, MPS or a green context
-    produce; it only decides which CTA computes which tile (and, for the split class, which chunk)."""
-    for M, N, K in [(1000, 4096, 4096), (64, 64, 65536)]:
-        fmt = fp4_format_for(torch.device("cuda"), nv, N, K)
-        a, sfa, _ = adv_fp4(M, K, 91, nv)
-        b, sfb, _ = weight(N, K, 92, nv)
-        alpha = alpha_of(0.4)
-        C = chunks_for(N, K, fmt)
-        base = default_config(M, N, K, C, "k", 204, "sm_107", fmt)
-        ref = bits(direct(a, b, sfa, sfb, alpha, nv, config=base, chunks=C))
-        for g in (1, 3, 17, 74):
-            cfg = dataclasses.replace(base, grid_clusters=g)
-            assert torch.equal(
-                bits(direct(a, b, sfa, sfb, alpha, nv, config=cfg, chunks=C)), ref
-            ), f"grid={g} at {(M, N, K)}"
-
-
-@needs_device
-@both_formats
-def test_the_two_instructions_are_two_classes(nv):
-    """On SM107 both instructions exist: the sm_100 classes (``in_fmt="nvfp4"`` / ``"mxfp4"``) run there too and are
-    different specifications from the 128-wide step's; the NVFP4 class rule picks the 64-wide step's class for a split weight
-    shape (the same bits as on SM100 / SM103)."""
-    fam = part_of(torch.device("cuda"))[1]
-    base, k128 = ("nvfp4", "nvfp4_k128") if nv else ("mxfp4", "mxfp4_k128")
-    a, sfa, _ = adv_fp4(300, 4096, 93, nv)
-    b, sfb, _ = weight(2048, 4096, 94, nv)
-    alpha = alpha_of(0.75)
-    if fam != "sm_107":
-        with pytest.raises(bi.BatchInvariantUnsupportedError, match="on SM107"):
-            direct(a, b, sfa, sfb, alpha, nv, in_fmt=k128)
-        assert fp4_format_for(torch.device("cuda"), nv, 2048, 4096) == base
-        assert fp4_format_for(torch.device("cuda"), nv, 128, 8192) == base
-        return
-    assert fp4_format_for(torch.device("cuda"), nv, 2048, 4096) == k128
-    wide = bits(direct(a, b, sfa, sfb, alpha, nv))
-    narrow = bits(direct(a, b, sfa, sfb, alpha, nv, in_fmt=base))
-    assert not torch.equal(wide, narrow)
-    for fmt, ref in ((base, narrow), (k128, wide)):
-        for c in rank_topk(300, 2048, 4096, 1, "k", 204, 4, "sm_107", fmt):
-            assert torch.equal(
-                bits(direct(a, b, sfa, sfb, alpha, nv, config=c, in_fmt=fmt)), ref
-            ), (
-                fmt,
-                c.describe(),
-            )
-    # a split weight shape: NVFP4 runs the 64-wide step's class on SM107 (the rule), MXFP4 the 128-wide one
-    a2, sfa2, _ = adv_fp4(300, 8192, 95, nv)
-    b2, sfb2, _ = weight(128, 8192, 96, nv)
-    dev_fmt = fp4_format_for(torch.device("cuda"), nv, 128, 8192)
-    assert dev_fmt == (base if nv else k128)
-    other = k128 if nv else base
-    assert not torch.equal(
-        bits(direct(a2, b2, sfa2, sfb2, alpha, nv)),
-        bits(direct(a2, b2, sfa2, sfb2, alpha, nv, in_fmt=other)),
-    )
-    assert torch.equal(
-        bits(bi_mm(a2, b2, sfa2, sfb2, alpha, nv)),
-        bits(direct(a2, b2, sfa2, sfb2, alpha, nv, in_fmt=dev_fmt)),
-    )
-
-
-@needs_device
-@both_formats
 @pytest.mark.parametrize("N,K", [(4096, 4096), (128, 8192)])
-def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, nv):
-    """Under ``autotune(True)`` the FlashInfer autotuner profiles the class's candidates (none may be dropped as
-    unsupported; the profiled row counts get scale buffers of their own size) and the tuned process computes the same
-    bits as the untuned one, during and after tuning."""
+def test_public_rows_keep_their_bits_inside_autotune(N, K, nv):
+    """The public batch-invariant entry agrees before, during and after autotuning."""
     a, sfa, ra = adv_fp4(300, K, 101, nv)
     b, sfb, _ = weight(N, K, 102, nv)
     alpha = alpha_of(0.55)
@@ -933,20 +609,8 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, nv):
         return bits(bi_mm(a[:M].contiguous(), b, swizzle_sf(ra[:M]), sfb, alpha, nv))
 
     ref = [run(M) for M in (1, 16, 300)]
-    tuner = AutoTuner.get()
-    before = {
-        k: len(v)
-        for k, v in tuner.stats.failed_tactics.items()
-        if tuning.CUSTOM_OP_MM_FP4 in k
-    }
     with autotune(True):
         tuned = [run(M) for M in (1, 16, 300)]
-    after = {
-        k: len(v)
-        for k, v in tuner.stats.failed_tactics.items()
-        if tuning.CUSTOM_OP_MM_FP4 in k
-    }
-    assert after == before, f"tactics failed while profiling: {after}"
     post = [run(M) for M in (1, 16, 300)]
     for r, t, p in zip(ref, tuned, post, strict=True):
         assert torch.equal(r, t) and torch.equal(r, p)
@@ -955,7 +619,7 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, nv):
 
 @needs_device
 def test_public_api_skips_backend_selection(monkeypatch):
-    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    """batch_invariant=True uses the cuDNN plan directly, so the @backend_requirement wrapper must not run the auto selection
     for it (host cost only): a selecting call rewrites `mm_fp4.suitable_auto_backends`, a bypassed one leaves it."""
     a, sfa, _ = adv_fp4(16, 4096, 131, True)
     b, sfb, _ = weight(4096, 4096, 132, True)
@@ -970,19 +634,41 @@ def test_public_api_skips_backend_selection(monkeypatch):
 
 @needs_device
 @pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (37, 128, 8192)])
-def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
-    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
-    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
-    (only the entry's own fresh output skips the aliasing check)."""
+def test_public_output_buffer_and_graph_replay(M, N, K):
+    """A caller-provided output survives graph replay and must be disjoint from the inputs."""
     nv = True
-    a, sfa, _ = adv_fp4(M, K, 181, nv)
-    b, sfb, _ = weight(N, K, 182, nv)
+    a, sfa, a_rows = adv_fp4(M, K, 181, nv)
+    b, sfb, b_rows = weight(N, K, 182, nv)
     alpha = alpha_of(0.5)
-    ref = bits(direct(a, b, sfa, sfb, alpha, nv))
-    assert torch.equal(bits(bi_mm(a, b, sfa, sfb, alpha, nv)), ref)
+    got = bi_mm(a, b, sfa, sfb, alpha, nv)
+    assert norm_rel_err(got, a, a_rows, b.t(), b_rows, alpha, nv) <= 2**-8
+    ref = bits(got)
     out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     assert bi_mm(a, b, sfa, sfb, alpha, nv, out=out) is out
     assert torch.equal(bits(out), ref)
+    chunks = chunks_for(N, K, "nvfp4")
+    if chunks > 1:
+        storage = torch.full(
+            (chunks * M * N + 8,), float("nan"), dtype=torch.float32, device=a.device
+        )
+        scratch = storage[4:-4]
+        out.fill_(float("nan"))
+        with patch.object(
+            gemm_base,
+            "_execute_cudnn_batch_invariant",
+            wraps=gemm_base._execute_cudnn_batch_invariant,
+        ) as execute:
+            assert (
+                mm_fp4_batch_invariant(
+                    a, b, sfa, sfb, alpha, out=out, workspace=scratch
+                )
+                is out
+            )
+        used = execute.call_args.args[0].get_workspace_size() // scratch.element_size()
+        assert torch.equal(bits(out), ref)
+        assert torch.isnan(storage[:4]).all() and torch.isnan(storage[4 + used :]).all()
+        if used:
+            assert torch.isfinite(scratch[:used]).any()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -995,13 +681,14 @@ def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(bits(out), ref)
-    buf = torch.empty(M * max(2 * N, K // 2), dtype=torch.uint8, device="cuda")
-    alias_a = buf[: M * K // 2].view(M, K // 2)
+    buf = torch.empty(M * max(2 * N, K // 2 + 1), dtype=torch.uint8, device="cuda")
     alias_out = buf[: 2 * M * N].view(torch.bfloat16).view(M, N)
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
-    ):
-        bi_mm(alias_a, b, sfa, sfb, alpha, nv, out=alias_out)
+    for pitch in (K // 2, K // 2 + 1):
+        alias_a = buf.as_strided((M, K // 2), (pitch, 1))
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+        ):
+            bi_mm(alias_a, b, sfa, sfb, alpha, nv, out=alias_out)
 
 
 @needs_device
@@ -1014,14 +701,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         flashinfer.mm_fp4(
             a, b, sfa, sfb, alpha, backend="cutlass", batch_invariant=True
         )
-    # the class's checks, reached through the API (which runs no backend checks for the flag) and through its entries
-    auto = tuning.mm_fp4_batch_invariant_auto
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="8x4"):
-        auto(a, b, sfa, sfb, alpha, torch.bfloat16, None, 16, True, "auto", True)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="block_size"):
-        auto(a, b, sfa, sfb, alpha, torch.bfloat16, None, 32, False, "auto", True)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16"):
-        auto(a, b, sfa, sfb, alpha, torch.float32, None, 16, False, "auto", True)
+        bi_mm(a, b, sfa, sfb, alpha, nv, use_8x4_sf_layout=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="K-major"):
         bi_mm(a, b.contiguous(), sfa, sfb, alpha, nv)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="packed fp4"):
@@ -1061,21 +742,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             nv,
             out=torch.empty(16, 4096, dtype=torch.float16, device="cuda"),
         )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
-        direct(a, b, sfa, sfb, alpha, nv, chunks=0)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="granules"):
-        direct(a, b, sfa, sfb, alpha, nv, chunks=128)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
-        direct(
-            a,
-            b,
-            sfa,
-            sfb,
-            alpha,
-            nv,
-            config=Knobs((128, 64), (1, 1), False, True, "m", 1, 0, False, 1, True),
-            chunks=1,
-        )
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="block_size"):
         mm_fp4_batch_invariant(a, b, sfa, sfb, alpha, use_nvfp4=nv, block_size=32)
     # the quantizers' dtypes are the same bytes: e4m3-typed NVFP4 scales and the packed-fp4 torch dtype
@@ -1090,65 +756,3 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         a[:0], b, swizzle_sf(torch.zeros(0, 256, dtype=torch.uint8)), sfb, alpha, nv
     )
     assert out.shape == (0, 4096)
-
-
-@needs_device
-@both_formats
-def test_chunk_count_and_workspace_checks(nv):
-    """A caller workspace may not overlap the output or alpha: the split class writes its partials there before the fixup
-    reads them; the workspace split at M beyond the hardware's grid.y limit strides over rows and agrees with its own
-    sub-batch."""
-    M, N, K = 64, 128, 8192
-    a, sfa, _ = adv_fp4(M, K, 131, nv)
-    b, sfb, _ = weight(N, K, 132, nv)
-    alpha = alpha_of(0.45)
-    fmt = fp4_format_for(torch.device("cuda"), nv, N, K)
-    C = chunks_for(N, K, fmt)
-    assert C > 1
-    ws = torch.empty(C * M * N + 64, dtype=torch.float32, device="cuda")
-    ref = bits(bi_mm(a, b, sfa, sfb, alpha, nv)).clone()
-    wsplit = Knobs((128, 64), (1, 1), False, True, "m", 1)
-    assert torch.equal(
-        bits(
-            direct(a, b, sfa, sfb, alpha, nv, config=wsplit, workspace=ws[: C * M * N])
-        ),
-        ref,
-    )
-    out = ws.view(torch.bfloat16)[: M * N].view(M, N)
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
-    ):
-        direct(a, b, sfa, sfb, alpha, nv, out=out, config=wsplit, workspace=ws)
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
-    ):
-        direct(a, b, sfa, sfb, ws[:1], nv, config=wsplit, workspace=ws)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
-        direct(
-            ws.view(torch.uint8)[: 16 * K // 2].view(16, K // 2),
-            b,
-            swizzle_sf(torch.zeros(16, K // block(nv), dtype=torch.uint8)),
-            sfb,
-            alpha,
-            nv,
-            config=wsplit,
-            workspace=ws,
-        )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="scales overlapping"):
-        direct(
-            a,
-            b,
-            sfa,
-            ws.view(torch.uint8)[: sfb.numel()],
-            alpha,
-            nv,
-            config=wsplit,
-            workspace=ws,
-        )
-    big_m = 70000
-    ab, sfab, rab = adv_fp4(big_m, K, 133, nv)
-    full = bits(direct(ab, b, sfab, sfb, alpha, nv, config=wsplit, chunks=C))
-    assert torch.equal(
-        bits(bi_mm(ab[:777].contiguous(), b, swizzle_sf(rab[:777]), sfb, alpha, nv)),
-        full[:777],
-    )

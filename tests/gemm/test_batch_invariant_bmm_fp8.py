@@ -1,28 +1,14 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant fp8 GEMM: ``flashinfer.bmm_fp8(A, B, A_scale, B_scale, dtype, backend="auto", batch_invariant=True)``.
-
-The classes ``gemm.e4m3`` / ``gemm.e5m2`` (``kfold.scaled``, ``kchunk[C].scaled``) are the bf16 class's dataflow at the
-32-wide ``kind::f8f6f4`` step with the chain ``cvt(mul.rn(acc, mul.rn(a_scale, b_scale)))``. There is no exact CPU oracle
-for the MMA step, so the classes are checked by bit agreement across their configurations and the two implementations of
-the split class (the hardware hypothesis of ``lean/BIKernels/GEMMConfig.lean``), by the launch-model properties R1-R2 on
-adversarial operands, along the rows and along the batch index, by the exact chain (the scaled output against the fp32
-accumulator scaled on the CPU with the same correctly rounded operations), and by an accuracy yardstick against the
-fp8 backends of ``bmm_fp8``. Device-free tests cover the fingerprints, the chunk rule, the dispatcher and the tuner's
-tactic encoding; the GPU tests need SM100 / SM103 / SM107.
-"""
-
-import dataclasses
+"""Batch-invariant FP8 BMM: reference accuracy, scaling, row and batch invariance, and CUDA Graph replay."""
 
 import pytest
 import torch
 
 import flashinfer
 from flashinfer import batch_invariant as bi
-from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.gemm.batch_invariant import tuning
+from flashinfer.autotuner import autotune
 from flashinfer.gemm.batch_invariant.api import (
-    BMM_FP8_ARCHS,
     bmm_fp8_batch_invariant,
     mm_fp8_batch_invariant,
 )
@@ -30,7 +16,6 @@ from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
 from flashinfer.gemm.batch_invariant.heuristic import PARTS
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
-    Knobs,
     enumerate_space,
     knob_product,
 )
@@ -41,13 +26,7 @@ from flashinfer.gemm.batch_invariant.schedule import (
 )
 
 E4, E5 = torch.float8_e4m3fn, torch.float8_e5m2
-_supported = torch.cuda.is_available() and bi.is_supported_device(
-    torch.device("cuda"), BMM_FP8_ARCHS
-)
-needs_device = pytest.mark.skipif(
-    not _supported,
-    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
-)
+needs_device = pytest.mark.usefixtures("cudnn_batch_invariant_device")
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -192,17 +171,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                         assert cfg in spaces[b_major], cfg.describe()
 
 
-def test_tactic_encoding_round_trips():
-    for cfg in enumerate_space(16, 128, 8192, chunks=4, b_major="k", in_fmt="e4m3")[
-        ::97
-    ]:
-        t = tuning.knobs_to_tactic(cfg)
-        assert (
-            tuning.knobs_from_tactic(t) == cfg
-            and tuning.knobs_from_tactic(list(t)) == cfg
-        )
-
-
 def test_unsupported_device_raises_before_any_kernel():
     a = torch.zeros(2, 4, 64).to(E4)
     w = torch.zeros(2, 64, 64).to(E4).transpose(1, 2)
@@ -299,23 +267,6 @@ def test_batch_invariance_along_rows_and_batch():
     assert torch.equal(
         bits(bi_bmm(A5[perm].contiguous(), B5[perm], sa, sb)), out5[perm]
     )
-    # the dispatcher's picks for other row counts and parts compute the same bits
-    for M in (16, 1000):
-        c1 = mm_fp8_batch_invariant(
-            A[0, :M].clone(),
-            B[0],
-            sa,
-            sb,
-            config=default_config(M, N, K, 1, "k", 204, "sm_107", "e4m3"),
-        )
-        c2 = mm_fp8_batch_invariant(
-            A[0, :M].clone(),
-            B[0],
-            sa,
-            sb,
-            config=default_config(2049, N, K, 1, "k", 148, "sm_100", "e4m3"),
-        )
-        assert torch.equal(bits(c1), bits(c2)) and torch.equal(bits(c1), full[:M])
 
 
 @needs_device
@@ -354,107 +305,21 @@ def test_weight_layouts_agree():
 
 
 @needs_device
-@pytest.mark.parametrize("M,N,K,dt", [(1000, 4096, 4096, E4), (37, 2048, 4000, E5)])
-def test_config_agreement(M, N, K, dt):
-    """R3: every configuration the tuner may choose (the dispatcher's top candidates on every part, both layouts) and a spread
-    of hand-picked records (64- / 128- / 256-row tiles, 1- and 2-CTA MMA, clusters, both rasters, swizzles, the 16-wide decode
-    tile) give identical bits, for both weight layouts."""
-    fmt = "e4m3" if dt == E4 else "e5m2"
-    a, Bk = adv_fp8(M, K, seed=61, dt=dt), weights(1, N, K, 62, dt)[0]
-    Bn = Bk.contiguous()
-    sa, sb = scales()
-    cfgs = []
-    for family, sm in PARTS:
-        for lay in ("k", "n"):
-            cfgs += rank_topk(M, N, K, 1, lay, sm, 10, family, fmt)
-    cfgs += [
-        Knobs((64, 32), (1, 1), False, True, "m", 1),
-        Knobs((128, 128), (1, 2), False, True, "n", 2),
-        Knobs((128, 256), (2, 1), True, True, "m", 1),
-        Knobs((256, 64), (2, 2), True, True, "n", 4),
-        Knobs((128, 16), (1, 1), False, True, "m", 1),
-        Knobs((128, 16), (2, 1), True, True, "m", 1),
-        Knobs((64, 192), (4, 1), False, True, "m", 8),
-    ]
-    cfgs = list(dict.fromkeys(cfgs))
-    ref = None
-    checked = 0
-    for lay, B in (("k", Bk), ("n", Bn)):
-        for c in cfgs:
-            if not can_implement(c, M, N, K, lay, 1, fmt):
-                continue
-            got = bits(mm_fp8_batch_invariant(a, B, sa, sb, config=c))
-            if ref is None:
-                ref = got
-            assert torch.equal(got, ref), f"{c.describe()} ({lay}) differs"
-            checked += 1
-    assert checked >= 24
-
-
-@needs_device
-@pytest.mark.parametrize("dt", [E4, E5], ids=["e4m3", "e5m2"])
-@pytest.mark.parametrize(
-    "M,N,K,od", [(37, 128, 8192, torch.bfloat16), (300, 64, 16384, torch.float16)]
-)
-def test_cta_chunk_fold_equals_workspace_split(M, N, K, od, dt):
-    """The split class ``kchunk[C].scaled`` has two implementations: the workspace split (chunks on different CTAs, an fp32
-    workspace, a fixup fold in chunk order and the chain) and the in-CTA chunk fold (one CTA folds every chunk of its tile
-    through a TMEM running sum, the chain after the last chunk). They are one term in Lean (``ctaSplit32_eq_kchunk32``)
-    and one bit pattern here, on both weight layouts and both output dtypes; and the split class is a different
-    specification from the unsplit fold (expected)."""
-    fmt = "e4m3" if dt == E4 else "e5m2"
-    C = chunks_for(N, K, fmt)
-    assert C > 1
-    a, Bk = adv_fp8(M, K, seed=71, dt=dt), weights(1, N, K, 72, dt=dt)[0]
-    sa, sb = scales() if od == torch.bfloat16 else scales(2**-9 * 1.3, 2**-6 * 0.7)
-    ws = Knobs((128, 64), (1, 1), False, True, "m", 1)
-    ref = bits(mm_fp8_batch_invariant(a, Bk, sa, sb, out_dtype=od, config=ws, chunks=C))
-    recs = [
-        k for k in rank_topk(M, N, K, C, "k", 204, 10, "sm_107", fmt) if k.cta_chunks
-    ]
-    recs += [
-        Knobs((64, 32), (1, 4), False, True, "m", 1, 0, True),
-        Knobs((128, 64), (1, 1), False, True, "n", 1, 0, True),
-        Knobs((256, 128), (2, 1), True, True, "m", 2, 0, True),
-    ]
-    recs = [k for k in dict.fromkeys(recs) if can_implement(k, M, N, K, "k", C, fmt)]
-    assert len(recs) >= 3
-    for k in recs:
-        for B in (Bk, Bk.contiguous()):
-            assert torch.equal(
-                bits(
-                    mm_fp8_batch_invariant(
-                        a, B, sa, sb, out_dtype=od, config=k, chunks=C
-                    )
-                ),
-                ref,
-            ), k.describe()
-    assert torch.equal(
-        bits(bi_bmm(a.unsqueeze(0), Bk.unsqueeze(0), sa, sb, od))[0], ref
-    )  # the dispatcher's own pick (a per-element launch of the split class) is a member too
-    assert not torch.equal(
-        bits(mm_fp8_batch_invariant(a, Bk, sa, sb, out_dtype=od, config=ws, chunks=1)),
-        ref,
-    )
-
-
-@needs_device
 def test_scale_chain_is_exact():
-    """``out == cvt_rn(mul_rn(acc, mul_rn(a_scale, b_scale)))`` bit for bit, where ``acc`` is the kernel's own fp32 accumulator
-    (the fp32 output under unit scales: x * 1.0 is exact). Both CPU fp32 multiplies are correctly rounded, as is the bf16 /
-    fp16 conversion; the unsplit class and the split class (the fixup's chain and the in-CTA fold's) alike."""
-    one = torch.ones(1, device="cuda")
+    """Integer operands give exact partial sums, isolating both FP32 scale multiplies and the final conversion."""
+    rng = torch.Generator(device="cuda").manual_seed(81)
     for (M, N, K), od in [
         ((300, 2048, 1024), torch.bfloat16),
         ((64, 4096, 4096), torch.float16),
         ((16, 64, 65536), torch.bfloat16),
         ((16, 64, 65536), torch.float16),
     ]:
-        a, B = adv_fp8(M, K, seed=81), weights(1, N, K, 82)[0]
+        a = torch.randint(-4, 5, (M, K), device="cuda", generator=rng).to(E4)
+        B = torch.randint(-4, 5, (N, K), device="cuda", generator=rng).to(E4).t()
         sa, sb = scales()
-        acc = mm_fp8_batch_invariant(a, B, one, one, out_dtype=torch.float32).cpu()
+        acc = (a.double() @ B.double()).float().cpu()
         exact = (acc * (sa.cpu() * sb.cpu())).to(od)
-        got = mm_fp8_batch_invariant(a, B, sa, sb, out_dtype=od).cpu()
+        got = bi_bmm(a[None], B[None], sa, sb, dtype=od)[0].cpu()
         assert torch.equal(bits(got), bits(exact)), (
             M,
             N,
@@ -462,87 +327,19 @@ def test_scale_chain_is_exact():
             od,
             chunks_for(N, K, "e4m3"),
         )
-        if chunks_for(N, K, "e4m3") > 1:
-            cc = Knobs((128, 64), (1, 1), False, True, "m", 1, 0, True)
-            got_cc = mm_fp8_batch_invariant(a, B, sa, sb, out_dtype=od, config=cc).cpu()
-            assert torch.equal(bits(got_cc), bits(exact))
-
-
-@needs_device
-def test_workspace_split_at_large_m():
-    """The split class with its partials in the workspace at M beyond the hardware's grid.y limit (the fixup kernel strides
-    over rows): bit-equal to the in-CTA chunk fold and to its own sub-batch; a caller's workspace is checked."""
-    M, N, K = 70000, 128, 8192
-    C = chunks_for(N, K, "e4m3")
-    assert C == 4
-    a, B = adv_fp8(M, K, seed=111, cancel=False), weights(1, N, K, 112)[0]
-    sa, sb = scales()
-    ws_rec = Knobs((128, 64), (1, 1), False, True, "m", 1)
-    cta_rec = Knobs((128, 64), (1, 1), False, True, "m", 1, 0, True)
-    full = bits(mm_fp8_batch_invariant(a, B, sa, sb, config=ws_rec, chunks=C))
-    assert torch.equal(
-        full, bits(mm_fp8_batch_invariant(a, B, sa, sb, config=cta_rec, chunks=C))
-    )
-    assert torch.equal(
-        bits(mm_fp8_batch_invariant(a[:1000], B, sa, sb, config=ws_rec, chunks=C)),
-        full[:1000],
-    )
-    ws = torch.empty(C * M * N + 4, dtype=torch.float32, device="cuda")
-    assert torch.equal(
-        bits(
-            mm_fp8_batch_invariant(
-                a, B, sa, sb, config=ws_rec, chunks=C, workspace=ws[: C * M * N]
-            )
-        ),
-        full,
-    )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="workspace"):
-        mm_fp8_batch_invariant(
-            a[:16], B, sa, sb, config=ws_rec, chunks=C, workspace=ws[1 : 1 + C * 16 * N]
-        )  # 4-byte offset
-
-
-@needs_device
-def test_persistent_grid_size_does_not_change_bits():
-    """R2 for the SM count: a smaller persistent grid is what a smaller part, an SM carveout, MPS or a green context
-    produce; it only decides which CTA computes which tile (and, for the split class, which chunk)."""
-    sa, sb = scales()
-    for M, N, K in [(1000, 4096, 4096), (64, 64, 65536)]:
-        a, B = adv_fp8(M, K, seed=91), weights(1, N, K, 92)[0]
-        C = chunks_for(N, K, "e4m3")
-        base = default_config(M, N, K, C, "k", 204, "sm_107", "e4m3")
-        ref = bits(mm_fp8_batch_invariant(a, B, sa, sb, config=base, chunks=C))
-        for g in (1, 3, 17, 74):
-            cfg = dataclasses.replace(base, grid_clusters=g)
-            assert torch.equal(
-                bits(mm_fp8_batch_invariant(a, B, sa, sb, config=cfg, chunks=C)), ref
-            ), f"grid={g} at {(M, N, K)}"
 
 
 @needs_device
 @pytest.mark.parametrize("b,N,K,layout", [(1, 4096, 4096, "k"), (4, 64, 8192, "n")])
-def test_autotuning_profiles_every_candidate_and_keeps_the_bits(b, N, K, layout):
-    """Under ``autotune(True)`` the FlashInfer autotuner profiles the class's candidates (none may be dropped as
-    unsupported) and the tuned process computes the same bits as the untuned one, during and after tuning."""
+def test_public_rows_keep_their_bits_inside_autotune(b, N, K, layout):
+    """The public batch-invariant entry agrees before, during and after autotuning."""
     A = adv_fp8(b, 300, K, seed=101)
     B = weights(b, N, K, 102)
     B = B if layout == "k" else B.contiguous()
     sa, sb = scales()
     ref = [bits(bi_bmm(A[:, :M].contiguous(), B, sa, sb)) for M in (1, 16, 300)]
-    tuner = AutoTuner.get()
-    before = {
-        k: len(v)
-        for k, v in tuner.stats.failed_tactics.items()
-        if tuning.CUSTOM_OP_BMM_FP8 in k
-    }
     with autotune(True):
         tuned = [bits(bi_bmm(A[:, :M].contiguous(), B, sa, sb)) for M in (1, 16, 300)]
-    after = {
-        k: len(v)
-        for k, v in tuner.stats.failed_tactics.items()
-        if tuning.CUSTOM_OP_BMM_FP8 in k
-    }
-    assert after == before, f"tactics failed while profiling: {after}"
     post = [bits(bi_bmm(A[:, :M].contiguous(), B, sa, sb)) for M in (1, 16, 300)]
     for r, t, p in zip(ref, tuned, post, strict=True):
         assert torch.equal(r, t) and torch.equal(r, p)
@@ -618,7 +415,7 @@ def test_trace_apply_does_not_replace_the_class():
 
 @needs_device
 def test_public_api_skips_backend_selection(monkeypatch):
-    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    """batch_invariant=True uses the cuDNN plan directly, so the @backend_requirement wrapper must not run the auto selection
     for it (host cost only): a selecting call rewrites `bmm_fp8.suitable_auto_backends`, a bypassed one leaves it."""
     A, B = adv_fp8(2, 16, 4096, seed=131), weights(2, 4096, 4096, 132)
     sa, sb = scales()
@@ -633,13 +430,17 @@ def test_public_api_skips_backend_selection(monkeypatch):
 
 @needs_device
 @pytest.mark.parametrize("b,M,N,K", [(2, 16, 4096, 4096), (2, 16, 64, 8192)])
-def test_public_path_equals_the_class_entry_and_checks_caller_buffers(b, M, N, K):
-    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
-    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
-    (only the entry's own fresh output skips the aliasing check)."""
-    A, B = adv_fp8(b, M, K, seed=181), weights(b, N, K, 182)
+def test_public_output_buffer_and_graph_replay(b, M, N, K):
+    """A caller-provided output survives graph replay and must be disjoint from the inputs."""
+    rng = torch.Generator(device="cuda").manual_seed(181)
+    A = torch.randint(-4, 5, (b, M, K), device="cuda", generator=rng).to(E4)
+    B = (
+        torch.randint(-4, 5, (b, N, K), device="cuda", generator=rng)
+        .to(E4)
+        .transpose(1, 2)
+    )
     sa, sb = scales()
-    ref = bits(bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16))
+    ref = bits(((A.double() @ B.double()).float() * (sa * sb)).to(torch.bfloat16))
     assert torch.equal(bits(bi_bmm(A, B, sa, sb)), ref)
     out = torch.empty(b, M, N, dtype=torch.bfloat16, device="cuda")
     assert bi_bmm(A, B, sa, sb, out=out) is out and torch.equal(bits(out), ref)
@@ -657,13 +458,14 @@ def test_public_path_equals_the_class_entry_and_checks_caller_buffers(b, M, N, K
     assert torch.equal(bits(out), ref)
     # a caller's output over an operand's bytes is refused on both paths: the unsplit class's one launch over the batch
     # and the split classes' launch per element (one byte buffer sized for the larger of the two views)
-    buf = torch.empty(max(b * M * K, 2 * b * M * N), dtype=torch.uint8, device="cuda")
-    a_alias = buf[: b * M * K].view(torch.float8_e4m3fn).view(b, M, K)
+    buf = torch.empty(b * M * max(K + 1, 2 * N), dtype=torch.uint8, device="cuda")
     out_alias = buf[: 2 * b * M * N].view(torch.bfloat16).view(b, M, N)
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
-    ):
-        bi_bmm(a_alias, B, sa, sb, out=out_alias)
+    for pitch in (K, K + 1):
+        a_alias = buf.view(E4).as_strided((b, M, K), (M * pitch, pitch, 1))
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+        ):
+            bi_bmm(a_alias, B, sa, sb, out=out_alias)
 
 
 @needs_device
@@ -709,98 +511,49 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
 
 @needs_device
 def test_chunk_count_and_workspace_checks():
-    """``chunks`` must be positive (the typed error, not a division by zero), and a caller workspace may not overlap the
-    output or a scale: the split class writes its partials there before the fixup reads them."""
-    b, M, N, K = (
-        3,
-        64,
-        128,
-        8192,
-    )  # N = 128: the chunk rule splits; b = 3: one workspace reused per element
-    A, B = adv_fp8(b, M, K, seed=131), weights(b, N, K, 132)
+    # The same cuDNN plan reuses the scratch region for each batch element.
+    b, m, n, k = 3, 37, 128, 8192
+    a = torch.zeros(b, m, k, dtype=E4, device="cuda")
+    a.view(torch.uint8)[:, :, 0] = 0x38  # E4M3 1.0
+    weight = weights(b, n, k, seed=132)
     sa, sb = scales()
-    # a caller-forced configuration the kernel cannot implement: the 16-wide tile of the 2-CTA pair needs a K-major weight
-    # on kind::f8f6f4 (the only guard is the launch path's, for the unsplit class the batched launch's)
-    A1, B1 = adv_fp8(1, 16, 4096, seed=141), weights(1, 4096, 4096, 142)
-    forced = Knobs((256, 16), (2, 1), True, True, "m", 1)
-    assert not can_implement(forced, 16, 4096, 4096, "n", 1, "e4m3")
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
-        bmm_fp8_batch_invariant(
-            A1, B1.contiguous(), sa, sb, torch.bfloat16, config=forced
-        )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
-        bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, chunks=0)
-    C = chunks_for(N, K, "e4m3")
-    assert C > 1
-    ws = torch.empty(C * M * N + 64, dtype=torch.float32, device="cuda")
-    ref = bits(bi_bmm(A, B, sa, sb)).clone()
-    got = bmm_fp8_batch_invariant(
-        A, B, sa, sb, torch.bfloat16, workspace=ws[: C * M * N]
+    expected = (
+        ((weight[:, :1, :].float() + 0.0) * (sa * sb))
+        .to(torch.bfloat16)
+        .expand(b, m, n)
     )
-    assert torch.equal(bits(got), ref)
-    for i in range(
-        b
-    ):  # every element through the one reused workspace equals its own single-element call
-        single = bmm_fp8_batch_invariant(
-            A[i : i + 1], B[i : i + 1], sa, sb, torch.bfloat16
-        )
-        assert torch.equal(bits(got[i]), bits(single[0])), i
-    # the output may not alias an input or a scale on either launch path: the bits would depend on which CTA runs first
-    buf = torch.empty(M, 2 * N, dtype=torch.uint8, device="cuda")
-    out_alias = buf.view(
-        torch.bfloat16
-    )  # (M, N) bf16 over the same bytes as the (M, K <= 2N) fp8 operand below
-    a_alias = buf[:, : min(K, 2 * N)].view(torch.float8_e4m3fn)
-    Ka = a_alias.shape[1]
-    w_alias = weights(1, N, Ka, 133)[0]
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
-    ):
-        mm_fp8_batch_invariant(a_alias, w_alias, sa, sb, out=out_alias)
-    a2 = adv_fp8(M, 4096, seed=134)
-    w_buf = torch.empty(N, 4096, dtype=torch.float8_e4m3fn, device="cuda")
-    out_w = (
-        w_buf.view(torch.uint8).view(-1)[: 2 * M * N].view(torch.bfloat16).view(M, N)
-    )  # a contiguous output over the weight's first rows
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="B overlapping the output"
-    ):
-        mm_fp8_batch_invariant(a2, w_buf.t(), sa, sb, out=out_w)
-    out_s = torch.empty(M, 4096, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="a scale overlapping the output"
-    ):
-        mm_fp8_batch_invariant(
-            a2,
-            weights(1, 4096, 4096, 135)[0],
-            out_s.view(torch.float32)[0, :1],
-            sb,
-            out=out_s,
-        )
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
-    ):
-        bmm_fp8_batch_invariant(A, B, ws[:1], sb, torch.bfloat16, workspace=ws)
-    big = torch.empty(
-        b * 16 * K // 4, dtype=torch.float32, device="cuda"
-    )  # a workspace holding the (b, 16, K) operand below
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
+    chunks = chunks_for(n, k, "e4m3")
+    storage = torch.full((chunks * m * n + 4,), float("nan"), device=a.device)
+    scratch = storage[:-4]
+    out = torch.empty(b, m, n, dtype=torch.bfloat16, device=a.device)
+    assert (
         bmm_fp8_batch_invariant(
-            big.view(torch.float8_e4m3fn).view(b, 16, K),
-            B,
-            sa,
-            sb,
-            torch.bfloat16,
-            workspace=big,
+            a, weight, sa, sb, torch.bfloat16, out=out, workspace=scratch
         )
-    out = ws.view(torch.bfloat16)[: b * M * N].view(b, M, N)
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
-    ):
-        bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, out=out, workspace=ws)
-    out = torch.empty(b, M, N, dtype=torch.bfloat16, device="cuda")
-    got = bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, out=out, workspace=ws)
-    assert torch.equal(bits(got), ref)
+        is out
+    )
+    assert torch.equal(bits(out), bits(expected))
+    assert torch.isnan(storage[-4:]).all()
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks"):
+        bmm_fp8_batch_invariant(a, weight, sa, sb, torch.bfloat16, chunks=0)
+    if torch.isfinite(scratch).any():
+        # These checks apply when the selected plan writes its partials into the workspace.
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="workspace"):
+            bmm_fp8_batch_invariant(
+                a, weight, sa, sb, torch.bfloat16, workspace=scratch[:1]
+            )
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="workspace"):
+            bmm_fp8_batch_invariant(
+                a, weight, scratch[:1], sb, torch.bfloat16, workspace=scratch
+            )
+        # A copy fixes the row pitch, but caller scratch still cannot overwrite its source.
+        source = torch.empty(b * m * (k + 1), dtype=torch.uint8, device=a.device)
+        pitched = source.view(E4).as_strided((b, m, k), (m * (k + 1), k + 1, 1))
+        scratch_alias = source[: scratch.nbytes].view(torch.float32)
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match="A overlapping the workspace"
+        ):
+            bmm_fp8_batch_invariant(pitched, weight, sa, sb, workspace=scratch_alias)
 
 
 @needs_device

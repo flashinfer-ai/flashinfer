@@ -279,8 +279,7 @@ never on the batch size, the row's position in the batch or the kernel configura
   batch (run-to-run too). A mismatch is an error regardless of `--allow_output_mismatch`. For `nvfp4_quantize`, whose
   refcheck compares the backends' codes and scales bit for bit, set `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1` so the
   `cuda` / `cute-dsl` backends take the exact path the class computes.
-- `--autotune` makes the GEMM classes profile their top configurations through FlashInfer's autotuner (reported as
-  `batch_invariant_autotune`); without it the class's dispatcher picks the configuration.
+- cuDNN selects the batch-invariant GEMM execution plan. `--autotune` applies to the other GEMM backends that support it.
 - `log_softmax` and `log_probs` have the batch-invariant class as their only kernel, so `batch_invariant` is their
   only backend and their default.
 
@@ -325,7 +324,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `mm_tf32`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `mm_tf32`, `bmm_bf16` routines) |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags
@@ -620,7 +619,7 @@ Backend Legend:
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Hopper SM90; Blackwell SM100+)
-- batch_invariant: FlashInfer's batch-invariant kernels (`batch_invariant=True`: a row's bits depend only on its own
+- batch_invariant: batch-invariant operators, with cuDNN execution plans for GEMM (`batch_invariant=True`: a row's bits depend only on its own
   inputs, never on the batch size, its position or the configuration; Blackwell SM100 / SM103 / SM107; see
   `flashinfer/batch_invariant/README.md` and [Batch-invariant mode](#batch-invariant-mode))
 - cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use

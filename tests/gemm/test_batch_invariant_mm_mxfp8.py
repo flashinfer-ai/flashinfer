@@ -1,39 +1,23 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant MXFP8 GEMM: ``flashinfer.mm_mxfp8(a, b, a_descale, b_descale, backend="auto", batch_invariant=True)``.
+"""Batch-invariant MXFP8 GEMM: scale layout, dequantized reference, row invariance and CUDA Graph replay."""
 
-The classes ``gemm.mxfp8.kfold`` / ``kchunk[C]`` (the SM100 / SM103 instruction: 32 e4m3 elements per step with one UE8M0
-block scale per row) and ``gemm.mxfp8.kfold64`` / ``kchunk64[C]`` (the SM107 instruction: 64 per step) are the dense K fold
-with a block-scaled step: the scales are applied inside the instruction, the chain is one ``cvt.rn``. There is no exact CPU
-oracle for the step, so the classes are checked by bit agreement across their configurations -- the dense records, the
-swapped decode records, the in-cluster split, the in-CTA chunk fold, the workspace split and (SM107) the B-reuse record,
-the hardware hypothesis of ``lean/BIKernels/GEMMConfig.lean`` -- by the launch-model properties R1-R2 on adversarial
-operands and scales, by bit equality with FlashInfer's own CuTe-DSL MXFP8 kernel (the same instruction, the same K order)
-and by an accuracy yardstick against the other backends. Device-free tests cover the fingerprints (the architecture is a
-dimension), the chunk rule, the spaces, the dispatcher and the tuner's tactic encoding; the GPU tests need SM100 / SM103 /
-SM107.
-"""
-
-import dataclasses
-import re
+from unittest.mock import patch
 
 import pytest
 import torch
 
 import flashinfer
 from flashinfer import batch_invariant as bi
-from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.gemm.batch_invariant import tuning
+from flashinfer.gemm import gemm_base
+from flashinfer.autotuner import autotune
 from flashinfer.gemm.batch_invariant.api import (
-    MM_MXFP8_ARCHS,
     mm_mxfp8_batch_invariant,
     mx_format_for,
-    part_of,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
-    Knobs,
     enumerate_space,
     knob_product,
 )
@@ -47,13 +31,7 @@ from flashinfer.gemm.batch_invariant.schedule import (
 from flashinfer.gemm.batch_invariant.spec import MXFP8_FMTS, chunk_unit
 
 E4 = torch.float8_e4m3fn
-_supported = torch.cuda.is_available() and bi.is_supported_device(
-    torch.device("cuda"), MM_MXFP8_ARCHS
-)
-needs_device = pytest.mark.skipif(
-    not _supported,
-    reason="needs a CUDA device of SM100 / SM103 / SM107 with the CuTe DSL",
-)
+needs_device = pytest.mark.usefixtures("cudnn_batch_invariant_device")
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -357,25 +335,6 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 assert cfg in space, cfg.describe()
 
 
-def test_tactic_encoding_round_trips():
-    for fmt, shape in (
-        ("mxfp8", (16, 128, 8192, 4)),
-        ("mxfp8_k64", (8, 4096, 4096, 1)),
-    ):
-        M, N, K, C = shape
-        for cfg in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)[::41]:
-            t = tuning.knobs_to_tactic(cfg)
-            assert (
-                len(t) == 13
-                and tuning.knobs_from_tactic(t) == cfg
-                and tuning.knobs_from_tactic(list(t)) == cfg
-            )
-    # a tactic written before the block-scaled knobs existed is a dense record
-    assert tuning.knobs_from_tactic(
-        (128, 64, 1, 1, False, True, "m", 1, 0, False)
-    ) == Knobs((128, 64), (1, 1), False, True, "m", 1, 0, False)
-
-
 def test_unsupported_device_raises_before_any_kernel():
     a = torch.zeros(4, 128).to(E4)
     w = torch.zeros(128, 128).to(E4).t()
@@ -443,8 +402,6 @@ def test_partial_last_step_reads_finite_scale_padding():
     out = bi_mm(a, b, sfa, sfb)
     assert torch.isfinite(out.float()).all()
     assert norm_rel_err(out, a, sfa, b.t(), sfb) <= 2.0**-8
-    f32 = mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=torch.float32)
-    assert torch.equal(bits(f32.to(torch.bfloat16)), bits(out))
 
 
 def test_flag_bypasses_the_operator_backend_selection():
@@ -456,102 +413,6 @@ def test_flag_bypasses_the_operator_backend_selection():
     b = torch.zeros(128, 128).to(E4).t()
     sf = torch.zeros(512, dtype=torch.uint8)
     assert _heuristic_func_mm_mxfp8([], a, b, sf, sf, batch_invariant=True)
-
-
-@needs_device
-def test_launch_placements_share_one_compiled_object(monkeypatch):
-    """The block-scaled wrapper's object rule: records differing only in the raster order, the swizzle size or the
-    persistent grid launch ONE compiled object (one ``jit.build_and_load`` name, without those tokens) with bit-identical
-    outputs; an in-cluster split record (``cluster_k > 1``: the chunk fold inside the cluster) is its own ``C1 ... _ck<k>``
-    object next to the split class's ``CL`` object."""
-    import flashinfer.batch_invariant.jit as J
-    from flashinfer.gemm.batch_invariant import api as bi_api
-    from flashinfer.gemm.batch_invariant.blocks import compile_blockscaled as bcb
-
-    names = []
-    orig = J.build_and_load
-
-    def recording(module, kernel, compile_fn):
-        names.append(kernel)
-        return orig(module, kernel, compile_fn)
-
-    monkeypatch.setattr(J, "build_and_load", recording)
-    bcb._compiled_blockscaled.cache_clear()
-    bi_api.clear_kernel_cache()
-    fam = part_of(torch.device("cuda"))[1]
-    fmt = mx_class_for("mxfp8", fam)
-    M, N, K = 300, 4096, 2048
-    assert chunks_for(N, K, fmt) == 1
-    a, sfa = adv_mx(M, K, 161)
-    b, sfb = weight(N, K, 162)
-    base = Knobs((128, 128), (1, 2), False, True, "m", 1)
-    ref = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=base))
-    for r in ("m", "n"):
-        for s in (1, 2, 4, 8):
-            for g in (0, 9):
-                cfg = dataclasses.replace(
-                    base, raster_along=r, swizzle_size=s, grid_clusters=g
-                )
-                got = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=cfg))
-                assert torch.equal(got, ref), cfg.describe()
-    objects = [n for n in names if "_bk_C" in n]
-    assert len(objects) == 1 and "_bk_C1_" in objects[0], names
-    assert re.search(r"_r[mn]_sw\d|_g\d", objects[0]) is None, objects
-    # the in-cluster split record keeps its own object (its factor is static), beside the split class's dynamic-L object
-    del names[:]
-    N2, K2 = 512, 16384
-    C = chunks_for(N2, K2, fmt)
-    assert C == 2
-    a2, sfa2 = adv_mx(M, K2, 163)
-    b2, sfb2 = weight(N2, K2, 164)
-    split = Knobs((128, 64), (1, 1), False, True, "m", 1)
-    ref2 = bits(mm_mxfp8_batch_invariant(a2, b2, sfa2, sfb2, config=split, chunks=C))
-    ck = next(
-        k
-        for k in enumerate_space(M, N2, K2, chunks=C, b_major="k", in_fmt=fmt)
-        if k.cluster_k == C
-    )
-    got = bits(mm_mxfp8_batch_invariant(a2, b2, sfa2, sfb2, config=ck, chunks=C))
-    assert torch.equal(got, ref2), ck.describe()
-    objects = sorted(n for n in names if "_bk_C" in n)
-    assert len(objects) == 2, names
-    assert any("_bk_CL_" in n and "_ck" not in n for n in objects), objects
-    assert any("_bk_C1_" in n and f"_ck{C}" in n for n in objects), objects
-
-
-@needs_device
-def test_in_cluster_split_store_staging_is_stable_under_repeats():
-    """The in-cluster split's owner stores every C-th subtile through a staging buffer indexed by its own store count; with
-    several subtiles per owner and a stage count sharing a factor with C, a global-index scheme would reuse one buffer under
-    a store still in flight. Forced ``cluster_k = 2`` records at a shape with several subtiles per owner, repeated, against
-    the workspace split."""
-    fam = part_of(torch.device("cuda"))[1]
-    fmt = mx_class_for("mxfp8", fam)
-    M, N, K = 300, 512, 16384
-    C = chunks_for(N, K, fmt)
-    assert C == 2
-    a, sfa = adv_mx(M, K, 151)
-    b, sfb = weight(N, K, 152)
-    ref = bits(
-        mm_mxfp8_batch_invariant(
-            a,
-            b,
-            sfa,
-            sfb,
-            config=Knobs((128, 64), (1, 1), False, True, "m", 1),
-            chunks=C,
-        )
-    )
-    recs = [
-        k
-        for k in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)
-        if k.cluster_k == C and k.tile_n >= 128
-    ]
-    assert recs
-    for k in recs[:: max(1, len(recs) // 4)]:
-        for _ in range(12):
-            got = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=k, chunks=C))
-            assert torch.equal(got, ref), k.describe()
 
 
 def test_unlisted_compute_capability_raises():
@@ -623,23 +484,6 @@ def test_batch_invariance_along_rows():
         ).to(torch.uint8)
     )
     assert torch.equal(bits(bi_mm(x, b, sfx, sfb))[5], full[100])
-    # the dispatcher's picks for other row counts and parts compute the same bits
-    fam = part_of(torch.device("cuda"))[1]
-    fmt = mx_class_for("mxfp8", fam)
-    for M in (16, 1000):
-        for cfg in (
-            default_config(M, N, K, 1, "k", 204, "sm_107", fmt),
-            default_config(2049, N, K, 1, "k", 148, "sm_100", fmt),
-            default_config(1, N, K, 1, "k", 148, "sm_100", fmt),
-        ):
-            if can_implement(cfg, M, N, K, "k", 1, fmt):
-                sfm = swizzle_sf(
-                    (torch.log2(e8m0(sfa, 2049, K)[:M]) + 127).to(torch.uint8)
-                )
-                got = bits(
-                    mm_mxfp8_batch_invariant(a[:M].clone(), b, sfm, sfb, config=cfg)
-                )
-                assert torch.equal(got, full[:M]), (M, cfg.describe())
 
 
 @needs_device
@@ -663,194 +507,9 @@ def test_permutation_and_subbatch_invariance(N, K):
 
 
 @needs_device
-@pytest.mark.parametrize("M,N,K", [(1000, 4096, 4096), (37, 2048, 4000 + 96)])
-def test_config_agreement(M, N, K):
-    """R3: every configuration the tuner may choose (the dispatcher's top candidates on every part that runs the class) and
-    a spread of hand-picked records (1- and 2-CTA MMA, the 64- / 128- / 192- / 256-wide tiles, clusters, both rasters,
-    swizzles, the B-reuse tile on SM107) give identical bits."""
-    fam = part_of(torch.device("cuda"))[1]
-    fmt = mx_class_for("mxfp8", fam)
-    a, sfa = adv_mx(M, K, 61)
-    b, sfb = weight(N, K, 62)
-    cfgs = []
-    for family, sm in PARTS:
-        if mx_class_for("mxfp8", family) == fmt:
-            cfgs += rank_topk(M, N, K, 1, "k", sm, 10, family, fmt)
-    cfgs += [
-        Knobs((128, 64), (1, 1), False, True, "m", 1),
-        Knobs((128, 128), (1, 2), False, True, "n", 2),
-        Knobs((128, 192), (4, 1), False, True, "m", 8),
-        Knobs((128, 256), (2, 1), False, True, "m", 1),
-        Knobs((256, 64), (2, 2), True, True, "n", 4),
-        Knobs((256, 128), (2, 1), True, True, "m", 1),
-        Knobs((256, 192), (2, 2), True, True, "m", 2),
-        Knobs((256, 256), (4, 1), True, True, "n", 1),
-        Knobs((512, 128), (2, 1), True, True, "m", 1),  # B-reuse (SM107)
-        Knobs((512, 256), (2, 2), True, True, "n", 2),
-    ]
-    cfgs = list(dict.fromkeys(cfgs))
-    ref = None
-    checked = 0
-    for c in cfgs:
-        if not can_implement(c, M, N, K, "k", 1, fmt):
-            continue
-        got = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=c))
-        if ref is None:
-            ref = got
-        assert torch.equal(got, ref), f"{c.describe()} differs"
-        checked += 1
-    assert checked >= 14
-
-
-@needs_device
-def test_swapped_decode_records_compute_the_class():
-    """The decode specialisation (``swap_ab``: the weights as the kernel's A, the tokens as its B, one token tile) on the
-    narrow 8 / 16 / 32 tiles and the 64-wide one, 1- and 2-CTA, clusters along M, every raster: the same bits as the dense
-    records (the block-scaled step is symmetric in its operands), at M = 1 .. 64 and for a bf16 and an fp16 output."""
-    fam = part_of(torch.device("cuda"))[1]
-    fmt = mx_class_for("mxfp8", fam)
-    N, K = 4096, 4096
-    for M, od in (
-        (1, torch.bfloat16),
-        (5, torch.float16),
-        (8, torch.bfloat16),
-        (16, torch.float16),
-        (33, torch.bfloat16),
-        (64, torch.bfloat16),
-    ):
-        a, sfa = adv_mx(M, K, 70 + M)
-        b, sfb = weight(N, K, 71)
-        dense = Knobs((128, 128), (1, 1), False, True, "m", 1)
-        ref = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=od, config=dense))
-        recs = [
-            k for k in enumerate_space(M, N, K, b_major="k", in_fmt=fmt) if k.swap_ab
-        ]
-        pick = {(k.tile_n, k.tile_m, k.cluster_m, k.raster_along): k for k in recs}
-        assert len(pick) >= 4, M
-        for k in list(pick.values())[::3] + [k for k in recs if k.tile_n == 64][:4]:
-            got = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=od, config=k))
-            assert torch.equal(got, ref), (M, k.describe())
-        assert torch.equal(
-            bits(bi_mm(a, b, sfa, sfb, out_dtype=od)), ref
-        )  # the dispatcher's own pick
-
-
-@needs_device
-@pytest.mark.parametrize(
-    "M,N,K,od",
-    [
-        (37, 128, 8192, torch.bfloat16),
-        (300, 128, 16384, torch.float16),
-        (16, 128, 4096, torch.bfloat16),
-    ],
-)
-def test_split_implementations_agree(M, N, K, od):
-    """The split class ``kchunk[C]`` has three implementations: the workspace split (chunks on different CTAs, an fp32
-    workspace, a fixup fold in chunk order and the chain), the in-CTA chunk fold (one CTA folds every chunk of its tile
-    through a TMEM running sum) and the in-cluster split (the chunks on the CTAs of one cluster, the fold through
-    distributed shared memory). They are one term in Lean (``ctaSplitMX8_eq_kchunkMX8``, ``clusterSplitMX8_eq_kchunkMX8``)
-    and one bit pattern here; and the split class is a different specification from the unsplit fold (expected)."""
-    fam = part_of(torch.device("cuda"))[1]
-    fmt = mx_class_for("mxfp8", fam)
-    C = chunks_for(N, K, fmt)
-    assert C > 1
-    span = (
-        12 if od == torch.bfloat16 else 2
-    )  # an fp16 output stays finite over the long K
-    a, sfa = adv_mx(M, K, 81, span=span)
-    b, sfb = weight(N, K, 82, span=span)
-    ws = Knobs((128, 64), (1, 1), False, True, "m", 1)
-    ref = bits(
-        mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=od, config=ws, chunks=C)
-    )
-    space = enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)
-    recs = [
-        k
-        for k in rank_topk(M, N, K, C, "k", 204, 10, "sm_107", fmt)
-        if k.cta_chunks or k.cluster_k > 1
-    ]
-    recs += [k for k in space if k.cluster_k > 1][::7]
-    recs += [k for k in space if k.cta_chunks][::29]
-    recs += [
-        Knobs((128, 64), (1, 4), False, True, "m", 1, 0, True),
-        Knobs((256, 128), (2, 1), True, True, "n", 2, 0, True),
-        Knobs((128, 128), (1, 1), False, True, "m", 1, 0, False, 2),
-        Knobs((128, 64), (1, 1), False, True, "n", 1, 0, False, 4),
-    ]
-    recs = [k for k in dict.fromkeys(recs) if can_implement(k, M, N, K, "k", C, fmt)]
-    assert any(k.cta_chunks for k in recs)
-    assert C not in (2, 4) or any(
-        k.cluster_k > 1 for k in recs
-    )  # the in-cluster split exists at C = 2 / 4
-    for k in recs:
-        got = bits(
-            mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=od, config=k, chunks=C)
-        )
-        assert torch.equal(got, ref), k.describe()
-    assert torch.equal(
-        bits(bi_mm(a, b, sfa, sfb, out_dtype=od)), ref
-    )  # the dispatcher's own pick is a member too
-    assert not torch.equal(
-        bits(
-            mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=od, config=ws, chunks=1)
-        ),
-        ref,
-    )
-
-
-@needs_device
-def test_persistent_grid_size_does_not_change_bits():
-    """R2 for the SM count: a smaller persistent grid is what a smaller part, an SM carveout, MPS or a green context
-    produce; it only decides which CTA computes which tile (and, for the split class, which chunk)."""
-    fam = part_of(torch.device("cuda"))[1]
-    fmt = mx_class_for("mxfp8", fam)
-    for M, N, K in [(1000, 4096, 4096), (64, 64, 65536)]:
-        a, sfa = adv_mx(M, K, 91)
-        b, sfb = weight(N, K, 92)
-        C = chunks_for(N, K, fmt)
-        base = default_config(M, N, K, C, "k", 204, "sm_107", fmt)
-        ref = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=base, chunks=C))
-        for g in (1, 3, 17, 74):
-            cfg = dataclasses.replace(base, grid_clusters=g)
-            assert torch.equal(
-                bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=cfg, chunks=C)),
-                ref,
-            ), f"grid={g} at {(M, N, K)}"
-
-
-@needs_device
-def test_the_two_instructions_are_two_classes():
-    """On SM107 both instructions exist: the sm_100 class (``in_fmt="mxfp8"``) runs there too and is a different
-    specification from the device's own class (its fold updates the accumulator every 32 elements, not every 64)."""
-    fam = part_of(torch.device("cuda"))[1]
-    a, sfa = adv_mx(300, 4096, 93)
-    b, sfb = weight(2048, 4096, 94)
-    if fam != "sm_107":
-        with pytest.raises(
-            bi.BatchInvariantUnsupportedError, match="mxfp8_k64 on SM107"
-        ):
-            mm_mxfp8_batch_invariant(a, b, sfa, sfb, in_fmt="mxfp8_k64")
-        assert mx_format_for(torch.device("cuda")) == "mxfp8"
-        return
-    assert mx_format_for(torch.device("cuda")) == "mxfp8_k64"
-    k64 = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb))
-    k32 = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, in_fmt="mxfp8"))
-    assert not torch.equal(k64, k32)
-    # each class agrees with itself across its configurations
-    for fmt, ref in (("mxfp8", k32), ("mxfp8_k64", k64)):
-        for c in rank_topk(300, 2048, 4096, 1, "k", 204, 4, "sm_107", fmt):
-            assert torch.equal(
-                bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=c, in_fmt=fmt)),
-                ref,
-            ), (fmt, c.describe())
-
-
-@needs_device
 @pytest.mark.parametrize("N,K", [(4096, 4096), (128, 8192)])
-def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K):
-    """Under ``autotune(True)`` the FlashInfer autotuner profiles the class's candidates (none may be dropped as
-    unsupported; the profiled row counts get scale buffers of their own size) and the tuned process computes the same
-    bits as the untuned one, during and after tuning."""
+def test_public_rows_keep_their_bits_inside_autotune(N, K):
+    """The public batch-invariant entry agrees before, during and after autotuning."""
     a, sfa = adv_mx(300, K, 101)
     b, sfb = weight(N, K, 102)
     rows = (torch.log2(e8m0(sfa, 300, K)) + 127).to(torch.uint8)
@@ -859,20 +518,8 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K):
         return bits(bi_mm(a[:M].contiguous(), b, swizzle_sf(rows[:M]), sfb))
 
     ref = [run(M) for M in (1, 16, 300)]
-    tuner = AutoTuner.get()
-    before = {
-        k: len(v)
-        for k, v in tuner.stats.failed_tactics.items()
-        if tuning.CUSTOM_OP_MM_MXFP8 in k
-    }
     with autotune(True):
         tuned = [run(M) for M in (1, 16, 300)]
-    after = {
-        k: len(v)
-        for k, v in tuner.stats.failed_tactics.items()
-        if tuning.CUSTOM_OP_MM_MXFP8 in k
-    }
-    assert after == before, f"tactics failed while profiling: {after}"
     post = [run(M) for M in (1, 16, 300)]
     for r, t, p in zip(ref, tuned, post, strict=True):
         assert torch.equal(r, t) and torch.equal(r, p)
@@ -895,16 +542,36 @@ def test_public_api_skips_backend_selection(monkeypatch):
 
 @needs_device
 @pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (37, 128, 8192)])
-def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
-    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
-    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
-    (only the entry's own fresh output skips the aliasing check)."""
+def test_public_output_buffer_and_graph_replay(M, N, K):
+    """A caller-provided output survives graph replay and must be disjoint from the inputs."""
     a, sfa = adv_mx(M, K, 181)
     b, sfb = weight(N, K, 182)
-    ref = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb))
-    assert torch.equal(bits(bi_mm(a, b, sfa, sfb)), ref)
+    got = bi_mm(a, b, sfa, sfb)
+    assert norm_rel_err(got, a, sfa, b.t(), sfb) <= 2**-8
+    ref = bits(got)
     out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     assert bi_mm(a, b, sfa, sfb, out=out) is out and torch.equal(bits(out), ref)
+    chunks = chunks_for(N, K, "mxfp8")
+    if chunks > 1:
+        storage = torch.full(
+            (chunks * M * N + 8,), float("nan"), dtype=torch.float32, device=a.device
+        )
+        scratch = storage[4:-4]
+        out.fill_(float("nan"))
+        with patch.object(
+            gemm_base,
+            "_execute_cudnn_batch_invariant",
+            wraps=gemm_base._execute_cudnn_batch_invariant,
+        ) as execute:
+            assert (
+                mm_mxfp8_batch_invariant(a, b, sfa, sfb, out=out, workspace=scratch)
+                is out
+            )
+        used = execute.call_args.args[0].get_workspace_size() // scratch.element_size()
+        assert torch.equal(bits(out), ref)
+        assert torch.isnan(storage[:4]).all() and torch.isnan(storage[4 + used :]).all()
+        if used:
+            assert torch.isfinite(scratch[:used]).any()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -932,10 +599,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     b, sfb = weight(4096, 4096, 122)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match='backend="auto"'):
         flashinfer.mm_mxfp8(a, b, sfa, sfb, backend="cutlass", batch_invariant=True)
-    # the class's checks, reached through the API (which runs no backend checks for the flag) and through its entries
-    auto = tuning.mm_mxfp8_batch_invariant_auto
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="8x4"):
-        auto(a, b, sfa, sfb, None, torch.bfloat16, True, "auto")
+        bi_mm(a, b, sfa, sfb, use_8x4_sf_layout=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="K-major"):
         bi_mm(a, b.contiguous(), sfa, sfb)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="float8_e4m3fn"):
@@ -954,8 +619,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # error (a ValueError, as before)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16 output"):
         bi_mm(a, b, sfa, sfb, out_dtype=torch.float32)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16"):
-        auto(a, b, sfa, sfb, None, torch.float32, False, "auto")
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         mm_mxfp8_batch_invariant(
             a,
@@ -964,69 +627,5 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             sfb,
             out=torch.empty(16, 4096, dtype=torch.float16, device="cuda"),
         )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
-        mm_mxfp8_batch_invariant(a, b, sfa, sfb, chunks=0)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="granules"):
-        mm_mxfp8_batch_invariant(a, b, sfa, sfb, chunks=64)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
-        mm_mxfp8_batch_invariant(
-            a,
-            b,
-            sfa,
-            sfb,
-            config=Knobs((128, 8), (1, 1), False, True, "m", 1, 0, False, 1, True),
-            chunks=1,
-        )
-    # the direct entry exposes the fp32 chain input for tests; nothing to launch at M = 0
-    f32 = mm_mxfp8_batch_invariant(a, b, sfa, sfb, out_dtype=torch.float32)
-    assert torch.equal(bits(f32.to(torch.bfloat16)), bits(bi_mm(a, b, sfa, sfb)))
     out = bi_mm(a[:0], b, swizzle_sf(torch.zeros(0, 128, dtype=torch.uint8)), sfb)
     assert out.shape == (0, 4096)
-
-
-@needs_device
-def test_chunk_count_and_workspace_checks():
-    """A caller workspace may not overlap the output: the split class writes its partials there before the fixup reads them;
-    the workspace split at M beyond the hardware's grid.y limit strides over rows and agrees with its own sub-batch."""
-    M, N, K = 64, 128, 8192
-    a, sfa = adv_mx(M, K, 131)
-    b, sfb = weight(N, K, 132)
-    fmt = mx_format_for(torch.device("cuda"))
-    C = chunks_for(N, K, fmt)
-    assert C > 1
-    ws = torch.empty(C * M * N + 64, dtype=torch.float32, device="cuda")
-    ref = bits(bi_mm(a, b, sfa, sfb)).clone()
-    wsplit = Knobs((128, 64), (1, 1), False, True, "m", 1)
-    assert torch.equal(
-        bits(
-            mm_mxfp8_batch_invariant(
-                a, b, sfa, sfb, config=wsplit, workspace=ws[: C * M * N]
-            )
-        ),
-        ref,
-    )
-    out = ws.view(torch.bfloat16)[: M * N].view(M, N)
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
-    ):
-        mm_mxfp8_batch_invariant(a, b, sfa, sfb, out=out, config=wsplit, workspace=ws)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
-        mm_mxfp8_batch_invariant(
-            ws.view(E4)[: 16 * K].view(16, K),
-            b,
-            swizzle_sf(torch.zeros(16, K // 32, dtype=torch.uint8)),
-            sfb,
-            config=wsplit,
-            workspace=ws,
-        )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="scales overlapping"):
-        mm_mxfp8_batch_invariant(
-            a, b, sfa, ws.view(torch.uint8)[: sfb.numel()], config=wsplit, workspace=ws
-        )
-    big_m = 70000
-    ab, sfab = adv_mx(big_m, K, 133, cancel=False)
-    full = bits(mm_mxfp8_batch_invariant(ab, b, sfab, sfb, config=wsplit, chunks=C))
-    rows = (torch.log2(e8m0(sfab, big_m, K)) + 127).to(torch.uint8)
-    assert torch.equal(
-        bits(bi_mm(ab[:777].contiguous(), b, swizzle_sf(rows[:777]), sfb)), full[:777]
-    )
