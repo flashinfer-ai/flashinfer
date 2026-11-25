@@ -12,7 +12,7 @@ per input shape, which can be Firefly; the autotuner has a single tactic to
 choose for it. Tracking issue: flashinfer-ai/flashinfer#9994.
 
 Firefly runs the routed experts of a MoE layer on datacenter Blackwell
-(SM100, SM103; tested on B200 only) from per-token or per-tensor NVFP4
+(tested on B200/SM100 and GB300/SM103) from per-token or per-tensor NVFP4
 activations and NVFP4 weights, with CuTe DSL kernels that choose their schedule from the
 batch size (from 1 token to `tune_max_num_tokens`).
 
