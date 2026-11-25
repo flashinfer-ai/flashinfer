@@ -2,7 +2,7 @@
 
 `sm120_mxfp4_mxfp8_bf16_nosync` is an expert-parallel MegaMoE kernel
 for SM120 (compute capability 12.0: RTX PRO 6000, RTX 6000D) aimed at decode-size
-batches, at most 128 tokens per rank. It takes MXFP4 (E2M1, UE8M0 per 32) expert
+batches, at most 224 tokens per rank. It takes MXFP4 (E2M1, UE8M0 per 32) expert
 weights and MXFP8 (E4M3, UE8M0 per 32) activations and returns BF16. One
 persistent kernel per layer exchanges the routes, dispatches tokens, runs FC1,
 clamped SwiGLU and FC2, pushes the partials back, and combines them. Ranks never
@@ -53,19 +53,29 @@ layer = MoEEpLayer(
   configured backend.
 - A call runs the nosync kernel when its bound is at most `max_tokens_per_rank`
   and the routes it bounds average at most `max_tokens_per_expert` per expert:
-  `bound * ep_size * top_k / num_experts <= max_tokens_per_expert`. The per-expert
-  load, not the per-rank count, decides where the kernel stops winning. The
-  default 128 keeps every call up to 128 tokens per rank on the kernel through
-  EP32 for DeepSeek-V4.1-Flash and GLM-5.3-Flash. Measured on RTX 6000D with
-  balanced routing and ConnectX-8 switches, GLM-5.3-Flash at EP16 (57 tokens per
-  expert at 128 tokens per rank) takes 397 / 469 µs per layer at 96 / 128 tokens
-  per rank on the kernel, 534 / 608 µs when a limit of 32 hands them to cake;
-  past 57 tokens per expert (measured with a larger per-rank cap) the kernel
-  and cake are within 1.5%. **For the best performance,
-  measure the switch point on the deployment and set `max_tokens_per_expert`
-  yourself**: where the kernel stops winning depends on the model, the routing
-  and the interconnect, so no single value is best everywhere.
-- `NosyncOptions` fields: `max_tokens_per_rank` (1–128) and
+  `bound * ep_size * top_k / num_experts <= max_tokens_per_expert`. The defaults
+  (224 per rank, 128 per expert) follow where the kernel stops winning. RTX 6000D,
+  EP8 on one ConnectX-8 host and EP16 across two (`NCCL_IB_TC=96`), cold L2,
+  balanced routing, µs per layer, nosync (32-token items) vs cake:
+
+  | tokens / rank | V4.1 EP8 | GLM EP8 | V4.1 EP16 | GLM EP16 |
+  |---:|---:|---:|---:|---:|
+  | 128 | 720 / 937 | 597 / 761 | 469 / 612 | 462 / 614 |
+  | 192 | 797 / 948 | 744 / 781 | 609 / 709 | 645 / 756 |
+  | 224 | 904 / 963 | 791 / 790 | 707 / 791 | 725 / 826 |
+  | 256 | 972 / 965 | 840 / 801 | 822 / 827 | 821 / 859 |
+  | 288 | 986 / 975 | 854 / 812 | 864 / 865 | 896 / 865 |
+  | 384 | 1213 / 999 | 1230 / 984 | 1201 / 958 | — |
+
+  (V4.1: DeepSeek-V4.1-Flash, 384 experts, top-6; GLM: GLM-5.3-Flash, 288
+  experts, top-8.) The crossing sits at 224-256 tokens per rank at both EP sizes,
+  although the tokens per expert there differ by 2× (28-57 at EP8, 56-114 at
+  EP16), so the per-rank cap decides and the per-expert bound only caps the
+  averages. **For the best performance, measure the switch point on the
+  deployment and set both**: where the kernel stops winning depends on the
+  model, the routing and the interconnect, so no single value is best
+  everywhere.
+- `NosyncOptions` fields: `max_tokens_per_rank` (1–224, default 224) and
   `max_tokens_per_expert` (default 128), both the same on every rank;
   `transport` and `tokens_per_item` (below), and `top_k` / `swiglu_limit`, which
   default to the configured cake or cutedsl backend's and must be set for any
@@ -118,15 +128,19 @@ every CTA is resident (CTAs wait on each other's flags). Phases:
    source rank's combine buffer; the source sums its top-k partials with the
    routing weights once every expert rank has signalled.
 
-**Work-item width (`tokens_per_item`).** An item multiplies 8 tokens per weight
-load, 16 once the experts average at least 3 routed rows each
-(`tokens * top_k / local_experts`), and 32 from 8 rows; 24 can be forced. Items
-wider than 8 stage their tokens' activations in shared memory once per CTA (the
-8 warps share them, one K step ahead with `cp.async`) and skip the MMAs of their
-empty groups of 8, so the last, partly empty tile of an expert costs little. On
-RTX 6000D with cold L2 (DeepSeek-V4.1-Flash, balanced routing, EP8 on one host
-and EP16 across two) 32 is 1–9% faster than 16 from 8 rows; below it 16 is as
-fast or faster.
+**Work-item width (`tokens_per_item`).** An item multiplies 8, 16, 24, 32 or 64
+tokens per weight load. The default is 16 while the local experts average fewer
+than 16 routed rows each (e = `tokens * top_k / local_experts`), else 32.
+**This is an empirical default, not the optimum:** it comes from forced
+8 / 16 / 32 / 64 sweeps on RTX 6000D (CX8 hosts, EP8 on one host and EP16 across
+two, cold L2, balanced routing, DeepSeek-V4.1-Flash and GLM-5.3-Flash, 1-1024
+tokens per rank), where 8 was never faster than 16 and 64 never faster than 32
+(32 is 4-17% faster from 256 tokens per rank). Re-sweep `tokens_per_item` for the
+model, EP size, network and routing you deploy. Items wider than 8 stage their
+tokens' activations in shared memory once per CTA (the 8 warps share them, one K
+step ahead with `cp.async`) and skip the MMAs of their empty groups of 8, so the
+last, partly empty tile of an expert costs little. 64-token items run one CTA per
+SM with dynamic shared memory.
 
 **GEMM core.** `mma.sync ... kind::mxf8f6f4.block_scale` with swap-AB: 16 weight
 rows × 8 tokens per MMA. Each lane loads 16 contiguous bytes of a weight row per
@@ -246,7 +260,7 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
 ## Limits and known gaps
 
 - Compute capability 12.0; `hidden % 256 == 0`, `hidden <= 7936`,
-  `intermediate_size % 256 == 0`; top-k ≤ 8; at most 128 tokens per rank; up to
+  `intermediate_size % 256 == 0`; top-k ≤ 8; at most 224 tokens per rank; up to
   8 ranks with ≤ 256 local experts, or 9–32 ranks with ≤ 64 local experts (a
   second build of the kernel, `FLASHINFER_MEGAMOE_SM120_MAX_WORLD=32`, loaded for
   groups of more than 8 ranks: its per-call bookkeeping in shared memory holds
@@ -257,13 +271,11 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
   one host at the same 1 token per rank (DeepSeek-V4.1-Flash and GLM-5.3-Flash,
   random and balanced routing, RTX 6000D hosts with ConnectX-8 switches). From 8
   tokens per rank, EP16 is faster with random routing (9–30%).
-- When EP8 goes over the NIC across sockets (`"auto"` on the RTX PRO 6000 host
-  and on the ConnectX-8-switch RTX 6000D host), cake can be faster at 128 tokens
-  per rank (on RTX PRO 6000: 0.91× for DeepSeek-V4-Flash, 0.85× for GLM-5.3-Flash; on the ConnectX-8 host
-  0.87× for DeepSeek-V4-Flash and 0.81× for GLM-5.3-Flash). Phase stamps place
-  the extra time in the GIN path: on the ConnectX-8 host in receiving the
-  dispatched tokens (the per-token puts queue behind each other), on RTX PRO 6000
-  in waiting for the pushed-back partials. On such hosts `max_tokens_per_expert=16`
-  hands these calls to cake. Hosts where every pair is P2P (the Broadcom RTX 6000D
-  host) stay faster up to 28 tokens per expert, which the default keeps on the
-  kernel.
+- On RoCE set `NCCL_IB_TC` to the lossless traffic class (96 on the ConnectX-8
+  RTX 6000D hosts): the GIN queue pairs do not take the port's default class, so
+  without it their packets go out on the lossy class 0 and the FC2 partials are
+  dropped under load (EP16 stalls). Every ConnectX-8 number above is with it.
+- When EP8 goes over the NIC across sockets on RTX PRO 6000 (`"auto"`), cake can
+  be faster at 128 tokens per rank (0.91× for DeepSeek-V4-Flash, 0.85× for
+  GLM-5.3-Flash): phase stamps place the extra time in waiting for the pushed-back
+  partials. There `max_tokens_per_expert=16` hands these calls to cake.

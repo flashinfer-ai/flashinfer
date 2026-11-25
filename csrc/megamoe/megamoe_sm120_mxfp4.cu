@@ -38,11 +38,16 @@ enum Sm120Offset : int {
   kNumSm120Offsets
 };
 
+// Default work-item width from the routed rows each local expert averages, e = T * TOPK / EL:
+// 16 below e 16, else 32. An empirical default, not the optimum: forced 8 / 16 / 32 / 64 sweeps on
+// RTX 6000D (CX8 hosts, EP8 on one, EP16 across two), cold L2, balanced routing,
+// DeepSeek-V4.1-Flash and GLM-5.3-Flash, 1-1024 tokens per rank. 8 was never faster than 16, nor 64
+// than 32 (32 is 4-17% faster from 256 tokens per rank). Re-sweep (tokens_per_item) for the model,
+// EP size, network and routing you deploy.
+constexpr int kTile32Rows = 16;  // routed rows per local expert from which items cover 32 tokens
+
 // Every CTA of the grid must be resident at once (CTAs wait on each other's flags), so the grid is
 // the device's full occupancy and the launch is cooperative.
-constexpr int kTile16Rows = 3;  // routed rows per local expert from which items cover 16 tokens
-constexpr int kTile32Rows = 8;  // ... and from which they cover 32
-
 template <int kTileN>
 static int sm120_grid_size(int dev) {
   static int grids[64] = {};
@@ -52,9 +57,14 @@ static int sm120_grid_size(int dev) {
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), cudaSuccess);
   TVM_FFI_ICHECK(coop) << "SM120 MegaMoE needs cooperative launch support";
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), cudaSuccess);
-  TVM_FFI_ICHECK_EQ(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                        &occ, s::sm120_mega_moe_kernel<kTileN>, s::kWarps * 32, 0),
+  TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(s::sm120_mega_moe_kernel<kTileN>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         s::tile_smem_bytes<kTileN>()),
                     cudaSuccess);
+  TVM_FFI_ICHECK_EQ(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, s::sm120_mega_moe_kernel<kTileN>,
+                                                    s::kWarps * 32, s::tile_smem_bytes<kTileN>()),
+      cudaSuccess);
   return grids[dev] = occ * sms;
 }
 
@@ -64,7 +74,7 @@ static void sm120_launch(s::Args& a, int dev, cudaStream_t stream) {
   TVM_FFI_ICHECK_EQ(
       cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(s::sm120_mega_moe_kernel<kTileN>),
                                   dim3(sm120_grid_size<kTileN>(dev)), dim3(s::kWarps * 32), params,
-                                  0, stream),
+                                  s::tile_smem_bytes<kTileN>(), stream),
       cudaSuccess);
 }
 
@@ -165,17 +175,12 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
   ffi::CUDADeviceGuard device_guard(y.device().device_id);
   const int dev = y.device().device_id;
   cudaStream_t stream = get_stream(y.device());
-  // Work-item width (tokens_per_item: 8, 16, 24 or 32; 0 = default). Default: by the routed rows
-  // each local expert averages, T * TOPK / EL (the rows a rank receives, spread over its experts):
-  // 8 below 3 rows, 16 below 8, else 32. Items wider than 8 stage their activations once per CTA
-  // and skip their empty groups of 8, so a wider item costs little when an expert's last tile is
-  // partly empty and cuts the weight passes of experts with many rows. Measured with cold L2 on
-  // RTX 6000D, DeepSeek-V4.1-Flash, balanced routing: from 8 rows 32 is 1-9% faster than 16 (EP8
-  // on one host, EP16 across two), below it 16 is as fast or faster.
+  // Work-item width (tokens_per_item: 8, 16, 24, 32 or 64; 0 = the default above). Items
+  // wider than 8 stage their activations once per CTA and skip their empty groups of 8, so a wider
+  // item cuts the weight passes of experts with many rows.
   const int width = tokens_per_item                      ? static_cast<int>(tokens_per_item)
                     : a.T * a.TOPK >= kTile32Rows * a.EL ? 32
-                    : a.T * a.TOPK >= kTile16Rows * a.EL ? 16
-                                                         : 8;
+                                                         : 16;
   switch (width) {
     case 8:
       sm120_launch<8>(a, dev, stream);
@@ -189,8 +194,11 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
     case 32:
       sm120_launch<32>(a, dev, stream);
       break;
+    case 64:
+      sm120_launch<64>(a, dev, stream);
+      break;
     default:
-      TVM_FFI_ICHECK(false) << "tokens_per_item must be 8, 16, 24 or 32, got " << width;
+      TVM_FFI_ICHECK(false) << "tokens_per_item must be 8, 16, 24, 32 or 64, got " << width;
   }
 }
 

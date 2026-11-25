@@ -39,13 +39,14 @@ GIN_CONTEXTS = 4
 
 def counter_ints(wide: bool = False) -> int:
     """The kernel's counter block (sm120_mxfp4_mega_moe.cuh kCtrInts: per-call counters, per-expert
-    and per-tile counts, GIN signal totals; error word at 3) in the default or the 32-rank build:
-    1596 or 4428 ints. The launcher checks the layout leaves this much room."""
+    and per-tile counts, GIN signal totals; error word at 3) in the default or the 32-rank build.
+    The launcher checks the layout leaves this much room."""
+    from .config import MAX_TOKENS_PER_RANK
+
     max_world = 32 if wide else 8
     max_local = 2048 // max_world
-    max_tiles = (
-        max_local + max_world * 128
-    )  # kMaxTiles: 128 tokens per rank, top-8, 8 per tile
+    # kMaxTiles: the capacity's tokens per rank, top-8, 8 per tile
+    max_tiles = max_local + max_world * MAX_TOKENS_PER_RANK
     return 12 + max_local + max_tiles + 2 * max_world + 4 * max_world
 
 
@@ -81,9 +82,10 @@ def buffer_layout(
     from GIN ranks; the packed row of each (token, k); the routing counts staged for GIN ranks.
     ``wide``: the layout of the 32-rank kernel build (a larger counter block)."""
     epr = experts // ranks
-    rows = (
-        epr * ranks * capacity
-    )  # an expert pool slot per (local expert, source rank, token)
+    # expert pool: per source rank its routes here, packed (a token reaches each local expert at
+    # most once); the FC1 output: those rows plus each expert's last partial tile (64-token items)
+    rows = ranks * capacity * min(topk, epr)
+    inter_rows = rows + epr * 64
     row_bytes = pool_row_bytes(hidden)
     gin_block = _align(capacity * topk * 4, 16) + capacity * row_bytes  # per GIN rank
     sizes = (
@@ -98,8 +100,8 @@ def buffer_layout(
         ranks * 4,
         2 * ranks * (epr + 1) * 4,  # two halves, by epoch parity
         ranks * 4,
-        rows * intermediate,
-        rows * (intermediate // 128) * 4,
+        inter_rows * intermediate,
+        inter_rows * (intermediate // 128) * 4,
         counter_ints(wide) * 4,
         ranks * gin_block if gin else 0,
         ranks * gin_block if gin else 0,

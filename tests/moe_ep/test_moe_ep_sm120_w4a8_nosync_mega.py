@@ -388,8 +388,8 @@ def _args(**overrides):
         intermediate=256,
         experts=256,
         topk=6,
-        capacity=128,
-        threshold=128,
+        capacity=224,
+        threshold=224,
         tokens_per_expert=128,
         tokens=[1, 8, 20, 64, 128],
         routing="random",
@@ -435,7 +435,7 @@ def test_sm120_nosync_skewed_routing(routing):
 
 @pytest.mark.parametrize("uneven", [False, True], ids=["even", "uneven"])
 def test_sm120_nosync_switch(uneven):
-    """Capacity 512: calls up to 128 tokens per rank run the nosync kernel, larger ones the
+    """Capacity 512: calls up to 224 tokens per rank run the nosync kernel, larger ones the
     configured backend (bit-identical to a layer without the option), eager (all-reduced token count) and under CUDA
     graphs (compile_tokens_per_rank); with uneven rows the largest rank decides."""
     if not _sm120_gpus(4):
@@ -445,7 +445,7 @@ def test_sm120_nosync_switch(uneven):
             hidden=4096,
             intermediate=2048,
             capacity=512,
-            tokens=[1, 128, 129, 512],
+            tokens=[1, 224, 225, 512],
             uneven=uneven,
         )
     )
@@ -462,11 +462,13 @@ def test_nosync_token_limit():
     """Per-rank bound: the per-rank cap and the per-expert average over all ranks' routes."""
     from flashinfer.moe_ep.modes.nosync_layer import nosync_token_limit
 
-    # the default 128: DeepSeek-V4.1-Flash and GLM-5.3-Flash keep the 128 cap through EP32
-    assert nosync_token_limit(128, 128, 384, 32, 6) == 128
-    assert nosync_token_limit(128, 128, 288, 16, 8) == 128
-    assert nosync_token_limit(128, 128, 288, 32, 8) == 128
-    assert nosync_token_limit(128, 128, 128, 32, 8) == 64
+    # the defaults 224 / 128: DeepSeek-V4.1-Flash keeps the 224 cap through EP32, GLM-5.3-Flash
+    # through EP16 (144 at EP32)
+    assert nosync_token_limit(224, 128, 384, 16, 6) == 224
+    assert nosync_token_limit(224, 128, 384, 32, 6) == 224
+    assert nosync_token_limit(224, 128, 288, 16, 8) == 224
+    assert nosync_token_limit(224, 128, 288, 32, 8) == 144
+    assert nosync_token_limit(224, 128, 128, 32, 8) == 64
 
     assert nosync_token_limit(128, 32, 256, 8, 6) == 128
     assert nosync_token_limit(128, 32, 288, 16, 8) == 72
@@ -484,16 +486,16 @@ def test_nosync_token_limit():
 @pytest.mark.parametrize(
     "experts,topk,limit,tokens",
     [
-        (256, 6, 128, [128]),
-        (288, 8, 128, [128]),
-        (384, 6, 128, [128]),
+        (256, 6, 128, [224]),
+        (288, 8, 128, [224]),
+        (384, 6, 128, [224]),
         (128, 8, 32, [64, 65]),
     ],
     ids=["dsv4_flash", "glm53_flash", "dsv41_flash", "128_experts_top8_limit32"],
 )
 def test_sm120_nosync_tokens_per_expert(experts, topk, limit, tokens):
     """EP8 with the default 128 tokens per expert: DeepSeek-V4-Flash, GLM-5.3-Flash and
-    DeepSeek-V4.1-Flash keep the 128 cap; with 32, 128 experts with top-8 switch at 64 tokens
+    DeepSeek-V4.1-Flash keep the 224 cap; with 32, 128 experts with top-8 switch at 64 tokens
     per rank."""
     if not _sm120_gpus(8):
         pytest.skip("requires 8 SM120 GPUs")
@@ -519,12 +521,12 @@ def test_sm120_nosync_model_shapes(ep, hidden, intermediate, experts, topk):
             intermediate=intermediate,
             experts=experts,
             topk=topk,
-            tokens=[1, 16, 64, 128],
+            tokens=[1, 16, 64, 128, 224],
         )
     )
 
 
-@pytest.mark.parametrize("tokens_per_item", [8, 16, 24, 32])
+@pytest.mark.parametrize("tokens_per_item", [8, 16, 24, 32, 64])
 def test_sm120_nosync_tokens_per_item(tokens_per_item):
     """Every work-item width, forced, at token counts below and above it."""
     if not _sm120_gpus(4):
@@ -651,7 +653,7 @@ def test_sm120_nosync_multihost_model_shapes(hidden, intermediate, experts, topk
         intermediate=intermediate,
         experts=experts,
         topk=topk,
-        tokens=[1, 16, 64, 128],
+        tokens=[1, 16, 64, 128, 224],
         transport=None,
         cake_transport="lsa_where_reachable",
         local_rank=int(os.environ["LOCAL_RANK"]),
@@ -894,8 +896,8 @@ if __name__ == "__main__":
     parser.add_argument("--intermediate", type=int, default=256)
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument("--topk", type=int, default=6)
-    parser.add_argument("--capacity", type=int, default=128)
-    parser.add_argument("--threshold", type=int, default=128)
+    parser.add_argument("--capacity", type=int, default=224)
+    parser.add_argument("--threshold", type=int, default=224)
     parser.add_argument("--tokens-per-expert", type=int, default=128)
     parser.add_argument("--fallback", choices=["cake", "cutedsl"], default="cake")
     parser.add_argument(
@@ -904,7 +906,7 @@ if __name__ == "__main__":
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--transport", choices=["p2p", "nic", "auto"], default="p2p")
     parser.add_argument(
-        "--tokens-per-item", type=int, choices=[8, 16, 24, 32], default=None
+        "--tokens-per-item", type=int, choices=[8, 16, 24, 32, 64], default=None
     )
     parser.add_argument("--uneven", action="store_true")
     parser.add_argument("--default-knobs", action="store_true")

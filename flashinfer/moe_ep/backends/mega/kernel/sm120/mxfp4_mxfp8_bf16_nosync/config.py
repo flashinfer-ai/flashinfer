@@ -20,16 +20,16 @@ import math
 from dataclasses import dataclass
 
 TRANSPORTS = ("p2p", "auto", "nic")
-TOKENS_PER_ITEM = (8, 16, 24, 32)
-# The kernel is measured faster than cake and cutedsl up to 128 tokens per rank (RTX 6000D and
-# RTX PRO 6000, DeepSeek-V4-Flash, DeepSeek-V4.1-Flash and GLM-5.3-Flash MoE shapes); its expert
-# pools hold max_tokens_per_rank rows per (local expert, source rank).
-MAX_TOKENS_PER_RANK = 128
+TOKENS_PER_ITEM = (8, 16, 24, 32, 64)
+# Up to 224 tokens per rank the kernel is measured no slower than cake (RTX 6000D, EP8 on one CX8
+# host and EP16 across two, DeepSeek-V4.1-Flash and GLM-5.3-Flash MoE shapes, balanced routing);
+# from 256 cake wins. Its pools hold max_tokens_per_rank rows per source rank and route slot.
+MAX_TOKENS_PER_RANK = 224
 
 
 @dataclass
 class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
-    """Static parameters of the nosync kernel (at most 128 tokens per rank).
+    """Static parameters of the nosync kernel (at most 224 tokens per rank).
 
     Deployments normally reach it through :class:`NosyncSwitchConfig`, which runs it for
     small batches and the deployment's own backend for the rest.
@@ -60,9 +60,10 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     EP8 needs the second setting (DSV4-Flash, 128 tokens per rank: 11 ms all-P2P, 0.75 ms).
 
     ``tokens_per_item`` is the number of tokens one work item multiplies per weight load (8,
-    16, 24 or 32). ``None`` picks by this rank's routed rows per local expert
-    (``tokens * top_k / local_experts``): 8 below 3, 16 below 8, else 32 (measured with cold L2
-    on RTX 6000D). Set it explicitly after sweeping a deployment's shapes.
+    16, 24, 32 or 64). ``None`` picks by the routed rows per local expert
+    (``tokens * top_k / local_experts``): 16 below 16, else 32. It is an empirical default from
+    cold-L2 sweeps on RTX 6000D, not the optimum: set it explicitly after sweeping a deployment's
+    shapes.
     """
 
     intermediate_size: int

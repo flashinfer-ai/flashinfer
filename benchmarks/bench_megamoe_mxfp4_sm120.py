@@ -126,6 +126,7 @@ def _moe_ep(args, h, ih, experts, topk, generator, raw):
         from flashinfer.moe_ep import NosyncOptions
 
         nosync = NosyncOptions(
+            max_tokens_per_rank=args.capacity,
             transport=args.nosync_transport,
             tokens_per_item=args.tokens_per_item,
             max_tokens_per_expert=args.max_tokens_per_expert,
@@ -312,7 +313,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokens", type=int, nargs="+", default=[1, 2, 8, 16, 20, 32, 64]
     )
-    parser.add_argument("--capacity", type=int, default=128)
+    parser.add_argument("--capacity", type=int, default=224)
     parser.add_argument("--routing", choices=["random", "balanced"], default="random")
     parser.add_argument("--cold-l2", action="store_true")
     parser.add_argument("--repeats", type=int, default=40)
@@ -332,7 +333,7 @@ if __name__ == "__main__":
         choices=["nosync", "cutedsl", "cake"],
         default="nosync",
         help="cutedsl / cake: that moe_ep backend; nosync: the --fallback backend with "
-        "MoEEpLayer(nosync=NosyncOptions()), so calls up to 128 tokens per rank run "
+        "MoEEpLayer(nosync=NosyncOptions()), so calls up to 224 tokens per rank run "
         "sm120_mxfp4_mxfp8_bf16_nosync",
     )
     parser.add_argument(
@@ -352,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokens-per-item",
         type=int,
-        choices=[8, 16, 24, 32],
+        choices=[8, 16, 24, 32, 64],
         default=None,
         help="nosync: force the work-item width (default: by routed rows per local expert)",
     )

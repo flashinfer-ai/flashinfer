@@ -43,15 +43,17 @@ class NosyncOptions:
     """Run small calls on the nosync kernel.
 
     A call runs the nosync kernel when every rank holds at most ``max_tokens_per_rank`` tokens
-    (at most 128, the kernel's capacity) and the call's tokens on all ranks times ``top_k``
+    (at most 224, the kernel's capacity) and the call's tokens on all ranks times ``top_k``
     average at most ``max_tokens_per_expert`` per expert; the layer bounds the total by the
-    largest rank's count times the EP size. Both must be the same on every rank. The default 128
-    keeps every call of DeepSeek-V4.1-Flash and GLM-5.3-Flash up to 128 tokens per rank on the
-    kernel through EP32; measured on RTX 6000D (EP8 on one host, EP16 across two, balanced
-    routing) the kernel is faster than cake there, and from 57 tokens per expert on the two are
-    within 1.5%. Where the kernel stops winning depends on the model, the routing and how the
-    ranks are connected, so for the best performance measure it on the deployment
-    (``benchmarks/bench_megamoe_mxfp4_sm120.py --max-tokens-per-expert``) and set it.
+    largest rank's count times the EP size. Both must be the same on every rank. The defaults
+    (224 per rank, 128 per expert) are where the kernel stops winning, measured on RTX 6000D (EP8
+    on one host, EP16 across two, cold L2, balanced routing, DeepSeek-V4.1-Flash and
+    GLM-5.3-Flash): up to 224 tokens per rank it is 6-25% faster than cake but for one point
+    within 0.2%, from 256 cake is up to 5% faster and from 384 21-25%. The crossing follows the
+    tokens per rank at both EP sizes (28-114 tokens per expert there), so the per-expert bound
+    only caps the averages. Where the kernel stops winning depends on the model, the routing and
+    how the ranks are connected, so for the best performance measure it on the deployment
+    (``benchmarks/bench_megamoe_mxfp4_sm120.py``) and set both.
     ``transport`` and
     ``tokens_per_item`` are the nosync kernel's
     (:class:`~flashinfer.moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`); ``transport``
@@ -65,7 +67,7 @@ class NosyncOptions:
     is the cake or cutedsl SM120 MXFP4 backend; set them for any other backend.
     """
 
-    max_tokens_per_rank: int = 128
+    max_tokens_per_rank: int = 224
     max_tokens_per_expert: int = 128
     transport: str | tuple[int, ...] | None = None
     tokens_per_item: int | None = None
