@@ -12,7 +12,7 @@ name: CI Bot Commands
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited, deleted]
 
 permissions:
   contents: read
@@ -32,6 +32,7 @@ jobs:
     # here: each carries the marker below (NOTE_MARKER in the run step; keep the
     # two in sync), so a note is never read back as a command and costs no job.
     if: |
+      github.event.action == 'created' &&
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@flashinfer-bot') &&
       !(github.event.comment.user.login == 'flashinfer-bot' &&
@@ -487,7 +488,7 @@ jobs:
   api-break-command:
     if: >-
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@flashinfer-bot')
+      (github.event.action != 'created' || contains(github.event.comment.body, '@flashinfer-bot'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

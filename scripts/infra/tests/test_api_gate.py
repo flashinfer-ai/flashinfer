@@ -1,6 +1,7 @@
 """Authorization, trust and merge-gate contracts migrated from Node."""
 
 import copy
+import hashlib
 import os
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from pr_checks.github_api import GitHubError
 from api_test_support import FakeGitHub
 
 ROOT = "repos/org/repo"
+REVISION = hashlib.sha256(("a" * 40 + ":" + "b" * 40 + ":0").encode()).hexdigest()[:24]
 BREAK = {
     "execution_status": "COMPLETE",
     "findings": [{"classification": "BREAKING", "level": "error"}],
@@ -95,6 +97,8 @@ class Fixture:
                 "path": ".github/workflows/" + file,
                 "repository": {"full_name": "org/repo"},
             }
+        self.api.routes[("GET", ROOT + "/issues/3/timeline")] = []
+        self.records[0]["description"] = "complete:" + REVISION
         self.gate = Gate(self.api, self.context, warning=lambda _: None)
 
     def add_status(self, data):
@@ -215,7 +219,7 @@ class GateTest(unittest.TestCase):
         return {
             "id": number,
             "context": "api-break-exception/pr-3",
-            "description": f"expected:{number}",
+            "description": f"expected:{number}:{REVISION}",
             "state": "success",
             "target_url": "https://github.com/org/repo/actions/runs/2",
             "creator": {"login": "github-actions[bot]"},
@@ -356,7 +360,8 @@ class GateTest(unittest.TestCase):
 
             f.run(scan)
             self.assertEqual(
-                f.statuses("api-break-exception/pr-3")[0]["description"], "revoke:10"
+                f.statuses("api-break-exception/pr-3")[0]["description"],
+                "revoke:10:" + REVISION,
             )
             self.assertEqual(f.statuses()[-1]["state"], "error")
             self.assertEqual(f.reactions(), ["eyes"])
@@ -419,3 +424,139 @@ class GateTest(unittest.TestCase):
         self.assertEqual(f.statuses()[-1]["state"], "failure")
         self.assertIn("shared", f.statuses()[-1]["description"])
         self.assertEqual(f.reactions(), ["eyes"])
+
+    def test_force_push_back_does_not_restore_an_old_approval(self):
+        f = Fixture()
+        item = self.exception(10)
+        self.assertTrue(f.gate.valid_exception(f.pr, item))
+        f.api.routes[("GET", ROOT + "/issues/3/timeline")] = [
+            {
+                "id": 91,
+                "event": "head_ref_force_pushed",
+                "commit_id": f.pr["head"]["sha"],
+            }
+        ]
+        self.assertFalse(f.gate.valid_exception(f.pr, item))
+
+    def test_later_healthy_scan_does_not_hide_earlier_eligible_scan(self):
+        f = Fixture()
+        f.records.insert(
+            0, {**f.records[0], "id": 2, "created_at": "2026-11-25T02:00:00Z"}
+        )
+        f.run()
+        self.assertEqual(f.reactions(), ["eyes", "+1"])
+
+    def test_partial_approval_can_resume_after_api_recovery(self):
+        f = Fixture()
+        f.api.routes[("GET", ROOT + "/pulls")] = GitHubError(503, "unavailable")
+        f.run()
+        self.assertEqual(f.statuses()[-1]["state"], "error")
+        self.assertEqual(f.statuses("api-scan/pr-3")[-1]["state"], "success")
+        f.api.routes[("GET", ROOT + "/pulls")] = [f.pr]
+        f.run()
+        self.assertEqual(f.statuses()[-1]["state"], "success")
+        self.assertEqual(f.reactions()[-1], "+1")
+
+    def test_peer_opened_during_status_write_reblocks_success(self):
+        f = Fixture()
+        calls = 0
+
+        def peers(_):
+            nonlocal calls
+            calls += 1
+            return [f.pr] if calls == 1 else [f.pr, {**f.pr, "number": 4}]
+
+        f.api.routes[("GET", ROOT + "/pulls")] = peers
+        f.run()
+        self.assertEqual(f.statuses()[-1]["state"], "failure")
+        self.assertEqual(f.reactions(), ["eyes"])
+
+    def test_approval_edit_or_delete_triggers_recheck_without_reaction(self):
+        for action in ("edited", "deleted"):
+            with self.subTest(action=action):
+                f = Fixture()
+                f.run()
+                self.assertEqual(f.statuses()[-1]["state"], "success")
+                f.context.payload["action"] = action
+                if action == "edited":
+                    f.comment["body"] = "approval withdrawn"
+                    f.comment["updated_at"] = "2026-11-25T04:00:00Z"
+                else:
+                    f.api.routes[("GET", ROOT + "/issues/comments/10")] = GitHubError(
+                        404, "deleted"
+                    )
+                f.run()
+                self.assertEqual(f.statuses()[-1]["state"], "failure")
+                self.assertEqual(f.reactions(), ["eyes", "+1"])
+
+    def test_generation_change_during_success_write_reblocks(self):
+        f = Fixture()
+
+        def write(data):
+            result = f.add_status(data)
+            if data["context"] == "API compatibility" and data["state"] == "success":
+                f.api.routes[("GET", ROOT + "/issues/3/timeline")] = [
+                    {"id": 92, "event": "head_ref_force_pushed"}
+                ]
+            return result
+
+        f.api.routes[("POST", ROOT + "/statuses/" + "a" * 40)] = write
+        f.run()
+        self.assertNotEqual(f.statuses()[-1]["state"], "success")
+        self.assertEqual(f.reactions(), ["eyes"])
+
+    def test_unrelated_comment_edit_does_not_rescan(self):
+        f = Fixture()
+        f.context.payload["action"] = "edited"
+
+        def fail(_):
+            raise AssertionError("unrelated comment must not trigger a rescan")
+
+        f.run(fail)
+        self.assertEqual(f.statuses(), [])
+        self.assertEqual(f.reactions(), [])
+
+    def test_old_base_evidence_cannot_approve_same_head(self):
+        f = Fixture()
+        f.pr["base"]["sha"] = "c" * 40
+        f.run()
+        self.assertEqual(f.reactions(), ["eyes"])
+        self.assertEqual(f.statuses(), [])
+
+    def test_rescan_without_push_preserves_approval(self):
+        f = Fixture()
+        f.run()
+        f.records.insert(
+            0,
+            {
+                **f.records[0],
+                "id": 99,
+                "context": "api-scan/pr-3",
+                "description": "complete:" + REVISION,
+                "state": "success",
+            },
+        )
+        with patch.object(f.gate, "write_report"):
+            self.assertTrue(
+                f.gate.evaluate(f.gate.bind(copy.deepcopy(f.pr)), copy.deepcopy(BREAK))
+            )
+
+    def test_healthy_earlier_evidence_does_not_override_current_scan_error(self):
+        f = Fixture(scan_state="error")
+        f.records.append({**f.records[0], "id": 0, "state": "success"})
+        f.run()
+        self.assertEqual(f.reactions(), ["eyes"])
+        self.assertEqual(f.statuses(), [])
+
+    def test_partial_acceptance_retry_cannot_override_newer_revoke(self):
+        f = Fixture()
+        f.api.routes[("GET", ROOT + "/pulls")] = GitHubError(503, "unavailable")
+        f.run()
+        f.api.routes[("GET", ROOT + "/pulls")] = [f.pr]
+        f.records.append(
+            self.exception(11, description="revoke:11:" + REVISION, state="failure")
+        )
+        previous = len(f.statuses())
+        f.run()
+        self.assertEqual(len(f.statuses()), previous)
+        self.assertNotIn("+1", f.reactions())

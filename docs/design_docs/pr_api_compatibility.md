@@ -80,11 +80,24 @@ gate for that head. It posts no acknowledgment or approval-summary comment.
 The existing sticky report may update to `PASS (expected)`; findings remain
 BREAKING/error in the evidence.
 
-A trusted complete scan must predate the command. A queued command cannot approve
-a new head whose scan completed after the command was posted. Every new commit
-requires a new command. Approval records bind PR, SHA, command ID, actor and
-workflow provenance. Editing or deleting an approval invalidates it without
-resurrecting an older approval. A deleted comment does not invalidate completed scan evidence.
+A trusted complete scan for the same head/base generation must predate the
+command. The most recent scan must also be healthy; a newer healthy rescan does
+not hide qualifying earlier evidence. A partially completed acceptance can be
+retried after revalidating the live comment, permissions, revision and command
+order. An evaluation API failure leaves the gate in error and preserves completed
+scan evidence. A queued command cannot approve a new revision whose scan
+completed after the command was posted. Every new commit
+requires a new command. Approval and complete-scan records bind PR, head SHA,
+base SHA, and a revision generation derived from trusted PR timeline events.
+Returning to an earlier head by force-push cannot reuse that head's old approval;
+rescanning without an intervening revision change preserves approval. Records
+also bind command ID, actor and workflow provenance. Older unbound records are
+not eligible; rollout requires a fresh scan and approval.
+
+Editing or deleting the latest recorded approval queues a gate reevaluation through `issue_comment` edited/deleted events. Until GitHub runs that
+queued job, the previous status may still be visible. Reevaluation invalidates
+the approval without resurrecting an older one. A deleted comment does not
+invalidate completed scan evidence.
 A successful rescan from either trusted workflow refreshes that evidence; a
 failed revoke rescan leaves the gate in error and refreshes the summary as
 incomplete when comment delivery is available. A later explicit revocation takes
@@ -125,7 +138,12 @@ GitHub commit statuses are shared by all PRs using the same head SHA. Before
 publishing success, the gate checks for other open PRs at that SHA and fails
 closed if any exist. Use a distinct head commit for each open PR (an empty commit
 is sufficient). An exception in one PR cannot waive this restriction or unblock
-another PR. The required check name remains **API compatibility**.
+another PR. The shared-head check runs before and after publishing success;
+a newly detected peer repairs success to failure. GitHub does not offer an
+atomic transaction covering PR enumeration, revision changes and commit-status
+publication. Event delivery/queue delay and the final API read/write window
+remain; this checker is not an atomic per-PR merge authorization service.
+The required check name remains **API compatibility**.
 
 ## Validation
 
@@ -153,3 +171,27 @@ provenance, delayed approval, head races, revocation and scan failures.
 GitHub references: [commit statuses](https://docs.github.com/en/rest/commits/statuses),
 [concurrency queues](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
 and [pull_request_target](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target).
+
+
+## Documentation and API check separation
+
+API scanning and merge gating run in `pr-api-compatibility.yml` from trusted
+code. Its `trusted-public-api-report` artifact, API sticky marker, and inline
+marker are independent of documentation reports. Evidence-upload failures warn
+without replacing a completed gate decision.
+
+`pr-api-doc-checks.yml` runs the read-only advisory documentation producer and
+uploads only documentation evidence. It also hosts the separate `API policy
+tests` job; the two jobs share a workflow trigger, but the tests do not publish
+API findings or make the compatibility decision. `pr-api-doc-comment.yml` reads
+only documentation artifacts and writes only documentation comments.
+
+The privileged documentation reporter runs from the default branch. Until this
+PR's reporter update is deployed there, the old reporter can still complain that
+`public-api.json` is missing from the now-documentation-only artifact. That is a
+rollout mismatch, not evidence that the trusted API scan failed. Do not fabricate
+an empty API report to hide it.
+
+The sticky API summary intentionally lists changes only; detailed reasons remain
+in inline comments. Invalid anchors receive individual retry only for positively
+identified anchor-validation errors; spam/rate-limit responses never fan out.

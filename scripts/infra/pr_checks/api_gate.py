@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -69,7 +70,9 @@ def gate_state(report: dict, expected: bool) -> str:
 
 
 def command_id(record: dict) -> int:
-    match = re.fullmatch(r"(?:expected|revoke):(\d+)", record.get("description", ""))
+    match = re.fullmatch(
+        r"(?:expected|revoke):(\d+)(?::[a-f0-9]{24})?", record.get("description", "")
+    )
     return int(match[1]) if match else 0
 
 
@@ -148,6 +151,49 @@ class Gate:
             latest["state"] == "open"
             and latest["head"]["sha"] == pr["head"]["sha"]
             and latest["base"]["sha"] == pr["base"]["sha"]
+            and (
+                "_api_generation" not in pr
+                or self.generation(latest) == pr["_api_generation"]
+            )
+        )
+
+    def generation(self, pr: dict) -> str:
+        # Commit statuses survive force-pushes. Trusted timeline event IDs
+        # distinguish returning to an old SHA from rescanning the same head.
+        events = self.api.paginate(f"{self.root}/issues/{pr['number']}/timeline")
+        updates = sorted(
+            (e["event"], e["id"])
+            for e in events
+            if e.get("event")
+            in {
+                "head_ref_force_pushed",
+                "head_ref_deleted",
+                "head_ref_restored",
+                "base_ref_changed",
+                "base_ref_force_pushed",
+            }
+        )
+        event = json.dumps(updates, separators=(",", ":")) if updates else "0"
+        stamp = f"{pr['head']['sha']}:{pr['base']['sha']}:{event}"
+        return hashlib.sha256(stamp.encode()).hexdigest()[:24]
+
+    def bind(self, pr: dict) -> dict:
+        return {**pr, "_api_generation": self.generation(pr)}
+
+    def revision(self, pr: dict) -> str:
+        return pr.get("_api_generation") or self.generation(pr)
+
+    def scan_description(self, pr: dict) -> str:
+        return f"complete:{self.revision(pr)}"
+
+    def decision_description(self, pr: dict, command: str, id: int) -> str:
+        return f"{command}:{id}:{self.revision(pr)}"
+
+    def shared_head(self, pr: dict) -> bool:
+        return any(
+            other["number"] != pr["number"]
+            and other["head"]["sha"] == pr["head"]["sha"]
+            for other in self.api.paginate(f"{self.root}/pulls?state=open")
         )
 
     def provenance(self, item: dict, event: str, workflow: str) -> bool:
@@ -188,9 +234,13 @@ class Gate:
     def exception_comment(self, pr: dict, item: dict) -> dict | None:
         if (
             item.get("context") != self.exception_context(pr)
-            or not re.fullmatch(r"(?:expected|revoke):\d+", item.get("description", ""))
+            or not re.fullmatch(
+                r"(?:expected|revoke):\d+:[a-f0-9]{24}", item.get("description", "")
+            )
             or not self.provenance(item, "issue_comment", "ci-bot-commands.yml")
         ):
+            return None
+        if item["description"].rsplit(":", 1)[-1] != self.revision(pr):
             return None
         id = command_id(item)
         try:
@@ -294,15 +344,9 @@ class Gate:
         expected = approved(self, pr, self.statuses(pr))
         state = gate_state(report, expected)
         blocked_reason = ""
-        if state == "success":
-            others = self.api.paginate(f"{self.root}/pulls?state=open")
-            if any(
-                other["number"] != pr["number"]
-                and other["head"]["sha"] == pr["head"]["sha"]
-                for other in others
-            ):
-                state = "failure"
-                blocked_reason = "Head commit is shared by multiple open PRs; push a distinct commit before retrying."
+        if state == "success" and self.shared_head(pr):
+            state = "failure"
+            blocked_reason = "Head commit is shared by multiple open PRs; push a distinct commit before retrying."
         if not self.current_head(pr):
             return False
         description = blocked_reason or (
@@ -315,6 +359,19 @@ class Gate:
             else "No blocking API changes"
         )
         self.status(pr, GATE, state, description)
+        # Repair a success if a peer appeared between the preflight and write.
+        # GitHub offers no atomic PR-scoped commit-status transaction.
+        if state == "success" and self.shared_head(pr):
+            state = "failure"
+            blocked_reason = "Head commit is shared by multiple open PRs; push a distinct commit before retrying."
+            self.status(pr, GATE, state, blocked_reason)
+        if state == "success" and not self.current_head(pr):
+            latest = self.pull(pr["number"])
+            if latest["head"]["sha"] != pr["head"]["sha"]:
+                return False
+            state = "failure"
+            blocked_reason = "PR revision changed during gate publication; a fresh API scan is required."
+            self.status(pr, GATE, state, blocked_reason)
         maintainers = []
         try:
             maintainers = [
@@ -337,8 +394,54 @@ class Gate:
             self.warning(f"API comments could not be updated: {error}")
         return state == "success" and self.current_head(pr)
 
+    def evaluate_safely(self, pr: dict, report: dict) -> bool:
+        try:
+            return self.evaluate(pr, report)
+        except Exception as error:
+            self.warning(f"API gate evaluation failed: {error}")
+            # A reporting/API failure does not erase completed scan evidence.
+            if self.current_head(pr):
+                self.status(
+                    pr, GATE, "error", "API gate evaluation failed; retry the workflow"
+                )
+            return False
+
+    def command_scan(self, pr: dict, scan) -> dict | None:
+        self.status(pr, GATE, "pending", "Re-evaluating API compatibility")
+        try:
+            report = scan(pr)
+            if gate_state(report, True) == "error":
+                raise RuntimeError("API rescan did not complete")
+        except Exception as error:
+            self.warning(str(error))
+            if not self.current_head(pr):
+                return None
+            self.status(pr, self.scan_context(pr), "error", "Trusted API rescan failed")
+            self.status(pr, GATE, "error", "API rescan failed; inspect workflow logs")
+            failed = {
+                "execution_status": "FAILED",
+                "findings": [],
+                "error": str(error),
+                "base": pr["base"]["sha"],
+                "head": pr["head"]["sha"],
+            }
+            self.write_report(failed)
+            try:
+                self.publish(pr, failed)
+            except Exception as publication_error:
+                self.warning(
+                    f"API failure summary could not be updated: {publication_error}"
+                )
+            return None
+        if not self.current_head(pr):
+            return None
+        self.status(pr, self.scan_context(pr), "success", self.scan_description(pr))
+        return report
+
     def run_scan(self) -> None:
-        pr = self.pull(self.context.payload["pull_request"]["number"])
+        pr = self.bind(self.pull(self.context.payload["pull_request"]["number"]))
+        if not self.current_head(pr):
+            return
         self.status(pr, GATE, "pending", "Scanning public API compatibility")
         try:
             report = self.scan(pr)
@@ -349,19 +452,54 @@ class Gate:
                 pr,
                 self.scan_context(pr),
                 "success" if complete else "error",
-                "Trusted API scan complete"
+                self.scan_description(pr)
                 if complete
                 else "Trusted API scan incomplete",
             )
-            self.evaluate(pr, report)
         except Exception as error:
             self.warning(str(error))
-            self.status(pr, self.scan_context(pr), "error", "Trusted API scan failed")
-            self.status(pr, GATE, "error", "API scan failed; inspect workflow logs")
+            if self.current_head(pr):
+                self.status(
+                    pr, self.scan_context(pr), "error", "Trusted API scan failed"
+                )
+                self.status(pr, GATE, "error", "API scan failed; inspect workflow logs")
             raise
+        self.evaluate_safely(pr, report)
+
+    def changed_approval(self, comment: dict, scan) -> None:
+        pr = self.pull(self.context.payload["issue"]["number"])
+        if pr["state"] != "open":
+            return
+        records = sorted(
+            (
+                s
+                for s in self.statuses(pr)
+                if s["context"] == self.exception_context(pr)
+            ),
+            key=command_id,
+            reverse=True,
+        )
+        latest = next(
+            (
+                s
+                for s in records
+                if self.provenance(s, "issue_comment", "ci-bot-commands.yml")
+            ),
+            None,
+        )
+        if latest is None or command_id(latest) != comment["id"]:
+            return
+        pr = self.bind(pr)
+        report = self.command_scan(pr, scan)
+        if report is not None:
+            self.evaluate_safely(pr, report)
 
     def handle_command(self, *, scan=None) -> None:
         comment = self.context.payload["comment"]
+        scan = scan or self.scan
+        if self.context.payload.get("action", "created") in ("edited", "deleted"):
+            self.changed_approval(comment, scan)
+            return
         command = parse_command(comment["body"])
         if not command:
             return
@@ -381,18 +519,47 @@ class Gate:
             or comment["updated_at"] != comment["created_at"]
         ):
             return
+        pr = self.bind(pr)
         records = self.statuses(pr)
-        latest = max(
+        scans = sorted(
             (s for s in records if s["context"] == self.scan_context(pr)),
             key=lambda s: s["id"],
-            default=None,
+            reverse=True,
         )
+        healthy = bool(
+            scans
+            and scans[0]["state"] == "success"
+            and scans[0].get("description") == self.scan_description(pr)
+            and self.trusted_scan(scans[0])
+        )
+        resumed = (
+            any(
+                s["context"] == self.exception_context(pr)
+                and command_id(s) == comment["id"]
+                and self.valid_exception(pr, s)
+                for s in records
+            )
+            if command == "expected"
+            else False
+        )
+
+        def predates(record):
+            return datetime.fromisoformat(
+                record["created_at"].replace("Z", "+00:00")
+            ) <= datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))
+
         if command == "expected" and (
-            not latest
-            or latest["state"] != "success"
-            or datetime.fromisoformat(latest["created_at"].replace("Z", "+00:00"))
-            > datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))
-            or not self.trusted_scan(latest)
+            not healthy
+            or not (
+                resumed
+                or any(
+                    s["state"] == "success"
+                    and s.get("description") == self.scan_description(pr)
+                    and predates(s)
+                    and self.trusted_scan(s)
+                    for s in scans
+                )
+            )
         ):
             return
         live = self.api.request("GET", f"{self.root}/issues/comments/{comment['id']}")
@@ -411,35 +578,22 @@ class Gate:
                 return
         if command == "revoke":
             self.status(
-                pr, self.exception_context(pr), "failure", f"revoke:{comment['id']}"
+                pr,
+                self.exception_context(pr),
+                "failure",
+                self.decision_description(pr, command, comment["id"]),
             )
-        self.status(pr, GATE, "pending", "Re-evaluating API compatibility")
-        try:
-            report = (scan or self.scan)(pr)
-            if gate_state(report, True) == "error":
-                raise RuntimeError("API rescan did not complete")
-        except Exception as error:
-            self.warning(str(error))
-            self.status(pr, self.scan_context(pr), "error", "Trusted API rescan failed")
-            self.status(pr, GATE, "error", "API rescan failed; inspect workflow logs")
-            try:
-                self.publish(
-                    pr,
-                    {"execution_status": "FAILED", "findings": [], "error": str(error)},
-                )
-            except Exception as publication_error:
-                self.warning(
-                    f"API failure summary could not be updated: {publication_error}"
-                )
+        report = self.command_scan(pr, scan)
+        if report is None:
             return
-        if not self.current_head(pr):
-            return
-        self.status(pr, self.scan_context(pr), "success", "Trusted API rescan complete")
-        if command == "expected":
+        if command == "expected" and not resumed:
             self.status(
-                pr, self.exception_context(pr), "success", f"expected:{comment['id']}"
+                pr,
+                self.exception_context(pr),
+                "success",
+                self.decision_description(pr, command, comment["id"]),
             )
-        if self.evaluate(pr, report) and command == "expected":
+        if self.evaluate_safely(pr, report) and command == "expected":
             react("+1")
 
 

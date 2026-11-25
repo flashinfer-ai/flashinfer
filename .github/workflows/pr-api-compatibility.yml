@@ -39,6 +39,10 @@ jobs:
           root = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"]
           target = os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"]
           for name in ("API compatibility", f"api-scan/pr-{pr['number']}"):
+              with urlopen(Request(root + "/pulls/" + str(pr["number"]), headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json"}), timeout=60) as response:
+                  latest = json.load(response)
+              if latest["state"] != "open" or any(latest[side]["sha"] != pr[side]["sha"] for side in ("head", "base")):
+                  break
               data = {"context": name, "state": os.environ["API_GATE_STATE"], "description": os.environ["API_GATE_DESCRIPTION"], "target_url": target}
               request = Request(root + "/statuses/" + pr["head"]["sha"], data=json.dumps(data).encode(), method="POST", headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json", "Content-Type": "application/json"})
               with urlopen(request, timeout=60) as response:
@@ -54,18 +58,24 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/infra/tests -p 'test*api*.py' -v
       - name: Scan git objects and publish API gate
+        id: scan
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/infra/pr_checks/api_gate.py scan
       - name: Upload trusted API evidence
+        id: evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: trusted-public-api-report
           path: reports/public-api.json
           if-no-files-found: warn
+      - name: Report evidence upload failure
+        if: steps.evidence.outcome == 'failure'
+        run: echo "::warning::API evidence upload failed; the completed gate result is unchanged."
       - name: Fail API gate if workflow execution failed
-        if: failure()
+        if: failure() && steps.scan.outcome != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           API_GATE_STATE: error
