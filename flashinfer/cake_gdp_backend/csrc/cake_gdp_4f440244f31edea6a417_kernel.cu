@@ -1204,14 +1204,14 @@ kernel_cake_gdp_4f440244f31edea6a417(const __grid_constant__ CUtensorMap Q, cons
                         int pj_wend = pj_chunks;
                         int pj_go = ((pj_span < 0 && pj_cut >= pj_chunks) ? 0 : 1);
                         int pj_prev = 0;
-                        float pj_tot = 0.0f;
+                        int pj_tot = 0;
                         while (pj_go != 0) {
                             pj_go = ((pj_fw == 0 || pj_fw <= 48 && pj_x < pj_chunks && pj_span != 0) ? 1 : 0);
                             if (pj_go != 0) {
                                 int pj_w = 0;
                                 if (pj_fw == 0) {
                                     int pk_lane = lane;
-                                    float pk_acc = 0.0f;
+                                    int pk_acc = 0;
                                     int w = 0;
                                     int pk_b = 0;
                                     int pk_go = 1;
@@ -1331,194 +1331,226 @@ kernel_cake_gdp_4f440244f31edea6a417(const __grid_constant__ CUtensorMap Q, cons
                                         if (pk_cnt[15] != 0) {
                                             pk_g[15] = gate[(pj_s0 + pk_tok_15) * num_heads + pj_head];
                                         }
-                                        float pk_part_0 = 0.0f;
+                                        int pk_part_0 = 0;
                                         float pk_lg_0;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_0) : "f"(pk_g[0] + 1e-10f));
-                                        pk_part_0 = pk_part_0 + ((pk_cnt[0] != 0) ? pk_lg_0 : 0.0f);
+                                        int pk_q_0 = __float2int_rn(pk_lg_0 * 65536.0f);
+                                        pk_q_0 = ((pk_q_0 < 0) ? pk_q_0 : 0);
+                                        pk_part_0 = pk_part_0 + ((pk_cnt[0] != 0) ? pk_q_0 : 0);
                                         float pk_lg_1;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_1) : "f"(pk_g[1] + 1e-10f));
-                                        pk_part_0 = pk_part_0 + ((pk_cnt[1] != 0) ? pk_lg_1 : 0.0f);
-                                        float pk_o_0 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 1);
+                                        int pk_q_1 = __float2int_rn(pk_lg_1 * 65536.0f);
+                                        pk_q_1 = ((pk_q_1 < 0) ? pk_q_1 : 0);
+                                        pk_part_0 = pk_part_0 + ((pk_cnt[1] != 0) ? pk_q_1 : 0);
+                                        int pk_o_0 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 1);
                                         pk_part_0 = pk_part_0 + pk_o_0;
-                                        float pk_o_1 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 2);
+                                        int pk_o_1 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 2);
                                         pk_part_0 = pk_part_0 + pk_o_1;
-                                        float pk_o_2 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 4);
+                                        int pk_o_2 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 4);
                                         pk_part_0 = pk_part_0 + pk_o_2;
-                                        float pk_o_3 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 8);
+                                        int pk_o_3 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 8);
                                         pk_part_0 = pk_part_0 + pk_o_3;
-                                        float pk_o_4 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 16);
+                                        int pk_o_4 = __shfl_sync(0xFFFFFFFF, pk_part_0, pk_lane ^ 16);
                                         pk_part_0 = pk_part_0 + pk_o_4;
                                         if (w == 0 && pk_x0 - 1 >= 0) {
                                             pk_acc = pk_acc + pk_part_0;
-                                            int pk_hit_0 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_0 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_0 != 0) {
                                                 w = pk_b * 8 + 1;
                                             }
                                         }
-                                        float pk_part_1 = 0.0f;
+                                        int pk_part_1 = 0;
                                         float pk_lg_2;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_2) : "f"(pk_g[2] + 1e-10f));
-                                        pk_part_1 = pk_part_1 + ((pk_cnt[2] != 0) ? pk_lg_2 : 0.0f);
+                                        int pk_q_2 = __float2int_rn(pk_lg_2 * 65536.0f);
+                                        pk_q_2 = ((pk_q_2 < 0) ? pk_q_2 : 0);
+                                        pk_part_1 = pk_part_1 + ((pk_cnt[2] != 0) ? pk_q_2 : 0);
                                         float pk_lg_3;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_3) : "f"(pk_g[3] + 1e-10f));
-                                        pk_part_1 = pk_part_1 + ((pk_cnt[3] != 0) ? pk_lg_3 : 0.0f);
-                                        float pk_o_5 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 1);
+                                        int pk_q_3 = __float2int_rn(pk_lg_3 * 65536.0f);
+                                        pk_q_3 = ((pk_q_3 < 0) ? pk_q_3 : 0);
+                                        pk_part_1 = pk_part_1 + ((pk_cnt[3] != 0) ? pk_q_3 : 0);
+                                        int pk_o_5 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 1);
                                         pk_part_1 = pk_part_1 + pk_o_5;
-                                        float pk_o_6 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 2);
+                                        int pk_o_6 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 2);
                                         pk_part_1 = pk_part_1 + pk_o_6;
-                                        float pk_o_7 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 4);
+                                        int pk_o_7 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 4);
                                         pk_part_1 = pk_part_1 + pk_o_7;
-                                        float pk_o_8 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 8);
+                                        int pk_o_8 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 8);
                                         pk_part_1 = pk_part_1 + pk_o_8;
-                                        float pk_o_9 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 16);
+                                        int pk_o_9 = __shfl_sync(0xFFFFFFFF, pk_part_1, pk_lane ^ 16);
                                         pk_part_1 = pk_part_1 + pk_o_9;
                                         if (w == 0 && pk_x0 - 1 - 1 >= 0) {
                                             pk_acc = pk_acc + pk_part_1;
-                                            int pk_hit_1 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_1 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_1 != 0) {
                                                 w = pk_b * 8 + 1 + 1;
                                             }
                                         }
-                                        float pk_part_2 = 0.0f;
+                                        int pk_part_2 = 0;
                                         float pk_lg_4;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_4) : "f"(pk_g[4] + 1e-10f));
-                                        pk_part_2 = pk_part_2 + ((pk_cnt[4] != 0) ? pk_lg_4 : 0.0f);
+                                        int pk_q_4 = __float2int_rn(pk_lg_4 * 65536.0f);
+                                        pk_q_4 = ((pk_q_4 < 0) ? pk_q_4 : 0);
+                                        pk_part_2 = pk_part_2 + ((pk_cnt[4] != 0) ? pk_q_4 : 0);
                                         float pk_lg_5;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_5) : "f"(pk_g[5] + 1e-10f));
-                                        pk_part_2 = pk_part_2 + ((pk_cnt[5] != 0) ? pk_lg_5 : 0.0f);
-                                        float pk_o_10 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 1);
+                                        int pk_q_5 = __float2int_rn(pk_lg_5 * 65536.0f);
+                                        pk_q_5 = ((pk_q_5 < 0) ? pk_q_5 : 0);
+                                        pk_part_2 = pk_part_2 + ((pk_cnt[5] != 0) ? pk_q_5 : 0);
+                                        int pk_o_10 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 1);
                                         pk_part_2 = pk_part_2 + pk_o_10;
-                                        float pk_o_11 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 2);
+                                        int pk_o_11 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 2);
                                         pk_part_2 = pk_part_2 + pk_o_11;
-                                        float pk_o_12 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 4);
+                                        int pk_o_12 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 4);
                                         pk_part_2 = pk_part_2 + pk_o_12;
-                                        float pk_o_13 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 8);
+                                        int pk_o_13 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 8);
                                         pk_part_2 = pk_part_2 + pk_o_13;
-                                        float pk_o_14 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 16);
+                                        int pk_o_14 = __shfl_sync(0xFFFFFFFF, pk_part_2, pk_lane ^ 16);
                                         pk_part_2 = pk_part_2 + pk_o_14;
                                         if (w == 0 && pk_x0 - 1 - 2 >= 0) {
                                             pk_acc = pk_acc + pk_part_2;
-                                            int pk_hit_2 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_2 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_2 != 0) {
                                                 w = pk_b * 8 + 2 + 1;
                                             }
                                         }
-                                        float pk_part_3 = 0.0f;
+                                        int pk_part_3 = 0;
                                         float pk_lg_6;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_6) : "f"(pk_g[6] + 1e-10f));
-                                        pk_part_3 = pk_part_3 + ((pk_cnt[6] != 0) ? pk_lg_6 : 0.0f);
+                                        int pk_q_6 = __float2int_rn(pk_lg_6 * 65536.0f);
+                                        pk_q_6 = ((pk_q_6 < 0) ? pk_q_6 : 0);
+                                        pk_part_3 = pk_part_3 + ((pk_cnt[6] != 0) ? pk_q_6 : 0);
                                         float pk_lg_7;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_7) : "f"(pk_g[7] + 1e-10f));
-                                        pk_part_3 = pk_part_3 + ((pk_cnt[7] != 0) ? pk_lg_7 : 0.0f);
-                                        float pk_o_15 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 1);
+                                        int pk_q_7 = __float2int_rn(pk_lg_7 * 65536.0f);
+                                        pk_q_7 = ((pk_q_7 < 0) ? pk_q_7 : 0);
+                                        pk_part_3 = pk_part_3 + ((pk_cnt[7] != 0) ? pk_q_7 : 0);
+                                        int pk_o_15 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 1);
                                         pk_part_3 = pk_part_3 + pk_o_15;
-                                        float pk_o_16 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 2);
+                                        int pk_o_16 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 2);
                                         pk_part_3 = pk_part_3 + pk_o_16;
-                                        float pk_o_17 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 4);
+                                        int pk_o_17 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 4);
                                         pk_part_3 = pk_part_3 + pk_o_17;
-                                        float pk_o_18 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 8);
+                                        int pk_o_18 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 8);
                                         pk_part_3 = pk_part_3 + pk_o_18;
-                                        float pk_o_19 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 16);
+                                        int pk_o_19 = __shfl_sync(0xFFFFFFFF, pk_part_3, pk_lane ^ 16);
                                         pk_part_3 = pk_part_3 + pk_o_19;
                                         if (w == 0 && pk_x0 - 1 - 3 >= 0) {
                                             pk_acc = pk_acc + pk_part_3;
-                                            int pk_hit_3 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_3 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_3 != 0) {
                                                 w = pk_b * 8 + 3 + 1;
                                             }
                                         }
-                                        float pk_part_4 = 0.0f;
+                                        int pk_part_4 = 0;
                                         float pk_lg_8;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_8) : "f"(pk_g[8] + 1e-10f));
-                                        pk_part_4 = pk_part_4 + ((pk_cnt[8] != 0) ? pk_lg_8 : 0.0f);
+                                        int pk_q_8 = __float2int_rn(pk_lg_8 * 65536.0f);
+                                        pk_q_8 = ((pk_q_8 < 0) ? pk_q_8 : 0);
+                                        pk_part_4 = pk_part_4 + ((pk_cnt[8] != 0) ? pk_q_8 : 0);
                                         float pk_lg_9;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_9) : "f"(pk_g[9] + 1e-10f));
-                                        pk_part_4 = pk_part_4 + ((pk_cnt[9] != 0) ? pk_lg_9 : 0.0f);
-                                        float pk_o_20 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 1);
+                                        int pk_q_9 = __float2int_rn(pk_lg_9 * 65536.0f);
+                                        pk_q_9 = ((pk_q_9 < 0) ? pk_q_9 : 0);
+                                        pk_part_4 = pk_part_4 + ((pk_cnt[9] != 0) ? pk_q_9 : 0);
+                                        int pk_o_20 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 1);
                                         pk_part_4 = pk_part_4 + pk_o_20;
-                                        float pk_o_21 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 2);
+                                        int pk_o_21 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 2);
                                         pk_part_4 = pk_part_4 + pk_o_21;
-                                        float pk_o_22 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 4);
+                                        int pk_o_22 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 4);
                                         pk_part_4 = pk_part_4 + pk_o_22;
-                                        float pk_o_23 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 8);
+                                        int pk_o_23 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 8);
                                         pk_part_4 = pk_part_4 + pk_o_23;
-                                        float pk_o_24 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 16);
+                                        int pk_o_24 = __shfl_sync(0xFFFFFFFF, pk_part_4, pk_lane ^ 16);
                                         pk_part_4 = pk_part_4 + pk_o_24;
                                         if (w == 0 && pk_x0 - 1 - 4 >= 0) {
                                             pk_acc = pk_acc + pk_part_4;
-                                            int pk_hit_4 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_4 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_4 != 0) {
                                                 w = pk_b * 8 + 4 + 1;
                                             }
                                         }
-                                        float pk_part_5 = 0.0f;
+                                        int pk_part_5 = 0;
                                         float pk_lg_10;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_10) : "f"(pk_g[10] + 1e-10f));
-                                        pk_part_5 = pk_part_5 + ((pk_cnt[10] != 0) ? pk_lg_10 : 0.0f);
+                                        int pk_q_10 = __float2int_rn(pk_lg_10 * 65536.0f);
+                                        pk_q_10 = ((pk_q_10 < 0) ? pk_q_10 : 0);
+                                        pk_part_5 = pk_part_5 + ((pk_cnt[10] != 0) ? pk_q_10 : 0);
                                         float pk_lg_11;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_11) : "f"(pk_g[11] + 1e-10f));
-                                        pk_part_5 = pk_part_5 + ((pk_cnt[11] != 0) ? pk_lg_11 : 0.0f);
-                                        float pk_o_25 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 1);
+                                        int pk_q_11 = __float2int_rn(pk_lg_11 * 65536.0f);
+                                        pk_q_11 = ((pk_q_11 < 0) ? pk_q_11 : 0);
+                                        pk_part_5 = pk_part_5 + ((pk_cnt[11] != 0) ? pk_q_11 : 0);
+                                        int pk_o_25 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 1);
                                         pk_part_5 = pk_part_5 + pk_o_25;
-                                        float pk_o_26 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 2);
+                                        int pk_o_26 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 2);
                                         pk_part_5 = pk_part_5 + pk_o_26;
-                                        float pk_o_27 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 4);
+                                        int pk_o_27 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 4);
                                         pk_part_5 = pk_part_5 + pk_o_27;
-                                        float pk_o_28 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 8);
+                                        int pk_o_28 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 8);
                                         pk_part_5 = pk_part_5 + pk_o_28;
-                                        float pk_o_29 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 16);
+                                        int pk_o_29 = __shfl_sync(0xFFFFFFFF, pk_part_5, pk_lane ^ 16);
                                         pk_part_5 = pk_part_5 + pk_o_29;
                                         if (w == 0 && pk_x0 - 1 - 5 >= 0) {
                                             pk_acc = pk_acc + pk_part_5;
-                                            int pk_hit_5 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_5 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_5 != 0) {
                                                 w = pk_b * 8 + 5 + 1;
                                             }
                                         }
-                                        float pk_part_6 = 0.0f;
+                                        int pk_part_6 = 0;
                                         float pk_lg_12;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_12) : "f"(pk_g[12] + 1e-10f));
-                                        pk_part_6 = pk_part_6 + ((pk_cnt[12] != 0) ? pk_lg_12 : 0.0f);
+                                        int pk_q_12 = __float2int_rn(pk_lg_12 * 65536.0f);
+                                        pk_q_12 = ((pk_q_12 < 0) ? pk_q_12 : 0);
+                                        pk_part_6 = pk_part_6 + ((pk_cnt[12] != 0) ? pk_q_12 : 0);
                                         float pk_lg_13;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_13) : "f"(pk_g[13] + 1e-10f));
-                                        pk_part_6 = pk_part_6 + ((pk_cnt[13] != 0) ? pk_lg_13 : 0.0f);
-                                        float pk_o_30 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 1);
+                                        int pk_q_13 = __float2int_rn(pk_lg_13 * 65536.0f);
+                                        pk_q_13 = ((pk_q_13 < 0) ? pk_q_13 : 0);
+                                        pk_part_6 = pk_part_6 + ((pk_cnt[13] != 0) ? pk_q_13 : 0);
+                                        int pk_o_30 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 1);
                                         pk_part_6 = pk_part_6 + pk_o_30;
-                                        float pk_o_31 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 2);
+                                        int pk_o_31 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 2);
                                         pk_part_6 = pk_part_6 + pk_o_31;
-                                        float pk_o_32 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 4);
+                                        int pk_o_32 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 4);
                                         pk_part_6 = pk_part_6 + pk_o_32;
-                                        float pk_o_33 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 8);
+                                        int pk_o_33 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 8);
                                         pk_part_6 = pk_part_6 + pk_o_33;
-                                        float pk_o_34 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 16);
+                                        int pk_o_34 = __shfl_sync(0xFFFFFFFF, pk_part_6, pk_lane ^ 16);
                                         pk_part_6 = pk_part_6 + pk_o_34;
                                         if (w == 0 && pk_x0 - 1 - 6 >= 0) {
                                             pk_acc = pk_acc + pk_part_6;
-                                            int pk_hit_6 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_6 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_6 != 0) {
                                                 w = pk_b * 8 + 6 + 1;
                                             }
                                         }
-                                        float pk_part_7 = 0.0f;
+                                        int pk_part_7 = 0;
                                         float pk_lg_14;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_14) : "f"(pk_g[14] + 1e-10f));
-                                        pk_part_7 = pk_part_7 + ((pk_cnt[14] != 0) ? pk_lg_14 : 0.0f);
+                                        int pk_q_14 = __float2int_rn(pk_lg_14 * 65536.0f);
+                                        pk_q_14 = ((pk_q_14 < 0) ? pk_q_14 : 0);
+                                        pk_part_7 = pk_part_7 + ((pk_cnt[14] != 0) ? pk_q_14 : 0);
                                         float pk_lg_15;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pk_lg_15) : "f"(pk_g[15] + 1e-10f));
-                                        pk_part_7 = pk_part_7 + ((pk_cnt[15] != 0) ? pk_lg_15 : 0.0f);
-                                        float pk_o_35 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 1);
+                                        int pk_q_15 = __float2int_rn(pk_lg_15 * 65536.0f);
+                                        pk_q_15 = ((pk_q_15 < 0) ? pk_q_15 : 0);
+                                        pk_part_7 = pk_part_7 + ((pk_cnt[15] != 0) ? pk_q_15 : 0);
+                                        int pk_o_35 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 1);
                                         pk_part_7 = pk_part_7 + pk_o_35;
-                                        float pk_o_36 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 2);
+                                        int pk_o_36 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 2);
                                         pk_part_7 = pk_part_7 + pk_o_36;
-                                        float pk_o_37 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 4);
+                                        int pk_o_37 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 4);
                                         pk_part_7 = pk_part_7 + pk_o_37;
-                                        float pk_o_38 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 8);
+                                        int pk_o_38 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 8);
                                         pk_part_7 = pk_part_7 + pk_o_38;
-                                        float pk_o_39 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 16);
+                                        int pk_o_39 = __shfl_sync(0xFFFFFFFF, pk_part_7, pk_lane ^ 16);
                                         pk_part_7 = pk_part_7 + pk_o_39;
                                         if (w == 0 && pk_x0 - 1 - 7 >= 0) {
                                             pk_acc = pk_acc + pk_part_7;
-                                            int pk_hit_7 = __any_sync(0xFFFFFFFF, pk_acc <= -14.43f);
+                                            int pk_hit_7 = __any_sync(0xFFFFFFFF, pk_acc <= -945684);
                                             if (pk_hit_7 != 0) {
                                                 w = pk_b * 8 + 7 + 1;
                                             }
@@ -1531,7 +1563,7 @@ kernel_cake_gdp_4f440244f31edea6a417(const __grid_constant__ CUtensorMap Q, cons
                                 if (pj_fw > 0) {
                                     int pj_inc = ((pj_prev > 0 && pj_x <= 128) ? 1 : 0);
                                     int pj_wlo = ((pj_inc != 0) ? pj_prev : 0);
-                                    float pj_wacc = ((pj_inc != 0) ? pj_tot : 0.0f);
+                                    int pj_wacc = ((pj_inc != 0) ? pj_tot : 0);
                                     int pw_lane = lane;
                                     int pw_c0 = pj_x - 128;
                                     if (pw_c0 < pj_wlo) {
@@ -1542,7 +1574,7 @@ kernel_cake_gdp_4f440244f31edea6a417(const __grid_constant__ CUtensorMap Q, cons
                                     if (pw_thi > pj_e0 - pj_s0) {
                                         pw_thi = pj_e0 - pj_s0;
                                     }
-                                    float pw_acc = pj_wacc;
+                                    int pw_acc = pj_wacc;
                                     int hit = 0;
                                     int pw_b = pw_thi;
                                     float pw_g[8];
@@ -1629,51 +1661,67 @@ kernel_cake_gdp_4f440244f31edea6a417(const __grid_constant__ CUtensorMap Q, cons
                                         if (pw_tn_7 >= pw_tlo) {
                                             pw_n[7] = gate[(pj_s0 + pw_tn_7) * num_heads + pj_head];
                                         }
-                                        float pw_part = 0.0f;
+                                        int pw_part = 0;
                                         int pw_tc_0 = pw_b - 256 + pw_lane;
                                         float pw_lg_0;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_0) : "f"(pw_g[0] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_0 >= pw_tlo) ? pw_lg_0 : 0.0f);
+                                        int pw_q_0 = __float2int_rn(pw_lg_0 * 65536.0f);
+                                        pw_q_0 = ((pw_q_0 < 0) ? pw_q_0 : 0);
+                                        pw_part = pw_part + ((pw_tc_0 >= pw_tlo) ? pw_q_0 : 0);
                                         int pw_tc_1 = pw_b - 256 + 32 + pw_lane;
                                         float pw_lg_1;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_1) : "f"(pw_g[1] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_1 >= pw_tlo) ? pw_lg_1 : 0.0f);
+                                        int pw_q_1 = __float2int_rn(pw_lg_1 * 65536.0f);
+                                        pw_q_1 = ((pw_q_1 < 0) ? pw_q_1 : 0);
+                                        pw_part = pw_part + ((pw_tc_1 >= pw_tlo) ? pw_q_1 : 0);
                                         int pw_tc_2 = pw_b - 256 + 64 + pw_lane;
                                         float pw_lg_2;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_2) : "f"(pw_g[2] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_2 >= pw_tlo) ? pw_lg_2 : 0.0f);
+                                        int pw_q_2 = __float2int_rn(pw_lg_2 * 65536.0f);
+                                        pw_q_2 = ((pw_q_2 < 0) ? pw_q_2 : 0);
+                                        pw_part = pw_part + ((pw_tc_2 >= pw_tlo) ? pw_q_2 : 0);
                                         int pw_tc_3 = pw_b - 256 + 96 + pw_lane;
                                         float pw_lg_3;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_3) : "f"(pw_g[3] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_3 >= pw_tlo) ? pw_lg_3 : 0.0f);
+                                        int pw_q_3 = __float2int_rn(pw_lg_3 * 65536.0f);
+                                        pw_q_3 = ((pw_q_3 < 0) ? pw_q_3 : 0);
+                                        pw_part = pw_part + ((pw_tc_3 >= pw_tlo) ? pw_q_3 : 0);
                                         int pw_tc_4 = pw_b - 256 + 128 + pw_lane;
                                         float pw_lg_4;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_4) : "f"(pw_g[4] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_4 >= pw_tlo) ? pw_lg_4 : 0.0f);
+                                        int pw_q_4 = __float2int_rn(pw_lg_4 * 65536.0f);
+                                        pw_q_4 = ((pw_q_4 < 0) ? pw_q_4 : 0);
+                                        pw_part = pw_part + ((pw_tc_4 >= pw_tlo) ? pw_q_4 : 0);
                                         int pw_tc_5 = pw_b - 256 + 160 + pw_lane;
                                         float pw_lg_5;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_5) : "f"(pw_g[5] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_5 >= pw_tlo) ? pw_lg_5 : 0.0f);
+                                        int pw_q_5 = __float2int_rn(pw_lg_5 * 65536.0f);
+                                        pw_q_5 = ((pw_q_5 < 0) ? pw_q_5 : 0);
+                                        pw_part = pw_part + ((pw_tc_5 >= pw_tlo) ? pw_q_5 : 0);
                                         int pw_tc_6 = pw_b - 256 + 192 + pw_lane;
                                         float pw_lg_6;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_6) : "f"(pw_g[6] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_6 >= pw_tlo) ? pw_lg_6 : 0.0f);
+                                        int pw_q_6 = __float2int_rn(pw_lg_6 * 65536.0f);
+                                        pw_q_6 = ((pw_q_6 < 0) ? pw_q_6 : 0);
+                                        pw_part = pw_part + ((pw_tc_6 >= pw_tlo) ? pw_q_6 : 0);
                                         int pw_tc_7 = pw_b - 256 + 224 + pw_lane;
                                         float pw_lg_7;
                                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(pw_lg_7) : "f"(pw_g[7] + 1e-10f));
-                                        pw_part = pw_part + ((pw_tc_7 >= pw_tlo) ? pw_lg_7 : 0.0f);
-                                        float pw_o_0 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 1);
+                                        int pw_q_7 = __float2int_rn(pw_lg_7 * 65536.0f);
+                                        pw_q_7 = ((pw_q_7 < 0) ? pw_q_7 : 0);
+                                        pw_part = pw_part + ((pw_tc_7 >= pw_tlo) ? pw_q_7 : 0);
+                                        int pw_o_0 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 1);
                                         pw_part = pw_part + pw_o_0;
-                                        float pw_o_1 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 2);
+                                        int pw_o_1 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 2);
                                         pw_part = pw_part + pw_o_1;
-                                        float pw_o_2 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 4);
+                                        int pw_o_2 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 4);
                                         pw_part = pw_part + pw_o_2;
-                                        float pw_o_3 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 8);
+                                        int pw_o_3 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 8);
                                         pw_part = pw_part + pw_o_3;
-                                        float pw_o_4 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 16);
+                                        int pw_o_4 = __shfl_sync(0xFFFFFFFF, pw_part, pw_lane ^ 16);
                                         pw_part = pw_part + pw_o_4;
                                         pw_acc = pw_acc + pw_part;
-                                        int pw_hit = __any_sync(0xFFFFFFFF, pw_acc <= -14.43f);
+                                        int pw_hit = __any_sync(0xFFFFFFFF, pw_acc <= -945684);
                                         hit = ((pw_hit != 0) ? 1 : 0);
                                         pw_b = pw_b - 256;
                                         pw_go = ((hit == 0 && pw_b > pw_tlo) ? 1 : 0);
