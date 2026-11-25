@@ -208,6 +208,17 @@ __device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
 __device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
     float2 r;
     asm("add.rn.ftz.f32x2 %0, %1, %2;"
+#if __CUDA_ARCH__ == 1030
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 sub_f32x2(float2 a, float2 b) {
+    float2 r;
+    asm("sub.rn.ftz.f32x2 %0, %1, %2;"
+#else
+#endif
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
     return r;
@@ -1250,12 +1261,16 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 float sf_fit[4];
                 float b_sums[4];
                 float b_weights[4];
+#if __CUDA_ARCH__ == 1030
+                float g_safe[4];
+                float qv[4];
+                float qq[4];
+                g_safe[0] = ((g[0] > -CUDART_INF_F) ? g[0] : 0.0f);
+                const float2 _fma_b2_28 = {c_log2, c_log2};
+                const float2 _fma_c2_29 = {-g_safe[0], -g_safe[0]};
+#else
                 int g_live_0 = g[0] > -CUDART_INF_F;
                 float g_safe_0 = ((g_live_0 != 0) ? g[0] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                const float2 _fma_b2_28 = {c_log2, c_log2};
-                const float2 _fma_c2_29 = {-g_safe_0, -g_safe_0};
-#else
                 const float2 _fma_b2_24 = {c_log2, c_log2};
                 const float2 _fma_c2_25 = {-g_safe_0, -g_safe_0};
 #endif
@@ -1282,22 +1297,20 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8)[_la], reinterpret_cast<const float2*>((t8 + 2))[_la]);
                 b_sums[0] = t8[0] + t8[1];
 #if __CUDA_ARCH__ == 1030
-                float _exp2_30 = approx_exp2(g_safe_0 - m);
-                b_weights[0] = ((g_live_0 != 0) ? _exp2_30 : 0.0f);
-                float _exp2_31 = approx_exp2(g_safe_0 - m - 4.0f);
-                float sf_ex_0 = 448.0f * _exp2_31;
-                const float2 _scale2_32 = {6.0f, 6.0f};
+                const float2 _scale2_30 = {6.0f, 6.0f};
 #else
                 float _exp2_26 = approx_exp2(g_safe_0 - m);
                 b_weights[0] = ((g_live_0 != 0) ? _exp2_26 : 0.0f);
                 float _exp2_27 = approx_exp2(g_safe_0 - m - 4.0f);
                 float sf_ex_0 = 448.0f * _exp2_27;
+                float qv[4];
+                float qq[4];
                 const float2 _scale2_28 = {6.0f, 6.0f};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_32);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_30);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_28);
 #endif
@@ -1306,7 +1319,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 float q_b[16];
                 unsigned int qn[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_33;
+                uint32_t _cvt_f16x2_e2m1x2_31;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_29;
 #endif
@@ -1314,8 +1327,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[0] >> 0)));
-                qn[0] = _cvt_f16x2_e2m1x2_33;
+                : "=r"(_cvt_f16x2_e2m1x2_31) : "r"((uint32_t)(codes[0] >> 0)));
+                qn[0] = _cvt_f16x2_e2m1x2_31;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_29) : "r"((uint32_t)(codes[0] >> 0)));
                 qn[0] = _cvt_f16x2_e2m1x2_29;
@@ -1332,7 +1345,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b[0] = qw_0[0];
                 q_b[1] = qw_0[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_34;
+                uint32_t _cvt_f16x2_e2m1x2_32;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_30;
 #endif
@@ -1340,8 +1353,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[0] >> 8)));
-                qn[1] = _cvt_f16x2_e2m1x2_34;
+                : "=r"(_cvt_f16x2_e2m1x2_32) : "r"((uint32_t)(codes[0] >> 8)));
+                qn[1] = _cvt_f16x2_e2m1x2_32;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_30) : "r"((uint32_t)(codes[0] >> 8)));
                 qn[1] = _cvt_f16x2_e2m1x2_30;
@@ -1358,7 +1371,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b[2] = qw_1[0];
                 q_b[3] = qw_1[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_35;
+                uint32_t _cvt_f16x2_e2m1x2_33;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_31;
 #endif
@@ -1366,8 +1379,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[0] >> 16)));
-                qn[2] = _cvt_f16x2_e2m1x2_35;
+                : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[0] >> 16)));
+                qn[2] = _cvt_f16x2_e2m1x2_33;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_31) : "r"((uint32_t)(codes[0] >> 16)));
                 qn[2] = _cvt_f16x2_e2m1x2_31;
@@ -1384,7 +1397,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b[4] = qw_2[0];
                 q_b[5] = qw_2[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_36;
+                uint32_t _cvt_f16x2_e2m1x2_34;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_32;
 #endif
@@ -1392,8 +1405,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[0] >> 24)));
-                qn[3] = _cvt_f16x2_e2m1x2_36;
+                : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[0] >> 24)));
+                qn[3] = _cvt_f16x2_e2m1x2_34;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_32) : "r"((uint32_t)(codes[0] >> 24)));
                 qn[3] = _cvt_f16x2_e2m1x2_32;
@@ -1410,7 +1423,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b[6] = qw_3[0];
                 q_b[7] = qw_3[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_37;
+                uint32_t _cvt_f16x2_e2m1x2_35;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_33;
 #endif
@@ -1418,8 +1431,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_37) : "r"((uint32_t)(codes[1] >> 0)));
-                qn[4] = _cvt_f16x2_e2m1x2_37;
+                : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[1] >> 0)));
+                qn[4] = _cvt_f16x2_e2m1x2_35;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[1] >> 0)));
                 qn[4] = _cvt_f16x2_e2m1x2_33;
@@ -1436,7 +1449,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b[8] = qw_4[0];
                 q_b[9] = qw_4[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_38;
+                uint32_t _cvt_f16x2_e2m1x2_36;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_34;
 #endif
@@ -1444,8 +1457,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_38) : "r"((uint32_t)(codes[1] >> 8)));
-                qn[5] = _cvt_f16x2_e2m1x2_38;
+                : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[1] >> 8)));
+                qn[5] = _cvt_f16x2_e2m1x2_36;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[1] >> 8)));
                 qn[5] = _cvt_f16x2_e2m1x2_34;
@@ -1462,7 +1475,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b[10] = qw_5[0];
                 q_b[11] = qw_5[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_39;
+                uint32_t _cvt_f16x2_e2m1x2_37;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_35;
 #endif
@@ -1470,8 +1483,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_39) : "r"((uint32_t)(codes[1] >> 16)));
-                qn[6] = _cvt_f16x2_e2m1x2_39;
+                : "=r"(_cvt_f16x2_e2m1x2_37) : "r"((uint32_t)(codes[1] >> 16)));
+                qn[6] = _cvt_f16x2_e2m1x2_37;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[1] >> 16)));
                 qn[6] = _cvt_f16x2_e2m1x2_35;
@@ -1488,7 +1501,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b[12] = qw_6[0];
                 q_b[13] = qw_6[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_40;
+                uint32_t _cvt_f16x2_e2m1x2_38;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_36;
 #endif
@@ -1496,8 +1509,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_40) : "r"((uint32_t)(codes[1] >> 24)));
-                qn[7] = _cvt_f16x2_e2m1x2_40;
+                : "=r"(_cvt_f16x2_e2m1x2_38) : "r"((uint32_t)(codes[1] >> 24)));
+                qn[7] = _cvt_f16x2_e2m1x2_38;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[1] >> 24)));
                 qn[7] = _cvt_f16x2_e2m1x2_36;
@@ -1527,7 +1540,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _la = 0; _la < 1; _la++)
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_0)[_la], reinterpret_cast<const float2*>((t8_0 + 2))[_la]);
-                float qv = t8_0[0] + t8_0[1];
+                qv[0] = t8_0[0] + t8_0[1];
                 uint32_t a0;
                 asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0) : "r"(qn[0]), "r"(qn[0]), "r"(0));
                 uint32_t b0;
@@ -1555,27 +1568,23 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     "add.rn.f32.f16 %1, hi, %4;\n\t"
                     "}\n"
                     : "=&f"(w[0]), "=&f"(w[1]) : "r"(v), "f"(0.0f), "f"(0.0f));
-                float qq = w[0] + w[1];
+                qq[0] = w[0] + w[1];
 #if __CUDA_ARCH__ == 1030
-                float _rcp_41 = approx_rcp(qq);
-                sf_fit[0] = ((g_live_0 != 0 && qq > 0.0f) ? sf_ex_0 * qv * _rcp_41 : 0.0f);
+                g_safe[1] = ((g[1] > -CUDART_INF_F) ? g[1] : 0.0f);
+                const float2 _fma_b2_39 = {c_log2, c_log2};
+                const float2 _fma_c2_40 = {-g_safe[1], -g_safe[1]};
 #else
-                float _rcp_37 = approx_rcp(qq);
-                sf_fit[0] = ((g_live_0 != 0 && qq > 0.0f) ? sf_ex_0 * qv * _rcp_37 : 0.0f);
-#endif
+                float _rcp_37 = approx_rcp(qq[0]);
+                sf_fit[0] = ((g_live_0 != 0 && qq[0] > 0.0f) ? sf_ex_0 * qv[0] * _rcp_37 : 0.0f);
                 int g_live_1 = g[1] > -CUDART_INF_F;
                 float g_safe_1 = ((g_live_1 != 0) ? g[1] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                const float2 _fma_b2_42 = {c_log2, c_log2};
-                const float2 _fma_c2_43 = {-g_safe_1, -g_safe_1};
-#else
                 const float2 _fma_b2_38 = {c_log2, c_log2};
                 const float2 _fma_c2_39 = {-g_safe_1, -g_safe_1};
 #endif
                 #pragma unroll
                 for (int _lf = 0; _lf < 8; _lf++)
 #if __CUDA_ARCH__ == 1030
-                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_42, _fma_c2_43);
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_39, _fma_c2_40);
 #else
                     fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_38, _fma_c2_39);
 #endif
@@ -1595,22 +1604,20 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_1)[_la], reinterpret_cast<const float2*>((t8_1 + 2))[_la]);
                 b_sums[1] = t8_1[0] + t8_1[1];
 #if __CUDA_ARCH__ == 1030
-                float _exp2_44 = approx_exp2(g_safe_1 - m);
-                b_weights[1] = ((g_live_1 != 0) ? _exp2_44 : 0.0f);
-                float _exp2_45 = approx_exp2(g_safe_1 - m - 4.0f);
-                float sf_ex_1 = 448.0f * _exp2_45;
-                const float2 _scale2_46 = {6.0f, 6.0f};
+                const float2 _scale2_41 = {6.0f, 6.0f};
 #else
                 float _exp2_40 = approx_exp2(g_safe_1 - m);
                 b_weights[1] = ((g_live_1 != 0) ? _exp2_40 : 0.0f);
                 float _exp2_41 = approx_exp2(g_safe_1 - m - 4.0f);
                 float sf_ex_1 = 448.0f * _exp2_41;
+                float qv_0[4];
+                float qq_0[4];
                 const float2 _scale2_42 = {6.0f, 6.0f};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_46);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_41);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_42);
 #endif
@@ -1619,7 +1626,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 float q_b_0[16];
                 unsigned int qn_0[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_47;
+                uint32_t _cvt_f16x2_e2m1x2_42;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_43;
 #endif
@@ -1627,8 +1634,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[2] >> 0)));
-                qn_0[0] = _cvt_f16x2_e2m1x2_47;
+                : "=r"(_cvt_f16x2_e2m1x2_42) : "r"((uint32_t)(codes[2] >> 0)));
+                qn_0[0] = _cvt_f16x2_e2m1x2_42;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_43) : "r"((uint32_t)(codes[2] >> 0)));
                 qn_0[0] = _cvt_f16x2_e2m1x2_43;
@@ -1645,7 +1652,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_0[0] = qw_8[0];
                 q_b_0[1] = qw_8[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_48;
+                uint32_t _cvt_f16x2_e2m1x2_43;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_44;
 #endif
@@ -1653,8 +1660,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[2] >> 8)));
-                qn_0[1] = _cvt_f16x2_e2m1x2_48;
+                : "=r"(_cvt_f16x2_e2m1x2_43) : "r"((uint32_t)(codes[2] >> 8)));
+                qn_0[1] = _cvt_f16x2_e2m1x2_43;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_44) : "r"((uint32_t)(codes[2] >> 8)));
                 qn_0[1] = _cvt_f16x2_e2m1x2_44;
@@ -1671,7 +1678,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_0[2] = qw_9[0];
                 q_b_0[3] = qw_9[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_49;
+                uint32_t _cvt_f16x2_e2m1x2_44;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_45;
 #endif
@@ -1679,8 +1686,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[2] >> 16)));
-                qn_0[2] = _cvt_f16x2_e2m1x2_49;
+                : "=r"(_cvt_f16x2_e2m1x2_44) : "r"((uint32_t)(codes[2] >> 16)));
+                qn_0[2] = _cvt_f16x2_e2m1x2_44;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_45) : "r"((uint32_t)(codes[2] >> 16)));
                 qn_0[2] = _cvt_f16x2_e2m1x2_45;
@@ -1697,7 +1704,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_0[4] = qw_10[0];
                 q_b_0[5] = qw_10[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_50;
+                uint32_t _cvt_f16x2_e2m1x2_45;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_46;
 #endif
@@ -1705,8 +1712,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_50) : "r"((uint32_t)(codes[2] >> 24)));
-                qn_0[3] = _cvt_f16x2_e2m1x2_50;
+                : "=r"(_cvt_f16x2_e2m1x2_45) : "r"((uint32_t)(codes[2] >> 24)));
+                qn_0[3] = _cvt_f16x2_e2m1x2_45;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_46) : "r"((uint32_t)(codes[2] >> 24)));
                 qn_0[3] = _cvt_f16x2_e2m1x2_46;
@@ -1723,7 +1730,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_0[6] = qw_11[0];
                 q_b_0[7] = qw_11[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_51;
+                uint32_t _cvt_f16x2_e2m1x2_46;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_47;
 #endif
@@ -1731,8 +1738,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_51) : "r"((uint32_t)(codes[3] >> 0)));
-                qn_0[4] = _cvt_f16x2_e2m1x2_51;
+                : "=r"(_cvt_f16x2_e2m1x2_46) : "r"((uint32_t)(codes[3] >> 0)));
+                qn_0[4] = _cvt_f16x2_e2m1x2_46;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[3] >> 0)));
                 qn_0[4] = _cvt_f16x2_e2m1x2_47;
@@ -1749,7 +1756,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_0[8] = qw_12[0];
                 q_b_0[9] = qw_12[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_52;
+                uint32_t _cvt_f16x2_e2m1x2_47;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_48;
 #endif
@@ -1757,8 +1764,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_52) : "r"((uint32_t)(codes[3] >> 8)));
-                qn_0[5] = _cvt_f16x2_e2m1x2_52;
+                : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[3] >> 8)));
+                qn_0[5] = _cvt_f16x2_e2m1x2_47;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[3] >> 8)));
                 qn_0[5] = _cvt_f16x2_e2m1x2_48;
@@ -1775,7 +1782,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_0[10] = qw_13[0];
                 q_b_0[11] = qw_13[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_53;
+                uint32_t _cvt_f16x2_e2m1x2_48;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_49;
 #endif
@@ -1783,8 +1790,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_53) : "r"((uint32_t)(codes[3] >> 16)));
-                qn_0[6] = _cvt_f16x2_e2m1x2_53;
+                : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[3] >> 16)));
+                qn_0[6] = _cvt_f16x2_e2m1x2_48;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[3] >> 16)));
                 qn_0[6] = _cvt_f16x2_e2m1x2_49;
@@ -1801,7 +1808,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_0[12] = qw_14[0];
                 q_b_0[13] = qw_14[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_54;
+                uint32_t _cvt_f16x2_e2m1x2_49;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_50;
 #endif
@@ -1809,8 +1816,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_54) : "r"((uint32_t)(codes[3] >> 24)));
-                qn_0[7] = _cvt_f16x2_e2m1x2_54;
+                : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[3] >> 24)));
+                qn_0[7] = _cvt_f16x2_e2m1x2_49;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_50) : "r"((uint32_t)(codes[3] >> 24)));
                 qn_0[7] = _cvt_f16x2_e2m1x2_50;
@@ -1840,7 +1847,11 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _la = 0; _la < 1; _la++)
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_2)[_la], reinterpret_cast<const float2*>((t8_2 + 2))[_la]);
-                float qv_0 = t8_2[0] + t8_2[1];
+#if __CUDA_ARCH__ == 1030
+                qv[1] = t8_2[0] + t8_2[1];
+#else
+                qv_0[1] = t8_2[0] + t8_2[1];
+#endif
                 uint32_t a0_0;
                 asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_0) : "r"(qn_0[0]), "r"(qn_0[0]), "r"(0));
                 uint32_t b0_0;
@@ -1868,27 +1879,24 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     "add.rn.f32.f16 %1, hi, %4;\n\t"
                     "}\n"
                     : "=&f"(w_0[0]), "=&f"(w_0[1]) : "r"(v_16), "f"(0.0f), "f"(0.0f));
-                float qq_0 = w_0[0] + w_0[1];
 #if __CUDA_ARCH__ == 1030
-                float _rcp_55 = approx_rcp(qq_0);
-                sf_fit[1] = ((g_live_1 != 0 && qq_0 > 0.0f) ? sf_ex_1 * qv_0 * _rcp_55 : 0.0f);
+                qq[1] = w_0[0] + w_0[1];
+                g_safe[2] = ((g[2] > -CUDART_INF_F) ? g[2] : 0.0f);
+                const float2 _fma_b2_50 = {c_log2, c_log2};
+                const float2 _fma_c2_51 = {-g_safe[2], -g_safe[2]};
 #else
-                float _rcp_51 = approx_rcp(qq_0);
-                sf_fit[1] = ((g_live_1 != 0 && qq_0 > 0.0f) ? sf_ex_1 * qv_0 * _rcp_51 : 0.0f);
-#endif
+                qq_0[1] = w_0[0] + w_0[1];
+                float _rcp_51 = approx_rcp(qq_0[1]);
+                sf_fit[1] = ((g_live_1 != 0 && qq_0[1] > 0.0f) ? sf_ex_1 * qv_0[1] * _rcp_51 : 0.0f);
                 int g_live_2 = g[2] > -CUDART_INF_F;
                 float g_safe_2 = ((g_live_2 != 0) ? g[2] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                const float2 _fma_b2_56 = {c_log2, c_log2};
-                const float2 _fma_c2_57 = {-g_safe_2, -g_safe_2};
-#else
                 const float2 _fma_b2_52 = {c_log2, c_log2};
                 const float2 _fma_c2_53 = {-g_safe_2, -g_safe_2};
 #endif
                 #pragma unroll
                 for (int _lf = 0; _lf < 8; _lf++)
 #if __CUDA_ARCH__ == 1030
-                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_56, _fma_c2_57);
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_50, _fma_c2_51);
 #else
                     fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_52, _fma_c2_53);
 #endif
@@ -1908,22 +1916,20 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_3)[_la], reinterpret_cast<const float2*>((t8_3 + 2))[_la]);
                 b_sums[2] = t8_3[0] + t8_3[1];
 #if __CUDA_ARCH__ == 1030
-                float _exp2_58 = approx_exp2(g_safe_2 - m);
-                b_weights[2] = ((g_live_2 != 0) ? _exp2_58 : 0.0f);
-                float _exp2_59 = approx_exp2(g_safe_2 - m - 4.0f);
-                float sf_ex_2 = 448.0f * _exp2_59;
-                const float2 _scale2_60 = {6.0f, 6.0f};
+                const float2 _scale2_52 = {6.0f, 6.0f};
 #else
                 float _exp2_54 = approx_exp2(g_safe_2 - m);
                 b_weights[2] = ((g_live_2 != 0) ? _exp2_54 : 0.0f);
                 float _exp2_55 = approx_exp2(g_safe_2 - m - 4.0f);
                 float sf_ex_2 = 448.0f * _exp2_55;
+                float qv_1[4];
+                float qq_1[4];
                 const float2 _scale2_56 = {6.0f, 6.0f};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_60);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_52);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_56);
 #endif
@@ -1932,7 +1938,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 float q_b_1[16];
                 unsigned int qn_1[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_61;
+                uint32_t _cvt_f16x2_e2m1x2_53;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_57;
 #endif
@@ -1940,8 +1946,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_61) : "r"((uint32_t)(codes[4] >> 0)));
-                qn_1[0] = _cvt_f16x2_e2m1x2_61;
+                : "=r"(_cvt_f16x2_e2m1x2_53) : "r"((uint32_t)(codes[4] >> 0)));
+                qn_1[0] = _cvt_f16x2_e2m1x2_53;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[4] >> 0)));
                 qn_1[0] = _cvt_f16x2_e2m1x2_57;
@@ -1958,7 +1964,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_1[0] = qw_16[0];
                 q_b_1[1] = qw_16[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_62;
+                uint32_t _cvt_f16x2_e2m1x2_54;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_58;
 #endif
@@ -1966,8 +1972,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_62) : "r"((uint32_t)(codes[4] >> 8)));
-                qn_1[1] = _cvt_f16x2_e2m1x2_62;
+                : "=r"(_cvt_f16x2_e2m1x2_54) : "r"((uint32_t)(codes[4] >> 8)));
+                qn_1[1] = _cvt_f16x2_e2m1x2_54;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[4] >> 8)));
                 qn_1[1] = _cvt_f16x2_e2m1x2_58;
@@ -1984,7 +1990,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_1[2] = qw_17[0];
                 q_b_1[3] = qw_17[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_63;
+                uint32_t _cvt_f16x2_e2m1x2_55;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_59;
 #endif
@@ -1992,8 +1998,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_63) : "r"((uint32_t)(codes[4] >> 16)));
-                qn_1[2] = _cvt_f16x2_e2m1x2_63;
+                : "=r"(_cvt_f16x2_e2m1x2_55) : "r"((uint32_t)(codes[4] >> 16)));
+                qn_1[2] = _cvt_f16x2_e2m1x2_55;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_59) : "r"((uint32_t)(codes[4] >> 16)));
                 qn_1[2] = _cvt_f16x2_e2m1x2_59;
@@ -2010,7 +2016,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_1[4] = qw_18[0];
                 q_b_1[5] = qw_18[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_64;
+                uint32_t _cvt_f16x2_e2m1x2_56;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_60;
 #endif
@@ -2018,8 +2024,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[4] >> 24)));
-                qn_1[3] = _cvt_f16x2_e2m1x2_64;
+                : "=r"(_cvt_f16x2_e2m1x2_56) : "r"((uint32_t)(codes[4] >> 24)));
+                qn_1[3] = _cvt_f16x2_e2m1x2_56;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_60) : "r"((uint32_t)(codes[4] >> 24)));
                 qn_1[3] = _cvt_f16x2_e2m1x2_60;
@@ -2036,7 +2042,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_1[6] = qw_19[0];
                 q_b_1[7] = qw_19[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_65;
+                uint32_t _cvt_f16x2_e2m1x2_57;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_61;
 #endif
@@ -2044,8 +2050,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_65) : "r"((uint32_t)(codes[5] >> 0)));
-                qn_1[4] = _cvt_f16x2_e2m1x2_65;
+                : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[5] >> 0)));
+                qn_1[4] = _cvt_f16x2_e2m1x2_57;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_61) : "r"((uint32_t)(codes[5] >> 0)));
                 qn_1[4] = _cvt_f16x2_e2m1x2_61;
@@ -2062,7 +2068,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_1[8] = qw_20[0];
                 q_b_1[9] = qw_20[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_66;
+                uint32_t _cvt_f16x2_e2m1x2_58;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_62;
 #endif
@@ -2070,8 +2076,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_66) : "r"((uint32_t)(codes[5] >> 8)));
-                qn_1[5] = _cvt_f16x2_e2m1x2_66;
+                : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[5] >> 8)));
+                qn_1[5] = _cvt_f16x2_e2m1x2_58;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_62) : "r"((uint32_t)(codes[5] >> 8)));
                 qn_1[5] = _cvt_f16x2_e2m1x2_62;
@@ -2088,7 +2094,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_1[10] = qw_21[0];
                 q_b_1[11] = qw_21[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_67;
+                uint32_t _cvt_f16x2_e2m1x2_59;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_63;
 #endif
@@ -2096,8 +2102,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_67) : "r"((uint32_t)(codes[5] >> 16)));
-                qn_1[6] = _cvt_f16x2_e2m1x2_67;
+                : "=r"(_cvt_f16x2_e2m1x2_59) : "r"((uint32_t)(codes[5] >> 16)));
+                qn_1[6] = _cvt_f16x2_e2m1x2_59;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_63) : "r"((uint32_t)(codes[5] >> 16)));
                 qn_1[6] = _cvt_f16x2_e2m1x2_63;
@@ -2114,7 +2120,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_1[12] = qw_22[0];
                 q_b_1[13] = qw_22[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_68;
+                uint32_t _cvt_f16x2_e2m1x2_60;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_64;
 #endif
@@ -2122,8 +2128,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_68) : "r"((uint32_t)(codes[5] >> 24)));
-                qn_1[7] = _cvt_f16x2_e2m1x2_68;
+                : "=r"(_cvt_f16x2_e2m1x2_60) : "r"((uint32_t)(codes[5] >> 24)));
+                qn_1[7] = _cvt_f16x2_e2m1x2_60;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[5] >> 24)));
                 qn_1[7] = _cvt_f16x2_e2m1x2_64;
@@ -2153,7 +2159,11 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _la = 0; _la < 1; _la++)
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_4)[_la], reinterpret_cast<const float2*>((t8_4 + 2))[_la]);
-                float qv_1 = t8_4[0] + t8_4[1];
+#if __CUDA_ARCH__ == 1030
+                qv[2] = t8_4[0] + t8_4[1];
+#else
+                qv_1[2] = t8_4[0] + t8_4[1];
+#endif
                 uint32_t a0_1;
                 asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_1) : "r"(qn_1[0]), "r"(qn_1[0]), "r"(0));
                 uint32_t b0_1;
@@ -2181,27 +2191,24 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     "add.rn.f32.f16 %1, hi, %4;\n\t"
                     "}\n"
                     : "=&f"(w_1[0]), "=&f"(w_1[1]) : "r"(v_17), "f"(0.0f), "f"(0.0f));
-                float qq_1 = w_1[0] + w_1[1];
 #if __CUDA_ARCH__ == 1030
-                float _rcp_69 = approx_rcp(qq_1);
-                sf_fit[2] = ((g_live_2 != 0 && qq_1 > 0.0f) ? sf_ex_2 * qv_1 * _rcp_69 : 0.0f);
+                qq[2] = w_1[0] + w_1[1];
+                g_safe[3] = ((g[3] > -CUDART_INF_F) ? g[3] : 0.0f);
+                const float2 _fma_b2_61 = {c_log2, c_log2};
+                const float2 _fma_c2_62 = {-g_safe[3], -g_safe[3]};
 #else
-                float _rcp_65 = approx_rcp(qq_1);
-                sf_fit[2] = ((g_live_2 != 0 && qq_1 > 0.0f) ? sf_ex_2 * qv_1 * _rcp_65 : 0.0f);
-#endif
+                qq_1[2] = w_1[0] + w_1[1];
+                float _rcp_65 = approx_rcp(qq_1[2]);
+                sf_fit[2] = ((g_live_2 != 0 && qq_1[2] > 0.0f) ? sf_ex_2 * qv_1[2] * _rcp_65 : 0.0f);
                 int g_live_3 = g[3] > -CUDART_INF_F;
                 float g_safe_3 = ((g_live_3 != 0) ? g[3] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                const float2 _fma_b2_70 = {c_log2, c_log2};
-                const float2 _fma_c2_71 = {-g_safe_3, -g_safe_3};
-#else
                 const float2 _fma_b2_66 = {c_log2, c_log2};
                 const float2 _fma_c2_67 = {-g_safe_3, -g_safe_3};
 #endif
                 #pragma unroll
                 for (int _lf = 0; _lf < 8; _lf++)
 #if __CUDA_ARCH__ == 1030
-                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_70, _fma_c2_71);
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_61, _fma_c2_62);
 #else
                     fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_66, _fma_c2_67);
 #endif
@@ -2221,22 +2228,20 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_5)[_la], reinterpret_cast<const float2*>((t8_5 + 2))[_la]);
                 b_sums[3] = t8_5[0] + t8_5[1];
 #if __CUDA_ARCH__ == 1030
-                float _exp2_72 = approx_exp2(g_safe_3 - m);
-                b_weights[3] = ((g_live_3 != 0) ? _exp2_72 : 0.0f);
-                float _exp2_73 = approx_exp2(g_safe_3 - m - 4.0f);
-                float sf_ex_3 = 448.0f * _exp2_73;
-                const float2 _scale2_74 = {6.0f, 6.0f};
+                const float2 _scale2_63 = {6.0f, 6.0f};
 #else
                 float _exp2_68 = approx_exp2(g_safe_3 - m);
                 b_weights[3] = ((g_live_3 != 0) ? _exp2_68 : 0.0f);
                 float _exp2_69 = approx_exp2(g_safe_3 - m - 4.0f);
                 float sf_ex_3 = 448.0f * _exp2_69;
+                float qv_2[4];
+                float qq_2[4];
                 const float2 _scale2_70 = {6.0f, 6.0f};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 8; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_74);
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_63);
 #else
                     mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_70);
 #endif
@@ -2245,7 +2250,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 float q_b_2[16];
                 unsigned int qn_2[8];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_75;
+                uint32_t _cvt_f16x2_e2m1x2_64;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_71;
 #endif
@@ -2253,8 +2258,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_75) : "r"((uint32_t)(codes[6] >> 0)));
-                qn_2[0] = _cvt_f16x2_e2m1x2_75;
+                : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[6] >> 0)));
+                qn_2[0] = _cvt_f16x2_e2m1x2_64;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[6] >> 0)));
                 qn_2[0] = _cvt_f16x2_e2m1x2_71;
@@ -2271,7 +2276,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_2[0] = qw_24[0];
                 q_b_2[1] = qw_24[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_76;
+                uint32_t _cvt_f16x2_e2m1x2_65;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_72;
 #endif
@@ -2279,8 +2284,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_76) : "r"((uint32_t)(codes[6] >> 8)));
-                qn_2[1] = _cvt_f16x2_e2m1x2_76;
+                : "=r"(_cvt_f16x2_e2m1x2_65) : "r"((uint32_t)(codes[6] >> 8)));
+                qn_2[1] = _cvt_f16x2_e2m1x2_65;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_72) : "r"((uint32_t)(codes[6] >> 8)));
                 qn_2[1] = _cvt_f16x2_e2m1x2_72;
@@ -2297,7 +2302,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_2[2] = qw_25[0];
                 q_b_2[3] = qw_25[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_77;
+                uint32_t _cvt_f16x2_e2m1x2_66;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_73;
 #endif
@@ -2305,8 +2310,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_77) : "r"((uint32_t)(codes[6] >> 16)));
-                qn_2[2] = _cvt_f16x2_e2m1x2_77;
+                : "=r"(_cvt_f16x2_e2m1x2_66) : "r"((uint32_t)(codes[6] >> 16)));
+                qn_2[2] = _cvt_f16x2_e2m1x2_66;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_73) : "r"((uint32_t)(codes[6] >> 16)));
                 qn_2[2] = _cvt_f16x2_e2m1x2_73;
@@ -2323,7 +2328,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_2[4] = qw_26[0];
                 q_b_2[5] = qw_26[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_78;
+                uint32_t _cvt_f16x2_e2m1x2_67;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_74;
 #endif
@@ -2331,8 +2336,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_78) : "r"((uint32_t)(codes[6] >> 24)));
-                qn_2[3] = _cvt_f16x2_e2m1x2_78;
+                : "=r"(_cvt_f16x2_e2m1x2_67) : "r"((uint32_t)(codes[6] >> 24)));
+                qn_2[3] = _cvt_f16x2_e2m1x2_67;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_74) : "r"((uint32_t)(codes[6] >> 24)));
                 qn_2[3] = _cvt_f16x2_e2m1x2_74;
@@ -2349,7 +2354,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_2[6] = qw_27[0];
                 q_b_2[7] = qw_27[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_79;
+                uint32_t _cvt_f16x2_e2m1x2_68;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_75;
 #endif
@@ -2357,8 +2362,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_79) : "r"((uint32_t)(codes[7] >> 0)));
-                qn_2[4] = _cvt_f16x2_e2m1x2_79;
+                : "=r"(_cvt_f16x2_e2m1x2_68) : "r"((uint32_t)(codes[7] >> 0)));
+                qn_2[4] = _cvt_f16x2_e2m1x2_68;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_75) : "r"((uint32_t)(codes[7] >> 0)));
                 qn_2[4] = _cvt_f16x2_e2m1x2_75;
@@ -2375,7 +2380,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_2[8] = qw_28[0];
                 q_b_2[9] = qw_28[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_80;
+                uint32_t _cvt_f16x2_e2m1x2_69;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_76;
 #endif
@@ -2383,8 +2388,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_80) : "r"((uint32_t)(codes[7] >> 8)));
-                qn_2[5] = _cvt_f16x2_e2m1x2_80;
+                : "=r"(_cvt_f16x2_e2m1x2_69) : "r"((uint32_t)(codes[7] >> 8)));
+                qn_2[5] = _cvt_f16x2_e2m1x2_69;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_76) : "r"((uint32_t)(codes[7] >> 8)));
                 qn_2[5] = _cvt_f16x2_e2m1x2_76;
@@ -2401,7 +2406,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_2[10] = qw_29[0];
                 q_b_2[11] = qw_29[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_81;
+                uint32_t _cvt_f16x2_e2m1x2_70;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_77;
 #endif
@@ -2409,8 +2414,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_81) : "r"((uint32_t)(codes[7] >> 16)));
-                qn_2[6] = _cvt_f16x2_e2m1x2_81;
+                : "=r"(_cvt_f16x2_e2m1x2_70) : "r"((uint32_t)(codes[7] >> 16)));
+                qn_2[6] = _cvt_f16x2_e2m1x2_70;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_77) : "r"((uint32_t)(codes[7] >> 16)));
                 qn_2[6] = _cvt_f16x2_e2m1x2_77;
@@ -2427,7 +2432,7 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 q_b_2[12] = qw_30[0];
                 q_b_2[13] = qw_30[1];
 #if __CUDA_ARCH__ == 1030
-                uint32_t _cvt_f16x2_e2m1x2_82;
+                uint32_t _cvt_f16x2_e2m1x2_71;
 #else
                 uint32_t _cvt_f16x2_e2m1x2_78;
 #endif
@@ -2435,8 +2440,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
 #if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_82) : "r"((uint32_t)(codes[7] >> 24)));
-                qn_2[7] = _cvt_f16x2_e2m1x2_82;
+                : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[7] >> 24)));
+                qn_2[7] = _cvt_f16x2_e2m1x2_71;
 #else
                 : "=r"(_cvt_f16x2_e2m1x2_78) : "r"((uint32_t)(codes[7] >> 24)));
                 qn_2[7] = _cvt_f16x2_e2m1x2_78;
@@ -2466,7 +2471,11 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 #pragma unroll
                 for (int _la = 0; _la < 1; _la++)
                     add_f32x2_inplace(&reinterpret_cast<float2*>(t8_6)[_la], reinterpret_cast<const float2*>((t8_6 + 2))[_la]);
-                float qv_2 = t8_6[0] + t8_6[1];
+#if __CUDA_ARCH__ == 1030
+                qv[3] = t8_6[0] + t8_6[1];
+#else
+                qv_2[3] = t8_6[0] + t8_6[1];
+#endif
                 uint32_t a0_2;
                 asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_2) : "r"(qn_2[0]), "r"(qn_2[0]), "r"(0));
                 uint32_t b0_2;
@@ -2494,13 +2503,63 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     "add.rn.f32.f16 %1, hi, %4;\n\t"
                     "}\n"
                     : "=&f"(w_2[0]), "=&f"(w_2[1]) : "r"(v_18), "f"(0.0f), "f"(0.0f));
-                float qq_2 = w_2[0] + w_2[1];
 #if __CUDA_ARCH__ == 1030
-                float _rcp_83 = approx_rcp(qq_2);
-                sf_fit[3] = ((g_live_3 != 0 && qq_2 > 0.0f) ? sf_ex_3 * qv_2 * _rcp_83 : 0.0f);
+                qq[3] = w_2[0] + w_2[1];
+                float d_w[4];
+                const float2 _sub2_72 = {m, m};
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    reinterpret_cast<float2*>(d_w)[_ls] = sub_f32x2(reinterpret_cast<float2*>(g_safe)[_ls], _sub2_72);
+                float d_s[4];
+                const float2 _sub2_73 = {4.0f, 4.0f};
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    reinterpret_cast<float2*>(d_s)[_ls] = sub_f32x2(reinterpret_cast<float2*>(d_w)[_ls], _sub2_73);
+                float e_s[4];
+                float r_q[4];
+                float _exp2_74 = approx_exp2(d_w[0]);
+                b_weights[0] = ((g[0] > -CUDART_INF_F) ? _exp2_74 : 0.0f);
+                float _exp2_75 = approx_exp2(d_s[0]);
+                e_s[0] = _exp2_75;
+                float _rcp_76 = approx_rcp(qq[0]);
+                r_q[0] = _rcp_76;
+                float _exp2_77 = approx_exp2(d_w[1]);
+                b_weights[1] = ((g[1] > -CUDART_INF_F) ? _exp2_77 : 0.0f);
+                float _exp2_78 = approx_exp2(d_s[1]);
+                e_s[1] = _exp2_78;
+                float _rcp_79 = approx_rcp(qq[1]);
+                r_q[1] = _rcp_79;
+                float _exp2_80 = approx_exp2(d_w[2]);
+                b_weights[2] = ((g[2] > -CUDART_INF_F) ? _exp2_80 : 0.0f);
+                float _exp2_81 = approx_exp2(d_s[2]);
+                e_s[2] = _exp2_81;
+                float _rcp_82 = approx_rcp(qq[2]);
+                r_q[2] = _rcp_82;
+                float _exp2_83 = approx_exp2(d_w[3]);
+                b_weights[3] = ((g[3] > -CUDART_INF_F) ? _exp2_83 : 0.0f);
+                float _exp2_84 = approx_exp2(d_s[3]);
+                e_s[3] = _exp2_84;
+                float _rcp_85 = approx_rcp(qq[3]);
+                r_q[3] = _rcp_85;
+                float fit[4];
+                const float2 _scale2_86 = {448.0f, 448.0f};
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    reinterpret_cast<float2*>(fit)[_ls] = mul_f32x2(reinterpret_cast<float2*>(e_s)[_ls], _scale2_86);
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>(fit)[_ls], reinterpret_cast<const float2*>(qv)[_ls]);
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>(fit)[_ls], reinterpret_cast<const float2*>(r_q)[_ls]);
+                sf_fit[0] = ((g[0] > -CUDART_INF_F && qq[0] > 0.0f) ? fit[0] : 0.0f);
+                sf_fit[1] = ((g[1] > -CUDART_INF_F && qq[1] > 0.0f) ? fit[1] : 0.0f);
+                sf_fit[2] = ((g[2] > -CUDART_INF_F && qq[2] > 0.0f) ? fit[2] : 0.0f);
+                sf_fit[3] = ((g[3] > -CUDART_INF_F && qq[3] > 0.0f) ? fit[3] : 0.0f);
 #else
-                float _rcp_79 = approx_rcp(qq_2);
-                sf_fit[3] = ((g_live_3 != 0 && qq_2 > 0.0f) ? sf_ex_3 * qv_2 * _rcp_79 : 0.0f);
+                qq_2[3] = w_2[0] + w_2[1];
+                float _rcp_79 = approx_rcp(qq_2[3]);
+                sf_fit[3] = ((g_live_3 != 0 && qq_2[3] > 0.0f) ? sf_ex_3 * qv_2[3] * _rcp_79 : 0.0f);
 #endif
                 unsigned int sf_word[1];
                 {
@@ -2550,8 +2609,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 }
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1030
-                int _warp_vote_84 = __any_sync(0xFFFFFFFF, rescale != 0);
-                if (_warp_vote_84 != 0) {
+                int _warp_vote_87 = __any_sync(0xFFFFFFFF, rescale != 0);
+                if (_warp_vote_87 != 0) {
 #else
                 int _warp_vote_80 = __any_sync(0xFFFFFFFF, rescale != 0);
                 if (_warp_vote_80 != 0) {
@@ -2565,14 +2624,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_0));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_85 = {alpha, alpha};
+                    const float2 _scale2_88 = {alpha, alpha};
 #else
                     const float2 _scale2_81 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_0)[_ls], _scale2_85);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_0)[_ls], _scale2_88);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_0)[_ls], _scale2_81);
 #endif
@@ -2586,14 +2645,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_1));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_86 = {alpha, alpha};
+                    const float2 _scale2_89 = {alpha, alpha};
 #else
                     const float2 _scale2_82 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_1)[_ls], _scale2_86);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_1)[_ls], _scale2_89);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_1)[_ls], _scale2_82);
 #endif
@@ -2607,14 +2666,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_2));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_87 = {alpha, alpha};
+                    const float2 _scale2_90 = {alpha, alpha};
 #else
                     const float2 _scale2_83 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_2)[_ls], _scale2_87);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_2)[_ls], _scale2_90);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_2)[_ls], _scale2_83);
 #endif
@@ -2628,14 +2687,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_3));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_88 = {alpha, alpha};
+                    const float2 _scale2_91 = {alpha, alpha};
 #else
                     const float2 _scale2_84 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_3)[_ls], _scale2_88);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_3)[_ls], _scale2_91);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_3)[_ls], _scale2_84);
 #endif
@@ -2649,14 +2708,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_4));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_89 = {alpha, alpha};
+                    const float2 _scale2_92 = {alpha, alpha};
 #else
                     const float2 _scale2_85 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_4)[_ls], _scale2_89);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_4)[_ls], _scale2_92);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_4)[_ls], _scale2_85);
 #endif
@@ -2670,14 +2729,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_5));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_90 = {alpha, alpha};
+                    const float2 _scale2_93 = {alpha, alpha};
 #else
                     const float2 _scale2_86 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_5)[_ls], _scale2_90);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_5)[_ls], _scale2_93);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_5)[_ls], _scale2_86);
 #endif
@@ -2691,14 +2750,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_6));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_91 = {alpha, alpha};
+                    const float2 _scale2_94 = {alpha, alpha};
 #else
                     const float2 _scale2_87 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_6)[_ls], _scale2_91);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_6)[_ls], _scale2_94);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_6)[_ls], _scale2_87);
 #endif
@@ -2712,14 +2771,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                         : "r"(o_addr_7));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_92 = {alpha, alpha};
+                    const float2 _scale2_95 = {alpha, alpha};
 #else
                     const float2 _scale2_88 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_7)[_ls], _scale2_92);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_7)[_ls], _scale2_95);
 #else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_7)[_ls], _scale2_88);
 #endif
@@ -2758,8 +2817,8 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                 float l_row = l_sum + xch_l[other];
                 float gk_e = *kv_gs;
 #if __CUDA_ARCH__ == 1030
-                float _rcp_93 = approx_rcp(gk_e * l_row);
-                float inv = ((l_row > 0.0f) ? 0.005952381f * _rcp_93 : 0.0f);
+                float _rcp_96 = approx_rcp(gk_e * l_row);
+                float inv = ((l_row > 0.0f) ? 0.005952381f * _rcp_96 : 0.0f);
 #else
                 float _rcp_89 = approx_rcp(gk_e * l_row);
                 float inv = ((l_row > 0.0f) ? 0.005952381f * _rcp_89 : 0.0f);
@@ -2777,14 +2836,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_94 = {inv, inv};
+                const float2 _scale2_97 = {inv, inv};
 #else
                 const float2 _scale2_90 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_0)[_ls], _scale2_94);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_0)[_ls], _scale2_97);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_0)[_ls], _scale2_90);
 #endif
@@ -2799,14 +2858,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_95 = reinterpret_cast<const unsigned*>(o_bf16_0);
+                            const unsigned* _raw_stv8_98 = reinterpret_cast<const unsigned*>(o_bf16_0);
 #else
                             const unsigned* _raw_stv8_91 = reinterpret_cast<const unsigned*>(o_bf16_0);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0))), "r"(_raw_stv8_95[0]), "r"(_raw_stv8_95[1]), "r"(_raw_stv8_95[2]), "r"(_raw_stv8_95[3]), "r"(_raw_stv8_95[4]), "r"(_raw_stv8_95[5]), "r"(_raw_stv8_95[6]), "r"(_raw_stv8_95[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0))), "r"(_raw_stv8_98[0]), "r"(_raw_stv8_98[1]), "r"(_raw_stv8_98[2]), "r"(_raw_stv8_98[3]), "r"(_raw_stv8_98[4]), "r"(_raw_stv8_98[5]), "r"(_raw_stv8_98[6]), "r"(_raw_stv8_98[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0))), "r"(_raw_stv8_91[0]), "r"(_raw_stv8_91[1]), "r"(_raw_stv8_91[2]), "r"(_raw_stv8_91[3]), "r"(_raw_stv8_91[4]), "r"(_raw_stv8_91[5]), "r"(_raw_stv8_91[6]), "r"(_raw_stv8_91[7]) : "memory");
 #endif
@@ -2814,14 +2873,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_96 = reinterpret_cast<const unsigned*>(o_bf16_0);
+                            const unsigned* _raw_stv8_99 = reinterpret_cast<const unsigned*>(o_bf16_0);
 #else
                             const unsigned* _raw_stv8_92 = reinterpret_cast<const unsigned*>(o_bf16_0);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_0))), "r"(_raw_stv8_96[0]), "r"(_raw_stv8_96[1]), "r"(_raw_stv8_96[2]), "r"(_raw_stv8_96[3]), "r"(_raw_stv8_96[4]), "r"(_raw_stv8_96[5]), "r"(_raw_stv8_96[6]), "r"(_raw_stv8_96[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_0))), "r"(_raw_stv8_99[0]), "r"(_raw_stv8_99[1]), "r"(_raw_stv8_99[2]), "r"(_raw_stv8_99[3]), "r"(_raw_stv8_99[4]), "r"(_raw_stv8_99[5]), "r"(_raw_stv8_99[6]), "r"(_raw_stv8_99[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_0))), "r"(_raw_stv8_92[0]), "r"(_raw_stv8_92[1]), "r"(_raw_stv8_92[2]), "r"(_raw_stv8_92[3]), "r"(_raw_stv8_92[4]), "r"(_raw_stv8_92[5]), "r"(_raw_stv8_92[6]), "r"(_raw_stv8_92[7]) : "memory");
 #endif
@@ -2830,14 +2889,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_97 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
+                            const unsigned* _raw_stv8_100 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
 #else
                             const unsigned* _raw_stv8_93 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0 + 16))), "r"(_raw_stv8_97[0]), "r"(_raw_stv8_97[1]), "r"(_raw_stv8_97[2]), "r"(_raw_stv8_97[3]), "r"(_raw_stv8_97[4]), "r"(_raw_stv8_97[5]), "r"(_raw_stv8_97[6]), "r"(_raw_stv8_97[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0 + 16))), "r"(_raw_stv8_100[0]), "r"(_raw_stv8_100[1]), "r"(_raw_stv8_100[2]), "r"(_raw_stv8_100[3]), "r"(_raw_stv8_100[4]), "r"(_raw_stv8_100[5]), "r"(_raw_stv8_100[6]), "r"(_raw_stv8_100[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0 + 16))), "r"(_raw_stv8_93[0]), "r"(_raw_stv8_93[1]), "r"(_raw_stv8_93[2]), "r"(_raw_stv8_93[3]), "r"(_raw_stv8_93[4]), "r"(_raw_stv8_93[5]), "r"(_raw_stv8_93[6]), "r"(_raw_stv8_93[7]) : "memory");
 #endif
@@ -2845,14 +2904,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_98 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
+                            const unsigned* _raw_stv8_101 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
 #else
                             const unsigned* _raw_stv8_94 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_0 + 16))), "r"(_raw_stv8_98[0]), "r"(_raw_stv8_98[1]), "r"(_raw_stv8_98[2]), "r"(_raw_stv8_98[3]), "r"(_raw_stv8_98[4]), "r"(_raw_stv8_98[5]), "r"(_raw_stv8_98[6]), "r"(_raw_stv8_98[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_0 + 16))), "r"(_raw_stv8_101[0]), "r"(_raw_stv8_101[1]), "r"(_raw_stv8_101[2]), "r"(_raw_stv8_101[3]), "r"(_raw_stv8_101[4]), "r"(_raw_stv8_101[5]), "r"(_raw_stv8_101[6]), "r"(_raw_stv8_101[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_0 + 16))), "r"(_raw_stv8_94[0]), "r"(_raw_stv8_94[1]), "r"(_raw_stv8_94[2]), "r"(_raw_stv8_94[3]), "r"(_raw_stv8_94[4]), "r"(_raw_stv8_94[5]), "r"(_raw_stv8_94[6]), "r"(_raw_stv8_94[7]) : "memory");
 #endif
@@ -2867,14 +2926,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 32));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_99 = {inv, inv};
+                const float2 _scale2_102 = {inv, inv};
 #else
                 const float2 _scale2_95 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_1)[_ls], _scale2_99);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_1)[_ls], _scale2_102);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_1)[_ls], _scale2_95);
 #endif
@@ -2889,14 +2948,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_100 = reinterpret_cast<const unsigned*>(o_bf16_1);
+                            const unsigned* _raw_stv8_103 = reinterpret_cast<const unsigned*>(o_bf16_1);
 #else
                             const unsigned* _raw_stv8_96 = reinterpret_cast<const unsigned*>(o_bf16_1);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1))), "r"(_raw_stv8_100[0]), "r"(_raw_stv8_100[1]), "r"(_raw_stv8_100[2]), "r"(_raw_stv8_100[3]), "r"(_raw_stv8_100[4]), "r"(_raw_stv8_100[5]), "r"(_raw_stv8_100[6]), "r"(_raw_stv8_100[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1))), "r"(_raw_stv8_103[0]), "r"(_raw_stv8_103[1]), "r"(_raw_stv8_103[2]), "r"(_raw_stv8_103[3]), "r"(_raw_stv8_103[4]), "r"(_raw_stv8_103[5]), "r"(_raw_stv8_103[6]), "r"(_raw_stv8_103[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1))), "r"(_raw_stv8_96[0]), "r"(_raw_stv8_96[1]), "r"(_raw_stv8_96[2]), "r"(_raw_stv8_96[3]), "r"(_raw_stv8_96[4]), "r"(_raw_stv8_96[5]), "r"(_raw_stv8_96[6]), "r"(_raw_stv8_96[7]) : "memory");
 #endif
@@ -2904,14 +2963,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_101 = reinterpret_cast<const unsigned*>(o_bf16_1);
+                            const unsigned* _raw_stv8_104 = reinterpret_cast<const unsigned*>(o_bf16_1);
 #else
                             const unsigned* _raw_stv8_97 = reinterpret_cast<const unsigned*>(o_bf16_1);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_1))), "r"(_raw_stv8_101[0]), "r"(_raw_stv8_101[1]), "r"(_raw_stv8_101[2]), "r"(_raw_stv8_101[3]), "r"(_raw_stv8_101[4]), "r"(_raw_stv8_101[5]), "r"(_raw_stv8_101[6]), "r"(_raw_stv8_101[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_1))), "r"(_raw_stv8_104[0]), "r"(_raw_stv8_104[1]), "r"(_raw_stv8_104[2]), "r"(_raw_stv8_104[3]), "r"(_raw_stv8_104[4]), "r"(_raw_stv8_104[5]), "r"(_raw_stv8_104[6]), "r"(_raw_stv8_104[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_1))), "r"(_raw_stv8_97[0]), "r"(_raw_stv8_97[1]), "r"(_raw_stv8_97[2]), "r"(_raw_stv8_97[3]), "r"(_raw_stv8_97[4]), "r"(_raw_stv8_97[5]), "r"(_raw_stv8_97[6]), "r"(_raw_stv8_97[7]) : "memory");
 #endif
@@ -2920,14 +2979,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_102 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
+                            const unsigned* _raw_stv8_105 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
 #else
                             const unsigned* _raw_stv8_98 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1 + 16))), "r"(_raw_stv8_102[0]), "r"(_raw_stv8_102[1]), "r"(_raw_stv8_102[2]), "r"(_raw_stv8_102[3]), "r"(_raw_stv8_102[4]), "r"(_raw_stv8_102[5]), "r"(_raw_stv8_102[6]), "r"(_raw_stv8_102[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1 + 16))), "r"(_raw_stv8_105[0]), "r"(_raw_stv8_105[1]), "r"(_raw_stv8_105[2]), "r"(_raw_stv8_105[3]), "r"(_raw_stv8_105[4]), "r"(_raw_stv8_105[5]), "r"(_raw_stv8_105[6]), "r"(_raw_stv8_105[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1 + 16))), "r"(_raw_stv8_98[0]), "r"(_raw_stv8_98[1]), "r"(_raw_stv8_98[2]), "r"(_raw_stv8_98[3]), "r"(_raw_stv8_98[4]), "r"(_raw_stv8_98[5]), "r"(_raw_stv8_98[6]), "r"(_raw_stv8_98[7]) : "memory");
 #endif
@@ -2935,14 +2994,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_103 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
+                            const unsigned* _raw_stv8_106 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
 #else
                             const unsigned* _raw_stv8_99 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_1 + 16))), "r"(_raw_stv8_103[0]), "r"(_raw_stv8_103[1]), "r"(_raw_stv8_103[2]), "r"(_raw_stv8_103[3]), "r"(_raw_stv8_103[4]), "r"(_raw_stv8_103[5]), "r"(_raw_stv8_103[6]), "r"(_raw_stv8_103[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_1 + 16))), "r"(_raw_stv8_106[0]), "r"(_raw_stv8_106[1]), "r"(_raw_stv8_106[2]), "r"(_raw_stv8_106[3]), "r"(_raw_stv8_106[4]), "r"(_raw_stv8_106[5]), "r"(_raw_stv8_106[6]), "r"(_raw_stv8_106[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_1 + 16))), "r"(_raw_stv8_99[0]), "r"(_raw_stv8_99[1]), "r"(_raw_stv8_99[2]), "r"(_raw_stv8_99[3]), "r"(_raw_stv8_99[4]), "r"(_raw_stv8_99[5]), "r"(_raw_stv8_99[6]), "r"(_raw_stv8_99[7]) : "memory");
 #endif
@@ -2957,14 +3016,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 64));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_104 = {inv, inv};
+                const float2 _scale2_107 = {inv, inv};
 #else
                 const float2 _scale2_100 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_2)[_ls], _scale2_104);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_2)[_ls], _scale2_107);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_2)[_ls], _scale2_100);
 #endif
@@ -2979,14 +3038,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_105 = reinterpret_cast<const unsigned*>(o_bf16_2);
+                            const unsigned* _raw_stv8_108 = reinterpret_cast<const unsigned*>(o_bf16_2);
 #else
                             const unsigned* _raw_stv8_101 = reinterpret_cast<const unsigned*>(o_bf16_2);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2))), "r"(_raw_stv8_105[0]), "r"(_raw_stv8_105[1]), "r"(_raw_stv8_105[2]), "r"(_raw_stv8_105[3]), "r"(_raw_stv8_105[4]), "r"(_raw_stv8_105[5]), "r"(_raw_stv8_105[6]), "r"(_raw_stv8_105[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2))), "r"(_raw_stv8_108[0]), "r"(_raw_stv8_108[1]), "r"(_raw_stv8_108[2]), "r"(_raw_stv8_108[3]), "r"(_raw_stv8_108[4]), "r"(_raw_stv8_108[5]), "r"(_raw_stv8_108[6]), "r"(_raw_stv8_108[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2))), "r"(_raw_stv8_101[0]), "r"(_raw_stv8_101[1]), "r"(_raw_stv8_101[2]), "r"(_raw_stv8_101[3]), "r"(_raw_stv8_101[4]), "r"(_raw_stv8_101[5]), "r"(_raw_stv8_101[6]), "r"(_raw_stv8_101[7]) : "memory");
 #endif
@@ -2994,14 +3053,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_106 = reinterpret_cast<const unsigned*>(o_bf16_2);
+                            const unsigned* _raw_stv8_109 = reinterpret_cast<const unsigned*>(o_bf16_2);
 #else
                             const unsigned* _raw_stv8_102 = reinterpret_cast<const unsigned*>(o_bf16_2);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_2))), "r"(_raw_stv8_106[0]), "r"(_raw_stv8_106[1]), "r"(_raw_stv8_106[2]), "r"(_raw_stv8_106[3]), "r"(_raw_stv8_106[4]), "r"(_raw_stv8_106[5]), "r"(_raw_stv8_106[6]), "r"(_raw_stv8_106[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_2))), "r"(_raw_stv8_109[0]), "r"(_raw_stv8_109[1]), "r"(_raw_stv8_109[2]), "r"(_raw_stv8_109[3]), "r"(_raw_stv8_109[4]), "r"(_raw_stv8_109[5]), "r"(_raw_stv8_109[6]), "r"(_raw_stv8_109[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_2))), "r"(_raw_stv8_102[0]), "r"(_raw_stv8_102[1]), "r"(_raw_stv8_102[2]), "r"(_raw_stv8_102[3]), "r"(_raw_stv8_102[4]), "r"(_raw_stv8_102[5]), "r"(_raw_stv8_102[6]), "r"(_raw_stv8_102[7]) : "memory");
 #endif
@@ -3010,14 +3069,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_107 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
+                            const unsigned* _raw_stv8_110 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
 #else
                             const unsigned* _raw_stv8_103 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2 + 16))), "r"(_raw_stv8_107[0]), "r"(_raw_stv8_107[1]), "r"(_raw_stv8_107[2]), "r"(_raw_stv8_107[3]), "r"(_raw_stv8_107[4]), "r"(_raw_stv8_107[5]), "r"(_raw_stv8_107[6]), "r"(_raw_stv8_107[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2 + 16))), "r"(_raw_stv8_110[0]), "r"(_raw_stv8_110[1]), "r"(_raw_stv8_110[2]), "r"(_raw_stv8_110[3]), "r"(_raw_stv8_110[4]), "r"(_raw_stv8_110[5]), "r"(_raw_stv8_110[6]), "r"(_raw_stv8_110[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2 + 16))), "r"(_raw_stv8_103[0]), "r"(_raw_stv8_103[1]), "r"(_raw_stv8_103[2]), "r"(_raw_stv8_103[3]), "r"(_raw_stv8_103[4]), "r"(_raw_stv8_103[5]), "r"(_raw_stv8_103[6]), "r"(_raw_stv8_103[7]) : "memory");
 #endif
@@ -3025,14 +3084,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_108 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
+                            const unsigned* _raw_stv8_111 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
 #else
                             const unsigned* _raw_stv8_104 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_2 + 16))), "r"(_raw_stv8_108[0]), "r"(_raw_stv8_108[1]), "r"(_raw_stv8_108[2]), "r"(_raw_stv8_108[3]), "r"(_raw_stv8_108[4]), "r"(_raw_stv8_108[5]), "r"(_raw_stv8_108[6]), "r"(_raw_stv8_108[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_2 + 16))), "r"(_raw_stv8_111[0]), "r"(_raw_stv8_111[1]), "r"(_raw_stv8_111[2]), "r"(_raw_stv8_111[3]), "r"(_raw_stv8_111[4]), "r"(_raw_stv8_111[5]), "r"(_raw_stv8_111[6]), "r"(_raw_stv8_111[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_2 + 16))), "r"(_raw_stv8_104[0]), "r"(_raw_stv8_104[1]), "r"(_raw_stv8_104[2]), "r"(_raw_stv8_104[3]), "r"(_raw_stv8_104[4]), "r"(_raw_stv8_104[5]), "r"(_raw_stv8_104[6]), "r"(_raw_stv8_104[7]) : "memory");
 #endif
@@ -3047,14 +3106,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 96));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_109 = {inv, inv};
+                const float2 _scale2_112 = {inv, inv};
 #else
                 const float2 _scale2_105 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_3)[_ls], _scale2_109);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_3)[_ls], _scale2_112);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_3)[_ls], _scale2_105);
 #endif
@@ -3069,14 +3128,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_110 = reinterpret_cast<const unsigned*>(o_bf16_3);
+                            const unsigned* _raw_stv8_113 = reinterpret_cast<const unsigned*>(o_bf16_3);
 #else
                             const unsigned* _raw_stv8_106 = reinterpret_cast<const unsigned*>(o_bf16_3);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3))), "r"(_raw_stv8_110[0]), "r"(_raw_stv8_110[1]), "r"(_raw_stv8_110[2]), "r"(_raw_stv8_110[3]), "r"(_raw_stv8_110[4]), "r"(_raw_stv8_110[5]), "r"(_raw_stv8_110[6]), "r"(_raw_stv8_110[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3))), "r"(_raw_stv8_113[0]), "r"(_raw_stv8_113[1]), "r"(_raw_stv8_113[2]), "r"(_raw_stv8_113[3]), "r"(_raw_stv8_113[4]), "r"(_raw_stv8_113[5]), "r"(_raw_stv8_113[6]), "r"(_raw_stv8_113[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3))), "r"(_raw_stv8_106[0]), "r"(_raw_stv8_106[1]), "r"(_raw_stv8_106[2]), "r"(_raw_stv8_106[3]), "r"(_raw_stv8_106[4]), "r"(_raw_stv8_106[5]), "r"(_raw_stv8_106[6]), "r"(_raw_stv8_106[7]) : "memory");
 #endif
@@ -3084,14 +3143,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_111 = reinterpret_cast<const unsigned*>(o_bf16_3);
+                            const unsigned* _raw_stv8_114 = reinterpret_cast<const unsigned*>(o_bf16_3);
 #else
                             const unsigned* _raw_stv8_107 = reinterpret_cast<const unsigned*>(o_bf16_3);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_3))), "r"(_raw_stv8_111[0]), "r"(_raw_stv8_111[1]), "r"(_raw_stv8_111[2]), "r"(_raw_stv8_111[3]), "r"(_raw_stv8_111[4]), "r"(_raw_stv8_111[5]), "r"(_raw_stv8_111[6]), "r"(_raw_stv8_111[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_3))), "r"(_raw_stv8_114[0]), "r"(_raw_stv8_114[1]), "r"(_raw_stv8_114[2]), "r"(_raw_stv8_114[3]), "r"(_raw_stv8_114[4]), "r"(_raw_stv8_114[5]), "r"(_raw_stv8_114[6]), "r"(_raw_stv8_114[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_3))), "r"(_raw_stv8_107[0]), "r"(_raw_stv8_107[1]), "r"(_raw_stv8_107[2]), "r"(_raw_stv8_107[3]), "r"(_raw_stv8_107[4]), "r"(_raw_stv8_107[5]), "r"(_raw_stv8_107[6]), "r"(_raw_stv8_107[7]) : "memory");
 #endif
@@ -3100,14 +3159,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_112 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
+                            const unsigned* _raw_stv8_115 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
 #else
                             const unsigned* _raw_stv8_108 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3 + 16))), "r"(_raw_stv8_112[0]), "r"(_raw_stv8_112[1]), "r"(_raw_stv8_112[2]), "r"(_raw_stv8_112[3]), "r"(_raw_stv8_112[4]), "r"(_raw_stv8_112[5]), "r"(_raw_stv8_112[6]), "r"(_raw_stv8_112[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3 + 16))), "r"(_raw_stv8_115[0]), "r"(_raw_stv8_115[1]), "r"(_raw_stv8_115[2]), "r"(_raw_stv8_115[3]), "r"(_raw_stv8_115[4]), "r"(_raw_stv8_115[5]), "r"(_raw_stv8_115[6]), "r"(_raw_stv8_115[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3 + 16))), "r"(_raw_stv8_108[0]), "r"(_raw_stv8_108[1]), "r"(_raw_stv8_108[2]), "r"(_raw_stv8_108[3]), "r"(_raw_stv8_108[4]), "r"(_raw_stv8_108[5]), "r"(_raw_stv8_108[6]), "r"(_raw_stv8_108[7]) : "memory");
 #endif
@@ -3115,14 +3174,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_113 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
+                            const unsigned* _raw_stv8_116 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
 #else
                             const unsigned* _raw_stv8_109 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_3 + 16))), "r"(_raw_stv8_113[0]), "r"(_raw_stv8_113[1]), "r"(_raw_stv8_113[2]), "r"(_raw_stv8_113[3]), "r"(_raw_stv8_113[4]), "r"(_raw_stv8_113[5]), "r"(_raw_stv8_113[6]), "r"(_raw_stv8_113[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_3 + 16))), "r"(_raw_stv8_116[0]), "r"(_raw_stv8_116[1]), "r"(_raw_stv8_116[2]), "r"(_raw_stv8_116[3]), "r"(_raw_stv8_116[4]), "r"(_raw_stv8_116[5]), "r"(_raw_stv8_116[6]), "r"(_raw_stv8_116[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_3 + 16))), "r"(_raw_stv8_109[0]), "r"(_raw_stv8_109[1]), "r"(_raw_stv8_109[2]), "r"(_raw_stv8_109[3]), "r"(_raw_stv8_109[4]), "r"(_raw_stv8_109[5]), "r"(_raw_stv8_109[6]), "r"(_raw_stv8_109[7]) : "memory");
 #endif
@@ -3137,14 +3196,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 128));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_114 = {inv, inv};
+                const float2 _scale2_117 = {inv, inv};
 #else
                 const float2 _scale2_110 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_4)[_ls], _scale2_114);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_4)[_ls], _scale2_117);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_4)[_ls], _scale2_110);
 #endif
@@ -3159,14 +3218,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_115 = reinterpret_cast<const unsigned*>(o_bf16_4);
+                            const unsigned* _raw_stv8_118 = reinterpret_cast<const unsigned*>(o_bf16_4);
 #else
                             const unsigned* _raw_stv8_111 = reinterpret_cast<const unsigned*>(o_bf16_4);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4))), "r"(_raw_stv8_115[0]), "r"(_raw_stv8_115[1]), "r"(_raw_stv8_115[2]), "r"(_raw_stv8_115[3]), "r"(_raw_stv8_115[4]), "r"(_raw_stv8_115[5]), "r"(_raw_stv8_115[6]), "r"(_raw_stv8_115[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4))), "r"(_raw_stv8_118[0]), "r"(_raw_stv8_118[1]), "r"(_raw_stv8_118[2]), "r"(_raw_stv8_118[3]), "r"(_raw_stv8_118[4]), "r"(_raw_stv8_118[5]), "r"(_raw_stv8_118[6]), "r"(_raw_stv8_118[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4))), "r"(_raw_stv8_111[0]), "r"(_raw_stv8_111[1]), "r"(_raw_stv8_111[2]), "r"(_raw_stv8_111[3]), "r"(_raw_stv8_111[4]), "r"(_raw_stv8_111[5]), "r"(_raw_stv8_111[6]), "r"(_raw_stv8_111[7]) : "memory");
 #endif
@@ -3174,14 +3233,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_116 = reinterpret_cast<const unsigned*>(o_bf16_4);
+                            const unsigned* _raw_stv8_119 = reinterpret_cast<const unsigned*>(o_bf16_4);
 #else
                             const unsigned* _raw_stv8_112 = reinterpret_cast<const unsigned*>(o_bf16_4);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_4))), "r"(_raw_stv8_116[0]), "r"(_raw_stv8_116[1]), "r"(_raw_stv8_116[2]), "r"(_raw_stv8_116[3]), "r"(_raw_stv8_116[4]), "r"(_raw_stv8_116[5]), "r"(_raw_stv8_116[6]), "r"(_raw_stv8_116[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_4))), "r"(_raw_stv8_119[0]), "r"(_raw_stv8_119[1]), "r"(_raw_stv8_119[2]), "r"(_raw_stv8_119[3]), "r"(_raw_stv8_119[4]), "r"(_raw_stv8_119[5]), "r"(_raw_stv8_119[6]), "r"(_raw_stv8_119[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_4))), "r"(_raw_stv8_112[0]), "r"(_raw_stv8_112[1]), "r"(_raw_stv8_112[2]), "r"(_raw_stv8_112[3]), "r"(_raw_stv8_112[4]), "r"(_raw_stv8_112[5]), "r"(_raw_stv8_112[6]), "r"(_raw_stv8_112[7]) : "memory");
 #endif
@@ -3190,14 +3249,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_117 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
+                            const unsigned* _raw_stv8_120 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
 #else
                             const unsigned* _raw_stv8_113 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4 + 16))), "r"(_raw_stv8_117[0]), "r"(_raw_stv8_117[1]), "r"(_raw_stv8_117[2]), "r"(_raw_stv8_117[3]), "r"(_raw_stv8_117[4]), "r"(_raw_stv8_117[5]), "r"(_raw_stv8_117[6]), "r"(_raw_stv8_117[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4 + 16))), "r"(_raw_stv8_120[0]), "r"(_raw_stv8_120[1]), "r"(_raw_stv8_120[2]), "r"(_raw_stv8_120[3]), "r"(_raw_stv8_120[4]), "r"(_raw_stv8_120[5]), "r"(_raw_stv8_120[6]), "r"(_raw_stv8_120[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4 + 16))), "r"(_raw_stv8_113[0]), "r"(_raw_stv8_113[1]), "r"(_raw_stv8_113[2]), "r"(_raw_stv8_113[3]), "r"(_raw_stv8_113[4]), "r"(_raw_stv8_113[5]), "r"(_raw_stv8_113[6]), "r"(_raw_stv8_113[7]) : "memory");
 #endif
@@ -3205,14 +3264,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_118 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
+                            const unsigned* _raw_stv8_121 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
 #else
                             const unsigned* _raw_stv8_114 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_4 + 16))), "r"(_raw_stv8_118[0]), "r"(_raw_stv8_118[1]), "r"(_raw_stv8_118[2]), "r"(_raw_stv8_118[3]), "r"(_raw_stv8_118[4]), "r"(_raw_stv8_118[5]), "r"(_raw_stv8_118[6]), "r"(_raw_stv8_118[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_4 + 16))), "r"(_raw_stv8_121[0]), "r"(_raw_stv8_121[1]), "r"(_raw_stv8_121[2]), "r"(_raw_stv8_121[3]), "r"(_raw_stv8_121[4]), "r"(_raw_stv8_121[5]), "r"(_raw_stv8_121[6]), "r"(_raw_stv8_121[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_4 + 16))), "r"(_raw_stv8_114[0]), "r"(_raw_stv8_114[1]), "r"(_raw_stv8_114[2]), "r"(_raw_stv8_114[3]), "r"(_raw_stv8_114[4]), "r"(_raw_stv8_114[5]), "r"(_raw_stv8_114[6]), "r"(_raw_stv8_114[7]) : "memory");
 #endif
@@ -3227,14 +3286,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 160));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_119 = {inv, inv};
+                const float2 _scale2_122 = {inv, inv};
 #else
                 const float2 _scale2_115 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_5)[_ls], _scale2_119);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_5)[_ls], _scale2_122);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_5)[_ls], _scale2_115);
 #endif
@@ -3249,14 +3308,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_120 = reinterpret_cast<const unsigned*>(o_bf16_5);
+                            const unsigned* _raw_stv8_123 = reinterpret_cast<const unsigned*>(o_bf16_5);
 #else
                             const unsigned* _raw_stv8_116 = reinterpret_cast<const unsigned*>(o_bf16_5);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5))), "r"(_raw_stv8_120[0]), "r"(_raw_stv8_120[1]), "r"(_raw_stv8_120[2]), "r"(_raw_stv8_120[3]), "r"(_raw_stv8_120[4]), "r"(_raw_stv8_120[5]), "r"(_raw_stv8_120[6]), "r"(_raw_stv8_120[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5))), "r"(_raw_stv8_123[0]), "r"(_raw_stv8_123[1]), "r"(_raw_stv8_123[2]), "r"(_raw_stv8_123[3]), "r"(_raw_stv8_123[4]), "r"(_raw_stv8_123[5]), "r"(_raw_stv8_123[6]), "r"(_raw_stv8_123[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5))), "r"(_raw_stv8_116[0]), "r"(_raw_stv8_116[1]), "r"(_raw_stv8_116[2]), "r"(_raw_stv8_116[3]), "r"(_raw_stv8_116[4]), "r"(_raw_stv8_116[5]), "r"(_raw_stv8_116[6]), "r"(_raw_stv8_116[7]) : "memory");
 #endif
@@ -3264,14 +3323,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_121 = reinterpret_cast<const unsigned*>(o_bf16_5);
+                            const unsigned* _raw_stv8_124 = reinterpret_cast<const unsigned*>(o_bf16_5);
 #else
                             const unsigned* _raw_stv8_117 = reinterpret_cast<const unsigned*>(o_bf16_5);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_5))), "r"(_raw_stv8_121[0]), "r"(_raw_stv8_121[1]), "r"(_raw_stv8_121[2]), "r"(_raw_stv8_121[3]), "r"(_raw_stv8_121[4]), "r"(_raw_stv8_121[5]), "r"(_raw_stv8_121[6]), "r"(_raw_stv8_121[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_5))), "r"(_raw_stv8_124[0]), "r"(_raw_stv8_124[1]), "r"(_raw_stv8_124[2]), "r"(_raw_stv8_124[3]), "r"(_raw_stv8_124[4]), "r"(_raw_stv8_124[5]), "r"(_raw_stv8_124[6]), "r"(_raw_stv8_124[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_5))), "r"(_raw_stv8_117[0]), "r"(_raw_stv8_117[1]), "r"(_raw_stv8_117[2]), "r"(_raw_stv8_117[3]), "r"(_raw_stv8_117[4]), "r"(_raw_stv8_117[5]), "r"(_raw_stv8_117[6]), "r"(_raw_stv8_117[7]) : "memory");
 #endif
@@ -3280,14 +3339,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_122 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
+                            const unsigned* _raw_stv8_125 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
 #else
                             const unsigned* _raw_stv8_118 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5 + 16))), "r"(_raw_stv8_122[0]), "r"(_raw_stv8_122[1]), "r"(_raw_stv8_122[2]), "r"(_raw_stv8_122[3]), "r"(_raw_stv8_122[4]), "r"(_raw_stv8_122[5]), "r"(_raw_stv8_122[6]), "r"(_raw_stv8_122[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5 + 16))), "r"(_raw_stv8_125[0]), "r"(_raw_stv8_125[1]), "r"(_raw_stv8_125[2]), "r"(_raw_stv8_125[3]), "r"(_raw_stv8_125[4]), "r"(_raw_stv8_125[5]), "r"(_raw_stv8_125[6]), "r"(_raw_stv8_125[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5 + 16))), "r"(_raw_stv8_118[0]), "r"(_raw_stv8_118[1]), "r"(_raw_stv8_118[2]), "r"(_raw_stv8_118[3]), "r"(_raw_stv8_118[4]), "r"(_raw_stv8_118[5]), "r"(_raw_stv8_118[6]), "r"(_raw_stv8_118[7]) : "memory");
 #endif
@@ -3295,14 +3354,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_123 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
+                            const unsigned* _raw_stv8_126 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
 #else
                             const unsigned* _raw_stv8_119 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_5 + 16))), "r"(_raw_stv8_123[0]), "r"(_raw_stv8_123[1]), "r"(_raw_stv8_123[2]), "r"(_raw_stv8_123[3]), "r"(_raw_stv8_123[4]), "r"(_raw_stv8_123[5]), "r"(_raw_stv8_123[6]), "r"(_raw_stv8_123[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_5 + 16))), "r"(_raw_stv8_126[0]), "r"(_raw_stv8_126[1]), "r"(_raw_stv8_126[2]), "r"(_raw_stv8_126[3]), "r"(_raw_stv8_126[4]), "r"(_raw_stv8_126[5]), "r"(_raw_stv8_126[6]), "r"(_raw_stv8_126[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_5 + 16))), "r"(_raw_stv8_119[0]), "r"(_raw_stv8_119[1]), "r"(_raw_stv8_119[2]), "r"(_raw_stv8_119[3]), "r"(_raw_stv8_119[4]), "r"(_raw_stv8_119[5]), "r"(_raw_stv8_119[6]), "r"(_raw_stv8_119[7]) : "memory");
 #endif
@@ -3317,14 +3376,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 192));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_124 = {inv, inv};
+                const float2 _scale2_127 = {inv, inv};
 #else
                 const float2 _scale2_120 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_6)[_ls], _scale2_124);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_6)[_ls], _scale2_127);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_6)[_ls], _scale2_120);
 #endif
@@ -3339,14 +3398,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_125 = reinterpret_cast<const unsigned*>(o_bf16_6);
+                            const unsigned* _raw_stv8_128 = reinterpret_cast<const unsigned*>(o_bf16_6);
 #else
                             const unsigned* _raw_stv8_121 = reinterpret_cast<const unsigned*>(o_bf16_6);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6))), "r"(_raw_stv8_125[0]), "r"(_raw_stv8_125[1]), "r"(_raw_stv8_125[2]), "r"(_raw_stv8_125[3]), "r"(_raw_stv8_125[4]), "r"(_raw_stv8_125[5]), "r"(_raw_stv8_125[6]), "r"(_raw_stv8_125[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6))), "r"(_raw_stv8_128[0]), "r"(_raw_stv8_128[1]), "r"(_raw_stv8_128[2]), "r"(_raw_stv8_128[3]), "r"(_raw_stv8_128[4]), "r"(_raw_stv8_128[5]), "r"(_raw_stv8_128[6]), "r"(_raw_stv8_128[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6))), "r"(_raw_stv8_121[0]), "r"(_raw_stv8_121[1]), "r"(_raw_stv8_121[2]), "r"(_raw_stv8_121[3]), "r"(_raw_stv8_121[4]), "r"(_raw_stv8_121[5]), "r"(_raw_stv8_121[6]), "r"(_raw_stv8_121[7]) : "memory");
 #endif
@@ -3354,14 +3413,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_126 = reinterpret_cast<const unsigned*>(o_bf16_6);
+                            const unsigned* _raw_stv8_129 = reinterpret_cast<const unsigned*>(o_bf16_6);
 #else
                             const unsigned* _raw_stv8_122 = reinterpret_cast<const unsigned*>(o_bf16_6);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_6))), "r"(_raw_stv8_126[0]), "r"(_raw_stv8_126[1]), "r"(_raw_stv8_126[2]), "r"(_raw_stv8_126[3]), "r"(_raw_stv8_126[4]), "r"(_raw_stv8_126[5]), "r"(_raw_stv8_126[6]), "r"(_raw_stv8_126[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_6))), "r"(_raw_stv8_129[0]), "r"(_raw_stv8_129[1]), "r"(_raw_stv8_129[2]), "r"(_raw_stv8_129[3]), "r"(_raw_stv8_129[4]), "r"(_raw_stv8_129[5]), "r"(_raw_stv8_129[6]), "r"(_raw_stv8_129[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_6))), "r"(_raw_stv8_122[0]), "r"(_raw_stv8_122[1]), "r"(_raw_stv8_122[2]), "r"(_raw_stv8_122[3]), "r"(_raw_stv8_122[4]), "r"(_raw_stv8_122[5]), "r"(_raw_stv8_122[6]), "r"(_raw_stv8_122[7]) : "memory");
 #endif
@@ -3370,14 +3429,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_127 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
+                            const unsigned* _raw_stv8_130 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
 #else
                             const unsigned* _raw_stv8_123 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6 + 16))), "r"(_raw_stv8_127[0]), "r"(_raw_stv8_127[1]), "r"(_raw_stv8_127[2]), "r"(_raw_stv8_127[3]), "r"(_raw_stv8_127[4]), "r"(_raw_stv8_127[5]), "r"(_raw_stv8_127[6]), "r"(_raw_stv8_127[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6 + 16))), "r"(_raw_stv8_130[0]), "r"(_raw_stv8_130[1]), "r"(_raw_stv8_130[2]), "r"(_raw_stv8_130[3]), "r"(_raw_stv8_130[4]), "r"(_raw_stv8_130[5]), "r"(_raw_stv8_130[6]), "r"(_raw_stv8_130[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6 + 16))), "r"(_raw_stv8_123[0]), "r"(_raw_stv8_123[1]), "r"(_raw_stv8_123[2]), "r"(_raw_stv8_123[3]), "r"(_raw_stv8_123[4]), "r"(_raw_stv8_123[5]), "r"(_raw_stv8_123[6]), "r"(_raw_stv8_123[7]) : "memory");
 #endif
@@ -3385,14 +3444,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_128 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
+                            const unsigned* _raw_stv8_131 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
 #else
                             const unsigned* _raw_stv8_124 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_6 + 16))), "r"(_raw_stv8_128[0]), "r"(_raw_stv8_128[1]), "r"(_raw_stv8_128[2]), "r"(_raw_stv8_128[3]), "r"(_raw_stv8_128[4]), "r"(_raw_stv8_128[5]), "r"(_raw_stv8_128[6]), "r"(_raw_stv8_128[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_6 + 16))), "r"(_raw_stv8_131[0]), "r"(_raw_stv8_131[1]), "r"(_raw_stv8_131[2]), "r"(_raw_stv8_131[3]), "r"(_raw_stv8_131[4]), "r"(_raw_stv8_131[5]), "r"(_raw_stv8_131[6]), "r"(_raw_stv8_131[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_6 + 16))), "r"(_raw_stv8_124[0]), "r"(_raw_stv8_124[1]), "r"(_raw_stv8_124[2]), "r"(_raw_stv8_124[3]), "r"(_raw_stv8_124[4]), "r"(_raw_stv8_124[5]), "r"(_raw_stv8_124[6]), "r"(_raw_stv8_124[7]) : "memory");
 #endif
@@ -3407,14 +3466,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 224));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_129 = {inv, inv};
+                const float2 _scale2_132 = {inv, inv};
 #else
                 const float2 _scale2_125 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_129);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_132);
 #else
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_125);
 #endif
@@ -3429,14 +3488,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_130 = reinterpret_cast<const unsigned*>(o_bf16_7);
+                            const unsigned* _raw_stv8_133 = reinterpret_cast<const unsigned*>(o_bf16_7);
 #else
                             const unsigned* _raw_stv8_126 = reinterpret_cast<const unsigned*>(o_bf16_7);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7))), "r"(_raw_stv8_130[0]), "r"(_raw_stv8_130[1]), "r"(_raw_stv8_130[2]), "r"(_raw_stv8_130[3]), "r"(_raw_stv8_130[4]), "r"(_raw_stv8_130[5]), "r"(_raw_stv8_130[6]), "r"(_raw_stv8_130[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7))), "r"(_raw_stv8_133[0]), "r"(_raw_stv8_133[1]), "r"(_raw_stv8_133[2]), "r"(_raw_stv8_133[3]), "r"(_raw_stv8_133[4]), "r"(_raw_stv8_133[5]), "r"(_raw_stv8_133[6]), "r"(_raw_stv8_133[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7))), "r"(_raw_stv8_126[0]), "r"(_raw_stv8_126[1]), "r"(_raw_stv8_126[2]), "r"(_raw_stv8_126[3]), "r"(_raw_stv8_126[4]), "r"(_raw_stv8_126[5]), "r"(_raw_stv8_126[6]), "r"(_raw_stv8_126[7]) : "memory");
 #endif
@@ -3444,14 +3503,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_131 = reinterpret_cast<const unsigned*>(o_bf16_7);
+                            const unsigned* _raw_stv8_134 = reinterpret_cast<const unsigned*>(o_bf16_7);
 #else
                             const unsigned* _raw_stv8_127 = reinterpret_cast<const unsigned*>(o_bf16_7);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_7))), "r"(_raw_stv8_131[0]), "r"(_raw_stv8_131[1]), "r"(_raw_stv8_131[2]), "r"(_raw_stv8_131[3]), "r"(_raw_stv8_131[4]), "r"(_raw_stv8_131[5]), "r"(_raw_stv8_131[6]), "r"(_raw_stv8_131[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_7))), "r"(_raw_stv8_134[0]), "r"(_raw_stv8_134[1]), "r"(_raw_stv8_134[2]), "r"(_raw_stv8_134[3]), "r"(_raw_stv8_134[4]), "r"(_raw_stv8_134[5]), "r"(_raw_stv8_134[6]), "r"(_raw_stv8_134[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_7))), "r"(_raw_stv8_127[0]), "r"(_raw_stv8_127[1]), "r"(_raw_stv8_127[2]), "r"(_raw_stv8_127[3]), "r"(_raw_stv8_127[4]), "r"(_raw_stv8_127[5]), "r"(_raw_stv8_127[6]), "r"(_raw_stv8_127[7]) : "memory");
 #endif
@@ -3460,14 +3519,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     if (direct != 0) {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_132 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
+                            const unsigned* _raw_stv8_135 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
 #else
                             const unsigned* _raw_stv8_128 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7 + 16))), "r"(_raw_stv8_132[0]), "r"(_raw_stv8_132[1]), "r"(_raw_stv8_132[2]), "r"(_raw_stv8_132[3]), "r"(_raw_stv8_132[4]), "r"(_raw_stv8_132[5]), "r"(_raw_stv8_132[6]), "r"(_raw_stv8_132[7]) : "memory");
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7 + 16))), "r"(_raw_stv8_135[0]), "r"(_raw_stv8_135[1]), "r"(_raw_stv8_135[2]), "r"(_raw_stv8_135[3]), "r"(_raw_stv8_135[4]), "r"(_raw_stv8_135[5]), "r"(_raw_stv8_135[6]), "r"(_raw_stv8_135[7]) : "memory");
 #else
                                 :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7 + 16))), "r"(_raw_stv8_128[0]), "r"(_raw_stv8_128[1]), "r"(_raw_stv8_128[2]), "r"(_raw_stv8_128[3]), "r"(_raw_stv8_128[4]), "r"(_raw_stv8_128[5]), "r"(_raw_stv8_128[6]), "r"(_raw_stv8_128[7]) : "memory");
 #endif
@@ -3475,14 +3534,14 @@ kernel_cake_fp4_mla_decode_d7619422e769ca616502(const __grid_constant__ CUtensor
                     } else {
                         {
 #if __CUDA_ARCH__ == 1030
-                            const unsigned* _raw_stv8_133 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
+                            const unsigned* _raw_stv8_136 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
 #else
                             const unsigned* _raw_stv8_129 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if __CUDA_ARCH__ == 1030
-                                :: "l"((void*)(partial_O + (o_base + dim0_7 + 16))), "r"(_raw_stv8_133[0]), "r"(_raw_stv8_133[1]), "r"(_raw_stv8_133[2]), "r"(_raw_stv8_133[3]), "r"(_raw_stv8_133[4]), "r"(_raw_stv8_133[5]), "r"(_raw_stv8_133[6]), "r"(_raw_stv8_133[7]) : "memory");
+                                :: "l"((void*)(partial_O + (o_base + dim0_7 + 16))), "r"(_raw_stv8_136[0]), "r"(_raw_stv8_136[1]), "r"(_raw_stv8_136[2]), "r"(_raw_stv8_136[3]), "r"(_raw_stv8_136[4]), "r"(_raw_stv8_136[5]), "r"(_raw_stv8_136[6]), "r"(_raw_stv8_136[7]) : "memory");
 #else
                                 :: "l"((void*)(partial_O + (o_base + dim0_7 + 16))), "r"(_raw_stv8_129[0]), "r"(_raw_stv8_129[1]), "r"(_raw_stv8_129[2]), "r"(_raw_stv8_129[3]), "r"(_raw_stv8_129[4]), "r"(_raw_stv8_129[5]), "r"(_raw_stv8_129[6]), "r"(_raw_stv8_129[7]) : "memory");
 #endif

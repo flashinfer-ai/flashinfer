@@ -1455,6 +1455,8 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         codes[1] = w_lo_1 | w_hi_1 << 16;
                         sf_fit[0] = sf_near[0];
                     } else {
+                        float qv[4];
+                        float qq[4];
 #if __CUDA_ARCH__ == 1030
                         const float2 _scale2_50 = {6.0f, 6.0f};
 #else
@@ -1693,7 +1695,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         #pragma unroll
                         for (int _la = 0; _la < 1; _la++)
                             add_f32x2_inplace(&reinterpret_cast<float2*>(t8_0)[_la], reinterpret_cast<const float2*>((t8_0 + 2))[_la]);
-                        float qv = t8_0[0] + t8_0[1];
+                        qv[0] = t8_0[0] + t8_0[1];
                         uint32_t a0;
                         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0) : "r"(qn[0]), "r"(qn[0]), "r"(0));
                         uint32_t b0;
@@ -1721,13 +1723,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                             "add.rn.f32.f16 %1, hi, %4;\n\t"
                             "}\n"
                             : "=&f"(w[0]), "=&f"(w[1]) : "r"(v), "f"(0.0f), "f"(0.0f));
-                        float qq = w[0] + w[1];
+                        qq[0] = w[0] + w[1];
 #if __CUDA_ARCH__ == 1030
-                        float _rcp_59 = approx_rcp(qq);
-                        sf_fit[0] = ((g_live != 0 && qq > 0.0f) ? sf_ex * qv * _rcp_59 : 0.0f);
+                        float _rcp_59 = approx_rcp(qq[0]);
+                        sf_fit[0] = ((g_live != 0 && qq[0] > 0.0f) ? sf_ex * qv[0] * _rcp_59 : 0.0f);
 #else
-                        float _rcp_55 = approx_rcp(qq);
-                        sf_fit[0] = ((g_live != 0 && qq > 0.0f) ? sf_ex * qv * _rcp_55 : 0.0f);
+                        float _rcp_55 = approx_rcp(qq[0]);
+                        sf_fit[0] = ((g_live != 0 && qq[0] > 0.0f) ? sf_ex * qv[0] * _rcp_55 : 0.0f);
 #endif
                     }
                     int g_live_0 = g[1] > -CUDART_INF_F;
@@ -1824,6 +1826,8 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         codes[3] = w_lo_3 | w_hi_3 << 16;
                         sf_fit[1] = sf_near[1];
                     } else {
+                        float qv_1[4];
+                        float qq_1[4];
 #if __CUDA_ARCH__ == 1030
                         const float2 _scale2_70 = {6.0f, 6.0f};
 #else
@@ -2062,7 +2066,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         #pragma unroll
                         for (int _la = 0; _la < 1; _la++)
                             add_f32x2_inplace(&reinterpret_cast<float2*>(t8_2)[_la], reinterpret_cast<const float2*>((t8_2 + 2))[_la]);
-                        float qv_1 = t8_2[0] + t8_2[1];
+                        qv_1[1] = t8_2[0] + t8_2[1];
                         uint32_t a0_1;
                         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_1) : "r"(qn_1[0]), "r"(qn_1[0]), "r"(0));
                         uint32_t b0_1;
@@ -2090,13 +2094,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                             "add.rn.f32.f16 %1, hi, %4;\n\t"
                             "}\n"
                             : "=&f"(w_1[0]), "=&f"(w_1[1]) : "r"(v_1), "f"(0.0f), "f"(0.0f));
-                        float qq_1 = w_1[0] + w_1[1];
+                        qq_1[1] = w_1[0] + w_1[1];
 #if __CUDA_ARCH__ == 1030
-                        float _rcp_79 = approx_rcp(qq_1);
-                        sf_fit[1] = ((g_live_0 != 0 && qq_1 > 0.0f) ? sf_ex_0 * qv_1 * _rcp_79 : 0.0f);
+                        float _rcp_79 = approx_rcp(qq_1[1]);
+                        sf_fit[1] = ((g_live_0 != 0 && qq_1[1] > 0.0f) ? sf_ex_0 * qv_1[1] * _rcp_79 : 0.0f);
 #else
-                        float _rcp_75 = approx_rcp(qq_1);
-                        sf_fit[1] = ((g_live_0 != 0 && qq_1 > 0.0f) ? sf_ex_0 * qv_1 * _rcp_75 : 0.0f);
+                        float _rcp_75 = approx_rcp(qq_1[1]);
+                        sf_fit[1] = ((g_live_0 != 0 && qq_1[1] > 0.0f) ? sf_ex_0 * qv_1[1] * _rcp_75 : 0.0f);
 #endif
                     }
                     int g_live_1 = g[2] > -CUDART_INF_F;
@@ -2193,6 +2197,8 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         codes[5] = w_lo_5 | w_hi_5 << 16;
                         sf_fit[2] = sf_near[2];
                     } else {
+                        float qv_2[4];
+                        float qq_2[4];
 #if __CUDA_ARCH__ == 1030
                         const float2 _scale2_90 = {6.0f, 6.0f};
 #else
@@ -2431,7 +2437,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         #pragma unroll
                         for (int _la = 0; _la < 1; _la++)
                             add_f32x2_inplace(&reinterpret_cast<float2*>(t8_4)[_la], reinterpret_cast<const float2*>((t8_4 + 2))[_la]);
-                        float qv_2 = t8_4[0] + t8_4[1];
+                        qv_2[2] = t8_4[0] + t8_4[1];
                         uint32_t a0_2;
                         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_2) : "r"(qn_2[0]), "r"(qn_2[0]), "r"(0));
                         uint32_t b0_2;
@@ -2459,13 +2465,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                             "add.rn.f32.f16 %1, hi, %4;\n\t"
                             "}\n"
                             : "=&f"(w_2[0]), "=&f"(w_2[1]) : "r"(v_2), "f"(0.0f), "f"(0.0f));
-                        float qq_2 = w_2[0] + w_2[1];
+                        qq_2[2] = w_2[0] + w_2[1];
 #if __CUDA_ARCH__ == 1030
-                        float _rcp_99 = approx_rcp(qq_2);
-                        sf_fit[2] = ((g_live_1 != 0 && qq_2 > 0.0f) ? sf_ex_1 * qv_2 * _rcp_99 : 0.0f);
+                        float _rcp_99 = approx_rcp(qq_2[2]);
+                        sf_fit[2] = ((g_live_1 != 0 && qq_2[2] > 0.0f) ? sf_ex_1 * qv_2[2] * _rcp_99 : 0.0f);
 #else
-                        float _rcp_95 = approx_rcp(qq_2);
-                        sf_fit[2] = ((g_live_1 != 0 && qq_2 > 0.0f) ? sf_ex_1 * qv_2 * _rcp_95 : 0.0f);
+                        float _rcp_95 = approx_rcp(qq_2[2]);
+                        sf_fit[2] = ((g_live_1 != 0 && qq_2[2] > 0.0f) ? sf_ex_1 * qv_2[2] * _rcp_95 : 0.0f);
 #endif
                     }
                     int g_live_2 = g[3] > -CUDART_INF_F;
@@ -2562,6 +2568,8 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         codes[7] = w_lo_7 | w_hi_7 << 16;
                         sf_fit[3] = sf_near[3];
                     } else {
+                        float qv_3[4];
+                        float qq_3[4];
 #if __CUDA_ARCH__ == 1030
                         const float2 _scale2_110 = {6.0f, 6.0f};
 #else
@@ -2800,7 +2808,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         #pragma unroll
                         for (int _la = 0; _la < 1; _la++)
                             add_f32x2_inplace(&reinterpret_cast<float2*>(t8_6)[_la], reinterpret_cast<const float2*>((t8_6 + 2))[_la]);
-                        float qv_3 = t8_6[0] + t8_6[1];
+                        qv_3[3] = t8_6[0] + t8_6[1];
                         uint32_t a0_3;
                         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_3) : "r"(qn_3[0]), "r"(qn_3[0]), "r"(0));
                         uint32_t b0_3;
@@ -2828,13 +2836,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                             "add.rn.f32.f16 %1, hi, %4;\n\t"
                             "}\n"
                             : "=&f"(w_3[0]), "=&f"(w_3[1]) : "r"(v_3), "f"(0.0f), "f"(0.0f));
-                        float qq_3 = w_3[0] + w_3[1];
+                        qq_3[3] = w_3[0] + w_3[1];
 #if __CUDA_ARCH__ == 1030
-                        float _rcp_119 = approx_rcp(qq_3);
-                        sf_fit[3] = ((g_live_2 != 0 && qq_3 > 0.0f) ? sf_ex_2 * qv_3 * _rcp_119 : 0.0f);
+                        float _rcp_119 = approx_rcp(qq_3[3]);
+                        sf_fit[3] = ((g_live_2 != 0 && qq_3[3] > 0.0f) ? sf_ex_2 * qv_3[3] * _rcp_119 : 0.0f);
 #else
-                        float _rcp_115 = approx_rcp(qq_3);
-                        sf_fit[3] = ((g_live_2 != 0 && qq_3 > 0.0f) ? sf_ex_2 * qv_3 * _rcp_115 : 0.0f);
+                        float _rcp_115 = approx_rcp(qq_3[3]);
+                        sf_fit[3] = ((g_live_2 != 0 && qq_3[3] > 0.0f) ? sf_ex_2 * qv_3[3] * _rcp_115 : 0.0f);
 #endif
                     }
                 } else {
@@ -2874,12 +2882,17 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     b_weights[0] = ((g_live_3 != 0) ? _exp2_122 : 0.0f);
                     float _exp2_123 = approx_exp2(g_safe_3 - m - 4.0f);
                     float sf_ex_3 = 448.0f * _exp2_123;
-                    const float2 _scale2_124 = {6.0f, 6.0f};
 #else
                     float _exp2_118 = approx_exp2(g_safe_3 - m);
                     b_weights[0] = ((g_live_3 != 0) ? _exp2_118 : 0.0f);
                     float _exp2_119 = approx_exp2(g_safe_3 - m - 4.0f);
                     float sf_ex_3 = 448.0f * _exp2_119;
+#endif
+                    float qv_4[4];
+                    float qq_4[4];
+#if __CUDA_ARCH__ == 1030
+                    const float2 _scale2_124 = {6.0f, 6.0f};
+#else
                     const float2 _scale2_120 = {6.0f, 6.0f};
 #endif
                     #pragma unroll
@@ -3115,7 +3128,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     #pragma unroll
                     for (int _la = 0; _la < 1; _la++)
                         add_f32x2_inplace(&reinterpret_cast<float2*>(t8_7_1)[_la], reinterpret_cast<const float2*>((t8_7_1 + 2))[_la]);
-                    float qv_4 = t8_7_1[0] + t8_7_1[1];
+                    qv_4[0] = t8_7_1[0] + t8_7_1[1];
                     uint32_t a0_4;
                     asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_4) : "r"(qn_4[0]), "r"(qn_4[0]), "r"(0));
                     uint32_t b0_4;
@@ -3143,13 +3156,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         "add.rn.f32.f16 %1, hi, %4;\n\t"
                         "}\n"
                         : "=&f"(w_4[0]), "=&f"(w_4[1]) : "r"(v_4), "f"(0.0f), "f"(0.0f));
-                    float qq_4 = w_4[0] + w_4[1];
+                    qq_4[0] = w_4[0] + w_4[1];
 #if __CUDA_ARCH__ == 1030
-                    float _rcp_133 = approx_rcp(qq_4);
-                    sf_fit[0] = ((g_live_3 != 0 && qq_4 > 0.0f) ? sf_ex_3 * qv_4 * _rcp_133 : 0.0f);
+                    float _rcp_133 = approx_rcp(qq_4[0]);
+                    sf_fit[0] = ((g_live_3 != 0 && qq_4[0] > 0.0f) ? sf_ex_3 * qv_4[0] * _rcp_133 : 0.0f);
 #else
-                    float _rcp_129 = approx_rcp(qq_4);
-                    sf_fit[0] = ((g_live_3 != 0 && qq_4 > 0.0f) ? sf_ex_3 * qv_4 * _rcp_129 : 0.0f);
+                    float _rcp_129 = approx_rcp(qq_4[0]);
+                    sf_fit[0] = ((g_live_3 != 0 && qq_4[0] > 0.0f) ? sf_ex_3 * qv_4[0] * _rcp_129 : 0.0f);
 #endif
                     int g_live_3_1 = g[1] > -CUDART_INF_F;
                     float g_safe_3_1 = ((g_live_3_1 != 0) ? g[1] : 0.0f);
@@ -3187,12 +3200,17 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     b_weights[1] = ((g_live_3_1 != 0) ? _exp2_136 : 0.0f);
                     float _exp2_137 = approx_exp2(g_safe_3_1 - m - 4.0f);
                     float sf_ex_3_1 = 448.0f * _exp2_137;
-                    const float2 _scale2_138 = {6.0f, 6.0f};
 #else
                     float _exp2_132 = approx_exp2(g_safe_3_1 - m);
                     b_weights[1] = ((g_live_3_1 != 0) ? _exp2_132 : 0.0f);
                     float _exp2_133 = approx_exp2(g_safe_3_1 - m - 4.0f);
                     float sf_ex_3_1 = 448.0f * _exp2_133;
+#endif
+                    float qv_0[4];
+                    float qq_0[4];
+#if __CUDA_ARCH__ == 1030
+                    const float2 _scale2_138 = {6.0f, 6.0f};
+#else
                     const float2 _scale2_134 = {6.0f, 6.0f};
 #endif
                     #pragma unroll
@@ -3428,7 +3446,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     #pragma unroll
                     for (int _la = 0; _la < 1; _la++)
                         add_f32x2_inplace(&reinterpret_cast<float2*>(t8_9)[_la], reinterpret_cast<const float2*>((t8_9 + 2))[_la]);
-                    float qv_0 = t8_9[0] + t8_9[1];
+                    qv_0[1] = t8_9[0] + t8_9[1];
                     uint32_t a0_0;
                     asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_0) : "r"(qn_0[0]), "r"(qn_0[0]), "r"(0));
                     uint32_t b0_0;
@@ -3456,13 +3474,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         "add.rn.f32.f16 %1, hi, %4;\n\t"
                         "}\n"
                         : "=&f"(w_0[0]), "=&f"(w_0[1]) : "r"(v_16), "f"(0.0f), "f"(0.0f));
-                    float qq_0 = w_0[0] + w_0[1];
+                    qq_0[1] = w_0[0] + w_0[1];
 #if __CUDA_ARCH__ == 1030
-                    float _rcp_147 = approx_rcp(qq_0);
-                    sf_fit[1] = ((g_live_3_1 != 0 && qq_0 > 0.0f) ? sf_ex_3_1 * qv_0 * _rcp_147 : 0.0f);
+                    float _rcp_147 = approx_rcp(qq_0[1]);
+                    sf_fit[1] = ((g_live_3_1 != 0 && qq_0[1] > 0.0f) ? sf_ex_3_1 * qv_0[1] * _rcp_147 : 0.0f);
 #else
-                    float _rcp_143 = approx_rcp(qq_0);
-                    sf_fit[1] = ((g_live_3_1 != 0 && qq_0 > 0.0f) ? sf_ex_3_1 * qv_0 * _rcp_143 : 0.0f);
+                    float _rcp_143 = approx_rcp(qq_0[1]);
+                    sf_fit[1] = ((g_live_3_1 != 0 && qq_0[1] > 0.0f) ? sf_ex_3_1 * qv_0[1] * _rcp_143 : 0.0f);
 #endif
                     int g_live_4 = g[2] > -CUDART_INF_F;
                     float g_safe_4 = ((g_live_4 != 0) ? g[2] : 0.0f);
@@ -3500,12 +3518,17 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     b_weights[2] = ((g_live_4 != 0) ? _exp2_150 : 0.0f);
                     float _exp2_151 = approx_exp2(g_safe_4 - m - 4.0f);
                     float sf_ex_4 = 448.0f * _exp2_151;
-                    const float2 _scale2_152 = {6.0f, 6.0f};
 #else
                     float _exp2_146 = approx_exp2(g_safe_4 - m);
                     b_weights[2] = ((g_live_4 != 0) ? _exp2_146 : 0.0f);
                     float _exp2_147 = approx_exp2(g_safe_4 - m - 4.0f);
                     float sf_ex_4 = 448.0f * _exp2_147;
+#endif
+                    float qv_1_1[4];
+                    float qq_1_1[4];
+#if __CUDA_ARCH__ == 1030
+                    const float2 _scale2_152 = {6.0f, 6.0f};
+#else
                     const float2 _scale2_148 = {6.0f, 6.0f};
 #endif
                     #pragma unroll
@@ -3741,7 +3764,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     #pragma unroll
                     for (int _la = 0; _la < 1; _la++)
                         add_f32x2_inplace(&reinterpret_cast<float2*>(t8_11)[_la], reinterpret_cast<const float2*>((t8_11 + 2))[_la]);
-                    float qv_1_1 = t8_11[0] + t8_11[1];
+                    qv_1_1[2] = t8_11[0] + t8_11[1];
                     uint32_t a0_1_1;
                     asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_1_1) : "r"(qn_1_1[0]), "r"(qn_1_1[0]), "r"(0));
                     uint32_t b0_1_1;
@@ -3769,13 +3792,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         "add.rn.f32.f16 %1, hi, %4;\n\t"
                         "}\n"
                         : "=&f"(w_1_1[0]), "=&f"(w_1_1[1]) : "r"(v_17), "f"(0.0f), "f"(0.0f));
-                    float qq_1_1 = w_1_1[0] + w_1_1[1];
+                    qq_1_1[2] = w_1_1[0] + w_1_1[1];
 #if __CUDA_ARCH__ == 1030
-                    float _rcp_161 = approx_rcp(qq_1_1);
-                    sf_fit[2] = ((g_live_4 != 0 && qq_1_1 > 0.0f) ? sf_ex_4 * qv_1_1 * _rcp_161 : 0.0f);
+                    float _rcp_161 = approx_rcp(qq_1_1[2]);
+                    sf_fit[2] = ((g_live_4 != 0 && qq_1_1[2] > 0.0f) ? sf_ex_4 * qv_1_1[2] * _rcp_161 : 0.0f);
 #else
-                    float _rcp_157 = approx_rcp(qq_1_1);
-                    sf_fit[2] = ((g_live_4 != 0 && qq_1_1 > 0.0f) ? sf_ex_4 * qv_1_1 * _rcp_157 : 0.0f);
+                    float _rcp_157 = approx_rcp(qq_1_1[2]);
+                    sf_fit[2] = ((g_live_4 != 0 && qq_1_1[2] > 0.0f) ? sf_ex_4 * qv_1_1[2] * _rcp_157 : 0.0f);
 #endif
                     int g_live_5 = g[3] > -CUDART_INF_F;
                     float g_safe_5 = ((g_live_5 != 0) ? g[3] : 0.0f);
@@ -3813,12 +3836,17 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     b_weights[3] = ((g_live_5 != 0) ? _exp2_164 : 0.0f);
                     float _exp2_165 = approx_exp2(g_safe_5 - m - 4.0f);
                     float sf_ex_5 = 448.0f * _exp2_165;
-                    const float2 _scale2_166 = {6.0f, 6.0f};
 #else
                     float _exp2_160 = approx_exp2(g_safe_5 - m);
                     b_weights[3] = ((g_live_5 != 0) ? _exp2_160 : 0.0f);
                     float _exp2_161 = approx_exp2(g_safe_5 - m - 4.0f);
                     float sf_ex_5 = 448.0f * _exp2_161;
+#endif
+                    float qv_2_1[4];
+                    float qq_2_1[4];
+#if __CUDA_ARCH__ == 1030
+                    const float2 _scale2_166 = {6.0f, 6.0f};
+#else
                     const float2 _scale2_162 = {6.0f, 6.0f};
 #endif
                     #pragma unroll
@@ -4054,7 +4082,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     #pragma unroll
                     for (int _la = 0; _la < 1; _la++)
                         add_f32x2_inplace(&reinterpret_cast<float2*>(t8_13)[_la], reinterpret_cast<const float2*>((t8_13 + 2))[_la]);
-                    float qv_2_1 = t8_13[0] + t8_13[1];
+                    qv_2_1[3] = t8_13[0] + t8_13[1];
                     uint32_t a0_2_1;
                     asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_2_1) : "r"(qn_2_1[0]), "r"(qn_2_1[0]), "r"(0));
                     uint32_t b0_2_1;
@@ -4082,13 +4110,13 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         "add.rn.f32.f16 %1, hi, %4;\n\t"
                         "}\n"
                         : "=&f"(w_2_1[0]), "=&f"(w_2_1[1]) : "r"(v_18), "f"(0.0f), "f"(0.0f));
-                    float qq_2_1 = w_2_1[0] + w_2_1[1];
+                    qq_2_1[3] = w_2_1[0] + w_2_1[1];
 #if __CUDA_ARCH__ == 1030
-                    float _rcp_175 = approx_rcp(qq_2_1);
-                    sf_fit[3] = ((g_live_5 != 0 && qq_2_1 > 0.0f) ? sf_ex_5 * qv_2_1 * _rcp_175 : 0.0f);
+                    float _rcp_175 = approx_rcp(qq_2_1[3]);
+                    sf_fit[3] = ((g_live_5 != 0 && qq_2_1[3] > 0.0f) ? sf_ex_5 * qv_2_1[3] * _rcp_175 : 0.0f);
 #else
-                    float _rcp_171 = approx_rcp(qq_2_1);
-                    sf_fit[3] = ((g_live_5 != 0 && qq_2_1 > 0.0f) ? sf_ex_5 * qv_2_1 * _rcp_171 : 0.0f);
+                    float _rcp_171 = approx_rcp(qq_2_1[3]);
+                    sf_fit[3] = ((g_live_5 != 0 && qq_2_1[3] > 0.0f) ? sf_ex_5 * qv_2_1[3] * _rcp_171 : 0.0f);
 #endif
                 }
                 unsigned int sf_word[1];

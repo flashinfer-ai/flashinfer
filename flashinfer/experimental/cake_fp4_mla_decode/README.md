@@ -45,8 +45,11 @@ The runner takes TensorRT-LLM's per-layer views as they are: `kv_cache`
 `[B, W]`, the int32 KV lengths (each including the step's query tokens; query
 token `t` of `q_len` sees `kv_len - (q_len - 1 - t)` keys) and the FP32
 global scales on the device. The scale pools have no padding between pages
-(page strides of 5,120 and 4,096 bytes) and use the page ids of `kv_cache`.
-The decode loads the V scales from the V-scale pool. The split-KV reducer
+(page strides of 5,120 and 4,096 bytes) and use the page ids of `kv_cache`;
+the runner refuses a pool in any other layout with a `ValueError`. The decode
+reads the V scales from the V-scale pool on every call (it does not derive
+them from `kv_scale_cache`), so the pool must hold the V scales TensorRT-LLM
+writes with the cache. The split-KV reducer
 launches with programmatic dependent launch: its blocks start while the
 decode finishes and wait for the decode's results.
 
