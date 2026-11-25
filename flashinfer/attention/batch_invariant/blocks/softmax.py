@@ -185,6 +185,7 @@ def unit_loop(
     s_mx: cute.Tensor,
     c: Float32,
     nc: Float32,
+    ca: Float32,
     window_left: Int32,
     rows_valid: Int32,
     q_tok0: Int32,
@@ -361,6 +362,20 @@ def unit_loop(
             cute.arch.barrier(
                 barrier_id=BAR_SOFTMAX_ALL, number_of_threads=st.softmax_threads
             )
+        if cutlass.const_expr(st.soft_cap):
+            # the capped class: every score becomes its capped value (spec.capped_score) before anything reads it -- the maximum, the
+            # rescale and the exponentials are all over the capped scores; the mask's -inf is written after, so a masked key stays
+            # absent whatever its raw score
+            if cutlass.const_expr(not exchange):
+                for i in cutlass.range_constexpr(0, T, 2):
+                    t0, t1 = spec.capped_scores2(CuteF32, rF[i], rF[i + 1], ca)
+                    rF[i] = t0
+                    rF[i + 1] = t1
+            if cutlass.const_expr(not one_slice):
+                for i in cutlass.range_constexpr(0, kpt, 2):
+                    t0, t1 = spec.capped_scores2(CuteF32, rS[i], rS[i + 1], ca)
+                    rS[i] = t0
+                    rS[i + 1] = t1
         k0 = t * T
         # mask only the tiles that need it: a boundary of a live row's visible range inside the tile. Interior tiles
         # are fully visible and padding rows (row >= rows_valid) are never masked: their values are never stored (a
@@ -526,6 +541,7 @@ def softmax_loop(
     s_mx: cute.Tensor,
     c: Float32,
     nc: Float32,
+    ca: Float32,
     window_left: Int32,
     rows_valid: Int32,
     q_tok0: Int32,
@@ -554,6 +570,7 @@ def softmax_loop(
                 s_mx,
                 c,
                 nc,
+                ca,
                 window_left,
                 rows_valid,
                 q_tok0,
@@ -579,6 +596,7 @@ def softmax_loop(
                 s_mx,
                 c,
                 nc,
+                ca,
                 window_left,
                 rows_valid,
                 q_tok0,
@@ -604,6 +622,7 @@ def softmax_loop(
             s_mx,
             c,
             nc,
+            ca,
             window_left,
             rows_valid,
             q_tok0,

@@ -102,6 +102,11 @@ class TermAlgebra:
         ``ex2(-inf) = 0``)."""
         return self._mk("ex2", a)
 
+    def tanh(self, a: Term) -> Term:
+        """``tanh.approx.f32``: an opaque hardware primitive, deterministic per architecture (``tanh(+-0) = +-0``,
+        ``tanh(+-inf) = +-1``, ``|tanh| <= 1``); the capped attention class's soft cap."""
+        return self._mk("tanh", a)
+
     def cvt_out(self, a: Term, fmt_name: str) -> Term:
         """``cvt.rn.<fmt>.f32``: the one conversion of the epilogue."""
         return self._mk("cvt_out", a, fmt_name)
@@ -173,6 +178,8 @@ def sexpr(t: Term) -> str:
             out = f"(fmax {a} {b})"
         elif op == "ex2":
             out = f"(ex2 {A[0]})"
+        elif op == "tanh":
+            out = f"(tanh {A[0]})"
         elif op == "cvt_out":
             out = f"(cvt {A[1]} {A[0]})"
         elif op == "op:mma_bf16_k16":

@@ -232,9 +232,13 @@ class SwapsPlan:
         cap: int = 0,
         *,
         causal: bool = True,
+        soft_cap: bool = False,
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
         self.causal = causal  # the mask mode (blocks/operands.StaticPlan.causal)
+        self.soft_cap = (
+            soft_cap  # capped score leaves (blocks/operands.StaticPlan.soft_cap)
+        )
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page

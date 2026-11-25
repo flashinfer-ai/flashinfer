@@ -79,6 +79,11 @@ class CuteF32:
         return ex2_approx_ftz(a)
 
     @staticmethod
+    def tanh(a):
+        """``tanh.approx.f32``, pinned as inline asm: the capped attention class's opaque soft cap."""
+        return tanh_approx(a)
+
+    @staticmethod
     def cvt_out(a, fmt_name: str):
         """``cvt.rn.<fmt>.f32`` (``arith.truncf``, RNE); the identity for ``f32``."""
         return a if fmt_name == "f32" else a.to(get_cutlass_dtype(fmt_name))
@@ -99,6 +104,23 @@ def ex2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip)],
             "ex2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def tanh_approx(a: Float32, *, loc=None, ip=None) -> Float32:
+    """The one ``tanh`` a batch-invariant kernel may use: PTX ``tanh.approx.f32`` (MUFU.TANH), deterministic per architecture;
+    ``tanh(+-0) = +-0``, ``tanh(+-inf) = +-1``, every result within ``[-1, 1]`` and exactly ``+-1`` in saturation."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
             is_align_stack=False,

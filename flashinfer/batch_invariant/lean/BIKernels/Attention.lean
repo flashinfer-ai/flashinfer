@@ -27,10 +27,21 @@ a token depends on its position `p` and the window (causal) or its request's key
 on the batch, the page table (paged or ragged KV) or the configuration. What is modelled: the per-row dataflow, the split kernel's
 workspace and fixup, the launch model (prefill batch / decode batch -> per-row terms). What is not, and
 is covered by the hardware tests: the plumbing (TMA, TMEM, barriers), the instruction semantics (`mma16`,
-`ex2`), and the null steps (a kernel's identity steps on rows whose tile has no visible key, exact
+`ex2`, `tanh`), and the null steps (a kernel's identity steps on rows whose tile has no visible key, exact
 up to the sign of an exact-zero accumulator, erased by the epilogue's `add +0`).
 
-The S-expression printer reproduces `term.sexpr` textually; `Cases.lean` (generated) checks
+The **capped class** (`logits_soft_cap > 0`, the `C`-suffixed definitions with `cap = true`) is the same dataflow with every
+score leaf replaced by its capped value `cappedScore s = tanh(mul(s, ca))`: one `mul.rn` and the opaque `tanh`
+(`tanh.approx.f32`, a hardware primitive of the capped class as `ex2` is of both, covered by the hardware tests). The cap's
+value reaches the term through the runtime leaves `ca` and `c` / `nc` only, as `sm_scale` does, so one capped class covers
+every cap. A masked key is absent from the term before the leaf is formed, so the
+mask is applied after the cap by construction. The cap composes with the mask mode: the leaf does not read the visible range
+and the visible range does not read the leaf, so there is a capped causal and a capped non-causal class. `cap = false` is
+definitionally the uncapped class of the mode (`outputC_off`), the classes differ as terms (`soft_cap_changes_the_term`,
+`soft_cap_changes_the_term_noncausal`, `capped_output_depends_on_mode`), and every guarantee below is stated for all four.
+
+The S-expression printer reproduces `term.sexpr` textually; the generated cases (`Cases/Attention*.lean`, and
+`Cases/AttentionSoftCap*.lean` for the capped classes) check
 the Python spec's terms node for node by `native_decide`.
 -/
 namespace BIK.Attn
@@ -50,6 +61,7 @@ inductive ATerm where
   | div (a b : ATerm)
   | fmax (a b : ATerm)
   | ex2 (a : ATerm)
+  | tanh (a : ATerm)
   | cvt (fmt : String) (a : ATerm)
   | mma (acc : ATerm) (pslice : String) (vt d : Nat)
   deriving DecidableEq, Repr, Inhabited
@@ -64,6 +76,7 @@ def ATerm.sexpr : ATerm → String
   | .div a b => s!"(div {a.sexpr} {b.sexpr})"
   | .fmax a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(fmax {p} {q})"
   | .ex2 a => s!"(ex2 {a.sexpr})"
+  | .tanh a => s!"(tanh {a.sexpr})"
   | .cvt f a => s!"(cvt {f} {a.sexpr})"
   | .mma acc ps vt d => s!"(mma16 {acc.sexpr} (op:pv_kslice (op:p_slice{ps}) (op:v_slice {vt} {d})))"
 
@@ -161,7 +174,15 @@ structure State where
 
 def c : ATerm := .sym "c"
 def nc : ATerm := .sym "nc"
+/-- The capped class's runtime leaf `ca = fp32(sm_scale / cap)` (`spec.soft_cap_scales`). -/
+def ca : ATerm := .sym "ca"
 def initState : State := ⟨.const "-inf", .const "0.0", .const "0.0"⟩
+
+/-- `spec.capped_score`: `tanh(mul(s, ca))`. -/
+def cappedScore (s : ATerm) : ATerm := .tanh (.mul s ca)
+
+/-- The score leaf of a class: the raw score, or its capped value under the capped class. -/
+def scoreLeaf (cap : Bool) (s : ATerm) : ATerm := if cap then cappedScore s else s
 
 /-- `spec.alpha_term`: `ex2(add(mul(m_old, c), mul(m_new, nc)))`. -/
 def alphaTerm (mOld mNew : ATerm) : ATerm := .ex2 (.add (.mul mOld c) (.mul mNew nc))
@@ -174,10 +195,12 @@ def pvFold (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
     let slice := (pbf.drop (16 * j)).take 16
     .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
 
-/-- `spec.tile_step` on a present tile `t`. -/
-def tileStep (P : Core) (st : State) (t : Nat) : State :=
+/-- `spec.tile_step` on a present tile `t`, for the uncapped (`cap = false`) or the capped class: only the score leaves
+differ; a key outside the visible range is absent whatever its score. -/
+def tileStepC (cap : Bool) (P : Core) (st : State) (t : Nat) : State :=
   let scores : List (Option ATerm) :=
-    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.row (t * P.T + i) P.steps) else none)
+    (List.range P.T).map (fun i =>
+      if P.visible (t * P.T + i) then some (scoreLeaf cap (.score P.row (t * P.T + i) P.steps)) else none)
   let mT := (ptree ATerm.fmax P.tbits scores).getD (.const "-inf")
   let mNew := ATerm.fmax st.m mT
   let alpha := alphaTerm st.m mNew
@@ -189,6 +212,9 @@ def tileStep (P : Core) (st : State) (t : Nat) : State :=
   let oNew := pvFold (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
   ⟨mNew, lNew, oNew⟩
 
+/-- The uncapped class's tile step. -/
+def tileStep (P : Core) (st : State) (t : Nat) : State := tileStepC false P st t
+
 /-- `spec.merge`: the running state `a` with the finished chunk `b`. -/
 def merge (a b : State) : State :=
   let m := ATerm.fmax a.m b.m
@@ -198,18 +224,47 @@ def merge (a b : State) : State :=
   ⟨m, .fma b.l a2 (.mul a.l a1), .fma b.o a2 (.mul a.o a1)⟩
 
 /-- The per-chunk fold: the present tiles of chunk `j`, ascending, from the init state. -/
-def chunkState (P : Core) (j : Nat) : State := (P.tilesOfChunk j).foldl (tileStep P) initState
+def chunkStateC (cap : Bool) (P : Core) (j : Nat) : State := (P.tilesOfChunk j).foldl (tileStepC cap P) initState
+def chunkState (P : Core) (j : Nat) : State := chunkStateC false P j
 
 /-- The fused (one-CTA) path: present chunks merged in index order from the init state. -/
-def fused (P : Core) : State := P.presentChunks.foldl (fun acc j => merge acc (chunkState P j)) initState
+def fusedC (cap : Bool) (P : Core) : State :=
+  P.presentChunks.foldl (fun acc j => merge acc (chunkStateC cap P j)) initState
+def fused (P : Core) : State := fusedC false P
 
 /-- `spec.output_elem`. -/
 def epilogue (st : State) : ATerm := .cvt "bf16" (.add (.mul st.o (.div (.const "1.0") st.l)) (.const "0.0"))
 
-def outputCore (P : Core) : ATerm := epilogue (fused P)
+def outputCoreC (cap : Bool) (P : Core) : ATerm := epilogue (fusedC cap P)
+def outputCore (P : Core) : ATerm := outputCoreC false P
 
 /-- The term of one output element of a row: the dataflow over the row's visible range. -/
 def output (P : Params) : ATerm := outputCore P.core
+
+/-- The term of one output element under the uncapped (`cap = false`) or the capped class, in either mask mode: the cap acts
+on the score leaves, the mask mode on the visible range, and neither reads the other. -/
+def outputC (cap : Bool) (P : Params) : ATerm := outputCoreC cap P.core
+
+/-- **No cap is the existing class**: with the cap off the capped family is the uncapped term, definitionally (both mask
+modes). -/
+theorem outputC_off (P : Params) : outputC false P = output P := rfl
+
+/-- The uncapped class's leaf is the raw score. -/
+theorem scoreLeaf_off (s : ATerm) : scoreLeaf false s = s := rfl
+
+/-- **The cap is a class dimension**: the same position under the capped and the uncapped class is a different term (stated
+on a concrete toy row, decided). -/
+theorem soft_cap_changes_the_term :
+    outputC true ⟨1, 2, 8, 9, -1, 0, 0, true, 10⟩ ≠ outputC false ⟨1, 2, 8, 9, -1, 0, 0, true, 10⟩ := by native_decide
+
+/-- The same under the non-causal class: the capped non-causal class is another term than the non-causal class. -/
+theorem soft_cap_changes_the_term_noncausal :
+    outputC true ⟨1, 2, 8, 9, -1, 0, 0, false, 12⟩ ≠ outputC false ⟨1, 2, 8, 9, -1, 0, 0, false, 12⟩ := by native_decide
+
+/-- **The mask mode stays a class dimension under the cap**: the capped causal and the capped non-causal class differ as
+terms on the toy row of `output_depends_on_mode`, hence four fingerprints per head dim. -/
+theorem capped_output_depends_on_mode :
+    outputC true ⟨1, 2, 8, 9, -1, 0, 0, true, 12⟩ ≠ outputC true ⟨1, 2, 8, 9, -1, 0, 0, false, 12⟩ := by native_decide
 
 /-- Under the causal class the request's key count does not reach the term (only the position and the window do). -/
 theorem causal_output_ignores_kvLen (P : Params) (h : P.causal = true) (k : Nat) :
@@ -220,6 +275,15 @@ theorem causal_output_ignores_kvLen (P : Params) (h : P.causal = true) (k : Nat)
 theorem noncausal_output_ignores_position (P : Params) (h : P.causal = false) (p : Nat) (win : Int) :
     output { P with p := p, win := win } = output P := by
   simp [output, Params.core, Params.L, Params.lo, LMode, loMode, h]
+
+/-- The same two statements for either score class (`cap`). -/
+theorem causal_outputC_ignores_kvLen (cap : Bool) (P : Params) (h : P.causal = true) (k : Nat) :
+    outputC cap { P with kvLen := k } = outputC cap P := by
+  simp [outputC, Params.core, Params.L, Params.lo, LMode, loMode, h]
+
+theorem noncausal_outputC_ignores_position (cap : Bool) (P : Params) (h : P.causal = false) (p : Nat) (win : Int) :
+    outputC cap { P with p := p, win := win } = outputC cap P := by
+  simp [outputC, Params.core, Params.L, Params.lo, LMode, loMode, h]
 
 /-! ## The split kernel: one chunk per CTA, an index-addressed workspace, the fixup fold -/
 
@@ -237,6 +301,14 @@ for every unit kind, ring depth and grid the planner may choose). -/
 theorem splitKernel_eq_fused (P : Params) (σ : Nat → Nat) : splitKernel P σ = output P := rfl
 
 theorem splitKernel_assignment_irrelevant (P : Params) (σ τ : Nat → Nat) : splitKernel P σ = splitKernel P τ := rfl
+
+/-- The capped class's split kernel: the workspace slots hold the capped chunk states; the fixup is the same fold (it reads
+`c` / `nc` and the stored states only, never a score). -/
+def workspaceC (cap : Bool) (P : Params) (_σ : Nat → Nat) (j : Nat) : State := chunkStateC cap P.core j
+
+def splitKernelC (cap : Bool) (P : Params) (σ : Nat → Nat) : ATerm := epilogue (fixup (workspaceC cap P σ) P.presentChunks)
+
+theorem splitKernelC_eq_fused (cap : Bool) (P : Params) (σ : Nat → Nat) : splitKernelC cap P σ = outputC cap P := rfl
 
 /-- The merge is not associative as a dataflow: a CTA may hold exactly one chunk or all of them. A
 unit covering a proper prefix merged with a later state would compute a different term. -/
@@ -286,6 +358,43 @@ theorem prefill_decode_agree_noncausal (steps tbits C : Nat) (win : Int) (d : Na
       = rowOutput false steps tbits C win d (prefillRow kv_len q_len' j h row) := by
   unfold rowOutput prefillRow
   simp [output, Params.core, Params.L, Params.lo, LMode, loMode]
+
+/-- The launch model of either score class (`cap`) under the mask mode `causal`: the same rows, the class's own term. -/
+def rowOutputC (cap causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Row) : ATerm :=
+  outputC cap ⟨steps, tbits, C, r.p, win, r.row, d, causal, r.kvLen⟩
+
+/-- **Prefill == decode (R4) under the capped causal class** (and, at `cap = false`, the statement above). -/
+theorem prefill_decode_agreeC (cap : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len q_len i h row : Nat)
+    (hi : i < q_len) (hq : q_len ≤ kv_len) :
+    rowOutputC cap true steps tbits C win d (prefillRow kv_len q_len i h row)
+      = rowOutputC cap true steps tbits C win d (decodeRow (kv_len - q_len + i + 1) h row) := by
+  unfold rowOutputC prefillRow decodeRow
+  simp [outputC, Params.core, Params.L, Params.lo, LMode, loMode]
+
+/-- **Prefill == multi-token decode (R4) under the capped non-causal class** (and, at `cap = false`, the statement above). -/
+theorem prefill_decode_agree_noncausalC (cap : Bool) (steps tbits C : Nat) (win : Int) (d : Nat)
+    (kv_len q_len q_len' i j h row : Nat) :
+    rowOutputC cap false steps tbits C win d (prefillRow kv_len q_len i h row)
+      = rowOutputC cap false steps tbits C win d (prefillRow kv_len q_len' j h row) := by
+  unfold rowOutputC prefillRow
+  simp [outputC, Params.core, Params.L, Params.lo, LMode, loMode]
+
+def launchC (cap causal : Bool) (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
+  rowOutputC cap causal steps tbits C win d (rows r)
+
+/-- **Batch invariance (R2) under the capped classes**: equal rows give equal outputs whatever the batch. -/
+theorem batch_invarianceC (cap causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → Row) (rows₂ : Fin M₂ → Row) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    launchC cap causal M₁ rows₁ steps tbits C win d r₁ = launchC cap causal M₂ rows₂ steps tbits C win d r₂ := by
+  simp only [launchC, h]
+
+theorem permutation_invarianceC (cap causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) {M : Nat} (rows : Fin M → Row)
+    (σ : Fin M → Fin M) (r : Fin M) :
+    launchC cap causal M (rows ∘ σ) steps tbits C win d r = launchC cap causal M rows steps tbits C win d (σ r) := rfl
+
+theorem subbatch_invarianceC (cap causal : Bool) (steps tbits C : Nat) (win : Int) (d : Nat) {M k : Nat} (rows : Fin M → Row)
+    (sel : Fin k → Fin M) (i : Fin k) :
+    launchC cap causal k (rows ∘ sel) steps tbits C win d i = launchC cap causal M rows steps tbits C win d (sel i) := rfl
 
 /-- The launch applies the per-row term to every row; there is no batch parameter inside. -/
 def launch (causal : Bool) (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
@@ -384,6 +493,20 @@ computes the class term. -/
 theorem config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat) :
     kernel b₁ f₁ P σ = kernel b₂ f₂ P τ := by
   rw [kernel_eq_output, kernel_eq_output]
+
+/-- The capped class under a configuration: the same knobs select the same two formulas over the capped chunk states. -/
+def kernelC (cap : Bool) (b : Config) (fusedAuto : Bool) (P : Params) (σ : Nat → Nat) : ATerm :=
+  if b.policy == 2 || (b.policy == 0 && fusedAuto) then outputC cap P else splitKernelC cap P σ
+
+theorem kernelC_eq_output (cap : Bool) (b : Config) (f : Bool) (P : Params) (σ : Nat → Nat) :
+    kernelC cap b f P σ = outputC cap P := by
+  unfold kernelC
+  split <;> rfl
+
+/-- **Configuration invariance (R3) under the capped class.** -/
+theorem config_invarianceC (cap : Bool) (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat) :
+    kernelC cap b₁ f₁ P σ = kernelC cap b₂ f₂ P τ := by
+  rw [kernelC_eq_output, kernelC_eq_output]
 
 theorem space_invariant (space : List Config) :
     ∀ b₁ ∈ space, ∀ b₂ ∈ space, ∀ (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat), kernel b₁ f₁ P σ = kernel b₂ f₂ P τ :=

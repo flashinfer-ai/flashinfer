@@ -11,6 +11,11 @@ Chunked prefill: under the causal class a request cut into chunks (each later ch
 one-shot bits; under the non-causal class only query chunks planned over the request's full key set do -- a chunk run while the
 KV is still growing is that chunk's view of the keys present at the time, and a different ``kv_len`` is a different term.
 
+``logits_soft_cap`` at ``plan()`` selects the class within a mask mode: ``None`` / ``0`` the uncapped class, a positive finite cap
+the capped class, whose score leaves are ``cap * tanh(score * sm_scale / cap)`` (``spec.capped_score``). The cap's value is a
+runtime input of the capped class, like ``sm_scale``. The cap acts on the scores and the mask mode on which keys a row sees, so
+both capped classes exist (causal and non-causal).
+
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
 metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
@@ -29,7 +34,7 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, check_soft_cap
 
 CLASS = "attention.bf16"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -91,6 +96,10 @@ class BatchInvariantAttention:
         self._kv_indices: Optional[torch.Tensor] = None
         self._sm_scale: Optional[float] = None
         self._scale_log2 = 0.0
+        self._logits_soft_cap = 0.0  # the planned cap (0: the uncapped class)
+        self._soft_cap_scale: Optional[float] = (
+            None  # the capped class's binary32 score factor (engine.check_scales)
+        )
         self._window_left = -1
         self._causal = True  # the planned class's mask mode
         self._total_q = 0
@@ -416,10 +425,7 @@ class BatchInvariantAttention:
                     "bf16 queries, keys, values and output",
                 )
         page_size = self._check_page_size(page_size)
-        if logits_soft_cap is not None and logits_soft_cap > 0:
-            raise unsupported(
-                CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
-            )
+        soft_cap = self._soft_cap(logits_soft_cap)
         if pos_encoding_mode not in ("NONE", 0, None):
             raise unsupported(
                 CLASS,
@@ -449,19 +455,8 @@ class BatchInvariantAttention:
         if use_token_head_sf:
             raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
         causal, window_left = self._check_mask_mode(causal, window_left)
-        if sm_scale is not None:
-            ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
-            if ok:
-                try:
-                    ok = scale_log2(float(sm_scale)) != 0.0
-                except OverflowError:
-                    ok = False
-            if not ok:
-                raise unsupported(
-                    CLASS,
-                    f"sm_scale {sm_scale}",
-                    "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
-                )
+        scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
+        c, ca = self._scales(scale, soft_cap)
         qo_host, kv_indptr_host = self._host_offsets(
             qo_indptr, kv_indptr, q_len_per_req
         )
@@ -579,13 +574,48 @@ class BatchInvariantAttention:
         self._kv_indices = kv_indices_dev
         self._max_page = max_page
         self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
-        self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
-        self._scale_log2 = scale_log2(self._sm_scale)
+        self._sm_scale = scale
+        self._scale_log2 = c
+        self._logits_soft_cap = soft_cap
+        self._soft_cap_scale = ca
         self._window_left = int(window_left)
         self._causal = causal
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
+
+    @staticmethod
+    def _soft_cap(logits_soft_cap: Optional[float]) -> float:
+        """The cap of a ``plan()`` / ``forward()`` call: 0 for ``None`` / ``0`` (the uncapped class), the value for a positive finite
+        cap (the capped class); anything else is refused."""
+        try:
+            return check_soft_cap(logits_soft_cap)
+        except ValueError:
+            raise unsupported(
+                CLASS,
+                f"logits_soft_cap {logits_soft_cap}",
+                "a positive finite logits_soft_cap, or 0 / None for no cap",
+            ) from None
+
+    @staticmethod
+    def _scales(sm_scale: float, soft_cap: float) -> Tuple[float, Optional[float]]:
+        """The binary32 scalars the kernels read for a scale and a cap (``engine.check_scales``); a pair outside the class is
+        refused."""
+        try:
+            return engine.check_scales(sm_scale, soft_cap)
+        except ValueError:
+            if soft_cap:
+                raise unsupported(
+                    CLASS,
+                    f"sm_scale {sm_scale} with logits_soft_cap {soft_cap}",
+                    "a positive finite sm_scale and cap whose binary32 scales (cap * log2(e) and sm_scale / cap) "
+                    "are nonzero numbers",
+                ) from None
+            raise unsupported(
+                CLASS,
+                f"sm_scale {sm_scale}",
+                "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
+            ) from None
 
     def validate_forward_options(
         self,
@@ -602,27 +632,29 @@ class BatchInvariantAttention:
         """Check deprecated ``forward()`` overrides without changing the wrapper or its plan."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before forward()")
-        effective_scale = (
-            sm_scale if sm_scale is not None else 1.0 / math.sqrt(self._heads[2])
-        )
-        try:
-            c = engine.check_sm_scale(effective_scale)
-        except ValueError:
+        # the cap selects the class at plan(): forward() takes the planned one (None / 0 names the uncapped class here too)
+        soft_cap = self._soft_cap(logits_soft_cap)
+        if (soft_cap > 0) != (self._logits_soft_cap > 0):
             raise unsupported(
                 CLASS,
-                f"sm_scale {sm_scale}",
-                "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
-            ) from None
-        # The kernel consumes a binary32 log2 scale, not the caller's Python float.
-        if c != self._scale_log2:
-            raise unsupported(
-                CLASS,
-                f"sm_scale {effective_scale} at forward() after planning {self._sm_scale}",
-                "the planned binary32 log2 scale",
+                f"logits_soft_cap {logits_soft_cap} at forward() after planning {self._logits_soft_cap or None}",
+                "the planned logits_soft_cap",
             )
-        if logits_soft_cap is not None and logits_soft_cap > 0:
+        effective_scale = (
+            float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(self._heads[2])
+        )
+        scales = self._scales(effective_scale, soft_cap)
+        # The kernel consumes binary32 scales, not the caller's Python floats.
+        if scales != (self._scale_log2, self._soft_cap_scale):
             raise unsupported(
-                CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
+                CLASS,
+                f"sm_scale {effective_scale}"
+                + (f" with logits_soft_cap {soft_cap}" if soft_cap else "")
+                + f" at forward() after planning {self._sm_scale}"
+                + (
+                    f" with logits_soft_cap {self._logits_soft_cap}" if soft_cap else ""
+                ),
+                "the planned binary32 scales",
             )
         if pos_encoding_mode not in ("NONE", 0, None):
             raise unsupported(
@@ -806,5 +838,6 @@ class BatchInvariantAttention:
             self._config,
             ragged=self.kind == "ragged",
             enable_pdl=enable_pdl,
+            ca=self._soft_cap_scale,
         )
         return out

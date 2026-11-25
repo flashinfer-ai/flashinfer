@@ -105,7 +105,9 @@ class AttentionKernel:
         cap: int = 0,
         *,
         causal: bool = True,
+        soft_cap: bool = False,
     ):
+        self.soft_cap = soft_cap
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
             g,
@@ -136,6 +138,7 @@ class AttentionKernel:
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
+        ca: Float32,
         window_left: Int32,
         num_units: Int32,
         grid: Int32,
@@ -155,6 +158,7 @@ class AttentionKernel:
             self.hw_rowmax,
             self.cap,
             causal=self.causal,
+            soft_cap=self.soft_cap,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)
@@ -178,6 +182,7 @@ class AttentionKernel:
             mKvIndices,
             c,
             nc,
+            ca,
             window_left,
             num_units,
             st.qk_tiled_mma,
@@ -220,6 +225,7 @@ class AttentionKernel:
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
+        ca: Float32,
         window_left: Int32,
         num_units: Int32,
         qk_tiled_mma: cute.TiledMma,
@@ -571,6 +577,7 @@ class AttentionKernel:
                         s_mx,
                         c,
                         nc,
+                        ca,
                         window_left,
                         mDesc[(uk, F_ROWS)],
                         mDesc[(uk, F_QTOK0)],
@@ -596,6 +603,7 @@ class AttentionKernel:
                         s_mx,
                         c,
                         nc,
+                        ca,
                         window_left,
                         mDesc[(u, F_ROWS)],
                         mDesc[(u, F_QTOK0)],

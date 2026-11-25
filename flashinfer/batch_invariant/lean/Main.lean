@@ -112,3 +112,5 @@ def main : IO Unit := do
     IO.println s!"gemmmxw48k64out {steps} {fmt} {(outputKfoldMXW48K64 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (name, P) in attnCases do
     IO.println s!"attn {name} {(Attn.output P).sexpr}"
+  for (name, P) in attnSoftCapCases do
+    IO.println s!"attnsc {name} {(Attn.outputC true P).sexpr}"

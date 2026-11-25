@@ -34,7 +34,7 @@ from .plan import (
     snake_order,
     ws_row,
 )
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, check_soft_cap, scale_log2, soft_cap_scales
 
 
 PAGE_SIZES = (
@@ -82,6 +82,30 @@ def check_sm_scale(sm_scale: float) -> float:
             f"sm_scale {sm_scale}: sm_scale * log2(e) rounds to zero in binary32"
         )
     return c
+
+
+def check_scales(sm_scale: float, logits_soft_cap: Optional[float] = None) -> tuple:
+    """``(c, ca)``: the binary32 scalars the kernels read. Without a cap (``None`` / ``0``): ``c = check_sm_scale(sm_scale)`` and
+    ``ca = None`` (the uncapped class). With a positive finite cap (the capped class): ``spec.soft_cap_scales`` -- ``c`` the log2
+    scale of the capped scores, ``ca`` the factor from a raw score to the capped score's ``tanh`` argument, both nonzero binary32
+    numbers. ``ValueError`` otherwise (a negative or non-finite cap, a scale that leaves binary32 or rounds to zero)."""
+    cap = check_soft_cap(logits_soft_cap)
+    if cap == 0.0:
+        return check_sm_scale(sm_scale), None
+    s = float(sm_scale)
+    if not (math.isfinite(s) and s > 0.0):
+        raise ValueError(
+            f"sm_scale {sm_scale}: the class takes a positive finite scale"
+        )
+    try:
+        ca, c = soft_cap_scales(s, cap)
+    except OverflowError as e:
+        raise ValueError(str(e)) from None
+    if ca == 0.0 or c == 0.0:
+        raise ValueError(
+            f"sm_scale {sm_scale}, logits_soft_cap {logits_soft_cap}: a scale of the capped class rounds to zero in binary32"
+        )
+    return c, ca
 
 
 def valid_kv_slots(D: int = 128) -> tuple:
@@ -625,10 +649,14 @@ def run_attention(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     ragged: bool = False,
+    *,
+    logits_soft_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """Launch a plan from ``plan_attention``. ``kv_indptr`` must be the array the plan was built from (``plan_kv_indptr``: the plan
     runs with its own snapshot; a differing array is rejected, except under CUDA graph capture, where no device compare is possible
-    and the snapshot runs uncompared); ``kv_indices`` is read at run time."""
+    and the snapshot runs uncompared); ``kv_indices`` is read at run time. ``logits_soft_cap``: ``None`` / ``0`` runs the plan's
+    uncapped class; a positive finite cap runs its capped class (every score leaf ``cap * tanh(s * sm_scale / cap)``,
+    ``spec.capped_score``), in either mask mode."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -709,7 +737,7 @@ def run_attention(
         raise ValueError(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
-    c = check_sm_scale(sm_scale)
+    c, ca = check_scales(sm_scale, logits_soft_cap)
     return _run_attention_validated(
         planned,
         q,
@@ -723,6 +751,7 @@ def run_attention(
         out,
         config,
         ragged,
+        ca=ca,
     )
 
 
@@ -740,10 +769,16 @@ def _run_attention_validated(
     config: AttnConfig,
     ragged: bool,
     enable_pdl: Optional[bool] = None,
+    *,
+    ca: Optional[float] = None,
 ) -> torch.Tensor:
     """Launch after the public engine or wrapper has checked inputs; ``kv_indptr`` is the plan's snapshot (``plan_kv_indptr``), ``c``
     the binary32 log2 scale. ``enable_pdl``: launch the attention kernel as a programmatic dependent of the preceding kernel (None:
-    the device's default, ``device_support_pdl``)."""
+    the device's default, ``device_support_pdl``). ``ca``: ``None`` for the uncapped class; the capped class's binary32 score factor
+    otherwise (``check_scales``: ``c`` is then the log2 scale of the capped scores) -- it selects the capped kernels, whose score
+    leaves go through ``spec.capped_score``; the merges and the fixup read ``c`` alone and are the same code in both classes."""
+    soft_cap = ca is not None
+    ca = float(ca) if soft_cap else 0.0
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -791,7 +826,15 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, causal=causal
+            D,
+            g,
+            page,
+            n_pad,
+            ragged,
+            arch_smem_cap(q.device),
+            pdl,
+            causal=causal,
+            soft_cap=soft_cap,
         )
         kernel(
             q_view,
@@ -805,6 +848,7 @@ def _run_attention_validated(
             kv_indices,
             float(c),
             float(-c),
+            ca,
             int(window_left),
             int(plan.num_units),
             int(grid),
@@ -815,14 +859,24 @@ def _run_attention_validated(
         # the smem plan is sized for the execution device's shared memory: part of the kernel's identity, in-process and on disk
         cap = row_arch_smem_cap(q.device)
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
-        hwm = hw_row_max_enabled(
-            q.device, D
-        )  # the row maximum's placement: part of the kernel's identity
+        # the row maximum's placement: part of the kernel's identity (the capped class's maximum is over the capped scores: the
+        # register tree)
+        hwm = hw_row_max_enabled(q.device, D) and not soft_cap
         if (
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, causal=causal
+                D,
+                g,
+                page,
+                DEFAULT_RING[D],
+                1,
+                False,
+                ragged,
+                hwm,
+                cap,
+                causal=causal,
+                soft_cap=soft_cap,
             )
         else:
             kernel = get_compiled_attention(
@@ -836,6 +890,7 @@ def _run_attention_validated(
                 hwm,
                 cap,
                 causal=causal,
+                soft_cap=soft_cap,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -864,6 +919,7 @@ def _run_attention_validated(
             kv_indices,
             float(c),
             float(-c),
+            ca,
             int(window_left),
             int(n_launch if n_launch is not None else plan.num_units),
             int(grid),
@@ -902,9 +958,10 @@ def attention_paged(
     workspace: Optional[torch.Tensor] = None,
     *,
     causal: bool = True,
+    logits_soft_cap: Optional[float] = None,
 ) -> torch.Tensor:
     """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned, or with ``causal=False`` the
-    non-causal class: every token sees its request's whole key range)."""
+    non-causal class: every token sees its request's whole key range); ``logits_soft_cap`` as ``run_attention``."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -935,4 +992,5 @@ def attention_paged(
         kv_layout,
         out,
         config,
+        logits_soft_cap=logits_soft_cap,
     )

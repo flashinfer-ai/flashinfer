@@ -132,6 +132,20 @@ ATTN_CASES = [
         48,
     ),  # whole tiles: the last position equals the causal a0 row's prefix
 ]
+# the capped attention classes (``logits_soft_cap > 0``) on the same toy sizes: (name, D, T, C, p, window_left, row id, d, causal,
+# kv_len) -- causal: a two-chunk row (the merge over capped chunk states), windowed rows at every head dim (the mask after the
+# cap), a short row; non-causal: one row per head dim, the request's key count not a multiple of the tile (a partial last tile
+# masked after the cap) and a token in the first tile seeing past its position
+ATTN_SOFT_CAP_CASES = [
+    ("s0", 64, 16, 32, 40, -1, 0, 0, True, 0),
+    ("s1", 64, 16, 32, 33, 5, 1, 2, True, 0),
+    ("s2", 128, 16, 32, 33, 5, 1, 2, True, 0),
+    ("s3", 256, 16, 32, 33, 5, 1, 2, True, 0),
+    ("s4", 128, 16, 32, 7, -1, 3, 0, True, 0),
+    ("s5", 64, 16, 32, 5, -1, 0, 0, False, 41),
+    ("s6", 128, 16, 32, 20, -1, 1, 2, False, 45),
+    ("s7", 256, 16, 32, 0, -1, 0, 1, False, 33),
+]
 ATTN_HEAD_DIMS = (64, 128, 256)
 
 GEMM_CASES = [
@@ -589,6 +603,7 @@ DECIDED_THEOREMS = (
     + tuple(
         f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
     )
+    + tuple(f"attnsc_{n}_spec" for n, *_ in ATTN_SOFT_CAP_CASES)
 )
 #: `native_decide` theorems of the hand-written modules (not of the generated `Cases.lean`): the attention class-separation
 #: statements on toy rows; listed in `lean/Axioms.lean` with the generated ones.
@@ -597,6 +612,9 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_D",
     "Attn.output_depends_on_D_64",
     "Attn.output_depends_on_mode",
+    "Attn.soft_cap_changes_the_term",
+    "Attn.soft_cap_changes_the_term_noncausal",
+    "Attn.capped_output_depends_on_mode",
 )
 
 
@@ -690,6 +708,25 @@ def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, bool, int
             else RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
         )
         sx = sexpr(AttentionSpec(D, T=T, C=C).output(row, d))
+        out.append((name, D, T, C, p, win, rid, d, causal, kv_len, sx))
+    return out
+
+
+def attn_soft_cap_cases() -> List[
+    Tuple[str, int, int, int, int, int, int, int, bool, int, str]
+]:
+    """The capped attention classes' toy cases with the Python spec's S-expression of the output element."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from .fp_interface.term import sexpr
+
+    out = []
+    for name, D, T, C, p, win, rid, d, causal, kv_len in ATTN_SOFT_CAP_CASES:
+        row = (
+            RowSpec(p=p, window_left=win, row=rid)
+            if causal
+            else RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
+        )
+        sx = sexpr(AttentionSpec(D, T=T, C=C, soft_cap=True).output(row, d))
         out.append((name, D, T, C, p, win, rid, d, causal, kv_len, sx))
     return out
 
@@ -1228,6 +1265,37 @@ def _render_attention(L: List[str]) -> None:
     L.append("")
 
 
+def _render_attention_soft_cap(L: List[str]) -> None:
+    """The capped attention classes: the spec terms (`Attn.outputC true`) and, per case, the split kernel under every
+    chunk-to-CTA assignment."""
+    mk = MMA_K_OF["bf16"]
+    L.append(
+        "/-! The capped attention classes (`logits_soft_cap > 0`) on toy sizes (T = 16, C = 32; D = 64 / 128 / 256; causal and "
+        "non-causal rows): the Python spec's output element with every score leaf through `spec.capped_score` "
+        "(`AttentionSpec(soft_cap=True)`) reproduced by `Attn.outputC true` node for node, and the split kernel under every "
+        "chunk-to-CTA assignment. -/"
+    )
+    for name, D, T, C, p, win, rid, d, causal, kv_len, sx in attn_soft_cap_cases():
+        tb = T.bit_length() - 1
+        L.append(
+            f"def attnscP_{name} : Attn.Params := ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}, "
+            f"{'true' if causal else 'false'}, {kv_len}⟩"
+        )
+        L.append(
+            f"theorem attnsc_{name}_spec : (Attn.outputC true attnscP_{name}).sexpr = {lean_str(sx)} := by native_decide"
+        )
+        L.append(
+            f"theorem attnsc_{name}_split : ∀ σ : Nat → Nat, Attn.splitKernelC true attnscP_{name} σ = "
+            f"Attn.outputC true attnscP_{name} := fun σ => Attn.splitKernelC_eq_fused true _ σ"
+        )
+    L.append(
+        "def attnSoftCapCases : List (String × Attn.Params) := ["
+        + ", ".join(f'("{n}", attnscP_{n})' for n, *_ in ATTN_SOFT_CAP_CASES)
+        + "]"
+    )
+    L.append("")
+
+
 def _render_gemm(L: List[str]) -> None:
     """The GEMM classes: every format's cases, the biased chain after the bf16 ones."""
     _render_format(L, BY_FMT["bf16"])
@@ -1241,6 +1309,7 @@ def _render_gemm(L: List[str]) -> None:
 FAMILIES: Tuple[Tuple[str, Tuple[str, ...], Callable[[List[str]], None]], ...] = (
     ("GEMM", (), _render_gemm),
     ("Attention", (), _render_attention),
+    ("AttentionSoftCap", (), _render_attention_soft_cap),
 )
 
 
@@ -1347,6 +1416,7 @@ def summary() -> str:
         f"space={len(fp8bs_space())} dispatch={len(fp8bs_dispatch_cases())}"
         + f"; native_decide theorems={len(DECIDED_THEOREMS)}"
         + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
+        + f"; capped attention cases={len(ATTN_SOFT_CAP_CASES)}"
     )
 
 

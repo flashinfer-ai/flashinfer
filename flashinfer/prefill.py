@@ -3341,7 +3341,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
             class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
             takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
-            with ``causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            with ``causal=False``, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
@@ -6113,7 +6113,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
             class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
             takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
-            with ``causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            with ``causal=False``, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
