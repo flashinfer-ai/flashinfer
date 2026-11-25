@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from contextlib import suppress
 import importlib.util
 import io
 import tokenize
@@ -218,10 +219,14 @@ def expand_annotation_alias(
 
 
 def union_annotation_members(
-    node: ast.expr, aliases: dict[str, str]
+    node: ast.expr, aliases: dict[str, str], seen: frozenset[str] = frozenset()
 ) -> tuple[ast.expr, ...] | None:
     """Flatten one supported union annotation into its member expressions."""
     node = expand_annotation_alias(node, aliases)
+    key = ast.dump(node)
+    if key in seen:
+        return None
+    seen = seen | {key}
     if isinstance(node, ast.Subscript):
         annotation_name = typing_annotation_name(node.value)
         if annotation_name == "Optional":
@@ -232,8 +237,8 @@ def union_annotation_members(
             )
             return tuple(elements)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        left = union_annotation_members(node.left, aliases) or (node.left,)
-        right = union_annotation_members(node.right, aliases) or (node.right,)
+        left = union_annotation_members(node.left, aliases, seen) or (node.left,)
+        right = union_annotation_members(node.right, aliases, seen) or (node.right,)
         return (*left, *right)
     return None
 
@@ -251,24 +256,42 @@ def is_tuple_annotation(node: ast.expr) -> bool:
     )
 
 
+def reachable_aliases(node: ast.expr, aliases: dict[str, str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    pending = [node]
+    while pending:
+        for child in ast.walk(pending.pop()):
+            if (
+                isinstance(child, ast.Name)
+                and child.id in aliases
+                and child.id not in result
+            ):
+                result[child.id] = aliases[child.id]
+                with suppress(SyntaxError):
+                    pending.append(ast.parse(aliases[child.id], mode="eval").body)
+    return result
+
+
 def annotation_accepts(
     before: ast.expr,
     after: ast.expr,
     before_aliases: dict[str, str],
     after_aliases: dict[str, str],
+    comparing: frozenset[tuple[str, str]] = frozenset(),
 ) -> bool:
     """Return whether every value described by *before* is accepted by *after*."""
     before = expand_annotation_alias(before, before_aliases)
     after = expand_annotation_alias(after, after_aliases)
-    if ast.dump(before) == ast.dump(after) and (
-        before_aliases == after_aliases
-        or not any(
-            isinstance(node, ast.Name)
-            and node.id in (before_aliases.keys() | after_aliases.keys())
-            for node in ast.walk(before)
-        )
-    ):
+    pair = (ast.dump(before), ast.dump(after))
+    if pair[0] == pair[1] and reachable_aliases(
+        before, before_aliases
+    ) == reachable_aliases(after, after_aliases):
         return True
+    # Coinductive comparison: a recursive pair is already being checked;
+    # differences elsewhere in its union/tuple still have to match.
+    if pair in comparing:
+        return True
+    comparing = comparing | {pair}
 
     before_members = union_annotation_members(before, before_aliases)
     after_members = union_annotation_members(after, after_aliases)
@@ -282,6 +305,7 @@ def annotation_accepts(
                     new_member,
                     before_aliases,
                     after_aliases,
+                    comparing,
                 )
                 for new_member in new_members
             )
@@ -314,11 +338,13 @@ def annotation_accepts(
             ):
                 old_items = old_items[:1]
             return all(
-                annotation_accepts(item, new_items[0], before_aliases, after_aliases)
+                annotation_accepts(
+                    item, new_items[0], before_aliases, after_aliases, comparing
+                )
                 for item in old_items
             )
         return len(old_items) == len(new_items) and all(
-            annotation_accepts(old, new, before_aliases, after_aliases)
+            annotation_accepts(old, new, before_aliases, after_aliases, comparing)
             for old, new in zip(old_items, new_items, strict=True)
         )
     return False
@@ -384,9 +410,9 @@ def classify_signature(before: ApiFunction, after: ApiFunction) -> PrFinding:
                 target = (candidate, "posonly", position)
                 renamed_posonly.add(candidate.name)
         if target is None:
-            if after.kwarg is not None or (
-                kind == "posonly" and after.vararg is not None
-            ):
+            accepts_position = kind == "keyword" or after.vararg is not None
+            accepts_keyword = kind == "posonly" or after.kwarg is not None
+            if accepts_position and accepts_keyword:
                 warnings.append(
                     f"Compatibility handling for removed parameter `{name}` needs review."
                 )
@@ -406,7 +432,10 @@ def classify_signature(before: ApiFunction, after: ApiFunction) -> PrFinding:
         loses_position = kind != "keyword" and (
             new_kind == "keyword" or position != new_position
         )
-        if loses_keyword or loses_position:
+        gains_keyword_collision = (
+            kind == "posonly" and new_kind == "positional" and before.kwarg is not None
+        )
+        if loses_keyword or loses_position or gains_keyword_collision:
             reason = f"Parameter `{name}` changed its accepted calling convention or positional binding."
             (errors if item.default is None else warnings).append(reason)
         if not is_compatible_annotation(
@@ -553,7 +582,6 @@ def extract_public_apis(
                             default=child.lineno,
                         ),
                     )
-                visit(child, class_prefix)
 
     visit(tree)
     return result
@@ -859,17 +887,190 @@ def export_anchor(
     return ("flashinfer/__init__.py", side, 1, 1)
 
 
-def dynamic_namespace(source: str | None) -> bool:
+def module_source_path(revision: str, module: str) -> str | None:
+    path = module.replace(".", "/")
+    return next(
+        (
+            candidate
+            for candidate in (f"{path}.py", f"{path}/__init__.py")
+            if git_file(revision, candidate) is not None
+        ),
+        None,
+    )
+
+
+def lazy_keys(tree: ast.Module) -> set[str] | None:
+    """Resolve literal keys and literal-set comprehensions, never execute source."""
+    bindings = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            bindings[node.targets[0].id] = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value
+        ):
+            bindings[node.target.id] = node.value
+
+    related = {"_LAZY_EXPORTS"}
+    pending = [bindings.get("_LAZY_EXPORTS")]
+    while pending:
+        value = pending.pop()
+        if value is None:
+            continue
+        for child in ast.walk(value):
+            if (
+                isinstance(child, ast.Name)
+                and child.id in bindings
+                and child.id not in related
+            ):
+                related.add(child.id)
+                pending.append(bindings[child.id])
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and not (
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"frozenset", "set", "sorted"}
+            )
+            and any(
+                isinstance(child, ast.Name) and child.id in related
+                for child in ast.walk(node)
+            )
+        ):
+            return None
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and any(
+                isinstance(child, ast.Name) and child.id in related
+                for child in ast.walk(node.value)
+            )
+        ):
+            return None
+        if (
+            isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in related
+        ):
+            return None
+
+    def strings(node, seen=frozenset()):
+        if isinstance(node, ast.Name) and node.id in bindings and node.id not in seen:
+            return strings(bindings[node.id], seen | {node.id})
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"frozenset", "set", "sorted"}
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            return strings(node.args[0], seen)
+        if isinstance(node, (ast.Set, ast.List, ast.Tuple)) and all(
+            isinstance(x, ast.Constant) and isinstance(x.value, str) for x in node.elts
+        ):
+            return {x.value for x in node.elts}
+        return None
+
+    def keys(node):
+        if isinstance(node, ast.Dict):
+            result = set()
+            for key, value in zip(node.keys, node.values, strict=True):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    result.add(key.value)
+                elif key is None:
+                    extra = keys(value)
+                    if extra is None:
+                        return None
+                    result.update(extra)
+                else:
+                    return None
+            return result
+        if isinstance(node, ast.DictComp) and len(node.generators) == 1:
+            gen = node.generators[0]
+            if (
+                not gen.ifs
+                and not gen.is_async
+                and isinstance(gen.target, ast.Name)
+                and isinstance(node.key, ast.Name)
+                and node.key.id == gen.target.id
+            ):
+                return strings(gen.iter)
+        return None
+
+    return keys(bindings.get("_LAZY_EXPORTS"))
+
+
+def dynamic_namespace(source: str | None, name: str | None = None) -> bool:
     if source is None:
         return False
-    return any(
-        (isinstance(node, ast.FunctionDef) and node.name == "__getattr__")
-        or (
-            isinstance(node, ast.ImportFrom)
-            and any(alias.name == "*" for alias in node.names)
-        )
-        for node in ast.walk(ast.parse(source))
-    )
+    tree = ast.parse(source)
+
+    # Module-scope control flow is relevant; class methods and nested functions
+    # cannot implement PEP 562 hooks for the containing module.
+    def scope(node):
+        for child in ast.iter_child_nodes(node):
+            yield child
+            if not isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            ):
+                yield from scope(child)
+
+    nodes = list(scope(tree))
+    if any(
+        isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names)
+        for node in nodes
+    ):
+        return True
+    hooks = [
+        n
+        for n in nodes
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == "__getattr__"
+    ]
+    if name is not None and len(hooks) == 1:
+        hook = hooks[0]
+        body = hook.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+        ):
+            body = body[1:]
+        # Recognize the established table-only hook. Unknown hooks/tables remain
+        # advisory; a proven absent key in this hook raises AttributeError.
+        if body and isinstance(body[0], ast.Try):
+            block = body[0]
+            first = block.body[0] if block.body else None
+            value = first.value if isinstance(first, ast.Assign) else None
+            args = hook.args.posonlyargs + hook.args.args
+            handlers = block.handlers
+            if (
+                len(block.body) == 1
+                and not block.finalbody
+                and isinstance(value, ast.Subscript)
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "_LAZY_EXPORTS"
+                and args
+                and isinstance(value.slice, ast.Name)
+                and value.slice.id == args[0].arg
+                and len(handlers) == 1
+                and isinstance(handlers[0].type, ast.Name)
+                and handlers[0].type.id == "KeyError"
+                and len(handlers[0].body) == 1
+                and isinstance(handlers[0].body[0], ast.Raise)
+                and isinstance(handlers[0].body[0].exc, ast.Call)
+                and isinstance(handlers[0].body[0].exc.func, ast.Name)
+                and handlers[0].body[0].exc.func.id == "AttributeError"
+            ):
+                known = lazy_keys(tree)
+                if known is not None and name not in known:
+                    return False
+    return bool(hooks)
 
 
 def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrFinding]:
@@ -940,8 +1141,18 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
         )
         api_changes[change] = (old, new)
 
+        remaining_path = (
+            module_source_path(head, module_name_from_path(old_path))
+            if old_path
+            else None
+        )
+        if old and remaining_path and remaining_path != old_path:
+            # A module and a same-named package provide the same import path.
+            new = module_apis(head, module_name_from_path(old_path), target_cache)
         reexports = (
-            module_reexports(old_path, git_file(head, old_path)) if old_path else {}
+            module_reexports(remaining_path, git_file(head, remaining_path))
+            if old and remaining_path
+            else {}
         )
         for name in sorted(set(old) - set(new)):
             api = old[name]
@@ -954,9 +1165,11 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                 if target_api:
                     add_signature(api, target_api)
                     continue
-            remaining_source = git_file(head, old_path) if old_path else None
+            remaining_source = (
+                git_file(head, remaining_path) if remaining_path else None
+            )
             remaining = extract_public_apis(
-                old_path or "",
+                remaining_path or "",
                 remaining_source,
                 decorated_only=False,
             ).get(name)
@@ -1022,9 +1235,9 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
             f"from flashinfer import {name}",
             "(removed)",
             f"Public top-level export `{name}` was removed."
-            if not dynamic_namespace(new_init)
+            if not dynamic_namespace(new_init, name)
             else f"Top-level export `{name}` requires dynamic namespace review.",
-            uncertain=dynamic_namespace(new_init),
+            uncertain=dynamic_namespace(new_init, name),
             anchors=(export_anchor(old_init, name, "LEFT"),),
         )
     for name in sorted(set(old_exports) & set(new_exports)):
@@ -1056,6 +1269,8 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
         old_apis, new_apis = api_changes.get(change, ({}, {}))
         old_module = public_module(change.old_path, has_decorated_api=bool(old_apis))
         if not old_module:
+            continue
+        if module_source_path(head, old_module) is not None:
             continue
         if change.status == "D":
             surface(

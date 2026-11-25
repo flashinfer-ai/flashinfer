@@ -30,7 +30,11 @@ class ClassificationTest(unittest.TestCase):
             ("x, y=1", "x, y=None", "LIKELY_BREAKING"),
             ("x, *args", "x, mode=None, *args", "LIKELY_BREAKING"),
             ("x, **kwargs", "x, *, mode=None, **kwargs", "LIKELY_BREAKING"),
-            ("x, y=0", "x, **kwargs", "LIKELY_BREAKING"),
+            ("x, y=0", "x, **kwargs", "BREAKING"),
+            ("x, /, **kwargs", "x, **kwargs", "BREAKING"),
+            ("x, /", "**kwargs", "BREAKING"),
+            ("x, /", "*args", "LIKELY_BREAKING"),
+            ("x, *, y=0", "x, **kwargs", "LIKELY_BREAKING"),
             ("x, *, y=0", "x, *, z=0, y=0", "NON_BREAKING"),
             ("x", "x, y=0", "NON_BREAKING"),
             ("x: Tensor", "x: Tensor | None", "NON_BREAKING"),
@@ -163,3 +167,107 @@ class InlineSourceRangeTest(unittest.TestCase):
         old = {"flashinfer/example.py": "@flashinfer_api\ndef api(\n x,\n): pass\n"}
         finding = compare_snapshots(old, {"flashinfer/example.py": ""})[0]
         self.assertIn(("flashinfer/example.py", "LEFT", 1, 4), finding.anchors)
+
+
+class ReviewRegressionTest(unittest.TestCase):
+    def test_recursive_alias_ignores_unrelated_constants(self):
+        aliases = {"Tree": "tuple[Tree] | None", "OTHER": "1"}
+        self.assertTrue(
+            checker.is_compatible_annotation(
+                "Tree", "Tree", aliases, {**aliases, "OTHER": "2"}
+            )
+        )
+
+    def test_recursive_alias_changes_terminate_and_detect_narrowing(self):
+        old = {"Tree": "tuple[Tree, int | str] | None"}
+        new = {"Tree": "tuple[Tree, int] | None"}
+        self.assertFalse(checker.is_compatible_annotation("Tree", "Tree", old, new))
+        self.assertTrue(checker.is_compatible_annotation("Tree", "Tree", new, old))
+        self.assertTrue(
+            checker.is_compatible_annotation(
+                "Tree",
+                "Tree",
+                {"Tree": "Tree | int"},
+                {"Tree": "Tree | int", "OTHER": "2"},
+            )
+        )
+
+    def test_nested_function_cannot_preserve_a_removed_module_api(self):
+        old = {"flashinfer/example.py": "@flashinfer_api\ndef api(x): pass\n"}
+        for source in (
+            "def helper():\n def api(x): pass\n",
+            "class Helper:\n def __getattr__(self, name): return resolve(name)\n",
+        ):
+            with self.subTest(source=source):
+                findings = compare_snapshots(old, {"flashinfer/example.py": source})
+                self.assertEqual(findings[0].classification, "BREAKING")
+
+    def test_experimental_syntax_does_not_block_stable_gate(self):
+        self.assertEqual(
+            compare_snapshots(
+                {"flashinfer/experimental/example.py": "x=1\n"},
+                {"flashinfer/experimental/example.py": "def broken(:\n"},
+            ),
+            [],
+        )
+
+    def test_known_lazy_hook_does_not_hide_removed_export(self):
+        prefix = "from .activation import gelu_and_mul\n"
+        # Exercise the repository's real lazy-export hook and computed table.
+        init = (
+            Path(checker.__file__).resolve().parents[2] / "flashinfer/__init__.py"
+        ).read_text()
+        removed = init.replace(
+            "from .activation import gelu_and_mul as gelu_and_mul\n", "", 1
+        )
+        full_findings = compare_snapshots(
+            {"flashinfer/__init__.py": init}, {"flashinfer/__init__.py": removed}
+        )
+        self.assertEqual(
+            next(
+                f for f in full_findings if f.api == "flashinfer.gelu_and_mul"
+            ).classification,
+            "BREAKING",
+        )
+        lazy = init[
+            init.index("_PRIMS_TS_LAZY_EXPORTS =") : init.index("def __dir__()")
+        ]
+        findings = compare_snapshots(
+            {"flashinfer/__init__.py": prefix + lazy}, {"flashinfer/__init__.py": lazy}
+        )
+        self.assertEqual(findings[0].classification, "BREAKING")
+        # A runtime update makes table membership uncertain again.
+        after = lazy + "\n_LAZY_EXPORTS.update(runtime_exports)\n"
+        findings = compare_snapshots(
+            {"flashinfer/__init__.py": prefix + lazy}, {"flashinfer/__init__.py": after}
+        )
+        self.assertEqual(findings[0].classification, "LIKELY_BREAKING")
+
+    def test_module_package_conversion_preserves_import_and_checks_signature(self):
+        for reverse in (False, True):
+            for broken in (False, True):
+                with self.subTest(reverse=reverse, broken=broken):
+                    paths = ["flashinfer/example.py", "flashinfer/example/__init__.py"]
+                    if reverse:
+                        paths.reverse()
+                    old = {paths[0]: "@flashinfer_api\ndef api(x): pass\n"}
+                    new = {
+                        paths[1]: "@flashinfer_api\ndef api("
+                        + ("x, y" if broken else "x")
+                        + "): pass\n"
+                    }
+                    findings = compare_snapshots(old, new)
+                    self.assertFalse(
+                        any(
+                            f.check
+                            in (
+                                "public_module_deleted",
+                                "public_module_moved",
+                                "public_api_removed",
+                            )
+                            for f in findings
+                        )
+                    )
+                    self.assertEqual(
+                        any(f.classification == "BREAKING" for f in findings), broken
+                    )
