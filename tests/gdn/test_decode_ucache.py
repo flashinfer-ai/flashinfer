@@ -882,3 +882,226 @@ def test_fp16_u_ring_is_umma_only():
             flush_min=13,
             backend="hmma",
         )
+
+
+# --------------------------------------------------------------------------- stochastic rounding
+_PHILOX = (
+    0xD2511F53,
+    0xCD9E8D57,
+    0x9E3779B9,
+    0xBB67AE85,
+)  # round A, round B, key A, key B
+
+
+def _hmma_philox_noise13(seed, sidx, rounds):
+    """13-bit noise of every element of state slot ``sidx`` ([HV, V, K]) under the HMMA
+    kernel's scheme: Philox4x32 with key = seed; element (v, k) takes word (k % 32) // 8 of
+    the draw whose counter is the flat state-pool offset of (row v - v % 16 + v % 8,
+    column k - k % 32 + k % 8 - k % 2) plus 8 for v % 16 >= 8; even k rbits[12:0], odd k
+    rbits[28:16]. numpy reference of the fold in gdn_decode_bf16_wy_ucache_flush.py."""
+    import numpy as np
+
+    u64, m32 = np.uint64, np.uint64(0xFFFFFFFF)
+    hv, v, k = np.meshgrid(
+        np.arange(HV, dtype=np.int64),
+        np.arange(V, dtype=np.int64),
+        np.arange(K, dtype=np.int64),
+        indexing="ij",
+    )
+    row, col = v - v % 16 + v % 8, k - k % 32 + k % 8 - k % 2
+    ctr = (((sidx * HV + hv) * V + row) * K + col + 8 * ((v % 16) // 8)).astype(u64)
+    c0, c1 = ctr & m32, ctr >> u64(32)
+    c2 = np.zeros_like(c0)
+    c3 = np.zeros_like(c0)
+    ra, rb, ka, kb = (u64(x) for x in _PHILOX)
+    k0, k1 = u64(seed & 0xFFFFFFFF), u64((seed >> 32) & 0xFFFFFFFF)
+    for _ in range(rounds):
+        pb, pa = c2 * rb, c0 * ra
+        c0, c2 = (pb >> u64(32)) ^ c1 ^ k0, (pa >> u64(32)) ^ c3 ^ k1
+        c1, c3 = pb & m32, pa & m32
+        k0, k1 = (k0 + ka) & m32, (k1 + kb) & m32
+    words = np.stack([c0, c1, c2, c3], axis=-1)
+    w = np.take_along_axis(words, ((k % 32) // 8)[..., None], axis=-1)[..., 0]
+    bits = np.where(k % 2 == 0, w & u64(0x1FFF), (w >> u64(16)) & u64(0x1FFF))
+    return torch.from_numpy(bits.astype(np.int32))
+
+
+def _sr_case(arm, hist, seed, bases=None):
+    _, _, _, io_dtype, state_dtype, ring_dtype = ARMS[arm]
+    return _make_case(
+        len(hist), hist, io_dtype, state_dtype, seed, ring_dtype=ring_dtype, bases=bases
+    )
+
+
+def _sr_call(mod, case, **kw):
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = [
+        x.clone() for x in case
+    ]
+    y = mod.gated_delta_rule_mtp_ucache_flush(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=idx,
+        k_cache=kc,
+        u_cache=uc,
+        g_cache=gc,
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=FLUSH_MIN,
+        restart_hist_on_flush=False,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    return y, pool, (kc, uc, gc)
+
+
+@pytest.mark.parametrize("rounds", [10, 5])
+@pytest.mark.parametrize("scale", [1.0, 1e-5])
+def test_stochastic_rounding_matches_reference_bits(rounds, scale):
+    """HMMA stochastic rounding (fp16 state, software, every SM90+ GPU) only changes how
+    the flushed state is rounded: outputs and rings are bit-identical to round-to-nearest,
+    verify rows keep their state, every flushed element is RN or its neighbour, and each
+    rounding direction agrees with the reference noise bits (up where RN went down needs
+    noise >= 4096 of 8192, = 4096 only at an exact tie RN broke down to even; down where
+    RN went up needs noise < 4096). Noise from another seed must violate that, which
+    proves the check can fail. 10 rounds runs Philox as a loop, 5 unrolled. Scale 1e-5
+    puts the flushed state in the fp16 subnormal range, which takes the kernel's full
+    rounding routine instead of its normal-range path."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("fp16_state")
+    hist = [13, 12, 16, 13, 0, 13]
+    case = list(_sr_case("fp16_state", hist, seed=71, bases=[28, 5, 30, 17, 9, 0]))
+    for i in (7, 9):  # state pool and u ring
+        case[i] = (case[i].float() * scale).to(case[i].dtype)
+    seed = 0x1234_5678_9ABC_DEF1 + rounds
+    pool0 = case[7].clone()
+    y_rn, s_rn, rings_rn = _sr_call(mod, case)
+    y_sr, s_sr, rings_sr = _sr_call(
+        mod,
+        case,
+        stochastic_rounding="philox",
+        philox_rounds=rounds,
+        rand_seed=torch.tensor([seed], dtype=torch.int64, device=DEV),
+    )
+    assert torch.equal(y_rn, y_sr)
+    for x, z in zip(rings_rn, rings_sr, strict=True):
+        assert torch.equal(x.nan_to_num(), z.nan_to_num())
+    n_diff = n_bad = n_bad_ctl = 0
+    for r, hist_r in enumerate(hist):
+        if hist_r < FLUSH_MIN:
+            assert torch.equal(s_sr[r], pool0[r]) and torch.equal(s_rn[r], pool0[r])
+            continue
+        rn = s_rn[r].view(torch.int16).int().cpu()
+        sr = s_sr[r].view(torch.int16).int().cpu()
+        mag_rn, mag_sr = rn & 0x7FFF, sr & 0x7FFF
+        finite = mag_rn < 0x7C00  # 13-bit noise model, subnormals included
+        assert torch.equal((rn >> 15)[finite], (sr >> 15)[finite]), "sign flipped"
+        step = mag_sr - mag_rn
+        assert step.abs().max().item() <= 1, "SR result is not RN or its neighbour"
+        noise = _hmma_philox_noise13(seed, r, rounds)
+        ctl = _hmma_philox_noise13(seed + 1, r, rounds)
+        up, down = finite & (step == 1), finite & (step == -1)
+        n_diff += int(up.sum() + down.sum())
+        n_bad += int(((noise < 4096) & up).sum() + ((noise >= 4096) & down).sum())
+        n_bad_ctl += int(((ctl < 4096) & up).sum() + ((ctl >= 4096) & down).sum())
+    total = sum(HV * V * K for hist_r in hist if hist_r >= FLUSH_MIN)
+    assert abs(n_diff / total - 0.25) < 0.05, n_diff / total  # E[min(f, 1 - f)] = 1/4
+    assert n_bad == 0, f"{n_bad} of {n_diff} rounding directions contradict the bits"
+    assert n_bad_ctl > 0.3 * n_diff, (n_bad_ctl, n_diff)
+
+
+def test_stochastic_rounding_seed_and_graph():
+    """Same seed -> bit-identical state, another seed -> different; the seed is read on
+    device, so an in-place update reaches a captured CUDA graph."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("fp16_state")
+    case = _sr_case("fp16_state", [13, 5, 13, 16], seed=12)
+    seed_t = torch.tensor([7], dtype=torch.int64, device=DEV)
+    ph = dict(stochastic_rounding="philox")
+    _, a1, _ = _sr_call(mod, case, rand_seed=seed_t, **ph)
+    _, a2, _ = _sr_call(mod, case, rand_seed=seed_t, **ph)
+    _, b1, _ = _sr_call(
+        mod, case, rand_seed=torch.tensor([8], dtype=torch.int64, device=DEV), **ph
+    )
+    assert torch.equal(a1, a2) and not torch.equal(a1, b1)
+
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = [
+        x.clone() for x in case
+    ]
+    pool_init = pool.clone()
+
+    def step():
+        mod.gated_delta_rule_mtp_ucache_flush(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=FLUSH_MIN,
+            restart_hist_on_flush=False,
+            rand_seed=seed_t,
+            **ph,
+        )
+
+    step()  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    for want_seed, want in ((7, a1), (8, b1)):
+        pool.copy_(pool_init)
+        seed_t.fill_(want_seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(pool, want), f"graph replay with seed {want_seed}"
+
+
+def test_stochastic_rounding_rejections():
+    """The HMMA kernel rounds the fp16 state with "philox" only: bf16 state and "lcg"
+    raise NotImplementedError; a missing or malformed seed and fewer than 2 rounds raise
+    ValueError."""
+    _skip_if_not_sm90_or_later()
+    seed = torch.tensor([1], dtype=torch.int64, device=DEV)
+    with pytest.raises(NotImplementedError):
+        _sr_call(
+            _load_flush("bf16"),
+            _sr_case("bf16", [13, 5], seed=5),
+            stochastic_rounding="philox",
+            rand_seed=seed,
+        )
+    mod, case = _load_flush("fp16_state"), _sr_case("fp16_state", [13, 5], seed=5)
+    with pytest.raises(NotImplementedError):
+        _sr_call(mod, case, stochastic_rounding="lcg", rand_seed=seed)
+    for bad in (
+        None,
+        torch.tensor([1, 2], dtype=torch.int64, device=DEV),
+        torch.tensor([1], dtype=torch.int32, device=DEV),
+        torch.tensor([1], dtype=torch.int64),
+    ):
+        with pytest.raises(ValueError):
+            _sr_call(mod, case, stochastic_rounding="philox", rand_seed=bad)
+    for rounds in (0, 1):
+        with pytest.raises(ValueError):
+            _sr_call(
+                mod,
+                case,
+                stochastic_rounding="philox",
+                rand_seed=seed,
+                philox_rounds=rounds,
+            )
