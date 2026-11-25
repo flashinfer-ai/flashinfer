@@ -86,7 +86,8 @@ nearest even (``rounds_at_most``).
 
 Prefill: the ``prefill`` route holds the single-pass programs of two kernel
 bodies: the V6 fork-order body (``body`` ``prefill_sm90_v6``: the plain, the
-initial-state and the pool-indexed flag sets, final state stored) and the
+initial-state and the pool-indexed flag sets, final state stored, and their
+``split_items`` twins, which the SM90 V6 WARM-UP SPLIT PLAN below feeds) and the
 merged chunked prefill body (``body`` ``prefill_sm90``: the unit programs and
 the ``split_items`` programs); the BODY ROUTE OF RECORD below
 (``prefill_body_class``) picks the body of every sequence from its chunk
@@ -147,6 +148,7 @@ store, ...; the split programs spell ``split_items`` too).
 from __future__ import annotations
 
 import functools
+import heapq
 import itertools
 from typing import Any, NamedTuple, Sequence
 
@@ -8729,6 +8731,540 @@ MODULES: dict[str, dict[str, Any]] = {
             "use_state_indices": True,
         },
     },
+    "cake_gdp_5acbda2bd1002fd68a95": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": False,
+            "use_state_indices": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_5acbda2bd1002fd68a95",
+        "kernel_symbol": "kernel_cake_gdp_5acbda2bd1002fd68a95",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_5acbda2bd1002fd68a95",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": False,
+            "use_state_indices": False,
+        },
+    },
+    "cake_gdp_edfb71d95c7a9c2a133d": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_edfb71d95c7a9c2a133d",
+        "kernel_symbol": "kernel_cake_gdp_edfb71d95c7a9c2a133d",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_edfb71d95c7a9c2a133d",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": False,
+        },
+    },
+    "cake_gdp_446ecf26f72f95aacf84": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_446ecf26f72f95aacf84",
+        "kernel_symbol": "kernel_cake_gdp_446ecf26f72f95aacf84",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_446ecf26f72f95aacf84",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": True,
+        },
+    },
     "cake_gdp_ff55032bc5fdf2697d77": {
         "arches": [
             "sm_100a",
@@ -10704,6 +11240,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_3220d37914678385a837",
             "cake_gdp_245414df8449fb1825a1",
             "cake_gdp_b81854850bf4b769295c",
+            "cake_gdp_5acbda2bd1002fd68a95",
+            "cake_gdp_edfb71d95c7a9c2a133d",
+            "cake_gdp_446ecf26f72f95aacf84",
         ],
     },
     "sm_100a": {
@@ -11723,6 +12262,324 @@ def prefill_launch_plan(classes) -> list[tuple[str, list[int]]]:
 
 # ---- END BODY ROUTE OF RECORD ----
 
+# ---- BATCH BODY ROUTE (GDP prefill sm_90a: one body, one launch per call) ----
+# The backend runs a whole sm_90a call on ONE body in ONE launch; the per-sequence classes of the route of record only
+# decide whether the merged split body is a candidate (some sequence is merged-class).  The body is then the one of the
+# lesser modeled kernel time of the whole batch.  Both bodies run persistent CTAs that take their work strided (CTA
+# ``b`` of a grid of ``G`` runs work ``b, b + G, ...``) and a CTA's time is the sum of its chunk-steps, so the model
+# is the most loaded CTA: the V6 body over the ``N x H`` sequence-major tiles of each sequence's chunks, the merged
+# body over the ``split_table`` items (each item's chunks, plus ``ROUTE_WARMUP_CHUNKS`` for a cut past 0) on
+# ``min(sm_count, tiles)`` CTAs.  The step and base times are a fit of the H100 (132 SMs) kernel times
+# (2026-11-24: 88 workloads x two gate sets, each body forced on the whole batch; error within 3 %).
+ROUTE_BATCH_V6_STEP_NS = 2040  # one V6 chunk-step
+ROUTE_BATCH_V6_BASE_NS = 15000  # the V6 launch, seed and final store
+ROUTE_BATCH_P3_STEP_NS = 7570  # one merged-body chunk-step
+ROUTE_BATCH_P3_BASE_NS = 27000  # the merged launch, seed and final store
+
+
+def _most_loaded(loads: list[int], grid: int) -> int:
+    """The largest sum of ``loads[b::grid]`` over the ``grid`` CTAs (0 for no work)."""
+    if not loads:
+        return 0
+    return max(sum(loads[b::grid]) for b in range(grid))
+
+
+def prefill_batch_costs(
+    cu_seqlens,
+    n: int,
+    H: int,
+    sm_count: int,
+    total_tokens: int | None = None,
+) -> tuple[int, int]:
+    """The modeled kernel time of the whole batch under each body, ``(t_v6, t_p3)`` in nanoseconds: the base plus the
+    chunk-steps of the most loaded CTA at the body's step time (see the BATCH BODY ROUTE comment).  The merged body
+    runs the items of ``split_table`` (a sequence the rule leaves whole is one item per head)."""
+    chunks = route_chunk_steps(cu_seqlens, n, total_tokens)
+    tiles = [c for c in chunks for _ in range(H)]
+    if not tiles:
+        return 0, 0
+    t_v6 = ROUTE_BATCH_V6_BASE_NS + ROUTE_BATCH_V6_STEP_NS * _most_loaded(
+        tiles, min(sm_count, len(tiles))
+    )
+    items = [
+        min(span, chunks[seq] - cut) + (ROUTE_WARMUP_CHUNKS if cut > 0 else 0)
+        for seq, _head, cut, span in split_table(
+            cu_seqlens, n, H, sm_count, total_tokens=total_tokens
+        )
+    ]
+    t_p3 = ROUTE_BATCH_P3_BASE_NS + ROUTE_BATCH_P3_STEP_NS * _most_loaded(
+        items, min(sm_count, len(items))
+    )
+    return t_v6, t_p3
+
+
+def prefill_batch_body(
+    cu_seqlens,
+    n: int,
+    H: int,
+    sm_count: int,
+    *,
+    store_final_state: bool = True,
+    unit_gates: bool = False,
+    unit_beta: bool = False,
+    total_tokens: int | None = None,
+) -> str:
+    """The one body of a whole sm_90a call: ``ROUTE_BODY_P3`` for a unit-gate / unit-beta call (its exact unit
+    program), ``ROUTE_BODY_V6`` for a call without a final state and for a batch with no merged-class sequence (the
+    route of record), else the body of the lesser ``prefill_batch_costs`` (ties to V6).  A merged choice runs the
+    split program over ``split_table`` of the whole batch: every sequence, a short or empty one included, is in the
+    same launch (a sequence the rule leaves whole is one item per head, bitwise the merged single pass)."""
+    if unit_gates or unit_beta:
+        return ROUTE_BODY_P3
+    if not store_final_state:
+        return ROUTE_BODY_V6
+    classes = prefill_body_classes(
+        cu_seqlens, n, H, sm_count, store_final_state=True, total_tokens=total_tokens
+    )
+    if ROUTE_BODY_P3 not in classes:
+        return ROUTE_BODY_V6
+    t_v6, t_p3 = prefill_batch_costs(cu_seqlens, n, H, sm_count, total_tokens)
+    return ROUTE_BODY_P3 if t_p3 < t_v6 else ROUTE_BODY_V6
+
+
+# ---- END BATCH BODY ROUTE ----
+
+
+# ---- SM90 V6 WARM-UP SPLIT PLAN (GDP prefill sm_90a: the split twins of the V6 programs) ----
+# The V6 body's ``split_items`` programs (the plain, initial-state and pool-indexed flag sets, with per-CTA row lists
+# and the stale-plan guard) run one launch of persistent CTAs, one per SM, over a host table of rows ``(sequence,
+# head, cut, span)`` in chunk units (a chunk is 64 expanded rows: ``ceil(len n / 64)`` chunks per sequence):
+# * A sequence of ``chunks`` chunks is balanced when its slot ``slot = n ceil(ceil(H padded / G) / n)`` (``padded =
+#   n ceil(chunks / n)``: its head-major chunk space cut into ``G`` = SM count slots, each a whole number of
+#   blocks) is at least V6_SM90_MIN_SLOT chunks and shorter than a head, and a head holds at most V6_SM90_SPLIT_MAX
+#   cuts.  Its rows are ``(seq, head, cut, -slot)``: slot ``k`` covers chunks ``[k slot, (k + 1) slot)`` of that
+#   space, one row per head it touches; a cut fewer than V6_SM90_CUT_MIN chunks after its head start moves to the
+#   head start.  The cuts read the sequence's own length and the shape, never the rest of the batch.  At most
+#   V6_SM90_PLAN_ROWS // 2 sequences are balanced, the longest.
+# * Every other sequence is one whole-head row per head, ``(seq, head, 0, chunks)``.
+# * Placement: CTA ``k`` takes slot ``k`` of every balanced sequence, its cut-0 rows first; then each whole-head row,
+#   longest first, goes to the least-loaded CTA (several one-token rows fill the slack of the balanced slots).
+# * Choice: the facade runs the split program when a sequence is balanced and the plan's most loaded CTA (its rows'
+#   chunks, V6_SM90_ROW_COST per row and V6_SM90_WARMUP_COST per row after a cut) is lighter than the most loaded
+#   CTA of the V6 program over the ``N x H`` tiles (each tile's chunks and V6_SM90_ROW_COST, strided over
+#   ``min(SM count, N x H)`` CTAs): both run the same chunk step, so a batch whose tiles already fill the SMs (many
+#   sequences of one or two slots each) keeps the V6 program.
+# The device scans back from every cut past 0 until the log2 gate decay of the chunks before it reaches the build's
+# threshold (within a warm-up cap), runs that warm-up from a zero state and writes O from the cut on; a cut that does
+# not saturate is not taken (the previous row runs through it), so the result does not depend on the cuts beyond
+# rounding.  The row of a head's cut 0 seeds the state and raises a seed-done flag; the row that reaches the head's
+# end stores the final state after that flag (every CTA is resident at once: one CTA per SM, at most SM count CTAs).
+# The table is ``[4 R row words][grid + 1 offsets][N][N + 1 cu_seqlens]``; the guarded program compares the last two
+# with the device offsets and, when they differ, runs no row and writes NaN to ``o[0, 0, :2]`` and, when it stores
+# one, to the final state ``[0, 0, 0, 0]``.  The split workspace (``ainv_workspace``) holds the ``N x H`` seed-done
+# flags, zero at launch; the kernel leaves them zero.
+# Expanded rows per chunk of the V6 body.
+V6_SM90_CHUNK_ROWS = 64
+# A sequence of fewer chunks is one row per head.
+V6_SM90_MIN_CHUNKS = 24
+# Chunks: a shorter balanced slot pays more per-row fill than it gains.
+V6_SM90_MIN_SLOT = 24
+# A cut fewer chunks than this after its head start moves to the head start.
+V6_SM90_CUT_MIN = 24
+# At most this many cuts per head (the device's forward scan reaches every cut).
+V6_SM90_SPLIT_MAX = 48
+# Rows of a CTA's list the device decodes into its shared plan table.
+V6_SM90_PLAN_ROWS = 64
+# A row's modeled cost past its chunks, in chunk steps (decode, seed, fill, final store).
+V6_SM90_ROW_COST = 3
+# The modeled warm-up of a row after a cut (the device decides it).
+V6_SM90_WARMUP_COST = 6
+
+
+class V6Sm90Plan(NamedTuple):
+    """One launch of a V6 split program on sm_90a: the rows in table order, the grid (the SM count when a sequence is
+    balanced) and the ``grid + 1`` offsets of the CTAs' row lists (CTA ``b`` runs rows ``offsets[b] ..
+    offsets[b + 1] - 1``).  ``split`` is whether the facade runs the split program for the batch: some sequence is
+    balanced and the plan's most loaded CTA, ``load``, is lighter than the V6 program's, ``serial_load`` (both in
+    chunk steps)."""
+
+    rows: tuple[tuple[int, int, int, int], ...]
+    offsets: tuple[int, ...]
+    grid: int
+    split: bool
+    load: int
+    serial_load: int
+
+
+def v6_sm90_chunks(
+    cu_seqlens: Sequence[int], n: int, total_tokens: int | None = None
+) -> list[int]:
+    """The V6 chunk count of each sequence as the device reads ``cu_seqlens``: ``ceil(len n / 64)``."""
+    raw = [int(x) for x in cu_seqlens]
+    total = raw[-1] if total_tokens is None else int(total_tokens)
+    out = []
+    for q in range(len(raw) - 1):
+        start, end = split_sequence_bounds(raw[q], raw[q + 1], total)
+        out.append(-(-(end - start) * int(n) // V6_SM90_CHUNK_ROWS))
+    return out
+
+
+def _v6_sm90_padded(chunks: int, n: int) -> int:
+    return n * -(-chunks // n)
+
+
+def v6_sm90_slot(chunks: int, H: int, n: int, slots: int) -> int:
+    """The balanced slot of a sequence of ``chunks`` chunks on ``slots`` slots, 0 when it is not balanced."""
+    if chunks < V6_SM90_MIN_CHUNKS:
+        return 0
+    padded = _v6_sm90_padded(chunks, n)
+    per_slot = -(-(H * padded) // slots)
+    slot = n * -(-per_slot // n)
+    if not V6_SM90_MIN_SLOT <= slot < padded or padded > (V6_SM90_SPLIT_MAX - 1) * slot:
+        return 0
+    return slot
+
+
+def _v6_sm90_slot_rows(
+    seq: int, chunks: int, H: int, n: int, slot: int
+) -> list[list[tuple[int, int, int, int]]]:
+    """The rows of a balanced sequence per slot, each slot's cut-0 rows first."""
+    padded = _v6_sm90_padded(chunks, n)
+    total = H * padded
+    pieces: list[list[list[int]]] = []
+    for k in range(-(-total // slot)):
+        lo, hi = k * slot, min((k + 1) * slot, total)
+        here = []
+        while lo < hi:
+            head, cut = lo // padded, lo % padded
+            if cut < chunks:
+                here.append([seq, head, cut, -slot])
+            lo = (head + 1) * padded if hi > (head + 1) * padded else hi
+        pieces.append(here)
+    for head in range(H):
+        rows = [r for slot_rows in pieces for r in slot_rows if r[1] == head]
+        first = min((r[2] for r in rows if r[2] > 0), default=None)
+        if first is not None and first < V6_SM90_CUT_MIN:
+            for slot_rows in pieces:
+                slot_rows[:] = [
+                    r for r in slot_rows if not (r[1] == head and r[2] == 0)
+                ]
+            for r in rows:
+                if r[2] == first:
+                    r[2] = 0
+    return [
+        [
+            (r[0], r[1], r[2], r[3])
+            for r in sorted(slot_rows, key=lambda r: 0 if r[2] == 0 else 1)
+        ]
+        for slot_rows in pieces
+    ]
+
+
+def _v6_sm90_row_cost(row: Sequence[int], chunks: int, n: int) -> int:
+    """The modeled cost of a row in chunk steps: its chunks (to the next planned cut for a balanced row), plus
+    V6_SM90_ROW_COST and, after a cut, V6_SM90_WARMUP_COST."""
+    _seq, head, cut, span = row
+    if span < 0:
+        slot, padded = -span, _v6_sm90_padded(chunks, n)
+        at = head * padded + cut
+        end = min((at // slot + 1) * slot - head * padded, chunks)
+        if cut == 0 and end < V6_SM90_CUT_MIN:
+            end = min(end + slot, chunks)
+    else:
+        end = chunks
+    return (
+        max(end - cut, 0) + V6_SM90_ROW_COST + (V6_SM90_WARMUP_COST if cut > 0 else 0)
+    )
+
+
+def v6_sm90_serial_load(chunks: Sequence[int], H: int, sm_count: int) -> int:
+    """The most loaded CTA of the V6 program over the ``N x H`` sequence-major tiles of sequences of ``chunks``
+    chunks, strided over ``min(sm_count, N x H)`` persistent CTAs, in chunk steps (a tile costs its chunks and
+    V6_SM90_ROW_COST)."""
+    tiles = [c + V6_SM90_ROW_COST for c in chunks for _ in range(int(H))]
+    if not tiles:
+        return 0
+    grid = min(int(sm_count), len(tiles))
+    return max(sum(tiles[b::grid]) for b in range(grid))
+
+
+def prefill_v6_sm90_plan(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    total_tokens: int | None = None,
+) -> V6Sm90Plan:
+    """The plan of a V6 split program for the host offsets ``cu_seqlens`` (``N + 1`` integers; ``total_tokens``
+    defaults to the last) on a device of ``sm_count`` SMs (see the rule above)."""
+    H, n, sm_count = int(num_heads), int(num_householder), int(sm_count)
+    if sm_count <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    chunks = v6_sm90_chunks(cu_seqlens, n, total_tokens)
+    slot_of = {q: v6_sm90_slot(c, H, n, sm_count) for q, c in enumerate(chunks)}
+    balanced = sorted(
+        sorted((q for q, s in slot_of.items() if s), key=lambda q: (-chunks[q], q))[
+            : V6_SM90_PLAN_ROWS // 2
+        ]
+    )
+    chosen = set(balanced)
+    whole = [
+        (q, h, 0, chunks[q])
+        for q in range(len(chunks))
+        if q not in chosen
+        for h in range(H)
+    ]
+    slot_rows = {
+        q: _v6_sm90_slot_rows(q, chunks[q], H, n, slot_of[q]) for q in balanced
+    }
+    total_rows = sum(len(r) for q in balanced for r in slot_rows[q]) + len(whole)
+    grid = sm_count if balanced else max(1, min(sm_count, total_rows))
+    lists: list[list[tuple[int, int, int, int]]] = [[] for _ in range(grid)]
+    load = [0] * grid
+    for q in balanced:
+        for k, rows in enumerate(slot_rows[q]):
+            for row in rows:
+                lists[k].append(row)
+                load[k] += _v6_sm90_row_cost(row, chunks[q], n)
+    for b in range(grid):
+        lists[b].sort(key=lambda r: 0 if r[2] == 0 else 1)  # stable: cut-0 rows first
+        if len(lists[b]) > V6_SM90_PLAN_ROWS:
+            raise ValueError(
+                f"CTA {b} of the sm_90a split plan has {len(lists[b])} balanced rows, more than its plan table's "
+                f"{V6_SM90_PLAN_ROWS}"
+            )
+    # each whole-head row, longest first, to the least-loaded CTA (ties to the lower index)
+    heap = [(load[b], b) for b in range(grid)]
+    heapq.heapify(heap)
+    for row in sorted(whole, key=lambda r: -_v6_sm90_row_cost(r, chunks[r[0]], n)):
+        cost = _v6_sm90_row_cost(row, chunks[row[0]], n)
+        least, b = heapq.heappop(heap)
+        lists[b].append(row)
+        load[b] = least + cost
+        heapq.heappush(heap, (load[b], b))
+    offsets = (0, *itertools.accumulate(len(x) for x in lists))
+    most = max(load, default=0)
+    serial = v6_sm90_serial_load(chunks, H, sm_count)
+    return V6Sm90Plan(
+        rows=tuple(r for x in lists for r in x),
+        offsets=offsets,
+        grid=grid,
+        split=bool(balanced) and most < serial,
+        load=most,
+        serial_load=serial,
+    )
+
+
+def v6_sm90_item_words(plan: V6Sm90Plan, cu_seqlens: Sequence[int]) -> tuple[int, ...]:
+    """The int32 words of a V6 split program's item table (formal 9, ``output_slot_indices``): the rows (4 words
+    each), the ``grid + 1`` row offsets, then the planned sequence count ``N`` and the ``N + 1`` host offsets
+    ``cu_seqlens`` the plan was made from (the stale-plan guard)."""
+    cu = [int(c) for c in cu_seqlens]
+    words = [int(w) for row in plan.rows for w in row]
+    words.extend(int(o) for o in plan.offsets)
+    words.extend((len(cu) - 1, *cu))
+    return tuple(words)
+
+
+# ---- END SM90 V6 WARM-UP SPLIT PLAN ----
+
 
 # ---- BLACKWELL V6 LAUNCH PLAN (sm_100a / sm_103a prefill) ----
 # The Blackwell prefill body (``prefill_bw_v6``) runs persistent CTAs over a host item table of rows ``(sequence,
@@ -12232,6 +13089,7 @@ __all__ = [
     "STATE_DTYPES",
     "STATE_STRIDE_ELEMENTS",
     "V6Plan",
+    "V6Sm90Plan",
     "V6_ARCHES",
     "V6_BODY",
     "arch_for_capability",
@@ -12243,6 +13101,8 @@ __all__ = [
     "library_name",
     "load",
     "max_num_tokens",
+    "prefill_batch_body",
+    "prefill_batch_costs",
     "prefill_body_class",
     "prefill_body_classes",
     "prefill_body_costs",
@@ -12251,6 +13111,7 @@ __all__ = [
     "prefill_route_modules",
     "prefill_split_table",
     "prefill_v6_plan",
+    "prefill_v6_sm90_plan",
     "route_applies",
     "route_chunk_steps",
     "route_key",
@@ -12266,6 +13127,8 @@ __all__ = [
     "state_dtype_key",
     "supported_num_householder",
     "v6_householders",
+    "v6_sm90_item_words",
+    "v6_sm90_serial_load",
     "v6_state_form",
     "v6_state_forms",
 ]
