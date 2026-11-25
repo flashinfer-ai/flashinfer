@@ -941,7 +941,9 @@ def test_the_launch_cache_is_bounded(arch):
         fn
         for name, fn in vars(loader).items()
         if callable(getattr(fn, "cache_info", None))
-        and (name.startswith(("_v6_", "v6_split")) or name == "_v6_launch_builds")
+        and name.startswith(("_v6_", "v6_split"))
+        # the programs of a state form: per-process constants
+        and name != "_v6_launch_builds"
     ]
     assert memo and all(fn.cache_info().currsize == 0 for fn in memo), [
         fn.__name__ for fn in memo if fn.cache_info().currsize

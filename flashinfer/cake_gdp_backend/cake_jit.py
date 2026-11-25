@@ -18120,7 +18120,7 @@ class V6Launch(NamedTuple):
 
 def clear_plan_caches() -> None:
     """Empty every cache of the Blackwell launch planner: the launches, the plans and the chooser's memo tables (the
-    native library stays loaded)."""
+    native library and the programs of each state form, ``_v6_launch_builds``, stay)."""
     _V6_PLANS.clear()
     _V6_LAUNCHES.clear()
     for fn in (
@@ -18134,7 +18134,6 @@ def clear_plan_caches() -> None:
         _v6_cut_rows,
         _v6_cut_flags,
         _v6_head_rows,
-        _v6_launch_builds,
     ):
         fn.cache_clear()
 

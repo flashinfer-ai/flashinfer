@@ -2105,11 +2105,11 @@ def _run_hopper_pool(
 
 # ---- the item tables of the persistent programs (the SM90 split items, the Blackwell rows) ----
 
-# Item buffers on the device, by (device, content).  An eager call uploads a new table on a private copy stream and
-# waits for that copy alone (a few KB; the compute stream is not synchronized), then keeps the table in a small LRU.
-# The buffer is allocated on the copy stream that writes it (a block a pending kernel of another stream still reads
-# is never handed to the copy) and every eager use records its stream on it (the block is not reused before the
-# kernels of that stream that read it are done);
+# Item buffers on the device, by (device, content).  An eager call copies a new table from host memory on a private
+# copy stream (a non-blocking stream: the compute stream is not synchronized) and waits for that copy alone (a few
+# KB), then keeps the table in a small LRU.  The buffer is allocated on the copy stream that writes it (a block a
+# pending kernel of another stream still reads is never handed to the copy) and every eager use records its stream
+# on it (the block is not reused before the kernels of that stream that read it are done);
 # a CUDA graph captured after an eager call of the same batch (the usual warm-up) reuses that complete table, so the
 # graph holds no copy, and the table is then kept for the life of the process (the graph reads it at every replay).
 # A table first seen during capture is copied inside the graph from a pinned buffer; both are kept as long as the
@@ -2153,14 +2153,14 @@ def _item_table_and_zeros(key: bytes, device: torch.device, zero_bytes: int):
         return _item_table(None, device, key=key), None
     n, z = len(key) // 4, zero_bytes // 4
     at = -(-n // 64) * 64  # the zeros start 256-byte aligned
-    pinned = torch.empty((at + z,), dtype=torch.int32, pin_memory=True)
-    ctypes.memmove(pinned.data_ptr(), key, len(key))
-    ctypes.memset(pinned.data_ptr() + len(key), 0, 4 * (at + z) - len(key))
+    words = bytearray(4 * (at + z))  # zero filled
+    words[: len(key)] = key
+    host = torch.frombuffer(words, dtype=torch.int32)
     stream = torch.cuda.current_stream(device)
     copy = _copy_stream(index, device)
     with torch.cuda.stream(copy):
         upload = torch.empty((at + z,), dtype=torch.int32, device=device)
-        upload.copy_(pinned, non_blocking=True)
+        upload.copy_(host, non_blocking=True)
     copy.synchronize()  # the table and the zeros are complete before any stream reads them
     # the call's kernel reads the table and writes the zeros on its stream
     upload.record_stream(stream)
@@ -2178,9 +2178,10 @@ def _item_table(
     key: Optional[bytes] = None,
 ) -> torch.Tensor:
     """The int32 ``items`` buffer ``words`` (the flat split items on SM90) on ``device`` (read only): a cached
-    complete buffer, else an upload from pinned host memory (a pageable copy would synchronize the compute stream,
-    which CUDA Graph capture refuses).  ``key`` is the bytes of ``words`` as int32 when the caller has them already;
-    ``words`` None reads the words from ``key`` (the item words of ``prefill_v6_launch`` on SM100 / SM103)."""
+    complete buffer, else an upload on the copy stream (under CUDA Graph capture, which refuses a pageable copy on
+    the capturing stream, a copy in the graph from pinned host memory).  ``key`` is the bytes of ``words`` as int32
+    when the caller has them already; ``words`` None reads the words from ``key`` (the item words of
+    ``prefill_v6_launch`` on SM100 / SM103)."""
 
     host = None
     if key is None:
@@ -2219,11 +2220,12 @@ def _item_table(
         _ITEM_TABLES_EAGER.move_to_end(cache_key)
         table.record_stream(stream)
         return table
-    pinned = pinned_words()
+    if host is None:
+        host = torch.frombuffer(bytearray(key), dtype=torch.int32)
     copy = _copy_stream(index, device)
     with torch.cuda.stream(copy):
-        table = torch.empty((pinned.numel(),), dtype=torch.int32, device=device)
-        table.copy_(pinned, non_blocking=True)
+        table = torch.empty((host.numel(),), dtype=torch.int32, device=device)
+        table.copy_(host, non_blocking=True)  # pageable: staged before the call returns
     copy.synchronize()  # the table is complete before any stream reads it
     table.record_stream(stream)
     _ITEM_TABLES_EAGER[cache_key] = table
