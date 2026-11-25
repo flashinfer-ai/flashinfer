@@ -81,11 +81,14 @@ def _quant_pt(x, recipe=None):
     return codes, sf, s, _dq(codes, sf, s[:, None])
 
 
-def _model(gated, experts=E, seed=0):
+def _model(gated, experts=E, seed=0, hidden=H, inter=I):
     torch.manual_seed(seed)
     act = ActivationType.Swiglu if gated else ActivationType.Relu2
     m = {"act": act, "gated": gated}
-    for name, rows, cols in (("w1", I * (2 if gated else 1), H), ("w2", H, I)):
+    for name, rows, cols in (
+        ("w1", inter * (2 if gated else 1), hidden),
+        ("w2", hidden, inter),
+    ):
         w = torch.randn(experts, rows, cols, device="cuda") / 10
         gs = 448 * 6 / w.abs().amax((1, 2))
         q = [_quant(w[e].bfloat16(), gs[e : e + 1]) for e in range(experts)]
@@ -96,7 +99,8 @@ def _model(gated, experts=E, seed=0):
     rec = prepare_records_nvfp4_weights(
         m["w1"], m["w1_sf"].view(torch.float8_e4m3fn), m["w1_g"],
         m["w2"], m["w2_sf"].view(torch.float8_e4m3fn), m["w2_g"],
-        num_local_experts=experts, hidden_size=H, intermediate_size=I, activation_type=act,
+        num_local_experts=experts, hidden_size=hidden, intermediate_size=inter,
+        activation_type=act,
     )  # fmt: skip
     m["r1"], m["r2"] = rec["w1"], rec["w2"]
     return m
@@ -309,6 +313,21 @@ def test_per_token(recipe, gated, tokens):
     with pytest.raises(ValueError, match="contiguous"):  # GEMM2's, before the prep's
         _trt(m, x, base, *args, per_token_scale=written.fill_(-1), output=wide[:, ::2])
     assert written.eq(-1).all()
+    if (
+        not gated
+    ):  # GEMM1's LoRA delta (gated only) and row_quant's I (at most 16384) too
+        lora = torch.zeros(tokens, K, 2 * I, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="gated"):
+            _trt(m, x, base, *args, per_token_scale=written, gemm1_lora_delta=lora)
+        big = _model(False, experts=2, hidden=128, inter=16400)
+        ids2, weights2 = _routing(tokens, experts=2)
+        with pytest.raises(ValueError, match="at most 16384"):
+            _trt(
+                big, x[:, :128].contiguous(), base, ids2, weights2,
+                torch.ones(2, device="cuda"), big["w1_g"], big["w2_g"], inter=16400,
+                num_experts=2, per_token_scale=written, nvfp4_4over6=recipe,
+            )  # fmt: skip
+        assert written.eq(-1).all()
     if recipe:  # the recipe reached the kernels
         std = _trt(m, codes, sf8, *args, per_token_scale=s, nvfp4_4over6=None)[0]
         assert not torch.equal(std, out)
@@ -561,6 +580,8 @@ def test_fc2_input_out():
     wide = torch.empty(tokens, 2 * H, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="contiguous"):  # GEMM2's, before row_quant's
         run(bad, output=wide[:, ::2])
+    with pytest.raises(ValueError, match="three tensors"):  # SM100's
+        run(bad + [bad[2].clone()])
     assert all(t.eq(9).all() for t in bad)
     bad[2] = bad[2].cpu()  # one off the device
     with pytest.raises(ValueError, match="input's device"):
@@ -759,6 +780,12 @@ def test_mxfp4_fp8_per_tensor(gated, tokens):
     s1 = q2 * a1 if gated else q2.repeat(E)  # SM100's: gated over the gate half's alpha
     trt = _trt(m, x8, None, ids, weights, s1, a1, a2)[0]
     torch.testing.assert_close(trt, out, atol=0, rtol=0)
+    if not gated:  # one for all experts
+        one = _trt(m, x8, None, ids, weights, q2, a1, a2)[0]
+        torch.testing.assert_close(one, out, atol=0, rtol=0)
+    for bad in (s1[:2], s1[:, None]):  # SM100's [local_num_experts]
+        with pytest.raises(ValueError, match="output1_scale_scalar"):
+            _trt(m, x8, None, ids, weights, bad, a1, a2)
 
 
 @pytest.mark.parametrize("gated,split", MX_MODELS)
@@ -783,8 +810,8 @@ def test_mxfp4_w4a16(gated, split):
 
 
 def test_mxfp4_scale_layouts():
-    """Strided weight scales prepare as their contiguous copy; halves whose powers of two
-    leave an FP32 ratio raise."""
+    """Strided weight scales prepare as their contiguous copy; halves 2^128 apart each take
+    their own global scale."""
     m = _mx_model(True, True)
     sizes = dict(num_local_experts=E, hidden_size=H, intermediate_size=I)
 
@@ -799,10 +826,65 @@ def test_mxfp4_scale_layouts():
         torch.testing.assert_close(a, b, atol=0, rtol=0)
     s1 = m["w1_sf"].clone()
     s1[:, :I], s1[:, I:] = 254, 126  # 2^128 apart
-    with pytest.raises(ValueError, match="FP32 ratio"):
-        prepare(s1)
+    g = list(prepare(s1))[1]
+    assert g.shape == (E, 2) and g.isfinite().all() and (g > 0).all()
     with pytest.raises(ValueError, match="must be uint8"):
         prepare(m["w1_sf"].bool())
+
+
+@pytest.mark.parametrize("mode", ["w4a16", "mxfp8", "per_token"])
+def test_mxfp4_split_range(mode):
+    """Gated halves 120 binades apart, the gate's above: the linear half runs under its own
+    global scale from its first product, as in the expert whose gate shares its scale (the
+    gate's inputs zero, its bias 1 in output units, so both run the same activation)."""
+    torch.manual_seed(0)
+    act, tokens = ActivationType.Swiglu, 37
+    w1 = torch.randint(256, (E, 2 * I, H // 2), dtype=torch.uint8, device="cuda")
+    w1[:, I:, 16:] = 0  # the gate half: its first block only
+    w2 = torch.randint(256, (E, H, I // 2), dtype=torch.uint8, device="cuda")
+    s2 = torch.randint(118, 124, (E, H, I // 32), dtype=torch.uint8, device="cuda")
+    models = []
+    for top in (247, 127):  # the gate's block 2^120, else as the linear half's
+        s1 = torch.full((E, 2 * I, H // 32), 127, dtype=torch.uint8, device="cuda")
+        s1[:, I:, 0] = top
+        rec = prepare_records_mxfp4_weights(
+            w1, s1, w2, s2, num_local_experts=E, hidden_size=H, intermediate_size=I,
+            activation_type=act,
+        )  # fmt: skip
+        names = ("r1", "w1_g", "r2", "w2_g")
+        models.append(
+            {
+                "w1": w1,
+                "w2": w2,
+                "act": act,
+                **dict(zip(names, rec.values(), strict=True)),
+            }
+        )
+    split, joint = models
+    assert split["w1_g"].shape == (E, 2) and joint["w1_g"].shape == (E,)
+    assert torch.equal(split["w1_g"][:, 0], joint["w1_g"])  # the linear half's
+    x = (torch.randn(tokens, H, device="cuda") * 1024).bfloat16()
+    x[:, :32] = 0  # the gate's inputs
+    ids, weights = _routing(tokens)
+    outs = []
+    for m in models:
+        gate = m["w1_g"].view(E, -1)[:, -1]
+        b1 = torch.zeros(E, 2 * I, device="cuda")
+        # 1 in output units: per token the bias runs under the gate's global scale
+        b1[:, I:] = 1 / gate[:, None] if mode == "per_token" else 1
+        kw = {}
+        if mode == "w4a16":
+            args = (x, None, ids, weights, None)
+        elif mode == "mxfp8":
+            codes, sf, _ = _mxfp8(x)
+            args = (codes.view(torch.float8_e4m3fn), sf, ids, weights, None)
+        else:
+            args = (x, _base(), ids, weights, gate)
+            kw["per_token_scale"] = torch.empty(tokens, device="cuda")
+        out = _trt(m, *args, m["w1_g"], m["w2_g"], gemm1_bias=b1, **kw)[0]
+        outs.append(out)
+    assert outs[1].isfinite().all() and outs[1].abs().amax() > 0
+    torch.testing.assert_close(outs[0], outs[1], atol=0, rtol=0)
 
 
 def test_zero_tokens():

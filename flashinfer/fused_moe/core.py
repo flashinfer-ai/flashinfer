@@ -2314,7 +2314,7 @@ class _RecordsExt:
     activation; ``rw`` [tokens, top_k] GEMM1's output times its routing weight (FP32, BF16 or
     FP16); ``act_out``
     BF16 [tokens * top_k, I] receives the activation (before ``rw``); ``up`` FP32 [E] the gated
-    linear half's alpha over alpha1 (alpha1 [E, 2]); ``fc2_out`` per token SM100's
+    linear half's own alpha (alpha1 [E, 2]); ``fc2_out`` per token SM100's
     ``fc2_input_out`` as uint8 [entries, I' / 2], [entries, I' / 16] and FP32 [entries] (I' >= I;
     not in the key: the autotuner's runs drop it); ``x_fmt`` 1, 2, 3 an MXFP8, FP8 (its scale in
     alpha1) or MXFP4 ``x`` (uint8) under E8M0 ``x_scale`` per 32, restored by the prep; ``fq`` 1,
@@ -2461,7 +2461,9 @@ def _w4a16_moe_sm80(
     if alpha1.numel() == 2 * num_experts:  # [E, 2]: linear then gate half (w1's rows)
         if not gated:
             raise ValueError("alpha1 [E, 2] takes a gated activation.")
-        up = alpha1[:, 0] / alpha1[:, 1]
+        # each half its own alpha, over alpha_den as the prep divides the gate's
+        den1 = None if ext is None or ext.alpha_den is None else ext.alpha_den[0]
+        up = alpha1[:, 0].contiguous() if den1 is None else alpha1[:, 0] / den1
         alpha1 = alpha1[:, 1].contiguous()
         ext = replace(ext or _RecordsExt(ActivationType.Swiglu), up=up)
     # 16-bit input under per-expert global scales: quantized per entry, GEMM1 reading entry rows
@@ -2509,6 +2511,11 @@ def _w4a16_moe_sm80(
         # The prep (per_token_scale) or row_quant (fc2_out) writes the caller's tensors before
         # the GEMMs check theirs: those checks first.
         e = ext or _RecordsExt(0)
+        if inter % (32 if e.fq else 16) or inter > 16384:  # row_mx's, row_quant's
+            raise ValueError(
+                "Below SM100 per token the intermediate size is a multiple of 16 (an MX or "
+                "FP8 GEMM2 input: 32) of at most 16384."
+            )
         scales: List[Tuple[Optional[torch.Tensor], Tuple[int, ...]]] = [
             (fc2_scale, (1, num_experts)), (fc2_den, (1,)),
             *((t, (1, num_experts)) for t in e.params),
@@ -2880,7 +2887,8 @@ def _trtllm_fp4_records_moe(
             "wide: its leading columns); no workspace_buffer or routing_metadata."
         )
     if fo is not None and (  # SM100's checks
-        pt is None or a.get("_nfse") or inter % 16
+        not isinstance(fo, (tuple, list)) or len(fo) != 3
+        or pt is None or a.get("_nfse") or inter % 16
         or any(not t.is_contiguous() or t.dim() < 2 or t.shape[0] < tokens
                or t.shape[1] != top_k for t in fo)
         or (fo[0].dtype, fo[0].shape[2:]) != (torch.uint8, (inter // 2,)) or fo[0].data_ptr() % 8
@@ -2889,9 +2897,9 @@ def _trtllm_fp4_records_moe(
     ):  # fmt: skip
         raise ValueError(
             "fc2_input_out takes per_token_scale without fused shared experts or routing "
-            "metadata: uint8 codes [>= num_tokens, top_k, intermediate_size / 2] (8 B aligned), "
-            "E4M3 or uint8 block scales [..., intermediate_size / 16], FP32 token scales "
-            "[>= num_tokens, top_k], contiguous."
+            "metadata, three tensors: uint8 codes [>= num_tokens, top_k, intermediate_size / "
+            "2] (8 B aligned), E4M3 or uint8 block scales [..., intermediate_size / 16], FP32 "
+            "token scales [>= num_tokens, top_k], contiguous."
         )
     # localized_* (per-domain copies of the weights passed in full) only steer the SM100 kernels.
     if a["local_expert_offset"]:  # local ids; the other ranks' are skipped
@@ -2912,11 +2920,17 @@ def _trtllm_fp4_records_moe(
             x_scale = x_scale[:, : hv // (16 if nv else 32)].contiguous()
     # GEMM2's input under s1, gated (but SiTU, or with dens) over the gate half's s_gate
     sit = gated and act != ActivationType.Situ and dens is None
-    inv = None  # FP8 GEMM2 input
-    if fp8 and s1 is not None:
-        inv = (
-            s1.float() / s_gate.view(s_gate.shape[0], -1)[:, -1] if sit else s1.float()
+    experts = r1.shape[0]
+    if s1 is not None and (s1.dim() > 1 or s1.numel() not in (1, experts)):
+        raise ValueError(  # SM100's [local_num_experts], or one for all
+            f"output1_scale_scalar must be [num_experts] or [1], got {tuple(s1.shape)}."
         )
+    inv = None  # FP8 GEMM2 input, per expert
+    if fp8 and s1 is not None:
+        inv = s1.float().expand(experts)
+        inv = (
+            inv / s_gate.view(s_gate.shape[0], -1)[:, -1] if sit else inv
+        ).contiguous()
     if fp8 and x_scale is None:  # per tensor: the codes stand in for the unread scales
         x_scale = x
 
@@ -2932,14 +2946,15 @@ def _trtllm_fp4_records_moe(
         out = x.new_empty(
             tokens, hv, dtype=torch.bfloat16 if narrow is None else narrow.dtype
         )
-    experts, inf, g = r1.shape[0], float("inf"), 2 if gated else 1
+    inf, g = float("inf"), 2 if gated else 1
     lora, act_out = a.get("gemm1_lora_delta"), None
     if lora is not None:  # the routed slots: fused shared experts last, no delta
         nfse = a.get("_nfse") or 0
         shape = (tokens, top_k - nfse, 2 * inter)  # as SM100's launcher
-        if lora.dtype != torch.bfloat16 or lora.shape != shape:
-            raise ValueError(
-                "gemm1_lora_delta must be BF16 [num_tokens, top_k, 2 * intermediate_size]."
+        if not gated or lora.dtype != torch.bfloat16 or lora.shape != shape:
+            raise ValueError(  # below SM100 GEMM1's gated epilogue adds it
+                "gemm1_lora_delta takes a gated activation, BF16 [num_tokens, top_k, 2 * "
+                "intermediate_size]."
             )
         lora = torch.nn.functional.pad(lora, (0, 0, 0, nfse))
         lora = valid(lora.flatten(0, 1), iv, g)

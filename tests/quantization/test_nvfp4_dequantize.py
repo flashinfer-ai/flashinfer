@@ -99,3 +99,67 @@ def test_nvfp4_dequantize_native_finite_pairs(layout, global_scale):
     torch.testing.assert_close(
         actual.view(torch.int32), expected.view(torch.int32), rtol=0, atol=0
     )
+
+
+def _swizzle(scales, layout):
+    # Tile as the 128x4 or 8x4 layout does, padding with NaN (E4M3) or Inf (UE8M0).
+    rows = 128 if layout == "128x4" else 8
+    m, k = scales.shape
+    padded = torch.full((-(-m // rows) * rows, -(-k // 4) * 4), 0xFF, dtype=torch.uint8)
+    padded[:m, :k] = scales
+    if layout == "128x4":
+        tiles = padded.reshape(-1, 4, 32, padded.shape[1] // 4, 4).permute(
+            0, 3, 2, 1, 4
+        )
+    else:
+        tiles = padded.reshape(-1, 8, padded.shape[1] // 4, 4).permute(0, 2, 1, 3)
+    return tiles.contiguous().flatten()
+
+
+_SM80 = "flashinfer.quantization.fp4_quantization.get_compute_capability"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("layout", ["128x4", "8x4"])
+@pytest.mark.parametrize("ufp8_type", [0, 1])
+def test_fp4_dequantize_sm80_swizzled_matches_linear(monkeypatch, layout, ufp8_type):
+    # SM80 to SM89 dequantize both layouts alike, under the host op's contract:
+    # the global scale applies to E4M3 scales only (UE8M0 byte 255 is Inf).
+    monkeypatch.setattr(_SM80, lambda device: (8, 0))
+    sf_vec_size = 32 if ufp8_type == 0 else 16
+    scales = torch.tensor([[0, 1, 127, 254, 255]] * 3, dtype=torch.uint8)
+    packed = torch.arange(3 * 5 * sf_vec_size // 2).remainder(256).to(torch.uint8)
+    packed = packed.view(3, -1)
+    kwargs = dict(sf_vec_size=sf_vec_size, ufp8_type=ufp8_type)
+    global_scale = torch.tensor([2.0])
+    linear = e2m1_and_ufp8sf_scale_to_float(
+        packed, scales, global_scale, is_sf_swizzled_layout=False, **kwargs
+    )
+    swizzled = e2m1_and_ufp8sf_scale_to_float(
+        packed,
+        _swizzle(scales, layout),
+        global_scale,
+        is_sf_8x4_layout=layout == "8x4",
+        **kwargs,
+    )
+    torch.testing.assert_close(
+        swizzled.view(torch.int32), linear.view(torch.int32), rtol=0, atol=0
+    )
+    if ufp8_type == 0:
+        # E2M1 1.0 under scale byte 127 and 2.0 under 255, the global scale unused
+        assert linear[0, [65, 129]].tolist() == [1.0, math.inf]
+
+
+@pytest.mark.cpu_only
+def test_fp4_dequantize_sm80_swizzled_global_scale(monkeypatch):
+    # The global scale is read as its value: FP64 is not read as FP32 bits,
+    # and an empty tensor is refused.
+    monkeypatch.setattr(_SM80, lambda device: (8, 0))
+    packed = torch.full((1, 8), 0x22, dtype=torch.uint8)  # E2M1 1.0s
+    scales = _swizzle(torch.tensor([[0x38]], dtype=torch.uint8), "128x4")  # E4M3 1.0
+    out = e2m1_and_ufp8sf_scale_to_float(
+        packed, scales, torch.tensor([2.0], dtype=torch.float64)
+    )
+    assert out.eq(2.0).all()
+    with pytest.raises(RuntimeError):
+        e2m1_and_ufp8sf_scale_to_float(packed, scales, torch.empty(0))

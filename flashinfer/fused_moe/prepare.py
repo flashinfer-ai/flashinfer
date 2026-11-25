@@ -2497,9 +2497,8 @@ def prepare_records_mxfp4_weights(
     the expert's power of two going to the FP32 ``w1_global_scale`` ([E], or [E, 2] up then gate
     when a gated expert's halves need their own) and ``w2_global_scale`` [E] that scale the GEMMs
     as NVFP4's global scales do. All-zero blocks hold no scale; an expert whose other blocks span
-    more than 30 binades raises, and so do halves whose powers of two leave an FP32 ratio. BF16
-    activations restore all 30 binades exactly; FP16 ones restore the top 24 exactly and round
-    blocks further below to FP16 subnormals.
+    more than 30 binades raises. BF16 activations restore all 30 binades exactly; FP16 ones
+    restore the top 24 exactly and round blocks further below to FP16 subnormals.
 
     Parameters
     ----------
@@ -2552,12 +2551,6 @@ def prepare_records_mxfp4_weights(
         # An all-zero half's records are zeros under any alpha: it takes the other's
         nz = (w1.view(torch.uint8) & 0x77).view(experts, 2, -1).amax(-1).bool()
         a1 = torch.where(nz, a1, a1.flip(-1))
-        ratio = a1[:, 0] / a1[:, 1]  # the kernels scale the up half by it in FP32
-        if not ((ratio > 0) & ratio.isfinite()).all():
-            raise ValueError(
-                "records MXFP4: an expert's up and gate halves are too far apart for an "
-                "FP32 ratio of their scales (2^-149 to 2^127)."
-            ) from None
     u2, a2 = _mxfp4_records_u5(w2, s2, 1)
     return {
         "w1": _w4a16_records(w1, u1, gated, u5=True),

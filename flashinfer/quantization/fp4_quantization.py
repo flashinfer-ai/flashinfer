@@ -1562,7 +1562,23 @@ def e2m1_and_ufp8sf_scale_to_float(
     major, minor = get_compute_capability(
         torch.device("cuda:0")
     )  # select any cuda device to get a compute capability
-    if major * 10 + minor < 90 and (major < 8 or not is_sf_swizzled_layout):
+    if major * 10 + minor < 90:
+        if major >= 8 and ufp8_type != 1:
+            # SM80 to SM89 dequantize both layouts here under the host op's
+            # contract, which applies the global scale to E4M3 scales only.
+            global_scale_tensor = None
+        if major >= 8 and is_sf_swizzled_layout:
+            # Untile the 128x4 or 8x4 scales into rows for the fallback.
+            rows = 8 if is_sf_8x4_layout else 128
+            m, sf_cols = e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2 // sf_vec_size
+            m_pad, cols_pad = round_up(m, rows), round_up(sf_cols, 4)
+            tile = (8, 4) if is_sf_8x4_layout else (32, 4, 4)
+            ufp8_scale_tensor = (
+                ufp8_scale_tensor.reshape(m_pad // rows, cols_pad // 4, *tile)
+                .transpose(1, 2 if is_sf_8x4_layout else 3)
+                .reshape(m_pad, cols_pad)[:m, :sf_cols]
+            )
+            is_sf_swizzled_layout = False
         # No kernel available; use pure-PyTorch fallback
         return _e2m1_and_ufp8sf_scale_to_float_cpu(
             e2m1_tensor,
@@ -2772,7 +2788,8 @@ def nvfp4_kv_quantize(
     ----------
     input : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype bf16 or fp16; ``K``
-        must be divisible by 16.
+        must be divisible by 16. It must be contiguous with a 4-byte aligned
+        data pointer; copy an offset view with ``input.clone()``.
     global_scale : torch.Tensor
         Global scale factor of shape ``[1]`` with dtype ``float32``, on the
         same CUDA device as ``input``.
@@ -2788,10 +2805,29 @@ def nvfp4_kv_quantize(
     M, K = input.shape
     if K % _NVFP4_BLOCK_SIZE != 0:
         raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
+    # The SM80-SM90 path: its kernel reads one float32 global scale and loads the
+    # input in 4-byte element pairs, which the module does not check.
+    sw_cvt = input.is_cuda and get_compute_capability(input.device)[0] < 10
+    if sw_cvt:
+        if input.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"input must have dtype torch.float16 or torch.bfloat16, got {input.dtype}"
+            )
+        if global_scale.dtype != torch.float32 or global_scale.numel() != 1:
+            raise ValueError("global_scale must be a float32 tensor with one element")
+        if global_scale.device != input.device:
+            raise ValueError("global_scale must be on the same device as input")
+        if input.data_ptr() % 4 != 0:
+            raise ValueError(
+                "input must be 4-byte aligned; copy an offset view with input.clone()"
+            )
     fp4_output = torch.empty((M, K // 2), dtype=torch.uint8, device=input.device)
     block_scales = torch.empty(
         (M, K // _NVFP4_BLOCK_SIZE), dtype=torch.uint8, device=input.device
     )
+    if sw_cvt and M == 0:
+        # No rows: the module would launch an empty grid.
+        return fp4_output, block_scales
     get_fp4_kv_quantization_module().nvfp4_kv_quant(
         input, global_scale, fp4_output, block_scales
     )

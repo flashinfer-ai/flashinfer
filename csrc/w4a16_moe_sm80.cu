@@ -238,7 +238,7 @@ struct GemmExt {
   const void* rw;             // GEMM1: [tokens x top_k] routing weights, XT if rw16
   bool rw16;
   __nv_bfloat16* act_out;  // GEMM1: [tokens x top_k][Nout] the activation (before rw), or null
-  const float* up;         // gated GEMM1: [E] the linear half's alpha over alpha[e], or null
+  const float* up;         // gated GEMM1: [E] the linear half's own alpha, or null (alpha's)
 };
 #ifdef RECORDS_ACT
 constexpr int kAct = RECORDS_ACT;
@@ -805,10 +805,9 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
   [[maybe_unused]] auto ext_act = [&](auto b, float3 q, int r, int i, float g, float u) {
     const GemmExt& x = ext_dep(p, b).x;
     const int e = p.block_expert[b], n = p.Nout, f = p.rowmap[b * R + r];
-    if constexpr (ACT == 1) {
-      const float ru = x.up ? x.up[e] : 1.f;  // the linear half's own alpha
+    if constexpr (ACT == 1) {  // u under the linear half's own alpha (ext_up), as its bias
       g += ext_bias(x, p.alpha, e, (2L * e + 1) * n + i);
-      u = u * ru + ext_bias(x, p.alpha, e, 2L * e * n + i) * (x.bias_alpha ? ru : 1.f);
+      u += ext_bias(x, x.up ? x.up : p.alpha, e, 2L * e * n + i);
       if (x.lora && f >= 0) {
         g += __bfloat162float(x.lora[(2L * f + 1) * n + i]);
         u += __bfloat162float(x.lora[2L * f * n + i]);
@@ -827,6 +826,13 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
   [[maybe_unused]] auto ext_q_of = [&](auto b) {
     return ext_q(ext_dep(p, b).x, p.alpha, p.block_expert[b]);
   };
+  // Gated: the linear half's alpha, applied from the first product (a gate alpha far above it
+  // would overflow the half's products before any ratio of the two).
+  [[maybe_unused]] auto ext_up = [&](auto b) {
+    const GemmExt& x = ext_dep(p, b).x;
+    const int e = p.block_expert[b];
+    return x.up ? x.up[e] : p.alpha[e];
+  };
 
   // Writes one tile from per-lane fp32 values v[SC][G][4] (summed over k);
   // gemm's mapping with record warp slot ws = wc SC + s in place of the warp
@@ -836,6 +842,12 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
     const int Nout = p.Nout;
     [[maybe_unused]] float3 prm{};  // kExt GEMM1: the activation's parameters
     if constexpr (kExt && ACT != 0) prm = ext_q_of(b);
+    // kExt gated: the halves' own alphas (per token the row scales hold s_t alone)
+    [[maybe_unused]] float ga = 0.f, ua = 0.f;
+    if constexpr (kExt && ACT == 1) {
+      ga = p.alpha[p.block_expert[b]];
+      ua = ext_up(b);
+    }
     // R 8 GEMM1 with SiLU or relu2 on SM8x: rows at or past the block's row
     // count are padding that GEMM2 zero-fills on load, so they are not stored.
     constexpr bool kSkipPad = !kSm90 && R == 8 && ACT != 0;
@@ -912,16 +924,17 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
         const int r0 = wt * TW + gi * 8 + 2 * tq;
         if constexpr (ACT == 1) {
           const int i = c * NC * 64 + ws * 8 + g8;
-          [[maybe_unused]] float2 rs;  // PT: rows r0 and r0 + 1's alpha s_t
+          [[maybe_unused]] float2 rs;  // PT: rows r0 and r0 + 1's alpha s_t (kExt: s_t)
           if constexpr (PT) rs = reinterpret_cast<const float2*>(smem + kRing)[r0 / 2];
           if (i < Nout) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
               if (kSkipPad && r0 + h >= prows) continue;  // padding row
-              float gt = v[s][gi][h] * a, up = v[s][gi][2 + h] * a;
+              float gt = v[s][gi][h] * a, up = v[s][gi][2 + h] * (kExt ? ua * 128.f : a);
               if constexpr (PT) {  // the reference's BF16 GEMM1 outputs, as relu2's below
-                gt = x_round(mul_ftz(v[s][gi][h] * 128.f, h ? rs.y : rs.x));
-                up = x_round(mul_ftz(v[s][gi][2 + h] * 128.f, h ? rs.y : rs.x));
+                const float st = h ? rs.y : rs.x;
+                gt = x_round(mul_ftz(v[s][gi][h] * 128.f, kExt ? mul_ftz(ga, st) : st));
+                up = x_round(mul_ftz(v[s][gi][2 + h] * 128.f, kExt ? mul_ftz(ua, st) : st));
               }
               float y;
               if constexpr (kExt)
@@ -1002,6 +1015,8 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
       const int Nout = p.Nout, col0 = c * FC;
       [[maybe_unused]] float3 prm{};  // kExt: the activation's parameters
       if constexpr (kExt) prm = ext_q_of(b);
+      [[maybe_unused]] float au = a;  // kExt gated: the linear half's own, as write_tile's
+      if constexpr (kExt && ACT == 1) au = ext_up(b) * 128.f;
       // Loaded ahead of the barriers, which they would otherwise follow.
       const float num = p.fq_num[e * p.fq_num_stride];
       const float den = p.fq_den ? p.fq_den[e * p.fq_den_stride] : 1.f;
@@ -1019,7 +1034,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
         XT2 yb;
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          const float gt = x_round(v[0][0][h] * a), up = x_round(v[0][0][2 + h] * a);
+          const float gt = x_round(v[0][0][h] * a), up = x_round(v[0][0][2 + h] * au);
           float y;
           if constexpr (kExt)
             y = col0 + i < Nout ? ext_act(b, prm, 2 * tq + h, col0 + i, gt, up) : 0.f;
@@ -1070,7 +1085,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
             const int i = ws * 8 + g8;
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-              const float gt = x_round(v[s][gi][h] * a), up = x_round(v[s][gi][2 + h] * a);
+              const float gt = x_round(v[s][gi][h] * a), up = x_round(v[s][gi][2 + h] * au);
               float y;
               if constexpr (kExt)
                 y = col0 + i < Nout ? ext_act(b, prm, r0 + h, col0 + i, gt, up) : 0.f;
@@ -1262,12 +1277,13 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
     flashinfer::cp_async::commit_group();
   }
   if constexpr (PT && ACT) {
-    // GEMM1's row scales, the reference's FTZ alpha s_t (padding rows 0), read by write_tile past
-    // the k loop's barriers
+    // GEMM1's row scales, the reference's FTZ alpha s_t (padding rows 0; kExt gated: s_t, each
+    // half its own alpha), read by write_tile past the k loop's barriers
     if (has_act && aq == 0)
 #pragma unroll
       for (int j = 0; j < RJ; ++j)
-        reinterpret_cast<float*>(smem + kRing)[ar + RP * j] = mul_ftz(pt_a, pt_s[j]);
+        reinterpret_cast<float*>(smem + kRing)[ar + RP * j] =
+            kExt && ACT == 1 ? pt_s[j] : mul_ftz(pt_a, pt_s[j]);
   }
   uint32_t cslot = 0;
   const int tile = blockIdx.x;
