@@ -1,5 +1,6 @@
 """Staging parity and preparation helpers under CUDA graph replay."""
 
+import dataclasses
 import gc
 from types import SimpleNamespace
 
@@ -100,6 +101,37 @@ def test_mxfp8_eplb_staging_masks_invalid_slots(monkeypatch):
             expected_tensor[:rows].view(torch.uint8),
         )
     assert routing.expert_load.tolist() == [0, 0, 0, 3, 0, 0, 2, 0]
+
+    # Prefix views share the original addresses and strides, but the active
+    # range of logical experts changes.
+    logical.fill_(4)
+    table[4, 0] = 1
+    short_routing = dataclasses.replace(
+        routing,
+        logical_to_physical_map=table[:2],
+        logical_replica_count=counts[:2],
+    )
+    for tables, expert in ((routing, 1), (short_routing, -1), (routing, 1)):
+        routing.expert_load.zero_()
+        stage_mega_moe_inputs(
+            activations,
+            weights,
+            logical,
+            *actual,
+            kind="mxfp4_mxfp8",
+            eplb_tables=tables._tensors(),
+        )
+        assert (actual[2][:rows] == expert).all()
+        assert routing.expert_load.tolist() == [
+            0,
+            (rows - 1) * topk if expert >= 0 else 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])

@@ -693,7 +693,7 @@ def fused_quant_stage(
         norm_const,
         scale_multiplier,
         stream,
-        *(t.data_ptr() for t in eplb_tables or ()),
+        *((t.data_ptr(), t.shape) for t in eplb_tables or ()),
     )
     if stager.compiled is None or stager.launch_key != launch_key:
         import cutlass
