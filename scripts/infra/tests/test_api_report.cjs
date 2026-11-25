@@ -34,7 +34,8 @@ test("mixed sticky report lists changes without impact prose", () => {
     head: "a".repeat(40),
     maintainers: ["alice"],
   });
-  assert.match(text, /BLOCKED.*2 breaking.*2 likely breaking.*1 non-breaking/);
+  assert.match(text, /BLOCKED.*2 breaking.*2 likely breaking/);
+  assert.doesNotMatch(text, /non-breaking/);
   assert.match(text, /🚨 API BREAK 🚨 · 2/);
   assert.match(text, /⚠️ API LIKELY BREAK · 2/);
   assert.match(text, /Maintainers @alice can comment/);
@@ -165,4 +166,102 @@ test("multiple inline findings publish in one submitted review", async () => {
   assert.equal(result.posted, 2);
   assert.equal(result.line, 2);
   assert.equal(result.failed, 0);
+});
+
+test("complete clean reports render no PR comment", () => {
+  const options = { repo: "org/repo", head: "a".repeat(40) };
+  assert.equal(
+    renderSummary({ execution_status: "COMPLETE", findings: [] }, options),
+    null,
+  );
+  assert.equal(
+    renderSummary(
+      {
+        execution_status: "COMPLETE",
+        findings: [make("safe", "NON_BREAKING")],
+      },
+      options,
+    ),
+    null,
+  );
+});
+test("warnings, expected breaks and incomplete scans remain visible", () => {
+  const options = { repo: "org/repo", head: "a".repeat(40) };
+  assert.match(
+    renderSummary(
+      {
+        execution_status: "COMPLETE",
+        findings: [make("risk", "LIKELY_BREAKING")],
+      },
+      options,
+    ),
+    /API LIKELY BREAK/,
+  );
+  assert.match(
+    renderSummary(
+      { execution_status: "COMPLETE", findings: [make("risk", "BREAKING")] },
+      { ...options, expected: true },
+    ),
+    /PASS \(expected\)/,
+  );
+  assert.match(
+    renderSummary({ execution_status: "FAILED", findings: [] }, options),
+    /INCOMPLETE/,
+  );
+});
+test("clean publication is silent and removes only its own stale summary", async () => {
+  const { publishReport } = require("../pr_checks/api_report.cjs");
+  const pr = { number: 3, head: { sha: "a".repeat(40) } };
+  for (const stale of [false, true]) {
+    const calls = [];
+    const github = {
+      paginate: async (fn) => fn(),
+      rest: {
+        pulls: {
+          get: async () => ({ data: pr }),
+          listFiles: async () => {
+            throw Error("must not fetch diff for a clean result");
+          },
+        },
+        issues: {
+          listComments: async () => [
+            {
+              id: 1,
+              user: { login: "someone" },
+              body: "<!-- flashinfer-api-compatibility -->",
+            },
+            ...(stale
+              ? [
+                  {
+                    id: 2,
+                    user: { login: "github-actions[bot]" },
+                    body: "<!-- flashinfer-api-compatibility -->old",
+                  },
+                ]
+              : []),
+          ],
+          deleteComment: async (x) => calls.push(["delete", x.comment_id]),
+          createComment: async () => {
+            throw Error("must not post PASS");
+          },
+          updateComment: async () => {
+            throw Error("must not replace stale summary with PASS");
+          },
+        },
+      },
+    };
+    const delivery = await publishReport(
+      github,
+      { warning() {} },
+      pr,
+      {
+        execution_status: "COMPLETE",
+        findings: [make("safe", "NON_BREAKING")],
+      },
+      { owner: "org", repo: "repo" },
+    );
+    assert.deepEqual(calls, stale ? [["delete", 2]] : []);
+    assert.equal(delivery.total, 0);
+    assert.equal(delivery.posted, 0);
+  }
 });

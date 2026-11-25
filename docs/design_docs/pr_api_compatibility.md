@@ -11,7 +11,7 @@ cover every public class contract.
 | --- | --- | --- | --- |
 | BREAKING | error | Block unless accepted for this head | 🚨 API BREAK 🚨 |
 | LIKELY_BREAKING | warning | Pass with findings | ⚠️ API LIKELY BREAK |
-| NON_BREAKING | notice | Pass | Summary count only |
+| NON_BREAKING | notice | Pass | No PR comment |
 
 Errors cover removed public functions/exports/modules without compatibility
 entries, removed/renamed parameters, new required parameters, removed defaults,
@@ -36,7 +36,10 @@ annotation rule requires no runtime-return investigation.
 One sticky API comment lists changed APIs, linked source locations and signature
 diffs, grouped under the two severity headings. It does not repeat explanations,
 rule identifiers or daily-report metadata. Inline comments explain each API's
-impact and affected old calls. NON_BREAKING items contribute only to counts.
+impact and affected old calls. NON_BREAKING items and their counts are omitted
+from PR comments. Complete scans with no errors or warnings post no summary;
+when such a result resolves earlier findings, the previous API summary is removed.
+Warning, expected-break, and incomplete-scan reports remain visible.
 Inline anchors use source signature ranges and actual changed lines. Multi-line
 signature changes can attach to a changed argument, removals use LEFT-side lines,
 and renamed files retain their old/new coordinate mapping. If no precise line is

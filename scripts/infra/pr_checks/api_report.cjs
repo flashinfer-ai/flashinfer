@@ -98,6 +98,12 @@ function renderSummary(
       findings.filter((f) => f.classification === kind).length,
     ]),
   );
+  if (
+    report.execution_status === "COMPLETE" &&
+    !counts.BREAKING &&
+    !counts.LIKELY_BREAKING
+  )
+    return null;
   const state =
     report.execution_status !== "COMPLETE"
       ? "INCOMPLETE"
@@ -108,7 +114,7 @@ function renderSummary(
           : "PASS";
   const lines = [
     MARKER,
-    `**API check: ${state} · ${counts.BREAKING} breaking · ${counts.LIKELY_BREAKING} likely breaking · ${counts.NON_BREAKING} non-breaking**`,
+    `**API check: ${state} · ${counts.BREAKING} breaking · ${counts.LIKELY_BREAKING} likely breaking**`,
   ];
   if (report.execution_status !== "COMPLETE")
     lines.push(
@@ -160,6 +166,15 @@ function rightLines(patch = "") {
 }
 async function publishReport(github, core, pr, report, options) {
   const { owner, repo } = options;
+  const delivery = {
+    total: 0,
+    line: 0,
+    file: 0,
+    posted: 0,
+    updated: 0,
+    unplaced: 0,
+    failed: 0,
+  };
   const current = (
     await github.rest.pulls.get({ owner, repo, pull_number: pr.number })
   ).data;
@@ -175,12 +190,21 @@ async function publishReport(github, core, pr, report, options) {
     repo: `${owner}/${repo}`,
     head: pr.head.sha,
   });
-  if (body.length > 60000)
-    throw new Error("API report exceeds comment size; inspect the artifact.");
   const previous = comments.find(
     (c) =>
       c.user?.login === "github-actions[bot]" && c.body?.startsWith(MARKER),
   );
+  if (body === null) {
+    if (previous)
+      await github.rest.issues.deleteComment({
+        owner,
+        repo,
+        comment_id: previous.id,
+      });
+    return delivery;
+  }
+  if (body.length > 60000)
+    throw new Error("API report exceeds comment size; inspect the artifact.");
   if (previous)
     await github.rest.issues.updateComment({
       owner,
@@ -210,15 +234,6 @@ async function publishReport(github, core, pr, report, options) {
     }),
   ]);
   const pendingLines = [];
-  const delivery = {
-    total: 0,
-    line: 0,
-    file: 0,
-    posted: 0,
-    updated: 0,
-    unplaced: 0,
-    failed: 0,
-  };
   for (const finding of groupFindings(report.findings || []).filter(
     (f) => f.classification !== "NON_BREAKING",
   )) {
