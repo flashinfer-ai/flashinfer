@@ -42,27 +42,36 @@ def qk_tile(
     kv_cons,
     s_prod,
 ):
-    """``S = Q K^T`` of one tile: one ``D/16``-step fold per ring slot of K (one slot = the whole tile; with half-tile slots each would be
-    written to its own S columns by a 128 x 64 instruction -- the same per-element fold, ``ACCUMULATE`` off on its first step); the
+    """``S = Q K^T`` of one tile: one ``D/16``-step fold per key range of K (one range = the whole tile; with half-tile slots each is
+    written to its own S columns by a 128 x 64 instruction -- the same per-element fold, ``ACCUMULATE`` off on its first step); a
     slot is released as soon as its MMAs are issued (the release is the MMAs' completion)."""
     sh = None
+    tS = None
     for sl in cutlass.range_constexpr(st.slots_per_tile):
-        kh = kv_cons.wait_and_advance()
-        if cutlass.const_expr(sl == 0):
-            sh = s_prod.acquire_and_advance()  # the softmax warpgroups have copied the stage's previous S out (and its P was consumed)
-        tS = cute.make_tensor(
-            tStS_slots[sl].iterator + sh.index * st.tmem_s_stride, tStS_slots[sl].layout
-        )  # this tile's S stage
-        for j in cutlass.range_constexpr(low.inner):
-            qk_mma.set(tcgen05.Field.ACCUMULATE, low.accumulate(0, j))
-            cute.gemm(
-                qk_mma,
-                tS,
-                tSrQ[(None, None, j, q_stage)],
-                tSrK[(None, None, j, kh.index)],
-                tS,
-            )
-        kh.release()
+        # the key range's K: one ring slot, or qk_parts slots of Dk dims each in ascending dims (D = 512) -- the fold's K-steps run
+        # on across them, against the matching Dk-dim stage of the Q tile
+        for dp in cutlass.range_constexpr(st.qk_parts):
+            kh = kv_cons.wait_and_advance()
+            if cutlass.const_expr(sl == 0 and dp == 0):
+                sh = s_prod.acquire_and_advance()  # the softmax warpgroups have copied the stage's previous S out (and its P was consumed)
+            if cutlass.const_expr(dp == 0):
+                tS = cute.make_tensor(
+                    tStS_slots[sl].iterator + sh.index * st.tmem_s_stride,
+                    tStS_slots[sl].layout,
+                )  # this tile's S stage
+            for j in cutlass.range_constexpr(st.d_steps_part):
+                qk_mma.set(
+                    tcgen05.Field.ACCUMULATE,
+                    low.accumulate(0, dp * st.d_steps_part + j),
+                )
+                cute.gemm(
+                    qk_mma,
+                    tS,
+                    tSrQ[(None, None, j, q_stage * st.qk_parts + dp)],
+                    tSrK[(None, None, j, kh.index)],
+                    tS,
+                )
+            kh.release()
     sh.commit()
     return kv_cons, s_prod, qk_mma
 
@@ -107,7 +116,7 @@ def pv_tile(
     st,
     pv_mma: cute.TiledMma,
     low,
-    tOtOc: cute.Tensor,
+    tOtOc,
     tOrP: cute.Tensor,
     tmem_ptr: cute.Pointer,
     tOrV: cute.Tensor,
@@ -125,12 +134,17 @@ def pv_tile(
     vh = None
     tOrP_k = tOrP
     KS = st.k_steps_per_slot
-    for sl in cutlass.range_constexpr(st.slots_per_tile):
+    n_v = st.slots_per_tile * st.pv_parts  # ring slots of V per tile
+    for i in cutlass.range_constexpr(n_v):
+        sl = i // st.pv_parts
+        vp = i % st.pv_parts
+        # the key range's V: one ring slot, or pv_parts slots of Ds dims each (D = 512 on the smaller parts), slot vp folded into
+        # columns [vp Ds, (vp + 1) Ds) of the accumulator by its own instruction per key step
         vh = kv_cons.wait_and_advance()
         zero_v_tail(
             st, sKV_flat, zeros8, t * st.T + sl * st.slot_keys, vh.index, kv_len
         )
-        if cutlass.const_expr(sl == 0):
+        if cutlass.const_expr(sl == 0 and vp == 0):
             ph = p_cons.wait_and_advance()  # P(t) stored by the softmax warpgroups
             if cutlass.const_expr(
                 st.s_stages > 1
@@ -152,12 +166,12 @@ def pv_tile(
             pv_mma.set(tcgen05.Field.ACCUMULATE, low.accumulate(blk, j))
             cute.gemm(
                 pv_mma,
-                tOtOc,
+                tOtOc[vp],
                 tOrP_k[(None, None, j)],
                 tOrV[(None, None, jj, vh.index)],
-                tOtOc,
+                tOtOc[vp],
             )
-        if cutlass.const_expr(sl < st.slots_per_tile - 1):
+        if cutlass.const_expr(i < n_v - 1):
             vh.release()  # the slot's MMAs are issued: its release is their completion
     oh.commit()
     ph.release()
@@ -182,7 +196,7 @@ def mma_loop(
     qk_low,
     pv_low,
     tStS,
-    tOtOc: cute.Tensor,
+    tOtOc,
     tOrP: cute.Tensor,
     tmem_ptr: cute.Pointer,
     tSrQ: cute.Tensor,
@@ -198,7 +212,8 @@ def mma_loop(
     tile_hi: Int32,
     kv_len: Int32,
 ):
-    """``tStS`` is the tuple of the S accumulator's per-slot views of stage 0 (one view = the whole S at D <= 128)."""
+    """``tStS`` is the tuple of the S accumulator's per-slot views of stage 0 (one view = the whole S at D <= 128); ``tOtOc`` the
+    tuple of the accumulator's views per PV instruction (one view = the whole ``O_c`` unless a ring slot holds part of its dims)."""
     TPC = st.tpc
     zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), IN_DTYPE)
     zeros8.fill(0.0)

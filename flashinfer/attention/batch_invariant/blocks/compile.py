@@ -9,7 +9,7 @@ Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
 ``(D, page, Hkv, num_pages)`` (NHD or HND pools: runtime strides), O as ``(total_q * Hq, D)``, the fp32
 workspace flat, the fp32 per-CTA ``O_m`` scratch flat (``grid x 128 x D`` at D = 256, one element otherwise), the int32 split-group table ``(num_groups, GROUP_FIELDS)`` and the per-group arrival
-counters (the in-kernel chunk fold), the int32 descriptor table ``(num_units, 16)``, ``kv_indptr`` and ``kv_indices``.
+counters (the in-kernel chunk fold), the int32 descriptor table ``(num_units, DESC_FIELDS)``, ``kv_indptr`` and ``kv_indices``.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import cutlass
 import cutlass.cute as cute
 
 from ....batch_invariant import jit
-from ..plan import GROUP_FIELDS
+from ..plan import DESC_FIELDS, GROUP_FIELDS
 from .kernel import AttentionKernel
 
 MODULE = "batch_invariant_attention"
@@ -129,7 +129,7 @@ def get_compiled_attention(
             i32, (cute.sym_int(32),), (1,), assumed_align=4
         )
         desc_fake = cute.runtime.make_fake_tensor(
-            i32, (s_nunits, 16), (16, 1), assumed_align=16
+            i32, (s_nunits, DESC_FIELDS), (DESC_FIELDS, 1), assumed_align=16
         )
         indptr_fake = cute.runtime.make_fake_tensor(
             i32, (s_nb1,), (1,), assumed_align=4

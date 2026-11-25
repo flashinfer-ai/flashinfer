@@ -13,7 +13,7 @@ import cutlass
 import cutlass.cute as cute
 
 from ....batch_invariant import jit
-from ..plan import GROUP_FIELDS
+from ..plan import DESC_FIELDS, GROUP_FIELDS
 from .kernel import SwapsKernel
 
 MODULE = "batch_invariant_attention"
@@ -110,7 +110,7 @@ def get_compiled_swaps(
             i32, (cute.sym_int(32),), (1,), assumed_align=4
         )
         desc_fake = cute.runtime.make_fake_tensor(
-            i32, (s_nunits, 16), (16, 1), assumed_align=16
+            i32, (s_nunits, DESC_FIELDS), (DESC_FIELDS, 1), assumed_align=16
         )
         indices_fake = cute.runtime.make_fake_tensor(
             i32, (s_nidx,), (1,), assumed_align=4

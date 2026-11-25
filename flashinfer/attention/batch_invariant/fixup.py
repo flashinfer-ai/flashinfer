@@ -241,6 +241,14 @@ def wide_vec(D: int) -> int:
     return 2 if D >= 128 else 1
 
 
+WIDE_PART_DIMS = 256  # output columns one fixup block folds: a wider row (D = 512) is ``D / WIDE_PART_DIMS`` blocks, each with its own
+# scan warp forming the same ``a1`` / ``a2`` from the same ``(m, l)`` (the thread mapping of a block is the D = 256 one)
+
+
+def wide_parts(D: int) -> int:
+    return max(1, D // WIDE_PART_DIMS)
+
+
 @cute.jit
 def fold_row_state_wide(
     mWs: cute.Tensor,
@@ -454,9 +462,10 @@ class SplitKVFixup:
     ):
         # grid: (row blocks of a group, min(groups, MAX_GRID_Y)); a block handles 128 / (D / V) rows (2 / 2 / 1 at D = 64 / 128 / 256),
         # V = wide_vec(D) output columns per thread, and strides over the groups beyond grid.y
-        rows_per_block = THREADS // (self.D // wide_vec(self.D))
+        parts = wide_parts(self.D)
+        rows_per_block = THREADS // (self.D // parts // wide_vec(self.D))
         self.kernel(mWs, mO, mGroups, c, nc, window_left, Hq, num_groups).launch(
-            grid=[cute.ceil_div(max_rows, rows_per_block), grid_y, 1],
+            grid=[cute.ceil_div(max_rows, rows_per_block) * parts, grid_y, 1],
             block=[THREADS, 1, 1],
             stream=stream,
             use_pdl=self.pdl,
@@ -481,11 +490,16 @@ class SplitKVFixup:
         # the next kernel of the stream may be scheduled now (a programmatic dependent waits for this grid before reading)
         cute.arch.griddepcontrol_launch_dependents()
         V = wide_vec(D)
-        thr_per_row = D // V
+        parts = wide_parts(D)
+        thr_per_row = D // parts // V
         rows_per_block = THREADS // thr_per_row
         ri = tidx // thr_per_row
         r = bx * rows_per_block + ri
         d0 = (tidx % thr_per_row) * V
+        if cutlass.const_expr(parts > 1):
+            # block bx folds part bx % parts of the rows of block bx // parts
+            r = (bx // parts) * rows_per_block + ri
+            d0 = d0 + (bx % parts) * WIDE_PART_DIMS
         lane = tidx % 32
         is_scan_warp = (tidx % thr_per_row) < 32
         smem = cutlass.utils.SmemAllocator()
