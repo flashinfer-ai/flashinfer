@@ -1,5 +1,6 @@
 // Compact API-only reports. PR source text is untrusted even in a trusted scan.
 const crypto = require("node:crypto");
+const { selectAnchor, diffLines } = require("./api_anchors.cjs");
 const MARKER = "<!-- flashinfer-api-compatibility -->";
 const INLINE = "<!-- flashinfer-api-inline -->";
 const rank = { NON_BREAKING: 0, LIKELY_BREAKING: 1, BREAKING: 2 };
@@ -31,11 +32,24 @@ function groupFindings(findings) {
       groups.set(key, {
         ...higher,
         message: [...new Set([previous.message, finding.message])].join(" "),
+        anchors: [
+          ...new Map(
+            [...(previous.anchors || []), ...(finding.anchors || [])].map(
+              (a) => [JSON.stringify(a), a],
+            ),
+          ).values(),
+        ],
       });
     }
   }
   return [...groups.values()];
 }
+const codeText = (value) =>
+  String(value ?? "")
+    .replace(/@/g, "@\u200b")
+    .replace(/`/g, "ˋ")
+    .replace(/[\r\n]/g, " ")
+    .slice(0, 2500);
 function diff(finding) {
   const before = String(finding.before || "");
   const after = String(finding.after || "");
@@ -56,7 +70,7 @@ function diff(finding) {
   const start = prefix > 120 ? prefix - 70 : 0;
   const trimEnd = suffix > 120 ? suffix - 70 : 0;
   const fragment = (value) =>
-    `${start ? "…" : ""}${text(value.slice(start, value.length - trimEnd))}${trimEnd ? "…" : ""}`;
+    `${start ? "…" : ""}${codeText(value.slice(start, value.length - trimEnd))}${trimEnd ? "…" : ""}`;
   return [
     "```diff",
     `- ${fragment(before)}`,
@@ -106,14 +120,19 @@ function renderSummary(
     if (!items.length) continue;
     lines.push("", `**${heading(items[0])} · ${items.length}**`);
     for (const item of items) {
-      const path = String(item.path)
+      const source =
+        (item.anchors || []).find((a) => a[1] === "RIGHT") || item.anchors?.[0];
+      const sourcePath = source?.[0] || item.path;
+      const sourceLine = source?.[2] || item.line;
+      const revision = source?.[1] === "LEFT" ? report.base || head : head;
+      const path = String(sourcePath)
         .split("/")
         .map(encodeURIComponent)
         .join("/");
-      const url = `https://github.com/${repo}/blob/${head}/${path}#L${Number(item.line) || 1}`;
+      const url = `https://github.com/${repo}/blob/${revision}/${path}#L${Number(sourceLine) || 1}`;
       lines.push(
         "",
-        `**\`${text(item.api)}\`** · [${text(item.path)}:${Number(item.line) || 1}](${url})`,
+        `**\`${text(item.api)}\`** · [${text(sourcePath)}:${Number(sourceLine) || 1}](${url})`,
         "",
         diff(item),
       );
@@ -132,19 +151,12 @@ function renderSummary(
   return lines.join("\n");
 }
 
-// Only actual added/context RIGHT-side diff lines can receive inline comments.
 function rightLines(patch = "") {
-  let line = 0;
-  const result = new Set();
-  for (const row of patch.split("\n")) {
-    const match = row.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (match) {
-      line = Number(match[1]);
-      continue;
-    }
-    if (row.startsWith("+") || row.startsWith(" ")) result.add(line++);
-  }
-  return result;
+  return new Set(
+    diffLines(patch)
+      .filter((x) => x.side === "RIGHT")
+      .map((x) => x.line),
+  );
 }
 async function publishReport(github, core, pr, report, options) {
   const { owner, repo } = options;
@@ -197,45 +209,113 @@ async function publishReport(github, core, pr, report, options) {
       per_page: 100,
     }),
   ]);
-  const eligible = new Map(
-    files.map((file) => [file.filename, rightLines(file.patch)]),
-  );
+  const pendingLines = [];
+  const delivery = {
+    total: 0,
+    line: 0,
+    file: 0,
+    posted: 0,
+    updated: 0,
+    unplaced: 0,
+    failed: 0,
+  };
   for (const finding of groupFindings(report.findings || []).filter(
     (f) => f.classification !== "NON_BREAKING",
   )) {
-    if (!eligible.get(finding.path)?.has(finding.line)) continue; // Details remain in the artifact.
+    delivery.total++;
+    const anchor = selectAnchor(finding, files);
+    if (!anchor) {
+      delivery.unplaced++;
+      core.warning(`No changed file for API review comment: ${finding.api}`);
+      continue;
+    }
     const key = `<!-- key:${inlineKey(finding)} -->`;
+    const fileLevel = anchor.subject_type === "file";
     const prior = existing.find(
       (c) =>
         c.user?.login === "github-actions[bot]" &&
         c.body?.startsWith(INLINE) &&
         c.body.includes(key) &&
-        c.path === finding.path &&
-        c.line === finding.line,
+        c.path === anchor.path &&
+        (fileLevel
+          ? c.subject_type === "file"
+          : c.line === anchor.line && (c.side || "RIGHT") === anchor.side),
     );
+    const body = renderInline(finding);
     try {
-      if (prior)
+      if (prior) {
         await github.rest.pulls.updateReviewComment({
           owner,
           repo,
           comment_id: prior.id,
-          body: renderInline(finding),
+          body,
         });
-      else
+        delivery.updated++;
+      } else if (
+        !fileLevel &&
+        typeof github.rest.pulls.createReview === "function"
+      ) {
+        pendingLines.push({ ...anchor, body });
+        continue;
+      } else {
         await github.rest.pulls.createReviewComment({
           owner,
           repo,
           pull_number: pr.number,
           commit_id: pr.head.sha,
-          path: finding.path,
-          line: finding.line,
-          side: "RIGHT",
-          body: renderInline(finding),
+          ...anchor,
+          body,
         });
+        delivery.posted++;
+      }
+      delivery[fileLevel ? "file" : "line"]++;
     } catch (error) {
-      core.warning(`Inline API report failed: ${error.message}`);
+      delivery.failed++;
+      core.warning(
+        `API review comment failed for ${finding.api}: ${error.message}`,
+      );
     }
   }
+  if (pendingLines.length) {
+    try {
+      await github.rest.pulls.createReview({
+        owner,
+        repo,
+        pull_number: pr.number,
+        commit_id: pr.head.sha,
+        event: "COMMENT",
+        body: "<!-- flashinfer-api-inline-review -->",
+        comments: pendingLines,
+      });
+      delivery.posted += pendingLines.length;
+      delivery.line += pendingLines.length;
+    } catch (error) {
+      // A validation failure on one anchor must not hide unrelated findings.
+      // Do not amplify permission/rate-limit failures with per-line retries.
+      if (error.status === 422) {
+        for (const comment of pendingLines) {
+          try {
+            await github.rest.pulls.createReviewComment({
+              owner,
+              repo,
+              pull_number: pr.number,
+              commit_id: pr.head.sha,
+              ...comment,
+            });
+            delivery.posted++;
+            delivery.line++;
+          } catch (individual) {
+            delivery.failed++;
+            core.warning(`API inline comment failed: ${individual.message}`);
+          }
+        }
+      } else {
+        delivery.failed += pendingLines.length;
+        core.warning(`API inline review failed: ${error.message}`);
+      }
+    }
+  }
+  return delivery;
 }
 module.exports = {
   groupFindings,

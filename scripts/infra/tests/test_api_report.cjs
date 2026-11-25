@@ -62,7 +62,8 @@ test("PR source text cannot inject mentions or break markdown fences", () => {
   const finding = make("foo", "BREAKING");
   finding.before = "```\n@someone <script>";
   const text = renderInline(finding);
-  assert.doesNotMatch(text, /@someone|<script>/);
+  assert.doesNotMatch(text, /@someone/);
+  assert.equal((text.match(/```/g) || []).length, 2); // HTML stays literal inside an unbroken fence.
 });
 
 test("active inline thread is reused after an unrelated push", async () => {
@@ -113,4 +114,55 @@ test("long signatures show the changed region rather than all unchanged argument
   assert.match(result, /\*, y/);
   assert.doesNotMatch(result, /arg_0, arg_1/);
   assert.match(result, /…/);
+});
+
+test("fenced signature diffs keep native return arrows", () => {
+  const item = make("foo", "BREAKING");
+  item.before = "def foo(x) -> Tensor";
+  item.after = "def foo(x) -> None";
+  const body = renderInline(item);
+  assert.match(body, /-> Tensor/);
+  assert.doesNotMatch(body, /&gt;/);
+});
+
+test("multiple inline findings publish in one submitted review", async () => {
+  const { publishReport } = require("../pr_checks/api_report.cjs");
+  const calls = [];
+  const pr = { number: 3, head: { sha: "b".repeat(40) } };
+  const github = {
+    paginate: async (fn) => fn(),
+    rest: {
+      issues: { listComments: async () => [], createComment: async () => {} },
+      pulls: {
+        get: async () => ({ data: pr }),
+        listFiles: async () => [
+          {
+            filename: "flashinfer/example.py",
+            patch: "@@ -12 +12 @@\n-old\n+new",
+          },
+        ],
+        listReviewComments: async () => [],
+        createReview: async (data) => calls.push(data),
+        createReviewComment: async () => {
+          throw Error("must batch line comments");
+        },
+      },
+    },
+  };
+  const result = await publishReport(
+    github,
+    { warning() {} },
+    pr,
+    {
+      execution_status: "COMPLETE",
+      findings: [make("foo", "BREAKING"), make("bar", "LIKELY_BREAKING")],
+    },
+    { owner: "org", repo: "repo" },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].comments.length, 2);
+  assert.equal(calls[0].event, "COMMENT");
+  assert.equal(result.posted, 2);
+  assert.equal(result.line, 2);
+  assert.equal(result.failed, 0);
 });

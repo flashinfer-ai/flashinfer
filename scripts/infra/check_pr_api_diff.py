@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.util
+import io
+import tokenize
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -51,6 +53,8 @@ class ApiFunction:
     kwarg: ApiParameter | None
     return_annotation: str | None
     type_aliases: tuple[tuple[str, str], ...]
+    signature_end_line: int = 0
+    decorator_line: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,33 @@ def signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
     returns = f" -> {ast.unparse(node.returns)}" if node.returns else ""
     return f"{prefix} {node.name}({ast.unparse(node.args)}){returns}"
+
+
+def signature_end(node: ast.FunctionDef | ast.AsyncFunctionDef, source: str) -> int:
+    # Stop at the header colon; body/docstring lines are not signature anchors.
+    lines = source.splitlines()[node.lineno - 1 : node.body[0].lineno]
+    depth = 0
+    for token in tokenize.generate_tokens(io.StringIO("\n".join(lines)).readline):
+        if token.type != tokenize.OP:
+            continue
+        if token.string in ("(", "[", "{"):
+            depth += 1
+        elif token.string in (")", "]", "}"):
+            depth -= 1
+        elif token.string == ":" and depth == 0:
+            return node.lineno + token.start[0] - 1
+    return node.lineno
+
+
+def source_anchor(
+    api: ApiFunction, side: str, *, decorators: bool = False
+) -> tuple[str, str, int, int]:
+    return (
+        api.path,
+        side,
+        (api.decorator_line or api.line) if decorators else api.line,
+        api.signature_end_line or api.line,
+    )
 
 
 def parameter(arg: ast.arg, default: ast.expr | None = None) -> ApiParameter:
@@ -440,6 +471,7 @@ def classify_signature(before: ApiFunction, after: ApiFunction) -> PrFinding:
         before=before.signature,
         after=after.signature,
         rule_id="signature_changed",
+        anchors=(source_anchor(after, "RIGHT"), source_anchor(before, "LEFT")),
     )
 
 
@@ -515,6 +547,11 @@ def extract_public_apis(
                             ast.unparse(child.returns) if child.returns else None
                         ),
                         type_aliases=type_aliases,
+                        signature_end_line=signature_end(child, source),
+                        decorator_line=min(
+                            (d.lineno for d in child.decorator_list),
+                            default=child.lineno,
+                        ),
                     )
                 visit(child, class_prefix)
 
@@ -796,6 +833,32 @@ def public_module(path: str | None, *, has_decorated_api: bool = False) -> str |
     return ".".join(parts)
 
 
+def export_anchor(
+    source: str | None, name: str, side: str
+) -> tuple[str, str, int, int]:
+    tree = ast.parse(source or "")
+    for node in module_scope_imports(tree):
+        for alias in node.names:
+            if (alias.asname or alias.name) == name:
+                return (
+                    "flashinfer/__init__.py",
+                    side,
+                    alias.lineno,
+                    alias.end_lineno or alias.lineno,
+                )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and key.value == name:
+                    return (
+                        "flashinfer/__init__.py",
+                        side,
+                        key.lineno,
+                        key.end_lineno or key.lineno,
+                    )
+    return ("flashinfer/__init__.py", side, 1, 1)
+
+
 def dynamic_namespace(source: str | None) -> bool:
     if source is None:
         return False
@@ -829,6 +892,7 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
         message: str,
         *,
         uncertain: bool = False,
+        anchors: tuple[tuple[str, str, int, int], ...] = (),
     ) -> None:
         findings.append(
             PrFinding(
@@ -842,6 +906,7 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                 before=before,
                 after=after,
                 rule_id=check_id,
+                anchors=anchors,
             )
         )
 
@@ -904,7 +969,7 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                 old_path or new_path or "flashinfer",
                 api.line,
                 f"{api.module}.{name}",
-                api.signature,
+                f"@flashinfer_api {api.signature}" if remaining else api.signature,
                 remaining.signature if remaining else "(removed)",
                 "Public API decorator was removed; review tracing and registration."
                 if remaining
@@ -915,6 +980,8 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                     or dynamic
                     or name.partition(".")[0] in reexports
                 ),
+                anchors=(source_anchor(api, "LEFT", decorators=True),)
+                + ((source_anchor(remaining, "RIGHT"),) if remaining else ()),
             )
 
         for name in sorted(set(old) & set(new)):
@@ -942,7 +1009,8 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                     )
                 )
 
-    old_exports = exported_names(git_file(base, "flashinfer/__init__.py"))
+    old_init = git_file(base, "flashinfer/__init__.py")
+    old_exports = exported_names(old_init)
     new_init = git_file(head, "flashinfer/__init__.py")
     new_exports = exported_names(new_init)
     for name in sorted(set(old_exports) - set(new_exports)):
@@ -957,6 +1025,7 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
             if not dynamic_namespace(new_init)
             else f"Top-level export `{name}` requires dynamic namespace review.",
             uncertain=dynamic_namespace(new_init),
+            anchors=(export_anchor(old_init, name, "LEFT"),),
         )
     for name in sorted(set(old_exports) & set(new_exports)):
         if old_exports[name] != new_exports[name]:
@@ -978,6 +1047,10 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                     new_exports[name],
                     "Top-level export moved; review the old direct submodule import.",
                     uncertain=True,
+                    anchors=(
+                        export_anchor(new_init, name, "RIGHT"),
+                        export_anchor(old_init, name, "LEFT"),
+                    ),
                 )
     for change in changes:
         old_apis, new_apis = api_changes.get(change, ({}, {}))
@@ -993,6 +1066,21 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                 f"import {old_module}",
                 "(removed)",
                 f"Public module `{old_module}` was deleted; its old import fails.",
+                anchors=(
+                    (
+                        change.old_path or "flashinfer",
+                        "LEFT",
+                        1,
+                        max(
+                            1,
+                            len(
+                                (
+                                    git_file(base, change.old_path or "") or ""
+                                ).splitlines()
+                            ),
+                        ),
+                    ),
+                ),
             )
         elif change.status.startswith("R"):
             new_module = public_module(
@@ -1005,8 +1093,23 @@ def check(base: str, head: str, *, include_compatible: bool = False) -> list[PrF
                     1,
                     old_module,
                     f"import {old_module}",
-                    f"import {new_module or change.new_path}",
+                    f"import {new_module or module_name_from_path(change.new_path or '')}",
                     "Public module moved without preserving the old import path.",
+                    anchors=(
+                        (
+                            change.old_path or "flashinfer",
+                            "LEFT",
+                            1,
+                            max(
+                                1,
+                                len(
+                                    (
+                                        git_file(base, change.old_path or "") or ""
+                                    ).splitlines()
+                                ),
+                            ),
+                        ),
+                    ),
                 )
 
     return findings

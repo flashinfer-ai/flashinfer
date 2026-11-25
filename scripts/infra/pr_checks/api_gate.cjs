@@ -255,12 +255,18 @@ async function evaluate({ github, core, context, pr, report, publish = true }) {
       core.warning(`Maintainer accounts could not be listed: ${error.message}`);
     }
     try {
-      await publishReport(github, core, pr, report, {
+      const delivery = await publishReport(github, core, pr, report, {
         ...context.repo,
         expected,
         maintainers,
         runUrl: runUrl(context),
       });
+      report.comment_delivery = delivery;
+      fs.mkdirSync("reports", { recursive: true });
+      fs.writeFileSync(
+        "reports/public-api.json",
+        JSON.stringify(report, null, 2) + "\n",
+      );
     } catch (error) {
       core.warning(`API comments could not be updated: ${error.message}`);
     }

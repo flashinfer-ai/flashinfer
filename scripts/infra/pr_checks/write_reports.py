@@ -21,6 +21,7 @@ class PrFinding:
     before: str = ""
     after: str = ""
     rule_id: str = ""
+    anchors: tuple[tuple[str, str, int, int], ...] = ()
 
 
 def emit_finding(finding: PrFinding, github_actions: bool) -> None:

@@ -37,8 +37,14 @@ One sticky API comment lists changed APIs, linked source locations and signature
 diffs, grouped under the two severity headings. It does not repeat explanations,
 rule identifiers or daily-report metadata. Inline comments explain each API's
 impact and affected old calls. NON_BREAKING items contribute only to counts.
-Full evidence remains in the `trusted-public-api-report` workflow artifact;
-findings that cannot be attached to a diff line are available there.
+Inline anchors use source signature ranges and actual changed lines. Multi-line
+signature changes can attach to a changed argument, removals use LEFT-side lines,
+and renamed files retain their old/new coordinate mapping. If no precise line is
+available, use an explicit file-level review comment rather than an unrelated
+line. Findings with no changed file are logged as unplaced. Full evidence and
+`comment_delivery` counts remain in the `trusted-public-api-report` artifact.
+New line comments are submitted in one review; reruns update matching active
+comments without duplicating threads.
 
 All report text is English. A blocked report ends with:
 

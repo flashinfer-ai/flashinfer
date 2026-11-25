@@ -147,3 +147,19 @@ class AliasAndSurfaceTest(unittest.TestCase):
         self.assertEqual(
             compare_snapshots(before, after)[0].classification, "LIKELY_BREAKING"
         )
+
+
+class InlineSourceRangeTest(unittest.TestCase):
+    def test_multiline_signature_carries_both_source_ranges(self):
+        old = {
+            "flashinfer/example.py": "@flashinfer_api\ndef api(\n x,\n y=0,\n): pass\n"
+        }
+        new = {"flashinfer/example.py": "@flashinfer_api\ndef api(\n x,\n): pass\n"}
+        finding = compare_snapshots(old, new)[0]
+        self.assertIn(("flashinfer/example.py", "RIGHT", 2, 4), finding.anchors)
+        self.assertIn(("flashinfer/example.py", "LEFT", 2, 5), finding.anchors)
+
+    def test_deleted_api_carries_old_side_signature(self):
+        old = {"flashinfer/example.py": "@flashinfer_api\ndef api(\n x,\n): pass\n"}
+        finding = compare_snapshots(old, {"flashinfer/example.py": ""})[0]
+        self.assertIn(("flashinfer/example.py", "LEFT", 1, 4), finding.anchors)
