@@ -7,8 +7,9 @@ quantizes, interleaves (groups of 8), and swizzles them. Pass pre-quantized
 MXFP8 weights via ``w13``/``w2`` plus ``w13_scale``/``w2_scale`` to skip
 re-quantization.
 
-Requires sm_120/sm_121 (Blackwell-consumer); the kernel tree is
-process-exclusive with the sm_100 and sm_90 trees.
+Requires sm_120/sm_121 (Blackwell-consumer). The swap-AB sources load
+unqualified packages, so they require a separate process from other
+implementations that load different versions of those packages.
 """
 
 from __future__ import annotations

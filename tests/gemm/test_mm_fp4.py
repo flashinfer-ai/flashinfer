@@ -21,6 +21,7 @@ from flashinfer.utils import (
     LibraryError,
 )
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from tests.utils.test_helpers.pdl import late_store
 
 
@@ -288,6 +289,38 @@ def _nvfp4_operands_wide_range(m, n, k, seed):
     return a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
 
 
+def _exact_b12x_fp4_operands(m, n, k, use_nvfp4):
+    # Every block has max=6*scale, with power-of-two scales and E2M1 values.
+    # Quantization is lossless, so the original inputs give an independent oracle.
+    block_size = 16 if use_nvfp4 else 32
+
+    def operand(rows, global_scale):
+        x = torch.randint(-2, 3, (rows, k), device="cuda").to(torch.bfloat16)
+        x[:, ::block_size] = 6
+        exponents = (
+            torch.arange(rows, device="cuda")[:, None]
+            + torch.arange(k // block_size, device="cuda")[None, :]
+        ) % 3 - 1
+        x *= (2.0**exponents).repeat_interleave(block_size, dim=1)
+        if use_nvfp4:
+            q, sf = nvfp4_quantize(
+                x,
+                torch.tensor(global_scale, device="cuda"),
+                sfLayout=SfLayout.layout_128x4,
+                do_shuffle=False,
+                nvfp4_4over6=None,
+            )
+        else:
+            q, sf = mxfp4_quantize(x)
+        return x, q, sf
+
+    a, a_fp4, a_s = operand(m, 2.0)
+    b, b_fp4, b_s = operand(n, 4.0)
+    alpha = torch.tensor(1.0 / 8, device="cuda") if use_nvfp4 else None
+    reference = a.float() @ b.float().T
+    return a_fp4, a_s, b_fp4, b_s, alpha, reference
+
+
 @pytest.mark.parametrize(
     "m,n,out_dtype,backend,use_nvfp4,auto_tuning",
     [
@@ -303,23 +336,28 @@ def test_mm_fp4_b12x_output_row_alignment(
     m, n, out_dtype, backend, use_nvfp4, auto_tuning
 ):
     """Unaligned output rows must not use TMA, including cached FP4 tactics."""
+    min_cuda = "12.9" if use_nvfp4 else "13.0"
     if not (
-        is_sm12x_supported(torch.device("cuda"))
-        and version_at_least(torch.version.cuda, "13.0")
+        is_sm12x_supported(torch.device("cuda")) and is_cuda_version_at_least(min_cuda)
     ):
-        pytest.skip("b12x NVFP4/MXFP4 requires SM120/SM121 + CUDA 13+.")
+        pytest.skip(f"b12x FP4 requires SM120/SM121 + CUDA {min_cuda}+.")
 
+    from flashinfer.gemm.gemm_base import _b12x_gemm_fp4_runner
+
+    sm_major, sm_minor = get_compute_capability(torch.device("cuda"))
+    runner = _b12x_gemm_fp4_runner(sm_major, sm_minor, True, out_dtype, use_nvfp4)
     torch.manual_seed(0)
     k = 256
+    # These bounded, lossless inputs accumulate exactly in FP32 at K=256,
+    # including whichever backend "auto" selects; only the output cast rounds.
     # Alternate store modes in one process: the compiled-kernel cache must
     # distinguish the aligned TMA path from the predicated global-store path.
     aligned_n = (n + 7) // 8 * 8
     for cols in (aligned_n, n, aligned_n):
-        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, cols, k)
-        if not use_nvfp4:
-            a_fp4, a_s = mxfp4_quantize(a)
-            b_fp4, b_s = mxfp4_quantize(b)
-            alpha = None
+        a_fp4, a_s, b_fp4, b_s, alpha, reference = _exact_b12x_fp4_operands(
+            m, cols, k, use_nvfp4
+        )
+        reference = reference.to(out_dtype)
         guard = 128
         storage = torch.full(
             (guard + m * cols + m * 128 + guard,),
@@ -348,25 +386,44 @@ def test_mm_fp4_b12x_output_row_alignment(
         # Profile this regression shape without allocating unrelated M buckets.
         with autotune(auto_tuning, tuning_buckets=(m,)):
             run()
-        torch.cuda.synchronize()
-        assert torch.all(storage[:guard] == 42)
-        assert torch.all(storage[guard + m * cols :] == 42)
-        assert torch.isfinite(out).all()
-        reference = torch.mm(a, b.T).float()
-        assert torch.all(F.cosine_similarity(reference, out.float(), dim=1) > 0.97)
+
+        def check_output():
+            torch.cuda.synchronize()
+            assert torch.all(storage[:guard] == 42)
+            assert torch.all(storage[guard + m * cols :] == 42)
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+        check_output()
 
         if cols == n:
-            expected = out.clone()
+            # Profiling only times candidates. Verify every advertised tactic,
+            # including candidates that do not win autotuning, on the tail-N path.
+            inputs = [
+                a_fp4,
+                b_fp4.T,
+                a_s,
+                b_s.T,
+                alpha,
+                out_dtype,
+                out,
+                16 if use_nvfp4 else 32,
+                use_nvfp4,
+                None,
+            ]
+            tactics = runner.get_valid_tactics(inputs, None)
+            assert tactics, "b12x must advertise tactics for this supported shape"
+            for tactic in tactics:
+                out.fill_(float("nan"))
+                runner.forward(inputs, tactic=tactic)
+                check_output()
+
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run()
             for _ in range(2):
                 out.fill_(float("nan"))
                 graph.replay()
-                torch.cuda.synchronize()
-                torch.testing.assert_close(out, expected, rtol=0, atol=0)
-                assert torch.all(storage[:guard] == 42)
-                assert torch.all(storage[guard + m * cols :] == 42)
+                check_output()
 
 
 def test_mm_fp4_b12x_short_k_multi_wave():
