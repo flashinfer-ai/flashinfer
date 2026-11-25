@@ -4465,12 +4465,16 @@ def gemm(
             )
     else:
         # Non-swapAB: C is (M, N) row-major.
+        row_multiple = 16
+        if cutlass.const_expr(cfg.narrow_gated_store_cols is not None):
+            row_multiple = cfg.narrow_gated_store_cols
+        row_width = cute.assume(output_n_for_c, row_multiple)
         c_layout = cute.make_layout(
             (
                 num_tokens if cfg.fuse_moe_finalize else cute.assume(m, 32),
-                cute.assume(output_n_for_c, 16),
+                row_width,
             ),
-            stride=(cute.assume(output_n_for_c, 16), 1),
+            stride=(row_width, 1),
         )
     if cutlass.const_expr(cfg.has_output_block_scaling or cfg.uses_fp8_output):
         c_quant_dtype = (

@@ -266,6 +266,43 @@ def test_batch_m_output_rows_require_16_byte_alignment(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("output_dtype", ["BF16", "FP16"])
+def test_rubin_tile8_gated_output_alignment(output_dtype):
+    from dataclasses import replace
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        BatchMode,
+        DType,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        sm_arch=107,
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(getattr(DType, output_dtype)),
+        act_kind=int(ActKind.SWIGLU),
+        tile_n=8,
+        epi_tile_n=8,
+        mma_n=8,
+        mma_k=64,
+        tile_k=256,
+        use_tma_store=0,
+    )
+    # Eight accumulator columns produce one 8-byte direct store per row.
+    validate_config(cfg, problem_mnk=(256, 8, 256))
+    with pytest.raises(ValueError, match="output rows must be 16-byte aligned"):
+        validate_config(replace(cfg, use_tma_store=1), problem_mnk=(256, 8, 256))
+    wider = replace(cfg, tile_n=16, epi_tile_n=16, mma_n=16)
+    assert wider.narrow_gated_store_cols is None
+    validate_config(wider, problem_mnk=(256, 16, 256))
+
+
+@pytest.mark.cpu_only
 def test_batch_n_does_not_require_16_byte_output_rows():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,

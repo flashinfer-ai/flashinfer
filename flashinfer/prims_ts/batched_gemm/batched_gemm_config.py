@@ -2119,6 +2119,21 @@ class BatchedGemmConfig:
         return self.non_swap_gated_accumulator_cols_per_step // 2
 
     @property
+    def narrow_gated_store_cols(self) -> int | None:
+        """Output elements per vector for a sub-16-byte direct gated store."""
+        if (
+            self.is_rubin_nvfp4_batch_m
+            and self.has_gated_epilogue
+            and not self.use_tma_store
+            and self.dtype_c in (int(DType.BF16), int(DType.FP16))
+            and self.non_swap_gated_output_cols_per_call < 8
+        ):
+            # Direct stores align to their emitted vector. A tile-8 gated
+            # epilogue writes four 16-bit values per row.
+            return self.non_swap_gated_output_cols_per_call
+        return None
+
+    @property
     def non_swap_output_sf_blocks_per_call(self) -> int:
         """Output quantization blocks produced by one non-swap epilogue call."""
         return self.non_swap_gated_output_cols_per_call // self.output_sf_block_size_c
@@ -4266,10 +4281,13 @@ def validate_config(
         _, problem_n, _ = problem_mnk
         if isinstance(problem_n, int):
             output_n = problem_n // 2 if cfg.has_gated_epilogue else problem_n
-            required_output_multiple = 128 // cfg.dtype_c_bits
+            required_output_multiple = (
+                cfg.narrow_gated_store_cols or 128 // cfg.dtype_c_bits
+            )
             if output_n % required_output_multiple != 0:
+                alignment_bytes = required_output_multiple * cfg.dtype_c_bits // 8
                 raise ValueError(
-                    "Batch-M output rows must be 16-byte aligned; "
+                    f"Batch-M output rows must be {alignment_bytes}-byte aligned; "
                     f"output width {output_n} with {cfg.dtype_c_bits}-bit elements "
                     f"must be a multiple of {required_output_multiple}. Pad problem N."
                 )
