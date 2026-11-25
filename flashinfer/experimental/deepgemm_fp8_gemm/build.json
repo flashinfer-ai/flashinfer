@@ -69,7 +69,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu": "98adb7af1fc2297b1727233e3715d9c31dd0255f78011e938f36712563febd92",
-        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "672a14441295a8988633e90d75fd8c80b383a25a9f4b051682d2ec3469034833"
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "da8d33d3389f6ea6fc7787488696fd263119b91537e15519d7992fd27bde0821"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu",
@@ -88,7 +88,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu": "98adb7af1fc2297b1727233e3715d9c31dd0255f78011e938f36712563febd92",
-        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "672a14441295a8988633e90d75fd8c80b383a25a9f4b051682d2ec3469034833"
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "da8d33d3389f6ea6fc7787488696fd263119b91537e15519d7992fd27bde0821"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu",
@@ -107,7 +107,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu": "069f4eb1c02a78c6e4476bcadac03768e6071551b508e7e922054d10a5ddaee7",
-        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "98819a124177a806affd541a447864b64907ef108fff425f6df3f8a227d5dc00"
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "9223425f37d932d0f25efdbf98d5010c99651a234986cd8492b73b9202c4bf73"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu",
@@ -126,7 +126,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu": "069f4eb1c02a78c6e4476bcadac03768e6071551b508e7e922054d10a5ddaee7",
-        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "98819a124177a806affd541a447864b64907ef108fff425f6df3f8a227d5dc00"
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "9223425f37d932d0f25efdbf98d5010c99651a234986cd8492b73b9202c4bf73"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu",

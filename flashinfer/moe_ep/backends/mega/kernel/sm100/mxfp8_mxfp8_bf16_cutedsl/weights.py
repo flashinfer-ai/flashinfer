@@ -5,13 +5,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal, Tuple
 
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
+from ..common import mxfp8_weight_utils
 from ..common.mxfp8_weight_utils import (
     as_mxfp8_scale as _as_mxfp8_scale,
     interleave_gate_up,
     mxfp8_data_dtype as _mxfp8_data_dtype,
-    mxfp8_swizzled_flat_sf_size as _mxfp8_swizzled_flat_sf_size,
-    quantize_mxfp8_weight_k_major as _quantize_mxfp8_weight_k_major,
-    swizzle_expert_scales as _swizzle_expert_scales,
 )
 
 if TYPE_CHECKING:
@@ -23,6 +21,7 @@ TransformedMegaWeights = Tuple[
 ]
 
 Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
+_quantize_mxfp8_weight_k_major = mxfp8_weight_utils.quantize_mxfp8_weight_k_major
 
 
 def _fc1_weight_from_w13(
@@ -45,7 +44,9 @@ def _fc1_weight_from_w13(
 def _interleave_gate_up_32(
     tensor: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    from ......kernel_src.sm100.cutedsl_megamoe import Mxfp8BlockSize
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        Mxfp8BlockSize,
+    )
 
     return interleave_gate_up(
         tensor,
@@ -79,176 +80,42 @@ def preprocess_mega_weights(
     activation_clamp: float | None = None,
     kernel_variant: Literal["inference", "genphase"] = "inference",
 ) -> TransformedMegaWeights:
-    """bf16 (or pre-quantized) weights → MXFP8 + swizzled-SF mega layout."""
-    import torch
+    """Prepare canonical weights for standard or GenPhase.
 
-    if kernel_variant == "genphase":
-        from ......kernel_src.sm100.next_cutedsl_megamoe import (
-            preprocess_genphase_prequantized_weights,
-            preprocess_genphase_weights,
-        )
+    FC1 w13 is [E, 2I, H], with gate rows followed by up rows; FC2 w2 is
+    [E, H, I]. Prequantized MXFP8 inputs retain those shapes, with plain
+    E8M0 scales [E, 2I, H/32] and [E, H, I/32]. Pre-interleaved kernel-layout
+    FC1 inputs from the retired legacy implementation are not accepted.
+    """
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+        preprocess_block_scaled_weights,
+        preprocess_prequantized_block_scaled_weights,
+    )
 
-        if isinstance(weights, PrequantizedMoEWeights):
-            return preprocess_genphase_prequantized_weights(
-                weights.w13,
-                weights.w2,
-                _as_mxfp8_scale(weights.w13_scale),
-                _as_mxfp8_scale(weights.w2_scale),
-                quant_kind=kind,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-            )
-        if weights.w13.ndim != 3 or weights.w13.shape[1:] != (
-            2 * intermediate_size,
-            hidden_size,
-        ):
-            raise ValueError("GenPhase w13 must have canonical shape [E, 2I, H].")
-        return preprocess_genphase_weights(
+    if kernel_variant not in ("inference", "genphase"):
+        raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
+    del gate_up_clamp, activation_clamp
+    if isinstance(weights, PrequantizedMoEWeights):
+        return preprocess_prequantized_block_scaled_weights(
             weights.w13,
             weights.w2,
+            _as_mxfp8_scale(weights.w13_scale),
+            _as_mxfp8_scale(weights.w2_scale),
             quant_kind=kind,
+            hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         )
-    if kernel_variant != "inference":
-        raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
-
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
-    # shim exposes the cutlass-pulling stacking helper lazily via the boundary.
-    from ......kernel_src.sm100.cutedsl_megamoe import (
-        Mxfp8BlockSize,
-        _stack_byte_reinterpretable_tensors,
-        ceil_div,
+    if weights.w13.ndim != 3 or weights.w13.shape[1:] != (
+        2 * intermediate_size,
+        hidden_size,
+    ):
+        raise ValueError("w13 must have canonical shape [E, 2I, H].")
+    return preprocess_block_scaled_weights(
+        weights.w13,
+        weights.w2,
+        quant_kind=kind,
+        intermediate_size=intermediate_size,
     )
-
-    del gate_up_clamp, activation_clamp  # MXFP8 weight quant uses a fixed 1.0 norm.
-
-    fc1_out = 2 * intermediate_size
-    num_experts = weights.w13.shape[0]
-    data_dtype = _mxfp8_data_dtype(kind)
-
-    logical_w13_shape = (num_experts, fc1_out, hidden_size)
-    logical_w2_shape = (num_experts, hidden_size, intermediate_size)
-    kernel_fc1_shape = (num_experts, hidden_size, fc1_out)
-    kernel_fc2_shape = (num_experts, intermediate_size, hidden_size)
-
-    hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
-    intermediate_sf_cols = ceil_div(intermediate_size, Mxfp8BlockSize)
-
-    if isinstance(weights, PrequantizedMoEWeights):
-        w13_scale_in = _as_mxfp8_scale(weights.w13_scale)
-        w2_scale_in = _as_mxfp8_scale(weights.w2_scale)
-        expected_w13_scale_shape = (
-            num_experts,
-            fc1_out,
-            hidden_sf_cols,
-        )
-        expected_w2_scale_shape = (
-            num_experts,
-            hidden_size,
-            intermediate_sf_cols,
-        )
-        if w13_scale_in.shape != expected_w13_scale_shape:
-            raise ValueError(
-                f"w13_scale must have shape {expected_w13_scale_shape}, "
-                f"got {tuple(w13_scale_in.shape)}"
-            )
-        if w2_scale_in.shape != expected_w2_scale_shape:
-            raise ValueError(
-                f"w2_scale must have shape {expected_w2_scale_shape}, "
-                f"got {tuple(w2_scale_in.shape)}"
-            )
-
-        if (
-            weights.w13.shape == kernel_fc1_shape
-            and weights.w2.shape == kernel_fc2_shape
-        ):
-            if not _is_mxfp8_weight(weights.w13, kind=kind) or not _is_mxfp8_weight(
-                weights.w2, kind=kind
-            ):
-                raise ValueError(
-                    f"packed MXFP8 weights must have dtype {data_dtype}; got "
-                    f"{weights.w13.dtype} / {weights.w2.dtype}"
-                )
-            fc1_weight = weights.w13
-            fc2_weight = weights.w2
-            w13_scale = w13_scale_in
-        elif (
-            weights.w13.shape == logical_w13_shape
-            and weights.w2.shape == logical_w2_shape
-        ):
-            if not _is_mxfp8_weight(weights.w13, kind=kind) or not _is_mxfp8_weight(
-                weights.w2, kind=kind
-            ):
-                raise ValueError(
-                    f"packed MXFP8 weights must have dtype {data_dtype}; got "
-                    f"{weights.w13.dtype} / {weights.w2.dtype}"
-                )
-            fc1_weight = _fc1_kernel_weight_from_canonical_mxfp8(
-                weights.w13, intermediate_size=intermediate_size
-            )
-            fc2_weight = weights.w2.transpose(1, 2).contiguous()
-            w13_scale = _interleave_gate_up_32(w13_scale_in, intermediate_size=fc1_out)
-        else:
-            raise ValueError(
-                "pre-quantized MXFP8 weights must be in kernel layout "
-                f"{kernel_fc1_shape} / {kernel_fc2_shape} or SGLang canonical "
-                f"layout {logical_w13_shape} / {logical_w2_shape}; got "
-                f"{tuple(weights.w13.shape)} / {tuple(weights.w2.shape)}"
-            )
-        fc1_sf_swizzled = [
-            _swizzle_expert_scales(w13_scale[e]) for e in range(num_experts)
-        ]
-        fc2_sf_swizzled = [
-            _swizzle_expert_scales(w2_scale_in[e]) for e in range(num_experts)
-        ]
-    else:
-        if weights.w13.shape != logical_w13_shape:
-            raise ValueError(
-                f"w13 must have shape {logical_w13_shape}, "
-                f"got {tuple(weights.w13.shape)}"
-            )
-        if weights.w2.shape != logical_w2_shape:
-            raise ValueError(
-                f"w2 must have shape {logical_w2_shape}, got {tuple(weights.w2.shape)}"
-            )
-
-        fc1_fp32 = _fc1_weight_from_w13(
-            weights.w13, intermediate_size=intermediate_size
-        )
-        fc1_q_parts = []
-        fc1_sf_parts = []
-        fc2_q_parts = []
-        fc2_sf_parts = []
-        for expert in range(num_experts):
-            fc1_q, fc1_sf = _quantize_mxfp8_weight_k_major(
-                fc1_fp32[expert].transpose(0, 1),
-                kind=kind,
-            )
-            fc2_hw = weights.w2[expert]
-            fc2_q, fc2_sf = _quantize_mxfp8_weight_k_major(
-                fc2_hw,
-                kind=kind,
-            )
-            fc1_q_parts.append(fc1_q.transpose(0, 1))
-            fc1_sf_parts.append(fc1_sf)
-            fc2_q_parts.append(fc2_q.transpose(0, 1))
-            fc2_sf_parts.append(fc2_sf)
-
-        fc1_weight = torch.stack(fc1_q_parts, dim=0)
-        fc2_weight = torch.stack(fc2_q_parts, dim=0)
-        fc1_sf_swizzled = [_swizzle_expert_scales(sf) for sf in fc1_sf_parts]
-        fc2_sf_swizzled = [_swizzle_expert_scales(sf) for sf in fc2_sf_parts]
-
-    fc1_flat_sf_size = fc1_sf_swizzled[0].numel()
-    fc2_flat_sf_size = fc2_sf_swizzled[0].numel()
-    fc1_weight_sf = _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0).view(
-        num_experts, fc1_flat_sf_size
-    )
-    fc2_weight_sf = _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0).view(
-        num_experts, fc2_flat_sf_size
-    )
-
-    return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
 
 
 def validate_transformed_mega_weights(
@@ -260,53 +127,32 @@ def validate_transformed_mega_weights(
     world_size: int,
     num_experts: int,
 ) -> None:
-    """One-time check for kernel-ready MXFP8 weights (``preprocess_weights=False``)."""
+    """Validate the sources-backed weight layout used by the public selector."""
     import torch
 
     from ......core.validation.common import MoEEpConfigError
-    from ...weight_validation import (
-        check_transformed_mega_weights_structure,
-        check_transformed_weight_pair,
+    from ...weight_validation import check_transformed_mega_weights_structure
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+        Sm100BlockScaledMoeConfig,
+        validate_standard_weights,
     )
-
-    if world_size <= 0:
-        raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
-    if num_experts % world_size != 0:
-        raise MoEEpConfigError(
-            f"num_experts ({num_experts}) must be divisible by world_size ({world_size})"
-        )
-
-    local_experts = num_experts // world_size
-    fc1_out = 2 * intermediate_size
-    data_dtype = _mxfp8_data_dtype(kind)
-
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import Mxfp8BlockSize, ceil_div
-
-    hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
-    intermediate_sf_cols = ceil_div(intermediate_size, Mxfp8BlockSize)
-    fc1_flat_sf = _mxfp8_swizzled_flat_sf_size(fc1_out, hidden_sf_cols)
-    fc2_flat_sf = _mxfp8_swizzled_flat_sf_size(hidden_size, intermediate_sf_cols)
 
     check_transformed_mega_weights_structure(transformed)
-    check_transformed_weight_pair(
-        transformed[0],
-        label="fc1",
-        num_local_experts=local_experts,
-        weight_dtype=data_dtype,
-        expected_weight_shape=(local_experts, hidden_size, fc1_out),
-        scale_dtype=torch.uint8,
-        expected_scale_shape=(local_experts, fc1_flat_sf),
-    )
-    check_transformed_weight_pair(
-        transformed[1],
-        label="fc2",
-        num_local_experts=local_experts,
-        weight_dtype=data_dtype,
-        expected_weight_shape=(local_experts, intermediate_size, hidden_size),
-        scale_dtype=torch.uint8,
-        expected_scale_shape=(local_experts, fc2_flat_sf),
-    )
+    try:
+        config = Sm100BlockScaledMoeConfig(
+            num_total_experts=num_experts,
+            max_tokens_per_rank=1,
+            num_topk=1,
+            hidden=hidden_size,
+            intermediate=intermediate_size,
+            rank=0,
+            world_size=world_size,
+            quant_kind=kind,
+        )
+        device = getattr(transformed[0][0], "device", torch.device("cpu"))
+        validate_standard_weights(transformed, config, device)
+    except ValueError as exc:
+        raise MoEEpConfigError(str(exc)) from exc
 
 
 __all__ = [

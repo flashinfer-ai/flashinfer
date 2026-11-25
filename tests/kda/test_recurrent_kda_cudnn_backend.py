@@ -889,13 +889,6 @@ def test_cudnn_entry_point_requires_cu_seqlens():
 
 
 # Native pool addressing must preserve KDA's implicit input-state mutation.
-def _require_state_pool_frontend():
-    import cudnn
-
-    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
-        pytest.skip("state pools require cuDNN frontend 1.31+")
-
-
 def _make_kda_pool(heads, dtype, padding=0):
     row_size = heads * HEAD_DIM * HEAD_DIM
     storage = torch.randn(7 * (row_size + padding), device="cuda", dtype=dtype)
@@ -911,7 +904,6 @@ def _make_kda_pool(heads, dtype, padding=0):
 @pytest.mark.parametrize("padding", [0, 96])
 @pytest.mark.parametrize("return_state", [False, True])
 def test_cudnn_kda_pool_updates_only_selected_rows(state_dtype, padding, return_state):
-    _require_state_pool_frontend()
     inputs = _make_inputs([17, 0, 31], 4, seed=311)
     pool = _make_kda_pool(4, state_dtype, padding)
     for slot_values in ([5, 2, 4], [1, 6, 3]):
@@ -940,7 +932,6 @@ def test_cudnn_kda_pool_updates_only_selected_rows(state_dtype, padding, return_
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_cudnn_kda_pool_long_prefill_matches_serial(state_dtype):
-    _require_state_pool_frontend()
     inputs = _make_inputs([2049, 0, 1023], 4, seed=319)
     pool = _make_kda_pool(4, state_dtype, 96)
     slots = torch.tensor([5, 2, 4], device="cuda", dtype=torch.int32)
@@ -966,7 +957,6 @@ def test_cudnn_kda_pool_long_prefill_matches_serial(state_dtype):
 @pytest.mark.parametrize("return_state", [False, True])
 @pytest.mark.parametrize("identical", [False, True])
 def test_cudnn_kda_pool_explicit_output_state(return_state, identical):
-    _require_state_pool_frontend()
     inputs = _make_inputs([17, 31], 4, seed=313)
     pool = _make_kda_pool(4, torch.float32, 96)
     slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
@@ -1000,7 +990,6 @@ def test_cudnn_kda_pool_explicit_output_state(return_state, identical):
 
 
 def test_cudnn_kda_pool_capture_observes_changed_slots_and_contents():
-    _require_state_pool_frontend()
     inputs = _make_inputs([17, 31], 4, seed=317)
     pool = _make_kda_pool(4, torch.bfloat16, 96)
     seed = pool.clone()

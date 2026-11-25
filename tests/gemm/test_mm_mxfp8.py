@@ -25,6 +25,9 @@ _MIN_COS_SIM = 0.98
 
 def test_mm_mxfp8_auto_retunes_when_cudnn_becomes_eligible(monkeypatch):
     # Exercise the real SM120 backend filters with CPU tensors and fake runners.
+    # Operand residency is tested separately; this test isolates autotuner caching.
+    monkeypatch.setattr(gemm_base, "_check_mm_mxfp8_tensor_devices", lambda *args: None)
+
     def capability(device):
         return 12, 0
 

@@ -345,6 +345,7 @@ TensorRT-LLM Fused MoE
     trtllm_bf16_routed_moe
     trtllm_fp4_block_scale_moe
     trtllm_fp4_block_scale_routed_moe
+    split_fp4_moe_weights_by_locality_domain
     trtllm_fp8_block_scale_moe
     trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_channel_scale_moe
@@ -538,10 +539,14 @@ single-kernel or entirely on-chip intermediate implementation.
 Cake NVFP4 Warp Decode (SM100/SM103)
 ------------------------------------
 
-The Cake warp-decode runner is an explicit unified-MoE backend for exact
-SM100 and exact SM103. Select it with
-``CakeWarpDecodeConfig(backend="cake")``; it is not in the default backend
-list. Each device loads only its exact generated target. The current generated
+The Cake warp-decode runner is a unified-MoE backend for exact SM100 and
+exact SM103. Select it explicitly with
+``CakeWarpDecodeConfig(backend="cake")``. The default backend list also ends
+with a Cake entry: a ``MoELayer`` built without ``backend=`` selects it only
+for a weight pack with a ``"cake"`` view and only when it measures faster
+than every earlier eligible backend;
+``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes it. Each device loads
+only its exact generated target. The current generated
 portfolio fails closed outside these contracts:
 
 * ``(activation, hidden_size, intermediate_size, num_experts, top_k)`` is
@@ -560,7 +565,8 @@ portfolio fails closed outside these contracts:
   ``(SwiGLU(), 4096, 256, 512, 10)``, ``(SwiGLU(), 3072, 768, 256, 8)``,
   and ``(SwiGLU(), 3072, 384, 256, 8)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
-  int32 expert IDs and BF16 routing weights;
+  int32 expert IDs and BF16 routing weights; an ID outside
+  ``[0, num_experts)`` drops its routing slot (see below);
 * quantization is NVFP4, finalization and PDL are enabled, and expert
   parallelism, fused shared experts, bias, and LoRA are disabled.
 
@@ -636,17 +642,18 @@ its dictionary directly::
     )
     output = MoELayer(config)(activations, weights)
 
+The kernels drop every routing slot whose expert ID lies outside
+``[0, num_experts)``, for example a ``-1`` padding slot. A dropped slot adds
+nothing to the output, and its routing weight is ignored even when it is NaN or
+Inf. Any number of a token's slots may be dropped, and a token without a valid
+slot outputs zeros. The check runs on the device in every launch and CUDA Graph replay; no
+host code reads ``topk_ids``, so the routing tensor may change between calls
+and replays without any revalidation.
+
 The runner prepares its route-map workspace before a timed launch or CUDA
 Graph capture and reuses it for the same token count and geometry. Warm up each
-shape and routing tensor before capturing it; an unseen workspace shape or an
-unvalidated routing-tensor generation during capture is rejected instead of
-initializing implicitly. Repeated calls reuse the routing validation receipt
-until a normal tensor is modified in place. Inference tensors lack a version
-counter, so their receipt is identity/storage based. Every later inference-mode
-mutation and graph replay must keep expert IDs in the configured range because
-neither path can be revalidated automatically. At most 64 live routing tensors
-are retained; validating another distinct tensor fails explicitly, so construct
-a new runner for another bounded lifetime.
+shape before capturing it; an unseen workspace shape during capture is
+rejected instead of initializing implicitly.
 
 The runner retains a bounded prepared-workspace cache keyed by execution stream
 and geometry. Preparation issues a generation receipt, and the binding records

@@ -29,9 +29,9 @@ from typing import Any, NamedTuple, Optional, Tuple
 
 import torch
 from filelock import FileLock
-from tvm_ffi import cpp
 
 from ..jit import env as jit_env
+from ..jit.inline_cubin import load_inline_with_cubin
 
 _CHUNK_SIZE = 128
 _HEADDIM = 64
@@ -78,6 +78,24 @@ _EXACTMETA_HOST_TEMPLATE = (
 _CHUNKPAR3_HOST_TEMPLATE = (
     Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel3_sequence.cpp"
 )
+# The launchers of the state-slot programs (``_SLOT_MODULES``): the fused,
+# three-phase and look-back launchers with the twelve slot arguments appended
+# (``_SLOT_ARGS``); they check ``initial_states`` / ``final_states`` /
+# ``checkpoint_states`` as state pools addressed by rows instead of contiguous
+# tensors, and the slot vectors at their element steps.
+_EXACTFUSED_SLOTS_HOST_TEMPLATE = (
+    Path("generated") / "host" / "mamba_ssd_combined_fused_slots_sequence.cpp"
+)
+_CHUNKPAR3_SLOTS_HOST_TEMPLATE = (
+    Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel3_slots_sequence.cpp"
+)
+_CHUNKPAR_SLOTS_HOST_TEMPLATE = (
+    Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel_slots_sequence.cpp"
+)
+# Schedule-variant suffix of a state-slot program: ``<dense key>_slots`` for a
+# dense program without a variant, ``<dense key>slots`` (``_tailslots``,
+# ``_noringslots``) for one with a variant.
+_SLOTS = "slots"
 
 
 @dataclass(frozen=True)
@@ -136,6 +154,10 @@ class _Program:
     packed-varlen ring program loading a work item's initial state as one
     bulk copy, :func:`ibulk_selected`; the fused family's sm_107a
     packed-varlen ring program doing the same, :func:`fused_ibulk_selected`).
+    ``state_slots`` marks a state-slot program (``_SLOT_PROGRAMS``): its
+    ``variant`` is its dense twin's, and it reads initial states from and
+    writes final states to caller state pools through per-sequence slot
+    vectors (``_SLOT_ARGS``).
     """
 
     family: str
@@ -149,6 +171,7 @@ class _Program:
     preprocess_args: tuple[str, ...]
     variant: str = ""
     cluster_dims: tuple[int, int, int] = (1, 1, 1)
+    state_slots: bool = False
 
     @property
     def kernels(self) -> tuple[_Kernel, _Kernel]:
@@ -204,60 +227,60 @@ _SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE = (
 # Retained start programs (the FlashInfer 36fd76859292 files): a literal the
 # Cake export does not fill.
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_3876f7208d",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_f074fc128b",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_2dc39c9955",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_636342f6cc",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9759edcc11",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_6037fe869d",
-    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_77156893a6",
-    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0f475595b9",
-    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163",
-    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e",
-    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_57c5d59a5d",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_0304e7bf49",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_5f1dbb9c66",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_bff217fa79",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_0c6f30beba",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_6d2318ba0d",
+    "exact_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_efdf7380e0",
+    "exact_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_2b039f415c",
+    "exact_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_a10529397b",
+    "exact_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_493e7eec20",
+    "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_52b64b0dd5",
 }
 _EXACTFUSED_MODULES = {
-    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_b9b1004bf9",
-    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_ca0e86b85e",
-    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_c0c70bdc72",
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2e60cd811b",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9f26678a99",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_33156e24a3",
-    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_b23fda648d",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_96d2060d32",
-    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_1b6ebc1d72",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_b13ad21c49",
-    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_079bcfe4b5",
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_011f21c410",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_e5b85d2d4e",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_9fdf6099c8",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_e7722e4417",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_5f0f1349bd",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_3558118052",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_a4e6f5d66c",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_a1617c33c9",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_76fa0fa01f",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_b3de9febfd",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_8b9a33aa87",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_22e35cf4ea",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_f383a3a64e",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_84131101e6",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_2a29ec0757",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_247f589535",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_bbe331b2df",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_9ff2b9e2c4",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_e5080758d8",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_9aa310f184",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_ab25f10fdc",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_a5df42f0c8",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_38cb1bdaba",
 }
 _EXACTPRE_MODULES = {
-    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_42e1969ba8",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_da7c5004dc",
-    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_9df4f49711",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_6a9d60dc45",
-    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_d2d517f5a8",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_4d4d183c65",
-    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_83e285944e",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_920a72bca9",
-    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_8c871220a8",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_58fa3281d0",
-    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_da634e043c",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_3db510fd81",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_6125204ac2",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_3aa1997f76",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_fedf317f24",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_98d1f6f397",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_6d4581c895",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_362beba49d",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_cc81103507",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_a1019b169f",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_4573278a33",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_79819ba300",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_5a81ce084c",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_2d24f1430d",
 }
 _CHUNKPAR3_MODULES = {
-    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_2d0d9e4b72",
-    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_e1869cbee5",
-    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_4b726bb26f",
-    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_3b884ec056",
-    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_a3f2b783ec",
-    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_d031378b2d",
+    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_6b2e063da1",
+    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_2a5bf81a57",
+    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_f528b5e49d",
+    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_2f5a18dab4",
+    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_ca8df391c9",
+    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_9359b5cf7d",
 }
 # The fused programs of the seq_idx triple form deriving its table
 # (``exactmeta_*``): the ``exactfused_*`` varlen main kernels -- the same
@@ -266,11 +289,11 @@ _CHUNKPAR3_MODULES = {
 # preprocess.  Refreshed by the Cake export together with the exactfused
 # varlen entries (an exactmeta entry always equals its exactfused twin).
 _EXACTMETA_MODULES = {
-    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2e60cd811b",
-    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9f26678a99",
-    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_33156e24a3",
-    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_96d2060d32",
-    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_b13ad21c49",
+    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_e7722e4417",
+    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_5f0f1349bd",
+    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_3558118052",
+    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_a1617c33c9",
+    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_b3de9febfd",
 }
 # The one-launch fused varlen programs (``exactone_*``): the exact scan's fused
 # varlen entries as SM103 renders them -- the main kernel's CTA prologue
@@ -281,11 +304,11 @@ _EXACTMETA_MODULES = {
 # render: its sources are the ``exactone_*`` entries of ``_SM107_MODULES``.
 # Refreshed by the Cake export; seed identities until it fills them.
 _EXACTONE_MODULES = {
-    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2e93602110",
-    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_417e094e67",
-    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_71ead26645",
-    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_1100526c71",
-    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_948223063c",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2278b3a894",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_838e00b3fb",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_fd43e14e41",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_c32913bf1c",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_b19488ae99",
 }
 # sm_107a (Rubin) device modules, filled by the Cake export: every
 # ``exactfused_*``, ``exactone_*``, ``exactpre_*`` (tail included),
@@ -322,76 +345,131 @@ _EXACTONE_MODULES = {
 # ``exactone_<state>_varlen_tablefirstunit``,
 # ``exactone_f32_varlen_tablerolesunit``, :func:`unit_cluster_variant`):
 # their entries are their sole sources (no fold module, never built for
-# another architecture).
+# another architecture).  The claim and wrap programs have state-slot twins
+# on sm_107a alone (``_SM107_SLOT_MODULES``, ``_SM107_ONLY_SLOT_PROGRAMS``).
 _SM107_MODULES = {
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_da9777c315",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_a9d2a3654f",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_94a91cbd54",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_24f1ab6c11",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_1c89156428",
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_bf68b8f8f3",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_f2d6324ea2",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_8f204dd7bf",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_e03e956d2e",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_e788b244f4",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_ea7e6fd350",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_d143ae24ea",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ae77ddc912",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_ee7d6500e5",
-    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_d6ebef6fe1",
-    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_e07ae30b9c",
-    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_ffad0741b7",
-    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_28b9c00efa",
-    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_dec73a4d81",
-    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f50d8568b5",
-    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_4e298ebb45",
-    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_231fcdbe99",
-    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_17444adc41",
-    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_83d228d84c",
-    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_64e0b8fd3d",
-    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_542047a878",
-    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_8a0418850b",
-    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_5bb1e2274f",
-    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_a0ea2820d8",
-    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_48e80d8704",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_a9564ce055",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_10c02fe15e",
-    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_fc388577dc",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_62c88e8153",
-    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_39bb8597d5",
-    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_35f6e66f75",
-    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_3449e8c0f2",
-    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_ebf7470866",
-    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_43dad44ea0",
-    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_5d526eacf5",
-    "exactpre_bf16_varlen_claim": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_claim_57675d132c",
-    "exactpre_f32_varlen_claim": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_8ae380b2cd",
-    "exactpre_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_ibulk_272db07349",
-    "exactpre_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ibulk_ae9645a9b3",
-    "exactone_bf16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirst_919b15eab0",
-    "exactone_f16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f16_varlen_tablefirst_2c8fb4061a",
-    "exactone_f32_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirst_0d97c77a55",
-    "exactone_bf16_varlen_tableroles": "mamba_ssd_q_tmem_alias_bf16_varlen_tableroles_24a80aed96",
-    "exactone_f16_varlen_tableroles": "mamba_ssd_q_tmem_alias_f16_varlen_tableroles_c93e2ea350",
-    "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_eba5f32222",
-    "exactfused_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_ibulk_5a2348bf3f",
-    "exactfused_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_ibulk_2158454d40",
-    "exactpre_bf16_varlen_tailone": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tailone_b708fb0cbd",
-    "exactpre_f16_varlen_tailone": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tailone_1494bfd93c",
-    "exactpre_f32_varlen_tailone": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tailone_d1940edbda",
-    "exactfused_bf16_batched_zpf": "mamba_ssd_q_tmem_alias_bf16_batched_zpf_853e3f9c12",
-    "exactfused_f32_batched_zpf": "mamba_ssd_q_tmem_alias_f32_batched_zpf_9a7b9d1222",
-    "exactpre_bf16_varlen_unit": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_unit_86c0dcc2d4",
-    "exactpre_f32_varlen_unit": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_unit_8d8c0d5ef1",
-    "exactone_bf16_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirstunit_1b60272131",
-    "exactone_f32_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirstunit_22af6b5b49",
-    "exactone_f32_varlen_tablerolesunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablerolesunit_4743b4456a",
-    "exactpre_bf16_varlen_wrap": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_wrap_6c0da31578",
-    "exactpre_f32_varlen_wrap": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_wrap_72a9ccdcba",
-    "exactfused_bf16_batched_chk": "mamba_ssd_q_tmem_alias_bf16_batched_chk_b93b8c643a",
-    "exactfused_bf16_batched_zpfchk": "mamba_ssd_q_tmem_alias_bf16_batched_zpfchk_cff885c8dc",
-    "exactfused_f32_batched_chk": "mamba_ssd_q_tmem_alias_f32_batched_chk_a978f5be55",
-    "exactfused_f32_batched_zpfchk": "mamba_ssd_q_tmem_alias_f32_batched_zpfchk_bb6a238109",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_92390c642a",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_80e17110b4",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_1a6f6e4221",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_58ab90c376",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_73955094cd",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_13feff66c7",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_8937a93746",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_35946eabaf",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_7d8f86aaa0",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_eeb1166697",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_0cc937a9b9",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_cf09ab8f4b",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_b406bd6d2a",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_d73173dce7",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5d5ce6f8b0",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_6f52680adb",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_25ad44523f",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_2d38229287",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_7f70322180",
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_1d840c20bf",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_3a0998010d",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_f8f536f2d1",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_f47717663d",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_95d0462cf3",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_ccf04dfaa7",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_6a71724ba5",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_af5dc20aa1",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_610c682793",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_db1cff3551",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_077bd5cfe9",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_4069811eb7",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_88fff9a30c",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_2855072fe8",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_0c32ee0084",
+    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_6f1a1be4aa",
+    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_c1ef3d2361",
+    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_2ef6405f3f",
+    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_5c92f5e8cc",
+    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_b23d97082a",
+    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_cfcea86980",
+    "exactpre_bf16_varlen_claim": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_claim_fd72f89a4f",
+    "exactpre_f32_varlen_claim": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_5d7931934e",
+    "exactpre_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_ibulk_921901c9f0",
+    "exactpre_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ibulk_e50c17ad9c",
+    "exactone_bf16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirst_5797e0d0fe",
+    "exactone_f16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f16_varlen_tablefirst_f385eaf41d",
+    "exactone_f32_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirst_9dce46fdcc",
+    "exactone_bf16_varlen_tableroles": "mamba_ssd_q_tmem_alias_bf16_varlen_tableroles_4547d672bc",
+    "exactone_f16_varlen_tableroles": "mamba_ssd_q_tmem_alias_f16_varlen_tableroles_d3eb3675bb",
+    "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_2a2cdd4b56",
+    "exactfused_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_ibulk_720ad6229b",
+    "exactfused_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_ibulk_c145683a5b",
+    "exactpre_bf16_varlen_tailone": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tailone_0e98def74f",
+    "exactpre_f16_varlen_tailone": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tailone_6b16983f45",
+    "exactpre_f32_varlen_tailone": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tailone_5c0137e420",
+    "exactfused_bf16_batched_zpf": "mamba_ssd_q_tmem_alias_bf16_batched_zpf_4beb2adefb",
+    "exactfused_f32_batched_zpf": "mamba_ssd_q_tmem_alias_f32_batched_zpf_7369a95b20",
+    "exactpre_bf16_varlen_unit": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_unit_9e07537c56",
+    "exactpre_f32_varlen_unit": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_unit_9d3d6dfd4f",
+    "exactone_bf16_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirstunit_5ecad11208",
+    "exactone_f32_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirstunit_57abd94902",
+    "exactone_f32_varlen_tablerolesunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablerolesunit_411142d7f6",
+    "exactpre_bf16_varlen_wrap": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_wrap_31036cd617",
+    "exactpre_f32_varlen_wrap": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_wrap_4b738ea95c",
+    "exactfused_bf16_batched_chk": "mamba_ssd_q_tmem_alias_bf16_batched_chk_1cb26f6df6",
+    "exactfused_bf16_batched_zpfchk": "mamba_ssd_q_tmem_alias_bf16_batched_zpfchk_52c82f79e0",
+    "exactfused_f32_batched_chk": "mamba_ssd_q_tmem_alias_f32_batched_chk_ae137a9f27",
+    "exactfused_f32_batched_zpfchk": "mamba_ssd_q_tmem_alias_f32_batched_zpfchk_02d1bae0ce",
+}
+# State-slot device modules, filled by the Cake export.  Each key is a dense
+# program key with the ``slots`` variant (``_SLOTS``: ``<key>_slots``, or
+# ``<key>slots`` after a variant), and its program reads the initial states
+# from and writes the final states to caller state pools through per-sequence
+# slot vectors (``initial_state_slots`` / ``final_state_slots``,
+# ``_SLOT_ARGS``); every other argument, the launch geometry, SMEM and cluster
+# shape are its dense twin's.  ``_SLOT_MODULES`` names the one unit sm_100a and
+# sm_103a both build (as the dense fold units), ``_SM107_SLOT_MODULES`` the
+# sm_107a render; ``_SM107_SLOT_MODULES`` holds every ``_SLOT_MODULES`` key and
+# the twins of the sm_107a-only claim and wrap programs
+# (``exactpre_<state>_varlen_claimslots`` / ``_wrapslots``,
+# ``_SM107_ONLY_SLOT_PROGRAMS``), which no other architecture builds.
+_SLOT_MODULES: dict[str, str] = {
+    "exactfused_bf16_varlen_slots": "mamba_ssd_q_tmem_alias_bf16_varlen_slots_6e2dc8f18a",
+    "exactfused_f16_varlen_slots": "mamba_ssd_q_tmem_alias_f16_varlen_slots_3e5f3c60f4",
+    "exactfused_f32_varlen_slots": "mamba_ssd_q_tmem_alias_f32_varlen_slots_45015c61af",
+    "exactfused_bf16_varlen_noringslots": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_slots_a2ad601880",
+    "exactfused_f16_varlen_noringslots": "mamba_ssd_q_tmem_alias_f16_varlen_noring_slots_8278bebedf",
+    "exactpre_bf16_varlen_slots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_slots_f9991d3f4a",
+    "exactpre_f16_varlen_slots": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_slots_5709c20731",
+    "exactpre_f32_varlen_slots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_slots_fbc47c71da",
+    "exactpre_bf16_varlen_tailslots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_slots_bbd38c6df7",
+    "exactpre_f16_varlen_tailslots": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_slots_63f3070d67",
+    "exactpre_f32_varlen_tailslots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_slots_f53941b810",
+    "chunkpar3_bf16_varlen_slots": "mamba_ssd_chunk_parallel_bf16_varlen_slots_3cda6d8803",
+    "chunkpar3_f16_varlen_slots": "mamba_ssd_chunk_parallel_f16_varlen_slots_45a1542e69",
+    "chunkpar3_f32_varlen_slots": "mamba_ssd_chunk_parallel_f32_varlen_slots_c0d0362387",
+    "chunkpar_bf16_varlen_slots": "mamba_ssd_chunk_parallel_v3_bf16_varlen_slots_94916cbcb4",
+    "chunkpar_f16_varlen_slots": "mamba_ssd_chunk_parallel_v3_f16_varlen_slots_274b3b8e8f",
+    "chunkpar_f32_varlen_slots": "mamba_ssd_chunk_parallel_v3_f32_varlen_slots_0756fd366b",
+}
+_SM107_SLOT_MODULES: dict[str, str] = {
+    "exactfused_bf16_varlen_slots": "mamba_ssd_q_tmem_alias_bf16_varlen_slots_341caa8df3",
+    "exactfused_f16_varlen_slots": "mamba_ssd_q_tmem_alias_f16_varlen_slots_7824d43b73",
+    "exactfused_f32_varlen_slots": "mamba_ssd_q_tmem_alias_f32_varlen_slots_c6bf189e48",
+    "exactfused_bf16_varlen_noringslots": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_slots_62922d908a",
+    "exactfused_f16_varlen_noringslots": "mamba_ssd_q_tmem_alias_f16_varlen_noring_slots_61e268077b",
+    "exactpre_bf16_varlen_slots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_slots_fcc698b4d5",
+    "exactpre_f16_varlen_slots": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_slots_81d9729107",
+    "exactpre_f32_varlen_slots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_slots_b3136fcb34",
+    "exactpre_bf16_varlen_tailslots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_slots_659e4c02fe",
+    "exactpre_f16_varlen_tailslots": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_slots_5d7cba9c4e",
+    "exactpre_f32_varlen_tailslots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_slots_d922e6139c",
+    "chunkpar3_bf16_varlen_slots": "mamba_ssd_chunk_parallel_bf16_varlen_slots_f4eeb057a0",
+    "chunkpar3_f16_varlen_slots": "mamba_ssd_chunk_parallel_f16_varlen_slots_37991b3213",
+    "chunkpar3_f32_varlen_slots": "mamba_ssd_chunk_parallel_f32_varlen_slots_1a162e2e94",
+    "chunkpar_bf16_varlen_slots": "mamba_ssd_chunk_parallel_v3_bf16_varlen_slots_f4c3752b5b",
+    "chunkpar_f16_varlen_slots": "mamba_ssd_chunk_parallel_v3_f16_varlen_slots_794f7db05e",
+    "chunkpar_f32_varlen_slots": "mamba_ssd_chunk_parallel_v3_f32_varlen_slots_40053893bd",
+    "exactpre_bf16_varlen_claimslots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_claim_slots_a62771f11a",
+    "exactpre_f32_varlen_claimslots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_slots_d68e044e02",
+    "exactpre_bf16_varlen_wrapslots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_wrap_slots_d49b78b94e",
+    "exactpre_f32_varlen_wrapslots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_wrap_slots_a7fe7e22b8",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -738,6 +816,36 @@ _MAIN_ARGS_CHUNKPAR3 = (
     "write_final_states",
     "checkpoint_state_count",
 )
+# The twelve arguments a state-slot program's main kernel takes after its dense
+# twin's: the per-sequence int32 slot vectors, the initial / final pools' row
+# strides in elements (64-bit) and their row counts, the checkpoint pool's row
+# stride (``checkpoint_state_count`` is its row count), the per-sequence uint8
+# initial-state flags (read where ``has_initial`` is ``_HAS_INITIAL_FLAGS``),
+# the int32 element steps of the three slot vectors (sequence ``i`` reads
+# ``slots[i * step]``) and the null slot.  A slot outside ``[0, rows)`` or equal
+# to ``null_slot`` reads a zero initial state or stores no final or checkpoint
+# state.
+_SLOT_ARGS = (
+    "initial_state_slots",
+    "final_state_slots",
+    "initial_state_slot_stride",
+    "final_state_slot_stride",
+    "initial_state_rows",
+    "final_state_rows",
+    "checkpoint_state_slot_stride",
+    "initial_state_flags",
+    "initial_state_slots_step",
+    "final_state_slots_step",
+    "checkpoint_state_slots_step",
+    "null_slot",
+)
+_MAIN_ARGS_SLOTS = _MAIN_ARGS + _SLOT_ARGS
+_MAIN_ARGS_CHUNKPAR_SLOTS = _MAIN_ARGS_CHUNKPAR + _SLOT_ARGS
+_MAIN_ARGS_CHUNKPAR3_SLOTS = _MAIN_ARGS_CHUNKPAR3 + _SLOT_ARGS
+# ``has_initial`` of a state-slot call with ``initial_state_flags``: each
+# sequence reads its initial slot only where its flag byte is nonzero (the
+# dense programs take 0 or 1).
+_HAS_INITIAL_FLAGS = 2
 # Per family: host template, main-kernel argument order, main dynamic SMEM.
 _FAMILY_HOST = {
     "exact": (_HOST_TEMPLATE, _MAIN_ARGS_START, _EXACT_SMEM_BYTES),
@@ -752,6 +860,21 @@ _FAMILY_HOST = {
         _CHUNKPAR3_SMEM_BYTES,
     ),
 }
+# Per family with state-slot programs: host template and main-kernel argument
+# order (the main dynamic SMEM is the dense twin's).
+_SLOT_FAMILY_HOST = {
+    "exactfused": (_EXACTFUSED_SLOTS_HOST_TEMPLATE, _MAIN_ARGS_SLOTS),
+    "exactpre": (_EXACTFUSED_SLOTS_HOST_TEMPLATE, _MAIN_ARGS_SLOTS),
+    "chunkpar": (_CHUNKPAR_SLOTS_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR_SLOTS),
+    "chunkpar3": (_CHUNKPAR3_SLOTS_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR3_SLOTS),
+}
+# Whether a state-slot call the chunk-parallel rule sends to the look-back
+# program runs that program's slot twin (``chunkpar_*_varlen_slots``) where
+# the architecture's slot table holds it (:func:`_lookback_state_slots`); off,
+# or without that twin, it runs the three-phase slot twin instead.  Read when
+# a call shape's workspace is created, so a runner keeps the choice of the
+# shapes it has seen.
+_LOOKBACK_STATE_SLOTS = True
 
 
 def _scan(module: str) -> _Kernel:
@@ -800,15 +923,25 @@ _VARIANT_CLUSTER_DIMS = {
 
 
 def _program(name: str, module: str) -> _Program:
-    """Bind program ``<family>_<state>_<mode>[_<variant>]`` to its generated main source."""
+    """Bind program ``<family>_<state>_<mode>[_<variant>]`` to its generated main source.
+
+    A variant ending in ``_SLOTS`` names a state-slot program: its SMEM and
+    cluster shape are those of the dense variant before the suffix, its host
+    template and main arguments ``_SLOT_FAMILY_HOST``'s."""
 
     family, state_key, _mode, *variant = name.split("_")
     code, bits = _STATE_DTYPE_CODES[state_key]
     host_template, main_args, smem_bytes = _FAMILY_HOST[family]
     variant_name = ""
+    state_slots = False
     if variant:
         (variant_name,) = variant
-        smem_bytes = _VARIANT_SMEM_BYTES[(family, variant_name)]
+        if variant_name.endswith(_SLOTS):
+            state_slots = True
+            variant_name = variant_name.removesuffix(_SLOTS)
+            host_template, main_args = _SLOT_FAMILY_HOST[family]
+        if variant_name:
+            smem_bytes = _VARIANT_SMEM_BYTES[(family, variant_name)]
     preprocess, preprocess_args = (
         (_PACKED_METADATA, _METADATA_ARGS)
         if family == "exactmeta"
@@ -826,6 +959,7 @@ def _program(name: str, module: str) -> _Program:
         preprocess_args,
         variant_name,
         _VARIANT_CLUSTER_DIMS.get((family, variant_name), (1, 1, 1)),
+        state_slots=state_slots,
     )
 
 
@@ -855,6 +989,29 @@ _PROGRAMS.update(
     (name, _program(name, _SM107_MODULES[name]))
     for name in sorted(_SM107_ONLY_PROGRAMS)
 )
+# The state-slot programs, apart from ``_PROGRAMS``: only a call with slot
+# vectors routes to them (``_WorkspaceKey.state_slots``), and every name the
+# loader resolves goes through :func:`_program_of`.  The sm_107a-only slot
+# programs (the twins of the claim and wrap programs, keys of
+# ``_SM107_SLOT_MODULES`` alone) bind their sm_107a module on every
+# architecture, as the sm_107a-only dense programs do; only capability (10, 7)
+# routes to them, where the same call without slot vectors runs a program of
+# a ``_SM107_SLOT_TWIN_VARIANTS`` variant (``CakeSSDCombined._program_route``).
+_SM107_ONLY_SLOT_PROGRAMS = frozenset(_SM107_SLOT_MODULES) - frozenset(_SLOT_MODULES)
+_SM107_SLOT_TWIN_VARIANTS = ("claim", "wrap")
+_SLOT_PROGRAMS: dict[str, _Program] = {
+    name: _program(name, module) for name, module in _SLOT_MODULES.items()
+}
+_SLOT_PROGRAMS.update(
+    (name, _program(name, _SM107_SLOT_MODULES[name]))
+    for name in sorted(_SM107_ONLY_SLOT_PROGRAMS)
+)
+
+
+def _program_of(name: str) -> _Program:
+    """The table binding of program ``name``, dense or state-slot."""
+
+    return _PROGRAMS[name] if name in _PROGRAMS else _SLOT_PROGRAMS[name]
 
 
 def _program_name(
@@ -867,7 +1024,10 @@ def _program_name(
     for the two-kernel exact-scan family, ``"ibulk"``, ``"zpf"``, ``"chk"``
     or ``"zpfchk"`` for the fused one,
     ``"tablefirst"``, ``"tableroles"``, ``"tablefirstunit"`` or
-    ``"tablerolesunit"`` for the one-launch family)."""
+    ``"tablerolesunit"`` for the one-launch family).  A state-slot program
+    appends ``_SLOTS`` to its dense twin's variant: ``"slots"``,
+    ``"noringslots"`` or ``"tailslots"`` (``_SLOT_MODULES``), or on sm_107a
+    ``"claimslots"`` or ``"wrapslots"`` (``_SM107_ONLY_SLOT_PROGRAMS``)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -877,10 +1037,15 @@ def _program_name(
 def _main_module(name: str, arch: str) -> str:
     """The main-kernel module program ``name`` builds for ``arch``: its
     ``_SM107_MODULES`` entry on sm_107a where the table has one, else the
-    program's fold module."""
+    program's fold module.  A state-slot program builds its
+    ``_SM107_SLOT_MODULES`` entry on sm_107a: its ``_SLOT_MODULES`` unit is
+    never built there (it lacks the sm_107a descriptor-mask branch of the
+    dense fold units)."""
 
-    module = _PROGRAMS[name].main.module
+    module = _program_of(name).main.module
     if arch == _SM107_ARCH:
+        if name in _SLOT_PROGRAMS:
+            return _SM107_SLOT_MODULES[name]
         return _SM107_MODULES.get(name, module)
     return module
 
@@ -896,7 +1061,7 @@ def _arch_program(name: str, arch: str) -> _Program:
     and build flags; only the module identity, hence the device source,
     differs)."""
 
-    program = _PROGRAMS[name]
+    program = _program_of(name)
     module = _main_module(name, arch)
     main = program.main if module == program.main.module else _scan(module)
     preprocess = program.preprocess
@@ -907,7 +1072,7 @@ def _arch_program(name: str, arch: str) -> _Program:
             else _SM107_SEGMENT_PREPROCESS
         )
     smem_bytes = program.main_smem_bytes
-    if arch == _SM107_ARCH and name in _SM107_MODULES:
+    if arch == _SM107_ARCH and (name in _SM107_MODULES or name in _SM107_SLOT_MODULES):
         mode = name.split("_")[2]
         smem_bytes = _SM107_VARIANT_SMEM_BYTES.get(
             (program.family, mode, program.variant), smem_bytes
@@ -940,13 +1105,29 @@ _PDL_TRIGGER_FAMILIES = frozenset({"chunkpar3"})
 
 def _main_pdl(name: str, arch: str) -> bool:
     """Whether program ``name`` launches its main kernel with programmatic
-    dependent launch on ``arch``: the sm_107a render (``_SM107_MODULES``) of a
-    two-kernel family."""
+    dependent launch on ``arch``: the sm_107a render (``_SM107_MODULES`` or
+    ``_SM107_SLOT_MODULES``) of a two-kernel family."""
 
     return (
         arch == _SM107_ARCH
-        and _PROGRAMS[name].family in _PDL_FAMILIES
-        and name in _SM107_MODULES
+        and _program_of(name).family in _PDL_FAMILIES
+        and (name in _SM107_MODULES or name in _SM107_SLOT_MODULES)
+    )
+
+
+def _lookback_state_slots(state_dtype: torch.dtype, arch: Optional[str]) -> bool:
+    """Whether a state-slot call the chunk-parallel rule sends to the
+    look-back program runs that program's slot twin on ``arch``:
+    ``_LOOKBACK_STATE_SLOTS`` is on and the twin of the state dtype is in the
+    slot table the architecture builds (``_SLOT_PROGRAMS`` and
+    ``_SM107_SLOT_MODULES`` on sm_107a).  Otherwise the call runs the
+    three-phase slot twin, the route of a loader without the look-back twin."""
+
+    name = _program_name("chunkpar", state_dtype, True, _SLOTS)
+    return (
+        _LOOKBACK_STATE_SLOTS
+        and name in _SLOT_PROGRAMS
+        and (arch != _SM107_ARCH or name in _SM107_SLOT_MODULES)
     )
 
 
@@ -1286,13 +1467,65 @@ def _chunk_parallel_mode() -> str:
     return mode
 
 
-def _storage_overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Whether the byte extents of two contiguous tensors intersect."""
+def _storage_extent(t: torch.Tensor) -> tuple[int, int]:
+    """The byte extent of a tensor, strided or not: from its first element to
+    one past its last (``1 + sum((size - 1) * stride)`` elements, none for an
+    empty tensor)."""
 
-    a_start, b_start = a.data_ptr(), b.data_ptr()
-    a_end = a_start + a.numel() * a.element_size()
-    b_end = b_start + b.numel() * b.element_size()
+    start = t.data_ptr()
+    elements = 0
+    if t.numel():
+        elements = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(t.shape, t.stride(), strict=True)
+        )
+    return start, start + elements * t.element_size()
+
+
+def _storage_overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether the byte extents of two tensors, strided or not, intersect:
+    the elements a row-strided state pool skips between rows count as its
+    own."""
+
+    a_start, a_end = _storage_extent(a)
+    b_start, b_end = _storage_extent(b)
     return a_start < b_end and b_start < a_end
+
+
+def _occupied_overlaps(rows: torch.Tensor, other: torch.Tensor) -> bool:
+    """Whether the byte extent of ``other`` meets an element ``rows`` occupies.
+
+    A row-strided ``rows`` (contiguous rows, a positive row stride of at least
+    one row) occupies only its rows, not the gaps between them; any other
+    geometry counts its whole extent (``_storage_overlaps``)."""
+
+    if (
+        rows.dim() == 0
+        or not rows.numel()
+        or not rows[0].is_contiguous()
+        or rows.stride(0) <= 0
+        or rows[0].numel() > rows.stride(0)
+    ):
+        return _storage_overlaps(rows, other)
+    start = rows.data_ptr()
+    row_bytes = rows[0].numel() * rows.element_size()
+    step = rows.stride(0) * rows.element_size()
+    other_start, other_end = _storage_extent(other)
+    # The first row that ends after ``other`` starts.
+    first = max(0, (other_start - start - row_bytes) // step + 1)
+    return first < rows.shape[0] and start + first * step < other_end
+
+
+def _same_tensor(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two tensors view the same elements in the same geometry (one
+    state pool passed for two roles)."""
+
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+    )
 
 
 def _stream_capturing(device: torch.device) -> bool:
@@ -1334,7 +1567,9 @@ class _WorkspaceKey(NamedTuple):
     buffer (``update_seq_chunk_cumsum=True``), which needs a publishing stage
     (the one-launch ``exactone`` program keeps its table private).  All three
     are derived from the call's arguments alone, so ``prepare`` and ``run``
-    of the same call resolve the same key."""
+    of the same call resolve the same key.  ``state_slots``: the call passes
+    ``initial_state_slots`` or ``final_state_slots``, so it runs a state-slot
+    program (``_SLOT_PROGRAMS``)."""
 
     device_index: Optional[int]
     batch: int
@@ -1346,12 +1581,15 @@ class _WorkspaceKey(NamedTuple):
     from_cu_seqlens: bool
     caller_cumsum: bool
     publish_table: bool
+    state_slots: bool
     chunk_parallel_mode: str
 
 
 # ``_WorkspaceKey`` without the family override: what ``prepare`` freezes the
 # override for.
-_ShapeKey = Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool, bool, bool]
+_ShapeKey = Tuple[
+    Optional[int], int, int, int, int, int, torch.dtype, bool, bool, bool, bool
+]
 
 
 @dataclass(frozen=True)
@@ -2831,15 +3069,16 @@ def _launch_program(
 ) -> None:
     """Launch one program's preprocess and main kernel on the explicit stream."""
 
+    program = _program_of(name)
     _load_generated_program(name, arch).run(
         *_sequence_arguments(
-            _PROGRAMS[name].main_args,
+            program.main_args,
             preprocess,
             preprocess_grid,
             main,
             main_grid,
             cuda_stream,
-            preprocess_args=_PROGRAMS[name].preprocess_args,
+            preprocess_args=program.preprocess_args,
         )
     )
     _LOADED_PROGRAMS.add((name, arch))
@@ -3168,7 +3407,7 @@ def _load_generated_program(name: str, arch: str):
                 os.replace(temporary_cubin, cubin_path)
             cubins[kernel.module] = cubin_path.read_bytes()
 
-        return cpp.load_inline(
+        return load_inline_with_cubin(
             module_name,
             cpp_sources=host_source,
             embed_cubin=cubins,
@@ -3321,11 +3560,89 @@ class CakeSSDCombined:
     ``update_seq_chunk_cumsum=False`` is trusted as the sequence boundaries:
     no kernel reads ``seq_idx`` on that call, so :meth:`seq_idx_status`
     cannot report ids the caller already consumed when building the table.
+
+    State pools (packed varlen only, both forms): with ``initial_state_slots``
+    or ``final_state_slots`` (int32 ``[num_seqs]`` on the device of ``x``,
+    possibly strided: sequence ``i``'s slot is element ``i * stride(0)``, e.g.
+    column 0 of a ``[num_seqs, 1 + num_spec]`` slot table),
+    ``initial_states`` / ``final_states`` is a pool
+    ``[num_slots, nheads, 64, 128]`` of the state dtype whose rows are dense
+    ``[nheads, 64, 128]`` blocks (``stride()[1:] == (8192, 128, 1)``) and may
+    be strided apart by at least one row (a view into a larger page); its
+    base address and row stride must be 16-byte aligned.  Sequence ``i``
+    starts from row ``initial_state_slots[i]`` and stores its final state to
+    row ``final_state_slots[i]``.  A slot outside ``[0, num_slots)``, or equal
+    to ``null_slot_id`` (default -1; ``0`` for a cache whose row 0 is a
+    placeholder block), acts as -1: a zero initial state, no store.  A
+    ``null_slot_id`` other than -1 needs a slot vector on every state side
+    the call binds: a dense side (``initial_states`` without
+    ``initial_state_slots``, or ``return_final_states=True`` without
+    ``final_state_slots``) addresses its rows through the identity slots
+    ``0 .. num_seqs - 1``, one of which would be the null slot, so such a
+    call is refused.  With
+    ``initial_state_flags`` (contiguous bool / uint8 ``[num_seqs]``) a
+    sequence whose flag is 0 starts from a zero state whatever its initial
+    slot, so one slot vector can serve both sides of an in-place pool while
+    new sequences start from zero.  In a slot call ``checkpoint_states`` is
+    a pool too (the same row rules; it may be the initial and / or final pool
+    tensor itself) and ``checkpoint_state_slots`` may be strided; sequence
+    ``i``'s state after token ``checkpoint_token_indices[i]`` (exclusive,
+    absolute in the packed axis; negative for none) is stored to row
+    ``checkpoint_state_slots[i]`` (skipped like a final slot; a contiguous
+    ``[num_checkpoints, nheads, 64, 128]`` tensor is a pool of one-row
+    stride, so a caller checkpoint slot equal to ``null_slot_id`` is skipped
+    there too).  In the
+    ``cu_seqlens`` form every token in ``(start, end]`` of the sequence is
+    captured (a token at the end stores the final state); in the ``seq_idx``
+    triple form only a token at a segment end of the caller's
+    ``chunk_indices`` / ``chunk_offsets`` is captured, any other one is
+    skipped silently.
+
+    Aliasing contract, per call (values are read on the device only, so the
+    host checks the tensors, never the slots): let ``I`` be the initial rows
+    read (flag set, slot valid), ``F`` the final rows and ``C`` the
+    checkpoint rows written.  A final row may equal the initial row of its
+    own sequence (in place).  Checkpoint rows are pairwise distinct and
+    disjoint from every row of ``I`` and ``F``, the sequence's own included.
+    A row may appear in several ``I`` entries when no ``F`` or ``C`` entry
+    holds it (read-only sharing, e.g. a common cached prefix).  Final rows
+    are unique.  Any other aliasing gives undefined values but stays
+    memory-safe (every store is bounded by its pool's rows).  The same pool
+    tensor (equal address, shape and strides) may serve several roles; any
+    other storage overlap between the state tensors is refused.
+
+    A vLLM-style caller passes its ``ssm_state`` cache view as the pools,
+    column 0 of its slot table as both slot vectors, ``has_initial_states``
+    as ``initial_state_flags``, its checkpoint block column as
+    ``checkpoint_state_slots`` and ``null_slot_id=0``, and converts relative
+    checkpoint offsets once per step with the same ``cu_seqlens`` it passes
+    here: ``where(offset > 0, cu_seqlens[:-1] + offset, -1)``.  It masks the
+    tokens by the offset only, never by a slot value: with one token vector
+    shared by several cache groups, masking by one group's slot would drop
+    another group's valid checkpoint without any signal, while a null slot
+    is skipped in the kernel (its extra segment boundary changes only the
+    rounding of that sequence's scan).
+
+    With ``null_slot_id`` -1, the other side may stay dense (``[num_seqs, ...]`` contiguous).  The host
+    never reads slot, flag or token values: a captured graph replays with
+    the vectors' contents at replay time, while replacing a pool tensor
+    (another address or row stride), a slot vector's step, the presence of
+    flags or ``null_slot_id`` needs a new capture.  Such calls run the
+    state-slot twin of the program the call would run (``*_slots``,
+    ``_SLOT_PROGRAMS``; checkpoints never change it), except that the
+    retained start programs run ``exactpre``, the look-back program its own
+    twin (the three-phase one with ``_LOOKBACK_STATE_SLOTS`` off or without
+    that twin in the architecture's slot table), and the
+    sm_107a bulk, one-CTA pair and one-CTA-cluster forms, the
+    SM100 metadata form and the SM103 / SM107 one-launch table forms the ring
+    two-kernel or fused programs.  The sm_107a claim and wrap programs run
+    their own twins (``_SM107_ONLY_SLOT_PROGRAMS``).
     """
 
     #: Program of the most recent :meth:`run` (``exactfused_*``,
     #: ``exactmeta_*``, ``exactone_*``, ``exactpre_*``, ``exact_*``,
-    #: ``chunkpar_*`` or ``chunkpar3_*``);
+    #: ``chunkpar_*`` or ``chunkpar3_*``, the state-slot programs ending in
+    #: ``slots``);
     #: ``None`` before the first call.
     last_program_name: Optional[str] = None
     #: Uncaptured per-shape workspaces a runner keeps (least recently used
@@ -3519,6 +3836,106 @@ class CakeSSDCombined:
             buffers[buffer_key] = buffer
         return buffer, value
 
+    @staticmethod
+    def _check_state_slots(
+        name: str, slots: torch.Tensor, num_sequences: int, device: torch.device
+    ) -> int:
+        """Validate a per-sequence slot vector, int32 ``[num_seqs]`` on the
+        device of ``x``, and return its element step: the kernel reads slot
+        ``i`` at ``slots[i * step]``, so the vector may be strided (a column
+        of a wider slot table).  A one-entry vector has no meaningful
+        ``stride(0)``: its step is 1.  Its values are read on the device
+        only."""
+
+        if slots.dtype != torch.int32:
+            raise ValueError(f"{name} must be int32 (got {slots.dtype})")
+        if slots.ndim != 1 or slots.numel() != num_sequences:
+            raise ValueError(
+                f"{name} must be a vector of one slot per sequence "
+                f"([{num_sequences}], got {list(slots.shape)})"
+            )
+        if slots.device != device:
+            raise ValueError(f"{name} must be on the device of x")
+        step = int(slots.stride(0)) if num_sequences > 1 else 1
+        if step < 1:
+            raise ValueError(f"{name} must have a positive stride (got {step})")
+        # The kernels index ``sequence * step`` in 32 bits.
+        if (num_sequences - 1) * step > 2**31 - 1:
+            raise ValueError(
+                f"{name} stride {step} addresses past 2**31 - 1 elements for "
+                f"{num_sequences} sequences"
+            )
+        return step
+
+    @staticmethod
+    def _check_state_flags(
+        flags: torch.Tensor, num_sequences: int, device: torch.device
+    ) -> torch.Tensor:
+        """Validate ``initial_state_flags`` (contiguous bool or uint8
+        ``[num_seqs]`` on the device of ``x``) and return its uint8 view, the
+        bytes the kernels read (a bool tensor is reinterpreted, not copied)."""
+
+        if flags.dtype not in (torch.bool, torch.uint8):
+            raise ValueError(
+                f"initial_state_flags must be bool or uint8 (got {flags.dtype})"
+            )
+        if flags.ndim != 1 or flags.numel() != num_sequences:
+            raise ValueError(
+                "initial_state_flags must be a vector of one flag per sequence "
+                f"([{num_sequences}], got {list(flags.shape)})"
+            )
+        if not flags.is_contiguous():
+            raise ValueError("initial_state_flags must be contiguous")
+        if flags.device != device:
+            raise ValueError("initial_state_flags must be on the device of x")
+        return flags.view(torch.uint8)
+
+    def _check_state_pool(
+        self, name: str, pool: torch.Tensor, device: torch.device
+    ) -> int:
+        """Validate a state pool ``[num_slots, nheads, 64, 128]`` and return
+        its row stride in elements.
+
+        Each row must be a dense ``[nheads, 64, 128]`` block; rows may be
+        strided (a page of a larger cache) by at least one row.  The base
+        address and the row stride must be 16-byte aligned.  A one-row pool
+        has no meaningful ``stride(0)``: its stride is one row."""
+
+        row_elements = self.nheads * _HEADDIM * _DSTATE
+        if pool.ndim != 4 or tuple(pool.shape[1:]) != (
+            self.nheads,
+            _HEADDIM,
+            _DSTATE,
+        ):
+            raise ValueError(
+                f"{name} must be a state pool [num_slots, {self.nheads}, 64, 128] "
+                f"(got {list(pool.shape)})"
+            )
+        rows = int(pool.shape[0])
+        if not 1 <= rows <= 2**31 - 1:
+            raise ValueError(
+                f"{name} must hold between 1 and 2**31 - 1 slots (got {rows})"
+            )
+        if tuple(pool.stride()[1:]) != (_HEADDIM * _DSTATE, _DSTATE, 1):
+            raise ValueError(
+                f"{name} rows must be dense [nheads, 64, 128] blocks: "
+                f"stride()[1:] must be (8192, 128, 1), got {tuple(pool.stride()[1:])}"
+            )
+        stride = int(pool.stride(0)) if rows > 1 else row_elements
+        if stride < row_elements:
+            raise ValueError(
+                f"{name} row stride {stride} is below one row ({row_elements} elements)"
+            )
+        if pool.dtype != self.state_dtype:
+            raise ValueError(f"{name} dtype must match state_dtype")
+        if pool.device != device:
+            raise ValueError(f"{name} must be on the device of x")
+        if pool.data_ptr() % 16 or stride * pool.element_size() % 16:
+            raise ValueError(
+                f"{name} base address and row stride must be 16-byte aligned"
+            )
+        return stride
+
     def _get_workspace(
         self,
         *,
@@ -3548,28 +3965,19 @@ class CakeSSDCombined:
         self._workspace = entry.workspace
         return entry.workspace
 
-    def _materialize_workspace(
+    def _program_route(
         self,
         *,
         key: _WorkspaceKey,
-        device: torch.device,
         sm_count: int,
         capability: tuple[int, int],
-    ) -> dict[str, Any]:
-        """Allocate the per-call-shape workspace of ``key`` and select its
-        kernel family.  The chunk-parallel buffers are per device, not per
-        shape: this only grows them to the shape's tile bound (the call binds
-        the device's current buffers, see ``_chunk_parallel_workspace``)."""
+    ) -> str:
+        """The program a call of ``key`` runs on a device of ``sm_count`` SMs
+        and ``capability`` (``workspace["program"]``): a function of the key
+        and the device alone."""
 
         batch, seqlen, nchunks = key.batch, key.seqlen, key.nchunks
         num_segments, num_sequences = key.num_segments, key.num_sequences
-        ids = torch.arange(num_segments, dtype=torch.int32, device=device)
-        chunks = ids % nchunks
-        starts = (ids // nchunks) * seqlen + chunks * _CHUNK_SIZE
-        # Batched segments are physical chunks; the trailing chunk of a
-        # sequence whose length is not a multiple of 128 is partial.
-        lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
-        tile_count = num_segments * self.nheads
         # The chunk-parallel rule reads the same host quantities in both
         # varlen metadata forms: the cu_seqlens form only knows the host
         # segment bound, so the triple form selects on that bound too (its
@@ -3588,6 +3996,24 @@ class CakeSSDCombined:
             capability=capability,
             mode=key.chunk_parallel_mode,
         )
+        # State-slot calls run only the programs that have a slot twin
+        # (``_SLOT_PROGRAMS``).  The look-back slot twin reads the initial
+        # state of a range's continuing item before the range publishes its
+        # flag, which the range of the item's last tile polls before its
+        # final store, so an in-place pool is ordered there too;
+        # ``_LOOKBACK_STATE_SLOTS`` off, or a slot table without that twin
+        # (:func:`_lookback_state_slots`), sends those calls to the
+        # three-phase slot twin, which reads and writes each state element in
+        # one thread.
+        slots = key.state_slots
+        if (
+            slots
+            and family == "chunkpar"
+            and not _lookback_state_slots(
+                self.state_dtype, _TARGET_ARCHS.get((capability[0], capability[1]))
+            )
+        ):
+            family = "chunkpar3"
         chunk_parallel = family != "exact"
         # Inside the fused shape window (the FI mirror of the Cake
         # ``fused_route`` window) the fused main kernel serves every form
@@ -3610,13 +4036,21 @@ class CakeSSDCombined:
         # prologue derives a private table from the triple (one launch, no
         # stage) -- unless the caller's buffer must receive the table
         # (``key.publish_table``), which only a publishing stage writes: that
-        # form keeps the two-kernel program on SM103 and SM107.
+        # form keeps the two-kernel program on SM103 and SM107.  No
+        # ``exactmeta`` or ``exactone`` slot program exists: a slot call that
+        # derives its table runs the two-kernel program, whose preprocess
+        # publishes it.
         derives_table = (
             self.has_varlen and not key.from_cu_seqlens and not key.caller_cumsum
         )
-        light_stage = derives_table and tuple(capability) in _LIGHT_STAGE_CAPABILITIES
+        light_stage = (
+            not slots
+            and derives_table
+            and tuple(capability) in _LIGHT_STAGE_CAPABILITIES
+        )
         one_launch = (
-            derives_table
+            not slots
+            and derives_table
             and not key.publish_table
             and tuple(capability) in _ONE_LAUNCH_CAPABILITIES
         )
@@ -3783,6 +4217,7 @@ class CakeSSDCombined:
                 program_family == "exactfused"
                 and self.has_varlen
                 and not variant
+                and not slots
                 and fused_ibulk_selected(
                     capability=capability,
                     state_dtype=self.state_dtype,
@@ -3822,7 +4257,14 @@ class CakeSSDCombined:
                 variant=variant,
                 state_dtype=self.state_dtype,
             )
-            if claim_selected(
+            if slots:
+                # The retained start programs (ring and ``_noring``) have no
+                # slot twin: their calls run the ring ``exactpre`` program.
+                if program_family == "exact":
+                    program_family = "exactpre"
+                if variant == "noring":
+                    variant = ""
+            if not slots and claim_selected(
                 mode_varlen=self.has_varlen,
                 num_sequences=num_sequences,
                 seqlen=batch * seqlen,
@@ -3836,7 +4278,8 @@ class CakeSSDCombined:
             # The initial-state bulk program takes the ring calls the claim
             # rule leaves: a call both rules admit keeps the claim program.
             if (
-                program_family == "exactpre"
+                not slots
+                and program_family == "exactpre"
                 and not variant
                 and ibulk_selected(
                     capability=capability,
@@ -3859,7 +4302,8 @@ class CakeSSDCombined:
             # initial-state bulk program would run, before the pair
             # program's one-CTA form.
             if (
-                program_family == "exactpre"
+                not slots
+                and program_family == "exactpre"
                 and variant in _WRAP_FROM_VARIANTS
                 and wrap_long_selected(
                     capability=capability,
@@ -3880,15 +4324,19 @@ class CakeSSDCombined:
                 variant = "wrap"
             # sm_107a: the pair calls ``tail_one_cta_selected`` admits run the
             # pair program's one-CTA form.
-            if variant == "tail" and tail_one_cta_selected(
-                capability=capability,
-                mode_varlen=self.has_varlen,
-                chunks_per_item=host_chunks_per_item(
+            if (
+                not slots
+                and variant == "tail"
+                and tail_one_cta_selected(
+                    capability=capability,
                     mode_varlen=self.has_varlen,
-                    num_sequences=num_sequences,
-                    # packed varlen: x is [1, total tokens, nheads, 64]
-                    seqlen=batch * seqlen if self.has_varlen else seqlen,
-                ),
+                    chunks_per_item=host_chunks_per_item(
+                        mode_varlen=self.has_varlen,
+                        num_sequences=num_sequences,
+                        # packed varlen: x is [1, total tokens, nheads, 64]
+                        seqlen=batch * seqlen if self.has_varlen else seqlen,
+                    ),
+                )
             ):
                 variant = "tailone"
         if program_family == "exactone":
@@ -3902,7 +4350,7 @@ class CakeSSDCombined:
             )
         # sm_107a: the one-CTA-cluster twin of the chosen program where the
         # rule takes it (``unit_cluster_variant``).
-        if not chunk_parallel:
+        if not chunk_parallel and not slots:
             variant = unit_cluster_variant(
                 capability=capability,
                 family=program_family,
@@ -3913,13 +4361,61 @@ class CakeSSDCombined:
                 nheads=self.nheads,
                 total_tokens=batch * seqlen,
             )
+        name = _program_name(
+            program_family,
+            self.state_dtype,
+            self.has_varlen,
+            variant + _SLOTS if slots else variant,
+        )
+        # sm_107a: a slot call whose dense call (the same key without slot
+        # vectors) runs the claim or wrap program runs that program's slot
+        # twin (``_SM107_ONLY_SLOT_PROGRAMS``), bitwise the dense call on the
+        # gathered states; every other slot call keeps the route above.
+        if slots and not chunk_parallel:
+            dense = self._program_route(
+                key=key._replace(state_slots=False),
+                sm_count=sm_count,
+                capability=capability,
+            )
+            twin = f"{dense}{_SLOTS}"
+            if (
+                _program_of(dense).variant in _SM107_SLOT_TWIN_VARIANTS
+                and twin in _SM107_ONLY_SLOT_PROGRAMS
+                and _TARGET_ARCHS.get((int(capability[0]), int(capability[1])))
+                == _SM107_ARCH
+            ):
+                name = twin
+        if slots and name not in _SLOT_PROGRAMS:
+            raise RuntimeError(f"Cake SSDCombined ships no state-slot program {name}")
+        return name
+
+    def _materialize_workspace(
+        self,
+        *,
+        key: _WorkspaceKey,
+        device: torch.device,
+        sm_count: int,
+        capability: tuple[int, int],
+    ) -> dict[str, Any]:
+        """Allocate the per-call-shape workspace of ``key`` and select its
+        kernel family.  The chunk-parallel buffers are per device, not per
+        shape: this only grows them to the shape's tile bound (the call binds
+        the device's current buffers, see ``_chunk_parallel_workspace``)."""
+
+        batch, seqlen, nchunks = key.batch, key.seqlen, key.nchunks
+        num_segments, num_sequences = key.num_segments, key.num_sequences
+        ids = torch.arange(num_segments, dtype=torch.int32, device=device)
+        chunks = ids % nchunks
+        starts = (ids // nchunks) * seqlen + chunks * _CHUNK_SIZE
+        # Batched segments are physical chunks; the trailing chunk of a
+        # sequence whose length is not a multiple of 128 is partial.
+        lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
+        tile_count = num_segments * self.nheads
+        name = self._program_route(key=key, sm_count=sm_count, capability=capability)
+        program_family = name.split("_")[0]
+        chunk_parallel = program_family in ("chunkpar", "chunkpar3")
         workspace: dict[str, Any] = {
-            "program": _program_name(
-                program_family,
-                self.state_dtype,
-                self.has_varlen,
-                variant,
-            ),
+            "program": name,
             "starts": starts,
             "lengths": lengths,
             "delta": torch.empty(
@@ -3953,6 +4449,12 @@ class CakeSSDCombined:
             # Packed copies of strided public inputs (``_contiguous_input``).
             "contiguous": {},
         }
+        if key.state_slots:
+            # The slot vector of a dense state side in a slot call: sequence
+            # ``i`` reads / writes row ``i`` of the contiguous states.
+            workspace["identity_slots"] = torch.arange(
+                num_sequences, dtype=torch.int32, device=device
+            )
         if self.has_varlen:
             # The runner-owned ``seq_chunk_cumsum`` the preprocess fills when
             # the caller supplies no vector (both packed-varlen forms).  Per
@@ -4083,9 +4585,29 @@ class CakeSSDCombined:
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         final_states: Optional[torch.Tensor] = None,
+        initial_state_slots: Optional[torch.Tensor] = None,
+        final_state_slots: Optional[torch.Tensor] = None,
+        initial_state_flags: Optional[torch.Tensor] = None,
+        null_slot_id: int = -1,
     ):
         """Run one forward: plan every host-side decision, then issue only
         device work (the packed-input copies, then the single launcher call).
+
+        With ``initial_state_slots`` (``final_state_slots``), an int32
+        ``[num_seqs]`` vector (possibly strided), ``initial_states``
+        (``final_states``) is a state pool ``[num_slots, nheads, 64, 128]``
+        and sequence ``i`` reads its initial state from (writes its final
+        state to) row ``slots[i]``; a slot outside ``[0, num_slots)`` or
+        equal to ``null_slot_id`` reads a zero state (stores nothing).  A
+        ``null_slot_id`` other than -1 requires a slot vector on each state
+        side the call binds (``ValueError`` for dense initial states or
+        returned final states without one).
+        ``initial_state_flags`` (bool / uint8 ``[num_seqs]``) gates each
+        sequence's initial read, and in such a call ``checkpoint_states`` is
+        a pool too (a dense checkpoint tensor skips a caller checkpoint slot
+        equal to ``null_slot_id``).  Packed varlen only; see the class
+        docstring.  The
+        returned final states are then the pool itself.
 
         Inside CUDA-graph capture the plan may allocate ``out``, final states
         and packed-input copies (from the graph's private pool) but never
@@ -4122,6 +4644,10 @@ class CakeSSDCombined:
             num_seqs=num_seqs,
             cu_seqlens=cu_seqlens,
             final_states=final_states,
+            initial_state_slots=initial_state_slots,
+            final_state_slots=final_state_slots,
+            initial_state_flags=initial_state_flags,
+            null_slot_id=null_slot_id,
             capturing=capturing,
             preparing=False,
         )
@@ -4180,6 +4706,13 @@ class CakeSSDCombined:
         cu_seqlens: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         final_states: Optional[torch.Tensor] = None,
+        initial_state_slots: Optional[torch.Tensor] = None,
+        final_state_slots: Optional[torch.Tensor] = None,
+        initial_state_flags: Optional[torch.Tensor] = None,
+        null_slot_id: int = -1,
+        checkpoint_token_indices: Optional[torch.Tensor] = None,
+        checkpoint_state_slots: Optional[torch.Tensor] = None,
+        checkpoint_states: Optional[torch.Tensor] = None,
     ) -> PreparedSSDCombined:
         """Prepare a call shape eagerly so that :meth:`run` on it is a pure
         launch, in particular inside CUDA-graph capture.
@@ -4212,13 +4745,40 @@ class CakeSSDCombined:
         on the program's first launch, so run the shape eagerly once before
         capturing it.  A static ``out`` is not required here; a captured
         :meth:`run` without one allocates its output from the graph pool,
-        with one it allocates nothing.
+        with one it allocates nothing.  A call with state pools is prepared
+        with its pools and slot vectors (``initial_state_slots`` /
+        ``final_state_slots``): passing slot vectors is part of the call shape.
+        Such a call is prepared with the ``initial_state_flags``,
+        ``null_slot_id`` and checkpoint pool it runs with, so that the
+        preparation validates them and allocates what they bind (the dummy
+        flag byte is allocated for every slot call, with or without flags, so
+        a captured run of the shape allocates nothing whichever it passes);
+        the checkpoint arguments never
+        change a slot call's program.  A call without slot vectors takes its
+        checkpoint outputs per :meth:`run` only (they may change its program,
+        see above), so ``prepare`` refuses them there.
         """
 
         if _stream_capturing(x.device):
             raise CakeSSDCombinedCaptureError(
                 "Cake SSDCombined prepare() allocates and may build programs: call "
                 "it eagerly, outside CUDA-graph capture"
+            )
+        if (
+            initial_state_slots is None
+            and final_state_slots is None
+            and any(
+                value is not None
+                for value in (
+                    checkpoint_token_indices,
+                    checkpoint_state_slots,
+                    checkpoint_states,
+                )
+            )
+        ):
+            raise ValueError(
+                "prepare() takes checkpoint outputs only for a state-slot call "
+                "(initial_state_slots or final_state_slots); pass them to run()"
             )
         # The cu_seqlens form only publishes into a caller buffer; the triple
         # form's caller table is trusted (run's default), which keeps
@@ -4241,14 +4801,18 @@ class CakeSSDCombined:
             chunk_offsets=chunk_offsets,
             seq_chunk_cumsum=seq_chunk_cumsum,
             update_seq_chunk_cumsum=publishes_into_buffer,
-            checkpoint_token_indices=None,
-            checkpoint_state_slots=None,
-            checkpoint_states=None,
+            checkpoint_token_indices=checkpoint_token_indices,
+            checkpoint_state_slots=checkpoint_state_slots,
+            checkpoint_states=checkpoint_states,
             out=out,
             return_final_states=return_final_states,
             num_seqs=num_seqs,
             cu_seqlens=cu_seqlens,
             final_states=final_states,
+            initial_state_slots=initial_state_slots,
+            final_state_slots=final_state_slots,
+            initial_state_flags=initial_state_flags,
+            null_slot_id=null_slot_id,
             capturing=False,
             preparing=True,
         )
@@ -4307,6 +4871,10 @@ class CakeSSDCombined:
         final_states: Optional[torch.Tensor],
         capturing: bool,
         preparing: bool,
+        initial_state_slots: Optional[torch.Tensor] = None,
+        final_state_slots: Optional[torch.Tensor] = None,
+        initial_state_flags: Optional[torch.Tensor] = None,
+        null_slot_id: int = -1,
     ) -> _LaunchPlan:
         """Validate one call and resolve everything it binds (``_LaunchPlan``).
 
@@ -4359,6 +4927,61 @@ class CakeSSDCombined:
                 "batched mode does not accept varlen metadata, seq_chunk_cumsum, "
                 "num_seqs, or cu_seqlens"
             )
+        state_slots = initial_state_slots is not None or final_state_slots is not None
+        if not mode_varlen and state_slots:
+            raise ValueError(
+                "initial_state_slots / final_state_slots require packed varlen "
+                "mode (cu_seqlens or the seq_idx triple)"
+            )
+        if initial_state_slots is not None and initial_states is None:
+            raise ValueError(
+                "initial_state_slots requires initial_states, the state pool"
+            )
+        if final_state_slots is not None:
+            if final_states is None:
+                raise ValueError(
+                    "final_state_slots requires final_states, the state pool"
+                )
+            if not return_final_states:
+                raise ValueError("final_state_slots requires return_final_states=True")
+        if initial_state_flags is not None and initial_state_slots is None:
+            raise ValueError(
+                "initial_state_flags requires initial_state_slots: the flags gate "
+                "each sequence's read of its initial pool row"
+            )
+        if isinstance(null_slot_id, bool) or not isinstance(null_slot_id, int):
+            raise ValueError(
+                f"null_slot_id must be an int (got {type(null_slot_id).__name__})"
+            )
+        if not -1 <= null_slot_id <= 2**31 - 1:
+            raise ValueError(
+                f"null_slot_id must be -1 or in [0, 2**31 - 1] (got {null_slot_id})"
+            )
+        if null_slot_id != -1 and not state_slots:
+            raise ValueError(
+                "null_slot_id requires initial_state_slots or final_state_slots"
+            )
+        # A dense side of a slot call addresses its rows through the identity
+        # slots ``0 .. num_seqs - 1``, which the null slot could name: the
+        # kernel would then skip that sequence's initial read or final store.
+        if null_slot_id != -1:
+            for dense_side, binds in (
+                (
+                    "initial_states without initial_state_slots",
+                    initial_states is not None and initial_state_slots is None,
+                ),
+                (
+                    "return_final_states=True without final_state_slots",
+                    return_final_states and final_state_slots is None,
+                ),
+            ):
+                if binds:
+                    raise ValueError(
+                        f"null_slot_id={null_slot_id} requires state pools with "
+                        "slot vectors on both state sides (or no state on a "
+                        f"side), got {dense_side}: a dense side addresses its "
+                        "rows by sequence index, which the null slot could name"
+                    )
         if mode_varlen and from_cu_seqlens:
             # cu_seqlens form: the device derives the segment tables; the
             # caller's chunk-128 triple is not consulted (seq_idx may ride
@@ -4427,8 +5050,13 @@ class CakeSSDCombined:
             counts: list[tuple[str, int]] = []
             if from_cu_seqlens:
                 counts.append(("cu_seqlens", int(cu_seqlens.numel()) - 1))
-            if initial_states is not None:
+            if initial_state_slots is not None:
+                # A pool's row count is not the sequence count.
+                counts.append(("initial_state_slots", int(initial_state_slots.numel())))
+            elif initial_states is not None:
                 counts.append(("initial_states", int(initial_states.shape[0])))
+            if final_state_slots is not None:
+                counts.append(("final_state_slots", int(final_state_slots.numel())))
             if not counts and seq_chunk_cumsum is not None:
                 # The caller's vector names the count only when nothing else
                 # does; otherwise its shape is validated against the count.
@@ -4467,6 +5095,10 @@ class CakeSSDCombined:
                 "checkpoint_states must be provided together"
             )
         checkpoint_state_count = 0
+        # A slot call's checkpoint pool: its row stride in elements (one row
+        # for dense checkpoint states or none) and its slot vector's step.
+        checkpoint_slot_stride = self.nheads * _HEADDIM * _DSTATE
+        checkpoint_slots_step = 1
         if checkpoint_states is not None:
             assert checkpoint_token_indices is not None
             assert checkpoint_state_slots is not None
@@ -4480,32 +5112,61 @@ class CakeSSDCombined:
                     "checkpoint_token_indices must be a contiguous int32 vector "
                     "with one entry per sequence"
                 )
-            if (
-                tuple(checkpoint_state_slots.shape) != (num_sequences,)
-                or checkpoint_state_slots.dtype != torch.int32
-                or not checkpoint_state_slots.is_contiguous()
-            ):
-                raise ValueError(
-                    "checkpoint_state_slots must be a contiguous int32 vector "
-                    "with one entry per sequence"
+            if state_slots:
+                # A slot call addresses checkpoint rows like the initial and
+                # final pools: a row-strided pool through a strided slot
+                # vector, never copied.
+                checkpoint_slots_step = self._check_state_slots(
+                    "checkpoint_state_slots",
+                    checkpoint_state_slots,
+                    num_sequences,
+                    x.device,
                 )
-            if (
-                checkpoint_states.ndim != 4
-                or tuple(checkpoint_states.shape[1:])
-                != (self.nheads, _HEADDIM, _DSTATE)
-                or checkpoint_states.dtype != self.state_dtype
-                or not checkpoint_states.is_contiguous()
-            ):
-                raise ValueError(
-                    "checkpoint_states must be contiguous [num_checkpoints, "
-                    f"{self.nheads}, 64, 128] with state dtype"
+                checkpoint_slot_stride = self._check_state_pool(
+                    "checkpoint_states", checkpoint_states, x.device
                 )
+            else:
+                if (
+                    tuple(checkpoint_state_slots.shape) != (num_sequences,)
+                    or checkpoint_state_slots.dtype != torch.int32
+                    or not checkpoint_state_slots.is_contiguous()
+                ):
+                    raise ValueError(
+                        "checkpoint_state_slots must be a contiguous int32 vector "
+                        "with one entry per sequence"
+                    )
+                if (
+                    checkpoint_states.ndim == 4
+                    and checkpoint_states.shape[0] > 1
+                    and tuple(checkpoint_states.shape[1:])
+                    == (self.nheads, _HEADDIM, _DSTATE)
+                    and tuple(checkpoint_states.stride()[1:])
+                    == (_HEADDIM * _DSTATE, _DSTATE, 1)
+                    and checkpoint_states.stride(0) != checkpoint_slot_stride
+                ):
+                    raise ValueError(
+                        "checkpoint_states rows are strided apart (a state pool): "
+                        "a checkpoint pool requires initial_state_slots or "
+                        "final_state_slots"
+                    )
+                if (
+                    checkpoint_states.ndim != 4
+                    or tuple(checkpoint_states.shape[1:])
+                    != (self.nheads, _HEADDIM, _DSTATE)
+                    or checkpoint_states.dtype != self.state_dtype
+                    or not checkpoint_states.is_contiguous()
+                ):
+                    raise ValueError(
+                        "checkpoint_states must be contiguous [num_checkpoints, "
+                        f"{self.nheads}, 64, 128] with state dtype"
+                    )
             checkpoint_state_count = int(checkpoint_states.shape[0])
         # The kernels address a state element with a 32-bit offset
-        # ``(row * nheads + head) * 64 * 128 + element``.
+        # ``(row * nheads + head) * 64 * 128 + element``; a slot call addresses
+        # its checkpoint pool with a 64-bit row offset.
         for name, rows in (
             ("the sequence count", num_sequences),
-            ("checkpoint_states", checkpoint_state_count),
+            ("checkpoint_states", 0 if state_slots else checkpoint_state_count),
         ):
             if rows * self.nheads * _HEADDIM * _DSTATE > 2**31:
                 raise ValueError(
@@ -4521,40 +5182,113 @@ class CakeSSDCombined:
                 )
         if z is not None and (z.shape != x.shape or z.dtype != torch.bfloat16):
             raise ValueError("z must have the same shape and dtype as x")
-        if initial_states is not None:
-            expected_states = (
-                num_sequences,
-                self.nheads,
-                _HEADDIM,
-                _DSTATE,
+        # Row strides (elements) of the state pools of a slot call and the
+        # element steps of its slot vectors.
+        initial_slot_stride = final_slot_stride = 0
+        initial_slots_step = final_slots_step = 1
+        if initial_state_slots is not None:
+            initial_slots_step = self._check_state_slots(
+                "initial_state_slots", initial_state_slots, num_sequences, x.device
             )
-            if tuple(initial_states.shape) != expected_states:
-                raise ValueError(f"initial_states must have shape {expected_states}")
+        if final_state_slots is not None:
+            final_slots_step = self._check_state_slots(
+                "final_state_slots", final_state_slots, num_sequences, x.device
+            )
+        if initial_state_flags is not None:
+            initial_state_flags = self._check_state_flags(
+                initial_state_flags, num_sequences, x.device
+            )
+        if initial_states is not None:
+            if initial_state_slots is not None:
+                initial_slot_stride = self._check_state_pool(
+                    "initial_states", initial_states, x.device
+                )
+            else:
+                expected_states = (
+                    num_sequences,
+                    self.nheads,
+                    _HEADDIM,
+                    _DSTATE,
+                )
+                if tuple(initial_states.shape) != expected_states:
+                    raise ValueError(
+                        f"initial_states must have shape {expected_states}"
+                    )
+        # A non-contiguous dense ``initial_states`` is packed into a private
+        # workspace buffer before the launch (``_contiguous_input``), so the
+        # kernels never read it in place; a state the call stores must still
+        # not land on an element of it (the caller's input), but may land in
+        # the gaps between its rows.  Any other tensor counts its whole
+        # extent.
+        initial_rows_only = (
+            initial_states is not None
+            and initial_state_slots is None
+            and not initial_states.is_contiguous()
+        )
+
+        def overlaps(state: torch.Tensor, other: torch.Tensor) -> bool:
+            if initial_rows_only and other is initial_states:
+                return _occupied_overlaps(other, state)
+            return _storage_overlaps(state, other)
+
         if final_states is not None:
             if not return_final_states:
                 raise ValueError("final_states requires return_final_states=True")
-            expected_states = (
-                num_sequences,
-                self.nheads,
-                _HEADDIM,
-                _DSTATE,
-            )
-            if (
-                tuple(final_states.shape) != expected_states
-                or final_states.dtype != self.state_dtype
-                or not final_states.is_contiguous()
-                or final_states.device != x.device
-            ):
-                raise ValueError(
-                    f"final_states must be a contiguous {list(expected_states)} "
-                    "tensor with the state dtype on the device of x"
+            if final_state_slots is not None:
+                final_slot_stride = self._check_state_pool(
+                    "final_states", final_states, x.device
                 )
+            else:
+                expected_states = (
+                    num_sequences,
+                    self.nheads,
+                    _HEADDIM,
+                    _DSTATE,
+                )
+                if (
+                    tuple(final_states.shape) != expected_states
+                    or final_states.dtype != self.state_dtype
+                    or not final_states.is_contiguous()
+                    or final_states.device != x.device
+                ):
+                    raise ValueError(
+                        f"final_states must be a contiguous {list(expected_states)} "
+                        "tensor with the state dtype on the device of x"
+                    )
+            # The final pool may be the initial pool itself (in place:
+            # sequence ``i`` reads row ``initial_state_slots[i]`` before it
+            # stores row ``final_state_slots[i]``): the same tensor geometry,
+            # both sides slot-indexed.  Any other overlap races.
+            same_pool = (
+                initial_state_slots is not None
+                and final_state_slots is not None
+                and initial_states is not None
+                and _same_tensor(final_states, initial_states)
+            )
             for name, other in (
-                ("initial_states", initial_states),
-                ("checkpoint_states", checkpoint_states),
+                ("initial_states", None if same_pool else initial_states),
+                ("checkpoint_states", None if state_slots else checkpoint_states),
             ):
-                if other is not None and _storage_overlaps(final_states, other):
+                if other is not None and overlaps(final_states, other):
                     raise ValueError(f"final_states must not overlap {name}")
+        if state_slots and checkpoint_states is not None:
+            # A checkpoint row is stored while other items still read initial
+            # rows and store final rows.  The checkpoint pool may be the
+            # initial and / or the final pool itself (its rows disjoint from
+            # every initial and final row of the call by contract, which the
+            # host cannot check without reading the slot values); any other
+            # overlap with either state tensor, pool or dense, is refused.
+            for name, other, pool in (
+                ("initial_states", initial_states, initial_state_slots is not None),
+                ("final_states", final_states, final_state_slots is not None),
+            ):
+                if other is None or (pool and _same_tensor(checkpoint_states, other)):
+                    continue
+                if overlaps(checkpoint_states, other):
+                    raise ValueError(
+                        f"checkpoint_states must not overlap {name}: a checkpoint "
+                        "pool may only be the identical pool tensor"
+                    )
         if seq_idx is not None:
             if (
                 tuple(seq_idx.shape) != (batch, seqlen)
@@ -4634,6 +5368,7 @@ class CakeSSDCombined:
             from_cu_seqlens,
             caller_cumsum,
             publish_table,
+            state_slots,
         )
         if preparing:
             mode = _chunk_parallel_mode()
@@ -4676,10 +5411,14 @@ class CakeSSDCombined:
             nchunks=nchunks,
             sm_count=sm_count,
             has_z=self.has_z,
-            varlen_family=_PROGRAMS[program_name].family,
+            varlen_family=_program_of(program_name).family,
             chunk_parallel_mode=key.chunk_parallel_mode,
         )
-        check_variant = single_sequence_batched_variant(**check_rule)
+        # A state-slot call keeps its program: the batched views below have
+        # no slot twin.
+        check_variant = (
+            None if key.state_slots else single_sequence_batched_variant(**check_rule)
+        )
         # sm_107a: a single-sequence triple call outside the fused window of
         # its [1, T] view runs the batched two-kernel main kernel on that
         # view after its unchanged segment preprocess
@@ -4723,7 +5462,7 @@ class CakeSSDCombined:
                     if self.seq_idx_dtype == torch.int64
                     else _TABLE_IN_KERNEL_I32
                 )
-        elif single_sequence_two_kernel_batched(**view_rule):
+        elif not key.state_slots and single_sequence_two_kernel_batched(**view_rule):
             view_name = _program_name("exactpre", self.state_dtype, False)
             # As for the check program: a captured call whose batched program
             # has not been launched in this process keeps the shape's
@@ -4736,19 +5475,23 @@ class CakeSSDCombined:
             ):
                 program_name = view_name
                 batched_view = True
-        program = _PROGRAMS[program_name]
+        program = _program_of(program_name)
         if capturing and (program_name, arch) not in _LOADED_PROGRAMS:
             # Loading (possibly building) the program is host work a graph
             # cannot record, and the host shim resolves its kernel handles
             # on the first launch.
             advice = "run the shape eagerly once before capturing it"
-            if checkpoint_state_count and (
-                single_sequence_batched_variant(
-                    **dict(check_rule, checkpoint_state_count=0)
-                )
-                is not None
-                or single_sequence_two_kernel_batched(
-                    **dict(view_rule, checkpoint_state_count=0)
+            if (
+                not key.state_slots
+                and checkpoint_state_count
+                and (
+                    single_sequence_batched_variant(
+                        **dict(check_rule, checkpoint_state_count=0)
+                    )
+                    is not None
+                    or single_sequence_two_kernel_batched(
+                        **dict(view_rule, checkpoint_state_count=0)
+                    )
                 )
             ):
                 # The call shape without checkpoint outputs runs the seq_idx
@@ -4809,12 +5552,14 @@ class CakeSSDCombined:
         z = packed("z", z)
         dt_bias = packed("dt_bias", dt_bias)
         # The ``_ibulk`` programs read an item's initial state with one bulk
-        # copy, which needs a 16-byte aligned address.
-        initial_states = packed(
-            "initial_states",
-            initial_states,
-            16 if program.variant == "ibulk" else 1,
-        )
+        # copy, which needs a 16-byte aligned address.  A state pool is bound
+        # as given (rows addressed through its stride), never copied.
+        if initial_state_slots is None:
+            initial_states = packed(
+                "initial_states",
+                initial_states,
+                16 if program.variant == "ibulk" else 1,
+            )
         seq_idx = packed("seq_idx", seq_idx)
         chunk_indices = packed("chunk_indices", chunk_indices)
         chunk_offsets = packed("chunk_offsets", chunk_offsets)
@@ -4822,9 +5567,12 @@ class CakeSSDCombined:
         checkpoint_token_indices = packed(
             "checkpoint_token_indices", checkpoint_token_indices
         )
-        checkpoint_state_slots = packed(
-            "checkpoint_state_slots", checkpoint_state_slots
-        )
+        if not state_slots:
+            # A slot call binds its (possibly strided) checkpoint slot vector
+            # as given, at its element step.
+            checkpoint_state_slots = packed(
+                "checkpoint_state_slots", checkpoint_state_slots
+            )
         # A call shorter than one chunk (``seqlen < 128``) binds the caller's
         # x/B/C/out directly: the token axis of the four tensor maps admits a
         # global extent below the 128-row box (``allow_oob_box`` in the
@@ -5122,6 +5870,67 @@ class CakeSSDCombined:
             # segment preprocess published: one logical chunk per chunk.
             main_values["mode_varlen"] = 0
             main_values["num_logical_chunks"] = nchunks
+        if program.state_slots:
+            # Each state side binds (states, slots, row stride, rows, step): a
+            # pool with the caller's slot vector at its element step; dense
+            # states (or the final states the runner allocates) with the
+            # identity slots; an absent side the dummies and 0 rows, which the
+            # kernel never reads.  The checkpoint side binds its states and
+            # slot vector as given (``checkpoint_state_count`` is its row
+            # count), the dummies without checkpoints.
+            row_elements = self.nheads * _HEADDIM * _DSTATE
+            identity_slots = workspace["identity_slots"]
+            dummy_slots = self._dummy(x.device, torch.int32)
+            # Resolved whether or not this call passes flags, so that the
+            # plan of every slot call (``prepare`` in particular) allocates
+            # the per-device dummy once: a captured call whose flags presence
+            # differs from the prepared one's then allocates nothing.
+            flags_dummy = self._dummy(x.device, torch.uint8)
+            if initial_state_slots is not None:
+                assert initial_states is not None
+                initial_side = (
+                    initial_state_slots,
+                    initial_slot_stride,
+                    int(initial_states.shape[0]),
+                    initial_slots_step,
+                )
+            elif initial_states is not None:
+                initial_side = (identity_slots, row_elements, num_sequences, 1)
+            else:
+                initial_side = (dummy_slots, 0, 0, 1)
+            if final_state_slots is not None:
+                final_side = (
+                    final_state_slots,
+                    final_slot_stride,
+                    int(final_states_arg.shape[0]),
+                    final_slots_step,
+                )
+            elif return_final_states:
+                final_side = (identity_slots, row_elements, num_sequences, 1)
+            else:
+                final_side = (dummy_slots, 0, 0, 1)
+            main_values.update(
+                initial_state_slots=initial_side[0],
+                final_state_slots=final_side[0],
+                initial_state_slot_stride=initial_side[1],
+                final_state_slot_stride=final_side[1],
+                initial_state_rows=initial_side[2],
+                final_state_rows=final_side[2],
+                checkpoint_state_slot_stride=checkpoint_slot_stride,
+                # Without flags a one-byte dummy the kernel never reads
+                # (``has_initial`` 0 or 1).
+                initial_state_flags=(
+                    initial_state_flags
+                    if initial_state_flags is not None
+                    else flags_dummy
+                ),
+                initial_state_slots_step=initial_side[3],
+                final_state_slots_step=final_side[3],
+                checkpoint_state_slots_step=checkpoint_slots_step,
+                null_slot=null_slot_id,
+            )
+            if initial_state_flags is not None:
+                main_values["has_initial"] = _HAS_INITIAL_FLAGS
         if program.family in ("chunkpar", "chunkpar3"):
             # Neither chunk-parallel signature (``_MAIN_ARGS_CHUNKPAR``,
             # ``_MAIN_ARGS_CHUNKPAR3``) has a fused input: bind exactly the

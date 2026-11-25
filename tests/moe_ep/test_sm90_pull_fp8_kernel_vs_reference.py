@@ -8,11 +8,8 @@ payloads, in both ``per_tensor`` and ``blockwise`` scale modes and both native
 and swap-AB geometries.  Tolerances follow the drop's ``mega_runner``
 validation (atol/rtol 1e-2 with inputs conditioned to O(1) outputs).
 
-Process isolation: the SM90 and SM100 kernel trees share top-level module
-names (``common``, ``src``, ``moe_nvfp4_swapab``) and are mutually exclusive
-per process.  This file therefore imports the SM90 tree only inside test
-bodies (guarded), is EXCLUDED from run_tests.sh's ``unit`` target, and runs in
-its own pytest process via the ``oracle_sm90`` target::
+This file is excluded from run_tests.sh's ``unit`` target. Run its single-rank
+checks separately with ``MEGA_NO_DIST=1`` through ``oracle_sm90``::
 
     bash tests/moe_ep/run_tests.sh oracle_sm90
 
@@ -33,12 +30,10 @@ FP8_BLOCK_K = 128  # Fp8BlockScaleK (re-asserted via the package boundary below)
 
 
 def _sm90_tree():
-    """Import the SM90 kernel package, skipping if the SM100 tree owns us."""
+    """Import the SM90 adapter, skipping if its runtime is unavailable."""
     try:
-        import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as pkg
+        import flashinfer.moe_ep.shims.sm90.cutedsl_megamoe as pkg
     except RuntimeError as exc:
-        # shim/_paths sibling-tree exclusivity guard: another test already
-        # loaded the SM100 kernel modules into this process.
         pytest.skip(f"SM90 kernel tree unavailable in this process: {exc}")
     return pkg
 

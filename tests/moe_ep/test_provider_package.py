@@ -1,7 +1,8 @@
-"""Rubin export integrity and coexistence with the Blackwell package."""
+"""Combined provider export integrity and architecture coexistence."""
 
 import ast
 import hashlib
+from importlib import metadata
 import json
 import os
 from pathlib import Path
@@ -11,14 +12,18 @@ import sys
 import pytest
 
 
-_ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src"
-)
+_PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "flashinfer"
+if not _PACKAGE_ROOT.is_dir():
+    # Nightly stages tests and benchmarks without the source package tree.
+    # Locate data without importing FlashInfer or its optional GPU dependencies.
+    _PACKAGE_ROOT = Path(
+        metadata.distribution("flashinfer-python").locate_file("flashinfer")
+    )
+_ROOT = _PACKAGE_ROOT / "moe_ep/kernels/cutedsl_megamoe"
 
 
 def test_export_manifest_matches_sources():
-    manifest = json.loads((_ROOT.parent / "export_manifest.json").read_text())
+    manifest = json.loads((_ROOT / "export_manifest.json").read_text())
     files = manifest["files"]
     assert set(files) == {str(path.relative_to(_ROOT)) for path in _ROOT.rglob("*.py")}
     for name, digest in files.items():
@@ -45,7 +50,7 @@ def test_reducer_benchmark_pins_match_vendored_sources():
     }
     assert set(bindings) == names
     for prefix in ("_CUTEDSL", "_RUBIN_CUTEDSL"):
-        source = root / bindings[prefix + "_SOURCE"]
+        source = _PACKAGE_ROOT.parent / bindings[prefix + "_SOURCE"]
         assert (
             hashlib.sha256(source.read_bytes()).hexdigest()
             == bindings[prefix + "_SOURCE_SHA256"]
@@ -60,16 +65,13 @@ import sys
 import types
 import torch
 
-namespace = "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src"
+namespace = "flashinfer.moe_ep.kernels.cutedsl_megamoe"
 foreign = {name: types.ModuleType(name) for name in ("sources", "common")}
 sys.modules.update(foreign)
 provider = importlib.import_module(namespace)
 assert not any(name.startswith(namespace + ".sources.kernel_src.") for name in sys.modules)
-blackwell = importlib.import_module(
-    "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources"
-)
-getattr(blackwell, "BlackwellInferenceMegaMoE")
-getattr(blackwell, "BlackwellInferenceGenphaseMegaMoE")
+getattr(provider, "BlackwellInferenceMegaMoE")
+getattr(provider, "BlackwellInferenceGenphaseMegaMoE")
 assert not any(name.startswith(namespace + ".sources.kernel_src.rubin.") for name in sys.modules)
 getattr(provider, "RubinInferenceMegaMoE")
 getattr(provider, "RubinInferenceGenphaseMegaMoE")

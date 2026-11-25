@@ -90,6 +90,14 @@ recapture.
 
 .. currentmodule:: flashinfer.decode
 
+.. note::
+
+   Compatibility: CUDA-core decode now raises ``ValueError`` for
+   ``disable_split_kv=True`` in ``plan()``, ``fast_decode_plan()``, and
+   ``workspace_size()``. Previously this flag was silently ignored on that
+   path. To disable split-KV, select ``backend="fa2", use_tensor_cores=True``.
+   Leave the flag at ``False`` to retain CUDA-core decode.
+
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
     :exclude-members: begin_forward, forward, forward_return_lse
@@ -260,7 +268,7 @@ PageAttention for MLA
 
 .. note::
 
-    Experimental ``SparseMLASm120Wrapper.run_mega`` for FP8 caches with ``backend="sparse"``
+    Experimental ``SparseMLASm120Wrapper.run_mega`` with ``backend="sparse"``
     fuses query RoPE, sparse attention, inverse output RoPE, and per-32-value
     FP8 E4M3 output quantization. Inputs are BF16 ``q[T,H,512]``, int32
     ``positions[T]``, and FP32 ``cos_sin[num_positions,64]``. Output buffers
