@@ -979,8 +979,9 @@ def gen_all_modules(
         if has_sm80 and get_cuda_version() >= Version("12.8"):
             jit_specs.append(gen_fp4_quantization_sm80_module())
             jit_specs.append(gen_mxfp8_quantization_sm100_module("80"))
-        # The records' BF16 and FP16 modules, each one for the SM80 and SM90 targets
-        if has_sm80 or has_sm90:
+        # The records' BF16 and FP16 modules, each one for the SM80 and SM90 targets;
+        # their software conversions compile CUDA 12.8's E8M0 type
+        if (has_sm80 or has_sm90) and get_cuda_version() >= Version("12.8"):
             jit_specs.append(gen_w4a16_moe_sm80_module())
             jit_specs.append(gen_w4a16_moe_sm80_module(f16=True))
             jit_specs.append(gen_trtllm_gen_routing_module())  # FP4 MoE routing
