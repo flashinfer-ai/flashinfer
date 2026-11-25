@@ -41,6 +41,7 @@ from .cake_grouped_fp8_fused_silu_quant import (
     gen_cake_grouped_fp8_fused_silu_quant_module,
 )
 from .cake_batch_deepgemm_fp8 import gen_cake_batch_deepgemm_fp8_module
+from .mxfp8_smallm_sm107 import gen_mm_mxfp8_smallm_sm107_module
 
 __all__ = [
     "gen_gemm_module",
@@ -66,4 +67,5 @@ __all__ = [
     "gen_cake_grouped_fp8_gemm_module",
     "gen_cake_grouped_fp8_fused_silu_quant_module",
     "gen_cake_batch_deepgemm_fp8_module",
+    "gen_mm_mxfp8_smallm_sm107_module",
 ]

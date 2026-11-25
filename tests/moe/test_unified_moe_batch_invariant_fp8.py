@@ -2099,6 +2099,9 @@ def test_routing_constants_are_read_from_the_cache_under_graph_capture():
     names = [
         e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
     ]
+    if not names:
+        # The replay ran (checked above); an empty trace means CUPTI recorded nothing.
+        pytest.skip("profiler recorded no CUDA activity for the graph replay")
     fills = [n for n in names if "Fill" in n or "fill" in n]
     assert len(fills) == 1, (
         names

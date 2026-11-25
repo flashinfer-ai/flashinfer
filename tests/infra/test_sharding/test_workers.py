@@ -355,3 +355,238 @@ xml_path.write_text(
 
     assert result.status == "infrastructure"
     assert "pytest output reader failed" in result.diagnostic
+
+
+def test_exit_without_junit_reports_exit_code_node_and_log_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A native library that calls exit(1) mid-test ends pytest with its
+    # ordinary failure code before it writes JUnit XML.
+    _install_fake_pytest(
+        tmp_path,
+        monkeypatch,
+        """\
+import json
+import os
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+selection = next(value.split("=", 1)[1] for value in arguments if value.startswith("--flashinfer-node-file="))
+nodeid = json.loads(Path(selection).read_text(encoding="utf-8"))[0]
+print(
+    '@@flashinfer-pytest-event@@ ' + json.dumps(
+        {"event": "start", "nodeid": nodeid, "started_at": 0.0}
+    ),
+    flush=True,
+)
+print("CUDA error: native failure from the kernel library", flush=True)
+os._exit(1)
+""",
+    )
+
+    result = execute_batch(_fake_batch_request(tmp_path))
+
+    assert result.status == "infrastructure"
+    assert "pytest did not produce JUnit XML (exit code 1;" in result.diagnostic
+    assert "last started node=tests/test_sample.py::test_case" in result.diagnostic
+    console = capsys.readouterr().out
+    assert "PYTEST LOG TAIL worker=0 batch=batch-1" in console
+    assert "CUDA error: native failure from the kernel library" in console
+    assert not list((tmp_path / "junit").glob("shards/*/units/*/batches/*.xml"))
+
+
+def test_last_started_node_survives_finish_without_changing_active_node() -> None:
+    progress = _BatchProgress()
+    progress.start("tests/test_sample.py::test_case[a]", 0.0)
+    progress.finish("tests/test_sample.py::test_case[a]", "passed")
+
+    active_nodeid, _, completed = progress.current()
+    assert active_nodeid is None
+    assert completed == 1
+    assert progress.last_started() == "tests/test_sample.py::test_case[a]"
+
+
+def test_exit_after_finish_reports_the_full_last_started_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Session teardown can exit() after the last test reports, when no node is
+    # active; the diagnostic still names the last one that started.
+    _install_fake_pytest(
+        tmp_path,
+        monkeypatch,
+        """\
+import json
+import os
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+selection = next(value.split("=", 1)[1] for value in arguments if value.startswith("--flashinfer-node-file="))
+nodeid = json.loads(Path(selection).read_text(encoding="utf-8"))[0]
+for event in (
+    {"event": "start", "nodeid": nodeid, "started_at": 0.0},
+    {"event": "finish", "nodeid": nodeid, "outcome": "passed"},
+):
+    print('@@flashinfer-pytest-event@@ ' + json.dumps(event), flush=True)
+os._exit(1)
+""",
+    )
+
+    result = execute_batch(_fake_batch_request(tmp_path))
+
+    assert result.status == "infrastructure"
+    assert "last started node=tests/test_sample.py::test_case)" in result.diagnostic
+
+
+def test_log_tail_excludes_output_from_earlier_executions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    request = _fake_batch_request(tmp_path)
+    log = workers_module._batch_artifacts(request).log
+    log.write_text("OUTPUT FROM AN EARLIER EXECUTION\n", encoding="utf-8")
+    _install_fake_pytest(
+        tmp_path,
+        monkeypatch,
+        """\
+import os
+
+print("output from this execution", flush=True)
+os._exit(1)
+""",
+    )
+
+    execute_batch(request)
+
+    console = capsys.readouterr().out
+    assert "output from this execution" in console
+    assert "OUTPUT FROM AN EARLIER EXECUTION" not in console
+    assert "OUTPUT FROM AN EARLIER EXECUTION" in log.read_text(encoding="utf-8")
+
+
+def test_output_error_prints_the_available_log_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _install_fake_pytest(
+        tmp_path,
+        monkeypatch,
+        """\
+import json
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+selection = next(value.split("=", 1)[1] for value in arguments if value.startswith("--flashinfer-node-file="))
+nodeid = json.loads(Path(selection).read_text(encoding="utf-8"))[0]
+print("visible before the reader failed", flush=True)
+print(
+    '@@flashinfer-pytest-event@@ ' + json.dumps(
+        {"event": "start", "nodeid": nodeid, "started_at": "not-a-time"}
+    ),
+    flush=True,
+)
+""",
+    )
+
+    result = execute_batch(_fake_batch_request(tmp_path))
+
+    assert result.status == "infrastructure"
+    assert "pytest output reader failed" in result.diagnostic
+    console = capsys.readouterr().out
+    assert "PYTEST LOG TAIL worker=0 batch=batch-1" in console
+    assert "visible before the reader failed" in console
+
+
+def _real_pytest_request(tmp_path: Path, source: str) -> BatchExecutionRequest:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "test_sample.py").write_text(source, encoding="utf-8")
+    nodeids = tuple(
+        f"test_sample.py::{line[4:].split('(', 1)[0]}"
+        for line in source.splitlines()
+        if line.startswith("def test_")
+    )
+    batch = Batch(
+        id="batch-1",
+        source_file="test_sample.py",
+        nodeids=nodeids,
+        estimated_ms=1000,
+        overhead_ms=0,
+        oversized=False,
+    )
+    unit = Unit(
+        id="unit-1",
+        batches=(batch,),
+        estimated_ms=1000,
+        oversized=False,
+        shard_index=0,
+    )
+    return replace(
+        _fake_batch_request(tmp_path),
+        pytest_root=project,
+        unit=unit,
+        batch=batch,
+        timeout_seconds=60,
+    )
+
+
+def test_real_pytest_keeps_output_of_a_test_that_ends_the_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Under pytest's default capture, output of a test that ends the process
+    # (a native library's exit()) is discarded with the unfinished report.
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+    request = _real_pytest_request(
+        tmp_path,
+        """\
+import os
+import sys
+
+
+def test_passes():
+    assert True
+
+
+def test_native_exit():
+    print("STDOUT BEFORE NATIVE EXIT")
+    print("STDERR BEFORE NATIVE EXIT", file=sys.stderr)
+    os.write(2, b"FD WRITE BEFORE NATIVE EXIT\\n")
+    os._exit(1)
+""",
+    )
+
+    result = execute_batch(request)
+
+    assert result.status == "infrastructure"
+    assert "last started node=test_sample.py::test_native_exit)" in result.diagnostic
+    console = capsys.readouterr().out
+    assert "PYTEST LOG TAIL worker=0 batch=batch-1" in console
+    for line in (
+        "STDOUT BEFORE NATIVE EXIT",
+        "STDERR BEFORE NATIVE EXIT",
+        "FD WRITE BEFORE NATIVE EXIT",
+    ):
+        assert line in console
+
+
+def test_real_pytest_failure_report_still_has_captured_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    request = _real_pytest_request(
+        tmp_path,
+        """\
+def test_fails():
+    print("OUTPUT OF A FAILING TEST")
+    assert False
+""",
+    )
+
+    result = execute_batch(request)
+
+    assert result.status != "infrastructure", result.diagnostic
+    log = workers_module._batch_artifacts(request).log.read_text(encoding="utf-8")
+    report = log.split("Captured stdout call", 1)
+    assert len(report) == 2, log
+    assert "OUTPUT OF A FAILING TEST" in report[1]

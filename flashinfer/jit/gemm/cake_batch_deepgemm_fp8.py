@@ -1764,9 +1764,12 @@ SERVING_PROGRAMS: dict[str, str] = {
 # low (from homed_low when its b is homed by groups) runs the masked pair program:
 # the 256-row pair tile below high and the 512-row tile from high.  Below that
 # bound, and on any SM count not listed, the serving program of SERVING_PROGRAMS
-# (or its locality-domain twin) runs.
+# (or its locality-domain twin) runs.  homed_low is the first measured
+# expected_m where the pair program on homed weights beat the twin (memory at its
+# full clock, B=64 weights of (4096, 7168): 0.91-0.92x the twin's time at 128,
+# 0.76-0.78x at 144 and 159, 1.15-1.16x at 72 and 96).
 PAIR_SERVING_EXPECTED_M: dict[int, tuple[int, int, int]] = {
-    212: (72, 320, 160),
+    212: (72, 320, 128),
 }
 
 # The locality-domain twins of sm_107a serving programs: one launch over both dies
@@ -1792,10 +1795,14 @@ DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
 # die class, with one exception: the "em16+" cells of
 # n4096_k7168_g64_s5e2_evict_normal_l8.  Homed weights must not fall back to the
 # whole program in any class (the whole program runs slower on homed weights than
-# on ordinary ones).  There the twin is the faster program on homed weights and
-# faster than the shipped whole program on ordinary weights on both die classes,
-# though not by the 0.98 margin over a full-grid whole build, which is not
-# shipped.
+# on ordinary ones), so that cell is listed below the homed low bound of
+# PAIR_SERVING_EXPECTED_M although the twin does not win everywhere in it.  At the
+# full memory clock (dies 108/104 and 106/106, every group holding expected_m
+# rows) the twin on homed weights took 0.75-0.76x the time of the whole program
+# on ordinary weights at expected_m 16-32, 0.95-0.97x at 36-64 against its
+# full grid (serving_config's reserve 0, shipped from expected_m 36), 1.03x at
+# 72 and 96 against that grid and 1.31-1.32x against the masked pair program
+# that ordinary weights run from expected_m 72 (see localize_weights).
 DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
     212: {
         ("even", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),

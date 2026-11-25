@@ -33,11 +33,15 @@ k L2 normalization, ``g = None`` / ``beta = None`` from a zero state (and the
 refusal of those calls with an initial state or a pool, which no exported SM90
 program serves), FP16 I/O, caller-provided output and state buffers, the scale
 values, the 18 prefill performance rows, empty batches, sequence independence,
-bitwise reproducibility, the body route of record (the V6 fork-order body for
-short sequences and for calls without a state, the merged body's unit and
-gate-saturation split programs for unit calls and long sequences; a mixed-class
-batch run as one launch per body over its own sequences, checked against the
-sequences alone), the launch count and one launch of every exported prefill
+bitwise reproducibility, the batch body route (one body and one launch per
+call: the V6 body's warm-up split programs for gated calls with a long
+sequence that fills a slot per SM, the V6 fork-order body for short sequences
+and for calls without a state, the merged body's unit and gate-saturation
+split programs for unit calls and for batches whose long sequences make the
+split the faster whole-batch kernel, the short and empty sequences in the same
+launch; checked against the sequences alone), the launch count, CUDA Graph
+capture and replay of a mixed batch (and the explicit failure of a V6 split
+graph replayed on other lengths), and one launch of every exported prefill
 program.  ``test_cake_gdp_prefill_route.py`` covers the route arithmetic and
 the registry without a GPU.
 
@@ -53,7 +57,11 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -109,14 +117,22 @@ SPLIT_FLAGS = {
     (True, False, True, False, False),
     (True, True, True, False, False),
 }
+# ... and the warm-up split programs of the V6 body (``split_items`` twins of its three programs), which run a gated
+# call whose ``prefill_v6_sm90_plan`` pays (a long sequence whose head-major chunks fill a slot per SM -- on 132 SMs
+# an 8192-token sequence at n = 3 from H = 8 on -- and the plan lighter than the V6 program's tiles), every sequence
+# of the batch in the one launch.
+V6_SPLIT_FLAGS = V6_FLAGS
 # The exact programs of the route: every routed program but the split ones.
 ROUTED_FLAGS = V6_FLAGS | UNIT_FLAGS
 # A batch of two 384-chunk sequences at n = 3, merged-class at the head counts the tests pass it (3 and 10; every
 # test asserts the class through the route), and the mixed-class batch of record: at H = 10 its long sequences are
-# merged-class and the short and the empty one V6-class (``[P3, V6, V6, P3]``).
+# merged-class and the short and the empty one V6-class (``[P3, V6, V6, P3]``).  At H = 10 (and not at H = 3) a
+# 384-chunk sequence is balanced on 132 SMs, so these batches run the V6 split program there; at H = 3 the merged
+# body's split program.
 MERGED_LENS = (8192, 8192)
 MIXED_LENS = (8192, 1000, 0, 8192)
 MIXED_H = 10
+MERGED_H = 3
 
 
 def _device() -> torch.device:
@@ -503,6 +519,50 @@ def _classes(c: Case) -> list[str]:
     )
 
 
+def _body(c: Case) -> str:
+    """The one body of the call ``c`` under the batch route on this device (``prefill_batch_body`` with the flags
+    the backend derives from the call, as ``_classes``)."""
+    stores = c.final or c.initial != "none" or c.unit_g or c.unit_beta
+    return loader.prefill_batch_body(
+        (0, *itertools.accumulate(c.lens)),
+        c.n,
+        c.H,
+        loader.sm_count(0),
+        store_final_state=stores,
+        unit_gates=c.unit_g,
+        unit_beta=c.unit_beta,
+        total_tokens=c.T,
+    )
+
+
+def _v6_split_of(lens: tuple[int, ...], n: int, H: int) -> bool:
+    """Whether a gated call of ``lens`` runs a V6 split program on this device (its plan pays)."""
+    return loader.prefill_v6_sm90_plan(
+        (0, *itertools.accumulate(lens)),
+        num_heads=H,
+        num_householder=n,
+        sm_count=loader.sm_count(0),
+    ).split
+
+
+def _v6_split(c: Case) -> bool:
+    """Whether the call ``c`` runs a V6 split program (a gated call whose plan pays)."""
+    return not (c.unit_g or c.unit_beta) and _v6_split_of(c.lens, c.n, c.H)
+
+
+def _launch(c: Case) -> tuple[str, bool]:
+    """The body of the one launch of ``c`` and whether its program is a split program."""
+    if _v6_split(c):
+        return loader.ROUTE_BODY_V6, True
+    body = _body(c)
+    return body, body == loader.ROUTE_BODY_P3 and not (c.unit_g or c.unit_beta)
+
+
+# A mixed bench row: four one-token sequences then one 8192-token sequence at H = 10: one V6 split launch (the long
+# sequence balanced on a slot per SM, the one-token rows on the least-loaded CTAs).
+BENCH_MIXED_LENS = (1, 1, 1, 1, 8192)
+
+
 # ---------------------------------------------------------------------------
 # Correctness matrix
 # ---------------------------------------------------------------------------
@@ -556,21 +616,26 @@ def test_write_only_pool_begins_at_zeros() -> None:
     _check(c, out, state)
 
 
-def test_write_only_pool_begins_at_zeros_on_the_split_route() -> None:
-    """A single H = 10, L = 8192, n = 3 sequence is a merged-class row (384 chunks, the split program with p > 1
-    on 132 SMs): with ``state_indices``, an output pool and no ``initial_state`` the route must still send it to
-    the merged body (a V6-routed run fails here), the sequence begins at zeros, its final state lands in the named
-    slot and the other pool rows keep their pre-launch values."""
-    c = _make(Case(lens=(8192,), H=10, n=3, initial="pool_disjoint", seed=11))
+@pytest.mark.parametrize("H", (MERGED_H, MIXED_H))
+def test_write_only_pool_begins_at_zeros_on_the_split_route(H: int) -> None:
+    """A single L = 8192, n = 3 sequence (384 chunks) runs a split program on 132 SMs: at H = 3 the merged body's
+    (a merged-class row, cut into p > 1 items), at H = 10 the V6 body's (a balanced row).  With ``state_indices``,
+    an output pool and no ``initial_state`` the sequence begins at zeros, its final state lands in the named slot
+    and the other pool rows keep their pre-launch values."""
+    c = _make(Case(lens=(8192,), H=H, n=3, initial="pool_disjoint", seed=11))
     c.initial_state, c.initial_before = None, None
     c.output_state.fill_(SENTINEL)
     c.output_state_before = c.output_state.clone()
     sm_count = loader.sm_count(0)
-    classes = loader.prefill_body_classes(c.cu_host, c.n, c.H, sm_count)
-    assert classes == [loader.ROUTE_BODY_P3], classes
-    (chunks,) = loader.route_chunk_steps(c.cu_host, c.n)
-    p, _span = loader.split_count(chunks, c.H, c.n, sm_count)
-    assert chunks == 384 and p > 1, (chunks, p, sm_count)
+    if H == MIXED_H:
+        assert _v6_split(c)
+    else:
+        assert not _v6_split(c)
+        classes = loader.prefill_body_classes(c.cu_host, c.n, c.H, sm_count)
+        assert classes == [loader.ROUTE_BODY_P3], classes
+        (chunks,) = loader.route_chunk_steps(c.cu_host, c.n)
+        p, _span = loader.split_count(chunks, c.H, c.n, sm_count)
+        assert chunks == 384 and p > 1, (chunks, p, sm_count)
     out, state = _run(c)
     _check(c, out, state)
 
@@ -856,36 +921,50 @@ def test_sequences_are_independent() -> None:
 
 @pytest.mark.parametrize("initial", ("none", "given", "pool_disjoint", "pool_same"))
 @pytest.mark.parametrize("final", (True, False))
-def test_mixed_class_batch_matches_the_sequences_alone(
-    initial: str, final: bool
-) -> None:
-    """The mixed-class batch of record (two merged-class long sequences around a short and an empty V6-class
-    one), served by one launch per body over per-class gathered tokens, satisfies the FP64 reference, and every
-    sequence gives the same bits as alone (its output rows, its final state slot) while the pool rows of the other
-    sequences stay untouched; each class alone (its sequences as one batch) gives the same bits too.  The plain
-    call keeping no state is uniform V6-class by the route and runs the same comparison."""
+def test_mixed_batch_matches_the_sequences_alone(initial: str, final: bool) -> None:
+    """The mixed batch of record (two long sequences, balanced at H = 10 on 132 SMs, around a short and an empty
+    one) is one launch of the V6 split program of its flags for the whole batch and satisfies the FP64 reference.
+    Every sequence, and the long pair, run alone gives the same bits as in the batch (its output rows, its final
+    state slot) when it runs the same program alone: a long sequence's rows depend on its own length only.  A
+    sequence that runs another program alone (the short one) is held to the reference only.  An empty sequence
+    copies its initial state under every program, so it is always compared bitwise.  The pool rows of the other
+    sequences stay untouched."""
     c = Case(lens=MIXED_LENS, H=MIXED_H, n=3, initial=initial, final=final, seed=30)
     V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     if final or initial != "none":
         assert _classes(c) == [P3, V6, V6, P3]
     else:
         assert _classes(c) == [V6] * c.N
+    assert _v6_split(c)
+    launch = _launch(c)
     out, state = _run_and_check(c)
     device = _device()
-    # Every sequence alone, then every class alone (the sequences of one body as one batch: what the backend launches
-    # for the mixed batch): the same bits in both partitions.
-    by_body: dict[str, list[int]] = {}
-    for seq, body in enumerate(_classes(c)):
-        by_body.setdefault(body, []).append(seq)
+    sm_count = loader.sm_count(0)
+    stores = c.final or c.initial != "none"
     groups = [[seq] for seq in range(c.N)] + [
-        seqs for seqs in by_body.values() if len(seqs) > 1
+        [seq for seq, cls in enumerate(_classes(c)) if cls == P3]
     ]
     for group in groups:
+        if not group:
+            continue
+        lens = [c.offsets[seq + 1] - c.offsets[seq] for seq in group]
+        if _v6_split_of(tuple(lens), c.n, c.H):
+            alone_launch = (V6, True)
+        else:
+            alone_body = loader.prefill_batch_body(
+                (0, *itertools.accumulate(lens)),
+                c.n,
+                c.H,
+                sm_count,
+                store_final_state=stores,
+            )
+            alone_launch = (alone_body, alone_body == P3)
+        if alone_launch != launch and sum(lens):
+            continue  # another program alone: the FP64 reference above holds it
         rows = torch.cat(
             [torch.arange(c.offsets[seq], c.offsets[seq + 1]) for seq in group]
         ).to(device)
         rows_n = (rows[:, None] * c.n + torch.arange(c.n, device=device)).reshape(-1)
-        lens = [c.offsets[seq + 1] - c.offsets[seq] for seq in group]
         group_t = torch.tensor(group, device=device)
         kwargs = dict(
             num_householder=c.n,
@@ -934,17 +1013,18 @@ def test_mixed_class_batch_matches_the_sequences_alone(
                 assert torch.equal(alone[1][i], state[seq]), (group, seq)
 
 
+@pytest.mark.parametrize("H", (MERGED_H, MIXED_H))
 @pytest.mark.parametrize("initial", ["given", "pool_disjoint"])
-def test_mixed_batch_whose_v6_class_is_only_empty_sequences(initial: str) -> None:
-    """Two merged-class long sequences around two empty ones: the V6 class has no token, so the backend launches it on
-    the one-row placeholders with ``total_tokens`` 0 (``_run_two_classes``); the empty sequences' final states are the
-    bitwise copies of their initial states (zeros from a zero record), the long sequences match the FP64 reference and
-    their output rows are the whole output."""
-    c = Case(
-        lens=(8192, 0, 0, 8192), H=MIXED_H, n=3, initial=initial, final=True, seed=31
-    )
+def test_merged_batch_with_empty_sequences(initial: str, H: int) -> None:
+    """Two merged-class long sequences around two empty ones: one split launch over the four sequences -- the
+    merged body's at H = 3 (an empty sequence is one item per head with no chunk), the V6 body's at H = 10 (the
+    long sequences balanced, an empty sequence one row per head with no chunk); the empty sequences' final states
+    are the bitwise copies of their initial states (zeros from a zero record), the long sequences match the FP64
+    reference and their output rows are the whole output."""
+    c = Case(lens=(8192, 0, 0, 8192), H=H, n=3, initial=initial, final=True, seed=31)
     V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     assert _classes(c) == [P3, V6, V6, P3]
+    assert _launch(c) == ((V6, True) if H == MIXED_H else (P3, True))
     out, state = _run_and_check(c)
     assert out.shape[0] == c.offsets[-1]
     for seq in (1, 2):
@@ -976,12 +1056,14 @@ def _count_device_events(call) -> list[str]:
 
 def test_single_launch() -> None:
     """BF16 normalized inputs, FP32 gates, an initial state and a kept final state, the host copy of ``cu_seqlens``
-    given and a uniform V6-class batch: the call launches the kernel alone (no fill, cast, copy or plan kernel).
-    Without the host copy the call adds the one device-to-host copy of ``cu_seqlens``.  A uniform merged-class
-    batch adds the item table upload and the workspace zero before its one kernel.  The mixed-class batch of
-    record launches exactly two Cake kernels (the gather / scatter copies beside them)."""
+    given and a uniform V6 batch: the call launches the kernel alone (no fill, cast, copy or plan kernel).  Without
+    the host copy the call adds the one device-to-host copy of ``cu_seqlens``.  A uniform merged batch adds the
+    workspace zero before its one kernel (its item table is cached on the device after the first call), and so does
+    a batch with a balanced sequence on the V6 split program.  A mixed batch -- one-token sequences beside a long
+    one, and the mixed batch of record -- is likewise one Cake kernel: no second launch, no gather or scatter of its
+    tokens, no copy."""
     c = _make(Case(lens=(400,) * 8, H=24, n=3, initial="given", cu_cpu=True, seed=26))
-    assert _classes(c) == [loader.ROUTE_BODY_V6] * c.N
+    assert _body(c) == loader.ROUTE_BODY_V6
     _check(c, *_run(c))  # warm-up
     names = _count_device_events(lambda: _run(c))
     assert len(names) == 1 and "cake_gdp" in names[0], names
@@ -989,21 +1071,193 @@ def test_single_launch() -> None:
     names_sync = _count_device_events(lambda: _run(c))
     assert [name for name in names_sync if "cake_gdp" in name] == names, names_sync
     assert sum("Memcpy" in name for name in names_sync) == 1, names_sync
-    s = _make(Case(lens=MERGED_LENS, H=10, n=3, initial="given", cu_cpu=True, seed=26))
-    assert _classes(s) == [loader.ROUTE_BODY_P3] * s.N
-    _check(s, *_run(s))  # warm-up
-    names_split = _count_device_events(lambda: _run(s))
-    kernels = [name for name in names_split if "cake_gdp" in name]
-    assert (
-        len(kernels) == 1 and names_split[-1] == kernels[0] and len(names_split) <= 3
-    ), names_split
-    m = _make(
-        Case(lens=MIXED_LENS, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=26)
+    for lens, H in (
+        (MERGED_LENS, MERGED_H),
+        (MERGED_LENS, MIXED_H),
+        (BENCH_MIXED_LENS, MIXED_H),
+        (MIXED_LENS, MIXED_H),
+    ):
+        m = _make(Case(lens=lens, H=H, n=3, initial="given", cu_cpu=True, seed=26))
+        expected = (
+            loader.ROUTE_BODY_V6 if H == MIXED_H else loader.ROUTE_BODY_P3,
+            True,
+        )
+        assert _launch(m) == expected, (lens, H)
+        _check(m, *_run(m))  # warm-up
+        names_m = _count_device_events(lambda m=m: _run(m))
+        kernels = [name for name in names_m if "cake_gdp" in name]
+        assert len(kernels) == 1 and names_m[-1] == kernels[0], (lens, names_m)
+        assert len(names_m) <= 2 and not any("Memcpy" in name for name in names_m), (
+            lens,
+            names_m,
+        )
+
+
+def _capture(call, *, warm_up: bool):
+    """``call`` captured into a CUDA graph on a side stream (after two eager warm-up calls there, the usual
+    recipe, when ``warm_up``); the graph and the tensors the captured call returned (graph-pool memory, rewritten
+    by every replay)."""
+    stream = torch.cuda.Stream(device=_device())
+    stream.wait_stream(torch.cuda.current_stream(_device()))
+    with torch.cuda.stream(stream):
+        for _ in range(2 if warm_up else 0):
+            call()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        result = call()
+    torch.cuda.synchronize(_device())
+    return graph, result
+
+
+@pytest.mark.parametrize("warm", (True, False))
+def test_mixed_batch_captures_into_a_cuda_graph(warm: bool) -> None:
+    """A mixed bench batch at H = 10 (one-token sequences beside a balanced long one; one V6 split launch) with
+    the host copy of ``cu_seqlens`` captures into a CUDA graph -- after eager calls of the batch (its item table
+    cached on the device: the graph holds no copy) and as the first call of its batch (the program loaded by an
+    eager call of another batch; the table copied in the graph from pinned memory) -- and every replay rewrites the
+    eager call's bits (output rows and final states); the eager result satisfies the FP64 reference."""
+    other = _make(
+        Case(
+            lens=BENCH_MIXED_LENS, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=33
+        )
     )
-    assert set(_classes(m)) == set(loader.ROUTE_BODIES)
-    _check(m, *_run(m))  # warm-up
-    names_mixed = _count_device_events(lambda: _run(m))
-    assert sum("cake_gdp" in name for name in names_mixed) == 2, names_mixed
+    # loads the program; the batch below is new to the table cache when not warm
+    _run(other)
+    lens = BENCH_MIXED_LENS if warm else (1, 1, 1, 8191)
+    c = _make(Case(lens=lens, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=34))
+    assert _launch(c) == (loader.ROUTE_BODY_V6, True)
+    graph, (g_out, g_state) = _capture(lambda: _run(c), warm_up=warm)
+    out, state = _run(c)
+    _check(c, out, state)
+    for _ in range(3):
+        g_out.zero_()
+        g_state.zero_()
+        graph.replay()
+        torch.cuda.synchronize(_device())
+        assert torch.equal(g_out, out) and torch.equal(g_state, state)
+
+
+# Batches with a balanced sequence on 132 SMs (a slot per SM of at least 24 chunks, shorter than a head) beside
+# one-token, short and empty sequences, n = 1..4: each runs the V6 split program of its flags.
+V6_SPLIT_ROWS = (
+    (3, 24, (8192,)),
+    (3, 24, (1, 1, 8192, 65)),
+    (1, 40, (1, 6000, 0, 2)),
+    (2, 20, (9000,)),
+    (4, 12, (4097, 1)),
+    (3, 80, (1, 1, 1, 4096)),
+)
+
+
+@pytest.mark.parametrize("initial", ("none", "given", "pool_same", "pool_disjoint"))
+@pytest.mark.parametrize("n,H,lens", V6_SPLIT_ROWS)
+def test_v6_split_rows(n: int, H: int, lens: tuple[int, ...], initial: str) -> None:
+    """A batch with a balanced sequence runs the V6 split program of its flags and satisfies the FP64 reference
+    (output rows, final states, untouched pool rows), with an invalid slot in the disjoint pool."""
+    invalid = (0,) if initial == "pool_disjoint" else ()
+    c = Case(lens=lens, H=H, n=n, initial=initial, invalid=invalid, seed=40)
+    assert _launch(c) == (loader.ROUTE_BODY_V6, True), (n, H, lens)
+    _run_and_check(c)
+
+
+@pytest.mark.parametrize("initial", ("none", "given"))
+def test_v6_split_long_sequence_bits_do_not_depend_on_short_rows(initial: str) -> None:
+    """The rows of a balanced sequence depend on its own length only, so its output rows and final state are the
+    same bits with any number of one-token sequences before it (the one-token rows run on the least-loaded CTAs),
+    and the one-token sequences satisfy the FP64 reference."""
+    long = _make(Case(lens=(8192,), H=MIXED_H, n=3, initial=initial, seed=41))
+    out, state = _run(long)
+    for d in (1, 4, 15):
+        c = _make(
+            Case(lens=(1,) * d + (8192,), H=MIXED_H, n=3, initial=initial, seed=42)
+        )
+        assert _v6_split(c)
+        rows = slice(d, d + 8192)
+        c.q[rows], c.k[d * 3 : (d + 8192) * 3] = long.q, long.k
+        c.v[d * 3 : (d + 8192) * 3], c.g[rows] = long.v, long.g
+        c.beta[d * 3 : (d + 8192) * 3] = long.beta
+        if initial == "given":
+            c.initial_state[d] = long.initial_state[0]
+            c.initial_before = c.initial_state.clone()
+        out_d, state_d = _run(c)
+        _check(c, out_d, state_d)
+        assert torch.equal(out_d[rows], out), d
+        assert torch.equal(state_d[d], state[0]), d
+
+
+# A V6 split graph replayed after the caller rewrote cu_seqlens in place with other lengths (same N and T): the
+# kernel compares the planned offsets with the device ones and runs no row; it writes NaN to o[0, 0, :2] and the
+# final state [0, 0, 0, 0] and leaves every other value as it was; replayed again on the restored batch, the graph
+# gives the eager call's bits.  Each case runs in its own process with CUDA_LAUNCH_BLOCKING=1.
+_STALE_CHILD = """
+import itertools, json, sys, torch
+from tests.gdp.test_cake_gdp_prefill import MIXED_H, Case, _capture, _make, _run, _v6_split
+x, y = json.loads(sys.argv[1])
+c = _make(Case(lens=tuple(x), H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=43))
+assert _v6_split(c)
+graph, (g_out, g_state) = _capture(lambda: _run(c), warm_up=True)
+eager_out, eager_state = _run(c)
+kept = c.cu.clone()
+result = {"error": None}
+try:
+    c.cu.copy_(torch.tensor((0, *itertools.accumulate(y)), dtype=c.cu.dtype))
+    g_out.fill_(0.5)
+    g_state.fill_(0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    result["marker"] = bool(g_out[0, 0, :2].isnan().all() and g_state[0, 0, 0, 0].isnan())
+    g_out[0, 0, :2] = 0.5
+    g_state[0, 0, 0, 0] = 0.5
+    result["rest_kept"] = bool((g_out == 0.5).all() and (g_state == 0.5).all())
+    c.cu.copy_(kept)
+    graph.replay()
+    torch.cuda.synchronize()
+    result["restored"] = bool(torch.equal(g_out, eager_out) and torch.equal(g_state, eager_state))
+except Exception as exc:
+    result["error"] = str(exc).splitlines()[0]
+try:
+    result["context_alive"] = float(torch.ones(4, device="cuda").sum()) == 4.0
+except Exception:
+    result["context_alive"] = False
+print("STALE " + json.dumps(result))
+"""
+
+
+@pytest.mark.parametrize(
+    "captured,replayed",
+    [
+        ([1, 1, 1, 8189], [8189, 1, 1, 1]),
+        ([8192, 0], [0, 8192]),
+        ([8192, 8192], [8000, 8384]),
+    ],
+    ids=["tiny-moves", "to-empty", "rebalance"],
+)
+def test_a_v6_split_graph_replayed_on_other_lengths_fails_explicitly(
+    captured, replayed
+) -> None:
+    env = {**os.environ, "CUDA_LAUNCH_BLOCKING": "1"}
+    root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-c", _STALE_CHILD, json.dumps([captured, replayed])],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env=env,
+        cwd=root,
+    )
+    lines = [line for line in proc.stdout.splitlines() if line.startswith("STALE ")]
+    assert lines, (
+        f"the child process died (exit {proc.returncode}): {proc.stderr[-2000:]}"
+    )
+    result = json.loads(lines[-1][len("STALE ") :])
+    assert result == {
+        "error": None,
+        "marker": True,
+        "rest_kept": True,
+        "restored": True,
+        "context_alive": True,
+    }, result
 
 
 # ---------------------------------------------------------------------------
@@ -1014,9 +1268,10 @@ def test_single_launch() -> None:
 def test_every_prefill_program_is_launched(monkeypatch) -> None:
     """One call reaches every program of the ``prefill`` route: the three V6 programs through short batches with
     no / a given / a pooled initial state (a short batch keeping no final state runs the V6 plain program again,
-    its final state discarded), the two unit programs, and the three split programs through merged-class long
-    batches with the host copy of ``cu_seqlens``; every uniform batch is one launch whose record names the body
-    the route classed it into."""
+    its final state discarded), the two unit programs, the three merged split programs through merged-class long
+    batches at H = 3 and the three V6 split programs through a balanced sequence at H = 10, both with the host
+    copy of ``cu_seqlens``; every uniform batch is one launch whose record names the body and the split flag of
+    its launch."""
     arch = _arch()
     launched: list[str] = []
     original = loader.run_module
@@ -1060,28 +1315,43 @@ def test_every_prefill_program_is_launched(monkeypatch) -> None:
             ),
             P3,
         ),
+        # the V6 split programs: the host copy of cu_seqlens and a balanced sequence
+        *(
+            (
+                Case(lens=(8192,), H=MIXED_H, n=3, initial=initial, cu_cpu=True),
+                V6,
+            )
+            for initial in ("none", "given", "pool_disjoint")
+        ),
     ):
         c.seed = 28
-        assert _classes(c) == [body] * c.N, (c.lens, c.initial, c.final)
+        body_launched, split = _launch(c)
+        assert body_launched == body, (c.lens, c.initial, c.final)
+        if not (body == V6 and split):
+            assert _classes(c) == [body] * c.N, (c.lens, c.initial, c.final)
+            assert _body(c) == body, (c.lens, c.initial, c.final)
         before = len(launched)
         _run_and_check(c)
         assert len(launched) == before + 1, launched  # a uniform batch is one launch
-        assert loader.MODULES[launched[-1]]["body"] == body, (c.lens, launched[-1])
+        record = loader.MODULES[launched[-1]]
+        assert record["body"] == body, (c.lens, launched[-1])
+        assert bool(record["build"].get(loader.PREFILL_SPLIT_FLAG)) == split
     prefill = {
         name
         for name, record in loader.MODULES.items()
         if record["role"] == "prefill" and arch in record["arches"]
     }
     assert set(launched) == prefill, (sorted(set(launched)), sorted(prefill))
-    assert len(prefill) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS)
+    assert len(prefill) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS) + len(
+        V6_SPLIT_FLAGS
+    )
     split = [
         name
         for name in launched
         if loader.MODULES[name]["build"].get(loader.PREFILL_SPLIT_FLAG)
     ]
-    assert len(split) == len(SPLIT_FLAGS) and launched[-len(SPLIT_FLAGS) :] == split, (
-        launched
-    )
+    count = len(SPLIT_FLAGS) + len(V6_SPLIT_FLAGS)
+    assert len(split) == count and launched[-count:] == split, launched
 
 
 def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
@@ -1090,13 +1360,19 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
     V6-class short batch runs the V6 program of its flags over ``N x H`` tiles without a table; a call without
     ``cu_seqlens_cpu`` synchronizes the copy and selects the same program with the same bits; an int64 host copy
     is accepted; a unit long batch runs its exact unit program and a long batch keeping no state the V6 plain
-    program, both over ``N x H`` tiles; the mixed-class batch of record is two recorded launches in plan order
-    (the merged body, then the V6 body) over its classes' own sequences, satisfying the FP64 reference;
-    ``cu_seqlens_cpu`` is checked for device, rank, length and dtype."""
+    program, both over ``N x H`` tiles; the mixed batch of record (balanced at H = 10) is one recorded launch of
+    the V6 split program over the rows of ``prefill_v6_sm90_plan`` of the whole batch (every sequence, the short
+    and the empty one included) on the plan's grid, its item words ``v6_sm90_item_words``, satisfying the FP64
+    reference; ``cu_seqlens_cpu`` is checked for device, rank, length and dtype."""
     seen: list[tuple[str, dict]] = []
+    # total_tiles and the item words of each launch
+    items: list[tuple[int, tuple[int, ...]]] = []
     original = loader.run_module
 
     def recording(name, values, **kwargs):
+        items.append(
+            (values["total_tiles"], tuple(values["output_slot_indices"].tolist()))
+        )
         seen.append(
             (
                 name,
@@ -1222,7 +1498,7 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
         store_final_state=True,
     )
     assert seen[-1][1]["tiles"] == plain.N * 3 and seen[-1][1]["slots"] == 1
-    # the mixed-class batch of record: two launches in plan order, each over its class's sequences alone
+    # the mixed batch of record: one launch of the V6 split program over the rows of the whole batch
     mixed = Case(
         lens=MIXED_LENS,
         H=MIXED_H,
@@ -1232,48 +1508,42 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
         cu_cpu=True,
         seed=29,
     )
-    classes = _classes(mixed)
-    assert classes == [P3, V6, V6, P3]
-    assert loader.prefill_launch_plan(classes) == [(P3, [0, 3]), (V6, [1, 2])]
+    assert _classes(mixed) == [P3, V6, V6, P3]
+    assert _launch(mixed) == (V6, True)
     before = len(seen)
     _run_and_check(mixed)
     launches = seen[before:]
-    assert [loader.MODULES[name]["body"] for name, _ in launches] == [P3, V6]
-    merged_offsets = (0, MIXED_LENS[0], MIXED_LENS[0] + MIXED_LENS[3])
-    table = loader.prefill_split_table(
-        merged_offsets,
+    plan = loader.prefill_v6_sm90_plan(
+        mixed.offsets,
         num_heads=MIXED_H,
         num_householder=3,
         sm_count=sm_count,
-        total_tokens=merged_offsets[-1],
+        total_tokens=mixed.T,
     )
-    assert table is not None and len(table) > 2 * MIXED_H
-    assert launches[0] == (
-        loader.selected_prefill_module(
-            arch,
-            body=P3,
-            use_initial_state=True,
-            use_state_indices=True,
-            store_final_state=True,
-            split_items=True,
-        ),
-        {
-            "tiles": len(table),
-            "slots": 4 * len(table),
-            "ws": 4 * (2 * MIXED_H + 2 * len(table)),
-            "num_seqs": 2,
-        },
-    )
-    assert launches[1] == (
-        loader.selected_prefill_module(
-            arch,
-            body=V6,
-            use_initial_state=True,
-            use_state_indices=True,
-            store_final_state=True,
-        ),
-        {"tiles": 2 * MIXED_H, "slots": 2, "ws": 16, "num_seqs": 2},
-    )
+    words = loader.v6_sm90_item_words(plan, mixed.offsets)
+    assert plan.split and plan.grid == sm_count
+    assert {seq for seq, head, cut, span in plan.rows} == set(range(mixed.N))
+    assert len(plan.offsets) == plan.grid + 1 and plan.offsets[-1] == len(plan.rows)
+    assert words[-(mixed.N + 2) :] == (mixed.N, *mixed.offsets)
+    assert launches == [
+        (
+            loader.selected_prefill_module(
+                arch,
+                body=V6,
+                use_initial_state=True,
+                use_state_indices=False,
+                store_final_state=True,
+                split_items=True,
+            ),
+            {
+                "tiles": plan.grid,
+                "slots": len(words),
+                "ws": max(16, 4 * mixed.N * MIXED_H),
+                "num_seqs": mixed.N,
+            },
+        )
+    ]
+    assert items[-1] == (len(plan.rows), words)
     c = _make(Case(lens=(129, 65), H=3, n=3, seed=29))
 
     def call(cu_seqlens_cpu):
@@ -1305,10 +1575,10 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
 
 def test_route_tables_are_consistent() -> None:
     """The ``prefill`` route of the device: the three V6 records (every one storing a final state, no unit
-    program, no segment pass), the two unit records and the three split records of the merged body, in that
-    order; ``selected_prefill_module`` resolves every flag set of each body and refuses the removed merged exact
-    programs, a V6 unit program, a V6 program without a final state, an unknown further flag and both unit
-    flags; the grid rule, the route predicate and the logical names."""
+    program, no segment pass), the two unit records and the three split records of the merged body, then the
+    three V6 split records, in that order; ``selected_prefill_module`` resolves every flag set of each body and
+    refuses the removed merged exact programs, a V6 unit program, a V6 program without a final state, an unknown
+    further flag and both unit flags; the grid rule, the route predicate and the logical names."""
     arch = _arch()
     routes = loader.ROUTES[arch]
     assert [key for key in routes if key.startswith("prefill")] == [
@@ -1317,10 +1587,13 @@ def test_route_tables_are_consistent() -> None:
     single = routes[loader.PREFILL_ROUTE]
     V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     assert loader.ROUTE_BODIES == (P3, V6)
-    assert len(single) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS)
+    assert len(single) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS) + len(
+        V6_SPLIT_FLAGS
+    )
     v6_flags = set()
     unit_flags = set()
     split_flags = set()
+    v6_split_flags = set()
     for name in single:
         record = loader.MODULES[name]
         assert (
@@ -1346,16 +1619,24 @@ def test_route_tables_are_consistent() -> None:
             rule["unit_beta"],
         )
         if record["body"] == V6:
-            # a V6 record spells exactly the six flags: the final state stored, no unit program, no split items
-            assert set(rule) == {"kind", *loader.PREFILL_FLAGS}
+            # a V6 record stores the final state and runs no unit program; a V6 split record spells the split flag
+            # in its rule too, the others exactly the six flags
             assert (
                 rule["store_final_state"]
                 and not rule["unit_gates"]
                 and not rule["unit_beta"]
             )
-            assert not record["build"].get(loader.PREFILL_SPLIT_FLAG)
             assert record["launch"]["block"] == (384, 1, 1)
-            v6_flags.add(five)
+            if record["build"].get(loader.PREFILL_SPLIT_FLAG):
+                assert (
+                    set(rule)
+                    == {"kind", loader.PREFILL_SPLIT_FLAG, *loader.PREFILL_FLAGS}
+                    and rule[loader.PREFILL_SPLIT_FLAG] is True
+                )
+                v6_split_flags.add(five)
+            else:
+                assert set(rule) == {"kind", *loader.PREFILL_FLAGS}
+                v6_flags.add(five)
         elif record["build"].get(loader.PREFILL_SPLIT_FLAG):
             # a split program spells the flag in its rule
             assert (
@@ -1369,7 +1650,7 @@ def test_route_tables_are_consistent() -> None:
             assert rule["unit_gates"] or rule["unit_beta"]
             unit_flags.add(five)
     assert v6_flags == V6_FLAGS and unit_flags == UNIT_FLAGS
-    assert split_flags == SPLIT_FLAGS
+    assert split_flags == SPLIT_FLAGS and v6_split_flags == V6_SPLIT_FLAGS
     assert [
         (
             loader.MODULES[name]["body"],
@@ -1378,11 +1659,12 @@ def test_route_tables_are_consistent() -> None:
         for name in single
     ] == [(V6, False)] * len(V6_FLAGS) + [(P3, False)] * len(UNIT_FLAGS) + [
         (P3, True)
-    ] * len(SPLIT_FLAGS)
+    ] * len(SPLIT_FLAGS) + [(V6, True)] * len(V6_SPLIT_FLAGS)
     for body, table, extra in (
         (V6, V6_FLAGS, {}),
         (P3, UNIT_FLAGS, {}),
         (P3, SPLIT_FLAGS, {loader.PREFILL_SPLIT_FLAG: True}),
+        (V6, V6_SPLIT_FLAGS, {loader.PREFILL_SPLIT_FLAG: True}),
     ):
         for use_initial, use_indices, store, unit_g, unit_beta in table:
             name = loader.selected_prefill_module(
@@ -1422,7 +1704,7 @@ def test_route_tables_are_consistent() -> None:
         else:
             refused(**flags)
         refused(body=P3, **flags)
-    # no V6 unit program; no V6 program without a final state; no V6 split program
+    # no V6 unit program; no V6 program without a final state, split or not
     refused(
         body=V6,
         use_initial_state=False,
@@ -1447,7 +1729,7 @@ def test_route_tables_are_consistent() -> None:
         body=V6,
         use_initial_state=False,
         use_state_indices=False,
-        store_final_state=True,
+        store_final_state=False,
         split_items=True,
     )
     # slot indices without an initial state, in either body
@@ -1534,20 +1816,39 @@ def test_route_tables_are_consistent() -> None:
         device_capability=(12, 0), num_householder=1
     )
     assert loader.PREFILL_LOGICAL_TENSORS[:4] == ("q", "k", "v", "o")
+    # the logical names of the shared prefill vocabulary but the Blackwell body's own (its item table, workspace,
+    # flags word and counts, and the pool programs' write slots, rounding seed and Philox rounds)
+    blackwell_only = {
+        "items",
+        "split_workspace",
+        "state_stride_slot",
+        "num_items",
+        "flags",
+        "output_state_indices",
+        "rand_seed",
+        "philox_rounds",
+    }
     for name in (base, merged):
-        assert set(loader.MODULES[name]["logical"].values()) == set(
-            loader.PREFILL_LOGICAL_TENSORS
-        ) | set(loader.PREFILL_LOGICAL_SCALARS)
+        assert (
+            set(loader.MODULES[name]["logical"].values())
+            == (
+                set(loader.PREFILL_LOGICAL_TENSORS)
+                | set(loader.PREFILL_LOGICAL_SCALARS)
+            )
+            - blackwell_only
+        )
     # both bodies take the same 23 formals in the same order: one ``values`` dict serves every launch
     assert loader.MODULES[base]["logical"] == loader.MODULES[merged]["logical"]
     assert loader.MODULES[base]["arg_plan"] == loader.MODULES[merged]["arg_plan"]
 
 
-def test_no_final_state_runs_the_v6_body(monkeypatch) -> None:
+@pytest.mark.parametrize("H", (MERGED_H, MIXED_H))
+def test_no_final_state_runs_the_v6_body(monkeypatch, H: int) -> None:
     """A long batch reading no initial state and keeping no final state is V6-class at every length (no merged
-    program stores none, and the V6 step is the cheaper): the V6 plain program runs it over ``N x H`` tiles, its
-    final state going to the discard record, and the output satisfies the FP64 reference.  The same lengths with
-    a final state are merged-class."""
+    program stores none, and the V6 step is the cheaper): at H = 3 the V6 plain program runs it over ``N x H``
+    tiles, at H = 10 (its sequences balanced) the V6 split program of the plain flags on one CTA per SM; the final
+    state goes to the discard record and the output satisfies the FP64 reference.  The same lengths with a final
+    state are merged-class."""
     seen: list[tuple[str, Optional[int]]] = []
     original = loader.run_module
 
@@ -1559,7 +1860,7 @@ def test_no_final_state_runs_the_v6_body(monkeypatch) -> None:
     V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     c = Case(
         lens=MERGED_LENS,
-        H=MIXED_H,
+        H=H,
         n=3,
         initial="none",
         final=False,
@@ -1567,8 +1868,10 @@ def test_no_final_state_runs_the_v6_body(monkeypatch) -> None:
         seed=31,
     )
     assert _classes(c) == [V6] * c.N
-    kept = Case(lens=MERGED_LENS, H=MIXED_H, n=3, initial="none", final=True)
+    kept = Case(lens=MERGED_LENS, H=H, n=3, initial="none", final=True)
     assert _classes(kept) == [P3] * kept.N
+    split = H == MIXED_H
+    assert _launch(c) == (V6, split)
     _run_and_check(c)
     assert seen == [
         (
@@ -1578,25 +1881,27 @@ def test_no_final_state_runs_the_v6_body(monkeypatch) -> None:
                 use_initial_state=False,
                 use_state_indices=False,
                 store_final_state=True,
+                **({loader.PREFILL_SPLIT_FLAG: True} if split else {}),
             ),
-            c.N * c.H,
+            loader.sm_count(0) if split else c.N * c.H,
         )
     ]
 
 
 def test_prefill_records_reference_the_build_manifest() -> None:
-    """Every prefill record names its ``build.json`` library; the entries compile with fast math (their validated
-    setting)."""
+    """Every prefill record of this device's architecture names its ``build.json`` library; the entries compile
+    with fast math (their validated setting).  (The Blackwell body's records are covered by
+    ``test_cake_gdp_prefill_bw.py``.)"""
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     seen = 0
     v6_seen = 0
     for name, record in loader.MODULES.items():
-        if record["role"] != "prefill":
+        if record["role"] != "prefill" or _arch() not in record["arches"]:
             continue
         seen += 1
         assert record["library"] == record["kernel"] == name
-        # two prefill bodies: the merged body and the V6 fork-order body of the three routed V6 flag sets
+        # two prefill bodies: the merged body and the V6 fork-order body (three flag sets and their split twins)
         assert record["body"] in (loader.ROUTE_BODY_P3, loader.ROUTE_BODY_V6), (
             name,
             record["body"],
@@ -1613,8 +1918,8 @@ def test_prefill_records_reference_the_build_manifest() -> None:
                 assert (package / source).is_file(), source
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
             assert "--use_fast_math" in entry["nvcc_flags"], (name, entry["nvcc_flags"])
-    assert seen == len(ROUTED_FLAGS) + len(SPLIT_FLAGS)
-    assert v6_seen == len(V6_FLAGS), v6_seen
+    assert seen == len(ROUTED_FLAGS) + len(SPLIT_FLAGS) + len(V6_SPLIT_FLAGS)
+    assert v6_seen == len(V6_FLAGS) + len(V6_SPLIT_FLAGS), v6_seen
 
 
 def test_is_supported_reports_the_routes() -> None:

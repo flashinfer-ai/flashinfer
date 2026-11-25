@@ -1091,8 +1091,9 @@ class _SparseMLAPagedAttentionRunner:
         pages and flat inline FP8 KV, with FP8 compute, contiguous indices
         and H=8/16/32/64.
 
-        NVFP4 caches support mega only when the selected plan is prefill;
-        decode plans raise an error. Ordinary ``run`` still supports NVFP4 decode.
+        NVFP4 caches use the same decode and prefill selection as ``run``.
+        Split decode fuses inverse RoPE and FP8 output into the final merge.
+
         Requires backend="sparse"; full-BF16 attention plans are unsupported.
         Other keyword arguments follow ``run``, including sinks, sparse
         lengths, extra cache and LSE. Warm up before CUDA graph capture;

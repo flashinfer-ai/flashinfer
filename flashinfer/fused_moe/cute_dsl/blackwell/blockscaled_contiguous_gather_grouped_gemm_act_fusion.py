@@ -204,14 +204,174 @@ def _tanh_approx_f32(a, *, loc=None, ip=None):
     return _f32_asm("tanh.approx.f32 $0, $1;", a, loc=loc, ip=ip)
 
 
-@dsl_user_op
-def _round_to_bf16(a, *, loc=None, ip=None):
-    """Round an FP32 value to BF16 (nearest even) and widen it back."""
-    return _f32_asm(
-        "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.f32.bf16 $0, h; }",
-        a,
+# Pre-FC2 epilogue (``pre_fc2_routing``). Its per-element work bounds the
+# GEMM1 tile time; two measures reduce it without changing any result bit:
+# - BF16 rounding in pairs: one cvt.rn.bf16x2.f32 rounds two values. Each half
+#   is rounded to nearest even exactly like cvt.rn.bf16.f32; the only possible
+#   difference is a NaN payload, and NaN can only reach the first two roundings,
+#   whose results pass through max(v, 0) (returns 0 for NaN) before anything
+#   else uses them.
+# - Compact tiles: a tile with at most PRE_FC2_COMPACT_ROWS valid rows (decode)
+#   stages the BF16-rounded alpha * acc of its valid rows in shared memory, so
+#   all 128 epilogue threads share the per-element work of those rows instead
+#   of every warp running its 32 TMEM lanes (mostly padding) through the
+#   activation and quantization. Fuller tiles take the per-subtile path
+#   (staging them too was slower at large batch sizes). Padding rows of a
+#   compact tile's FP4 output and scale factors are not written (GEMM2 never
+#   stores padding rows).
+PRE_FC2_COMPACT_ROWS = 64
+
+
+def _f32x2_asm(asm, a, b, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [
+            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=f,=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _round_to_bf16x2(a, b, *, loc=None, ip=None):
+    """Round two FP32 values to BF16 (nearest even, one packed cvt) and widen both back.
+
+    Widening a BF16 is exact: its bits become the high half of the FP32.
+    """
+    return _f32x2_asm(
+        "{ .reg .b32 p; cvt.rn.bf16x2.f32 p, $3, $2; "
+        "shl.b32 $0, p, 16; and.b32 $1, p, 0xffff0000; }",
+        a,
+        b,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _bf16x2_bits(a, b, *, loc=None, ip=None):
+    """BF16 bits of round(a) (low half) and round(b) (high half) as one u32."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16x2_unpack(w, *, loc=None, ip=None):
+    """Widen the two BF16 halves of a u32 (low, high) to FP32 (exact)."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [cutlass.Uint32(w).ir_value(loc=loc, ip=ip)],
+        "{ shl.b32 $0, $2, 16; and.b32 $1, $2, 0xffff0000; }",
+        "=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _st_shared_v4_b32(addr, w0, w1, w2, w3, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w0).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w1).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w2).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_v4_b32(addr, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
+
+
+@dsl_user_op
+def _st_shared_f32(addr, v, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.f32 [$0], $1;",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_f32(addr, *, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.f32 $0, [$1];",
+            "=f,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 
@@ -537,7 +697,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param pre_fc2_routing: Weight each route in the epilogue and quantize
             with one FC2 input scale per expert, rounding to BF16 after FC1,
             the soft clamp, the square and the weighting. Requires non-gated
-            ClampedRelu2 and the routing_weights tensor.
+            ClampedRelu2, the routing_weights tensor and a 1-CTA 128x128 tile.
+            Padding rows of tiles with at most PRE_FC2_COMPACT_ROWS valid rows
+            are not written.
         :type pre_fc2_routing: bool
         :param clamped_relu2_tanh_approx: Compute the ClampedRelu2 soft clamp
             ``L * tanh(x / L)`` with one ``tanh.approx.f32`` per element instead
@@ -658,6 +820,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             raise ValueError("pre_fc2_routing requires non-gated ClampedRelu2")
         if pre_fc2_routing and use_a_per_token_scale:
             raise ValueError("pre_fc2_routing does not support per-token A scales")
+        if pre_fc2_routing and tuple(mma_tiler_mn) != (128, 128):
+            raise ValueError("pre_fc2_routing requires mma_tiler_mn=(128, 128)")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1237,10 +1401,87 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 self.buffer_align_bytes,
             ]
 
+        # The compact pre-FC2 epilogue also keeps one route weight per staged
+        # row (32 floats); it fits in the padding before the 1024-byte aligned sC.
+        @cute.struct
+        class SharedStorage1ctaCompact:
+            sInfo: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage],
+                1,
+            ]
+            a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+            tile_info_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_tile_stage * 2
+            ]
+            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+            sRowW: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 32], 16]
+            sC: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.c_dtype,
+                    cute.cosize(self.c_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            sA: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.smem_alloc_a_dtype,
+                    cute.cosize(self.a_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.smem_alloc_b_dtype,
+                    cute.cosize(self.b_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)
+                ],
+                self.buffer_align_bytes,
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                ],
+                self.buffer_align_bytes,
+            ]
+
+        if cutlass.const_expr(self.pre_fc2_routing):
+            # Staging holds 32 rows x CTA tile N BF16 values in the sC buffers.
+            # Compact tiles skip the per-subtile loop, which is where an
+            # overlapping accumulator would be released early.
+            sc_bytes = (
+                cute.cosize(self.c_smem_layout_staged.outer) * self.c_dtype.width // 8
+            )
+            if cutlass.const_expr(
+                self.use_2cta_instrs
+                or self.overlapping_accum
+                or self.cta_tile_shape_mnk[1] != 128
+                or sc_bytes < 32 * 128 * 2
+                or not self.generate_sfc
+                or self.sf_vec_size != 16
+                or self.c_dtype is not cutlass.Float4E2M1FN
+            ):
+                raise ValueError(
+                    "pre_fc2_routing needs a 1-CTA 128x128 NVFP4-output tile "
+                    "(16-element scale blocks, no overlapping accumulator) "
+                    f"and >= 8 KiB of sC (have {sc_bytes} B)"
+                )
+
         self.shared_storage = (
             SharedStorage2cta
             if cutlass.const_expr(self.use_2cta_instrs)
-            else SharedStorage1cta
+            else (
+                SharedStorage1ctaCompact
+                if cutlass.const_expr(self.pre_fc2_routing)
+                else SharedStorage1cta
+            )
         )
 
         # Launch the kernel synchronously
@@ -1275,6 +1516,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            c if cutlass.const_expr(self.pre_fc2_routing) else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1364,9 +1606,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        mC_gmem: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
+
+        ``mC_gmem`` is the output tensor itself (``mC_mnl`` is the TMA view);
+        it is passed only for the compact pre-FC2 epilogue, which stores
+        directly to global memory.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -2708,6 +2955,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 clamp_limit = clamped_relu2_limit[0]
                 inv_clamp_limit = cutlass.Float32(1.0) / clamp_limit
 
+            if cutlass.const_expr(self.pre_fc2_routing):
+                # Shared-memory addresses of the BF16 staging rows (the sC
+                # buffers) and of the staged route weights; byte-addressed
+                # views of the FP4 output and its scale factors.
+                compact_stage_base = cutlass.Int32(storage.sC.data_ptr().toint())
+                compact_roww_base = cutlass.Int32(storage.sRowW.data_ptr().toint())
+                compact_c_u64 = cute.recast_ptr(mC_gmem.iterator, dtype=cutlass.Uint64)
+                compact_sfc_u8 = cute.recast_ptr(mSFC_mnl.iterator, dtype=cutlass.Uint8)
+                compact_c_cols = cutlass.Int32(cute.size(mC_gmem, mode=[1]))
+                compact_c_u64_per_row = compact_c_cols // 16
+                compact_sfc_k_atoms = (compact_c_cols + 63) // 64
+
             #
             # Persistent tile scheduling loop
             #
@@ -2840,9 +3099,45 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                loop_subtile_cnt = subtile_cnt
+
+                if cutlass.const_expr(self.pre_fc2_routing):
+                    tile_valid_rows = cutlass.min(
+                        tile_info[4] - tile_m_start,
+                        cutlass.Int32(self.cta_tile_shape_mnk[0]),
+                    )
+                    is_compact = tile_valid_rows <= cutlass.Int32(PRE_FC2_COMPACT_ROWS)
+                    # Compact tiles skip the per-subtile loop below.
+                    loop_subtile_cnt = cutlass.Int32(subtile_cnt)
+                    if is_compact:
+                        loop_subtile_cnt = cutlass.Int32(0)
+                    if is_compact:
+                        self._pre_fc2_compact_tile(
+                            warp_idx,
+                            epi_tidx,
+                            tile_info,
+                            tile_m_start,
+                            tile_valid_rows,
+                            tiled_copy_t2r,
+                            tTR_tAcc,
+                            tTR_rAcc_up,
+                            subtile_cnt,
+                            alpha_val,
+                            route_weight,
+                            clamp_limit,
+                            norm_const,
+                            sf_from_amax,
+                            compact_stage_base,
+                            compact_roww_base,
+                            compact_c_u64,
+                            compact_sfc_u8,
+                            compact_c_u64_per_row,
+                            compact_sfc_k_atoms,
+                            epilogue_op,
+                        )
 
                 for subtile_idx in cutlass.range(
-                    0, subtile_cnt, 2 if self.gated else 1
+                    0, loop_subtile_cnt, 2 if self.gated else 1
                 ):
                     if cutlass.const_expr(self.gated):
                         real_subtile_idx = subtile_idx // 2
@@ -2889,17 +3184,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         if cutlass.const_expr(self.pre_fc2_routing):
                             # BF16 rounding after FC1, the soft clamp, the square
                             # and the route weighting, as in the reference.
-                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                                v = _round_to_bf16(
-                                    acc_vec[i] * cutlass.Float32(alpha_val)
-                                )
-                                v = _round_to_bf16(
-                                    clamp_limit
-                                    * _tanh_approx_f32(_div_full_f32(v, clamp_limit))
-                                )
-                                v = cute.arch.fmax(v, cutlass.Float32(0.0))
-                                v = _round_to_bf16(v * v)
-                                tCompute[i] = _round_to_bf16(v * route_weight)
+                            self._pre_fc2_act_into(
+                                tCompute, acc_vec, alpha_val, clamp_limit, route_weight
+                            )
                         elif cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(
                                 0, cute.size(tTR_rAcc_up), 2
@@ -3629,6 +3916,181 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             gC_for_tma_partition,
         )
         return tma_atom_c, bSG_sC, bSG_gC
+
+    def _pre_fc2_act(self, xs, alpha_val, clamp_limit, route_weight, staged=False):
+        """Pre-FC2 activation of a list of FP32 values (trace-time unrolled).
+
+        Per element, the reference's operations:
+        v = bf16(x * alpha) (skipped when ``staged``: xs already hold it),
+        v = bf16(L * tanh.approx(div.full(v, L))), v = max(v, 0),
+        v = bf16(v * v), result = bf16(v * route_weight),
+        with each BF16 rounding done for a pair of values by one packed cvt.
+        """
+        assert len(xs) % 2 == 0
+
+        def rnd(vs):
+            out = []
+            for j in range(0, len(vs), 2):
+                out.extend(_round_to_bf16x2(vs[j], vs[j + 1]))
+            return out
+
+        if staged:
+            v = list(xs)
+        else:
+            v = rnd([x * cutlass.Float32(alpha_val) for x in xs])
+        d = [_div_full_f32(x, clamp_limit) for x in v]
+        v = rnd([clamp_limit * _tanh_approx_f32(x) for x in d])
+        v = [cute.arch.fmax(x, cutlass.Float32(0.0)) for x in v]
+        v = rnd([x * x for x in v])
+        return rnd([x * route_weight for x in v])
+
+    def _pre_fc2_act_into(
+        self, dst, xs, alpha_val, clamp_limit, route_weight, staged=False
+    ):
+        """_pre_fc2_act of xs[0..n) (a list or a register vector), into dst[0..n)."""
+        n = cute.size(dst)
+        vals = self._pre_fc2_act(
+            [xs[i] for i in range(n)],
+            alpha_val,
+            clamp_limit,
+            route_weight,
+            staged=staged,
+        )
+        for i in range(n):
+            dst[i] = vals[i]
+
+    @cute.jit
+    def _pre_fc2_compact_tile(
+        self,
+        warp_idx: cutlass.Int32,
+        epi_tidx: cutlass.Int32,
+        tile_info: cute.Tensor,
+        tile_m_start: cutlass.Int32,
+        tile_valid_rows: cutlass.Int32,
+        tiled_copy_t2r: cute.TiledCopy,
+        tTR_tAcc: cute.Tensor,
+        tTR_rAcc: cute.Tensor,
+        subtile_cnt: cutlass.Constexpr,
+        alpha_val: cutlass.Float32,
+        route_weight: cutlass.Float32,
+        clamp_limit: cutlass.Float32,
+        norm_const: cutlass.Float32,
+        sf_from_amax: cutlass.Float32,
+        stage_base: cutlass.Int32,
+        roww_base: cutlass.Int32,
+        c_u64: cute.Pointer,
+        sfc_u8: cute.Pointer,
+        c_u64_per_row: cutlass.Int32,
+        sfc_k_atoms: cutlass.Int32,
+        epilogue_op: cutlass.Constexpr,
+    ):
+        """Pre-FC2 epilogue of a tile with few valid rows (decode).
+
+        Per 32-row quarter q with valid rows: epilogue warp q (the only warp
+        that can read TMEM lanes 32q..32q+31) loads its accumulator rows,
+        rounds alpha * acc to BF16 and stages the valid rows (256 B each,
+        16-byte chunks XOR-swizzled by row) plus their route weights in
+        shared memory. Then all 128 epilogue threads take one 16-column
+        scale block each (8 per row): the remaining activation steps, the
+        block amax and E4M3 scale, the NVFP4 quantization, and direct global
+        stores of 8 FP4 bytes and the scale byte (in the 128x4 swizzled
+        scale layout). Operations per element are those of the full path.
+        """
+        n_acc = cute.size(tTR_rAcc)  # accumulator columns per subtile (64)
+        chunks_per_subtile = n_acc // 8  # 16-byte chunks of 8 BF16 values
+        row_bytes = subtile_cnt * n_acc * 2  # 256 B per staged row
+        blocks_per_row = subtile_cnt * n_acc // self.sf_vec_size  # 8
+        lane = epi_tidx % 32
+        # The staging rows reuse the sC buffers: drain earlier TMA stores.
+        if warp_idx == self.epilog_warp_id[0]:
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+        # 64-bit tile bases (outputs can exceed 2^31 8-byte words); offsets
+        # inside one 128-row tile fit in 32 bits.
+        tile_c = c_u64 + cutlass.Int64(tile_m_start) * cutlass.Int64(c_u64_per_row)
+        tile_sfc = sfc_u8 + cutlass.Int64(tile_info[0]) * (
+            cutlass.Int64(sfc_k_atoms) * cutlass.Int64(512)
+        )
+        num_q = (tile_valid_rows + 31) // 32
+        for q in cutlass.range(num_q, unroll=1):
+            # Staging buffer free (TMA reads drained, previous quarter consumed).
+            self.epilog_sync_barrier.arrive_and_wait()
+            if warp_idx == q:
+                for s in cutlass.range_constexpr(subtile_cnt):
+                    cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+                    acc_vec = tTR_rAcc.load()
+                    words = [
+                        _bf16x2_bits(
+                            acc_vec[2 * j] * cutlass.Float32(alpha_val),
+                            acc_vec[2 * j + 1] * cutlass.Float32(alpha_val),
+                        )
+                        for j in range(n_acc // 2)
+                    ]
+                    if epi_tidx < tile_valid_rows:
+                        for c in cutlass.range_constexpr(chunks_per_subtile):
+                            chunk = s * chunks_per_subtile + c
+                            _st_shared_v4_b32(
+                                stage_base
+                                + lane * row_bytes
+                                + (((lane & 15) ^ chunk) << 4),
+                                words[4 * c],
+                                words[4 * c + 1],
+                                words[4 * c + 2],
+                                words[4 * c + 3],
+                            )
+                if epi_tidx < tile_valid_rows:
+                    _st_shared_f32(roww_base + lane * 4, route_weight)
+            # Staged rows visible to all epilogue warps.
+            self.epilog_sync_barrier.arrive_and_wait()
+            rows_q = cutlass.min(tile_valid_rows - q * 32, cutlass.Int32(32))
+            for it in cutlass.range(epi_tidx, rows_q * blocks_per_row, 128, unroll=1):
+                r = it // blocks_per_row
+                b = it % blocks_per_row
+                row_addr = stage_base + r * row_bytes
+                w_lo = _ld_shared_v4_b32(row_addr + (((2 * b) ^ (r & 15)) << 4))
+                w_hi = _ld_shared_v4_b32(row_addr + (((2 * b + 1) ^ (r & 15)) << 4))
+                rw = _ld_shared_f32(roww_base + r * 4)
+                v1 = [x for w in (*w_lo, *w_hi) for x in _bf16x2_unpack(w)]
+                tCompute = cute.make_rmem_tensor((self.sf_vec_size,), cutlass.Float32)
+                self._pre_fc2_act_into(
+                    tCompute, v1, alpha_val, clamp_limit, rw, staged=True
+                )
+                #
+                # Block amax -> E4M3 scale -> NVFP4, as in the full path.
+                #
+                tFrg = cute.logical_divide(tCompute, cute.make_layout(self.sf_vec_size))
+                frg = epilogue_op(tFrg.load())  # as in the full path, before the amax
+                abs_frg = type(frg)(math.absf(frg.ir_value()), frg.shape, frg.dtype)
+                tPv = cute.make_rmem_tensor((2,), cutlass.Float32)
+                tPv[0] = (
+                    abs_frg[None, 0].reduce(
+                        cute.ReductionOp.MAX, cutlass.Float32(0.0), 0
+                    )
+                    * sf_from_amax
+                )
+                tPv[1] = tPv[0]
+                tSf = cute.make_rmem_tensor((2,), self.sf_dtype)
+                tSf.store(tPv.load().to(self.sf_dtype))
+                block_scale = tSf.load().to(cutlass.Float32)[0]
+                acc_scale = cutlass.Float32(0.0)
+                if block_scale > cutlass.Float32(0.0):
+                    acc_scale = _div_full_f32(norm_const, block_scale)
+                for ei in cutlass.range_constexpr(self.sf_vec_size):
+                    tCompute[ei] = tCompute[ei] * acc_scale
+                tQ = cute.make_rmem_tensor((self.sf_vec_size,), self.c_dtype)
+                tQ.store(tCompute.load().to(self.c_dtype))
+                # Row of the tile and 16-column block of the output.
+                kblk = tile_info[1] * blocks_per_row + b
+                tile_c[(q * 32 + r) * c_u64_per_row + kblk] = cute.recast_tensor(
+                    tQ, cutlass.Uint64
+                )[0]
+                # 128x4 scale layout: 512-byte atoms of 128 rows x 4 blocks,
+                # (row % 32) * 16 + ((row / 32) % 4) * 4 + block % 4 inside;
+                # atoms ordered by 4-block group, then by 128-row tile.
+                tile_sfc[r * 16 + q * 4 + (kblk % 4) + 512 * (kblk // 4)] = (
+                    cute.recast_tensor(tSf, cutlass.Uint8)[0]
+                )
+        # Staging reads done before sC is reused (TMA path or next tile).
+        self.epilog_sync_barrier.arrive_and_wait()
 
     @staticmethod
     def _compute_stages(

@@ -776,6 +776,90 @@ class TmemSResource(DecodeGenResourceBase):
             head_dim_stage_idx=head_dim_stage_idx,
         )
 
+    @producer_work
+    @cute.jit
+    def qk_mma_head_slot(
+        self,
+        stage_info: StageInfo,
+        *,
+        q_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
+    ) -> None:
+        """Issue every head-dim stage of HEAD QK from one grouped K slot."""
+        self._qk_mma_slot(
+            stage_info,
+            q_desc=q_desc,
+            kv_desc=kv_desc,
+            stage_slot_offset=self._qk_head_stage_slot_offset(stage_info),
+        )
+
+    @producer_work
+    @cute.jit
+    def qk_mma_loop_slot(
+        self,
+        stage_info: StageInfo,
+        *,
+        q_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
+    ) -> None:
+        """Issue every head-dim stage of LOOP QK from one grouped K slot."""
+        self._qk_mma_slot(
+            stage_info,
+            q_desc=q_desc,
+            kv_desc=kv_desc,
+            stage_slot_offset=self._qk_loop_stage_slot_offset(stage_info),
+        )
+
+    @cute.jit
+    def _qk_mma_slot(
+        self,
+        stage_info: StageInfo,
+        *,
+        q_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
+        stage_slot_offset: Int32,
+    ) -> None:
+        """Issue all QK MMAs of a grouped TMEM K slot from one elected block.
+
+        Equivalent to ``_qk_mma`` for head-dim stages 0..G-1 in order: stage
+        ``h`` reads K at slot column ``h * stage_cols`` and the staged Q slice
+        ``h``; the very first MMA overwrites S and every later one accumulates.
+        All operand addresses are the slot/Q roots plus compile-time offsets.
+        """
+        cfg = self.cfg
+        stages = cfg.transformed_kv_hd_stages_per_slot
+        k_steps = cfg.head_dim_kv_stage // _mma_k_step_qk(cfg)
+        k_step_cols = _mma_k_step_qk(cfg) * cfg.qk_dtype_bytes // 4
+        q_stage_step = cfg.head_dim_kv_stage * cfg.tile_size_q * cfg.q_dtype_bytes // 16
+        q_desc = _freeze_smem_descriptor(q_desc)
+        tmem_col = self._qk_tmem_col(stage_info, stage_slot_offset)
+        _, mma_m, mma_n = _qk_mma_operand_contract_for_config(cfg)
+        idesc = prims.Tcgen05InstrDesc.build(
+            c_dtype=_qk_accumulator_dtype(cfg),
+            a_dtype=cfg.qk_dtype,
+            b_dtype=cfg.qk_dtype,
+            n_dim=mma_n,
+            m_dim=mma_m,
+        )
+        k_stage_cols = cfg.tmem_transformed_kv_stage_cols
+        if prims.elect_sync():
+            for stage in cutlass.range_constexpr(stages):
+                for ki in cutlass.range_constexpr(k_steps):
+                    k_operand = prims.make_tmem_ptr(
+                        kv_desc + Int32(stage * k_stage_cols + ki * k_step_cols),
+                        Int32,
+                    )
+                    q_operand = q_desc + Int32(stage * q_stage_step + ki * 2)
+                    prims.tcgen05_mma(
+                        _mma_kind_for_qk(cfg),
+                        prims.CTAGroup.CTA_1,
+                        tmem_col,
+                        k_operand,
+                        q_operand,
+                        idesc,
+                        cutlass.Boolean(stage != 0 or ki != 0),
+                    )
+
     @cute.jit
     def _qk_mma(
         self,
@@ -794,6 +878,12 @@ class TmemSResource(DecodeGenResourceBase):
         """
         cfg = self.cfg
         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+            if cutlass.const_expr(cfg.transformed_kv_hd_stages_per_slot > 1):
+                # kv_desc is the ring-slot base; select this head-dim stage.
+                kv_desc = kv_desc + Int32(
+                    (head_dim_stage_idx % cfg.transformed_kv_hd_stages_per_slot)
+                    * cfg.tmem_transformed_kv_stage_cols
+                )
             k_desc = prims.make_tmem_ptr(kv_desc, Int32)
         else:
             k_desc = _freeze_smem_descriptor(kv_desc)
