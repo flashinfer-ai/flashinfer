@@ -1,11 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The dispatcher of the batch-invariant GEMM classes: a ranking heuristic over the class's configuration space.
-
-For a shape, layout, format and part it orders the records of the enumerated space by a per-tile roofline estimate
-(SM-cycles of the launch) and `schedule.default_config` takes the first; `schedule.rank_topk` hands the first ``k`` to
-FlashInfer's autotuner. Nothing here reaches the bits: every record of the space computes the class (R3), the heuristic
-only orders them, so it may be as rough as it is.
+"""GEMM cost model used by grouped MoE and the standalone GEMM Lean cases.
 
 The estimate uses the part's numbers (SM count, co-resident cluster capacity per cluster size, L2 size, the dense bf16
 MMA rate per SM, the L2 -> SMEM and HBM bandwidths per SM; the capacity and the L2 size are the device's own once the
@@ -191,7 +186,7 @@ def decode_sane(
     guard leaves out the 16-wide tile because its 16-byte B box wastes the TMA's transactions; ``narrow_tiles`` admits it
     for the block-scale class, whose decode block is bounded by the per-block accumulator hand-off (`estimate_cycles`),
     not by the box, so the narrowest tile that still fits the part in one wave streams the weight through the most CTAs.
-    Records outside the guard stay members of the space (the autotuner may still reach them)."""
+    Records outside the guard remain in the configuration space used by the conformance model."""
     if M > DECODE_M:
         return True
     if swapped:

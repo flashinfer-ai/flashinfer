@@ -18,8 +18,7 @@ class BatchInvariantUnsupportedError(ValueError):
     raises this error, whose message names the class and the limit."""
 
 
-#: Operators that run their batch-invariant class under both values of the flag (no other kernel takes the operand
-#: pair), by the class-name prefix their errors carry: the message of such a class names no fallback.
+#: Operators with the same input contract under both flag values, by class-name prefix.
 _SELF_SERVED: Dict[str, str] = {}
 
 
@@ -36,7 +35,7 @@ def unsupported(
         if class_name == prefix or class_name.startswith((prefix + ".", prefix + "_")):
             return BatchInvariantUnsupportedError(
                 f"the class `{class_name}` does not support {what}; the limit is {limit}. `{operator}` runs this class "
-                "under both values of batch_invariant (no other kernel takes the operand pair): the call must meet the "
+                "under both values of batch_invariant: the call must meet the "
                 "class's contract."
             )
     return BatchInvariantUnsupportedError(
@@ -91,9 +90,10 @@ def check_device(
 
 
 @functools.lru_cache(maxsize=None)
-def _check_device_cached(
+def _check_device_arch(
     device: torch.device, class_name: str, archs: Tuple[Tuple[int, int], ...]
 ) -> Tuple[int, int]:
+    """Validate an operand device before selecting the implementation for its architecture."""
     if device.type != "cuda":
         raise unsupported(
             class_name,
@@ -109,6 +109,14 @@ def _check_device_cached(
             f"compute capability {cc[0]}.{cc[1]}",
             f"the architectures {_arch_names(archs)}",
         )
+    return cc
+
+
+@functools.lru_cache(maxsize=None)
+def _check_device_cached(
+    device: torch.device, class_name: str, archs: Tuple[Tuple[int, int], ...]
+) -> Tuple[int, int]:
+    cc = _check_device_arch(device, class_name, archs)
     from ..cute_dsl.availability import (
         is_cute_dsl_arch_supported,
         is_cute_dsl_available,

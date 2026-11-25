@@ -1,25 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The dense GEMM classes as a kernel generator on the engine.
+"""GEMM knob, reduction and epilogue models used by Lean conformance and grouped MoE.
 
-A GEMM kernel is generated from four typed parts, and nothing else:
-
-* the **reduction** (``spec.py``): a ``fold`` digit over the K steps of one opaque MMA instruction, and for the
-  split class a second ``fold`` over chunks -- a ``canon.Plan`` whose register-level folds are the only source of
-  per-element order;
-* the **mainloop block** (:class:`MainloopBlock`): the tcgen05 K pipeline (``blocks/mainloop.py``), opaque to the
-  engine below one instruction; its step width is the format's, its instruction variant is a function of the knobs
-  and is the single hardware assumption (A2) the GPU configuration-agreement tests discharge;
-* the **knobs** (:class:`Knobs`): tile M/N, 1-/2-CTA MMA, cluster shape, raster order, swizzle, grid size and the
-  in-CTA chunk fold. They choose which CTA owns which output tile, the pipeline depth and the launch geometry;
-  they cannot reach the reduction or the epilogue arithmetic. The enumerated knob product filtered by the kernel's
-  own acceptance is the configuration space the guarantee is claimed over;
-* the **epilogue chain** (``spec.EpilogueChain``): the elementwise ops the specification applies after the fold
-  (the fp8 classes' per-tensor scale, the conversion).
-
-``lean_cases.py`` emits the knob records of the whole space and of the dispatcher's choices from these objects,
-so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp8_space_ok``), the actual dispatch
-(``gemm_dispatch_in_space``) and instantiates ``config_invariance`` on them.
+``lean_cases.py`` emits the configuration spaces and reference selections checked
+in GEMMConfig.lean. The grouped MoE kernels also use Knobs and MainloopBlock.
+cuDNN builds and executes the plans for standalone batch-invariant GEMMs.
 """
 
 from __future__ import annotations

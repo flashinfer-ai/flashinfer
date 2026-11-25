@@ -138,7 +138,7 @@ if [[ -n "${CUDA_EXTRA_DEPENDENCY_OUTPUT}" ]]; then
 fi
 uv pip install --python "${VENV}/bin/python" \
     numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
-    "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.33.0" \
+    "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.34.0" \
     "cuda-tile>=1.4.0" "cuda-python>=13.0" \
     "nccl-extensions>=0.2.0" "nccl4py>=0.4.1" \
     "nvidia-nccl-cu13>=2.30.7"

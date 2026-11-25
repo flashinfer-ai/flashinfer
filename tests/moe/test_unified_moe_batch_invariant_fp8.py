@@ -8,8 +8,8 @@ the two calibrated multipliers, every routing input mode).
 The class has exact CPU models of everything but the tensor-core step (the routing, the static input quantization, the
 fused e4m3 quantization of the activation chain on the alpha-scaled accumulators, GEMM2's scaled chain, the slot-order
 combine), so the tests are bit comparisons: the layer's output against the class composed from its own pieces (the
-routing on the CPU, the grouped GEMM1 as the raw fp32 fold, the CPU chain with the exact requantization, the dense
-batch-invariant fp8 GEMM per expert for GEMM2, the CPU combine) for several activations, run-to-run determinism including
+routing on the CPU, the grouped GEMM1 as the raw fp32 fold, the CPU chain with the exact requantization, a dense
+PyTorch fp8 GEMM per expert for GEMM2, the CPU combine) for several activations, run-to-run determinism including
 CUDA-graph replay, batch / permutation / sub-batch invariance, agreement of every tactic the autotuner may pick, the three
 routing input modes giving the same bits, the error contract, and a plausibility observation against FlashInfer's torch
 reference of the fp8 per-tensor MoE. The device-free tests pin the registration, the fingerprint dimensions, the
@@ -872,15 +872,24 @@ def _reference_route(logits: torch.Tensor, k: int, method):
     return R.route_cpu(logits.cpu(), k, S.METHOD_OF_FLASHINFER[method])
 
 
+def _reference_fp8_accumulators(
+    a: torch.Tensor, b: torch.Tensor, one: torch.Tensor
+) -> torch.Tensor:
+    # These E4M3 test shapes use one K chunk. The reference accumulates in K order
+    # on the tensor cores, with unit scales to expose the raw FP32 values.
+    return torch._scaled_mm(
+        a, b, one, one, out_dtype=torch.float32, use_fast_accum=True
+    )
+
+
 def _reference_ffn(
     xq: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, view: dict, act
 ) -> torch.Tensor:
     """The class composed on the device from its own pieces: the class's permutation (the rows gathered by torch indexing),
     GEMM1 as the grouped fp8 kernel with the unscaled fp32 identity epilogue (the same fold; any record of the space gives its
     bits), the CPU chain of the activation with the exact e4m3 requantization on those accumulators and the view's scales,
-    GEMM2 as the dense batch-invariant fp8 GEMM per expert (``mm_fp8_batch_invariant`` with unit scales, fp32 out: the raw
-    fold at this weight shape, asserted unsplit), the CPU GEMM2 chain, the CPU slot-order combine. Bit for bit what the
-    fused op must produce."""
+    GEMM2 as a dense PyTorch fp8 GEMM per expert with raw fp32 output, the CPU GEMM2 chain, and the CPU slot-order combine.
+    The fused op must produce the same bits."""
     from flashinfer.fused_moe.batch_invariant import reference as R
     from flashinfer.fused_moe.batch_invariant import reference_fp8 as R8
     from flashinfer.fused_moe.batch_invariant.api import permute_plan
@@ -891,7 +900,6 @@ def _reference_ffn(
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import Fp8Chain
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import all_valid_configs_fp8
-    from flashinfer.gemm.batch_invariant.api import mm_fp8_batch_invariant
     from flashinfer.gemm.batch_invariant.schedule import chunks_for
 
     W = MoEWeightsE4M3.from_view(view)
@@ -932,8 +940,8 @@ def _reference_ffn(
     for e in range(E):
         lo, hi = int(off[e]), int(off[e + 1])
         if hi > lo:
-            acc2[lo:hi] = mm_fp8_batch_invariant(
-                a[lo:hi].contiguous(), W.w2q[e].t(), one, one, out_dtype=torch.float32
+            acc2[lo:hi] = _reference_fp8_accumulators(
+                a[lo:hi].contiguous(), W.w2q[e].t(), one
             )
     y_perm = R8.w8a8_gemm2_cpu(acc2.cpu(), W.s_inter.cpu(), sw2)
     y = y_perm[dest.view(-1).long().cpu()]
@@ -1220,7 +1228,7 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
 @needs_device
 def test_grouped_gemm1_is_the_dense_fp8_class_per_expert():
     """GEMM1 is a placement of the dense fp8 class, as GEMM2 is in the composition: its raw accumulators (the unscaled fp32
-    identity chain) on the dispatcher's dense and swapped records equal ``mm_fp8_batch_invariant`` (unit scales, fp32 out) on
+    identity chain) on the dispatcher's dense and swapped records equal the independent PyTorch fp8 reference on
     each expert's rows bit for bit, at a decode and a prefill token count; and the fused op's e4m3 intermediate on both records
     equals the CPU chain on the dense class's accumulators."""
     from flashinfer.fused_moe.batch_invariant import reference_fp8 as R8
@@ -1232,7 +1240,6 @@ def test_grouped_gemm1_is_the_dense_fp8_class_per_expert():
     )
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue import GROUP, Fp8Chain
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import default_configs_fp8
-    from flashinfer.gemm.batch_invariant.api import mm_fp8_batch_invariant
     from flashinfer.gemm.batch_invariant.schedule import chunks_for
 
     k, H, I, E = 6, 512, 256, 64
@@ -1256,12 +1263,8 @@ def test_grouped_gemm1_is_the_dense_fp8_class_per_expert():
         for e in range(E):
             lo, hi = int(off[e]), int(off[e + 1])
             if hi > lo:
-                dense[lo:hi] = mm_fp8_batch_invariant(
-                    x_perm[lo:hi].contiguous(),
-                    Wq.w1q[e].t(),
-                    one,
-                    one,
-                    out_dtype=torch.float32,
+                dense[lo:hi] = _reference_fp8_accumulators(
+                    x_perm[lo:hi].contiguous(), Wq.w1q[e].t(), one
                 )
         sw1 = torch.repeat_interleave(Wq.s_w1.cpu(), counts.cpu().long())
         u = dense.view(-1, I // GROUP, 2, GROUP)[:, :, 0, :].reshape(-1, I)

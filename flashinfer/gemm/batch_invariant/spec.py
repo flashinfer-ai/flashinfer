@@ -436,9 +436,8 @@ def scale_term(fp, in_fmt: str = "e4m3"):
 class EpilogueChain:
     """The elementwise ops after the fold, in order: ``mul.rn alpha`` for the scaled (fp8) classes, ``add.rn bias`` for
     the biased chain (the bias of the output column, widened to binary32 exactly: ``BIAS_NOTE``), then exactly one
-    ``cvt.rn <out>``. One object, one ``apply``: the spec term (:func:`output_elem`, ``fp`` = the term algebra), the
-    kernel (``blocks/epilogue.py``: ``fp`` = ``CuteF32`` for the ops before the conversion, the vector ``.to(out dtype)``
-    for the conversion itself) and the fixup all run this code."""
+    ``cvt.rn <out>``. :func:`output_elem` applies this chain in the term algebra to construct the
+    arithmetic specification. The cuDNN batch-invariant GEMM plan implements the same order."""
 
     ops: Tuple[str, ...]
 

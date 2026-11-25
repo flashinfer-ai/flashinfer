@@ -3,8 +3,7 @@
 """MXFP8 x MXFP4 (W4A8 in the MX formats) dense GEMM public API: e4m3 activations against packed e2m1 weights, one UE8M0
 block scale per 32 elements on each operand, applied inside the mixed-operand block-scaled instruction.
 
-The batch-invariant class of ``flashinfer/gemm/batch_invariant`` is the pair's only dense kernel in FlashInfer, so both
-values of ``batch_invariant`` run it; see ``flashinfer/batch_invariant/README.md``.
+cuDNN runs this operator with the BATCH_INVARIANT numerical note.
 """
 
 from typing import Optional
@@ -68,14 +67,10 @@ def mm_mxfp8_mxfp4(
         result is written into it. Defaults to ``None``.
 
     batch_invariant: bool
-        Both values run the batch-invariant mixed MX GEMM class today: FlashInfer
-        has no other dense kernel for this operand pair, so ``False`` (the
-        default) selects the same kernels as ``True``. ``True`` is the guarantee
-        and keeps it: a row of the output is bit-identical whatever the number of
-        rows, the row's position in the batch or the configuration chosen, and
-        the result is deterministic; a future non-invariant kernel may take the
-        ``False`` path. ``b`` must be the transpose of a row-major ``(n, k // 2)``
-        weight. The class is the architecture's (the SM107 instruction folds 64
+        Both flag values use the cuDNN batch-invariant GEMM plan. A row is
+        bit-identical across batch sizes, row positions and repeated calls.
+        ``b`` must be the transpose of a row-major ``(n, k // 2)`` weight.
+        The class is the architecture's (the SM107 instruction folds 64
         elements per step, the SM100 / SM103 one 32), so the specification is
         ``flashinfer.batch_invariant.fingerprint("mm_mxfp8_mxfp4", N=, K=,
         out_dtype=, arch=)``. Unsupported inputs raise
@@ -121,17 +116,15 @@ def mm_mxfp8_mxfp4(
     >>> out.shape
     torch.Size([512, 256])
     """
-    from ..batch_invariant.support import unsupported
-    from .batch_invariant.api import (
-        CLASS_MXW48,
-        MM_MXW48_API_OUT_DTYPES,
-        mm_mxfp8_mxfp4_batch_invariant,
-    )
+    from flashinfer.gemm.batch_invariant import api
 
-    if out_dtype not in MM_MXW48_API_OUT_DTYPES:
-        raise unsupported(CLASS_MXW48, f"out_dtype={out_dtype}", "bf16 or fp16 output")
-    # both flag values: the batch-invariant class is the pair's only dense kernel
-    return mm_mxfp8_mxfp4_batch_invariant(
+    if out_dtype not in api.MM_MXW48_API_OUT_DTYPES:
+        from ..batch_invariant.support import unsupported
+
+        raise unsupported(
+            api.CLASS_MXW48, f"out_dtype={out_dtype}", "bf16 or fp16 output"
+        )
+    return api.mm_mxfp8_mxfp4_batch_invariant(
         a, b, a_descale, b_descale, alpha, out_dtype, out, enable_pdl=enable_pdl
     )
 
