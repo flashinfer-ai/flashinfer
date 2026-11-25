@@ -26,6 +26,82 @@ def _buffers(capacity, hidden, topk, dtype):
     )
 
 
+def test_mxfp8_eplb_staging_masks_invalid_slots(monkeypatch):
+    from flashinfer.moe_ep import EplbRouting
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0")
+    rows, capacity, hidden, topk = 6, 32, 512, 4
+    activations = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    logical = torch.tensor(
+        [
+            [-1, 0, 1, 2],
+            [0, 3, 4, 5],
+            [0, 1, 3, 4],
+            [0, 2, 4, 5],
+            [0, 3, 4, 5],
+            [0, 1, 4, 5],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    physical = torch.tensor(
+        [
+            [-1, 3, -1, -1],
+            [6, -1, -1, -1],
+            [3, -1, -1, -1],
+            [6, -1, -1, -1],
+            [3, -1, -1, -1],
+            [6, -1, -1, -1],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    table = torch.tensor([[3, 6], [1, 2], [1, 2], [8, -1], [-1, -1]], device="cuda")
+    counts = torch.tensor([2, 0, 3, 1, 1], dtype=torch.int32, device="cuda")
+    weights = torch.rand(rows, topk, device="cuda")
+    weights[0, 0] = float("nan")
+    routing = EplbRouting(
+        table,
+        counts,
+        torch.zeros(8, dtype=torch.int32, device="cuda"),
+        torch.ones(2, dtype=torch.bool, device="cuda")[1:],
+        torch.tensor(rows - 1, dtype=torch.int32, device="cuda"),
+    )
+
+    def buffers():
+        return (
+            torch.empty((capacity, hidden), device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty(
+                (capacity, hidden // 32), device="cuda", dtype=torch.float8_e8m0fnu
+            ),
+            torch.full((capacity, topk), 5, device="cuda", dtype=torch.int32),
+            torch.empty((capacity, topk), device="cuda", dtype=torch.float32),
+        )
+
+    expected = buffers()
+    actual = buffers()
+    stage_mega_moe_inputs(activations, weights, physical, *expected, kind="mxfp4_mxfp8")
+    stage_mega_moe_inputs(
+        activations,
+        weights,
+        logical,
+        *actual,
+        kind="mxfp4_mxfp8",
+        eplb_tables=routing._tensors(),
+    )
+    assert torch.equal(actual[2], expected[2])
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        assert torch.equal(
+            actual_tensor[:rows].view(torch.uint8),
+            expected_tensor[:rows].view(torch.uint8),
+        )
+    assert routing.expert_load.tolist() == [0, 0, 0, 3, 0, 0, 2, 0]
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("norm", [1.0, 0.3, 0.7, 2.0])
 def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):

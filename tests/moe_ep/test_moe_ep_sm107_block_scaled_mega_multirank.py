@@ -820,16 +820,21 @@ def _assert_collective_reference(actual, expected, kind):
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("family", ["inference", "genphase"])
-def test_transformed_expert_updates_in_captured_graph(family, monkeypatch):
+@pytest.mark.parametrize("eplb", [False, True])
+def test_transformed_expert_updates_in_captured_graph(family, eplb, monkeypatch):
     """Replicate experts into physical slots and update their captured weights."""
     import torch.distributed as dist
 
-    from flashinfer.moe_ep import PrequantizedMoEWeights
+    from flashinfer.moe_ep import EplbRouting, PrequantizedMoEWeights
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
     from tests.moe_ep.sm107_test_utils import canonical_reference, quantize, weight_pack
 
     rank, world = _launcher_ranks()
     if world < 2:
         pytest.skip("requires torchrun with at least two ranks")
+    if eplb:
+        monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0")
+        monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
     # Keep the same replicated expert bank at every EP width.
     for name, value in dict(
         HIDDEN=512,
@@ -903,26 +908,66 @@ def test_transformed_expert_updates_in_captured_graph(family, monkeypatch):
             backend=MegaConfig(megakernel=cfg, transformed_weights=transformed),
         )
         transformed = layer.get_transformed_weights()
-        t = MoEEpTensors(x[rank].clone(), ids[rank].clone(), scores[rank].clone())
-        layer.warmup(t)
+        rows = 0 if eplb and family == "inference" and rank == 0 else NUM_TOKENS
+        t = MoEEpTensors(
+            x[rank, :rows].clone(),
+            ids[rank, :rows].clone(),
+            scores[rank, :rows].clone(),
+        )
+        physical_ids = t.topk_ids.clone() if eplb else t.topk_ids
+        eplb_routing = None
+        if eplb:
+            physical = torch.arange(logical_experts, device="cuda", dtype=torch.int64)
+            eplb_routing = EplbRouting(
+                logical_to_physical_map=torch.stack((physical, physical), dim=1),
+                logical_replica_count=torch.ones_like(physical),
+                expert_load=torch.zeros(NUM_EXPERTS, dtype=torch.int32, device="cuda"),
+                should_record=torch.tensor(False, device="cuda"),
+                num_unpadded_tokens=torch.tensor(
+                    rows, dtype=torch.int32, device="cuda"
+                ),
+            )
+            with monkeypatch.context() as env:
+                env.setenv("FLASHINFER_MEGA_FUSED_STAGE", "0")
+                with pytest.raises(
+                    MoEEpConfigError, match="requires fixed SM107 fused"
+                ):
+                    layer.forward(t, eplb_routing=eplb_routing)
+        layer.warmup(t, eplb_routing=eplb_routing)
         dist.barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
-            output = layer.forward(t)
+            output = layer.forward(t, eplb_routing=eplb_routing)
 
         def replay(pack):
+            if eplb_routing is not None:
+                eplb_routing.expert_load.zero_()
             dist.barrier()
             graph.replay()
             torch.cuda.synchronize()
-            xq, sf = quantize(t.hidden_states, kind)
-            reference = canonical_reference(
-                xq, sf, t.topk_ids, t.topk_weights, pack, kind, early=False
-            )
+            reference = torch.empty_like(output)
+            if rows:
+                xq, sf = quantize(t.hidden_states, kind)
+                reference = canonical_reference(
+                    xq, sf, physical_ids, t.topk_weights, pack, kind, early=False
+                )
             _assert_collective_reference(output, reference, kind)
+            if eplb_routing is not None:
+                load = torch.zeros_like(eplb_routing.expert_load)
+                if eplb_routing.should_record.item():
+                    live = eplb_routing.num_unpadded_tokens.item()
+                    load = torch.bincount(
+                        physical_ids[:live].flatten(), minlength=NUM_EXPERTS
+                    ).to(torch.int32)
+                bad_load = (load != eplb_routing.expert_load).any().to(torch.int32)
+                dist.all_reduce(bad_load, op=dist.ReduceOp.MAX)
+                assert not bad_load.item()
 
+        if eplb_routing is not None:
+            eplb_routing.should_record.fill_(True)
         replay(original_pack)
         baseline = output.clone()
-        t.topk_ids[::2].add_(logical_experts)
+        physical_ids[::2].add_(logical_experts)
         for pack, replacement in (
             (replica_pack, replica_weights),
             (changed_pack, changed_weights),
@@ -931,6 +976,14 @@ def test_transformed_expert_updates_in_captured_graph(family, monkeypatch):
                 for dst, src in zip(dst_pair, src_pair, strict=True):
                     dst.view(torch.uint8).copy_(src.view(torch.uint8))
             assert tuple(v.data_ptr() for pair in transformed for v in pair) == pointers
+            if eplb_routing is not None:
+                # The multiplicative hash is odd, so even rows choose replica 0.
+                eplb_routing.logical_to_physical_map[:, 0].copy_(
+                    physical + logical_experts
+                )
+                eplb_routing.logical_replica_count.fill_(2)
+                eplb_routing.num_unpadded_tokens.fill_(max(0, rows - 3))
+                eplb_routing.should_record.fill_(pack is replica_pack)
             replay(pack)
             _assert_collective_reference(output[1::2], baseline[1::2], kind)
             if pack is replica_pack:

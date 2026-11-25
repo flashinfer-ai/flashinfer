@@ -29,7 +29,7 @@ from .config import MegaConfig
 
 if TYPE_CHECKING:
     from ..core.kernel.base import MegaKernelBackend
-    from ..tensors import MoEEpTensors
+    from ..tensors import EplbRouting, MoEEpTensors
 
 
 class MoEEpMegaWorkspace:
@@ -445,6 +445,7 @@ class MoEEpMegaLayer(nn.Module):
         t: Optional["MoEEpTensors"] = None,
         *,
         workspace: MoEEpMegaWorkspace | None = None,
+        eplb_routing: EplbRouting | None = None,
     ) -> None:
         """Run one full eager forward so ``forward`` becomes graph-capturable.
 
@@ -463,6 +464,11 @@ class MoEEpMegaLayer(nn.Module):
         ``t`` defaults to a max-shape dummy batch. Pass a real batch when
         ``quantize_input=False`` — pre-quantized activations and scales
         cannot be fabricated here.
+
+        For logical EPLB routes, pass the actual input and EPLB buffers so
+        warmup compiles the same staging path as :meth:`forward`.
+        Disable recording in the EPLB buffers to keep warmup out of the
+        load counters.
         """
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise MoEEpConfigError(
@@ -470,6 +476,8 @@ class MoEEpMegaLayer(nn.Module):
             )
         uses_dummy_input = t is None
         if t is None:
+            if eplb_routing is not None:
+                raise MoEEpConfigError("EPLB warmup requires explicit logical routes")
             if not self._mega_config.quantize_input:
                 raise MoEEpConfigError(
                     "warmup() cannot build a dummy pre-quantized batch; pass "
@@ -504,7 +512,7 @@ class MoEEpMegaLayer(nn.Module):
                     device=device,
                 ),
             )
-        if self._kernel.supports_unfinalized_output:
+        if self._kernel.supports_unfinalized_output and eplb_routing is None:
             self.forward_unfinalized(t, workspace=workspace)
         else:
             # Output-view-capable backends capture their internal graph against a
@@ -518,6 +526,7 @@ class MoEEpMegaLayer(nn.Module):
                     and t.output is None
                     and getattr(self._megakernel_config, "knobs", None) != "auto"
                 ),
+                **({"eplb_routing": eplb_routing} if eplb_routing is not None else {}),
             )
         torch.cuda.synchronize()
         if uses_dummy_input:
@@ -613,6 +622,7 @@ class MoEEpMegaLayer(nn.Module):
         *,
         workspace: MoEEpMegaWorkspace | None = None,
         compile_tokens_per_rank: int | None = None,
+        eplb_routing: EplbRouting | None = None,
     ) -> tuple[FleetParams, Any, MegaKernelBackend, bool, Any]:
         if (
             compile_tokens_per_rank is not None
@@ -638,6 +648,10 @@ class MoEEpMegaLayer(nn.Module):
         else:
             fleet_params, backend_workspace, kernel = self._resolve_workspace(workspace)
         quantize_input = self._resolve_quantize_input(t)
+        if eplb_routing is not None:
+            kernel.validate_eplb_routing(
+                t, fleet_params, eplb_routing, quantize_input=quantize_input
+            )
         signature = self._input_signature(t)
         validation_key = None if backend_workspace is None else id(backend_workspace)
         previous_signature = (
@@ -771,6 +785,7 @@ class MoEEpMegaLayer(nn.Module):
         *,
         workspace: MoEEpMegaWorkspace | None = None,
         return_workspace_view: bool = False,
+        eplb_routing: EplbRouting | None = None,
     ) -> torch.Tensor:
         """Run MegaMoE and return either an owned tensor or a workspace view.
 
@@ -779,6 +794,12 @@ class MoEEpMegaLayer(nn.Module):
         ``return_workspace_view=True`` explicitly opts into a borrowed view on
         backends that support one. A view remains valid under stream ordering
         until the next launch reuses the pooled physical workspace.
+
+        Pass ``eplb_routing`` to interpret ``t.topk_ids`` as logical expert IDs.
+        This requires a fixed SM107 MXFP8-activation, MXFP4-weight backend,
+        fused BF16 input staging, and disabled route-value checks. Warm up
+        with the same routing mode before capture. Keep the routing buffers
+        alive until graph retirement.
         """
         if self._kernel.supports_unfinalized_output:
             raise MoEEpConfigError("finalize_mode=NONE requires forward_unfinalized()")
@@ -808,7 +829,7 @@ class MoEEpMegaLayer(nn.Module):
             kernel,
             quantize_input,
             transformed_weights,
-        ) = self._prepare_inputs(t, workspace=workspace)
+        ) = self._prepare_inputs(t, workspace=workspace, eplb_routing=eplb_routing)
         output = t.output
         if output is None and not return_workspace_view:
             # Owned-output allocation must stay ahead of the staging round
@@ -820,11 +841,10 @@ class MoEEpMegaLayer(nn.Module):
                 dtype=torch.bfloat16,
                 device=t.hidden_states.device,
             )
-        kernel.stage_inputs(
-            t,
-            backend_workspace,
-            quantize_input=quantize_input,
-        )
+        if eplb_routing is None:
+            kernel.stage_inputs(t, backend_workspace, quantize_input=quantize_input)
+        else:
+            kernel.stage_inputs_with_eplb(t, backend_workspace, eplb_routing)
         self._staged_kernel = kernel
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights

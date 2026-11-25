@@ -61,11 +61,12 @@ def _int32_routing_stager_class(
     num_experts: Optional[int] = None,
     fuse_tail_mask: bool = False,
     zero_masked_scores: bool = True,
+    fuse_eplb: bool = False,
 ):
     """Adapt routing and optionally apply the normal-FP32 MXFP8 scale floor."""
     import cutlass
     import cutlass.cute as cute
-    from cutlass import Float32, Int32
+    from cutlass import Float32, Int32, Uint32
     from cutlass._mlir.dialects import cf
     from cutlass.cutlass_dsl import dsl_user_op
     from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.inputs_process import (
@@ -113,7 +114,7 @@ def _int32_routing_stager_class(
             """
             if tid < cutlass.Int32(self.topk):
                 is_padding = False
-                if cutlass.const_expr(token_padding_info is not None):
+                if cutlass.const_expr(not fuse_eplb and token_padding_info is not None):
                     is_padding = token_padding_info[token_idx] != cutlass.Int32(0)
                 if cutlass.const_expr(num_experts is not None):
                     if not is_padding:
@@ -143,6 +144,22 @@ def _int32_routing_stager_class(
                     if is_padding
                     else cutlass.Int32(topk_idx[token_idx, tid])
                 )
+                if cutlass.const_expr(fuse_eplb):
+                    table, counts, loads, record, live = token_padding_info
+                    logical = cutlass.Int64(topk_idx[token_idx, tid])
+                    idx = Int32(-1)
+                    if (logical >= 0) & (logical < table.shape[0]):
+                        replicas = cutlass.Int64(counts[logical])
+                        if (replicas > 0) & (replicas <= table.shape[1]):
+                            hashed = Uint32(token_idx) * Uint32(2654435769)
+                            replica = Int32(hashed % Uint32(replicas))
+                            physical = cutlass.Int64(table[logical, replica])
+                            if (physical >= 0) & (physical < loads.shape[0]):
+                                idx = Int32(physical)
+                    if record[0] & (token_idx < live[0]) & (idx >= 0):
+                        cute.arch.atomic_add(
+                            loads.iterator + idx, Int32(1), sem="relaxed", scope="gpu"
+                        )
                 weight = cutlass.Float32(topk_weights[token_idx, tid])
                 if cutlass.const_expr(zero_masked_scores):
                     if idx == -1:
@@ -370,7 +387,44 @@ def _int32_routing_stager_class(
                 topk_weights_output,
             )
 
-    return NormalScaleMxDataPreprocess
+    if not fuse_eplb:
+        return NormalScaleMxDataPreprocess
+
+    class EplbMxDataPreprocess(NormalScaleMxDataPreprocess):
+        @cute.jit
+        def __call__(
+            self,
+            activation_bf16,
+            topk_idx,
+            topk_weights,
+            routing_tables,
+            activation_quant,
+            activation_sf,
+            topk_idx_output,
+            topk_weights_output,
+            cuda_stream,
+        ):
+            scale_layout = cute.make_layout(
+                (activation_sf.shape[0], (self.sf_vec, activation_sf.shape[1])),
+                stride=(activation_sf.stride[0], (0, activation_sf.stride[1])),
+            )
+            self.mxfp8_quant_and_process_impl(
+                activation_bf16,
+                topk_idx,
+                topk_weights,
+                routing_tables,
+                activation_quant,
+                cute.make_tensor(activation_sf.iterator, scale_layout),
+                topk_idx_output,
+                topk_weights_output,
+            ).launch(
+                grid=[activation_bf16.shape[0], 1, 1],
+                block=[self._threads_per_cta, 1, 1],
+                stream=cuda_stream,
+                min_blocks_per_mp=1,
+            )
+
+    return EplbMxDataPreprocess
 
 
 def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
@@ -450,6 +504,7 @@ def fused_quant_stage(
     zero_masked_scores: bool = True,
     batch_invariant: bool = False,
     batch_invariant_quant_kind: Optional[str] = None,
+    eplb_tables: Optional[tuple[torch.Tensor, ...]] = None,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -473,11 +528,21 @@ def fused_quant_stage(
     separate fill. It requires NVFP4 or normal-scale MXFP4/MXFP8 with int32 routes.
     ``zero_masked_scores=False`` preserves scores for consumers that exclude
     masked routes before arithmetic.
+    ``eplb_tables`` binds the replica map, replica counts, expert load, record
+    flag and unpadded row limit. The publisher updates these buffers in place.
     """
     if quant_type not in _QUANT_TYPES:
         raise ValueError(
             f"quant_type must be one of {_QUANT_TYPES}, got {quant_type!r}"
         )
+    if eplb_tables is not None and (
+        quant_type != "mxfp8_e4m3"
+        or not mxfp8_normal_scales
+        or num_experts is not None
+        or batch_invariant
+        or topk_idx_out.dtype != torch.int32
+    ):
+        raise ValueError("EPLB fusion requires trusted normal-scale E4M3 routing")
     if batch_invariant:
         if batch_invariant_quant_kind is not None and (
             batch_invariant_quant_kind not in ("mxfp8_e4m3", "mxfp8_e5m2")
@@ -569,6 +634,7 @@ def fused_quant_stage(
             topk_idx_out,
             topk_weights_out,
         )
+        + (eplb_tables or ())
     )
     key = (
         topk,
@@ -582,6 +648,7 @@ def fused_quant_stage(
         zero_masked_scores,
         batch_invariant,
         batch_invariant_quant_kind,
+        eplb_tables is not None,
     )
     stager = _STAGERS.get(key)
     if stager is None:
@@ -592,7 +659,11 @@ def fused_quant_stage(
 
         stager_class = (
             _int32_routing_stager_class(
-                normal_scales, num_experts, fuse_tail_mask, zero_masked_scores
+                normal_scales,
+                num_experts,
+                fuse_tail_mask,
+                zero_masked_scores,
+                eplb_tables is not None,
             )
             if topk_idx_out.dtype == torch.int32
             or normal_scales
@@ -622,6 +693,7 @@ def fused_quant_stage(
         norm_const,
         scale_multiplier,
         stream,
+        *(t.data_ptr() for t in eplb_tables or ()),
     )
     if stager.compiled is None or stager.launch_key != launch_key:
         import cutlass
@@ -630,7 +702,12 @@ def fused_quant_stage(
             _to_cute(hidden_states, 16),
             _to_cute(topk_ids, 4),
             _to_cute(topk_weights, 4),
-            None,  # token_padding_info: only live rows are launched
+            tuple(
+                _to_cute(t.reshape(1) if t.ndim == 0 else t, min(4, t.element_size()))
+                for t in eplb_tables
+            )
+            if eplb_tables is not None
+            else None,
             _to_cute(x_out[:num_tokens], 16),
             _to_cute(x_sf_out[:num_tokens], 4),
             _to_cute(topk_idx_out if fuse_tail_mask else topk_idx_out[:num_tokens], 4),

@@ -240,7 +240,7 @@ from .modes import (
     kernel_requires_weights,
     run_split_kernel,
 )
-from .tensors import MoEEpTensors
+from .tensors import EplbRouting, MoEEpTensors
 from .weights import (
     MoEWeightPack,
     PrequantizedMoEWeights,
@@ -316,6 +316,7 @@ __all__ = [
     "MoEEpSplitLayer",
     "MoEEpTransportError",
     "MoEEpTensors",
+    "EplbRouting",
     "MoEWeightPack",
     "PrequantizedMoEWeights",
     "UnquantizedMoEWeights",

@@ -13,6 +13,71 @@ if TYPE_CHECKING:
     import torch
 
 
+@dataclass(frozen=True, eq=False)
+class EplbRouting:
+    """Caller-owned expert-parallel load-balancer state for logical routes.
+
+    The map has shape ``[logical_experts, max_replicas]`` and contains global
+    physical expert IDs. The replica-count vector has one entry per logical
+    expert. Both tensors hold int32 or int64 indices. ``expert_load`` is an
+    int32 counter per physical expert. ``should_record`` (bool) and
+    ``num_unpadded_tokens`` (int32) are one-element tensors. All five tensors
+    must be contiguous on one CUDA device. The load counters must have their
+    own storage.
+
+    Every call selects a replica using the low 32 bits of
+    ``local_token_row * 2654435769`` modulo its replica count. Negative or
+    out-of-range IDs and invalid replica counts produce masked routes.
+    Counts accumulate in ``expert_load`` only when enabled and for rows below
+    ``num_unpadded_tokens``. Mark any padding that should skip dispatch with
+    ``-1`` in the input IDs.
+
+    Keep the tensors and their addresses alive until all CUDA graphs that
+    reference them are retired. Update tensor contents in place with stream
+    ordering. Publish routing after the corresponding weights are ready.
+    """
+
+    logical_to_physical_map: torch.Tensor
+    logical_replica_count: torch.Tensor
+    expert_load: torch.Tensor
+    should_record: torch.Tensor
+    num_unpadded_tokens: torch.Tensor
+
+    def __post_init__(self) -> None:
+        import torch
+
+        tensors = self._tensors()
+        table, replicas, load, record, live = tensors
+        if (
+            table.ndim != 2
+            or not all(table.shape)
+            or replicas.shape != table.shape[:1]
+            or load.ndim != 1
+            or load.numel() == 0
+            or table.dtype not in (torch.int32, torch.int64)
+            or replicas.dtype not in (torch.int32, torch.int64)
+            or load.dtype != torch.int32
+            or record.dtype != torch.bool
+            or live.dtype != torch.int32
+            or record.ndim > 1
+            or live.ndim > 1
+            or record.numel() != 1
+            or live.numel() != 1
+            or not table.is_cuda
+            or any(t.device != table.device or not t.is_contiguous() for t in tensors)
+        ):
+            raise ValueError("Invalid EPLB routing tensor shape, dtype or device")
+
+    def _tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.logical_to_physical_map,
+            self.logical_replica_count,
+            self.expert_load,
+            self.should_record,
+            self.num_unpadded_tokens,
+        )
+
+
 @dataclass
 class MoEEpTensors:
     """Per-iteration tensor bundle for MoE EP.
