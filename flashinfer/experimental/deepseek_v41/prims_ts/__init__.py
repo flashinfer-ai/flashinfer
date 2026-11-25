@@ -9,7 +9,6 @@ are imported only during compilation so workspace queries stay lightweight.
 
 import functools
 import hashlib
-from pathlib import Path
 
 import torch
 
@@ -63,9 +62,7 @@ def compile(
 
     require_cute_dsl_arch(device_index)
 
-    from ....attention.prims_ts.variants.mla_decode.kernel.latency_1cta import (
-        kernel as native_kernel,
-    )
+    from ....attention.prims_ts.compile_cache import kernel_source_files
     from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ....cute_dsl import fp4_common
     from .. import hca_v41_primitives
@@ -128,7 +125,6 @@ def compile(
         compiler,
     )
     key = hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
-    native_root = Path(native_kernel.__file__).resolve().parents[3]
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
         f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split{kv_splits}_v{head_dim_ctas}_p{int(persistent)}_i64"
@@ -159,7 +155,7 @@ def compile(
             resources.__file__,
             hca_v41_primitives.__file__,
             fp4_common.__file__,
-            *sorted(native_root.rglob("*.py")),
+            *kernel_source_files(),
         ),
     )
 

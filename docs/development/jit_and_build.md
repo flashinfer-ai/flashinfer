@@ -96,8 +96,9 @@ can survive checkout changes.
 Task-scheduled attention uses this cache through
 `flashinfer/attention/prims_ts/compile_cache.py`. Its keys cover compile specs,
 options, embedded device-capacity constants, and the attention source tree,
-including shared preparation, masks, and reductions. `_hardware.py` caches
-occupancy queries per device and cluster size.
+including shared preparation, masks, and reductions.
+`flashinfer/attention/prims_ts/common/hardware.py` caches occupancy queries
+per device and cluster size.
 
 ## Compiler caches
 

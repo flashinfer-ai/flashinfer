@@ -112,6 +112,7 @@ for name in (
     "mla_decode",
     "q_token_kv_block_sparse_metadata",
     "sage",
+    "sage.config",
     "vc_attention",
     "vc_attention.quantization",
 ):

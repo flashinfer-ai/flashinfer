@@ -11,6 +11,7 @@ These host contracts are not GPU/JIT or full decode numerical qualification.
 import argparse
 import ast
 import builtins
+import hashlib
 import math
 from pathlib import Path
 import struct
@@ -892,6 +893,71 @@ def test_native_source_hashes_without_importing_modules():
         for relative in sources
     }
     assert all(path.is_file() for path in paths.values())
+
+
+def test_prims_ts_compile_keys_shared_packing_source():
+    flashinfer = _ROOT / "flashinfer"
+    prims_ts = flashinfer / "attention/prims_ts"
+    deepseek = flashinfer / "experimental/deepseek_v41"
+    adapter = deepseek / "prims_ts"
+    adapter_path = adapter / "__init__.py"
+    cache_path = prims_ts / "compile_cache.py"
+    build_and_load = Mock()
+    cutlass = Mock(__version__="4.8.0", CUDA_VERSION=SimpleNamespace(major=13, minor=2))
+
+    def source(path):
+        assert path.is_file()
+        return SimpleNamespace(__file__=str(path))
+
+    imports = {
+        (0, "cutlass"): cutlass,
+        (0, "cutlass.cute"): cutlass,
+        (4, "cute_dsl.availability"): SimpleNamespace(require_cute_dsl_arch=Mock()),
+        (4, "attention.prims_ts.compile_cache"): SimpleNamespace(
+            kernel_source_files=extract(
+                cache_path, "kernel_source_files", Path=Path, __file__=str(cache_path)
+            )
+        ),
+        (4, "jit.cute_dsl_core"): SimpleNamespace(
+            build_and_load_cute_dsl_kernel=build_and_load
+        ),
+        (4, "cute_dsl"): SimpleNamespace(
+            fp4_common=source(flashinfer / "cute_dsl/fp4_common.py")
+        ),
+        (2, ""): SimpleNamespace(
+            hca_v41_primitives=source(deepseek / "hca_v41_primitives.py")
+        ),
+        (1, ""): SimpleNamespace(
+            kernel=Mock(__file__=str(adapter / "kernel.py")),
+            resources=source(adapter / "resources.py"),
+            sparse_views=source(adapter / "sparse_views.py"),
+            workspace=source(adapter / "workspace.py"),
+        ),
+    }
+
+    def stub_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if (level, name) in imports:
+            return imports[level, name]
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    compile_decode = extract(
+        adapter_path,
+        "compile",
+        __file__=str(adapter_path),
+        __builtins__={**vars(builtins), "__import__": stub_import},
+        hashlib=hashlib,
+        torch=SimpleNamespace(
+            cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)
+        ),
+        device_sm_count=lambda _: 148,
+    )
+    compile_decode(0, 128)
+
+    keyed_files = {
+        Path(path) for path in build_and_load.call_args.kwargs["extra_key_files"]
+    }
+    assert prims_ts / "device/packing.py" in keyed_files
+    assert adapter / "resources.py" in keyed_files
 
 
 def test_example_uses_common_descale_hnd_and_output_only_caller_buffers():
