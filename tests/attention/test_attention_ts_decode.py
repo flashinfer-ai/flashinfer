@@ -5361,6 +5361,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
             "output_scale": 1.0,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
+            "out_scale_dtype": None,
         },
     )()
     runtime = object()
@@ -11239,7 +11240,15 @@ def test_attention_ts_decode_mxfp8_output(
         policies[out_scale_dtype] = dict(wrapper._policy)
         outputs[out_scale_dtype] = _run_case(wrapper, case)
     assert policies[_E8M0] == policies[None]
-    _assert_auto_policy(policies[_E8M0], expected_policy, device=case.q.device)
+    # The expected policies belong to each case's own output dtype. MXFP8
+    # plans its 16-bit carrier, which can select differently (an FP8- or
+    # FP16-output case under a BF16 carrier), so the exact B200 policy
+    # applies only when the two dtypes match.
+    _assert_auto_policy(
+        policies[_E8M0],
+        expected_policy if case_kwargs["out_dtype"] == carrier else {},
+        device=case.q.device,
+    )
 
     out, out_scale = outputs[_E8M0]
     assert out.dtype == _FP8 and out.shape == case.q.shape

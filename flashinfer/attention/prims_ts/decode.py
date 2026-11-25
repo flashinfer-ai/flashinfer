@@ -5092,14 +5092,18 @@ class BatchDecodePagedTSWrapper:
             enabled=state.use_attention_sinks,
             validate=validate,
         )
-        out_scale, runtime_out_scale = prepare_out_scale(
-            out_scale,
-            out_shape=tuple(runtime.out.shape),
-            out_dtype=state.out_dtype,
-            out_scale_dtype=state.out_scale_dtype,
-            device=state.device,
-            validate=validate,
-        )
+        # Plain-output plans skip scale handling; a stray out_scale still
+        # reaches prepare_out_scale, which rejects it.
+        runtime_out_scale = None
+        if out_scale is not None or state.out_scale_dtype is not None:
+            out_scale, runtime_out_scale = prepare_out_scale(
+                out_scale,
+                out_shape=tuple(runtime.out.shape),
+                out_dtype=state.out_dtype,
+                out_scale_dtype=state.out_scale_dtype,
+                device=state.device,
+                validate=validate,
+            )
         result = _launch_decode(
             runtime,
             seq_lens_kv=effective_seq_lens,
