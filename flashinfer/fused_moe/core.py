@@ -2395,6 +2395,16 @@ _RECORDS_NO_EXT = (None,) * 3 + (0.0,) * 3 + (0, None, False) + (None,) * 4
 _W4A16_SM80_PT_TACTICS = W4A16_SM80_TACTICS[:4]  # per token: the base tiles 8 to 64
 
 
+def _check_records_device(x: torch.Tensor, *given: Any) -> None:
+    """As SM100's launchers: every tensor (also in a tuple or list) on the input's device."""
+    for v in given:
+        for t in v if isinstance(v, (tuple, list)) else (v,):
+            if isinstance(t, torch.Tensor) and t.device != x.device:
+                raise ValueError(
+                    "Below SM100 the MoE's tensors must be on the input's device."
+                )
+
+
 def _w4a16_moe_sm80(
     x, topk_ids, topk_weights, r1, alpha1, r2, alpha2, out, intermediate_size, gated,
     tactic=-1, x_scale=None, fc2_scale=None, fc2_den=None, slot_experts=None,
@@ -2415,6 +2425,10 @@ def _w4a16_moe_sm80(
     [tokens, K], or None to return GEMM2's rows [tokens * top_k, K] in (token, k) order. The
     NVFP4 activation quantizers run the 4over6 ``recipe`` (or the standard one), without fast
     math if ``exact``. ``ext``: a ``_RecordsExt``."""
+    _check_records_device(
+        x, topk_ids, topk_weights, r1, alpha1, r2, alpha2, out, x_scale, fc2_scale,
+        fc2_den, slot_experts, per_token_scale, *(vars(ext).values() if ext else ()),
+    )  # fmt: skip
     pt = per_token_scale is not None
     tactics = _W4A16_SM80_PT_TACTICS if pt else W4A16_SM80_TACTICS
     tactic = W4A16_SM80_TACTICS[3] if tactic in (None, -1) else tuple(tactic)
@@ -2674,13 +2688,6 @@ def _records_moe(
     activations) the quantizers run the 4over6 ``recipe``, without fast math under
     FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH (or TRTLLM_...), read each call as on SM100."""
     x, r1, alpha1, r2, alpha2 = (inputs[i] for i in (0, 3, 4, 5, 6))
-    given = [*inputs, *(() if ext is None else vars(ext).values())]
-    if any(  # as SM100's launchers: every tensor on the input's device
-        isinstance(t, torch.Tensor) and t.device != x.device
-        for v in given
-        for t in (v if isinstance(v, tuple) else (v,))
-    ):
-        raise ValueError("Below SM100 the MoE's tensors must be on the input's device.")
     experts = r1.shape[0]
     hidden = (ext or _RecordsExt(0)).hidden(x)
     rows1 = intermediate_size * (2 if gated else 1)
@@ -2802,6 +2809,7 @@ def _trtllm_fp4_records_moe(
     nv = codes and not fp8  # NVFP4 codes
     tokens, hidden = x.shape[0], x.shape[1] * (2 if nv else 1)
     inter, out, fo = (a[n] for n in ("intermediate_size", "output", "fc2_input_out"))
+    _check_records_device(x, out, fo)  # before they are replaced or written
     # SM100's checks: GEMM2's roundUp(valid, 128) columns within hidden, unfinalized rows as wide
     _infer_trtllm_moe_output_hidden_size(hidden, a["valid_hidden_size"])
     _check_valid_hidden_size_supports_finalize(a["valid_hidden_size"], finalize, hidden)

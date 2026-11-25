@@ -162,6 +162,11 @@ def test_records_unified(case, tokens):
             fresh = MoELayer(config, device=torch.device("cuda"))(act, pack)
             assert not torch.equal(fresh, first)
             torch.testing.assert_close(layer(act, pack), fresh, atol=0, rtol=0)
+    if key == "records_nvfp4":  # a parameter the activation reads, off the device
+        step = isinstance(activation, SwiGLUStep)
+        view["gemm1_clamp_limit" if step else "gemm1_alpha"] = torch.ones(E)
+        with pytest.raises(ValueError, match="input's device"):
+            layer(act, pack)
 
 
 def test_records_unified_rank0(monkeypatch):

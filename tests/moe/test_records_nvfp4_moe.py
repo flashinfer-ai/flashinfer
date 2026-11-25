@@ -482,8 +482,9 @@ def test_narrow_output(width):
     off = x.new_empty(tokens * H + 1)[1:].view(tokens, H)  # one element off 16 B
     with pytest.raises(RuntimeError, match="16 B aligned"):
         _trt(*args, output=off)
-    with pytest.raises(ValueError, match="input's device"):
-        _trt(*args, output=buf.cpu())
+    for bad in (buf.cpu(), buf[:, :width].cpu()):  # full width or narrower
+        with pytest.raises(ValueError, match="input's device"):
+            _trt(*args, output=bad)
     with pytest.raises(RuntimeError, match="act and records must be 16 B aligned"):
         _trt(m, off.copy_(x), *args[2:])
     r1 = m["r1"].new_empty(m["r1"].numel() + 1)[1:].view(m["r1"].shape).copy_(m["r1"])
@@ -511,7 +512,8 @@ def test_narrow_output(width):
 
 def test_fc2_input_out():
     """Per token, GEMM2's NVFP4 input as SM100's fc2_input_out, in buffers of a padded
-    intermediate size: the local entries decode to the rows GEMM2 ran on, the others zero."""
+    intermediate size: the local entries decode to the rows GEMM2 ran on, the others zero; a buffer
+    off the device is refused before any is written."""
     m = _model(False)
     tokens, half, ip = 37, E // 2, I + 64
     x = torch.randn(tokens, H, device="cuda").bfloat16()
@@ -520,11 +522,15 @@ def test_fc2_input_out():
     sub = {**m, "r1": m["r1"][:half], "r2": m["r2"][:half]}
     fo = [torch.full((tokens + 3, K, ip // n), 9, dtype=torch.uint8, device="cuda")
           for n in (2, 16)] + [torch.full((tokens + 3, K), 9.0, device="cuda")]  # fmt: skip
-    out = _trt(
-        sub, codes, sf.view(torch.float8_e4m3fn), ids, weights, torch.ones(half, device="cuda"),
-        m["w1_g"][:half], m["w2_g"][:half], num_experts=E, local=half, inter=ip,
-        valid_intermediate_size=I, per_token_scale=s, fc2_input_out=fo,
-    )[0]  # fmt: skip
+
+    def run(fo):
+        return _trt(
+            sub, codes, sf.view(torch.float8_e4m3fn), ids, weights,
+            torch.ones(half, device="cuda"), m["w1_g"][:half], m["w2_g"][:half], num_experts=E,
+            local=half, inter=ip, valid_intermediate_size=I, per_token_scale=s, fc2_input_out=fo,
+        )[0]  # fmt: skip
+
+    out = run(fo)
     local = ids < half
     assert local.any() and not local.all()
     assert all(t[tokens:].eq(9).all() for t in fo)  # rows past the tokens untouched
@@ -538,6 +544,11 @@ def test_fc2_input_out():
     for e in range(half):
         y[ids == e] = rows[ids == e] @ m["w2_deq"][e].T
     _close(out, (y * weights[..., None]).sum(1), 1e-2)
+    bad = [t.clone().fill_(9) for t in fo]
+    bad[2] = bad[2].cpu()  # one off the device
+    with pytest.raises(ValueError, match="input's device"):
+        run(bad)
+    assert all(t.eq(9).all() for t in bad)  # refused before any is written
 
 
 def test_deferred_finalize_and_shared_experts():
