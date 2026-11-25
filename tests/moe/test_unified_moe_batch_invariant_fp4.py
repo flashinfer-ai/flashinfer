@@ -4681,9 +4681,10 @@ def test_tuned_gather_winner_replayed_on_a_linear_pack_takes_the_box_form(pair):
     tuned on the 128x4 pack at ``H = 96`` carries GEMM1's gather record, which the linear layout's six (NVFP4) or three
     (MXFP4) scale bytes per row cannot feed, so its replay on a linear pack of the same layer takes the record's box form
     (a placement: the same bits), never the op's refusal; tuned on the linear pack first, the box winner replays on the
-    128x4 pack. The replay check requires gather records: the ranking's own at this shape (asserted present for both
-    pairs) and one supplied independently of the ranking (a gather twin of the swapped space), each replayed directly on
-    the linear pack with the bits of a fresh layer and each pinned as the cached winner."""
+    128x4 pack. The replay check takes gather records from two sources: the ranking's own at this shape, where the part's
+    ranking places one (the tactic list carries exactly those; the MX pair's ranking has none on sm_100), and one supplied
+    independently of the ranking (a gather twin of the swapped space), each replayed directly on the linear pack with the
+    bits of a fresh layer and each pinned as the cached winner."""
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe.batch_invariant.blocks.compile import (
         can_implement_swapped_blockscaled,
@@ -4722,7 +4723,7 @@ def test_tuned_gather_winner_replayed_on_a_linear_pack_takes_the_box_form(pair):
     tactics = runner.get_valid_tactics(runner.pack_inputs(act128, W_pack), None)
     gather = [t for t in tactics if t[7]]
     ranked_gather = [c for c in runner._ranked(T, H, gather_form=True)[0] if c.gather_a]
-    assert gather and ranked_gather, "the ranking places no gather record at this shape"
+    # the ranking's gather records are the part's (none for the MX pair on sm_100): the tactic list carries exactly them
     assert {t[:8] for t in gather} == {_tactic_fp4(c, c)[:8] for c in ranked_gather}
     assert not any(
         t[7] for t in runner.get_valid_tactics(runner.pack_inputs(actlin, W_pack), None)
@@ -4747,7 +4748,7 @@ def test_tuned_gather_winner_replayed_on_a_linear_pack_takes_the_box_form(pair):
         assert torch.equal(bits(layer(act128, W_pack)), ref)
     (key, (winner, tactic)), *rest = layer._winners.items()
     assert winner is runner and not rest
-    for t in (gather[0], independent):
+    for t in gather[:1] + [independent]:
         layer._winners[key] = (runner, t)
         assert _configs_from_tactic_fp4(t)[0].gather_a
         assert torch.equal(bits(layer(actlin, W_pack)), ref)
