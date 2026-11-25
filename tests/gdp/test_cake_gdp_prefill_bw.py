@@ -561,6 +561,35 @@ def test_a_graph_replayed_on_other_lengths_fails_explicitly(captured, replayed):
     }, result
 
 
+def test_back_to_back_eager_calls_of_new_batches():
+    """Eager calls of batches the process has not planned, issued back to back without a synchronization: each
+    call uploads its item table (with a split build's zeroed workspace) on the copy stream while the previous
+    call's kernel still runs.  The upload never lands in memory that kernel still uses (its workspaces freed on
+    the compute stream), so every call equals the same call made alone, bit for bit."""
+    H = 10
+    batches = [[1] * (i % 3) + [24576 - 192 * i] for i in range(8)]
+    inputs = [
+        _inputs(b, H, [1] * (len(b) - 1) + [0], seed=40 + i)
+        for i, b in enumerate(batches)
+    ]
+
+    def cold():
+        backend._ITEM_TABLES_EAGER.clear()
+        loader.clear_plan_caches()
+
+    alone = []
+    for x in inputs:
+        cold()
+        alone.append(_call(x, "cake"))
+        torch.cuda.synchronize()
+    for _ in range(3):
+        cold()
+        together = [_call(x, "cake") for x in inputs]
+        torch.cuda.synchronize()
+        for i, (a, b) in enumerate(zip(alone, together, strict=True)):
+            assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), f"batch {i}"
+
+
 def test_repeated_calls_are_bitwise_equal():
     inputs = _inputs([1] * 4 + [3000], 10, [1] * 4 + [0], seed=3)
     first = _call(inputs, "cake")

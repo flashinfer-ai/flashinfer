@@ -2106,7 +2106,10 @@ def _run_hopper_pool(
 # ---- the item tables of the persistent programs (the SM90 split items, the Blackwell rows) ----
 
 # Item buffers on the device, by (device, content).  An eager call uploads a new table on a private copy stream and
-# waits for that copy alone (a few KB; the compute stream is not synchronized), then keeps the table in a small LRU;
+# waits for that copy alone (a few KB; the compute stream is not synchronized), then keeps the table in a small LRU.
+# The buffer is allocated on the copy stream that writes it (a block a pending kernel of another stream still reads
+# is never handed to the copy) and every eager use records its stream on it (the block is not reused before the
+# kernels of that stream that read it are done);
 # a CUDA graph captured after an eager call of the same batch (the usual warm-up) reuses that complete table, so the
 # graph holds no copy, and the table is then kept for the life of the process (the graph reads it at every replay).
 # A table first seen during capture is copied inside the graph from a pinned buffer; both are kept as long as the
@@ -2153,11 +2156,14 @@ def _item_table_and_zeros(key: bytes, device: torch.device, zero_bytes: int):
     pinned = torch.empty((at + z,), dtype=torch.int32, pin_memory=True)
     ctypes.memmove(pinned.data_ptr(), key, len(key))
     ctypes.memset(pinned.data_ptr() + len(key), 0, 4 * (at + z) - len(key))
-    upload = torch.empty((at + z,), dtype=torch.int32, device=device)
+    stream = torch.cuda.current_stream(device)
     copy = _copy_stream(index, device)
     with torch.cuda.stream(copy):
+        upload = torch.empty((at + z,), dtype=torch.int32, device=device)
         upload.copy_(pinned, non_blocking=True)
     copy.synchronize()  # the table and the zeros are complete before any stream reads them
+    # the call's kernel reads the table and writes the zeros on its stream
+    upload.record_stream(stream)
     table = upload[:n]
     _ITEM_TABLES_EAGER[cache_key] = table
     if len(_ITEM_TABLES_EAGER) > _ITEM_TABLES_EAGER_MAX:
@@ -2207,16 +2213,19 @@ def _item_table(
         table.copy_(pinned, non_blocking=True)
         _ITEM_TABLES_IN_GRAPHS.append((pinned, table))
         return table
+    stream = torch.cuda.current_stream(device)
     table = _ITEM_TABLES_EAGER.get(cache_key)
     if table is not None:
         _ITEM_TABLES_EAGER.move_to_end(cache_key)
+        table.record_stream(stream)
         return table
     pinned = pinned_words()
-    table = torch.empty((pinned.numel(),), dtype=torch.int32, device=device)
     copy = _copy_stream(index, device)
     with torch.cuda.stream(copy):
+        table = torch.empty((pinned.numel(),), dtype=torch.int32, device=device)
         table.copy_(pinned, non_blocking=True)
     copy.synchronize()  # the table is complete before any stream reads it
+    table.record_stream(stream)
     _ITEM_TABLES_EAGER[cache_key] = table
     if len(_ITEM_TABLES_EAGER) > _ITEM_TABLES_EAGER_MAX:
         _ITEM_TABLES_EAGER.popitem(last=False)
