@@ -270,7 +270,7 @@ jobs:
           H100_ON_PRS: 'true'
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          RUN_H100=false
+          RUN_H100=true
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$H100_ON_PRS" != "true" ]; then
             RUN_H100=false
             echo "::notice title=H100 lane disabled on PRs::H100 tests run only in scheduled main runs and manual workflow_dispatch runs until runner capacity is restored" >&2
