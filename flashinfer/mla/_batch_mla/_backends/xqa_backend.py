@@ -34,7 +34,7 @@ from ._capabilities import (
 )
 
 
-_SUPPORTED_MLA_DIMENSIONS = frozenset({(512, 64)})
+_SUPPORTED_MLA_DIMENSIONS = frozenset({(512, 64), (256, 64)})
 _SUPPORTED_XQA_PAGE_SIZES = frozenset({16, 32, 64, 128})
 _XQA_MIN_WORKSPACE_BYTES = 128 * 1024 * 1024
 _XQA_SEMAPHORE_BYTES = 8 * 1024 * 1024
@@ -515,6 +515,12 @@ class _BatchMLAPagedAttentionXqaBackend(TunableRunner):
             )
         if sinks is not None:
             raise ValueError("XQA MLA does not support sinks")
+        if (kv_lora_rank, qk_rope_head_dim) not in _SUPPORTED_MLA_DIMENSIONS:
+            raise ValueError(
+                "Unsupported MLA dimensions for XQA MLA, got "
+                f"kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}; "
+                f"supported dimensions are {sorted(_SUPPORTED_MLA_DIMENSIONS)}."
+            )
         page_size = kv_cache.shape[-2]
         kv_cache = _check_mla_query_kv_shape(
             query, kv_cache, kv_lora_rank, qk_rope_head_dim

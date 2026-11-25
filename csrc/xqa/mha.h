@@ -33,9 +33,11 @@ static_assert((isMLA || validElemsPerHead <= 512) &&
 constexpr uint32_t headElems =
     validElemsPerHead <= 64
         ? 64
-        : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : (validElemsPerHead <= 256 ? 256 : 512)));
-static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 512 ||
-                  headElems == 576,
+        : (validElemsPerHead <= 128
+               ? 128
+               : (isMLA ? validElemsPerHead : (validElemsPerHead <= 256 ? 256 : 512)));
+static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 320 ||
+                  headElems == 512 || headElems == 576,
               "not implemented");
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;
@@ -71,7 +73,7 @@ constexpr uint32_t validElemsPerKHead = validElemsPerHead;
 constexpr bool lowPrecOutput = LOW_PREC_OUTPUT;
 
 #if IS_MLA
-constexpr uint32_t validElemsPerVHead = 512;
+constexpr uint32_t validElemsPerVHead = HEAD_ELEMS_V;
 static_assert(lowPrecOutput == false);
 using OutputHead = Vec<__nv_bfloat16, validElemsPerVHead>;
 #else

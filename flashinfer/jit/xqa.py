@@ -206,7 +206,9 @@ def gen_xqa_module_mla(
     use_sliding_window: bool = False,
 ) -> JitSpec:
     assert head_group_ratio == 128, "Only head group ratio 128 is supported for xqa MLA"
-    assert head_dim == 576, "Only head dim 576 is supported for xqa_module_mla"
+    assert head_dim in (320, 576), (
+        f"Only head dim 320 and 576 are supported for xqa_module_mla, got {head_dim}"
+    )
     assert input_dtype in (torch.float8_e4m3fn, torch.bfloat16), (
         f"Only fp8 and bf16 input are supported for xqa_module_mla, got {input_dtype}"
     )

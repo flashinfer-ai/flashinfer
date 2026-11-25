@@ -55,9 +55,9 @@ inline constexpr uint32_t nbQParts = nbKParts;
 
 inline constexpr uint32_t tokensPerTile = is_fp8 ? 64 : 32;
 
-inline constexpr uint32_t partElemsV = is_fp8 ? 128 : 64;
 inline constexpr uint32_t nbVSplit = 2;
 inline constexpr uint32_t gemm1V = exactDiv(validElemsPerVHead, nbVSplit);
+inline constexpr uint32_t partElemsV = (is_fp8 && gemm1V >= 256) ? 128 : 64;
 inline constexpr uint32_t nbProducerCtasPerCga = nbVSplit;
 
 inline constexpr uint32_t multiBlockMinNbTilesPerCta = 2;
@@ -276,7 +276,7 @@ struct SharedMemA {
   // arch).
   static inline constexpr uint32_t nbKBufs = is_fp8 ? 12 : 2;
 
-  static inline constexpr uint32_t regQParts = (useRegQ ? 4 : 0);
+  static inline constexpr uint32_t regQParts = (useRegQ ? mha::min(4U, nbQParts / 2) : 0);
   static inline constexpr uint32_t shmQParts = nbQParts - regQParts;
 
   using ShmQPart = Array2D<LdGrain, headGrpSize, grainsPerPartK>;
@@ -699,6 +699,9 @@ struct Producer {
               if (idxPartPrefetch < SharedMemA::regQParts) {
                 regQBuf[idxInstKPrefetch] = regQ[idxPartPrefetch][idxInstKPrefetch];
               } else {
+                if (ctaIter == 0) {
+                  smem.shmQBar.wait_parity(false);
+                }
                 regQBuf[idxInstKPrefetch] =
                     loadRegQCol(smem.q[idxPartPrefetch - SharedMemA::regQParts], idxInstKPrefetch);
               }
@@ -727,10 +730,11 @@ struct Producer {
           }
         }
       }
-#endif
+#else
       if (ctaIter == 0) {
         smem.shmQBar.wait_parity(false);
       }
+#endif
 #pragma unroll
       for (uint32_t idxPart = SharedMemA::regQParts; idxPart < nbQParts; idxPart++) {
 #pragma unroll

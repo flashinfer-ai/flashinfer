@@ -17,11 +17,13 @@ workspace_size = 128 * 1024 * 1024
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("page_size", [32, 64, 128])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("kv_lora_rank", [512, 256])
 def test_xqa_mla_batch_decode(
     batch_size: int,
     scale: float,
     page_size: int,
     enable_pdl: bool,
+    kv_lora_rank: int,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 12:
@@ -39,7 +41,6 @@ def test_xqa_mla_batch_decode(
     num_q_heads = 128
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
-    kv_lora_rank = 512
 
     # Initialize tensors
     query = torch.randn(

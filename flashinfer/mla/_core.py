@@ -7532,7 +7532,7 @@ def xqa_batch_decode_with_kv_cache_mla(
         Non-RoPE head dimension.  Must be ``128``.  Will be removed in 1.0; pass
         ``kv_lora_rank`` instead going forward.
     kv_lora_rank : int
-        Rank of the latent KV projection.  Must be ``512``.
+        Rank of the latent KV projection.  Must be ``512`` or ``256``.
     qk_rope_head_dim : int
         RoPE head dimension appended to the latent projection.  Must be ``64``.
     block_tables : torch.Tensor
