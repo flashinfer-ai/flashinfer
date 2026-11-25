@@ -4870,13 +4870,18 @@ def _prepare_tma_descriptors(io: dict, stream, *, prepare=None, reencode_tma=Non
     preparation_io = dict(io, tma_desc_storage_dp=descriptor_ptr, _reencode_tma=False)
     args = _launch_arg_tuple(preparation_io, stream)
     if prepare is None:
-        with task_scheduling_scope(), BaseDSL.enable_pyir():
-            prepare = cute.compile(
-                prepare_gemm_descriptors,
-                args,
-                io["cfg"],
-                options=_cute_compile_options(),
-            )
+        from flashinfer.jit.cute_dsl_core import _compile_in_process
+
+        def compile_prepare():
+            with task_scheduling_scope(), BaseDSL.enable_pyir():
+                return cute.compile(
+                    prepare_gemm_descriptors,
+                    args,
+                    io["cfg"],
+                    options=_cute_compile_options(),
+                )
+
+        prepare = _compile_in_process(compile_prepare)
     prepare(args)
     io.update(
         tma_desc_storage_dp=descriptor_ptr,

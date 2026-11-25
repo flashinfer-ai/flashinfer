@@ -14,7 +14,8 @@
 
 """JIT loader for the Cake SM120 MXFP4 x MXFP8 hybrid-transport MegaMoE closure.
 
-The closure under ``../src/`` is manifest-driven: one ``cake_sm120_megamoe_manifest.json``
+The sources in ``flashinfer/moe_ep/kernels/cake/mxfp4_megamoe_sm120/`` are
+manifest-driven: one ``cake_sm120_megamoe_manifest.json``
 seals (SHA-256) the hand-written host binding, the ONE generated parametric device source
 (``cake_sm120_megamoe_kernel.cuh`` and the part files it includes), four three-line
 instance wrappers (M128 / M64 row schedule x with / without the LSA copier CTAs) and the

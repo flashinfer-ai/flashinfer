@@ -210,7 +210,11 @@ def _compile_or_load(
     """Load the GEMM from the persistent module, compiling it on a miss."""
     import torch
 
-    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl, cute_dsl_cache_disabled
+    from flashinfer.jit.cute_dsl_core import (
+        JitSpecCuteDsl,
+        _compile_in_process,
+        cute_dsl_cache_disabled,
+    )
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _compile_for_launch,
         _prepare_tma_descriptors,
@@ -228,7 +232,7 @@ def _compile_or_load(
         # includes the descriptor pointer rather than an unprepared None.
         prepare = _prepare_tma_descriptors(io, stream, reencode_tma=reencode_tma)
         if cute_dsl_cache_disabled() or source_sha256 is None:
-            return _CompiledGemm(compile_fn(), prepare)
+            return _CompiledGemm(_compile_in_process(compile_fn), prepare)
         spec = JitSpecCuteDsl(
             _DISK_MODULE_NAME,
             _disk_kernel_name(cfg_hash, fc1_or_fc2, io),
@@ -236,14 +240,7 @@ def _compile_or_load(
             source_sha256,
             enable_tvm_ffi=False,
         )
-        kernel = spec.try_load()
-        if kernel is None:
-            # The module lock is held only to commit the artifact, so the
-            # threads of a parallel tactic precompile (and other ranks) keep
-            # compiling concurrently.
-            spec.compile_and_persist()
-            kernel = spec.load()
-    return _CompiledGemm(kernel, prepare)
+        return _CompiledGemm(spec.build_and_load(), prepare)
 
 
 def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> Any:
