@@ -170,11 +170,11 @@ def unit_loop(
     lo_row = []
     for n in cutlass.range_constexpr(NP):
         pos = kv_len - q_len + q_tok0 + n // g
-        if cutlass.const_expr(not st.causal):
+        if cutlass.const_expr(st.mask_mode == spec.MASK_NON_CAUSAL):
             pos = kv_len - 1
         L_row.append(pos + 1)
         lo = Int32(0)
-        if cutlass.const_expr(st.causal):
+        if cutlass.const_expr(st.mask_mode == spec.MASK_CAUSAL):
             if window_left >= 0:
                 lo = pos - window_left
                 if lo < 0:

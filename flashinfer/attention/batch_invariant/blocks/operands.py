@@ -32,8 +32,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
 
 from ..plan import om_in_tmem as _om_in_tmem
-from ..plan import ws_row
-from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
+from ..plan import keys_are_data, ws_row
+from ..spec import MASK_CAUSAL, MMA_K, TILE_KEYS, check_mask_mode, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
 IN_DTYPE = cutlass.BFloat16
@@ -194,15 +194,21 @@ class StaticPlan:
         hw_rowmax: bool = False,
         cap: int = 0,
         *,
-        causal: bool = True,
+        mask_mode: str = MASK_CAUSAL,
     ):
-        """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
+        """``mask_mode`` (keyword-only; ``spec.MASK_MODES``): what a row sees, a compile-time constant of the body
+        (``compile.kernel_name``); the causal mode's code is unchanged. Causal rows see ``[0, p]``, or ``[max(0, p -
+        window_left), p]`` with a window; ``"non_causal"`` rows see every key of the request, ``[0, kv_len)`` (the causal masking
+        code at the request's last position, no window). ``"key_set"``, the explicit-key-set class: the softmax reads
+        every row's visible keys of a tile as bits (the key-set words of the request's row-visibility block, ``plan.F_VIS``). Under
+        every mode whose keys are data (``keys_are_data``) the correction stores ``+0`` for a row without a visible key and the
+        in-kernel chunk fold takes the present chunks from the partials.
+        ``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
         self.hw_rowmax = hw_rowmax
+        self.mask_mode = check_mask_mode(mask_mode)
+        self.keys_are_data = keys_are_data(mask_mode)
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
-        # the mask mode (a class dimension): causal rows see [0, p], or [max(0, p - window_left), p] with a window (window_left >= 0),
-        # non-causal rows see every key of the request, [0, kv_len). A compile-time constant: the softmax masks and the fold's present chunks read it, the causal code is unchanged
-        self.causal = causal
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
         # the SM; the MMA warp issues both tiles' folds off one K / V stream; the correction warpgroup steps both tiles' statistics, A then B

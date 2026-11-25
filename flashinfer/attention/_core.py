@@ -703,6 +703,22 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
     accepted and silently ignored. ``v_sf_swizzled`` reads the V scale factors
     of a packed NVFP4 cache in the trtllm-gen per-page swizzle.
 
+    ``batch_invariant=True`` (keyword-only) runs the same mask under the
+    batch-invariant attention class with ranges
+    (``flashinfer.batch_invariant``): a token's output bits depend on its own
+    position, head, windows, range and keys alone, never on the batch, and a
+    token without a range gets the bits the causal batch-invariant wrappers
+    give it. The mode takes bf16 queries, keys, values and output at head
+    dimensions 64 / 128 / 256 on SM100 / SM103 / SM107; everything else this
+    wrapper accepts (a quantized or packed NVFP4 KV cache, calibration scales,
+    the log-sum-exp, CUDA-graph buffers) raises
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, and
+    nothing falls back. :meth:`run` reads the range tensor back to the host
+    once per call to build the work units for it; the units of a range tensor
+    and window pair are kept until the next :meth:`plan`, so the layers of one
+    forward pass plan once. The readback makes :meth:`run` an eager call under
+    the mode: capturing it in a CUDA graph raises the same error.
+
     Example
     -------
     >>> import torch, flashinfer
@@ -731,7 +747,27 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         head_dim_qk: int = 128,
         head_dim_vo: int = 128,
         v_sf_swizzled: bool = False,
+        *,
+        batch_invariant: bool = False,
     ) -> None:
+        if batch_invariant:
+            self._init_batch_invariant(
+                float_workspace_buffer,
+                kv_layout,
+                use_cuda_graph,
+                pos_encoding_mode,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                head_dim_qk,
+                head_dim_vo,
+                v_sf_swizzled,
+                qo_indptr_buf=qo_indptr_buf,
+                paged_kv_indptr_buf=paged_kv_indptr_buf,
+                paged_kv_indices_buf=paged_kv_indices_buf,
+                paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
+            )
+            return
         if pos_encoding_mode != "NONE":
             # POS_ENCODING_MODE is a compile-time constant of the customize
             # config, and a rotary mode makes the kernel read rope parameters
@@ -771,6 +807,86 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             jit_args=batch_prefill_bidirectional_ranges_jit_args(self._spec),
             jit_kwargs=self._spec["jit_kwargs"],
             variant_owns_mask=True,
+        )
+
+    _BATCH_INVARIANT_KIND = "ranges"
+
+    def _init_batch_invariant(
+        self,
+        float_workspace_buffer: torch.Tensor,
+        kv_layout: str,
+        use_cuda_graph: bool,
+        pos_encoding_mode: str,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        o_data_type: Optional[torch.dtype],
+        head_dim_qk: int,
+        head_dim_vo: int,
+        v_sf_swizzled: bool,
+        **metadata_bufs: Optional[torch.Tensor],
+    ) -> None:
+        """The constructor under ``batch_invariant=True``: no fa2 module is built; the parent constructs the
+        batch-invariant delegate of kind ``"ranges"``, and what the ranged class does not cover raises its typed error."""
+        from ..batch_invariant.support import unsupported
+        from .batch_invariant.spec import HEAD_DIMS
+        from .batch_invariant.wrappers import CLASS
+
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        o_data_type = (
+            q_data_type
+            if o_data_type is None
+            else canonicalize_torch_dtype(o_data_type)
+        )
+        if pos_encoding_mode != "NONE":
+            raise unsupported(
+                CLASS,
+                f"pos_encoding_mode {pos_encoding_mode!r}",
+                'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
+            )
+        for name, dtype in (
+            ("q_data_type", q_data_type),
+            ("kv_data_type", kv_data_type),
+            ("o_data_type", o_data_type),
+        ):
+            if dtype != torch.bfloat16:
+                raise unsupported(
+                    CLASS,
+                    f"{name} {dtype}",
+                    "bf16 queries, keys, values and output (no quantized or packed NVFP4 KV cache)",
+                )
+        if v_sf_swizzled:
+            raise unsupported(
+                CLASS, "v_sf_swizzled", "a bf16 KV cache (no scale factors)"
+            )
+        if head_dim_qk not in HEAD_DIMS or head_dim_vo != head_dim_qk:
+            raise unsupported(
+                CLASS,
+                f"head_dim_qk {head_dim_qk} with head_dim_vo {head_dim_vo}",
+                f"equal query and value head dims in {list(HEAD_DIMS)}",
+            )
+        for name, buf in metadata_bufs.items():
+            if buf is not None:
+                raise unsupported(
+                    CLASS,
+                    name,
+                    "no CUDA-graph metadata buffers (capture run() after plan())",
+                )
+        # what plan() and workspace_size() check their arguments against (``_check_specialization``)
+        self._spec = {
+            "dtype_q": q_data_type,
+            "dtype_kv": kv_data_type,
+            "dtype_o": o_data_type,
+            "head_dim_qk": head_dim_qk,
+            "head_dim_vo": head_dim_vo,
+            "packed_fp4_kv": False,
+            "jit_kwargs": {"pos_encoding_mode": PosEncodingMode.NONE.value},
+        }
+        super().__init__(
+            float_workspace_buffer=float_workspace_buffer,
+            kv_layout=kv_layout,
+            use_cuda_graph=use_cuda_graph,
+            batch_invariant=True,
         )
 
     @staticmethod
@@ -1235,6 +1351,25 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
                 f"q has dtype {q.dtype}, but this wrapper was built for "
                 f"{self._spec['dtype_q']}."
             )
+        if self._batch_invariant is not None:
+            # The batch-invariant class checks the tensors against its own
+            # plan and raises its typed error; nothing below is reached.
+            k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+            bi_out = self._batch_invariant.run_ranges(
+                q,
+                k_cache,
+                v_cache,
+                bidirectional_ranges,
+                causal_window_left=causal_window_left,
+                range_window_left=range_window_left,
+                out=out,
+                return_lse=return_lse,
+                lse=lse,
+                scales=(q_scale, k_scale, v_scale),
+                kv_cache_sf=kv_cache_sf,
+                enable_pdl=enable_pdl,
+            )
+            return bi_out
         self._check_runtime_shapes(q, paged_kv_cache)
 
         # The kernel indexes the rows flat; the 2-D shape is the public

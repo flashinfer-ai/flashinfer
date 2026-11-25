@@ -41,6 +41,7 @@ from ..plan import (
     F_TILE_HI,
     F_TILE_LO,
 )
+from ..spec import MASK_CAUSAL
 from .correction import correction_loop
 from .mma import mma_loop
 from .operands import (
@@ -76,12 +77,12 @@ class SwapsKernel:
         cap: int = 0,
         pdl: bool = False,
         *,
-        causal: bool = True,
+        mask_mode: str = MASK_CAUSAL,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
-        self.causal = causal  # the mask mode (a class dimension; compile-time)
+        self.mask_mode = mask_mode  # what a row sees (a class dimension; compile-time; operands.SWAPS_MASK_MODES)
 
     @cute.jit
     def __call__(
@@ -109,7 +110,7 @@ class SwapsKernel:
             self.n_pad,
             self.ragged,
             self.cap,
-            causal=self.causal,
+            mask_mode=self.mask_mode,
         )
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)

@@ -38,7 +38,9 @@ from ..plan import (
     F_SLOT,
     F_TILE_HI,
     F_TILE_LO,
+    F_VIS,
 )
+from ..spec import MASK_CAUSAL
 from .correction import correction_loop, correction_loop_q2, fold_group
 from .mma import mma_loop, mma_loop_q2
 from .operands import (
@@ -104,8 +106,9 @@ class AttentionKernel:
         hw_rowmax: bool = False,
         cap: int = 0,
         *,
-        causal: bool = True,
+        mask_mode: str = MASK_CAUSAL,
     ):
+        self.mask_mode = mask_mode  # what a row sees (compile-time; spec.MASK_MODES)
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
             g,
@@ -117,7 +120,6 @@ class AttentionKernel:
         )
         self.hw_rowmax = hw_rowmax
         self.cap = cap
-        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -154,7 +156,7 @@ class AttentionKernel:
             self.ragged,
             self.hw_rowmax,
             self.cap,
-            causal=self.causal,
+            mask_mode=self.mask_mode,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)
@@ -556,6 +558,9 @@ class AttentionKernel:
                 stats_prod.advance(2 * k)
                 for u in range(bidx, num_units, grid_size):
                     uk = 2 * u + k
+                    vis_row = Int32(0)
+                    if cutlass.const_expr(st.keys_are_data):
+                        vis_row = mDesc[(uk, F_VIS)]
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
                         k,
@@ -578,9 +583,14 @@ class AttentionKernel:
                         mDesc[(uk, F_QLEN)],
                         mDesc[(uk, F_TILE_LO)],
                         mDesc[(uk, F_TILE_HI)],
+                        mDesc,
+                        vis_row,
                     )
             if cutlass.const_expr(not st.q2):
                 for u in range(bidx, num_units, grid_size):
+                    vis_row = Int32(0)
+                    if cutlass.const_expr(st.keys_are_data):
+                        vis_row = mDesc[(u, F_VIS)]
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
                         k,
@@ -603,6 +613,8 @@ class AttentionKernel:
                         mDesc[(u, F_QLEN)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        mDesc,
+                        vis_row,
                     )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx >= R.correction_warps[0] and warp_idx < R.mma_warp:

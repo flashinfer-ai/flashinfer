@@ -134,6 +134,69 @@ ATTN_CASES = [
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
 
+
+def _attn_mask_pattern(kv_len: int, T: int) -> List[bool]:
+    """A toy key set: masked leaves inside every tile (``k % 3 == 1``) and tile 1 without a visible key."""
+    return [k % 3 != 1 and not T <= k < 2 * T for k in range(kv_len)]
+
+
+# explicit-key-set toy cases (the class behind the prefill wrappers' custom masks): (name, D, T, C, key bits over [0, kv_len),
+# row id, d), emitted to their own family module (`Cases/AttentionMask.lean`)
+ATTN_MASK_CASES = [
+    ("m0", 64, 16, 32, _attn_mask_pattern(77, 16), 0, 0),
+    (
+        "m1",
+        64,
+        16,
+        32,
+        [32 <= k < 64 and k % 2 == 0 for k in range(100)],
+        3,
+        1,
+    ),  # the keys of chunk 1 alone: chunks 0, 2 and 3 are absent, the first present chunk merges with the init state
+    ("m2", 128, 16, 32, _attn_mask_pattern(77, 16), 1, 2),
+    ("m3", 256, 16, 32, _attn_mask_pattern(50, 16), 0, 0),
+    ("m4", 64, 16, 32, [False] * 40, 0, 0),  # no visible key: the row outputs +0
+    ("m5", 64, 16, 32, [k == 31 for k in range(70)], 0, 0),  # one key, a chunk's last
+    ("m6", 64, 16, 32, [k == 32 for k in range(70)], 0, 0),  # one key, a chunk's first
+    ("m7", 64, 32, 64, _attn_mask_pattern(100, 32), 0, 0),  # two PV slices per tile
+]
+ATTN_MASK_EXTRA_KEYS = (
+    9  # the causal-range cases give the request this many keys past the row's position
+)
+# the ranged attention class's toy cases: (name, D, T, C, p, window_left, range start, range end, row id, d) -- the row sees its
+# causal keys and the keys [start, end); written to their own family module (`Cases/AttentionRanges.lean`)
+ATTN_RANGE_CASES = [
+    ("r0", 64, 16, 32, 6, -1, 3, 12, 0, 0),  # inside its range: the prefix [0, 12)
+    (
+        "r1",
+        64,
+        16,
+        32,
+        40,
+        2,
+        3,
+        9,
+        0,
+        1,
+    ),  # a range behind the window, in another chunk
+    (
+        "r2",
+        64,
+        16,
+        32,
+        100,
+        0,
+        36,
+        41,
+        3,
+        0,
+    ),  # chunks 0 and 2 absent between and before the two parts
+    ("r3", 128, 16, 32, 7, 3, 30, 36, 1, 2),  # a range ahead, across a chunk boundary
+    ("r4", 256, 16, 32, 33, 1, 40, 44, 1, 2),
+    ("r5", 64, 32, 64, 20, 4, 60, 70, 0, 0),  # two PV slices per tile
+    ("r6", 64, 16, 32, 21, 6, 9, 9, 2, 1),  # no range: the causal row
+]
+
 GEMM_CASES = [
     (64, 1),
     (128, 1),
@@ -582,6 +645,17 @@ FORMATS: Tuple[LeanFormat, ...] = (
 BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration spaces); every
 #: other case is kernel ``decide``. ``lean/Axioms.lean`` pins exactly these names.
+#: `native_decide` theorems of the family ``AttentionRanges``: the ranged attention class's spec cases and, per case, the
+#: equality of the ranged row's term with the explicit-key-set term of its visible set over a longer request
+RANGES_DECIDED_THEOREMS = tuple(
+    f"attnr_{n}_spec" for n, *_ in ATTN_RANGE_CASES
+) + tuple(f"attnr_{n}_keyset" for n, *_ in ATTN_RANGE_CASES)
+#: The `native_decide` theorems of the family ``AttentionMask``: the explicit-key-set spec cases and, per toy case of the two
+#: position-derived classes, the equality of that row's term with the explicit-key-set term of its visible set (a causal
+#: range over a longer request; every key of the request for a non-causal row).
+ATTN_MASK_DECIDED_THEOREMS = tuple(
+    f"attnm_{n}_spec" for n, *_ in ATTN_MASK_CASES
+) + tuple(f"attnm_{c[0]}_{'causal' if c[8] else 'noncausal'}" for c in ATTN_CASES)
 DECIDED_THEOREMS = (
     tuple(n for F in FORMATS for n in F.decided)
     + ("gemm_fp8bs_space_ok", "gemm_fp8bs_dispatch_in_space")
@@ -589,14 +663,19 @@ DECIDED_THEOREMS = (
     + tuple(
         f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
     )
+    + ATTN_MASK_DECIDED_THEOREMS
+    + RANGES_DECIDED_THEOREMS
 )
 #: `native_decide` theorems of the hand-written modules (not of the generated `Cases.lean`): the attention class-separation
-#: statements on toy rows; listed in `lean/Axioms.lean` with the generated ones.
+#: statements on toy rows (`Attention.lean`, `AttentionRanges.lean`); listed in `lean/Axioms.lean` with the generated ones.
 MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_C",
     "Attn.output_depends_on_D",
     "Attn.output_depends_on_D_64",
     "Attn.output_depends_on_mode",
+    "Attn.mask_output_depends_on_keys",
+    "AttnR.output_depends_on_range",
+    "AttnR.range_around_position_is_causal_at_end",
 )
 
 
@@ -691,6 +770,122 @@ def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, bool, int
         )
         sx = sexpr(AttentionSpec(D, T=T, C=C).output(row, d))
         out.append((name, D, T, C, p, win, rid, d, causal, kv_len, sx))
+    return out
+
+
+def attn_mask_cases() -> List[Tuple[str, int, int, int, List[bool], int, int, str]]:
+    """The explicit-key-set toy cases with the Python spec's S-expression of the output element."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from .fp_interface.term import sexpr
+
+    out = []
+    for name, D, T, C, keys, rid, d in ATTN_MASK_CASES:
+        row = RowSpec(
+            p=0,
+            row=rid,
+            kv_len=len(keys),
+            keys=frozenset(k for k, b in enumerate(keys) if b),
+        )
+        out.append(
+            (
+                name,
+                D,
+                T,
+                C,
+                keys,
+                rid,
+                d,
+                sexpr(AttentionSpec(D, T=T, C=C).output(row, d)),
+            )
+        )
+    return out
+
+
+def _lean_bools(keys: List[bool]) -> str:
+    return "[" + ", ".join("true" if b else "false" for b in keys) + "]"
+
+
+def _render_attention_mask(L: List[str]) -> None:
+    """The family ``AttentionMask``: the explicit-key-set class on toy sizes -- the Python spec's output element reproduced by
+    ``Attention.lean`` node for node, the split kernel's equality instantiated on every case, and, for every toy case of the
+    two position-derived classes, that row's term decided equal to the explicit-key-set term of its visible set: a causal
+    range over a longer request, every key of the request for a non-causal row (the Python spec builds the same term object
+    for both; asserted here)."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+
+    mk = MMA_K_OF["bf16"]
+    L.append(
+        "/-! The explicit-key-set attention class (custom masks) on toy sizes (T = 16 or 32, C = 2 T): a row's key bits are data; "
+        "a masked key is an absent leaf, a tile or chunk without a visible key is dropped, a row without one is `cvt bf16 +0`. -/"
+    )
+    for name, D, T, C, keys, rid, d, sx in attn_mask_cases():
+        tb = T.bit_length() - 1
+        L.append(
+            f"def attnmP_{name} : Attn.MParams := ⟨{D // mk}, {tb}, {C}, {_lean_bools(keys)}, {rid}, {d}⟩"
+        )
+        L.append(
+            f"theorem attnm_{name}_spec : (Attn.maskOutput attnmP_{name}).sexpr = {lean_str(sx)} := by native_decide"
+        )
+        L.append(
+            f"theorem attnm_{name}_split : ∀ σ : Nat → Nat, Attn.mSplitKernel attnmP_{name} σ = Attn.maskOutput attnmP_{name} := "
+            f"fun σ => Attn.mSplitKernel_eq_fused _ σ"
+        )
+    L.append(
+        "def attnMaskCases : List (String × Attn.MParams) := ["
+        + ", ".join(f'("{n}", attnmP_{n})' for n, *_ in ATTN_MASK_CASES)
+        + "]"
+    )
+    L.append("")
+    L.append(
+        "/-! A key set equal to a causal range gives the causal class's term: every causal toy case against the explicit-key-set "
+        f"row of a request with {ATTN_MASK_EXTRA_KEYS} more keys whose bits are the causal range's (window included). An "
+        "all-ones key set gives the non-causal class's term: every non-causal toy case against the explicit-key-set row that "
+        "shows the token every key of its request (the general theorem instantiated, and the equality decided). -/"
+    )
+    for name, D, T, C, p, win, rid, d, causal, kv_len in ATTN_CASES:
+        tb = T.bit_length() - 1
+        S = AttentionSpec(D, T=T, C=C)
+        if causal:
+            kv_len = p + 1 + ATTN_MASK_EXTRA_KEYS
+            row = RowSpec(p=p, window_left=win, row=rid)
+            key_set = frozenset(k for k in range(kv_len) if row.visible(k))
+            assert S.output(RowSpec(p=0, row=rid, kv_len=kv_len, keys=key_set), d) is (
+                S.output(row, d)
+            ), name
+            L.append(
+                f"theorem attnm_{name}_causal : Attn.maskOutput ⟨{D // mk}, {tb}, {C}, Attn.causalKeys {kv_len} {p} ({win}), {rid}, {d}⟩ = "
+                f"Attn.output ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}, true, 0⟩ := by native_decide"
+            )
+            continue
+        row = RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
+        all_keys = RowSpec(p=0, row=rid, kv_len=kv_len, keys=frozenset(range(kv_len)))
+        assert S.output(all_keys, d) is S.output(row, d), name
+        assert S.output(row.as_key_set(), d) is S.output(row, d), name
+        lean_row = f"⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}, false, {kv_len}⟩"
+        L.append(
+            f"theorem attnm_{name}_noncausal_row : Attn.maskOutput ⟨{D // mk}, {tb}, {C}, Attn.allKeys {kv_len}, {rid}, {d}⟩ = "
+            f"Attn.output {lean_row} := Attn.all_keys_row_is_noncausal_row {lean_row} rfl (by decide)"
+        )
+        L.append(
+            f"theorem attnm_{name}_noncausal : Attn.maskOutput ⟨{D // mk}, {tb}, {C}, {_lean_bools([True] * kv_len)}, {rid}, {d}⟩ = "
+            f"Attn.output {lean_row} := by native_decide"
+        )
+    L.append("")
+
+
+def attn_range_cases() -> List[tuple]:
+    """The ranged attention toy cases with the Python spec's S-expression of the output element."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from .fp_interface.term import sexpr
+
+    out = []
+    for name, D, T, C, p, win, ra, rb, rid, d in ATTN_RANGE_CASES:
+        row = RowSpec(p=p, window_left=win, row=rid, brange=(ra, rb))
+        sx = sexpr(AttentionSpec(D, T=T, C=C).output(row, d))
+        if ra >= rb:  # no range: the causal class's term, node for node
+            causal = RowSpec(p=p, window_left=win, row=rid)
+            assert sx == sexpr(AttentionSpec(D, T=T, C=C).output(causal, d)), name
+        out.append((name, D, T, C, p, win, ra, rb, rid, d, sx))
     return out
 
 
@@ -1237,11 +1432,86 @@ def _render_gemm(L: List[str]) -> None:
     _render_fp8_blockscale(L)
 
 
+def _render_attention_ranges(L: List[str]) -> None:
+    """The family ``AttentionRanges``: the ranged attention class's toy-case spec terms."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+
+    mk = MMA_K_OF["bf16"]
+    L.append(
+        "/-! The ranged attention class on toy sizes (T = 16, C = 32; a row sees its causal keys and its range): the Python spec's "
+        "output element (`attention/batch_invariant/spec.py`, `RowSpec.brange`) reproduced by `AttentionRanges.lean` node for node, "
+        "the split kernel's equality to it instantiated on every case, the causal class's term on the cases without a range, and "
+        "the explicit-key-set row with the same visible set: the general theorem instantiated on the row's own key range, and the "
+        f"equality decided for a request with {ATTN_MASK_EXTRA_KEYS} more keys (the Python spec builds the same term object). -/"
+    )
+    for name, D, T, C, p, win, ra, rb, rid, d, sx in attn_range_cases():
+        tb = T.bit_length() - 1
+        L.append(
+            f"def attnRP_{name} : AttnR.Params := ⟨{D // mk}, {tb}, {C}, {p}, {win}, {ra}, {rb}, {rid}, {d}⟩"
+        )
+        L.append(
+            f"theorem attnr_{name}_spec : (AttnR.output attnRP_{name}).sexpr = {lean_str(sx)} := by native_decide"
+        )
+        L.append(
+            f"theorem attnr_{name}_split : ∀ σ : Nat → Nat, AttnR.splitKernel attnRP_{name} σ = AttnR.output attnRP_{name} := "
+            f"fun σ => AttnR.splitKernel_eq_fused _ σ"
+        )
+        if ra >= rb:
+            L.append(
+                f"theorem attnr_{name}_causal : AttnR.output attnRP_{name} = Attn.output attnRP_{name}.causal := "
+                f"AttnR.no_range_is_causal _ (by decide)"
+            )
+        ranged = RowSpec(p=p, window_left=win, row=rid, brange=(ra, rb))
+        kv_len = ranged.L + ATTN_MASK_EXTRA_KEYS
+        S = AttentionSpec(D, T=T, C=C)
+        assert S.output(ranged.as_key_set(kv_len), d) is S.output(ranged, d), name
+        L.append(
+            f"theorem attnr_{name}_keyset_row : Attn.maskOutput (Attn.MParams.ofV attnRP_{name}.toV) = AttnR.output attnRP_{name} := "
+            f"AttnR.key_set_row_of_range_row _ (by decide)"
+        )
+        L.append(
+            f"theorem attnr_{name}_keyset : Attn.maskOutput ⟨{D // mk}, {tb}, {C}, "
+            f"{_lean_bools([ranged.visible(k) for k in range(kv_len)])}, {rid}, {d}⟩ = AttnR.output attnRP_{name} := by native_decide"
+        )
+    L.append(
+        "def attnRangesCases : List (String × AttnR.Params) := ["
+        + ", ".join(f'("{n}", attnRP_{n})' for n, *_ in ATTN_RANGE_CASES)
+        + "]"
+    )
+    L.append("")
+    L.append(
+        "/-! A range equal to the request's whole key range gives the non-causal class's term: every non-causal toy case "
+        "against the ranged row at the same position whose range is `[0, kv_len)`, with and without a window (the Python spec "
+        "builds the same term object; the general theorem instantiated). -/"
+    )
+    for name, D, T, C, p, _, rid, d, causal, kv_len in ATTN_CASES:
+        if causal:
+            continue
+        tb = T.bit_length() - 1
+        S = AttentionSpec(D, T=T, C=C)
+        nc_row = RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
+        for tag, win in (("", -1), ("_windowed", 3)):
+            ranged = RowSpec(p=p, window_left=win, row=rid, brange=(0, kv_len))
+            assert S.output(ranged, d) is S.output(nc_row, d), name
+            lean_row = f"⟨{D // mk}, {tb}, {C}, {p}, {win}, 0, {kv_len}, {rid}, {d}⟩"
+            L.append(
+                f"theorem attnr_{name}_noncausal{tag} : AttnR.output {lean_row} = "
+                f"Attn.output (AttnR.Params.nonCausal {lean_row}) := AttnR.whole_range_is_noncausal _ rfl (by decide)"
+            )
+    L.append("")
+
+
 #: The kernel families, one generated module each: (module name, the families whose definitions it uses, its renderer).
 FAMILIES: Tuple[Tuple[str, Tuple[str, ...], Callable[[List[str]], None]], ...] = (
     ("GEMM", (), _render_gemm),
     ("Attention", (), _render_attention),
+    ("AttentionMask", (), _render_attention_mask),
+    ("AttentionRanges", (), _render_attention_ranges),
 )
+#: The hand-written modules a family's parts import beyond ``BASE_IMPORTS``.
+FAMILY_IMPORTS: Dict[str, List[str]] = {
+    "AttentionRanges": ["import BIKernels.AttentionRanges"],
+}
 
 
 def _declarations(lines: List[str]) -> List[str]:
@@ -1300,6 +1570,7 @@ def render_modules() -> Dict[str, str]:
                 "\n".join(
                     LICENSE
                     + BASE_IMPORTS
+                    + FAMILY_IMPORTS.get(family, [])
                     + [f"import BIKernels.Cases.{m}" for m in before]
                     + ["namespace BIK", GENERATED, "set_option maxRecDepth 4096"]
                     + ["open GEMM", ""]
@@ -1347,6 +1618,7 @@ def summary() -> str:
         f"space={len(fp8bs_space())} dispatch={len(fp8bs_dispatch_cases())}"
         + f"; native_decide theorems={len(DECIDED_THEOREMS)}"
         + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
+        + f"; ranged attention cases={len(ATTN_RANGE_CASES)}"
     )
 
 

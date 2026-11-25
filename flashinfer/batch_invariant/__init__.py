@@ -25,14 +25,17 @@ from .support import (
 class ClassInfo(NamedTuple):
     """A consistency class behind a FlashInfer API: its name, the fixed dimensions its fingerprint takes, the
     function computing the fingerprint from them, the optional dimensions (flags of the specification with a
-    default, such as a bias) the function also accepts, and a note the missing-dimension error carries (what the
-    fixed dimensions select, where a caller could expect a default)."""
+    default, such as a bias) the function also accepts, a note the missing-dimension error carries (what the
+    fixed dimensions select, where a caller could expect a default), and the waivers: pairs ``(flag, dim)`` of an optional
+    flag that, when set, names a class in which the fixed dimension ``dim`` is not a dimension (it is then not required,
+    and the function does not read it)."""
 
     name: str
     dims: tuple
     fingerprint: Callable[..., str]
     optional: tuple = ()
     note: str = ""
+    waived: tuple = ()
 
 
 def _mm_bf16_fingerprint(N: int, K: int, bias: bool = False) -> str:
@@ -92,11 +95,17 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int, causal: Optional[bool] = None) -> str:
-    """The attention class at ``head_dim`` under a mask mode; ``None`` is the causal class (the decode wrapper's
-    ``is_causal=None``), never a truth value."""
-    from ..attention.batch_invariant.spec import spec_fingerprint
+def _attention_fingerprint(
+    head_dim: int, causal: Optional[bool] = None, custom_mask: bool = False
+) -> str:
+    """The attention class at ``head_dim`` under a mask mode; ``causal=None`` is the causal class (the decode wrapper's
+    ``is_causal=None``), never a truth value. ``custom_mask=True`` names the explicit-key-set class a ``plan()`` with a custom
+    mask runs (the mask is data of that class: its values never enter the identifier); the mask replaces the position-derived
+    keys, so ``causal`` is not read with it, as ``plan()`` does not read it."""
+    from ..attention.batch_invariant.spec import mask_fingerprint, spec_fingerprint
 
+    if custom_mask:
+        return mask_fingerprint(head_dim)
     return spec_fingerprint(head_dim, causal=True if causal is None else bool(causal))
 
 
@@ -104,8 +113,15 @@ def _attention_fingerprint(head_dim: int, causal: Optional[bool] = None) -> str:
 #: default mode.
 _PREFILL_CAUSAL_NOTE = (
     "`causal` selects one of the two attention classes -- causal=True the causal class, causal=False the non-causal "
-    "class -- and the wrapper's plan() defaults to causal=False"
+    "class -- and the wrapper's plan() defaults to causal=False (a plan with a custom mask runs a third class, named by "
+    "custom_mask=True, which does not read `causal`)"
 )
+
+
+def _attention_ranges_fingerprint(head_dim: int) -> str:
+    from ..attention.batch_invariant.spec import MASK_KEY_RANGES, spec_fingerprint
+
+    return spec_fingerprint(head_dim, mask_mode=MASK_KEY_RANGES)
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -629,17 +645,30 @@ CLASSES: Dict[str, ClassInfo] = {
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
     ),
+    # a prefill plan with a custom mask runs the explicit-key-set class (`custom_mask=True`): a token's output depends on its own
+    # mask row (ANDed with the window), its head and its request's keys alone; `causal` is not a dimension of that class (the
+    # plan does not read it with a mask), so the receipt does not require it then. The decode wrapper takes no mask
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("custom_mask",),
         note=_PREFILL_CAUSAL_NOTE,
+        waived=(("custom_mask", "causal"),),
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("custom_mask",),
         note=_PREFILL_CAUSAL_NOTE,
+        waived=(("custom_mask", "causal"),),
+    ),
+    # the ranged class: the same dataflow over the causal keys united with one bidirectional key range per query token (its
+    # own receipt: what a row may see is part of the class; a row without a range has the causal class's term and bits). The
+    # wrapper has one mask mode, so its receipt takes no `causal`
+    "BatchPrefillWithCausalBidirectionalRangesWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_ranges_fingerprint
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -750,8 +779,20 @@ def fingerprint(op: str, **dims) -> str:
     optional: omitted or ``None`` is the causal class, as ``is_causal=None`` is in its ``plan()``, and a single-token decode
     step is the causal class whatever ``is_causal`` says. The sliding window (``window_left``) is a per-call input of the
     causal class, like the KV position: the receipt is the digest of the class's no-window sample row and covers windowed
-    calls too.
+    calls too. The two prefill wrappers also take ``custom_mask=True``: a ``plan()`` with ``custom_mask`` /
+    ``packed_custom_mask`` runs the explicit-key-set class (``attn-bf16-d<D>-mask-*``), in which a token's visible keys are
+    its own mask row (ANDed with the window) instead of a range of its position or request. The mask replaces the
+    position-derived keys, so ``causal`` is neither required nor read with ``custom_mask=True`` (as ``plan()`` does not read it
+    with a mask). The mask is data of that class, like the KV position of the causal one: one receipt covers every mask; a mask
+    row equal to a causal range gives the causal class's bits and an all-ones mask the non-causal class's.
+    ``BatchPrefillWithCausalBidirectionalRangesWrapper`` takes ``head_dim`` alone (it has one mask mode) and names the ranged
+    class (``attn-bf16-d<D>-br-*``): the same tiles, chunks, softmax step and merge over the causal keys united with the token's
+    bidirectional key range. The ranges and the two windows are per-call inputs like the KV position; a token without a
+    range has the causal class's term, so its bits are those of the three wrappers above, and a token whose range is its
+    request's whole key range has the non-causal class's.
 
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, custom_mask=True)  # doctest: +SKIP
+    'attn-bf16-d128-mask-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
@@ -793,7 +834,8 @@ def fingerprint(op: str, **dims) -> str:
             f"fingerprint({op!r}) takes the fixed dimensions {list(info.dims)} and the optional {list(info.optional)}, not {unknown}"
         )
     # a fixed dimension has no default: one passed as None is as missing as one left out
-    missing = [d for d in info.dims if dims.get(d) is None]
+    waived = {d for flag, d in info.waived if dims.get(flag)}
+    missing = [d for d in info.dims if dims.get(d) is None and d not in waived]
     if missing:
         raise TypeError(
             f"fingerprint({op!r}) needs the fixed dimensions {missing}"
