@@ -4817,3 +4817,64 @@ def test_per_request_param_indexed_by_row(api, vocab_size, remap, expanded):
         else:
             # rows 0 and 2 keep their argmax alone, and row i's argmax is class i.
             assert counts[row_idx].item() == lanes, (remap, lane, counts)
+
+
+def test_chain_speculative_sampling_counter_validation():
+    B, N, V = 4, 3, 257
+    draft = torch.zeros((B, N, V), dtype=torch.float32, device="cuda:0")
+    target = torch.zeros((B, N + 1, V), dtype=torch.float32, device="cuda:0")
+    draft[..., 0] = 1
+    target[..., 0] = 1
+    draft_ids = torch.zeros((B, N), dtype=torch.int32, device="cuda:0")
+
+    # 1. int64 counter must be rejected with ValueError
+    counter_int64 = torch.zeros((B,), dtype=torch.int64, device="cuda:0")
+    with pytest.raises(ValueError, match="must be int32"):
+        flashinfer.sampling.chain_speculative_sampling(
+            draft,
+            draft_ids,
+            target,
+            maybe_output_accepted_token_num=counter_int64,
+        )
+
+    with pytest.raises(ValueError, match="must be int32"):
+        flashinfer.sampling.chain_speculative_sampling(
+            draft,
+            draft_ids,
+            target,
+            maybe_output_emitted_draft_token_num=counter_int64,
+        )
+
+    # 2. Non-contiguous counter must be rejected with ValueError
+    storage = torch.zeros((B, 2), dtype=torch.int32, device="cuda:0")
+    non_contiguous = storage[:, 0]
+    with pytest.raises(ValueError, match="must be contiguous"):
+        flashinfer.sampling.chain_speculative_sampling(
+            draft,
+            draft_ids,
+            target,
+            maybe_output_accepted_token_num=non_contiguous,
+        )
+
+    with pytest.raises(ValueError, match="must be contiguous"):
+        flashinfer.sampling.chain_speculative_sampling(
+            draft,
+            draft_ids,
+            target,
+            maybe_output_emitted_draft_token_num=non_contiguous,
+        )
+
+    # 3. Valid contiguous int32 counters are accepted and populated
+    counter_int32 = torch.zeros((B,), dtype=torch.int32, device="cuda:0")
+    emitted_int32 = torch.zeros((B,), dtype=torch.int32, device="cuda:0")
+    flashinfer.sampling.chain_speculative_sampling(
+        draft,
+        draft_ids,
+        target,
+        maybe_output_accepted_token_num=counter_int32,
+        maybe_output_emitted_draft_token_num=emitted_int32,
+    )
+    assert counter_int32.dtype == torch.int32
+    assert emitted_int32.dtype == torch.int32
+    assert torch.all(counter_int32 == N)
+    assert torch.all(emitted_int32 == N)
