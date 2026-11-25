@@ -4,11 +4,9 @@ Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_sm120"
 
 Requires Blackwell-consumer (sm_120/sm_121), >=4 GPUs, and CuTeDSL runtime
-deps (``nvidia-cutlass-dsl``, ``nvshmem4py``).  Kernels ship in-tree under
-``flashinfer.moe_ep.shims.sm120.swapab_cutedsl``.  The SM120
-tree is process-exclusive with the sm_100/sm_90 trees (shared top-level kernel
-module names), so run this file in its own torchrun process (see
-run_tests.sh ``run_mega_sm120``).
+deps (``nvidia-cutlass-dsl``, ``nvshmem4py``). The
+``flashinfer.moe_ep.shims.sm120.swapab_cutedsl`` adapter loads kernels from
+``flashinfer/moe_ep/kernels/flashinfer/sm120_swapab/``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -36,9 +34,7 @@ import os
 
 import pytest
 
-# This test verifies the mega path only through the swapab_cutedsl_megakernel
-# shim public API; it never imports the src/ kernel packages directly, so a
-# new src/ drop can't silently break it.
+# Use the adapter to exercise the same imports as the production backend.
 pytest.importorskip("flashinfer.moe_ep.shims.sm120.swapab_cutedsl")
 
 from .mega_oracle_compare import (  # noqa: E402

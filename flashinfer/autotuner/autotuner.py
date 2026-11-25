@@ -43,6 +43,7 @@ from flashinfer.utils import (
 
 from flashinfer.jit.core import logger
 from flashinfer.version import __version__ as _flashinfer_version
+from flashinfer.autotuner._graph_timing import profile_graph_pool
 from flashinfer.autotuner.initializers import (
     TensorInitializer,
     autotuner_initializer_rand_scaled,
@@ -4498,7 +4499,7 @@ class AutoTuner:
             )
             with torch.cuda.stream(stream):
                 if graph is not None:
-                    with torch.cuda.graph(graph):
+                    with torch.cuda.graph(graph, pool=profile_graph_pool()):
                         for profile_inputs in captured_batches:
                             _run_once(profile_inputs)
                     # Exercise the captured graph before collecting samples;
@@ -4593,7 +4594,7 @@ class AutoTuner:
 
             with torch.cuda.stream(stream):
                 if tuning_config.use_cuda_graph:
-                    with torch.cuda.graph(graph):
+                    with torch.cuda.graph(graph, pool=profile_graph_pool()):
                         _run_kernels()
 
                 stream.synchronize()
@@ -4902,7 +4903,7 @@ class AutoTuner:
                 if tuning_config.use_cuda_graph:
                     torch.cuda.synchronize()
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
+                    with torch.cuda.graph(graph, pool=profile_graph_pool()):
                         runner(inputs, tactic=tactic, **kwargs)
 
             def run_iteration():

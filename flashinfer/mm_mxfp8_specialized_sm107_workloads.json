@@ -1,0 +1,32 @@
+{
+  "op": "mm_mxfp8",
+  "kernel": "agent-generated SM107 small-M MXFP8 (E4M3 + UE8M0 block-32, 1D swizzled 128x4 scales) NT GEMM, bf16 out (csrc/mm_mxfp8_smallm_sm107.cu)",
+  "note": "Dispatch surface of mm_mxfp8's 'specialized' backend. backend='auto' routes to it only on the exact (M, N, K) shapes below: the shapes where the kernel beats the strongest stock configuration with margin on BOTH measured stock arms (the latest release and current main's autotuned ranking) on SM107 under CUDA-graph timing. Every other call keeps the stock path. An explicitly selected backend is never swapped and never falls back: backend='specialized' that cannot serve a call raises NotImplementedError with the refusal reason; only backend='auto' routes around a refusal. The allowlist is exact membership, not a range: off-list shapes measured slower (the kernel's generic route, which is also the green-context fallback for clustered routes, is capture-safe but unmeasured against the stock backends), so near-miss shapes must not be added without re-measuring.",
+  "backends": ["specialized"],
+  "auto_routing": {
+    "backend": "specialized",
+    "out_dtype": "bfloat16",
+    "use_8x4_sf_layout": false,
+    "scale_layout": "1D swizzled 128x4",
+    "a_layout": "row-major contiguous (M, K)",
+    "b_layout": "column-major (K, N) (b.t() contiguous)"
+  },
+  "dtypes": {
+    "a": "float8_e4m3fn",
+    "b": "float8_e4m3fn",
+    "a_descale": "uint8",
+    "b_descale": "uint8",
+    "out": "bfloat16"
+  },
+  "compute_capability": [10, 7],
+  "shapes_mnk": [
+    [4, 6144, 384], [8, 6144, 384], [12, 6144, 384],
+    [1, 5120, 576], [2, 5120, 576], [4, 5120, 576], [8, 5120, 576],
+    [4, 6144, 1024], [8, 6144, 1024], [12, 6144, 1024],
+    [1, 5120, 2048], [2, 5120, 2048], [4, 5120, 2048], [8, 5120, 2048],
+    [1, 1152, 5120], [2, 1152, 5120], [4, 1152, 5120], [8, 1152, 5120], [16, 1152, 5120], [32, 1152, 5120],
+    [1, 1792, 5120], [2, 1792, 5120], [4, 1792, 5120], [8, 1792, 5120], [32, 1792, 5120],
+    [4, 768, 6144], [8, 768, 6144], [12, 768, 6144], [24, 768, 6144],
+    [4, 1536, 6144], [8, 1536, 6144], [12, 1536, 6144], [24, 1536, 6144], [32, 1536, 6144]
+  ]
+}

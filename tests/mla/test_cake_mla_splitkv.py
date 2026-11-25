@@ -24,7 +24,16 @@ the max_seq_len 2049 where the listed ranges of B200 and GB300 start):
 - the split-KV scratch is keyed by the split count and never cached under stream
   capture or in the stateless mode;
 - the ``max_seq_len`` field of the ``backend="auto"`` decision memo keeps the side
-  of the split-KV range start, also a start inside a bucket (no GPU needed).
+  of the split-KV range start, also a start inside a bucket (no GPU needed);
+- the split-count rule: up to 32 splits, up to 64 for one query row whose
+  max_seq_len KV tiles hold at least the device's start (65536 tokens on B200,
+  131072 on GB300; an unlisted device keeps 32), every other launch unchanged,
+  and the binding's caps equal the host's (no GPU needed);
+- more than 32 splits (the wide reducer build), forced at 33, 37, 38, 48 and 64
+  splits and at the counts the rule picks: on live rows accuracy against FP64 at
+  the level of TRTLLM-GEN (as above, three draws), padded rows are exact zeros,
+  and the bits are run-to-run identical, eager and under CUDA-graph replay; 65
+  splits have no dispatch route.
 """
 
 import math
@@ -637,3 +646,375 @@ def test_auto_memo_seq_len_follows_the_splitkv_range(monkeypatch, start):
         assert below[:2] == at[:2]
     monkeypatch.setattr(cake_module, "_SPLITKV_RANGE", {})
     assert core._mla_auto_memo_seq_len(4096, 0)[2] is None
+
+
+# --- More than 32 splits: the wide reducer build -----------------------------------
+
+
+def _narrow_plan(total_q, max_seq_len, num_sms):
+    """The split count of every launch outside the wide rule: at most 32 splits."""
+    resident = max(1, num_sms // 2)
+    tiles = max(1, -(-max_seq_len // 128))
+    split = min(32, max(1, resident // max(1, total_q)), tiles)
+    return -(-tiles // -(-tiles // split))
+
+
+def _wide_plan(total_q, max_seq_len, num_sms):
+    """The split count of one query row of long KV: at most 64 splits."""
+    resident = max(1, num_sms // 2)
+    tiles = max(1, -(-max_seq_len // 128))
+    split = min(64, max(1, resident // max(1, total_q)), tiles)
+    return -(-tiles // -(-tiles // split))
+
+
+def test_splitkv_plan_wide_rule():
+    """``plan_kv_split`` allows up to 64 splits only for one query row whose
+    max_seq_len KV tiles hold at least the device's start (65536 tokens on B200,
+    131072 on GB300); every other launch, an unlisted device and a call without
+    ``arch`` keep the 32-split count they had. One wave of clusters at most, and
+    the count depends on max_seq_len only through its KV tile count. No GPU
+    needed."""
+    assert cake_module._SPLITKV_MAX_SPLIT == 64
+    assert cake_module._SPLITKV_NARROW_MAX_SPLIT == 32
+    starts = {("sm_100a", 148): 65536, ("sm_103a", 152): 131072}
+    assert starts == cake_module._SPLITKV_WIDE_MIN_SEQ_LEN
+    assert cake_module._SPLITKV_WIDE_MAX_ROWS == 1
+    for start in starts.values():
+        assert start % cake_module._KV_TILE == 0
+    plan = cake_module.plan_kv_split
+    devices = (("sm_100a", 148), ("sm_103a", 152))
+    # (rows, max_seq_len) -> splits on B200 (sm_100a, 148 SMs) and GB300
+    # (sm_103a, 152 SMs).
+    expected = {
+        (1, 32768): (32, 32),
+        (1, 33280): (29, 29),
+        (1, 65408): (32, 32),
+        (1, 65409): (64, 32),
+        (1, 65536): (64, 32),
+        (1, 65568): (57, 31),
+        (1, 130944): (64, 32),
+        (1, 130945): (64, 64),
+        (1, 131072): (64, 64),
+        (1, 131200): (61, 61),
+        (1, 262144): (64, 64),
+        (2, 32768): (32, 32),
+        (2, 65536): (32, 32),
+        (2, 131072): (32, 32),
+        (3, 65536): (24, 25),
+        (3, 262144): (24, 25),
+    }
+    for (rows, max_seq_len), splits in expected.items():
+        for (arch, num_sms), split in zip(devices, splits, strict=True):
+            assert plan(rows, max_seq_len, num_sms, arch) == split, (
+                arch,
+                num_sms,
+                rows,
+                max_seq_len,
+            )
+    lengths = (
+        1025,
+        2048,
+        4096,
+        8192,
+        16384,
+        16385,
+        24576,
+        32640,
+        32641,
+        32767,
+        32768,
+        33280,
+        49152,
+        65408,
+        65409,
+        65536,
+        65568,
+        130944,
+        130945,
+        131072,
+        131200,
+        262144,
+    )
+    # The listed devices, the other arch at the same SM count, and no arch.
+    for arch, num_sms in devices + (("sm_103a", 148), ("sm_100a", 152), (None, 148)):
+        start = starts.get((arch, num_sms))
+        for rows in range(1, 39):
+            for max_seq_len in lengths:
+                split = plan(rows, max_seq_len, num_sms, arch)
+                case = (arch, num_sms, rows, max_seq_len)
+                tiles = -(-max_seq_len // 128)
+                if start is None or rows > 1 or tiles * 128 < start:
+                    assert split == _narrow_plan(rows, max_seq_len, num_sms), case
+                else:
+                    assert split == _wide_plan(rows, max_seq_len, num_sms), case
+                if arch is None:
+                    assert split == plan(rows, max_seq_len, num_sms), case
+                assert 1 <= split <= 64, case
+                assert rows * split <= num_sms // 2, case
+                # Every max_seq_len of one KV tile count plans one count.
+                assert split == plan(rows, tiles * 128, num_sms, arch), case
+
+
+def test_splitkv_binding_caps_match_the_host():
+    """The binding accepts at most ``_SPLITKV_MAX_SPLIT`` splits and launches
+    the wide reducer build above ``_SPLITKV_NARROW_MAX_SPLIT``; no module
+    overrides either. The wide build's opt-in and launch use one dynamic
+    shared-memory size above 48 KiB and its own kernel. No GPU needed."""
+    import re
+
+    text = cake_module._source_path(cake_module._SPLITKV_BINDING).read_text()
+    assert f"#define CAKE_SPLITKV_MAX_SPLIT {cake_module._SPLITKV_MAX_SPLIT}\n" in text
+    assert (
+        f"#define CAKE_SPLITKV_NARROW_MAX_SPLIT "
+        f"{cake_module._SPLITKV_NARROW_MAX_SPLIT}\n"
+    ) in text
+    assert "(num_split <= CAKE_SPLITKV_MAX_SPLIT)" in text
+    assert "if (num_split > CAKE_SPLITKV_NARROW_MAX_SPLIT) {" in text
+    start = text.index("namespace CAKE_VARIANT_NS_3 {")
+    block = text[start : text.index("}  // namespace CAKE_VARIANT_NS_3", start)]
+    opt_in = re.findall(
+        r"CakeSetMaxDynamicSmem\(\s*reinterpret_cast<const void\*>\((kernel_\w+)\),"
+        r"\s*(\d+)\)",
+        block,
+    )
+    launch = re.findall(r"config\.dynamicSmemBytes = (\d+)u;", block)
+    kernels = set(re.findall(r"reinterpret_cast<const void\*>\((kernel_\w+)\)", block))
+    assert len(opt_in) == 1 and len(launch) == 1, (opt_in, launch)
+    assert int(opt_in[0][1]) == int(launch[0]) > 48 * 1024
+    for name, family in cake_module.FAMILIES.items():
+        if family["binding"] != cake_module._SPLITKV_BINDING:
+            continue
+        assert kernels == {f"kernel_{family['dependencies'][3]}"}, name
+        for flag in family.get("binding_flags", []):
+            assert not flag.startswith("-DCAKE_SPLITKV_MAX_SPLIT"), name
+            assert not flag.startswith("-DCAKE_SPLITKV_NARROW_MAX_SPLIT"), name
+
+
+@pytest.fixture
+def forced_split(monkeypatch):
+    """Force the split count ``plan_kv_split`` returns to the launch (``None``:
+    the rule's own count); records every count the launch used."""
+    used: list = []
+    plan = cake_module.plan_kv_split
+
+    def force(value):
+        def spy(total_q, max_seq_len, num_sms, arch=None):
+            split = (
+                plan(total_q, max_seq_len, num_sms, arch) if value is None else value
+            )
+            used.append(split)
+            return split
+
+        monkeypatch.setattr(cake_module, "plan_kv_split", spy)
+        return used
+
+    return force
+
+
+# name: (batch, q_len, page_size, sink, bmm2_scale, seq_lens pattern, max_seq_len)
+_WIDE_CASES = {
+    "rows1_page32_varied": (1, 1, 32, False, 1.0, "varied", 32768),
+    "rows2_q_len2_page64_sink_bmm2": (1, 2, 64, True, 0.5, "varied", 32768),
+    "rows2_page32_padded": (2, 1, 32, False, 1.0, "padded", 32768),
+}
+_WIDE_SPLITS = (33, 37, 38, 48, 64)
+_WIDE_DRAWS = range(3)
+
+
+def _wide_accuracy(case, label):
+    """Run the cells of ``case`` (``_WIDE_CASES`` layout) and check every draw as
+    ``test_splitkv_matches_trtllm_gen_and_fp64`` does: on live rows the maximum
+    absolute error against FP64 is within TRTLLM-GEN's plus one BF16 unit of the
+    largest reference value, and within the suite's tolerance; padded rows are
+    exact zeros and the default and the stateless mode agree."""
+    batch, q_len, page_size, has_sink, bmm2_scale, pattern, max_seq_len = case
+    for seed in _WIDE_DRAWS:
+        query, kv_cache, block_tables, seq_lens = _inputs(
+            batch, q_len, page_size, max_seq_len, pattern, seed
+        )
+        sink = None
+        if has_sink:
+            generator = torch.Generator(device="cuda").manual_seed(100 + seed)
+            sink = torch.randn(NUM_HEADS, device="cuda", generator=generator) * 2.0
+        outputs = [
+            _cake(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                sink=sink,
+                bmm2_scale=bmm2_scale,
+                out=_nan_out(query),
+                **mode,
+            )
+            for mode in ({}, {"stateless": True})
+        ]
+        torch.cuda.synchronize()
+        cell = f"{label} seed{seed}"
+        assert torch.equal(outputs[0], outputs[1]), cell
+        live = _row_lengths(seq_lens, q_len) > 0
+        padded = outputs[0][~live]
+        assert torch.equal(padded, torch.zeros_like(padded)), cell
+        assert bool(live.any()), cell
+        reference = _reference_fp64(
+            query, kv_cache, block_tables, seq_lens, sink, bmm2_scale
+        )[live]
+        trtllm_gen = _trtllm_gen(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            sink=sink,
+            bmm2_scale=bmm2_scale,
+            out=_nan_out(query),
+        )
+        torch.cuda.synchronize()
+        cake_live = outputs[0][live].double()
+        assert bool(cake_live.isfinite().all()), cell
+        cake_error = float((cake_live - reference).abs().max())
+        trtllm_gen_error = float((trtllm_gen[live].double() - reference).abs().max())
+        ulp = _bf16_ulp(float(reference.abs().max()))
+        rel_l2 = float(
+            (cake_live - reference).norm() / reference.norm().clamp_min(1e-30)
+        )
+        print(
+            f"{cell}: max_abs cake {cake_error:.3e} trtllm-gen "
+            f"{trtllm_gen_error:.3e} ulp {ulp:.3e} rel_l2 {rel_l2:.3e}"
+        )
+        assert cake_error <= trtllm_gen_error + ulp, cell
+        torch.testing.assert_close(
+            cake_live.float(),
+            reference.float(),
+            rtol=TOLERANCE,
+            atol=TOLERANCE,
+            msg=lambda message: f"{cell}: {message}",
+        )
+
+
+@pytest.mark.parametrize("num_split", _WIDE_SPLITS)
+@pytest.mark.parametrize("case", sorted(_WIDE_CASES))
+def test_splitkv_wide_split_counts_match_trtllm_gen_and_fp64(
+    splitkv_device, splitkv_domains, forced_split, case, num_split
+):
+    """33 to 64 splits (the wide reducer build), forced: accuracy against FP64 at
+    the level of TRTLLM-GEN, padded rows exact zeros."""
+    used = forced_split(num_split)
+    _wide_accuracy(_WIDE_CASES[case], f"{case} split{num_split}")
+    assert used and set(used) == {num_split}
+    assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
+
+
+# name: (batch, q_len, page_size, sink, bmm2_scale, seq_lens pattern, max_seq_len)
+_WIDE_PLAN_CASES = {
+    "rows1_kv131072": (1, 1, 32, False, 1.0, "varied", 131072),
+    "rows1_kv131200": (1, 1, 32, False, 1.0, "varied", 131200),
+    "rows1_q_len1_page64_sink_bmm2_kv196736": (1, 1, 64, True, 0.5, "varied", 196736),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_WIDE_PLAN_CASES))
+def test_splitkv_wide_plan_cases_match_trtllm_gen_and_fp64(
+    splitkv_device, splitkv_domains, forced_split, case
+):
+    """The split counts the rule picks above 32 on B200 and GB300 (64 at one row
+    of KV 131072, 61 at KV 131200, 62 at KV 196736): accuracy against FP64 at
+    the level of TRTLLM-GEN."""
+    batch, q_len, max_seq_len = (
+        _WIDE_PLAN_CASES[case][0],
+        _WIDE_PLAN_CASES[case][1],
+        _WIDE_PLAN_CASES[case][6],
+    )
+    arch, num_sms = splitkv_device
+    expected = cake_module.plan_kv_split(batch * q_len, max_seq_len, num_sms, arch)
+    if expected <= cake_module._SPLITKV_NARROW_MAX_SPLIT:
+        pytest.skip(f"this device plans {expected} splits for {case}")
+    used = forced_split(None)
+    _wide_accuracy(_WIDE_PLAN_CASES[case], f"{case} split{expected}")
+    assert used and set(used) == {expected}
+    assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
+
+
+def _check_deterministic(decode, query):
+    """200 eager calls and 1000 replays of a captured graph give the first
+    call's bits; the stateless mode gives them too."""
+    first = decode(_nan_out(query)).clone()
+    torch.cuda.synchronize()
+    assert bool(first.isfinite().all())
+    for call in range(200):
+        assert torch.equal(decode(_nan_out(query)), first), call
+    assert torch.equal(decode(_nan_out(query), stateless=True), first)
+    out = _nan_out(query)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode(out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode(out)
+    mismatches = torch.zeros((), dtype=torch.int64, device="cuda")
+    for _ in range(1000):
+        out.fill_(float("nan"))
+        graph.replay()
+        mismatches += (out != first).any()
+    torch.cuda.synchronize()
+    assert int(mismatches) == 0
+
+
+@pytest.mark.parametrize(
+    "case,num_split",
+    [("rows2_q_len2_page64_sink_kv32768", split) for split in _WIDE_SPLITS]
+    + [("rows1_kv131072", None)],
+)
+def test_splitkv_wide_split_counts_are_deterministic(
+    splitkv_device, splitkv_domains, forced_split, case, num_split
+):
+    """More than 32 splits (forced, or the rule's 64 at one row of KV 131072):
+    200 eager calls and 1000 graph replays give identical bits, and the
+    stateless mode agrees."""
+    batch, q_len, page_size, max_seq_len, has_sink = {
+        "rows2_q_len2_page64_sink_kv32768": (1, 2, 64, 32768, True),
+        "rows1_kv131072": (1, 1, 32, 131072, False),
+    }[case]
+    used = forced_split(num_split)
+    query, kv_cache, block_tables, seq_lens = _inputs(
+        batch, q_len, page_size, max_seq_len, "padded", 0
+    )
+    assert int(seq_lens[-1]) == max_seq_len
+    sink = None
+    if has_sink:
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        sink = torch.randn(NUM_HEADS, device="cuda", generator=generator) * 2.0
+
+    def decode(output, **kwargs):
+        return _cake(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            sink=sink,
+            bmm2_scale=0.5 if has_sink else 1.0,
+            out=output,
+            **kwargs,
+        )
+
+    _check_deterministic(decode, query)
+    assert used and min(used) > cake_module._SPLITKV_NARROW_MAX_SPLIT
+    if num_split is not None:
+        assert set(used) == {num_split}
+    assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
+
+
+def test_splitkv_binding_rejects_more_splits_than_it_merges(
+    splitkv_device, forced_split
+):
+    """65 splits, one more than the reducers merge: the binding raises before
+    any launch."""
+    forced_split(cake_module._SPLITKV_MAX_SPLIT + 1)
+    query, kv_cache, block_tables, seq_lens = _inputs(1, 1, 32, 32768, "varied", 0)
+    with pytest.raises(ValueError, match="no dispatch route"):
+        _cake(query, kv_cache, block_tables, seq_lens, 32768, stateless=True)
+        torch.cuda.synchronize()

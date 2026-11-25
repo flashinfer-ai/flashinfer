@@ -22,6 +22,7 @@ does not call ``libnccl_longseq`` and does not use the Helix/MNNVL A2A kernel.
 """
 
 import functools
+import warnings
 import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional
@@ -197,6 +198,7 @@ def decode_cp_a2a_lse_reduce(
     lse_mode: Literal["base2", "basee"] = "base2",
     *,
     mask: Optional[torch.Tensor] = None,
+    layout: Optional[Literal["dst_major", "head_major"]] = None,
 ) -> torch.Tensor:
     """Fuse an NCCL LSA DCP A2A exchange with the LSE-weighted reduce.
 
@@ -216,8 +218,8 @@ def decode_cp_a2a_lse_reduce(
         The data pointer and each head row must be 16-byte aligned.
         Destination-major ``[batch, cp_size * heads, head_dim]`` attention
         output can be viewed with ``unflatten(1, (cp_size, heads))``.
-        This order replaces the former ``[..., heads, cp_size, head_dim]``
-        contract; callers must update their head/destination mapping.
+        The head-major ``[..., heads, cp_size, head_dim]`` order accepted
+        through v0.7.5 is deprecated; see ``layout``.
     partial_lse : torch.Tensor
         Contiguous ``[batch, cp_size, heads]`` CUDA float32 tensor, or more
         generally ``[..., cp_size, heads]``. Its shape must match
@@ -245,6 +247,17 @@ def decode_cp_a2a_lse_reduce(
         all-excluded row returns zero. Finite LSE with NaN O retains NaN
         propagation. For CUDA graphs, keep mask storage alive and update its
         contents on the ordered stream.
+    layout : Optional[Literal["dst_major", "head_major"]]
+        Order of the ``cp_size`` and ``heads`` axes in ``partial_o`` and
+        ``partial_lse``. ``"dst_major"`` is ``[..., cp_size, heads, head_dim]``.
+        ``"head_major"`` is the deprecated ``[..., heads, cp_size, head_dim]``
+        order (``[..., heads, cp_size]`` for ``partial_lse``, and also
+        ``[cp_size, head_dim]`` with no head axis); such inputs are copied into
+        destination-major order and raise a ``DeprecationWarning``. Head-major
+        support is removed after two minor releases (v0.7.8).
+        ``None`` infers the order from which axis has length ``cp_size``. When
+        both do (``heads == cp_size > 1``) the order cannot be inferred and
+        ``layout`` must be given.
 
     Returns
     -------
@@ -254,9 +267,31 @@ def decode_cp_a2a_lse_reduce(
     """
     if lse_mode not in ("base2", "basee"):
         raise ValueError(f"lse_mode must be 'base2' or 'basee', got {lse_mode!r}")
+    squeeze = False
+    if _resolve_layout(partial_o, cp_size, layout) == "head_major":
+        warnings.warn(
+            "decode_cp_a2a_lse_reduce: head-major [..., heads, cp_size, head_dim] "
+            "inputs are deprecated and copied into destination-major order; pass "
+            "[..., cp_size, heads, head_dim] (layout='dst_major'). Head-major "
+            "support is removed after two minor releases (v0.7.8).",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        if partial_lse.shape != partial_o.shape[:-1]:
+            raise ValueError(
+                f"partial_lse shape {tuple(partial_lse.shape)} must equal "
+                f"partial_o.shape[:-1] = {tuple(partial_o.shape[:-1])}"
+            )
+        # A 2-D [cp_size, head_dim] input has no head axis; give it one.
+        squeeze = partial_o.dim() == 2
+        if squeeze:
+            partial_o = partial_o.unsqueeze(0)
+            partial_lse = partial_lse.unsqueeze(0)
+        partial_o = partial_o.transpose(-3, -2).contiguous()
+        partial_lse = partial_lse.transpose(-2, -1).contiguous()
     group_name = _get_workspace_state(workspace).group_name
     get_dcp_lse_reduce_module()
-    return torch.ops.flashinfer.decode_cp_a2a_lse_reduce(
+    out = torch.ops.flashinfer.decode_cp_a2a_lse_reduce(
         partial_o,
         partial_lse,
         workspace,
@@ -266,6 +301,37 @@ def decode_cp_a2a_lse_reduce(
         group_name,
         mask,
     )
+    return out.squeeze(0) if squeeze else out
+
+
+def _resolve_layout(
+    partial_o: torch.Tensor, cp_size: int, layout: Optional[str]
+) -> str:
+    """Return ``"dst_major"`` or ``"head_major"`` for this call's inputs."""
+    if layout is not None:
+        if layout not in ("dst_major", "head_major"):
+            raise ValueError(
+                f"layout must be 'dst_major', 'head_major' or None, got {layout!r}"
+            )
+        return layout
+    # One .shape read: each Tensor.dim()/size() call is a C++ round trip, and
+    # this runs on every eager decode call.
+    shape = partial_o.shape
+    ndim = len(shape)
+    if ndim == 2:
+        return "head_major"  # only the head-major contract had 2-D inputs
+    if ndim < 2:
+        return "dst_major"  # let the kernel's shape checks report it
+    dst = shape[-3] == cp_size
+    head = shape[-2] == cp_size
+    if dst and head and cp_size > 1:
+        raise ValueError(
+            "decode_cp_a2a_lse_reduce cannot infer the input layout because "
+            f"heads == cp_size == {cp_size}; pass layout='dst_major' for "
+            "[..., cp_size, heads, head_dim] or layout='head_major' for the "
+            "deprecated [..., heads, cp_size, head_dim]."
+        )
+    return "head_major" if head and not dst else "dst_major"
 
 
 __all__ = [

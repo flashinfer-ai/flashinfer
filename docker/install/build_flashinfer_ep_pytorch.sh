@@ -11,8 +11,8 @@
 # Env:
 #   FI_SRC        FlashInfer checkout (default /host/flashinfer)
 #   CUDA_MAJOR    CUDA major for the cuXX wheel suffix (default: auto from torch.version.cuda)
-#   FI_NCCL_VERSION  nvidia-nccl-<cuXX> pin (default 2.30.7). FI_-prefixed
-#                 because NVIDIA base images export NCCL_VERSION as the Debian
+#   FI_NCCL_VERSION  nvidia-nccl-<cuXX> pin (default: installed wheel, at least
+#                 2.30.7). FI_-prefixed because NVIDIA base images export NCCL_VERSION as the Debian
 #                 package version (e.g. 2.28.3-1), which is not a valid pip pin.
 #   NCCL_EXT_SPEC nccl-extensions pin (default nccl-extensions[<cuXX>]==0.2.0,
 #                 containing NCCL EP 0.3).
@@ -40,7 +40,16 @@ if [[ "${CUDA_MAJOR}" == "13" ]]; then
 fi
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
-NCCL_VERSION="${FI_NCCL_VERSION:-2.30.7}"
+# Preserve newer NCCL wheels required by torch while enforcing the EP floor.
+NCCL_VERSION="${FI_NCCL_VERSION:-$(python -c "
+from importlib.metadata import PackageNotFoundError, version
+from packaging.version import Version
+try:
+    installed = version('nvidia-nccl-${CU}')
+except PackageNotFoundError:
+    installed = '2.30.7'
+print(max(Version(installed), Version('2.30.7')))
+")}"
 NCCL_EXT_SPEC="${NCCL_EXT_SPEC:-nccl-extensions[${CU}]==0.2.0}"
 NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[${CU}]==0.6.0}"
 CUDA_CORE_VERSION="${CUDA_CORE_VERSION:-1.0.1}"
@@ -54,10 +63,8 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version
 nvcc --version | grep release || true
 
 echo "== pin NCCL EP 0.3 runtime wheels =="
-# PIP_CONSTRAINT= overrides the NVIDIA base image's constraint file (which pins
-# nvidia-nccl-<cuXX> to torch's 2.30.4) so we install the 2.30.7 that
-# nccl-extensions 0.2.0's libnccl_ep.so supports. --no-deps on the NCCL wheels
-# keeps the base torch intact;
+# PIP_CONSTRAINT= overrides the base image's older NCCL pin when EP needs a
+# newer runtime. --no-deps on the NCCL wheels keeps the base torch intact;
 # nccl.ep additionally imports cuda.core / cuda.bindings, installed explicitly at
 # ep_bench's exact versions (cuda-core 1.0.1, cuda-bindings 13.2.0).
 PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
@@ -166,7 +173,7 @@ echo "== build & install FlashInfer (NCCL-EP + Mega path) =="
 # is opted out.
 # PIP_CONSTRAINT= so the build hook's --no-deps NCCL floor upgrade
 # (_ensure_nccl_floor, nvidia-nccl-cu13>=2.30.7) isn't blocked by the base
-# image's constraint file — a no-op here since 2.30.7 is already pinned above.
+# image's constraint file — a no-op here since the selected NCCL is installed above.
 cd "${FI_SRC}"
 # --no-build-isolation makes pyproject's [build-system] requires OUR job:
 # setuptools>=77 (PEP 639 SPDX `license = "Apache-2.0"`), packaging>=24, and
@@ -181,7 +188,7 @@ PIP_CONSTRAINT="" BUILD_NIXL_EP=0 \
 
 # The full-dep editable install above lets pip's resolver downgrade
 # nvidia-nccl-<cuXX> to torch's exact pin (2.28.9 on the 26.05 image), undoing
-# the 2.30.7 pin from the top of this script — and _ensure_nccl_floor runs at
+# the selected pin from the top of this script — and _ensure_nccl_floor runs at
 # build time, before that final resolution. Re-assert the pin last.
 PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
     "nvidia-nccl-${CU}==${NCCL_VERSION}"
