@@ -16054,6 +16054,10 @@ SPLIT_WARMUP_MAX = 8  # a cut's warm-up runs at most 8 chunks from a zero seed
 # sm_103a) -48, a subset of the 2^-24 cuts (the V6 programs' BF16 state images need the deeper decay to keep
 # the split on / off within 1e-6 rel-L2; -32 did not)
 SPLIT_LOG2_THRESHOLD_ARCH = {"sm_90a": -24.0, "sm_100a": -48.0, "sm_103a": -48.0}
+# A cut's warm-up is the fewest chunks before it whose log2 gate decay reaches the threshold, within the build's warm-up
+# cap (SPLIT_WARMUP_MAX, or an inference build's longer cap) and the sequence start; a cut with none is not saturated.
+# A later cut of a saturated item ends its window iff the decay total of its whole warm-up window reaches the threshold
+# (gates lie in (0, 1], so the total reaches it iff a warm-up does; the device may sum a window in any order and parts).
 # (H above, least span in chunks) per arch: sm_90a H > 24 -> 48, H > 12 -> 24, else 12; Blackwell (sm_100a / sm_103a)
 # H > 12 -> 48, else 12 (its chunk step is shorter, so an item needs more chunks to pay its fill and drain)
 SPLIT_SPAN_MIN_ARCH = {
