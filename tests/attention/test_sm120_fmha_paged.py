@@ -136,6 +136,10 @@ def _tol():
         (2, 64, 128, 8, 2, 128, 64),  # GQA 4:1
         (1, 128, 128, 4, 4, 64, 64),  # head_dim=64
         (1, 129, 384, 2, 1, 256, 64),  # D=256 three-stage KV ring
+        (1, 128, 128, 4, 4, 32, 1),  # page_size=1, head_dim=32
+        (1, 128, 128, 4, 4, 64, 1),  # page_size=1, head_dim=64
+        (2, 64, 128, 8, 2, 128, 1),  # page_size=1, GQA 4:1, D=128
+        (1, 129, 384, 24, 4, 256, 1),  # page_size=1, Qwen GQA 6:1, D=256
     ],
 )
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -241,6 +245,8 @@ def test_sm120_paged_variable_kv_lengths():
     [
         (8, 8, 128, 64),  # MHA
         (8, 2, 128, 64),  # GQA 4:1
+        (8, 2, 128, 1),  # page_size=1, GQA 4:1
+        (24, 4, 256, 1),  # page_size=1, Qwen GQA 6:1, D=256
     ],
 )
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -340,3 +346,77 @@ def test_sm120_paged_compile_cache():
     assert new_misses <= 1, (
         f"expected at most 1 miss (got {new_misses}), means no caching"
     )
+
+
+# ---------------------------------------------------------------------------
+# Token-granular paged KV (page_size=1): fragmented tables & odd lengths
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("D", [32, 64, 128, 256])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_sm120_paged_page_size_1_fragmented_odd_lengths(D, is_causal):
+    """Shuffled page_size=1 block tables with odd/boundary sequence lengths."""
+    Hq, Hkv = (24, 4) if D == 256 else (8, 2)
+    q_lens = [1, 17, 65, 130]
+    kv_lens = [1, 63, 65, 1025]
+    B = len(q_lens)
+    sm_scale = 1.0 / math.sqrt(D)
+    in_dtype, out_dtype = torch.float8_e4m3fn, torch.bfloat16
+
+    total_q = sum(q_lens)
+    total_kv = sum(kv_lens)
+    max_kv = max(kv_lens)
+    cu_seqlens_q = torch.tensor([0, *q_lens], dtype=torch.int32, device="cuda").cumsum(
+        0, dtype=torch.int32
+    )
+    seqlens_kv = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+
+    q_packed = _make_fp8((total_q, Hq, D), in_dtype)
+    # Allocate extra unused pages and scatter tokens randomly across the pool.
+    num_pool_pages = total_kv + 37
+    kv_pool = torch.zeros((num_pool_pages, 2, Hkv, 1, D), dtype=in_dtype, device="cuda")
+    k_pool, v_pool = kv_pool.unbind(dim=1)
+    perm = torch.randperm(num_pool_pages, device="cuda", dtype=torch.int32)
+
+    block_tables = torch.zeros((B, max_kv), dtype=torch.int32, device="cuda")
+    k_seqs, v_seqs = [], []
+    cursor = 0
+    for b, kv_len in enumerate(kv_lens):
+        pages = perm[cursor : cursor + kv_len]
+        cursor += kv_len
+        block_tables[b, :kv_len] = pages
+        k_b = _make_fp8((kv_len, Hkv, D), in_dtype)
+        v_b = _make_fp8((kv_len, Hkv, D), in_dtype)
+        k_pool[pages, :, 0, :] = k_b
+        v_pool[pages, :, 0, :] = v_b
+        k_seqs.append(k_b)
+        v_seqs.append(v_b)
+
+    o = torch.empty((total_q, Hq, D), device="cuda", dtype=out_dtype)
+    sm120_fmha_fp8_paged_prefill(
+        q_packed,
+        k_pool,
+        v_pool,
+        o,
+        block_tables=block_tables,
+        seqlens_kv=seqlens_kv,
+        cu_seqlens_q=cu_seqlens_q,
+        is_causal=is_causal,
+        sm_scale=sm_scale,
+        max_seqlen_q=max(q_lens),
+    )
+    torch.cuda.synchronize()
+
+    for b in range(B):
+        q_start = int(cu_seqlens_q[b])
+        q_end = int(cu_seqlens_q[b + 1])
+        ref_b = _ref_paged_fmha_single(
+            q_packed[q_start:q_end],
+            k_seqs[b],
+            v_seqs[b],
+            sm_scale,
+            is_causal,
+            kv_lens[b],
+        ).to(out_dtype)
+        torch.testing.assert_close(o[q_start:q_end], ref_b, **_tol())

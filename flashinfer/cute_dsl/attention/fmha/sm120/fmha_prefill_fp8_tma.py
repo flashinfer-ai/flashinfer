@@ -66,7 +66,7 @@ from cutlass.experimental import primitives as prims
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-SUPPORTED_PAGE_SIZES = (16, 32, 64, 128)
+SUPPORTED_PAGE_SIZES = (1, 16, 32, 64, 128)
 
 # ---------------------------------------------------------------------------
 # PTX helpers.
@@ -418,6 +418,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             if num_tokens_per_page is not None:
                 raise ValueError("page size is only valid when use_paged_kv=True")
             self.num_tokens_per_page = self.kv_tile
+        # page_size=1 cannot use TMA swizzled boxes (box height 1 does not span
+        # an 8-row swizzle period and would require 128 page IDs in the load
+        # warp's 24-register budget). Use warp-cooperative 16B cp.async instead.
+        self.use_cp_async_paged_kv = self.use_paged_kv and self.num_tokens_per_page == 1
         # The block-table width is a runtime tensor dimension. Do not specialize
         # on it merely to cache one row in a warp; direct loads keep one compiled
         # artifact valid for every page-table capacity.
@@ -485,6 +489,17 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             self.num_tokens_per_page * self.tma_copy_head_per_iter
         )
         self.kv_page_chunks = self.kv_tile // self.num_tokens_per_page
+
+        # Cooperative 16-byte cp.async tiling for token-granular (page_size=1)
+        # paged KV. Every supported head_tile in {32, 64, 128, 256} divides 32
+        # lanes cleanly into contiguous 16B chunks per row.
+        self.cp_async_copy_bytes = 16
+        self.cp_async_lanes_per_row = self.head_tile // self.cp_async_copy_bytes
+        self.cp_async_rows_per_step = cute.arch.WARP_SIZE // self.cp_async_lanes_per_row
+        self.cp_async_row_chunks = self.kv_tile // cute.arch.WARP_SIZE
+        self.cp_async_steps_per_chunk = (
+            cute.arch.WARP_SIZE // self.cp_async_rows_per_step
+        )
 
     @cute.jit
     def _get_swizzled_col(
@@ -755,6 +770,68 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         mbar_arrived,
                         l2_cache_hint=l2_cache_hint,
                     )
+
+    @cute.jit
+    def load_one_paged_kv_tile_cp_async(
+        self,
+        s_dst: cutlass.Pointer,
+        kv_head_ptr: cutlass.Pointer,
+        kv_page_stride: cutlass.Int64,
+        mbar_arrived: cutlass.Pointer,
+        block_table_row_ptr: cutlass.Pointer,
+        kv_seq_idx: cutlass.Int32,
+        seqlen_k: cutlass.Int32,
+        lane: cutlass.Int32,
+    ) -> None:
+        """Load one logical K/V tile from token-granular (page_size=1) pages.
+
+        All 32 lanes of the load warp cooperatively gather 16-byte chunks via
+        ``cp.async.cg.shared.global`` directly into the swizzled SMEM layout
+        consumed by ``mma_qk`` and ``mma_pv``, then commit completion to
+        ``mbar_arrived`` via ``cp.async.mbarrier.arrive.noinc``.
+        """
+        lane_row = lane // self.cp_async_lanes_per_row
+        col = (lane % self.cp_async_lanes_per_row) * self.cp_async_copy_bytes
+        col_chunk = col // self.tma_copy_head_per_iter
+        col_in_chunk = col % self.tma_copy_head_per_iter
+        s_col_base = s_dst + col_chunk * self.tma_copy_elems_per_iter
+        kv_head_col_ptr = kv_head_ptr + cutlass.Int64(col)
+        last_valid_token = seqlen_k - cutlass.Int32(1)
+
+        for row_chunk in cutlass.range_constexpr(self.cp_async_row_chunks):
+            chunk_row_base = row_chunk * cute.arch.WARP_SIZE
+            logical_tok = cute.math.min(
+                kv_seq_idx + cutlass.Int32(chunk_row_base) + lane,
+                last_valid_token,
+            )
+            chunk_page_id = cutlass.Int32(block_table_row_ptr[logical_tok])
+
+            for step in cutlass.range_constexpr(self.cp_async_steps_per_chunk):
+                row_in_chunk = (
+                    cutlass.Int32(step * self.cp_async_rows_per_step) + lane_row
+                )
+                page_id = prims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=chunk_page_id,
+                    offset=row_in_chunk,
+                    mask_and_clamp=0x1F,
+                    kind=prims.Shfl.IDX,
+                )
+                row = cutlass.Int32(chunk_row_base) + row_in_chunk
+                s_ptr = (
+                    s_col_base
+                    + row * self.tma_copy_head_per_iter
+                    + self._get_swizzled_col(row, col_in_chunk)
+                )
+                g_ptr = kv_head_col_ptr + cutlass.Int64(page_id) * kv_page_stride
+                prims.cp_async_shared_global(
+                    s_ptr,
+                    g_ptr,
+                    self.cp_async_copy_bytes,
+                    prims.LoadCacheModifier.CG,
+                )
+
+        prims.cp_async_mbarrier_arrive(mbar_arrived, noinc=True)
 
     @cute.jit
     def load_q_tile(
@@ -2239,8 +2316,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         v: cute.Tensor,
         o: cute.Tensor,
         lse: cute.Tensor | None,
-        tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
-        tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_k_desc: cutlass.GridConstant[cuda.TensorMap] | None,
+        tma_v_desc: cutlass.GridConstant[cuda.TensorMap] | None,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         skip_softmax_threshold: cute.Tensor | None,
@@ -2389,8 +2466,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         )
         mbar_arrived = s_mbar
         mbar_consumed = s_mbar.subview(self.kv_pipeline_stages)
-        tma_k_desc_ptr = tma_k_desc.get_ptr()
-        tma_v_desc_ptr = tma_v_desc.get_ptr()
+        tma_k_desc_ptr = None
+        tma_v_desc_ptr = None
+        if cutlass.const_expr(not self.use_cp_async_paged_kv):
+            tma_k_desc_ptr = tma_k_desc.get_ptr()
+            tma_v_desc_ptr = tma_v_desc.get_ptr()
 
         # Initialize the K/V pipeline only for CTAs that have both a Q row and
         # at least one K/V token. The condition is CTA-uniform, so zero-length
@@ -2398,14 +2478,16 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         # return (early kernel returns are unsupported by CuTe DSL).
         if q_seq_idx < seqlen_q and has_kv_work:
             if warp == self.load_warp_id:
+                if cutlass.const_expr(not self.use_cp_async_paged_kv):
+                    if prims.elect_sync():
+                        prims.prefetch_tensormap(tma_k_desc_ptr)
+                        prims.prefetch_tensormap(tma_v_desc_ptr)
+                arrived_count = cute.arch.WARP_SIZE if self.use_cp_async_paged_kv else 1
                 if prims.elect_sync():
-                    prims.prefetch_tensormap(tma_k_desc_ptr)
-                    prims.prefetch_tensormap(tma_v_desc_ptr)
-                if prims.elect_sync():
-                    prims.mbarrier_init(mbar_arrived.subview(0), 1)
-                    prims.mbarrier_init(mbar_arrived.subview(1), 1)
+                    prims.mbarrier_init(mbar_arrived.subview(0), arrived_count)
+                    prims.mbarrier_init(mbar_arrived.subview(1), arrived_count)
                     if cutlass.const_expr(self.kv_pipeline_stages == 3):
-                        prims.mbarrier_init(mbar_arrived.subview(2), 1)
+                        prims.mbarrier_init(mbar_arrived.subview(2), arrived_count)
                     prims.mbarrier_init(mbar_consumed.subview(0), self.threads_compute)
                     prims.mbarrier_init(mbar_consumed.subview(1), self.threads_compute)
                     if cutlass.const_expr(self.kv_pipeline_stages == 3):
@@ -2427,7 +2509,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 and self.kv_tile == 128
             )
             uses_kv_l2_policy = cutlass.const_expr(
-                self.head_tile in (128, 256)
+                not self.use_cp_async_paged_kv
+                and self.head_tile in (128, 256)
                 and self.q_tile == 128
                 and self.kv_tile == 128
             )
@@ -2438,6 +2521,15 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     write_only_types=[cutlass.Int64],
                     read_only_args=[],
                 )
+            if cutlass.const_expr(self.use_cp_async_paged_kv):
+                k_page_stride = cutlass.Int64(k.stride[0])
+                v_page_stride = cutlass.Int64(v.stride[0])
+                kv_head_offset = cutlass.Int64(kv_head_idx * self.head_tile)
+                k_head_ptr = k.iterator.raw_ptr() + kv_head_offset
+                v_head_ptr = v.iterator.raw_ptr() + kv_head_offset
+                block_table_row_ptr = block_tables.iterator.raw_ptr() + cutlass.Int64(
+                    request_idx
+                ) * cutlass.Int64(block_tables.shape[1])
             cached_page = cutlass.Int32(0)
             if cutlass.const_expr(uses_three_stage_pipeline):
                 # Treat K and V as one ordered operand stream. Three ring slots
@@ -2456,7 +2548,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     kv_seq_idx = (
                         num_kv_tiles - cutlass.Int32(1) - tile_iteration
                     ) * self.kv_tile
-                    if cutlass.const_expr(self.use_paged_kv):
+                    if cutlass.const_expr(
+                        self.use_paged_kv and not self.use_cp_async_paged_kv
+                    ):
                         page_ids = self.resolve_paged_kv_tile_pages(
                             request_idx,
                             kv_seq_idx,
@@ -2464,13 +2558,29 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             block_tables,
                             cached_page,
                         )
-                    else:
+                    elif cutlass.const_expr(not self.use_paged_kv):
                         kv_tma_seq_idx = k_token_base + kv_seq_idx
 
                     s_operand = self.get_kv_stage_ptr(sKV, stage)
                     arrived = self.get_mbar_stage_ptr(mbar_arrived, stage)
                     is_v_operand = operand_idx & cutlass.Int32(1)
-                    if cutlass.const_expr(self.use_paged_kv):
+                    if cutlass.const_expr(self.use_cp_async_paged_kv):
+                        kv_head_ptr = k_head_ptr
+                        kv_page_stride = k_page_stride
+                        if is_v_operand != 0:
+                            kv_head_ptr = v_head_ptr
+                            kv_page_stride = v_page_stride
+                        self.load_one_paged_kv_tile_cp_async(
+                            s_operand,
+                            kv_head_ptr,
+                            kv_page_stride,
+                            arrived,
+                            block_table_row_ptr,
+                            kv_seq_idx,
+                            seqlen_k,
+                            lane,
+                        )
+                    elif cutlass.const_expr(self.use_paged_kv):
                         if is_v_operand == 0:
                             self.load_one_paged_kv_tile(
                                 s_operand,
@@ -2528,7 +2638,28 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     fixed_kv_l2_cache_hint = kv_l2_cache_hint
 
                 kv_seq_idx = (num_kv_tiles - 1) * self.kv_tile
-                if cutlass.const_expr(self.use_paged_kv):
+                if cutlass.const_expr(self.use_cp_async_paged_kv):
+                    self.load_one_paged_kv_tile_cp_async(
+                        sK,
+                        k_head_ptr,
+                        k_page_stride,
+                        k_arrived,
+                        block_table_row_ptr,
+                        kv_seq_idx,
+                        seqlen_k,
+                        lane,
+                    )
+                    self.load_one_paged_kv_tile_cp_async(
+                        sV,
+                        v_head_ptr,
+                        v_page_stride,
+                        v_arrived,
+                        block_table_row_ptr,
+                        kv_seq_idx,
+                        seqlen_k,
+                        lane,
+                    )
+                elif cutlass.const_expr(self.use_paged_kv):
                     page_ids = self.resolve_paged_kv_tile_pages(
                         request_idx,
                         kv_seq_idx,
@@ -2574,7 +2705,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 kv_seq_idx -= self.kv_tile
                 consumed_phase = cutlass.Int32(0)
                 while kv_seq_idx >= kv_begin_tile * self.kv_tile:
-                    if cutlass.const_expr(self.use_paged_kv):
+                    if cutlass.const_expr(
+                        self.use_paged_kv and not self.use_cp_async_paged_kv
+                    ):
                         page_ids = self.resolve_paged_kv_tile_pages(
                             request_idx,
                             kv_seq_idx,
@@ -2583,7 +2716,18 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             cached_page,
                         )
                     self.wait_pipeline_barrier(k_consumed, consumed_phase)
-                    if cutlass.const_expr(self.use_paged_kv):
+                    if cutlass.const_expr(self.use_cp_async_paged_kv):
+                        self.load_one_paged_kv_tile_cp_async(
+                            sK,
+                            k_head_ptr,
+                            k_page_stride,
+                            k_arrived,
+                            block_table_row_ptr,
+                            kv_seq_idx,
+                            seqlen_k,
+                            lane,
+                        )
+                    elif cutlass.const_expr(self.use_paged_kv):
                         self.load_one_paged_kv_tile(
                             sK,
                             tma_k_desc_ptr,
@@ -2603,7 +2747,18 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             fixed_kv_l2_cache_hint,
                         )
                     self.wait_pipeline_barrier(v_consumed, consumed_phase)
-                    if cutlass.const_expr(self.use_paged_kv):
+                    if cutlass.const_expr(self.use_cp_async_paged_kv):
+                        self.load_one_paged_kv_tile_cp_async(
+                            sV,
+                            v_head_ptr,
+                            v_page_stride,
+                            v_arrived,
+                            block_table_row_ptr,
+                            kv_seq_idx,
+                            seqlen_k,
+                            lane,
+                        )
+                    elif cutlass.const_expr(self.use_paged_kv):
                         self.load_one_paged_kv_tile(
                             sV,
                             tma_v_desc_ptr,
@@ -3112,28 +3267,32 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 raise ValueError(
                     "runtime paged tensors must match the compiled structural config"
                 )
-            tma_k_desc = cuda.create_tensor_map_tiled_from_view(
-                k,
-                box_dims=(
-                    1,
-                    1,
-                    self.num_tokens_per_page,
-                    self.tma_copy_head_per_iter,
-                ),
-                stride_order=(3, 2, 1, 0),
-                swizzle=self.tma_swizzle,
-            )
-            tma_v_desc = cuda.create_tensor_map_tiled_from_view(
-                v,
-                box_dims=(
-                    1,
-                    1,
-                    self.num_tokens_per_page,
-                    self.tma_copy_head_per_iter,
-                ),
-                stride_order=(3, 2, 1, 0),
-                swizzle=self.tma_swizzle,
-            )
+            if cutlass.const_expr(self.use_cp_async_paged_kv):
+                tma_k_desc = None
+                tma_v_desc = None
+            else:
+                tma_k_desc = cuda.create_tensor_map_tiled_from_view(
+                    k,
+                    box_dims=(
+                        1,
+                        1,
+                        self.num_tokens_per_page,
+                        self.tma_copy_head_per_iter,
+                    ),
+                    stride_order=(3, 2, 1, 0),
+                    swizzle=self.tma_swizzle,
+                )
+                tma_v_desc = cuda.create_tensor_map_tiled_from_view(
+                    v,
+                    box_dims=(
+                        1,
+                        1,
+                        self.num_tokens_per_page,
+                        self.tma_copy_head_per_iter,
+                    ),
+                    stride_order=(3, 2, 1, 0),
+                    swizzle=self.tma_swizzle,
+                )
         else:
             if cutlass.const_expr(
                 head_dim != k.shape[2]

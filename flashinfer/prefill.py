@@ -4658,7 +4658,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             _validate_sm120_prims_plan_options(
                 kv_layout=self._kv_layout,
-                required_kv_layout="HND",
+                required_kv_layout=(
+                    self._kv_layout
+                    if page_size == 1 and self._kv_layout in ("HND", "NHD")
+                    else "HND"
+                ),
                 custom_mask=custom_mask,
                 packed_custom_mask=packed_custom_mask,
                 pos_encoding_mode=pos_encoding_mode,
@@ -5417,13 +5421,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "backend='cute-dsl-prims' requires HND K/V pools with shape "
                     "[num_pages, num_kv_heads, page_size, head_dim]"
                 )
+            assert self._prims_backend is not None
+            if self._kv_layout == "NHD" and self._prims_backend._page_size == 1:
+                if k_cache.shape[1] != 1:
+                    raise ValueError(
+                        "backend='cute-dsl-prims' with kv_layout='NHD' and "
+                        "page_size=1 requires K/V pools with shape "
+                        "[num_pages, 1, num_kv_heads, head_dim]; got "
+                        f"{tuple(k_cache.shape)}"
+                    )
+                k_cache = k_cache.squeeze(1).unsqueeze(2)
+                v_cache = v_cache.squeeze(1).unsqueeze(2)
             if out is None:
                 out = torch.empty(
                     q.shape,
                     dtype=self._cached_o_data_type,
                     device=q.device,
                 )
-            assert self._prims_backend is not None
             lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
             res = self._prims_backend.run_paged(
                 q,
