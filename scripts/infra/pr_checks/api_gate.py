@@ -19,6 +19,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pr_checks.api_report import publish_report
+from pr_checks.api_codeowners import owners_for_paths
 from pr_checks.github_api import GitHub, GitHubError, warning as emit_warning
 
 GATE = "API compatibility"
@@ -374,13 +375,26 @@ class Gate:
             self.status(pr, GATE, state, blocked_reason)
         maintainers = []
         try:
-            maintainers = [
-                c["login"]
-                for c in self.api.paginate(f"{self.root}/collaborators")
-                if c.get("role_name") in ("admin", "maintain")
-            ]
+            revision = pr["base"]["sha"]
+            if not re.fullmatch(r"[a-f0-9]{40}", revision):
+                raise ValueError("Invalid base revision")
+            owners = subprocess.run(
+                ["git", "show", f"{revision}:.github/CODEOWNERS"],
+                cwd=Path(__file__).resolve().parents[3],
+                env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if owners.returncode == 0:
+                paths = [
+                    f["path"]
+                    for f in report["findings"]
+                    if f["classification"] == "BREAKING"
+                ]
+                maintainers = owners_for_paths(owners.stdout, paths)
         except Exception as error:
-            self.warning(f"Maintainer accounts could not be listed: {error}")
+            self.warning(f"Code owners could not be resolved: {error}")
         try:
             report["comment_delivery"] = self.publish(
                 pr,

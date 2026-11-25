@@ -177,6 +177,12 @@ and [pull_request_target](https://docs.github.com/en/actions/reference/workflows
 
 ## Documentation and API check separation
 
+Blocked summaries list code owners matched to BREAKING API paths using the
+target revision's `.github/CODEOWNERS` (last matching rule wins). Bot owners are
+omitted. These are ownership hints; accepting a break still requires a human
+with maintain/admin permission who is not the PR author. The PR head cannot
+replace the ownership hints by editing its own CODEOWNERS file.
+
 API scanning and merge gating run in `pr-api-compatibility.yml` from trusted
 code. Its `trusted-public-api-report` artifact, API sticky marker, and inline
 marker are independent of documentation reports. Evidence-upload failures warn

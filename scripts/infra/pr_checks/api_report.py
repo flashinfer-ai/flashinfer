@@ -179,15 +179,19 @@ def render_summary(
                 ]
             )
     if state == "BLOCKED" and not blocked_reason:
-        names = (
-            ", ".join(f"@{name}" for name in maintainers)
-            if maintainers
-            else "with maintain/admin permission"
-        )
+        if maintainers:
+            lines.extend(
+                [
+                    "",
+                    "Code owners: "
+                    + ", ".join(f"@{name}" for name in maintainers)
+                    + ".",
+                ]
+            )
         lines.extend(
             [
                 "",
-                f"Maintainers {names} can comment `@flashinfer-bot API BREAK expected` as the entire comment to unblock all API BREAK findings for the current head. Reason: … (provide separately in the PR description or discussion).",
+                "Maintainers with maintain/admin permission (other than the PR author) can comment `@flashinfer-bot API BREAK expected` as the entire comment to unblock all API BREAK findings for the current head. Reason: … (provide separately in the PR description or discussion).",
             ]
         )
     if run_url:

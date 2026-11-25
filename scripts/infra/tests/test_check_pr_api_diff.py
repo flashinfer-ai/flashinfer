@@ -769,5 +769,66 @@ class ListApisExperimentalExclusionTest(unittest.TestCase):
                 self.assertIn(f"def {name}(", included)
 
 
+class CodeOwnerHintsTest(unittest.TestCase):
+    def test_codeowners_matching(self):
+        from pr_checks.api_codeowners import owners_for_paths
+
+        rules = """* @global @flashinfer-bot
+/flashinfer/ @core
+/flashinfer/sampling.py @sampling @org/team # inline comment
+/docs/* @docs
+apps/ @apps
+**/logs @logs
+/apps/private
+*.cu @cuda
+!bad @invalid
+[ab].py @invalid
+"""
+        cases = {
+            "README.md": ["global"],
+            "flashinfer/sampling.py": ["sampling", "org/team"],
+            "flashinfer/sub/api.py": ["core"],
+            "nested/flashinfer/sampling.py": ["global"],
+            "docs/start.md": ["docs"],
+            "docs/nested/start.md": ["global"],
+            "nested/apps/api.py": ["apps"],
+            "apps/private/api.py": [],
+            "nested/logs/error.txt": ["logs"],
+            "csrc/kernel.cu": ["cuda"],
+            "Flashinfer/sampling.py": ["global"],
+        }
+        for path, owners in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(owners_for_paths(rules, [path]), owners)
+        self.assertEqual(
+            owners_for_paths(rules, ["flashinfer/sampling.py", "README.md"]),
+            ["sampling", "org/team", "global"],
+        )
+
+    def test_owner_hints_do_not_claim_unrelated_permissions(self):
+        from pr_checks.api_report import render_summary
+
+        report = {
+            "execution_status": "COMPLETE",
+            "findings": [
+                {
+                    "api": "flashinfer.foo",
+                    "path": "flashinfer/foo.py",
+                    "line": 1,
+                    "classification": "BREAKING",
+                    "message": "Removed API",
+                    "before": "def foo(x)",
+                    "after": "",
+                    "anchors": [],
+                }
+            ],
+        }
+        body = render_summary(
+            report, repo="org/repo", head="a" * 40, maintainers=["owner", "org/team"]
+        )
+        self.assertIn("Code owners: @owner, @org/team", body)
+        self.assertIn("maintain/admin permission", body)
+
+
 if __name__ == "__main__":
     unittest.main()
