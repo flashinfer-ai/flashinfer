@@ -12,6 +12,8 @@ Padding buffers are allocated once. Each padded call includes the A input copy,
 GEMM and output copy. Graph timing includes those device activities but excludes
 host dispatch; eager timing includes the completed call and final synchronization.
 Compilation, quantization and one-time buffer allocation are outside timing.
+Paths are shuffled separately for every sample of each timing metric. JSON
+records the seed and executed orders; raw_us uses round-major sample indices.
 """
 
 import argparse
@@ -39,6 +41,7 @@ def main():
     parser.add_argument("--scale-major-mode", choices=["K", "MN"], default="K")
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=9556)
     parser.add_argument("--compare-groupwise", action="store_true")
     args = parser.parse_args()
     if args.m != 1 and (args.m <= 0 or args.m % 128):
@@ -60,7 +63,7 @@ def main():
         parser.error(f"CUPTI >= 13 is required for warm/cold measurements: {exc}")
     if not is_sm12x_supported(torch.device("cuda")):
         parser.error("SM120/121 required")
-    torch.manual_seed(9556)
+    torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     m, n, k, mode = args.m, args.n, args.k, args.scale_major_mode
@@ -115,31 +118,44 @@ def main():
         name: {key: [] for key in ("eager_complete", "graph", "cold_graph")}
         for name in funcs
     }
-    rng = random.Random(9556)
-    for _ in range(args.rounds):
-        order = list(funcs)
-        rng.shuffle(order)
-        for name in order:
-            fn = funcs[name]
-            for _ in range(args.samples):
-                torch.cuda.synchronize()
-                start = time.perf_counter_ns()
-                fn()
-                torch.cuda.synchronize()
-                raw[name]["eager_complete"].append(
-                    (time.perf_counter_ns() - start) / 1000
+    rng = random.Random(args.seed)
+    sample_order = []
+    for round_index in range(args.rounds):
+        for key in ("eager_complete", "graph", "cold_graph"):
+            for sample_index in range(args.samples):
+                order = list(funcs)
+                rng.shuffle(order)
+                sample_order.append(
+                    {
+                        "round": round_index,
+                        "sample": sample_index,
+                        "metric": key,
+                        "paths": order,
+                    }
                 )
-            for cold, key in ((False, "graph"), (True, "cold_graph")):
-                times = bench_gpu_time(
-                    fn,
-                    enable_cupti=True,
-                    use_cuda_graph=True,
-                    dry_run_iters=5,
-                    repeat_iters=args.samples,
-                    cold_l2_cache=cold,
-                    l2_flush_size_mb=128 if cold else None,
-                )
-                raw[name][key].extend(t * 1000 for t in times)
+                for name in order:
+                    fn = funcs[name]
+                    if key == "eager_complete":
+                        torch.cuda.synchronize()
+                        start = time.perf_counter_ns()
+                        fn()
+                        torch.cuda.synchronize()
+                        elapsed_us = (time.perf_counter_ns() - start) / 1000
+                    else:
+                        cold = key == "cold_graph"
+                        times = bench_gpu_time(
+                            fn,
+                            enable_cupti=True,
+                            use_cuda_graph=True,
+                            dry_run_iters=5,
+                            repeat_iters=1,
+                            cold_l2_cache=cold,
+                            l2_flush_size_mb=128 if cold else None,
+                        )
+                        if len(times) != 1:
+                            raise RuntimeError("Expected one GPU timing per sample")
+                        elapsed_us = times[0] * 1000
+                    raw[name][key].append(elapsed_us)
     result = {
         "gpu": torch.cuda.get_device_name(),
         "cuda": torch.version.cuda,
@@ -149,6 +165,10 @@ def main():
         "module": flashinfer.__file__,
         "shape_mnk": [m, n, k],
         "layout": mode,
+        "seed": args.seed,
+        "rounds": args.rounds,
+        "samples_per_round": args.samples,
+        "sample_order": sample_order,
         "contract": "FP8 inputs ready; BF16 out; full-call GPU span; warm/cold L2; eager includes sync",
         "median_us": {
             name: {key: statistics.median(vals) for key, vals in metrics.items()}
