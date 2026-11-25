@@ -17,13 +17,17 @@ Host side of the Cake MLA decode over TensorRT-LLM's ``fp4_mla`` KV cache.
 
 :func:`plan_fp4_mla_decode` fixes one decode bucket (batch, query tokens per
 request, heads, page-table width, optionally a bound on the KV lengths) on one
-device, chooses the KV split count, the decode build and the reducer build,
-and allocates the split partials once; the returned
+device, chooses the KV split count, the decode build (with or without long
+rows, per item or persistent) and the reducer build, and allocates the split
+partials once; the returned
 :class:`Fp4MlaDecodeRunner` reads TensorRT-LLM's own tensors in place on every
 call (no copy of the cache, the query or its scales) and writes the
 caller-owned BF16 output.  A call allocates no CUDA memory and reads no
 device value on the host, so one runner serves every CUDA-graph replay of
-its bucket while ``kv_lens`` changes.
+its bucket while ``kv_lens`` changes.  The runner keeps the FFI views it
+derives from the caller's tensors, keyed by each tensor's address, dtype,
+shape, strides and device, so a call with the tensors of an earlier call
+repeats none of the layout checks and conversions.
 """
 
 from __future__ import annotations
@@ -75,6 +79,15 @@ MIN_PAGES_PER_SPLIT = 2
 DITHER_KEYS = 32768
 # Warps per CTA of the split reducer (256 threads).
 MERGE_WARPS = 8
+# The persistent decode build runs at most one cluster per SM pair, each
+# looping over the work items (the same bits as one cluster per item); it
+# overlaps an item's loads with the previous item's last pages and epilogue.
+# sm_100a takes it for every bucket; on sm_103a, whose persistent loop runs
+# each page some 6 % slower, only a bucket without long rows whose items
+# take several waves and have at most PERSISTENT_PAGES_SM103 pages each.
+PERSISTENT_PAGES_SM103 = 32
+# Views of the caller's tensors a runner keeps (their FFI tensors).
+VIEW_CACHE_ENTRIES = 256
 
 _U8 = (torch.uint8, torch.float8_e4m3fn)
 
@@ -114,6 +127,23 @@ def num_split_for(
     return chosen
 
 
+def persistent_for(
+    *, arch: str | None, items: int, pairs: int, pages_per_item: int, long_rows: bool
+) -> bool:
+    """Whether the bucket takes the persistent decode build: every bucket on
+    ``sm_100a``; on ``sm_103a`` a bucket without long rows whose ``items``
+    (splits included) exceed the device's ``pairs`` and whose items have at
+    most ``PERSISTENT_PAGES_SM103`` pages; none on another architecture.  The
+    choice changes neither the split count nor the arithmetic."""
+    if arch == "sm_100a":
+        return True
+    if arch == "sm_103a":
+        return (
+            not long_rows and items > pairs and pages_per_item <= PERSISTENT_PAGES_SM103
+        )
+    return False
+
+
 def merge_warps_per_row(rows: int) -> int:
     """The split reducer's warps per output row: 4 up to 256 rows, 2 up to
     1,024, else 1 (more warps per row for few rows, so the merge still spans
@@ -142,6 +172,11 @@ class Fp4MlaDecodePlan:
     sm_count: int
     num_split: int
     long_rows: bool = True
+    persistent: bool = False
+
+    @property
+    def pairs(self) -> int:
+        return self.sm_count // 2
 
     @property
     def rows_per_request(self) -> int:
@@ -160,7 +195,9 @@ class Fp4MlaDecodePlan:
         return merge_warps_per_row(self.rows)
 
 
-def _plan(batch, q_len, num_heads, page_table_width, sm_count, max_splits, max_kv):
+def _plan(
+    batch, q_len, num_heads, page_table_width, sm_count, max_splits, max_kv, arch
+):
     for name, value in (
         ("batch", batch),
         ("q_len", q_len),
@@ -186,6 +223,14 @@ def _plan(batch, q_len, num_heads, page_table_width, sm_count, max_splits, max_k
         page_table_width=page_table_width,
         max_splits=max_splits,
     )
+    long_rows = long_rows_for(page_table_width=page_table_width, max_kv=max_kv)
+    persistent = persistent_for(
+        arch=arch,
+        items=splits * m_tiles * batch,
+        pairs=sm_count // 2,
+        pages_per_item=-(-page_table_width // splits),
+        long_rows=long_rows,
+    )
     return Fp4MlaDecodePlan(
         batch,
         q_len,
@@ -193,14 +238,15 @@ def _plan(batch, q_len, num_heads, page_table_width, sm_count, max_splits, max_k
         page_table_width,
         sm_count,
         splits,
-        long_rows_for(page_table_width=page_table_width, max_kv=max_kv),
+        long_rows,
+        persistent,
     )
 
 
 def _page_view(pool, page_bytes, name):
     """``pool`` as ``[pages, page_bytes]`` bytes in place: the first dimension
-    is the page id, the rest one contiguous page; returns (view, page stride in
-    bytes).  The checks read the shape and strides only (no tensor op)."""
+    is the page id, the rest one contiguous page; returns (page count, page
+    stride in bytes).  The checks read the shape and strides only."""
     if pool.dtype not in _U8:
         raise TypeError(f"{name}: dtype {pool.dtype}, expected uint8 bytes")
     shape, strides = pool.shape, pool.stride()
@@ -220,14 +266,14 @@ def _page_view(pool, page_bytes, name):
     stride = strides[0]
     if stride < page_bytes:
         raise ValueError(f"{name}: page stride {stride} B overlaps the pages")
-    return pool.view(torch.uint8), stride
+    return shape[0], stride
 
 
 def _arg_slots(record, static, grid):
     """The ``run`` arguments of ``record`` (its ``arg_plan``, as
     ``cake_jit.launch_args`` orders them) with every value fixed by the plan
-    filled in, and ``(position, logical name)`` of the values each call
-    passes."""
+    filled in, and ``(position, index into _PER_CALL)`` of the values each
+    call passes."""
     logical = record["logical"]
     args, per_call = [], []
     for kind, key in record["arg_plan"]:
@@ -242,27 +288,26 @@ def _arg_slots(record, static, grid):
         if name in static:
             args.append(static[name])
         else:
-            per_call.append((len(args), name))
+            per_call.append((len(args), _PER_CALL.index(name)))
             args.append(None)
-    return args, tuple(per_call)
+    return tuple(args), tuple(per_call)
 
 
-# The logical arguments each call passes (the rest are the plan's).
-_PER_CALL = frozenset(
-    (
-        "kv_k",
-        "kv_v",
-        "kv_sf",
-        "v_pool",
-        "q",
-        "q_sf",
-        "page_table",
-        "kv_lens",
-        "q_gs",
-        "kv_gs",
-        "out",
-        "sm_scale",
-    )
+# The logical arguments each call passes (the rest are the plan's), in the
+# order of the values ``Fp4MlaDecodeRunner.__call__`` gathers.
+_PER_CALL = (
+    "kv_k",
+    "kv_v",
+    "kv_sf",
+    "v_pool",
+    "q",
+    "q_sf",
+    "page_table",
+    "kv_lens",
+    "q_gs",
+    "kv_gs",
+    "out",
+    "sm_scale",
 )
 
 
@@ -289,7 +334,12 @@ class Fp4MlaDecodeRunner:
         self.device = device
         self.device_index = device.index
         self.arch = device_arch(device.index)
-        self.decode = record_for("decode", self.arch, long_rows=plan.long_rows)
+        self.decode = record_for(
+            "decode",
+            self.arch,
+            long_rows=plan.long_rows,
+            persistent=plan.persistent,
+        )
         self.merge = record_for(
             "merge", self.arch, warps_per_row=plan.merge_warps_per_row
         )
@@ -311,12 +361,14 @@ class Fp4MlaDecodeRunner:
             batch=p.batch,
             rows_per_request=p.rows_per_request,
             num_split=s,
+            pairs=p.pairs,
         )
         self.merge_grid = launch_grid(
             MODULES[self.merge],
             batch=p.batch,
             rows_per_request=p.rows_per_request,
             num_split=s,
+            pairs=p.pairs,
         )
         # What every call launches with but the per-call tensors: the plan's
         # scalars, the partials and the grids, in each entry's argument order;
@@ -341,6 +393,9 @@ class Fp4MlaDecodeRunner:
         self._merge_args = _arg_slots(MODULES[self.merge], static, self.merge_grid)
         self._ffi_device = tvm_ffi.device(f"cuda:{self.device_index}")
         self._entries = None
+        # (role, address, dtype, shape, strides, device) -> what the role's
+        # checks derived from that tensor (its FFI view and page geometry).
+        self._views: dict[tuple, object] = {}
 
     def _entry_points(self):
         """The ``run`` entries of the decode and the reducer (loaded, or
@@ -351,6 +406,134 @@ class Fp4MlaDecodeRunner:
                 for name in (self.decode, self.merge)
             )
         return self._entries
+
+    def _view(self, role, tensor):
+        """What ``role``'s checks derive from ``tensor``, kept per tensor
+        geometry: a later call with a tensor of the same address, dtype,
+        shape, strides and device reuses it."""
+        key = (
+            role,
+            tensor.data_ptr(),
+            tensor.dtype,
+            tensor.shape,
+            tensor.stride(),
+            tensor.get_device(),
+        )
+        found = self._views.get(key)
+        if found is None:
+            found = _DERIVE[role](self, tensor)
+            if len(self._views) >= VIEW_CACHE_ENTRIES:
+                del self._views[next(iter(self._views))]
+            self._views[key] = found
+        return found
+
+    def _device_check(self, tensor):
+        if tensor.get_device() != self.device_index:
+            raise ValueError(f"every tensor must be on {self.device}")
+
+    def _kv(self, kv_cache):
+        pages, stride = _page_view(kv_cache, KV_PAGE_BYTES, "kv_cache")
+        if stride % 16:
+            raise ValueError(
+                f"kv_cache: page stride {stride} B is not a multiple of 16"
+            )
+        self._device_check(kv_cache)
+        kv = torch.as_strided(
+            kv_cache.view(torch.uint8),
+            (pages, PAGE_TOKENS, TOKEN_BYTES),
+            (stride, TOKEN_BYTES, 1),
+        )
+        return pages, tvm_ffi.from_dlpack(kv)
+
+    def _sf(self, kv_scale_cache):
+        pages, stride = _page_view(kv_scale_cache, SF_PAGE_BYTES, "kv_scale_cache")
+        if stride != SF_PAGE_BYTES:
+            raise ValueError(
+                f"kv_scale_cache: page stride {stride} B, expected {SF_PAGE_BYTES}"
+            )
+        self._device_check(kv_scale_cache)
+        words = kv_scale_cache.view(torch.uint8).view(-1).view(torch.uint32)
+        return pages, tvm_ffi.from_dlpack(words)
+
+    def _vsf(self, v_scale_cache):
+        pages, stride = _page_view(v_scale_cache, V_SCALE_PAGE_BYTES, "v_scale_cache")
+        if stride != V_SCALE_PAGE_BYTES:
+            raise ValueError(
+                f"v_scale_cache: page stride {stride} B; the decode reads "
+                f"TensorRT-LLM's MLA V-scale pool as {V_SCALE_PAGE_BYTES}-byte pages "
+                f"at a {V_SCALE_PAGE_BYTES}-byte stride, addressed by kv_cache's "
+                "page ids, and takes no other layout"
+            )
+        self._device_check(v_scale_cache)
+        words = v_scale_cache.view(torch.uint8).view(-1).view(torch.uint32)
+        return pages, tvm_ffi.from_dlpack(words)
+
+    def _q(self, q_fp4):
+        p = self.plan
+        if q_fp4.dtype not in _U8 or q_fp4.dim() != 2 or q_fp4.shape[1] != TOKEN_BYTES:
+            raise ValueError(
+                f"q_fp4: uint8 [rows, {TOKEN_BYTES}], got {q_fp4.dtype} {tuple(q_fp4.shape)}"
+            )
+        if not q_fp4.is_contiguous() or q_fp4.shape[0] < p.rows:
+            raise ValueError(f"q_fp4: contiguous with at least {p.rows} rows")
+        self._device_check(q_fp4)
+        words = q_fp4.view(torch.uint8)[: p.rows].view(torch.uint32)
+        return tvm_ffi.from_dlpack(words)
+
+    def _q_sf(self, q_scale):
+        need = -(-self.plan.rows // 128) * Q_SF_BLOCK_BYTES
+        if (
+            q_scale.dtype not in _U8
+            or not q_scale.is_contiguous()
+            or q_scale.numel() < need
+        ):
+            raise ValueError(f"q_scale: contiguous E4M3 bytes, at least {need}")
+        self._device_check(q_scale)
+        words = q_scale.view(torch.uint8).view(-1)[:need].view(torch.uint32)
+        return tvm_ffi.from_dlpack(words)
+
+    def _page_table(self, page_table):
+        p = self.plan
+        if (
+            page_table.dtype != torch.int32
+            or tuple(page_table.shape) != (p.batch, p.page_table_width)
+            or not page_table.is_contiguous()
+        ):
+            raise ValueError(
+                f"page_table: contiguous int32 [{p.batch}, {p.page_table_width}], got "
+                f"{page_table.dtype} {tuple(page_table.shape)}"
+            )
+        self._device_check(page_table)
+        return tvm_ffi.from_dlpack(page_table)
+
+    def _kv_lens(self, kv_lens):
+        p = self.plan
+        if (
+            kv_lens.dtype != torch.int32
+            or kv_lens.dim() != 1
+            or kv_lens.shape[0] < p.batch
+            or not kv_lens.is_contiguous()
+        ):
+            raise ValueError(f"kv_lens: contiguous int32 [>= {p.batch}]")
+        self._device_check(kv_lens)
+        return tvm_ffi.from_dlpack(kv_lens[: p.batch])
+
+    def _scale(self, name, scale):
+        if scale.dtype != torch.float32 or scale.numel() != 1:
+            raise ValueError(f"{name}: an FP32 one-element device tensor")
+        self._device_check(scale)
+        return tvm_ffi.from_dlpack(scale.view(1))
+
+    def _out(self, out):
+        p = self.plan
+        if (
+            out.dtype != torch.bfloat16
+            or out.numel() != p.rows * LATENT
+            or not out.is_contiguous()
+        ):
+            raise ValueError(f"out: contiguous BF16 with {p.rows} x {LATENT} elements")
+        self._device_check(out)
+        return tvm_ffi.from_dlpack(out.view(p.rows, LATENT))
 
     def __call__(
         self,
@@ -390,126 +573,64 @@ class Fp4MlaDecodeRunner:
         ``q_global_scale`` / ``kv_global_scale``: FP32 one-element device
         tensors.  ``out``: BF16, ``B q_len H x 512`` contiguous elements.
         """
-        p = self.plan
-        kv, kv_page_stride = _page_view(kv_cache, KV_PAGE_BYTES, "kv_cache")
-        if kv_page_stride % 16:
+        view = self._view
+        pages, kv = view("kv_cache", kv_cache)
+        sf_pages, sf = view("kv_scale_cache", kv_scale_cache)
+        if sf_pages < pages:
             raise ValueError(
-                f"kv_cache: page stride {kv_page_stride} B is not a multiple of 16"
+                f"kv_scale_cache holds {sf_pages} pages, fewer than kv_cache's {pages}"
             )
-        sf, sf_page_stride = _page_view(kv_scale_cache, SF_PAGE_BYTES, "kv_scale_cache")
-        if sf_page_stride != SF_PAGE_BYTES:
+        vsf_pages, vsf = view("v_scale_cache", v_scale_cache)
+        if vsf_pages < pages:
             raise ValueError(
-                f"kv_scale_cache: page stride {sf_page_stride} B, expected {SF_PAGE_BYTES}"
-            )
-        vsf, vsf_page_stride = _page_view(
-            v_scale_cache, V_SCALE_PAGE_BYTES, "v_scale_cache"
-        )
-        if vsf_page_stride != V_SCALE_PAGE_BYTES:
-            raise ValueError(
-                f"v_scale_cache: page stride {vsf_page_stride} B; the decode reads "
-                f"TensorRT-LLM's MLA V-scale pool as {V_SCALE_PAGE_BYTES}-byte pages "
-                f"at a {V_SCALE_PAGE_BYTES}-byte stride, addressed by kv_cache's "
-                "page ids, and takes no other layout"
-            )
-        pages = kv.shape[0]
-        if sf.shape[0] < pages:
-            raise ValueError(
-                f"kv_scale_cache holds {sf.shape[0]} pages, fewer than kv_cache's {pages}"
-            )
-        if vsf.shape[0] < pages:
-            raise ValueError(
-                f"v_scale_cache holds {vsf.shape[0]} pages, fewer than kv_cache's "
+                f"v_scale_cache holds {vsf_pages} pages, fewer than kv_cache's "
                 f"{pages}: the decode reads the V-scale page of every kv_cache page id"
             )
-        if q_fp4.dtype not in _U8 or q_fp4.dim() != 2 or q_fp4.shape[1] != TOKEN_BYTES:
-            raise ValueError(
-                f"q_fp4: uint8 [rows, {TOKEN_BYTES}], got {q_fp4.dtype} {tuple(q_fp4.shape)}"
-            )
-        if not q_fp4.is_contiguous() or q_fp4.shape[0] < p.rows:
-            raise ValueError(f"q_fp4: contiguous with at least {p.rows} rows")
-        need = -(-p.rows // 128) * Q_SF_BLOCK_BYTES
-        if (
-            q_scale.dtype not in _U8
-            or not q_scale.is_contiguous()
-            or q_scale.numel() < need
-        ):
-            raise ValueError(f"q_scale: contiguous E4M3 bytes, at least {need}")
-        if (
-            page_table.dtype != torch.int32
-            or tuple(page_table.shape) != (p.batch, p.page_table_width)
-            or not page_table.is_contiguous()
-        ):
-            raise ValueError(
-                f"page_table: contiguous int32 [{p.batch}, {p.page_table_width}], got "
-                f"{page_table.dtype} {tuple(page_table.shape)}"
-            )
-        if (
-            kv_lens.dtype != torch.int32
-            or kv_lens.dim() != 1
-            or kv_lens.shape[0] < p.batch
-            or not kv_lens.is_contiguous()
-        ):
-            raise ValueError(f"kv_lens: contiguous int32 [>= {p.batch}]")
-        for name, scale in (
-            ("q_global_scale", q_global_scale),
-            ("kv_global_scale", kv_global_scale),
-        ):
-            if scale.dtype != torch.float32 or scale.numel() != 1:
-                raise ValueError(f"{name}: an FP32 one-element device tensor")
-        if (
-            out.dtype != torch.bfloat16
-            or out.numel() != p.rows * LATENT
-            or not out.is_contiguous()
-        ):
-            raise ValueError(f"out: contiguous BF16 with {p.rows} x {LATENT} elements")
-        index = self.device_index
-        for t in (
+        values = (
+            kv,
             kv,
             sf,
             vsf,
-            q_fp4,
-            q_scale,
-            page_table,
-            kv_lens,
-            q_global_scale,
-            kv_global_scale,
-            out,
-        ):
-            if t.get_device() != index:
-                raise ValueError(f"every tensor must be on {self.device}")
-        call = {
-            "kv_k": torch.as_strided(
-                kv, (pages, PAGE_TOKENS, TOKEN_BYTES), (kv_page_stride, TOKEN_BYTES, 1)
-            ),
-            "kv_sf": sf.view(-1).view(torch.uint32),
-            "v_pool": vsf.view(-1).view(torch.uint32),
-            "q": q_fp4.view(torch.uint8)[: p.rows].view(torch.uint32),
-            "q_sf": q_scale.view(torch.uint8).view(-1)[:need].view(torch.uint32),
-            "page_table": page_table,
-            "kv_lens": kv_lens[: p.batch],
-            "q_gs": q_global_scale.view(1),
-            "kv_gs": kv_global_scale.view(1),
-            "out": out.view(p.rows, LATENT),
-            "sm_scale": float(sm_scale),
-        }
-        call["kv_v"] = call["kv_k"]
+            view("q_fp4", q_fp4),
+            view("q_scale", q_scale),
+            view("page_table", page_table),
+            view("kv_lens", kv_lens),
+            view("q_global_scale", q_global_scale),
+            view("kv_global_scale", kv_global_scale),
+            view("out", out),
+            float(sm_scale),
+        )
         decode, merge = self._entry_points()
         decode_args, decode_slots = self._decode_args
         decode_args = list(decode_args)
-        for position, name in decode_slots:
-            decode_args[position] = call[name]
-        if p.num_split > 1:
-            merge_args, merge_slots = self._merge_args
-            merge_args = list(merge_args)
-            for position, name in merge_slots:
-                merge_args[position] = call[name]
+        for position, index in decode_slots:
+            decode_args[position] = values[index]
         # One stream lookup per call: both launches go to torch's current
         # stream of the runner's device.
-        with tvm_ffi.use_raw_stream(self._ffi_device, _raw_stream(index)):
+        with tvm_ffi.use_raw_stream(self._ffi_device, _raw_stream(self.device_index)):
             decode(*decode_args)
-            if p.num_split > 1:
+            if self.plan.num_split > 1:
+                merge_args, merge_slots = self._merge_args
+                merge_args = list(merge_args)
+                for position, index in merge_slots:
+                    merge_args[position] = values[index]
                 merge(*merge_args)
         return out
+
+
+# What each role's checks derive from the caller's tensor (Fp4MlaDecodeRunner._view).
+_DERIVE = {
+    "kv_cache": Fp4MlaDecodeRunner._kv,
+    "kv_scale_cache": Fp4MlaDecodeRunner._sf,
+    "v_scale_cache": Fp4MlaDecodeRunner._vsf,
+    "q_fp4": Fp4MlaDecodeRunner._q,
+    "q_scale": Fp4MlaDecodeRunner._q_sf,
+    "page_table": Fp4MlaDecodeRunner._page_table,
+    "kv_lens": Fp4MlaDecodeRunner._kv_lens,
+    "q_global_scale": lambda runner, t: runner._scale("q_global_scale", t),
+    "kv_global_scale": lambda runner, t: runner._scale("kv_global_scale", t),
+    "out": Fp4MlaDecodeRunner._out,
+}
 
 
 def plan_fp4_mla_decode(
@@ -526,7 +647,8 @@ def plan_fp4_mla_decode(
     """The runner of one decode bucket on ``device``: ``batch`` requests of
     ``q_len`` query tokens and ``num_heads`` heads (at most 128) over a page
     table ``page_table_width`` pages wide.  The split count depends on the
-    bucket and the device's SM count only, never on ``kv_lens``.  ``max_kv``,
+    bucket and the device's SM count only, never on ``kv_lens``; the decode
+    build on the bucket and the device's architecture.  ``max_kv``,
     when given, bounds every ``kv_lens`` value of every call of the runner
     (for example the deployment's maximum sequence length); with the page
     table's width it picks the decode build, never the split count."""
@@ -543,7 +665,8 @@ def plan_fp4_mla_decode(
         raise ValueError(f"the decode runs on a CUDA device, got {dev}")
     index = dev.index if dev.index is not None else torch.cuda.current_device()
     dev = torch.device("cuda", index)
-    if device_arch(index) not in ARCHES:
+    arch = device_arch(index)
+    if arch not in ARCHES:
         raise RuntimeError(f"no Cake fp4_mla decode program for {dev}")
     plan = _plan(
         batch,
@@ -553,6 +676,7 @@ def plan_fp4_mla_decode(
         _sm_count(index),
         max_splits,
         max_kv,
+        arch,
     )
     return Fp4MlaDecodeRunner(plan, dev)
 
@@ -563,5 +687,6 @@ __all__ = [
     "long_rows_for",
     "merge_warps_per_row",
     "num_split_for",
+    "persistent_for",
     "plan_fp4_mla_decode",
 ]

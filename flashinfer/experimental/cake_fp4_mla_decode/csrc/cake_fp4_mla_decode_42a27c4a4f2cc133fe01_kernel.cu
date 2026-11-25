@@ -208,6 +208,17 @@ __device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
 __device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
     float2 r;
     asm("add.rn.ftz.f32x2 %0, %1, %2;"
+#if __CUDA_ARCH__ == 1030
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 sub_f32x2(float2 a, float2 b) {
+    float2 r;
+    asm("sub.rn.ftz.f32x2 %0, %1, %2;"
+#else
+#endif
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
     return r;
@@ -293,7 +304,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(480) __cluster_dims__(2,1,1) void
-kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
+kernel_cake_fp4_mla_decode_42a27c4a4f2cc133fe01(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -983,24 +994,25 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
             int mine = qs * 32 + lane;
             int other = (qs ^ 2) * 32 + lane;
             int xbar = make_warp_uniform(1 + 2 * grp + qs % 2);
-            int row_ok_1 = row_local < rows_valid_1;
+            int row_ok_c = row_local < rows_valid_1;
             int token = (row0_1 + row_local) / num_heads;
             int vis_raw = kv_len_i_1 - (q_len - 1 - token);
-            int vis = ((row_ok_1 != 0 && keys_1 > 0) ? vis_raw : 0);
-            int dither = vis >= 32768;
-            int warp_dither = __any_sync(0xFFFFFFFF, dither != 0);
+            int vis_c = ((row_ok_c != 0 && keys_1 > 0) ? vis_raw : 0);
             float gq = *q_gs;
             float gk = *kv_gs;
             float c_log2 = sm_scale * 1.442695f / (gq * gk);
             float m = -CUDART_INF_F;
             float l_sum = 0.0f;
             float s_vals[64];
-            int n_grp = (my_n_1 - grp + 2 - 1) / 2;
+            int h_s = 0;
+            int g0_s = 0;
+            int j0 = grp;
+            int n_grp = (my_n_1 - j0 + 2 - 1) / 2;
             unsigned int _phase_s_full = 0;
             unsigned int _phase_pv_done = 1;
             #pragma unroll 1
             for (int jj = 0; jj < n_grp; jj++) {
-                int j = 2 * jj + grp;
+                int j = j0 + 2 * jj;
                 int xs = 2 * grp + jj % 2;
                 int tok0 = 128 * (my_start_1 + j) + 64 * half;
                 mbarrier_wait(s_full_addr + (grp) * 8, _phase_s_full);
@@ -1072,7 +1084,7 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     "}"
                     :: "r"(s_empty_addr + (grp) * 8), "r"(0) : "memory");
                 _phase_s_full ^= 1;
-                int live = vis - tok0;
+                int live = vis_c - tok0;
                 int _warp_vote_22 = __any_sync(0xFFFFFFFF, live < 64);
                 if (_warp_vote_22 != 0) {
                     s_vals[0] = ((live > 0) ? s_vals[0] : -CUDART_INF_F);
@@ -1252,2873 +1264,1306 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                 float sf_fit[4];
                 float b_sums[4];
                 float b_weights[4];
-                if (warp_dither != 0) {
-                    float sf_near[4];
 #if __CUDA_ARCH__ == 1030
-                    float _exp2_28 = approx_exp2(g[0] - m - 4.0f);
-                    sf_near[0] = ((g[0] > -CUDART_INF_F) ? 448.0f * _exp2_28 : 0.0f);
-                    float _exp2_29 = approx_exp2(g[1] - m - 4.0f);
-                    sf_near[1] = ((g[1] > -CUDART_INF_F) ? 448.0f * _exp2_29 : 0.0f);
-                    float _exp2_30 = approx_exp2(g[2] - m - 4.0f);
-                    sf_near[2] = ((g[2] > -CUDART_INF_F) ? 448.0f * _exp2_30 : 0.0f);
-                    float _exp2_31 = approx_exp2(g[3] - m - 4.0f);
-                    sf_near[3] = ((g[3] > -CUDART_INF_F) ? 448.0f * _exp2_31 : 0.0f);
+                float g_safe[4];
+                float qv[4];
+                float qq[4];
+                g_safe[0] = ((g[0] > -CUDART_INF_F) ? g[0] : 0.0f);
+                const float2 _fma_b2_28 = {c_log2, c_log2};
+                const float2 _fma_c2_29 = {-g_safe[0], -g_safe[0]};
 #else
-                    float _exp2_24 = approx_exp2(g[0] - m - 4.0f);
-                    sf_near[0] = ((g[0] > -CUDART_INF_F) ? 448.0f * _exp2_24 : 0.0f);
-                    float _exp2_25 = approx_exp2(g[1] - m - 4.0f);
-                    sf_near[1] = ((g[1] > -CUDART_INF_F) ? 448.0f * _exp2_25 : 0.0f);
-                    float _exp2_26 = approx_exp2(g[2] - m - 4.0f);
-                    sf_near[2] = ((g[2] > -CUDART_INF_F) ? 448.0f * _exp2_26 : 0.0f);
-                    float _exp2_27 = approx_exp2(g[3] - m - 4.0f);
-                    sf_near[3] = ((g[3] > -CUDART_INF_F) ? 448.0f * _exp2_27 : 0.0f);
+                int g_live_0 = g[0] > -CUDART_INF_F;
+                float g_safe_0 = ((g_live_0 != 0) ? g[0] : 0.0f);
+                const float2 _fma_b2_24 = {c_log2, c_log2};
+                const float2 _fma_c2_25 = {-g_safe_0, -g_safe_0};
 #endif
-                    unsigned int near_word[1];
-                    {
-                        uint32_t _packed;
-                        asm volatile("{\n\t"
-                            ".reg .b16 _lo;\n\t"
-                            ".reg .b16 _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}"
-                            : "=r"(_packed) : "f"(sf_near[0]), "f"(sf_near[1]),
-                                               "f"(sf_near[2]), "f"(sf_near[3]));
-                        near_word[0] = _packed;
-                    }
-                    float six_rho_d[4];
+                #pragma unroll
+                for (int _lf = 0; _lf < 8; _lf++)
 #if __CUDA_ARCH__ == 1030
-                    uint16_t _e4m3x2_decode_32 = (uint16_t)(near_word[0] >> 0 & 0xFFu);
-                    uint32_t _f16x2_decode_32;
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_28, _fma_c2_29);
 #else
-                    uint16_t _e4m3x2_decode_28 = (uint16_t)(near_word[0] >> 0 & 0xFFu);
-                    uint32_t _f16x2_decode_28;
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_24, _fma_c2_25);
 #endif
-                    float sf_near_r_0;
-#if __CUDA_ARCH__ == 1030
-#else
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_28) : "h"(_e4m3x2_decode_28));
-                    uint16_t _f16_decode_28 = (uint16_t)_f16x2_decode_28;
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_0) : "h"(_f16_decode_28));
-                    float _rcp_29 = approx_rcp(sf_near_r_0);
-                    six_rho_d[0] = ((sf_near_r_0 > 0.0f) ? 6.0f * sf_near[0] * _rcp_29 : 0.0f);
-                    uint16_t _e4m3x2_decode_30 = (uint16_t)(near_word[0] >> 8 & 0xFFu);
-                    uint32_t _f16x2_decode_30;
-                    float sf_near_r_1;
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_30) : "h"(_e4m3x2_decode_30));
-                    uint16_t _f16_decode_30 = (uint16_t)_f16x2_decode_30;
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_1) : "h"(_f16_decode_30));
-                    float _rcp_31 = approx_rcp(sf_near_r_1);
-                    six_rho_d[1] = ((sf_near_r_1 > 0.0f) ? 6.0f * sf_near[1] * _rcp_31 : 0.0f);
-                    uint16_t _e4m3x2_decode_32 = (uint16_t)(near_word[0] >> 16 & 0xFFu);
-                    uint32_t _f16x2_decode_32;
-                    float sf_near_r_2;
-#endif
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_32) : "h"(_e4m3x2_decode_32));
-                    uint16_t _f16_decode_32 = (uint16_t)_f16x2_decode_32;
-#if __CUDA_ARCH__ == 1030
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_0) : "h"(_f16_decode_32));
-                    float _rcp_33 = approx_rcp(sf_near_r_0);
-                    six_rho_d[0] = ((sf_near_r_0 > 0.0f) ? 6.0f * sf_near[0] * _rcp_33 : 0.0f);
-                    uint16_t _e4m3x2_decode_34 = (uint16_t)(near_word[0] >> 8 & 0xFFu);
-#else
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_2) : "h"(_f16_decode_32));
-                    float _rcp_33 = approx_rcp(sf_near_r_2);
-                    six_rho_d[2] = ((sf_near_r_2 > 0.0f) ? 6.0f * sf_near[2] * _rcp_33 : 0.0f);
-                    uint16_t _e4m3x2_decode_34 = (uint16_t)(near_word[0] >> 24 & 0xFFu);
-#endif
-                    uint32_t _f16x2_decode_34;
-#if __CUDA_ARCH__ == 1030
-                    float sf_near_r_1;
-#else
-                    float sf_near_r_3;
-#endif
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_34) : "h"(_e4m3x2_decode_34));
-                    uint16_t _f16_decode_34 = (uint16_t)_f16x2_decode_34;
-#if __CUDA_ARCH__ == 1030
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_1) : "h"(_f16_decode_34));
-                    float _rcp_35 = approx_rcp(sf_near_r_1);
-                    six_rho_d[1] = ((sf_near_r_1 > 0.0f) ? 6.0f * sf_near[1] * _rcp_35 : 0.0f);
-                    uint16_t _e4m3x2_decode_36 = (uint16_t)(near_word[0] >> 16 & 0xFFu);
-                    uint32_t _f16x2_decode_36;
-                    float sf_near_r_2;
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_36) : "h"(_e4m3x2_decode_36));
-                    uint16_t _f16_decode_36 = (uint16_t)_f16x2_decode_36;
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_2) : "h"(_f16_decode_36));
-                    float _rcp_37 = approx_rcp(sf_near_r_2);
-                    six_rho_d[2] = ((sf_near_r_2 > 0.0f) ? 6.0f * sf_near[2] * _rcp_37 : 0.0f);
-                    uint16_t _e4m3x2_decode_38 = (uint16_t)(near_word[0] >> 24 & 0xFFu);
-                    uint32_t _f16x2_decode_38;
-                    float sf_near_r_3;
-                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_38) : "h"(_e4m3x2_decode_38));
-                    uint16_t _f16_decode_38 = (uint16_t)_f16x2_decode_38;
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_3) : "h"(_f16_decode_38));
-                    float _rcp_39 = approx_rcp(sf_near_r_3);
-                    six_rho_d[3] = ((sf_near_r_3 > 0.0f) ? 6.0f * sf_near[3] * _rcp_39 : 0.0f);
-#else
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(sf_near_r_3) : "h"(_f16_decode_34));
-                    float _rcp_35 = approx_rcp(sf_near_r_3);
-                    six_rho_d[3] = ((sf_near_r_3 > 0.0f) ? 6.0f * sf_near[3] * _rcp_35 : 0.0f);
-#endif
-                    int g_live = g[0] > -CUDART_INF_F;
-                    float g_safe = ((g_live != 0) ? g[0] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_40 = {c_log2, c_log2};
-                    const float2 _fma_c2_41 = {-g_safe, -g_safe};
-#else
-                    const float2 _fma_b2_36 = {c_log2, c_log2};
-                    const float2 _fma_c2_37 = {-g_safe, -g_safe};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_40, _fma_c2_41);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_36, _fma_c2_37);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le] = approx_exp2(s_vals[_le]);
-                    }
-                    float t8[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 0))[_la], reinterpret_cast<const float2*>((s_vals + 8))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8)[_la], reinterpret_cast<const float2*>((t8 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8)[_la], reinterpret_cast<const float2*>((t8 + 2))[_la]);
-                    b_sums[0] = t8[0] + t8[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_42 = approx_exp2(g_safe - m);
-                    b_weights[0] = ((g_live != 0) ? _exp2_42 : 0.0f);
-                    float _exp2_43 = approx_exp2(g_safe - m - 4.0f);
-                    float sf_ex = 448.0f * _exp2_43;
-#else
-                    float _exp2_38 = approx_exp2(g_safe - m);
-                    b_weights[0] = ((g_live != 0) ? _exp2_38 : 0.0f);
-                    float _exp2_39 = approx_exp2(g_safe - m - 4.0f);
-                    float sf_ex = 448.0f * _exp2_39;
-#endif
-                    float e_min = s_vals[0];
-                    #pragma unroll
-                    for (int _lr = 1; _lr < 16; _lr++) {
-                        e_min = fminf(e_min, s_vals[_lr]);
-                    }
-                    int flat = dither != 0 && e_min >= 0.5f;
-                    if (flat != 0) {
-#if __CUDA_ARCH__ == 1030
-                        const float2 _fma_b2_44 = {six_rho_d[0], six_rho_d[0]};
-                        const float2 _fma_c2_45 = {0.0f, 0.0f};
-#else
-                        const float2 _fma_b2_40 = {six_rho_d[0], six_rho_d[0]};
-                        const float2 _fma_c2_41 = {0.0f, 0.0f};
-#endif
-                        #pragma unroll
-                        for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_44, _fma_c2_45);
-                        uint16_t _cvt_rs_x4_f32_46;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_46) : "f"(s_vals[3]), "f"(s_vals[2]), "f"(s_vals[1]), "f"(s_vals[0]), "r"(3103267870u));
-                        unsigned int w_lo_0 = _cvt_rs_x4_f32_46;
-                        uint16_t _cvt_rs_x4_f32_47;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_47) : "f"(s_vals[7]), "f"(s_vals[6]), "f"(s_vals[5]), "f"(s_vals[4]), "r"(2564298778u));
-                        unsigned int w_hi_0 = _cvt_rs_x4_f32_47;
-#else
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_40, _fma_c2_41);
-                        uint16_t _cvt_rs_x4_f32_42;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_42) : "f"(s_vals[3]), "f"(s_vals[2]), "f"(s_vals[1]), "f"(s_vals[0]), "r"(3103267870u));
-                        unsigned int w_lo_0 = _cvt_rs_x4_f32_42;
-                        uint16_t _cvt_rs_x4_f32_43;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_43) : "f"(s_vals[7]), "f"(s_vals[6]), "f"(s_vals[5]), "f"(s_vals[4]), "r"(2564298778u));
-                        unsigned int w_hi_0 = _cvt_rs_x4_f32_43;
-#endif
-                        codes[0] = w_lo_0 | w_hi_0 << 16;
-#if __CUDA_ARCH__ == 1030
-                        uint16_t _cvt_rs_x4_f32_48;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_48) : "f"(s_vals[11]), "f"(s_vals[10]), "f"(s_vals[9]), "f"(s_vals[8]), "r"(2833781782u));
-                        unsigned int w_lo_1 = _cvt_rs_x4_f32_48;
-                        uint16_t _cvt_rs_x4_f32_49;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_49) : "f"(s_vals[15]), "f"(s_vals[14]), "f"(s_vals[13]), "f"(s_vals[12]), "r"(2294812690u));
-                        unsigned int w_hi_1 = _cvt_rs_x4_f32_49;
-#else
-                        uint16_t _cvt_rs_x4_f32_44;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_44) : "f"(s_vals[11]), "f"(s_vals[10]), "f"(s_vals[9]), "f"(s_vals[8]), "r"(2833781782u));
-                        unsigned int w_lo_1 = _cvt_rs_x4_f32_44;
-                        uint16_t _cvt_rs_x4_f32_45;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_45) : "f"(s_vals[15]), "f"(s_vals[14]), "f"(s_vals[13]), "f"(s_vals[12]), "r"(2294812690u));
-                        unsigned int w_hi_1 = _cvt_rs_x4_f32_45;
-#endif
-                        codes[1] = w_lo_1 | w_hi_1 << 16;
-                        sf_fit[0] = sf_near[0];
-                    } else {
-                        float qv[4];
-                        float qq[4];
-#if __CUDA_ARCH__ == 1030
-                        const float2 _scale2_50 = {6.0f, 6.0f};
-#else
-                        const float2 _scale2_46 = {6.0f, 6.0f};
-#endif
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_50);
-#else
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_46);
-#endif
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[0]) : "f"(s_vals[0]), "f"(s_vals[1]), "f"(s_vals[2]), "f"(s_vals[3]), "f"(s_vals[4]), "f"(s_vals[5]), "f"(s_vals[6]), "f"(s_vals[7]));
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[1]) : "f"(s_vals[8]), "f"(s_vals[9]), "f"(s_vals[10]), "f"(s_vals[11]), "f"(s_vals[12]), "f"(s_vals[13]), "f"(s_vals[14]), "f"(s_vals[15]));
-                        float q_b[16];
-                        unsigned int qn[8];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_51;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_47;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_51) : "r"((uint32_t)(codes[0] >> 0)));
-                        qn[0] = _cvt_f16x2_e2m1x2_51;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[0] >> 0)));
-                        qn[0] = _cvt_f16x2_e2m1x2_47;
-#endif
-                        float qw_0[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_0[0]), "=&f"(qw_0[1]) : "r"(qn[0]), "f"(0.0f), "f"(0.0f));
-                        q_b[0] = qw_0[0];
-                        q_b[1] = qw_0[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_52;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_48;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_52) : "r"((uint32_t)(codes[0] >> 8)));
-                        qn[1] = _cvt_f16x2_e2m1x2_52;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[0] >> 8)));
-                        qn[1] = _cvt_f16x2_e2m1x2_48;
-#endif
-                        float qw_1[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_1[0]), "=&f"(qw_1[1]) : "r"(qn[1]), "f"(0.0f), "f"(0.0f));
-                        q_b[2] = qw_1[0];
-                        q_b[3] = qw_1[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_53;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_49;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_53) : "r"((uint32_t)(codes[0] >> 16)));
-                        qn[2] = _cvt_f16x2_e2m1x2_53;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[0] >> 16)));
-                        qn[2] = _cvt_f16x2_e2m1x2_49;
-#endif
-                        float qw_2[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_2[0]), "=&f"(qw_2[1]) : "r"(qn[2]), "f"(0.0f), "f"(0.0f));
-                        q_b[4] = qw_2[0];
-                        q_b[5] = qw_2[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_54;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_50;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_54) : "r"((uint32_t)(codes[0] >> 24)));
-                        qn[3] = _cvt_f16x2_e2m1x2_54;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_50) : "r"((uint32_t)(codes[0] >> 24)));
-                        qn[3] = _cvt_f16x2_e2m1x2_50;
-#endif
-                        float qw_3[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_3[0]), "=&f"(qw_3[1]) : "r"(qn[3]), "f"(0.0f), "f"(0.0f));
-                        q_b[6] = qw_3[0];
-                        q_b[7] = qw_3[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_55;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_51;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_55) : "r"((uint32_t)(codes[1] >> 0)));
-                        qn[4] = _cvt_f16x2_e2m1x2_55;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_51) : "r"((uint32_t)(codes[1] >> 0)));
-                        qn[4] = _cvt_f16x2_e2m1x2_51;
-#endif
-                        float qw_4[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_4[0]), "=&f"(qw_4[1]) : "r"(qn[4]), "f"(0.0f), "f"(0.0f));
-                        q_b[8] = qw_4[0];
-                        q_b[9] = qw_4[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_56;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_52;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_56) : "r"((uint32_t)(codes[1] >> 8)));
-                        qn[5] = _cvt_f16x2_e2m1x2_56;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_52) : "r"((uint32_t)(codes[1] >> 8)));
-                        qn[5] = _cvt_f16x2_e2m1x2_52;
-#endif
-                        float qw_5[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_5[0]), "=&f"(qw_5[1]) : "r"(qn[5]), "f"(0.0f), "f"(0.0f));
-                        q_b[10] = qw_5[0];
-                        q_b[11] = qw_5[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_57;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_53;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[1] >> 16)));
-                        qn[6] = _cvt_f16x2_e2m1x2_57;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_53) : "r"((uint32_t)(codes[1] >> 16)));
-                        qn[6] = _cvt_f16x2_e2m1x2_53;
-#endif
-                        float qw_6[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_6[0]), "=&f"(qw_6[1]) : "r"(qn[6]), "f"(0.0f), "f"(0.0f));
-                        q_b[12] = qw_6[0];
-                        q_b[13] = qw_6[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_58;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_54;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[1] >> 24)));
-                        qn[7] = _cvt_f16x2_e2m1x2_58;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_54) : "r"((uint32_t)(codes[1] >> 24)));
-                        qn[7] = _cvt_f16x2_e2m1x2_54;
-#endif
-                        float qw_7[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_7[0]), "=&f"(qw_7[1]) : "r"(qn[7]), "f"(0.0f), "f"(0.0f));
-                        q_b[14] = qw_7[0];
-                        q_b[15] = qw_7[1];
-                        float qe[16];
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(qe)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b)[_ls], reinterpret_cast<const float2*>((s_vals + 0))[_ls]);
-                        float t8_0[8];
-                        #pragma unroll
-                        for (int _la = 0; _la < 4; _la++)
-                            reinterpret_cast<float2*>(t8_0)[_la] = add_f32x2(reinterpret_cast<float2*>((qe + 0))[_la], reinterpret_cast<const float2*>((qe + 8))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 2; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_0)[_la], reinterpret_cast<const float2*>((t8_0 + 4))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 1; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_0)[_la], reinterpret_cast<const float2*>((t8_0 + 2))[_la]);
-                        qv[0] = t8_0[0] + t8_0[1];
-                        uint32_t a0;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0) : "r"(qn[0]), "r"(qn[0]), "r"(0));
-                        uint32_t b0;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0) : "r"(qn[4]), "r"(qn[4]), "r"(0));
-                        uint32_t a1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1) : "r"(qn[1]), "r"(qn[1]), "r"(a0));
-                        uint32_t b1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1) : "r"(qn[5]), "r"(qn[5]), "r"(b0));
-                        uint32_t a2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2) : "r"(qn[2]), "r"(qn[2]), "r"(a1));
-                        uint32_t b2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2) : "r"(qn[6]), "r"(qn[6]), "r"(b1));
-                        uint32_t a3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3) : "r"(qn[3]), "r"(qn[3]), "r"(a2));
-                        uint32_t b3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3) : "r"(qn[7]), "r"(qn[7]), "r"(b2));
-                        uint32_t v;
-                        asm("add.f16x2 %0, %1, %2;" : "=r"(v) : "r"(a3), "r"(b3));
-                        float w[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(w[0]), "=&f"(w[1]) : "r"(v), "f"(0.0f), "f"(0.0f));
-                        qq[0] = w[0] + w[1];
-#if __CUDA_ARCH__ == 1030
-                        float _rcp_59 = approx_rcp(qq[0]);
-                        sf_fit[0] = ((g_live != 0 && qq[0] > 0.0f) ? sf_ex * qv[0] * _rcp_59 : 0.0f);
-#else
-                        float _rcp_55 = approx_rcp(qq[0]);
-                        sf_fit[0] = ((g_live != 0 && qq[0] > 0.0f) ? sf_ex * qv[0] * _rcp_55 : 0.0f);
-#endif
-                    }
-                    int g_live_0 = g[1] > -CUDART_INF_F;
-                    float g_safe_0 = ((g_live_0 != 0) ? g[1] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_60 = {c_log2, c_log2};
-                    const float2 _fma_c2_61 = {-g_safe_0, -g_safe_0};
-#else
-                    const float2 _fma_b2_56 = {c_log2, c_log2};
-                    const float2 _fma_c2_57 = {-g_safe_0, -g_safe_0};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_60, _fma_c2_61);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_56, _fma_c2_57);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le + 16] = approx_exp2(s_vals[_le + 16]);
-                    }
-                    float t8_1[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_1)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 16))[_la], reinterpret_cast<const float2*>((s_vals + 24))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_1)[_la], reinterpret_cast<const float2*>((t8_1 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_1)[_la], reinterpret_cast<const float2*>((t8_1 + 2))[_la]);
-                    b_sums[1] = t8_1[0] + t8_1[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_62 = approx_exp2(g_safe_0 - m);
-                    b_weights[1] = ((g_live_0 != 0) ? _exp2_62 : 0.0f);
-                    float _exp2_63 = approx_exp2(g_safe_0 - m - 4.0f);
-                    float sf_ex_0 = 448.0f * _exp2_63;
-#else
-                    float _exp2_58 = approx_exp2(g_safe_0 - m);
-                    b_weights[1] = ((g_live_0 != 0) ? _exp2_58 : 0.0f);
-                    float _exp2_59 = approx_exp2(g_safe_0 - m - 4.0f);
-                    float sf_ex_0 = 448.0f * _exp2_59;
-#endif
-                    float e_min_0 = s_vals[(16) + 0];
-                    #pragma unroll
-                    for (int _lr = 1; _lr < 16; _lr++) {
-                        e_min_0 = fminf(e_min_0, s_vals[(16) + _lr]);
-                    }
-                    int flat_0 = dither != 0 && e_min_0 >= 0.5f;
-                    if (flat_0 != 0) {
-#if __CUDA_ARCH__ == 1030
-                        const float2 _fma_b2_64 = {six_rho_d[1], six_rho_d[1]};
-                        const float2 _fma_c2_65 = {0.0f, 0.0f};
-#else
-                        const float2 _fma_b2_60 = {six_rho_d[1], six_rho_d[1]};
-                        const float2 _fma_c2_61 = {0.0f, 0.0f};
-#endif
-                        #pragma unroll
-                        for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_64, _fma_c2_65);
-                        uint16_t _cvt_rs_x4_f32_66;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_66) : "f"(s_vals[19]), "f"(s_vals[18]), "f"(s_vals[17]), "f"(s_vals[16]), "r"(3103267870u));
-                        unsigned int w_lo_2 = _cvt_rs_x4_f32_66;
-                        uint16_t _cvt_rs_x4_f32_67;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_67) : "f"(s_vals[23]), "f"(s_vals[22]), "f"(s_vals[21]), "f"(s_vals[20]), "r"(2564298778u));
-                        unsigned int w_hi_2 = _cvt_rs_x4_f32_67;
-#else
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_60, _fma_c2_61);
-                        uint16_t _cvt_rs_x4_f32_62;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_62) : "f"(s_vals[19]), "f"(s_vals[18]), "f"(s_vals[17]), "f"(s_vals[16]), "r"(3103267870u));
-                        unsigned int w_lo_2 = _cvt_rs_x4_f32_62;
-                        uint16_t _cvt_rs_x4_f32_63;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_63) : "f"(s_vals[23]), "f"(s_vals[22]), "f"(s_vals[21]), "f"(s_vals[20]), "r"(2564298778u));
-                        unsigned int w_hi_2 = _cvt_rs_x4_f32_63;
-#endif
-                        codes[2] = w_lo_2 | w_hi_2 << 16;
-#if __CUDA_ARCH__ == 1030
-                        uint16_t _cvt_rs_x4_f32_68;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_68) : "f"(s_vals[27]), "f"(s_vals[26]), "f"(s_vals[25]), "f"(s_vals[24]), "r"(2833781782u));
-                        unsigned int w_lo_3 = _cvt_rs_x4_f32_68;
-                        uint16_t _cvt_rs_x4_f32_69;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_69) : "f"(s_vals[31]), "f"(s_vals[30]), "f"(s_vals[29]), "f"(s_vals[28]), "r"(2294812690u));
-                        unsigned int w_hi_3 = _cvt_rs_x4_f32_69;
-#else
-                        uint16_t _cvt_rs_x4_f32_64;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_64) : "f"(s_vals[27]), "f"(s_vals[26]), "f"(s_vals[25]), "f"(s_vals[24]), "r"(2833781782u));
-                        unsigned int w_lo_3 = _cvt_rs_x4_f32_64;
-                        uint16_t _cvt_rs_x4_f32_65;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_65) : "f"(s_vals[31]), "f"(s_vals[30]), "f"(s_vals[29]), "f"(s_vals[28]), "r"(2294812690u));
-                        unsigned int w_hi_3 = _cvt_rs_x4_f32_65;
-#endif
-                        codes[3] = w_lo_3 | w_hi_3 << 16;
-                        sf_fit[1] = sf_near[1];
-                    } else {
-                        float qv_1[4];
-                        float qq_1[4];
-#if __CUDA_ARCH__ == 1030
-                        const float2 _scale2_70 = {6.0f, 6.0f};
-#else
-                        const float2 _scale2_66 = {6.0f, 6.0f};
-#endif
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_70);
-#else
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_66);
-#endif
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[2]) : "f"(s_vals[16]), "f"(s_vals[17]), "f"(s_vals[18]), "f"(s_vals[19]), "f"(s_vals[20]), "f"(s_vals[21]), "f"(s_vals[22]), "f"(s_vals[23]));
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[3]) : "f"(s_vals[24]), "f"(s_vals[25]), "f"(s_vals[26]), "f"(s_vals[27]), "f"(s_vals[28]), "f"(s_vals[29]), "f"(s_vals[30]), "f"(s_vals[31]));
-                        float q_b_1[16];
-                        unsigned int qn_1[8];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_71;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_67;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[2] >> 0)));
-                        qn_1[0] = _cvt_f16x2_e2m1x2_71;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_67) : "r"((uint32_t)(codes[2] >> 0)));
-                        qn_1[0] = _cvt_f16x2_e2m1x2_67;
-#endif
-                        float qw_8[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_8[0]), "=&f"(qw_8[1]) : "r"(qn_1[0]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[0] = qw_8[0];
-                        q_b_1[1] = qw_8[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_72;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_68;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_72) : "r"((uint32_t)(codes[2] >> 8)));
-                        qn_1[1] = _cvt_f16x2_e2m1x2_72;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_68) : "r"((uint32_t)(codes[2] >> 8)));
-                        qn_1[1] = _cvt_f16x2_e2m1x2_68;
-#endif
-                        float qw_9[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_9[0]), "=&f"(qw_9[1]) : "r"(qn_1[1]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[2] = qw_9[0];
-                        q_b_1[3] = qw_9[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_73;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_69;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_73) : "r"((uint32_t)(codes[2] >> 16)));
-                        qn_1[2] = _cvt_f16x2_e2m1x2_73;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_69) : "r"((uint32_t)(codes[2] >> 16)));
-                        qn_1[2] = _cvt_f16x2_e2m1x2_69;
-#endif
-                        float qw_10[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_10[0]), "=&f"(qw_10[1]) : "r"(qn_1[2]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[4] = qw_10[0];
-                        q_b_1[5] = qw_10[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_74;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_70;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_74) : "r"((uint32_t)(codes[2] >> 24)));
-                        qn_1[3] = _cvt_f16x2_e2m1x2_74;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_70) : "r"((uint32_t)(codes[2] >> 24)));
-                        qn_1[3] = _cvt_f16x2_e2m1x2_70;
-#endif
-                        float qw_11[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_11[0]), "=&f"(qw_11[1]) : "r"(qn_1[3]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[6] = qw_11[0];
-                        q_b_1[7] = qw_11[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_75;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_71;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_75) : "r"((uint32_t)(codes[3] >> 0)));
-                        qn_1[4] = _cvt_f16x2_e2m1x2_75;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[3] >> 0)));
-                        qn_1[4] = _cvt_f16x2_e2m1x2_71;
-#endif
-                        float qw_12[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_12[0]), "=&f"(qw_12[1]) : "r"(qn_1[4]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[8] = qw_12[0];
-                        q_b_1[9] = qw_12[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_76;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_72;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_76) : "r"((uint32_t)(codes[3] >> 8)));
-                        qn_1[5] = _cvt_f16x2_e2m1x2_76;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_72) : "r"((uint32_t)(codes[3] >> 8)));
-                        qn_1[5] = _cvt_f16x2_e2m1x2_72;
-#endif
-                        float qw_13[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_13[0]), "=&f"(qw_13[1]) : "r"(qn_1[5]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[10] = qw_13[0];
-                        q_b_1[11] = qw_13[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_77;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_73;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_77) : "r"((uint32_t)(codes[3] >> 16)));
-                        qn_1[6] = _cvt_f16x2_e2m1x2_77;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_73) : "r"((uint32_t)(codes[3] >> 16)));
-                        qn_1[6] = _cvt_f16x2_e2m1x2_73;
-#endif
-                        float qw_14[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_14[0]), "=&f"(qw_14[1]) : "r"(qn_1[6]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[12] = qw_14[0];
-                        q_b_1[13] = qw_14[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_78;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_74;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_78) : "r"((uint32_t)(codes[3] >> 24)));
-                        qn_1[7] = _cvt_f16x2_e2m1x2_78;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_74) : "r"((uint32_t)(codes[3] >> 24)));
-                        qn_1[7] = _cvt_f16x2_e2m1x2_74;
-#endif
-                        float qw_15[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_15[0]), "=&f"(qw_15[1]) : "r"(qn_1[7]), "f"(0.0f), "f"(0.0f));
-                        q_b_1[14] = qw_15[0];
-                        q_b_1[15] = qw_15[1];
-                        float qe_1[16];
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(qe_1)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_1)[_ls], reinterpret_cast<const float2*>((s_vals + 16))[_ls]);
-                        float t8_2[8];
-                        #pragma unroll
-                        for (int _la = 0; _la < 4; _la++)
-                            reinterpret_cast<float2*>(t8_2)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_1 + 0))[_la], reinterpret_cast<const float2*>((qe_1 + 8))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 2; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_2)[_la], reinterpret_cast<const float2*>((t8_2 + 4))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 1; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_2)[_la], reinterpret_cast<const float2*>((t8_2 + 2))[_la]);
-                        qv_1[1] = t8_2[0] + t8_2[1];
-                        uint32_t a0_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_1) : "r"(qn_1[0]), "r"(qn_1[0]), "r"(0));
-                        uint32_t b0_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_1) : "r"(qn_1[4]), "r"(qn_1[4]), "r"(0));
-                        uint32_t a1_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_1) : "r"(qn_1[1]), "r"(qn_1[1]), "r"(a0_1));
-                        uint32_t b1_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_1) : "r"(qn_1[5]), "r"(qn_1[5]), "r"(b0_1));
-                        uint32_t a2_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_1) : "r"(qn_1[2]), "r"(qn_1[2]), "r"(a1_1));
-                        uint32_t b2_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_1) : "r"(qn_1[6]), "r"(qn_1[6]), "r"(b1_1));
-                        uint32_t a3_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_1) : "r"(qn_1[3]), "r"(qn_1[3]), "r"(a2_1));
-                        uint32_t b3_1;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_1) : "r"(qn_1[7]), "r"(qn_1[7]), "r"(b2_1));
-                        uint32_t v_1;
-                        asm("add.f16x2 %0, %1, %2;" : "=r"(v_1) : "r"(a3_1), "r"(b3_1));
-                        float w_1[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(w_1[0]), "=&f"(w_1[1]) : "r"(v_1), "f"(0.0f), "f"(0.0f));
-                        qq_1[1] = w_1[0] + w_1[1];
-#if __CUDA_ARCH__ == 1030
-                        float _rcp_79 = approx_rcp(qq_1[1]);
-                        sf_fit[1] = ((g_live_0 != 0 && qq_1[1] > 0.0f) ? sf_ex_0 * qv_1[1] * _rcp_79 : 0.0f);
-#else
-                        float _rcp_75 = approx_rcp(qq_1[1]);
-                        sf_fit[1] = ((g_live_0 != 0 && qq_1[1] > 0.0f) ? sf_ex_0 * qv_1[1] * _rcp_75 : 0.0f);
-#endif
-                    }
-                    int g_live_1 = g[2] > -CUDART_INF_F;
-                    float g_safe_1 = ((g_live_1 != 0) ? g[2] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_80 = {c_log2, c_log2};
-                    const float2 _fma_c2_81 = {-g_safe_1, -g_safe_1};
-#else
-                    const float2 _fma_b2_76 = {c_log2, c_log2};
-                    const float2 _fma_c2_77 = {-g_safe_1, -g_safe_1};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_80, _fma_c2_81);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_76, _fma_c2_77);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le + 32] = approx_exp2(s_vals[_le + 32]);
-                    }
-                    float t8_3[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_3)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 32))[_la], reinterpret_cast<const float2*>((s_vals + 40))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_3)[_la], reinterpret_cast<const float2*>((t8_3 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_3)[_la], reinterpret_cast<const float2*>((t8_3 + 2))[_la]);
-                    b_sums[2] = t8_3[0] + t8_3[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_82 = approx_exp2(g_safe_1 - m);
-                    b_weights[2] = ((g_live_1 != 0) ? _exp2_82 : 0.0f);
-                    float _exp2_83 = approx_exp2(g_safe_1 - m - 4.0f);
-                    float sf_ex_1 = 448.0f * _exp2_83;
-#else
-                    float _exp2_78 = approx_exp2(g_safe_1 - m);
-                    b_weights[2] = ((g_live_1 != 0) ? _exp2_78 : 0.0f);
-                    float _exp2_79 = approx_exp2(g_safe_1 - m - 4.0f);
-                    float sf_ex_1 = 448.0f * _exp2_79;
-#endif
-                    float e_min_1 = s_vals[(32) + 0];
-                    #pragma unroll
-                    for (int _lr = 1; _lr < 16; _lr++) {
-                        e_min_1 = fminf(e_min_1, s_vals[(32) + _lr]);
-                    }
-                    int flat_1 = dither != 0 && e_min_1 >= 0.5f;
-                    if (flat_1 != 0) {
-#if __CUDA_ARCH__ == 1030
-                        const float2 _fma_b2_84 = {six_rho_d[2], six_rho_d[2]};
-                        const float2 _fma_c2_85 = {0.0f, 0.0f};
-#else
-                        const float2 _fma_b2_80 = {six_rho_d[2], six_rho_d[2]};
-                        const float2 _fma_c2_81 = {0.0f, 0.0f};
-#endif
-                        #pragma unroll
-                        for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_84, _fma_c2_85);
-                        uint16_t _cvt_rs_x4_f32_86;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_86) : "f"(s_vals[35]), "f"(s_vals[34]), "f"(s_vals[33]), "f"(s_vals[32]), "r"(3103267870u));
-                        unsigned int w_lo_4 = _cvt_rs_x4_f32_86;
-                        uint16_t _cvt_rs_x4_f32_87;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_87) : "f"(s_vals[39]), "f"(s_vals[38]), "f"(s_vals[37]), "f"(s_vals[36]), "r"(2564298778u));
-                        unsigned int w_hi_4 = _cvt_rs_x4_f32_87;
-#else
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_80, _fma_c2_81);
-                        uint16_t _cvt_rs_x4_f32_82;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_82) : "f"(s_vals[35]), "f"(s_vals[34]), "f"(s_vals[33]), "f"(s_vals[32]), "r"(3103267870u));
-                        unsigned int w_lo_4 = _cvt_rs_x4_f32_82;
-                        uint16_t _cvt_rs_x4_f32_83;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_83) : "f"(s_vals[39]), "f"(s_vals[38]), "f"(s_vals[37]), "f"(s_vals[36]), "r"(2564298778u));
-                        unsigned int w_hi_4 = _cvt_rs_x4_f32_83;
-#endif
-                        codes[4] = w_lo_4 | w_hi_4 << 16;
-#if __CUDA_ARCH__ == 1030
-                        uint16_t _cvt_rs_x4_f32_88;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_88) : "f"(s_vals[43]), "f"(s_vals[42]), "f"(s_vals[41]), "f"(s_vals[40]), "r"(2833781782u));
-                        unsigned int w_lo_5 = _cvt_rs_x4_f32_88;
-                        uint16_t _cvt_rs_x4_f32_89;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_89) : "f"(s_vals[47]), "f"(s_vals[46]), "f"(s_vals[45]), "f"(s_vals[44]), "r"(2294812690u));
-                        unsigned int w_hi_5 = _cvt_rs_x4_f32_89;
-#else
-                        uint16_t _cvt_rs_x4_f32_84;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_84) : "f"(s_vals[43]), "f"(s_vals[42]), "f"(s_vals[41]), "f"(s_vals[40]), "r"(2833781782u));
-                        unsigned int w_lo_5 = _cvt_rs_x4_f32_84;
-                        uint16_t _cvt_rs_x4_f32_85;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_85) : "f"(s_vals[47]), "f"(s_vals[46]), "f"(s_vals[45]), "f"(s_vals[44]), "r"(2294812690u));
-                        unsigned int w_hi_5 = _cvt_rs_x4_f32_85;
-#endif
-                        codes[5] = w_lo_5 | w_hi_5 << 16;
-                        sf_fit[2] = sf_near[2];
-                    } else {
-                        float qv_2[4];
-                        float qq_2[4];
-#if __CUDA_ARCH__ == 1030
-                        const float2 _scale2_90 = {6.0f, 6.0f};
-#else
-                        const float2 _scale2_86 = {6.0f, 6.0f};
-#endif
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_90);
-#else
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_86);
-#endif
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[4]) : "f"(s_vals[32]), "f"(s_vals[33]), "f"(s_vals[34]), "f"(s_vals[35]), "f"(s_vals[36]), "f"(s_vals[37]), "f"(s_vals[38]), "f"(s_vals[39]));
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[5]) : "f"(s_vals[40]), "f"(s_vals[41]), "f"(s_vals[42]), "f"(s_vals[43]), "f"(s_vals[44]), "f"(s_vals[45]), "f"(s_vals[46]), "f"(s_vals[47]));
-                        float q_b_2[16];
-                        unsigned int qn_2[8];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_91;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_87;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_91) : "r"((uint32_t)(codes[4] >> 0)));
-                        qn_2[0] = _cvt_f16x2_e2m1x2_91;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_87) : "r"((uint32_t)(codes[4] >> 0)));
-                        qn_2[0] = _cvt_f16x2_e2m1x2_87;
-#endif
-                        float qw_16[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_16[0]), "=&f"(qw_16[1]) : "r"(qn_2[0]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[0] = qw_16[0];
-                        q_b_2[1] = qw_16[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_92;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_88;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_92) : "r"((uint32_t)(codes[4] >> 8)));
-                        qn_2[1] = _cvt_f16x2_e2m1x2_92;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_88) : "r"((uint32_t)(codes[4] >> 8)));
-                        qn_2[1] = _cvt_f16x2_e2m1x2_88;
-#endif
-                        float qw_17[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_17[0]), "=&f"(qw_17[1]) : "r"(qn_2[1]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[2] = qw_17[0];
-                        q_b_2[3] = qw_17[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_93;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_89;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_93) : "r"((uint32_t)(codes[4] >> 16)));
-                        qn_2[2] = _cvt_f16x2_e2m1x2_93;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_89) : "r"((uint32_t)(codes[4] >> 16)));
-                        qn_2[2] = _cvt_f16x2_e2m1x2_89;
-#endif
-                        float qw_18[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_18[0]), "=&f"(qw_18[1]) : "r"(qn_2[2]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[4] = qw_18[0];
-                        q_b_2[5] = qw_18[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_94;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_90;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_94) : "r"((uint32_t)(codes[4] >> 24)));
-                        qn_2[3] = _cvt_f16x2_e2m1x2_94;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_90) : "r"((uint32_t)(codes[4] >> 24)));
-                        qn_2[3] = _cvt_f16x2_e2m1x2_90;
-#endif
-                        float qw_19[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_19[0]), "=&f"(qw_19[1]) : "r"(qn_2[3]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[6] = qw_19[0];
-                        q_b_2[7] = qw_19[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_95;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_91;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_95) : "r"((uint32_t)(codes[5] >> 0)));
-                        qn_2[4] = _cvt_f16x2_e2m1x2_95;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_91) : "r"((uint32_t)(codes[5] >> 0)));
-                        qn_2[4] = _cvt_f16x2_e2m1x2_91;
-#endif
-                        float qw_20[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_20[0]), "=&f"(qw_20[1]) : "r"(qn_2[4]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[8] = qw_20[0];
-                        q_b_2[9] = qw_20[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_96;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_92;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_96) : "r"((uint32_t)(codes[5] >> 8)));
-                        qn_2[5] = _cvt_f16x2_e2m1x2_96;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_92) : "r"((uint32_t)(codes[5] >> 8)));
-                        qn_2[5] = _cvt_f16x2_e2m1x2_92;
-#endif
-                        float qw_21[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_21[0]), "=&f"(qw_21[1]) : "r"(qn_2[5]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[10] = qw_21[0];
-                        q_b_2[11] = qw_21[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_97;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_93;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_97) : "r"((uint32_t)(codes[5] >> 16)));
-                        qn_2[6] = _cvt_f16x2_e2m1x2_97;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_93) : "r"((uint32_t)(codes[5] >> 16)));
-                        qn_2[6] = _cvt_f16x2_e2m1x2_93;
-#endif
-                        float qw_22[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_22[0]), "=&f"(qw_22[1]) : "r"(qn_2[6]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[12] = qw_22[0];
-                        q_b_2[13] = qw_22[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_98;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_94;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_98) : "r"((uint32_t)(codes[5] >> 24)));
-                        qn_2[7] = _cvt_f16x2_e2m1x2_98;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_94) : "r"((uint32_t)(codes[5] >> 24)));
-                        qn_2[7] = _cvt_f16x2_e2m1x2_94;
-#endif
-                        float qw_23[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_23[0]), "=&f"(qw_23[1]) : "r"(qn_2[7]), "f"(0.0f), "f"(0.0f));
-                        q_b_2[14] = qw_23[0];
-                        q_b_2[15] = qw_23[1];
-                        float qe_2[16];
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(qe_2)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_2)[_ls], reinterpret_cast<const float2*>((s_vals + 32))[_ls]);
-                        float t8_4[8];
-                        #pragma unroll
-                        for (int _la = 0; _la < 4; _la++)
-                            reinterpret_cast<float2*>(t8_4)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_2 + 0))[_la], reinterpret_cast<const float2*>((qe_2 + 8))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 2; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_4)[_la], reinterpret_cast<const float2*>((t8_4 + 4))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 1; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_4)[_la], reinterpret_cast<const float2*>((t8_4 + 2))[_la]);
-                        qv_2[2] = t8_4[0] + t8_4[1];
-                        uint32_t a0_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_2) : "r"(qn_2[0]), "r"(qn_2[0]), "r"(0));
-                        uint32_t b0_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_2) : "r"(qn_2[4]), "r"(qn_2[4]), "r"(0));
-                        uint32_t a1_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_2) : "r"(qn_2[1]), "r"(qn_2[1]), "r"(a0_2));
-                        uint32_t b1_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_2) : "r"(qn_2[5]), "r"(qn_2[5]), "r"(b0_2));
-                        uint32_t a2_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_2) : "r"(qn_2[2]), "r"(qn_2[2]), "r"(a1_2));
-                        uint32_t b2_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_2) : "r"(qn_2[6]), "r"(qn_2[6]), "r"(b1_2));
-                        uint32_t a3_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_2) : "r"(qn_2[3]), "r"(qn_2[3]), "r"(a2_2));
-                        uint32_t b3_2;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_2) : "r"(qn_2[7]), "r"(qn_2[7]), "r"(b2_2));
-                        uint32_t v_2;
-                        asm("add.f16x2 %0, %1, %2;" : "=r"(v_2) : "r"(a3_2), "r"(b3_2));
-                        float w_2[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(w_2[0]), "=&f"(w_2[1]) : "r"(v_2), "f"(0.0f), "f"(0.0f));
-                        qq_2[2] = w_2[0] + w_2[1];
-#if __CUDA_ARCH__ == 1030
-                        float _rcp_99 = approx_rcp(qq_2[2]);
-                        sf_fit[2] = ((g_live_1 != 0 && qq_2[2] > 0.0f) ? sf_ex_1 * qv_2[2] * _rcp_99 : 0.0f);
-#else
-                        float _rcp_95 = approx_rcp(qq_2[2]);
-                        sf_fit[2] = ((g_live_1 != 0 && qq_2[2] > 0.0f) ? sf_ex_1 * qv_2[2] * _rcp_95 : 0.0f);
-#endif
-                    }
-                    int g_live_2 = g[3] > -CUDART_INF_F;
-                    float g_safe_2 = ((g_live_2 != 0) ? g[3] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_100 = {c_log2, c_log2};
-                    const float2 _fma_c2_101 = {-g_safe_2, -g_safe_2};
-#else
-                    const float2 _fma_b2_96 = {c_log2, c_log2};
-                    const float2 _fma_c2_97 = {-g_safe_2, -g_safe_2};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_100, _fma_c2_101);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_96, _fma_c2_97);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le + 48] = approx_exp2(s_vals[_le + 48]);
-                    }
-                    float t8_5[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_5)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 48))[_la], reinterpret_cast<const float2*>((s_vals + 56))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_5)[_la], reinterpret_cast<const float2*>((t8_5 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_5)[_la], reinterpret_cast<const float2*>((t8_5 + 2))[_la]);
-                    b_sums[3] = t8_5[0] + t8_5[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_102 = approx_exp2(g_safe_2 - m);
-                    b_weights[3] = ((g_live_2 != 0) ? _exp2_102 : 0.0f);
-                    float _exp2_103 = approx_exp2(g_safe_2 - m - 4.0f);
-                    float sf_ex_2 = 448.0f * _exp2_103;
-#else
-                    float _exp2_98 = approx_exp2(g_safe_2 - m);
-                    b_weights[3] = ((g_live_2 != 0) ? _exp2_98 : 0.0f);
-                    float _exp2_99 = approx_exp2(g_safe_2 - m - 4.0f);
-                    float sf_ex_2 = 448.0f * _exp2_99;
-#endif
-                    float e_min_2 = s_vals[(48) + 0];
-                    #pragma unroll
-                    for (int _lr = 1; _lr < 16; _lr++) {
-                        e_min_2 = fminf(e_min_2, s_vals[(48) + _lr]);
-                    }
-                    int flat_2 = dither != 0 && e_min_2 >= 0.5f;
-                    if (flat_2 != 0) {
-#if __CUDA_ARCH__ == 1030
-                        const float2 _fma_b2_104 = {six_rho_d[3], six_rho_d[3]};
-                        const float2 _fma_c2_105 = {0.0f, 0.0f};
-#else
-                        const float2 _fma_b2_100 = {six_rho_d[3], six_rho_d[3]};
-                        const float2 _fma_c2_101 = {0.0f, 0.0f};
-#endif
-                        #pragma unroll
-                        for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_104, _fma_c2_105);
-                        uint16_t _cvt_rs_x4_f32_106;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_106) : "f"(s_vals[51]), "f"(s_vals[50]), "f"(s_vals[49]), "f"(s_vals[48]), "r"(3103267870u));
-                        unsigned int w_lo_6 = _cvt_rs_x4_f32_106;
-                        uint16_t _cvt_rs_x4_f32_107;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_107) : "f"(s_vals[55]), "f"(s_vals[54]), "f"(s_vals[53]), "f"(s_vals[52]), "r"(2564298778u));
-                        unsigned int w_hi_6 = _cvt_rs_x4_f32_107;
-#else
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_100, _fma_c2_101);
-                        uint16_t _cvt_rs_x4_f32_102;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_102) : "f"(s_vals[51]), "f"(s_vals[50]), "f"(s_vals[49]), "f"(s_vals[48]), "r"(3103267870u));
-                        unsigned int w_lo_6 = _cvt_rs_x4_f32_102;
-                        uint16_t _cvt_rs_x4_f32_103;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_103) : "f"(s_vals[55]), "f"(s_vals[54]), "f"(s_vals[53]), "f"(s_vals[52]), "r"(2564298778u));
-                        unsigned int w_hi_6 = _cvt_rs_x4_f32_103;
-#endif
-                        codes[6] = w_lo_6 | w_hi_6 << 16;
-#if __CUDA_ARCH__ == 1030
-                        uint16_t _cvt_rs_x4_f32_108;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_108) : "f"(s_vals[59]), "f"(s_vals[58]), "f"(s_vals[57]), "f"(s_vals[56]), "r"(2833781782u));
-                        unsigned int w_lo_7 = _cvt_rs_x4_f32_108;
-                        uint16_t _cvt_rs_x4_f32_109;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_109) : "f"(s_vals[63]), "f"(s_vals[62]), "f"(s_vals[61]), "f"(s_vals[60]), "r"(2294812690u));
-                        unsigned int w_hi_7 = _cvt_rs_x4_f32_109;
-#else
-                        uint16_t _cvt_rs_x4_f32_104;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_104) : "f"(s_vals[59]), "f"(s_vals[58]), "f"(s_vals[57]), "f"(s_vals[56]), "r"(2833781782u));
-                        unsigned int w_lo_7 = _cvt_rs_x4_f32_104;
-                        uint16_t _cvt_rs_x4_f32_105;
-                        asm("cvt.rs.satfinite.e2m1x4.f32 %0, {%1, %2, %3, %4}, %5;" : "=h"(_cvt_rs_x4_f32_105) : "f"(s_vals[63]), "f"(s_vals[62]), "f"(s_vals[61]), "f"(s_vals[60]), "r"(2294812690u));
-                        unsigned int w_hi_7 = _cvt_rs_x4_f32_105;
-#endif
-                        codes[7] = w_lo_7 | w_hi_7 << 16;
-                        sf_fit[3] = sf_near[3];
-                    } else {
-                        float qv_3[4];
-                        float qq_3[4];
-#if __CUDA_ARCH__ == 1030
-                        const float2 _scale2_110 = {6.0f, 6.0f};
-#else
-                        const float2 _scale2_106 = {6.0f, 6.0f};
-#endif
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_110);
-#else
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_106);
-#endif
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[6]) : "f"(s_vals[48]), "f"(s_vals[49]), "f"(s_vals[50]), "f"(s_vals[51]), "f"(s_vals[52]), "f"(s_vals[53]), "f"(s_vals[54]), "f"(s_vals[55]));
-                        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[7]) : "f"(s_vals[56]), "f"(s_vals[57]), "f"(s_vals[58]), "f"(s_vals[59]), "f"(s_vals[60]), "f"(s_vals[61]), "f"(s_vals[62]), "f"(s_vals[63]));
-                        float q_b_3[16];
-                        unsigned int qn_3[8];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_111;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_107;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_111) : "r"((uint32_t)(codes[6] >> 0)));
-                        qn_3[0] = _cvt_f16x2_e2m1x2_111;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_107) : "r"((uint32_t)(codes[6] >> 0)));
-                        qn_3[0] = _cvt_f16x2_e2m1x2_107;
-#endif
-                        float qw_24[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_24[0]), "=&f"(qw_24[1]) : "r"(qn_3[0]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[0] = qw_24[0];
-                        q_b_3[1] = qw_24[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_112;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_108;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_112) : "r"((uint32_t)(codes[6] >> 8)));
-                        qn_3[1] = _cvt_f16x2_e2m1x2_112;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_108) : "r"((uint32_t)(codes[6] >> 8)));
-                        qn_3[1] = _cvt_f16x2_e2m1x2_108;
-#endif
-                        float qw_25[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_25[0]), "=&f"(qw_25[1]) : "r"(qn_3[1]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[2] = qw_25[0];
-                        q_b_3[3] = qw_25[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_113;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_109;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_113) : "r"((uint32_t)(codes[6] >> 16)));
-                        qn_3[2] = _cvt_f16x2_e2m1x2_113;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_109) : "r"((uint32_t)(codes[6] >> 16)));
-                        qn_3[2] = _cvt_f16x2_e2m1x2_109;
-#endif
-                        float qw_26[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_26[0]), "=&f"(qw_26[1]) : "r"(qn_3[2]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[4] = qw_26[0];
-                        q_b_3[5] = qw_26[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_114;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_110;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_114) : "r"((uint32_t)(codes[6] >> 24)));
-                        qn_3[3] = _cvt_f16x2_e2m1x2_114;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_110) : "r"((uint32_t)(codes[6] >> 24)));
-                        qn_3[3] = _cvt_f16x2_e2m1x2_110;
-#endif
-                        float qw_27[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_27[0]), "=&f"(qw_27[1]) : "r"(qn_3[3]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[6] = qw_27[0];
-                        q_b_3[7] = qw_27[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_115;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_111;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_115) : "r"((uint32_t)(codes[7] >> 0)));
-                        qn_3[4] = _cvt_f16x2_e2m1x2_115;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_111) : "r"((uint32_t)(codes[7] >> 0)));
-                        qn_3[4] = _cvt_f16x2_e2m1x2_111;
-#endif
-                        float qw_28[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_28[0]), "=&f"(qw_28[1]) : "r"(qn_3[4]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[8] = qw_28[0];
-                        q_b_3[9] = qw_28[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_116;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_112;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_116) : "r"((uint32_t)(codes[7] >> 8)));
-                        qn_3[5] = _cvt_f16x2_e2m1x2_116;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_112) : "r"((uint32_t)(codes[7] >> 8)));
-                        qn_3[5] = _cvt_f16x2_e2m1x2_112;
-#endif
-                        float qw_29[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_29[0]), "=&f"(qw_29[1]) : "r"(qn_3[5]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[10] = qw_29[0];
-                        q_b_3[11] = qw_29[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_117;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_113;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_117) : "r"((uint32_t)(codes[7] >> 16)));
-                        qn_3[6] = _cvt_f16x2_e2m1x2_117;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_113) : "r"((uint32_t)(codes[7] >> 16)));
-                        qn_3[6] = _cvt_f16x2_e2m1x2_113;
-#endif
-                        float qw_30[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_30[0]), "=&f"(qw_30[1]) : "r"(qn_3[6]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[12] = qw_30[0];
-                        q_b_3[13] = qw_30[1];
-#if __CUDA_ARCH__ == 1030
-                        uint32_t _cvt_f16x2_e2m1x2_118;
-#else
-                        uint32_t _cvt_f16x2_e2m1x2_114;
-#endif
-                        asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_118) : "r"((uint32_t)(codes[7] >> 24)));
-                        qn_3[7] = _cvt_f16x2_e2m1x2_118;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_114) : "r"((uint32_t)(codes[7] >> 24)));
-                        qn_3[7] = _cvt_f16x2_e2m1x2_114;
-#endif
-                        float qw_31[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(qw_31[0]), "=&f"(qw_31[1]) : "r"(qn_3[7]), "f"(0.0f), "f"(0.0f));
-                        q_b_3[14] = qw_31[0];
-                        q_b_3[15] = qw_31[1];
-                        float qe_3[16];
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(qe_3)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_3)[_ls], reinterpret_cast<const float2*>((s_vals + 48))[_ls]);
-                        float t8_6[8];
-                        #pragma unroll
-                        for (int _la = 0; _la < 4; _la++)
-                            reinterpret_cast<float2*>(t8_6)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_3 + 0))[_la], reinterpret_cast<const float2*>((qe_3 + 8))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 2; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_6)[_la], reinterpret_cast<const float2*>((t8_6 + 4))[_la]);
-                        #pragma unroll
-                        for (int _la = 0; _la < 1; _la++)
-                            add_f32x2_inplace(&reinterpret_cast<float2*>(t8_6)[_la], reinterpret_cast<const float2*>((t8_6 + 2))[_la]);
-                        qv_3[3] = t8_6[0] + t8_6[1];
-                        uint32_t a0_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_3) : "r"(qn_3[0]), "r"(qn_3[0]), "r"(0));
-                        uint32_t b0_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_3) : "r"(qn_3[4]), "r"(qn_3[4]), "r"(0));
-                        uint32_t a1_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_3) : "r"(qn_3[1]), "r"(qn_3[1]), "r"(a0_3));
-                        uint32_t b1_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_3) : "r"(qn_3[5]), "r"(qn_3[5]), "r"(b0_3));
-                        uint32_t a2_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_3) : "r"(qn_3[2]), "r"(qn_3[2]), "r"(a1_3));
-                        uint32_t b2_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_3) : "r"(qn_3[6]), "r"(qn_3[6]), "r"(b1_3));
-                        uint32_t a3_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_3) : "r"(qn_3[3]), "r"(qn_3[3]), "r"(a2_3));
-                        uint32_t b3_3;
-                        asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_3) : "r"(qn_3[7]), "r"(qn_3[7]), "r"(b2_3));
-                        uint32_t v_3;
-                        asm("add.f16x2 %0, %1, %2;" : "=r"(v_3) : "r"(a3_3), "r"(b3_3));
-                        float w_3[2];
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 lo, hi;\n\t"
-                            "mov.b32 {lo, hi}, %2;\n\t"
-                            "add.rn.f32.f16 %0, lo, %3;\n\t"
-                            "add.rn.f32.f16 %1, hi, %4;\n\t"
-                            "}\n"
-                            : "=&f"(w_3[0]), "=&f"(w_3[1]) : "r"(v_3), "f"(0.0f), "f"(0.0f));
-                        qq_3[3] = w_3[0] + w_3[1];
-#if __CUDA_ARCH__ == 1030
-                        float _rcp_119 = approx_rcp(qq_3[3]);
-                        sf_fit[3] = ((g_live_2 != 0 && qq_3[3] > 0.0f) ? sf_ex_2 * qv_3[3] * _rcp_119 : 0.0f);
-#else
-                        float _rcp_115 = approx_rcp(qq_3[3]);
-                        sf_fit[3] = ((g_live_2 != 0 && qq_3[3] > 0.0f) ? sf_ex_2 * qv_3[3] * _rcp_115 : 0.0f);
-#endif
-                    }
-                } else {
-                    int g_live_3 = g[0] > -CUDART_INF_F;
-                    float g_safe_3 = ((g_live_3 != 0) ? g[0] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_120 = {c_log2, c_log2};
-                    const float2 _fma_c2_121 = {-g_safe_3, -g_safe_3};
-#else
-                    const float2 _fma_b2_116 = {c_log2, c_log2};
-                    const float2 _fma_c2_117 = {-g_safe_3, -g_safe_3};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_120, _fma_c2_121);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_lf], _fma_b2_116, _fma_c2_117);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le] = approx_exp2(s_vals[_le]);
-                    }
-                    float t8_7[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_7)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 0))[_la], reinterpret_cast<const float2*>((s_vals + 8))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_7)[_la], reinterpret_cast<const float2*>((t8_7 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_7)[_la], reinterpret_cast<const float2*>((t8_7 + 2))[_la]);
-                    b_sums[0] = t8_7[0] + t8_7[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_122 = approx_exp2(g_safe_3 - m);
-                    b_weights[0] = ((g_live_3 != 0) ? _exp2_122 : 0.0f);
-                    float _exp2_123 = approx_exp2(g_safe_3 - m - 4.0f);
-                    float sf_ex_3 = 448.0f * _exp2_123;
-#else
-                    float _exp2_118 = approx_exp2(g_safe_3 - m);
-                    b_weights[0] = ((g_live_3 != 0) ? _exp2_118 : 0.0f);
-                    float _exp2_119 = approx_exp2(g_safe_3 - m - 4.0f);
-                    float sf_ex_3 = 448.0f * _exp2_119;
-#endif
-                    float qv_4[4];
-                    float qq_4[4];
-#if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_124 = {6.0f, 6.0f};
-#else
-                    const float2 _scale2_120 = {6.0f, 6.0f};
-#endif
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_124);
-#else
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_120);
-#endif
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[0]) : "f"(s_vals[0]), "f"(s_vals[1]), "f"(s_vals[2]), "f"(s_vals[3]), "f"(s_vals[4]), "f"(s_vals[5]), "f"(s_vals[6]), "f"(s_vals[7]));
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[1]) : "f"(s_vals[8]), "f"(s_vals[9]), "f"(s_vals[10]), "f"(s_vals[11]), "f"(s_vals[12]), "f"(s_vals[13]), "f"(s_vals[14]), "f"(s_vals[15]));
-                    float q_b_4[16];
-                    unsigned int qn_4[8];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_125;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_121;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_125) : "r"((uint32_t)(codes[0] >> 0)));
-                    qn_4[0] = _cvt_f16x2_e2m1x2_125;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_121) : "r"((uint32_t)(codes[0] >> 0)));
-                    qn_4[0] = _cvt_f16x2_e2m1x2_121;
-#endif
-                    float qw_32[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_32[0]), "=&f"(qw_32[1]) : "r"(qn_4[0]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[0] = qw_32[0];
-                    q_b_4[1] = qw_32[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_126;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_122;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_126) : "r"((uint32_t)(codes[0] >> 8)));
-                    qn_4[1] = _cvt_f16x2_e2m1x2_126;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_122) : "r"((uint32_t)(codes[0] >> 8)));
-                    qn_4[1] = _cvt_f16x2_e2m1x2_122;
-#endif
-                    float qw_33[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_33[0]), "=&f"(qw_33[1]) : "r"(qn_4[1]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[2] = qw_33[0];
-                    q_b_4[3] = qw_33[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_127;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_123;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_127) : "r"((uint32_t)(codes[0] >> 16)));
-                    qn_4[2] = _cvt_f16x2_e2m1x2_127;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_123) : "r"((uint32_t)(codes[0] >> 16)));
-                    qn_4[2] = _cvt_f16x2_e2m1x2_123;
-#endif
-                    float qw_34[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_34[0]), "=&f"(qw_34[1]) : "r"(qn_4[2]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[4] = qw_34[0];
-                    q_b_4[5] = qw_34[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_128;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_124;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_128) : "r"((uint32_t)(codes[0] >> 24)));
-                    qn_4[3] = _cvt_f16x2_e2m1x2_128;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_124) : "r"((uint32_t)(codes[0] >> 24)));
-                    qn_4[3] = _cvt_f16x2_e2m1x2_124;
-#endif
-                    float qw_35[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_35[0]), "=&f"(qw_35[1]) : "r"(qn_4[3]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[6] = qw_35[0];
-                    q_b_4[7] = qw_35[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_129;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_125;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_129) : "r"((uint32_t)(codes[1] >> 0)));
-                    qn_4[4] = _cvt_f16x2_e2m1x2_129;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_125) : "r"((uint32_t)(codes[1] >> 0)));
-                    qn_4[4] = _cvt_f16x2_e2m1x2_125;
-#endif
-                    float qw_36[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_36[0]), "=&f"(qw_36[1]) : "r"(qn_4[4]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[8] = qw_36[0];
-                    q_b_4[9] = qw_36[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_130;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_126;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_130) : "r"((uint32_t)(codes[1] >> 8)));
-                    qn_4[5] = _cvt_f16x2_e2m1x2_130;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_126) : "r"((uint32_t)(codes[1] >> 8)));
-                    qn_4[5] = _cvt_f16x2_e2m1x2_126;
-#endif
-                    float qw_37[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_37[0]), "=&f"(qw_37[1]) : "r"(qn_4[5]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[10] = qw_37[0];
-                    q_b_4[11] = qw_37[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_131;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_127;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_131) : "r"((uint32_t)(codes[1] >> 16)));
-                    qn_4[6] = _cvt_f16x2_e2m1x2_131;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_127) : "r"((uint32_t)(codes[1] >> 16)));
-                    qn_4[6] = _cvt_f16x2_e2m1x2_127;
-#endif
-                    float qw_38[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_38[0]), "=&f"(qw_38[1]) : "r"(qn_4[6]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[12] = qw_38[0];
-                    q_b_4[13] = qw_38[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_132;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_128;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_132) : "r"((uint32_t)(codes[1] >> 24)));
-                    qn_4[7] = _cvt_f16x2_e2m1x2_132;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_128) : "r"((uint32_t)(codes[1] >> 24)));
-                    qn_4[7] = _cvt_f16x2_e2m1x2_128;
-#endif
-                    float qw_39[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_39[0]), "=&f"(qw_39[1]) : "r"(qn_4[7]), "f"(0.0f), "f"(0.0f));
-                    q_b_4[14] = qw_39[0];
-                    q_b_4[15] = qw_39[1];
-                    float qe_4[16];
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-                        reinterpret_cast<float2*>(qe_4)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_4)[_ls], reinterpret_cast<const float2*>((s_vals + 0))[_ls]);
-                    float t8_7_1[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_7_1)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_4 + 0))[_la], reinterpret_cast<const float2*>((qe_4 + 8))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_7_1)[_la], reinterpret_cast<const float2*>((t8_7_1 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_7_1)[_la], reinterpret_cast<const float2*>((t8_7_1 + 2))[_la]);
-                    qv_4[0] = t8_7_1[0] + t8_7_1[1];
-                    uint32_t a0_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_4) : "r"(qn_4[0]), "r"(qn_4[0]), "r"(0));
-                    uint32_t b0_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_4) : "r"(qn_4[4]), "r"(qn_4[4]), "r"(0));
-                    uint32_t a1_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_4) : "r"(qn_4[1]), "r"(qn_4[1]), "r"(a0_4));
-                    uint32_t b1_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_4) : "r"(qn_4[5]), "r"(qn_4[5]), "r"(b0_4));
-                    uint32_t a2_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_4) : "r"(qn_4[2]), "r"(qn_4[2]), "r"(a1_4));
-                    uint32_t b2_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_4) : "r"(qn_4[6]), "r"(qn_4[6]), "r"(b1_4));
-                    uint32_t a3_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_4) : "r"(qn_4[3]), "r"(qn_4[3]), "r"(a2_4));
-                    uint32_t b3_4;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_4) : "r"(qn_4[7]), "r"(qn_4[7]), "r"(b2_4));
-                    uint32_t v_4;
-                    asm("add.f16x2 %0, %1, %2;" : "=r"(v_4) : "r"(a3_4), "r"(b3_4));
-                    float w_4[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(w_4[0]), "=&f"(w_4[1]) : "r"(v_4), "f"(0.0f), "f"(0.0f));
-                    qq_4[0] = w_4[0] + w_4[1];
-#if __CUDA_ARCH__ == 1030
-                    float _rcp_133 = approx_rcp(qq_4[0]);
-                    sf_fit[0] = ((g_live_3 != 0 && qq_4[0] > 0.0f) ? sf_ex_3 * qv_4[0] * _rcp_133 : 0.0f);
-#else
-                    float _rcp_129 = approx_rcp(qq_4[0]);
-                    sf_fit[0] = ((g_live_3 != 0 && qq_4[0] > 0.0f) ? sf_ex_3 * qv_4[0] * _rcp_129 : 0.0f);
-#endif
-                    int g_live_3_1 = g[1] > -CUDART_INF_F;
-                    float g_safe_3_1 = ((g_live_3_1 != 0) ? g[1] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_134 = {c_log2, c_log2};
-                    const float2 _fma_c2_135 = {-g_safe_3_1, -g_safe_3_1};
-#else
-                    const float2 _fma_b2_130 = {c_log2, c_log2};
-                    const float2 _fma_c2_131 = {-g_safe_3_1, -g_safe_3_1};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_134, _fma_c2_135);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_130, _fma_c2_131);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le + 16] = approx_exp2(s_vals[_le + 16]);
-                    }
-                    float t8_8[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_8)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 16))[_la], reinterpret_cast<const float2*>((s_vals + 24))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_8)[_la], reinterpret_cast<const float2*>((t8_8 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_8)[_la], reinterpret_cast<const float2*>((t8_8 + 2))[_la]);
-                    b_sums[1] = t8_8[0] + t8_8[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_136 = approx_exp2(g_safe_3_1 - m);
-                    b_weights[1] = ((g_live_3_1 != 0) ? _exp2_136 : 0.0f);
-                    float _exp2_137 = approx_exp2(g_safe_3_1 - m - 4.0f);
-                    float sf_ex_3_1 = 448.0f * _exp2_137;
-#else
-                    float _exp2_132 = approx_exp2(g_safe_3_1 - m);
-                    b_weights[1] = ((g_live_3_1 != 0) ? _exp2_132 : 0.0f);
-                    float _exp2_133 = approx_exp2(g_safe_3_1 - m - 4.0f);
-                    float sf_ex_3_1 = 448.0f * _exp2_133;
-#endif
-                    float qv_0[4];
-                    float qq_0[4];
-#if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_138 = {6.0f, 6.0f};
-#else
-                    const float2 _scale2_134 = {6.0f, 6.0f};
-#endif
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_138);
-#else
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_134);
-#endif
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[2]) : "f"(s_vals[16]), "f"(s_vals[17]), "f"(s_vals[18]), "f"(s_vals[19]), "f"(s_vals[20]), "f"(s_vals[21]), "f"(s_vals[22]), "f"(s_vals[23]));
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[3]) : "f"(s_vals[24]), "f"(s_vals[25]), "f"(s_vals[26]), "f"(s_vals[27]), "f"(s_vals[28]), "f"(s_vals[29]), "f"(s_vals[30]), "f"(s_vals[31]));
-                    float q_b_0[16];
-                    unsigned int qn_0[8];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_139;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_135;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_139) : "r"((uint32_t)(codes[2] >> 0)));
-                    qn_0[0] = _cvt_f16x2_e2m1x2_139;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_135) : "r"((uint32_t)(codes[2] >> 0)));
-                    qn_0[0] = _cvt_f16x2_e2m1x2_135;
-#endif
-                    float qw_40[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_40[0]), "=&f"(qw_40[1]) : "r"(qn_0[0]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[0] = qw_40[0];
-                    q_b_0[1] = qw_40[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_140;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_136;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_140) : "r"((uint32_t)(codes[2] >> 8)));
-                    qn_0[1] = _cvt_f16x2_e2m1x2_140;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_136) : "r"((uint32_t)(codes[2] >> 8)));
-                    qn_0[1] = _cvt_f16x2_e2m1x2_136;
-#endif
-                    float qw_41[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_41[0]), "=&f"(qw_41[1]) : "r"(qn_0[1]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[2] = qw_41[0];
-                    q_b_0[3] = qw_41[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_141;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_137;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_141) : "r"((uint32_t)(codes[2] >> 16)));
-                    qn_0[2] = _cvt_f16x2_e2m1x2_141;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_137) : "r"((uint32_t)(codes[2] >> 16)));
-                    qn_0[2] = _cvt_f16x2_e2m1x2_137;
-#endif
-                    float qw_42[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_42[0]), "=&f"(qw_42[1]) : "r"(qn_0[2]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[4] = qw_42[0];
-                    q_b_0[5] = qw_42[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_142;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_138;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_142) : "r"((uint32_t)(codes[2] >> 24)));
-                    qn_0[3] = _cvt_f16x2_e2m1x2_142;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_138) : "r"((uint32_t)(codes[2] >> 24)));
-                    qn_0[3] = _cvt_f16x2_e2m1x2_138;
-#endif
-                    float qw_43[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_43[0]), "=&f"(qw_43[1]) : "r"(qn_0[3]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[6] = qw_43[0];
-                    q_b_0[7] = qw_43[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_143;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_139;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_143) : "r"((uint32_t)(codes[3] >> 0)));
-                    qn_0[4] = _cvt_f16x2_e2m1x2_143;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_139) : "r"((uint32_t)(codes[3] >> 0)));
-                    qn_0[4] = _cvt_f16x2_e2m1x2_139;
-#endif
-                    float qw_44[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_44[0]), "=&f"(qw_44[1]) : "r"(qn_0[4]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[8] = qw_44[0];
-                    q_b_0[9] = qw_44[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_144;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_140;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_144) : "r"((uint32_t)(codes[3] >> 8)));
-                    qn_0[5] = _cvt_f16x2_e2m1x2_144;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_140) : "r"((uint32_t)(codes[3] >> 8)));
-                    qn_0[5] = _cvt_f16x2_e2m1x2_140;
-#endif
-                    float qw_45[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_45[0]), "=&f"(qw_45[1]) : "r"(qn_0[5]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[10] = qw_45[0];
-                    q_b_0[11] = qw_45[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_145;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_141;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_145) : "r"((uint32_t)(codes[3] >> 16)));
-                    qn_0[6] = _cvt_f16x2_e2m1x2_145;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_141) : "r"((uint32_t)(codes[3] >> 16)));
-                    qn_0[6] = _cvt_f16x2_e2m1x2_141;
-#endif
-                    float qw_46[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_46[0]), "=&f"(qw_46[1]) : "r"(qn_0[6]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[12] = qw_46[0];
-                    q_b_0[13] = qw_46[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_146;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_142;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_146) : "r"((uint32_t)(codes[3] >> 24)));
-                    qn_0[7] = _cvt_f16x2_e2m1x2_146;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_142) : "r"((uint32_t)(codes[3] >> 24)));
-                    qn_0[7] = _cvt_f16x2_e2m1x2_142;
-#endif
-                    float qw_47[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_47[0]), "=&f"(qw_47[1]) : "r"(qn_0[7]), "f"(0.0f), "f"(0.0f));
-                    q_b_0[14] = qw_47[0];
-                    q_b_0[15] = qw_47[1];
-                    float qe_0[16];
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-                        reinterpret_cast<float2*>(qe_0)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_0)[_ls], reinterpret_cast<const float2*>((s_vals + 16))[_ls]);
-                    float t8_9[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_9)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_0 + 0))[_la], reinterpret_cast<const float2*>((qe_0 + 8))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_9)[_la], reinterpret_cast<const float2*>((t8_9 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_9)[_la], reinterpret_cast<const float2*>((t8_9 + 2))[_la]);
-                    qv_0[1] = t8_9[0] + t8_9[1];
-                    uint32_t a0_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_0) : "r"(qn_0[0]), "r"(qn_0[0]), "r"(0));
-                    uint32_t b0_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_0) : "r"(qn_0[4]), "r"(qn_0[4]), "r"(0));
-                    uint32_t a1_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_0) : "r"(qn_0[1]), "r"(qn_0[1]), "r"(a0_0));
-                    uint32_t b1_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_0) : "r"(qn_0[5]), "r"(qn_0[5]), "r"(b0_0));
-                    uint32_t a2_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_0) : "r"(qn_0[2]), "r"(qn_0[2]), "r"(a1_0));
-                    uint32_t b2_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_0) : "r"(qn_0[6]), "r"(qn_0[6]), "r"(b1_0));
-                    uint32_t a3_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_0) : "r"(qn_0[3]), "r"(qn_0[3]), "r"(a2_0));
-                    uint32_t b3_0;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_0) : "r"(qn_0[7]), "r"(qn_0[7]), "r"(b2_0));
-                    uint32_t v_16;
-                    asm("add.f16x2 %0, %1, %2;" : "=r"(v_16) : "r"(a3_0), "r"(b3_0));
-                    float w_0[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(w_0[0]), "=&f"(w_0[1]) : "r"(v_16), "f"(0.0f), "f"(0.0f));
-                    qq_0[1] = w_0[0] + w_0[1];
-#if __CUDA_ARCH__ == 1030
-                    float _rcp_147 = approx_rcp(qq_0[1]);
-                    sf_fit[1] = ((g_live_3_1 != 0 && qq_0[1] > 0.0f) ? sf_ex_3_1 * qv_0[1] * _rcp_147 : 0.0f);
-#else
-                    float _rcp_143 = approx_rcp(qq_0[1]);
-                    sf_fit[1] = ((g_live_3_1 != 0 && qq_0[1] > 0.0f) ? sf_ex_3_1 * qv_0[1] * _rcp_143 : 0.0f);
-#endif
-                    int g_live_4 = g[2] > -CUDART_INF_F;
-                    float g_safe_4 = ((g_live_4 != 0) ? g[2] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_148 = {c_log2, c_log2};
-                    const float2 _fma_c2_149 = {-g_safe_4, -g_safe_4};
-#else
-                    const float2 _fma_b2_144 = {c_log2, c_log2};
-                    const float2 _fma_c2_145 = {-g_safe_4, -g_safe_4};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_148, _fma_c2_149);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_144, _fma_c2_145);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le + 32] = approx_exp2(s_vals[_le + 32]);
-                    }
-                    float t8_10[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_10)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 32))[_la], reinterpret_cast<const float2*>((s_vals + 40))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_10)[_la], reinterpret_cast<const float2*>((t8_10 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_10)[_la], reinterpret_cast<const float2*>((t8_10 + 2))[_la]);
-                    b_sums[2] = t8_10[0] + t8_10[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_150 = approx_exp2(g_safe_4 - m);
-                    b_weights[2] = ((g_live_4 != 0) ? _exp2_150 : 0.0f);
-                    float _exp2_151 = approx_exp2(g_safe_4 - m - 4.0f);
-                    float sf_ex_4 = 448.0f * _exp2_151;
-#else
-                    float _exp2_146 = approx_exp2(g_safe_4 - m);
-                    b_weights[2] = ((g_live_4 != 0) ? _exp2_146 : 0.0f);
-                    float _exp2_147 = approx_exp2(g_safe_4 - m - 4.0f);
-                    float sf_ex_4 = 448.0f * _exp2_147;
-#endif
-                    float qv_1_1[4];
-                    float qq_1_1[4];
-#if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_152 = {6.0f, 6.0f};
-#else
-                    const float2 _scale2_148 = {6.0f, 6.0f};
-#endif
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_152);
-#else
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_148);
-#endif
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[4]) : "f"(s_vals[32]), "f"(s_vals[33]), "f"(s_vals[34]), "f"(s_vals[35]), "f"(s_vals[36]), "f"(s_vals[37]), "f"(s_vals[38]), "f"(s_vals[39]));
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[5]) : "f"(s_vals[40]), "f"(s_vals[41]), "f"(s_vals[42]), "f"(s_vals[43]), "f"(s_vals[44]), "f"(s_vals[45]), "f"(s_vals[46]), "f"(s_vals[47]));
-                    float q_b_1_1[16];
-                    unsigned int qn_1_1[8];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_153;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_149;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_153) : "r"((uint32_t)(codes[4] >> 0)));
-                    qn_1_1[0] = _cvt_f16x2_e2m1x2_153;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_149) : "r"((uint32_t)(codes[4] >> 0)));
-                    qn_1_1[0] = _cvt_f16x2_e2m1x2_149;
-#endif
-                    float qw_48[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_48[0]), "=&f"(qw_48[1]) : "r"(qn_1_1[0]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[0] = qw_48[0];
-                    q_b_1_1[1] = qw_48[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_154;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_150;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_154) : "r"((uint32_t)(codes[4] >> 8)));
-                    qn_1_1[1] = _cvt_f16x2_e2m1x2_154;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_150) : "r"((uint32_t)(codes[4] >> 8)));
-                    qn_1_1[1] = _cvt_f16x2_e2m1x2_150;
-#endif
-                    float qw_49[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_49[0]), "=&f"(qw_49[1]) : "r"(qn_1_1[1]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[2] = qw_49[0];
-                    q_b_1_1[3] = qw_49[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_155;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_151;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_155) : "r"((uint32_t)(codes[4] >> 16)));
-                    qn_1_1[2] = _cvt_f16x2_e2m1x2_155;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_151) : "r"((uint32_t)(codes[4] >> 16)));
-                    qn_1_1[2] = _cvt_f16x2_e2m1x2_151;
-#endif
-                    float qw_50[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_50[0]), "=&f"(qw_50[1]) : "r"(qn_1_1[2]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[4] = qw_50[0];
-                    q_b_1_1[5] = qw_50[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_156;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_152;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_156) : "r"((uint32_t)(codes[4] >> 24)));
-                    qn_1_1[3] = _cvt_f16x2_e2m1x2_156;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_152) : "r"((uint32_t)(codes[4] >> 24)));
-                    qn_1_1[3] = _cvt_f16x2_e2m1x2_152;
-#endif
-                    float qw_51[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_51[0]), "=&f"(qw_51[1]) : "r"(qn_1_1[3]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[6] = qw_51[0];
-                    q_b_1_1[7] = qw_51[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_157;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_153;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_157) : "r"((uint32_t)(codes[5] >> 0)));
-                    qn_1_1[4] = _cvt_f16x2_e2m1x2_157;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_153) : "r"((uint32_t)(codes[5] >> 0)));
-                    qn_1_1[4] = _cvt_f16x2_e2m1x2_153;
-#endif
-                    float qw_52[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_52[0]), "=&f"(qw_52[1]) : "r"(qn_1_1[4]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[8] = qw_52[0];
-                    q_b_1_1[9] = qw_52[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_158;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_154;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_158) : "r"((uint32_t)(codes[5] >> 8)));
-                    qn_1_1[5] = _cvt_f16x2_e2m1x2_158;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_154) : "r"((uint32_t)(codes[5] >> 8)));
-                    qn_1_1[5] = _cvt_f16x2_e2m1x2_154;
-#endif
-                    float qw_53[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_53[0]), "=&f"(qw_53[1]) : "r"(qn_1_1[5]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[10] = qw_53[0];
-                    q_b_1_1[11] = qw_53[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_159;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_155;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_159) : "r"((uint32_t)(codes[5] >> 16)));
-                    qn_1_1[6] = _cvt_f16x2_e2m1x2_159;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_155) : "r"((uint32_t)(codes[5] >> 16)));
-                    qn_1_1[6] = _cvt_f16x2_e2m1x2_155;
-#endif
-                    float qw_54[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_54[0]), "=&f"(qw_54[1]) : "r"(qn_1_1[6]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[12] = qw_54[0];
-                    q_b_1_1[13] = qw_54[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_160;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_156;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_160) : "r"((uint32_t)(codes[5] >> 24)));
-                    qn_1_1[7] = _cvt_f16x2_e2m1x2_160;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_156) : "r"((uint32_t)(codes[5] >> 24)));
-                    qn_1_1[7] = _cvt_f16x2_e2m1x2_156;
-#endif
-                    float qw_55[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_55[0]), "=&f"(qw_55[1]) : "r"(qn_1_1[7]), "f"(0.0f), "f"(0.0f));
-                    q_b_1_1[14] = qw_55[0];
-                    q_b_1_1[15] = qw_55[1];
-                    float qe_1_1[16];
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-                        reinterpret_cast<float2*>(qe_1_1)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_1_1)[_ls], reinterpret_cast<const float2*>((s_vals + 32))[_ls]);
-                    float t8_11[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_11)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_1_1 + 0))[_la], reinterpret_cast<const float2*>((qe_1_1 + 8))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_11)[_la], reinterpret_cast<const float2*>((t8_11 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_11)[_la], reinterpret_cast<const float2*>((t8_11 + 2))[_la]);
-                    qv_1_1[2] = t8_11[0] + t8_11[1];
-                    uint32_t a0_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_1_1) : "r"(qn_1_1[0]), "r"(qn_1_1[0]), "r"(0));
-                    uint32_t b0_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_1_1) : "r"(qn_1_1[4]), "r"(qn_1_1[4]), "r"(0));
-                    uint32_t a1_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_1_1) : "r"(qn_1_1[1]), "r"(qn_1_1[1]), "r"(a0_1_1));
-                    uint32_t b1_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_1_1) : "r"(qn_1_1[5]), "r"(qn_1_1[5]), "r"(b0_1_1));
-                    uint32_t a2_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_1_1) : "r"(qn_1_1[2]), "r"(qn_1_1[2]), "r"(a1_1_1));
-                    uint32_t b2_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_1_1) : "r"(qn_1_1[6]), "r"(qn_1_1[6]), "r"(b1_1_1));
-                    uint32_t a3_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_1_1) : "r"(qn_1_1[3]), "r"(qn_1_1[3]), "r"(a2_1_1));
-                    uint32_t b3_1_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_1_1) : "r"(qn_1_1[7]), "r"(qn_1_1[7]), "r"(b2_1_1));
-                    uint32_t v_17;
-                    asm("add.f16x2 %0, %1, %2;" : "=r"(v_17) : "r"(a3_1_1), "r"(b3_1_1));
-                    float w_1_1[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(w_1_1[0]), "=&f"(w_1_1[1]) : "r"(v_17), "f"(0.0f), "f"(0.0f));
-                    qq_1_1[2] = w_1_1[0] + w_1_1[1];
-#if __CUDA_ARCH__ == 1030
-                    float _rcp_161 = approx_rcp(qq_1_1[2]);
-                    sf_fit[2] = ((g_live_4 != 0 && qq_1_1[2] > 0.0f) ? sf_ex_4 * qv_1_1[2] * _rcp_161 : 0.0f);
-#else
-                    float _rcp_157 = approx_rcp(qq_1_1[2]);
-                    sf_fit[2] = ((g_live_4 != 0 && qq_1_1[2] > 0.0f) ? sf_ex_4 * qv_1_1[2] * _rcp_157 : 0.0f);
-#endif
-                    int g_live_5 = g[3] > -CUDART_INF_F;
-                    float g_safe_5 = ((g_live_5 != 0) ? g[3] : 0.0f);
-#if __CUDA_ARCH__ == 1030
-                    const float2 _fma_b2_162 = {c_log2, c_log2};
-                    const float2 _fma_c2_163 = {-g_safe_5, -g_safe_5};
-#else
-                    const float2 _fma_b2_158 = {c_log2, c_log2};
-                    const float2 _fma_c2_159 = {-g_safe_5, -g_safe_5};
-#endif
-                    #pragma unroll
-                    for (int _lf = 0; _lf < 8; _lf++)
-#if __CUDA_ARCH__ == 1030
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_162, _fma_c2_163);
-#else
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_158, _fma_c2_159);
-#endif
-                    #pragma unroll
-                    for (int _le = 0; _le < 16; _le++) {
-                        s_vals[_le + 48] = approx_exp2(s_vals[_le + 48]);
-                    }
-                    float t8_12[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_12)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 48))[_la], reinterpret_cast<const float2*>((s_vals + 56))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_12)[_la], reinterpret_cast<const float2*>((t8_12 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_12)[_la], reinterpret_cast<const float2*>((t8_12 + 2))[_la]);
-                    b_sums[3] = t8_12[0] + t8_12[1];
-#if __CUDA_ARCH__ == 1030
-                    float _exp2_164 = approx_exp2(g_safe_5 - m);
-                    b_weights[3] = ((g_live_5 != 0) ? _exp2_164 : 0.0f);
-                    float _exp2_165 = approx_exp2(g_safe_5 - m - 4.0f);
-                    float sf_ex_5 = 448.0f * _exp2_165;
-#else
-                    float _exp2_160 = approx_exp2(g_safe_5 - m);
-                    b_weights[3] = ((g_live_5 != 0) ? _exp2_160 : 0.0f);
-                    float _exp2_161 = approx_exp2(g_safe_5 - m - 4.0f);
-                    float sf_ex_5 = 448.0f * _exp2_161;
-#endif
-                    float qv_2_1[4];
-                    float qq_2_1[4];
-#if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_166 = {6.0f, 6.0f};
-#else
-                    const float2 _scale2_162 = {6.0f, 6.0f};
-#endif
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-#if __CUDA_ARCH__ == 1030
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_166);
-#else
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_162);
-#endif
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[6]) : "f"(s_vals[48]), "f"(s_vals[49]), "f"(s_vals[50]), "f"(s_vals[51]), "f"(s_vals[52]), "f"(s_vals[53]), "f"(s_vals[54]), "f"(s_vals[55]));
-                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[7]) : "f"(s_vals[56]), "f"(s_vals[57]), "f"(s_vals[58]), "f"(s_vals[59]), "f"(s_vals[60]), "f"(s_vals[61]), "f"(s_vals[62]), "f"(s_vals[63]));
-                    float q_b_2_1[16];
-                    unsigned int qn_2_1[8];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_167;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_163;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_167) : "r"((uint32_t)(codes[6] >> 0)));
-                    qn_2_1[0] = _cvt_f16x2_e2m1x2_167;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_163) : "r"((uint32_t)(codes[6] >> 0)));
-                    qn_2_1[0] = _cvt_f16x2_e2m1x2_163;
-#endif
-                    float qw_56[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_56[0]), "=&f"(qw_56[1]) : "r"(qn_2_1[0]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[0] = qw_56[0];
-                    q_b_2_1[1] = qw_56[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_168;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_164;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_168) : "r"((uint32_t)(codes[6] >> 8)));
-                    qn_2_1[1] = _cvt_f16x2_e2m1x2_168;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_164) : "r"((uint32_t)(codes[6] >> 8)));
-                    qn_2_1[1] = _cvt_f16x2_e2m1x2_164;
-#endif
-                    float qw_57[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_57[0]), "=&f"(qw_57[1]) : "r"(qn_2_1[1]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[2] = qw_57[0];
-                    q_b_2_1[3] = qw_57[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_169;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_165;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_169) : "r"((uint32_t)(codes[6] >> 16)));
-                    qn_2_1[2] = _cvt_f16x2_e2m1x2_169;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_165) : "r"((uint32_t)(codes[6] >> 16)));
-                    qn_2_1[2] = _cvt_f16x2_e2m1x2_165;
-#endif
-                    float qw_58[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_58[0]), "=&f"(qw_58[1]) : "r"(qn_2_1[2]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[4] = qw_58[0];
-                    q_b_2_1[5] = qw_58[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_170;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_166;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_170) : "r"((uint32_t)(codes[6] >> 24)));
-                    qn_2_1[3] = _cvt_f16x2_e2m1x2_170;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_166) : "r"((uint32_t)(codes[6] >> 24)));
-                    qn_2_1[3] = _cvt_f16x2_e2m1x2_166;
-#endif
-                    float qw_59[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_59[0]), "=&f"(qw_59[1]) : "r"(qn_2_1[3]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[6] = qw_59[0];
-                    q_b_2_1[7] = qw_59[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_171;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_167;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_171) : "r"((uint32_t)(codes[7] >> 0)));
-                    qn_2_1[4] = _cvt_f16x2_e2m1x2_171;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_167) : "r"((uint32_t)(codes[7] >> 0)));
-                    qn_2_1[4] = _cvt_f16x2_e2m1x2_167;
-#endif
-                    float qw_60[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_60[0]), "=&f"(qw_60[1]) : "r"(qn_2_1[4]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[8] = qw_60[0];
-                    q_b_2_1[9] = qw_60[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_172;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_168;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_172) : "r"((uint32_t)(codes[7] >> 8)));
-                    qn_2_1[5] = _cvt_f16x2_e2m1x2_172;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_168) : "r"((uint32_t)(codes[7] >> 8)));
-                    qn_2_1[5] = _cvt_f16x2_e2m1x2_168;
-#endif
-                    float qw_61[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_61[0]), "=&f"(qw_61[1]) : "r"(qn_2_1[5]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[10] = qw_61[0];
-                    q_b_2_1[11] = qw_61[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_173;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_169;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_173) : "r"((uint32_t)(codes[7] >> 16)));
-                    qn_2_1[6] = _cvt_f16x2_e2m1x2_173;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_169) : "r"((uint32_t)(codes[7] >> 16)));
-                    qn_2_1[6] = _cvt_f16x2_e2m1x2_169;
-#endif
-                    float qw_62[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_62[0]), "=&f"(qw_62[1]) : "r"(qn_2_1[6]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[12] = qw_62[0];
-                    q_b_2_1[13] = qw_62[1];
-#if __CUDA_ARCH__ == 1030
-                    uint32_t _cvt_f16x2_e2m1x2_174;
-#else
-                    uint32_t _cvt_f16x2_e2m1x2_170;
-#endif
-                    asm("{ .reg .b8 _b;                        \n\t"
-                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
-                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-#if __CUDA_ARCH__ == 1030
-                : "=r"(_cvt_f16x2_e2m1x2_174) : "r"((uint32_t)(codes[7] >> 24)));
-                    qn_2_1[7] = _cvt_f16x2_e2m1x2_174;
-#else
-                : "=r"(_cvt_f16x2_e2m1x2_170) : "r"((uint32_t)(codes[7] >> 24)));
-                    qn_2_1[7] = _cvt_f16x2_e2m1x2_170;
-#endif
-                    float qw_63[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(qw_63[0]), "=&f"(qw_63[1]) : "r"(qn_2_1[7]), "f"(0.0f), "f"(0.0f));
-                    q_b_2_1[14] = qw_63[0];
-                    q_b_2_1[15] = qw_63[1];
-                    float qe_2_1[16];
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-                        reinterpret_cast<float2*>(qe_2_1)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_2_1)[_ls], reinterpret_cast<const float2*>((s_vals + 48))[_ls]);
-                    float t8_13[8];
-                    #pragma unroll
-                    for (int _la = 0; _la < 4; _la++)
-                        reinterpret_cast<float2*>(t8_13)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_2_1 + 0))[_la], reinterpret_cast<const float2*>((qe_2_1 + 8))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 2; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_13)[_la], reinterpret_cast<const float2*>((t8_13 + 4))[_la]);
-                    #pragma unroll
-                    for (int _la = 0; _la < 1; _la++)
-                        add_f32x2_inplace(&reinterpret_cast<float2*>(t8_13)[_la], reinterpret_cast<const float2*>((t8_13 + 2))[_la]);
-                    qv_2_1[3] = t8_13[0] + t8_13[1];
-                    uint32_t a0_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_2_1) : "r"(qn_2_1[0]), "r"(qn_2_1[0]), "r"(0));
-                    uint32_t b0_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_2_1) : "r"(qn_2_1[4]), "r"(qn_2_1[4]), "r"(0));
-                    uint32_t a1_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_2_1) : "r"(qn_2_1[1]), "r"(qn_2_1[1]), "r"(a0_2_1));
-                    uint32_t b1_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_2_1) : "r"(qn_2_1[5]), "r"(qn_2_1[5]), "r"(b0_2_1));
-                    uint32_t a2_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_2_1) : "r"(qn_2_1[2]), "r"(qn_2_1[2]), "r"(a1_2_1));
-                    uint32_t b2_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_2_1) : "r"(qn_2_1[6]), "r"(qn_2_1[6]), "r"(b1_2_1));
-                    uint32_t a3_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_2_1) : "r"(qn_2_1[3]), "r"(qn_2_1[3]), "r"(a2_2_1));
-                    uint32_t b3_2_1;
-                    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_2_1) : "r"(qn_2_1[7]), "r"(qn_2_1[7]), "r"(b2_2_1));
-                    uint32_t v_18;
-                    asm("add.f16x2 %0, %1, %2;" : "=r"(v_18) : "r"(a3_2_1), "r"(b3_2_1));
-                    float w_2_1[2];
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b16 lo, hi;\n\t"
-                        "mov.b32 {lo, hi}, %2;\n\t"
-                        "add.rn.f32.f16 %0, lo, %3;\n\t"
-                        "add.rn.f32.f16 %1, hi, %4;\n\t"
-                        "}\n"
-                        : "=&f"(w_2_1[0]), "=&f"(w_2_1[1]) : "r"(v_18), "f"(0.0f), "f"(0.0f));
-                    qq_2_1[3] = w_2_1[0] + w_2_1[1];
-#if __CUDA_ARCH__ == 1030
-                    float _rcp_175 = approx_rcp(qq_2_1[3]);
-                    sf_fit[3] = ((g_live_5 != 0 && qq_2_1[3] > 0.0f) ? sf_ex_5 * qv_2_1[3] * _rcp_175 : 0.0f);
-#else
-                    float _rcp_171 = approx_rcp(qq_2_1[3]);
-                    sf_fit[3] = ((g_live_5 != 0 && qq_2_1[3] > 0.0f) ? sf_ex_5 * qv_2_1[3] * _rcp_171 : 0.0f);
-#endif
+                #pragma unroll
+                for (int _le = 0; _le < 16; _le++) {
+                    s_vals[_le] = approx_exp2(s_vals[_le]);
                 }
+                float t8[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 0))[_la], reinterpret_cast<const float2*>((s_vals + 8))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8)[_la], reinterpret_cast<const float2*>((t8 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8)[_la], reinterpret_cast<const float2*>((t8 + 2))[_la]);
+                b_sums[0] = t8[0] + t8[1];
+#if __CUDA_ARCH__ == 1030
+                const float2 _scale2_30 = {6.0f, 6.0f};
+#else
+                float _exp2_26 = approx_exp2(g_safe_0 - m);
+                b_weights[0] = ((g_live_0 != 0) ? _exp2_26 : 0.0f);
+                float _exp2_27 = approx_exp2(g_safe_0 - m - 4.0f);
+                float sf_ex_0 = 448.0f * _exp2_27;
+                float qv[4];
+                float qq[4];
+                const float2 _scale2_28 = {6.0f, 6.0f};
+#endif
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_30);
+#else
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 0))[_ls], _scale2_28);
+#endif
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[0]) : "f"(s_vals[0]), "f"(s_vals[1]), "f"(s_vals[2]), "f"(s_vals[3]), "f"(s_vals[4]), "f"(s_vals[5]), "f"(s_vals[6]), "f"(s_vals[7]));
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[1]) : "f"(s_vals[8]), "f"(s_vals[9]), "f"(s_vals[10]), "f"(s_vals[11]), "f"(s_vals[12]), "f"(s_vals[13]), "f"(s_vals[14]), "f"(s_vals[15]));
+                float q_b[16];
+                unsigned int qn[8];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_31;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_29;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_31) : "r"((uint32_t)(codes[0] >> 0)));
+                qn[0] = _cvt_f16x2_e2m1x2_31;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_29) : "r"((uint32_t)(codes[0] >> 0)));
+                qn[0] = _cvt_f16x2_e2m1x2_29;
+#endif
+                float qw_0[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_0[0]), "=&f"(qw_0[1]) : "r"(qn[0]), "f"(0.0f), "f"(0.0f));
+                q_b[0] = qw_0[0];
+                q_b[1] = qw_0[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_32;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_30;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_32) : "r"((uint32_t)(codes[0] >> 8)));
+                qn[1] = _cvt_f16x2_e2m1x2_32;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_30) : "r"((uint32_t)(codes[0] >> 8)));
+                qn[1] = _cvt_f16x2_e2m1x2_30;
+#endif
+                float qw_1[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_1[0]), "=&f"(qw_1[1]) : "r"(qn[1]), "f"(0.0f), "f"(0.0f));
+                q_b[2] = qw_1[0];
+                q_b[3] = qw_1[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_33;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_31;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[0] >> 16)));
+                qn[2] = _cvt_f16x2_e2m1x2_33;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_31) : "r"((uint32_t)(codes[0] >> 16)));
+                qn[2] = _cvt_f16x2_e2m1x2_31;
+#endif
+                float qw_2[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_2[0]), "=&f"(qw_2[1]) : "r"(qn[2]), "f"(0.0f), "f"(0.0f));
+                q_b[4] = qw_2[0];
+                q_b[5] = qw_2[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_34;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_32;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[0] >> 24)));
+                qn[3] = _cvt_f16x2_e2m1x2_34;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_32) : "r"((uint32_t)(codes[0] >> 24)));
+                qn[3] = _cvt_f16x2_e2m1x2_32;
+#endif
+                float qw_3[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_3[0]), "=&f"(qw_3[1]) : "r"(qn[3]), "f"(0.0f), "f"(0.0f));
+                q_b[6] = qw_3[0];
+                q_b[7] = qw_3[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_35;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_33;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[1] >> 0)));
+                qn[4] = _cvt_f16x2_e2m1x2_35;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_33) : "r"((uint32_t)(codes[1] >> 0)));
+                qn[4] = _cvt_f16x2_e2m1x2_33;
+#endif
+                float qw_4[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_4[0]), "=&f"(qw_4[1]) : "r"(qn[4]), "f"(0.0f), "f"(0.0f));
+                q_b[8] = qw_4[0];
+                q_b[9] = qw_4[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_36;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_34;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[1] >> 8)));
+                qn[5] = _cvt_f16x2_e2m1x2_36;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_34) : "r"((uint32_t)(codes[1] >> 8)));
+                qn[5] = _cvt_f16x2_e2m1x2_34;
+#endif
+                float qw_5[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_5[0]), "=&f"(qw_5[1]) : "r"(qn[5]), "f"(0.0f), "f"(0.0f));
+                q_b[10] = qw_5[0];
+                q_b[11] = qw_5[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_37;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_35;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_37) : "r"((uint32_t)(codes[1] >> 16)));
+                qn[6] = _cvt_f16x2_e2m1x2_37;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_35) : "r"((uint32_t)(codes[1] >> 16)));
+                qn[6] = _cvt_f16x2_e2m1x2_35;
+#endif
+                float qw_6[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_6[0]), "=&f"(qw_6[1]) : "r"(qn[6]), "f"(0.0f), "f"(0.0f));
+                q_b[12] = qw_6[0];
+                q_b[13] = qw_6[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_38;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_36;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_38) : "r"((uint32_t)(codes[1] >> 24)));
+                qn[7] = _cvt_f16x2_e2m1x2_38;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_36) : "r"((uint32_t)(codes[1] >> 24)));
+                qn[7] = _cvt_f16x2_e2m1x2_36;
+#endif
+                float qw_7[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_7[0]), "=&f"(qw_7[1]) : "r"(qn[7]), "f"(0.0f), "f"(0.0f));
+                q_b[14] = qw_7[0];
+                q_b[15] = qw_7[1];
+                float qe[16];
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+                    reinterpret_cast<float2*>(qe)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b)[_ls], reinterpret_cast<const float2*>((s_vals + 0))[_ls]);
+                float t8_0[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8_0)[_la] = add_f32x2(reinterpret_cast<float2*>((qe + 0))[_la], reinterpret_cast<const float2*>((qe + 8))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_0)[_la], reinterpret_cast<const float2*>((t8_0 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_0)[_la], reinterpret_cast<const float2*>((t8_0 + 2))[_la]);
+                qv[0] = t8_0[0] + t8_0[1];
+                uint32_t a0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0) : "r"(qn[0]), "r"(qn[0]), "r"(0));
+                uint32_t b0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0) : "r"(qn[4]), "r"(qn[4]), "r"(0));
+                uint32_t a1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1) : "r"(qn[1]), "r"(qn[1]), "r"(a0));
+                uint32_t b1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1) : "r"(qn[5]), "r"(qn[5]), "r"(b0));
+                uint32_t a2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2) : "r"(qn[2]), "r"(qn[2]), "r"(a1));
+                uint32_t b2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2) : "r"(qn[6]), "r"(qn[6]), "r"(b1));
+                uint32_t a3;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3) : "r"(qn[3]), "r"(qn[3]), "r"(a2));
+                uint32_t b3;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3) : "r"(qn[7]), "r"(qn[7]), "r"(b2));
+                uint32_t v;
+                asm("add.f16x2 %0, %1, %2;" : "=r"(v) : "r"(a3), "r"(b3));
+                float w[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(w[0]), "=&f"(w[1]) : "r"(v), "f"(0.0f), "f"(0.0f));
+                qq[0] = w[0] + w[1];
+#if __CUDA_ARCH__ == 1030
+                g_safe[1] = ((g[1] > -CUDART_INF_F) ? g[1] : 0.0f);
+                const float2 _fma_b2_39 = {c_log2, c_log2};
+                const float2 _fma_c2_40 = {-g_safe[1], -g_safe[1]};
+#else
+                float _rcp_37 = approx_rcp(qq[0]);
+                sf_fit[0] = ((g_live_0 != 0 && qq[0] > 0.0f) ? sf_ex_0 * qv[0] * _rcp_37 : 0.0f);
+                int g_live_1 = g[1] > -CUDART_INF_F;
+                float g_safe_1 = ((g_live_1 != 0) ? g[1] : 0.0f);
+                const float2 _fma_b2_38 = {c_log2, c_log2};
+                const float2 _fma_c2_39 = {-g_safe_1, -g_safe_1};
+#endif
+                #pragma unroll
+                for (int _lf = 0; _lf < 8; _lf++)
+#if __CUDA_ARCH__ == 1030
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_39, _fma_c2_40);
+#else
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_lf], _fma_b2_38, _fma_c2_39);
+#endif
+                #pragma unroll
+                for (int _le = 0; _le < 16; _le++) {
+                    s_vals[_le + 16] = approx_exp2(s_vals[_le + 16]);
+                }
+                float t8_1[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8_1)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 16))[_la], reinterpret_cast<const float2*>((s_vals + 24))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_1)[_la], reinterpret_cast<const float2*>((t8_1 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_1)[_la], reinterpret_cast<const float2*>((t8_1 + 2))[_la]);
+                b_sums[1] = t8_1[0] + t8_1[1];
+#if __CUDA_ARCH__ == 1030
+                const float2 _scale2_41 = {6.0f, 6.0f};
+#else
+                float _exp2_40 = approx_exp2(g_safe_1 - m);
+                b_weights[1] = ((g_live_1 != 0) ? _exp2_40 : 0.0f);
+                float _exp2_41 = approx_exp2(g_safe_1 - m - 4.0f);
+                float sf_ex_1 = 448.0f * _exp2_41;
+                float qv_0[4];
+                float qq_0[4];
+                const float2 _scale2_42 = {6.0f, 6.0f};
+#endif
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_41);
+#else
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 16))[_ls], _scale2_42);
+#endif
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[2]) : "f"(s_vals[16]), "f"(s_vals[17]), "f"(s_vals[18]), "f"(s_vals[19]), "f"(s_vals[20]), "f"(s_vals[21]), "f"(s_vals[22]), "f"(s_vals[23]));
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[3]) : "f"(s_vals[24]), "f"(s_vals[25]), "f"(s_vals[26]), "f"(s_vals[27]), "f"(s_vals[28]), "f"(s_vals[29]), "f"(s_vals[30]), "f"(s_vals[31]));
+                float q_b_0[16];
+                unsigned int qn_0[8];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_42;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_43;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_42) : "r"((uint32_t)(codes[2] >> 0)));
+                qn_0[0] = _cvt_f16x2_e2m1x2_42;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_43) : "r"((uint32_t)(codes[2] >> 0)));
+                qn_0[0] = _cvt_f16x2_e2m1x2_43;
+#endif
+                float qw_8[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_8[0]), "=&f"(qw_8[1]) : "r"(qn_0[0]), "f"(0.0f), "f"(0.0f));
+                q_b_0[0] = qw_8[0];
+                q_b_0[1] = qw_8[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_43;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_44;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_43) : "r"((uint32_t)(codes[2] >> 8)));
+                qn_0[1] = _cvt_f16x2_e2m1x2_43;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_44) : "r"((uint32_t)(codes[2] >> 8)));
+                qn_0[1] = _cvt_f16x2_e2m1x2_44;
+#endif
+                float qw_9[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_9[0]), "=&f"(qw_9[1]) : "r"(qn_0[1]), "f"(0.0f), "f"(0.0f));
+                q_b_0[2] = qw_9[0];
+                q_b_0[3] = qw_9[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_44;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_45;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_44) : "r"((uint32_t)(codes[2] >> 16)));
+                qn_0[2] = _cvt_f16x2_e2m1x2_44;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_45) : "r"((uint32_t)(codes[2] >> 16)));
+                qn_0[2] = _cvt_f16x2_e2m1x2_45;
+#endif
+                float qw_10[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_10[0]), "=&f"(qw_10[1]) : "r"(qn_0[2]), "f"(0.0f), "f"(0.0f));
+                q_b_0[4] = qw_10[0];
+                q_b_0[5] = qw_10[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_45;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_46;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_45) : "r"((uint32_t)(codes[2] >> 24)));
+                qn_0[3] = _cvt_f16x2_e2m1x2_45;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_46) : "r"((uint32_t)(codes[2] >> 24)));
+                qn_0[3] = _cvt_f16x2_e2m1x2_46;
+#endif
+                float qw_11[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_11[0]), "=&f"(qw_11[1]) : "r"(qn_0[3]), "f"(0.0f), "f"(0.0f));
+                q_b_0[6] = qw_11[0];
+                q_b_0[7] = qw_11[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_46;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_47;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_46) : "r"((uint32_t)(codes[3] >> 0)));
+                qn_0[4] = _cvt_f16x2_e2m1x2_46;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[3] >> 0)));
+                qn_0[4] = _cvt_f16x2_e2m1x2_47;
+#endif
+                float qw_12[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_12[0]), "=&f"(qw_12[1]) : "r"(qn_0[4]), "f"(0.0f), "f"(0.0f));
+                q_b_0[8] = qw_12[0];
+                q_b_0[9] = qw_12[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_47;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_48;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_47) : "r"((uint32_t)(codes[3] >> 8)));
+                qn_0[5] = _cvt_f16x2_e2m1x2_47;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[3] >> 8)));
+                qn_0[5] = _cvt_f16x2_e2m1x2_48;
+#endif
+                float qw_13[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_13[0]), "=&f"(qw_13[1]) : "r"(qn_0[5]), "f"(0.0f), "f"(0.0f));
+                q_b_0[10] = qw_13[0];
+                q_b_0[11] = qw_13[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_48;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_49;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_48) : "r"((uint32_t)(codes[3] >> 16)));
+                qn_0[6] = _cvt_f16x2_e2m1x2_48;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[3] >> 16)));
+                qn_0[6] = _cvt_f16x2_e2m1x2_49;
+#endif
+                float qw_14[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_14[0]), "=&f"(qw_14[1]) : "r"(qn_0[6]), "f"(0.0f), "f"(0.0f));
+                q_b_0[12] = qw_14[0];
+                q_b_0[13] = qw_14[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_49;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_50;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_49) : "r"((uint32_t)(codes[3] >> 24)));
+                qn_0[7] = _cvt_f16x2_e2m1x2_49;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_50) : "r"((uint32_t)(codes[3] >> 24)));
+                qn_0[7] = _cvt_f16x2_e2m1x2_50;
+#endif
+                float qw_15[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_15[0]), "=&f"(qw_15[1]) : "r"(qn_0[7]), "f"(0.0f), "f"(0.0f));
+                q_b_0[14] = qw_15[0];
+                q_b_0[15] = qw_15[1];
+                float qe_0[16];
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+                    reinterpret_cast<float2*>(qe_0)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_0)[_ls], reinterpret_cast<const float2*>((s_vals + 16))[_ls]);
+                float t8_2[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8_2)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_0 + 0))[_la], reinterpret_cast<const float2*>((qe_0 + 8))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_2)[_la], reinterpret_cast<const float2*>((t8_2 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_2)[_la], reinterpret_cast<const float2*>((t8_2 + 2))[_la]);
+#if __CUDA_ARCH__ == 1030
+                qv[1] = t8_2[0] + t8_2[1];
+#else
+                qv_0[1] = t8_2[0] + t8_2[1];
+#endif
+                uint32_t a0_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_0) : "r"(qn_0[0]), "r"(qn_0[0]), "r"(0));
+                uint32_t b0_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_0) : "r"(qn_0[4]), "r"(qn_0[4]), "r"(0));
+                uint32_t a1_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_0) : "r"(qn_0[1]), "r"(qn_0[1]), "r"(a0_0));
+                uint32_t b1_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_0) : "r"(qn_0[5]), "r"(qn_0[5]), "r"(b0_0));
+                uint32_t a2_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_0) : "r"(qn_0[2]), "r"(qn_0[2]), "r"(a1_0));
+                uint32_t b2_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_0) : "r"(qn_0[6]), "r"(qn_0[6]), "r"(b1_0));
+                uint32_t a3_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_0) : "r"(qn_0[3]), "r"(qn_0[3]), "r"(a2_0));
+                uint32_t b3_0;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_0) : "r"(qn_0[7]), "r"(qn_0[7]), "r"(b2_0));
+                uint32_t v_16;
+                asm("add.f16x2 %0, %1, %2;" : "=r"(v_16) : "r"(a3_0), "r"(b3_0));
+                float w_0[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(w_0[0]), "=&f"(w_0[1]) : "r"(v_16), "f"(0.0f), "f"(0.0f));
+#if __CUDA_ARCH__ == 1030
+                qq[1] = w_0[0] + w_0[1];
+                g_safe[2] = ((g[2] > -CUDART_INF_F) ? g[2] : 0.0f);
+                const float2 _fma_b2_50 = {c_log2, c_log2};
+                const float2 _fma_c2_51 = {-g_safe[2], -g_safe[2]};
+#else
+                qq_0[1] = w_0[0] + w_0[1];
+                float _rcp_51 = approx_rcp(qq_0[1]);
+                sf_fit[1] = ((g_live_1 != 0 && qq_0[1] > 0.0f) ? sf_ex_1 * qv_0[1] * _rcp_51 : 0.0f);
+                int g_live_2 = g[2] > -CUDART_INF_F;
+                float g_safe_2 = ((g_live_2 != 0) ? g[2] : 0.0f);
+                const float2 _fma_b2_52 = {c_log2, c_log2};
+                const float2 _fma_c2_53 = {-g_safe_2, -g_safe_2};
+#endif
+                #pragma unroll
+                for (int _lf = 0; _lf < 8; _lf++)
+#if __CUDA_ARCH__ == 1030
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_50, _fma_c2_51);
+#else
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_lf], _fma_b2_52, _fma_c2_53);
+#endif
+                #pragma unroll
+                for (int _le = 0; _le < 16; _le++) {
+                    s_vals[_le + 32] = approx_exp2(s_vals[_le + 32]);
+                }
+                float t8_3[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8_3)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 32))[_la], reinterpret_cast<const float2*>((s_vals + 40))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_3)[_la], reinterpret_cast<const float2*>((t8_3 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_3)[_la], reinterpret_cast<const float2*>((t8_3 + 2))[_la]);
+                b_sums[2] = t8_3[0] + t8_3[1];
+#if __CUDA_ARCH__ == 1030
+                const float2 _scale2_52 = {6.0f, 6.0f};
+#else
+                float _exp2_54 = approx_exp2(g_safe_2 - m);
+                b_weights[2] = ((g_live_2 != 0) ? _exp2_54 : 0.0f);
+                float _exp2_55 = approx_exp2(g_safe_2 - m - 4.0f);
+                float sf_ex_2 = 448.0f * _exp2_55;
+                float qv_1[4];
+                float qq_1[4];
+                const float2 _scale2_56 = {6.0f, 6.0f};
+#endif
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_52);
+#else
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 32))[_ls], _scale2_56);
+#endif
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[4]) : "f"(s_vals[32]), "f"(s_vals[33]), "f"(s_vals[34]), "f"(s_vals[35]), "f"(s_vals[36]), "f"(s_vals[37]), "f"(s_vals[38]), "f"(s_vals[39]));
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[5]) : "f"(s_vals[40]), "f"(s_vals[41]), "f"(s_vals[42]), "f"(s_vals[43]), "f"(s_vals[44]), "f"(s_vals[45]), "f"(s_vals[46]), "f"(s_vals[47]));
+                float q_b_1[16];
+                unsigned int qn_1[8];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_53;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_57;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_53) : "r"((uint32_t)(codes[4] >> 0)));
+                qn_1[0] = _cvt_f16x2_e2m1x2_53;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[4] >> 0)));
+                qn_1[0] = _cvt_f16x2_e2m1x2_57;
+#endif
+                float qw_16[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_16[0]), "=&f"(qw_16[1]) : "r"(qn_1[0]), "f"(0.0f), "f"(0.0f));
+                q_b_1[0] = qw_16[0];
+                q_b_1[1] = qw_16[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_54;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_58;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_54) : "r"((uint32_t)(codes[4] >> 8)));
+                qn_1[1] = _cvt_f16x2_e2m1x2_54;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[4] >> 8)));
+                qn_1[1] = _cvt_f16x2_e2m1x2_58;
+#endif
+                float qw_17[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_17[0]), "=&f"(qw_17[1]) : "r"(qn_1[1]), "f"(0.0f), "f"(0.0f));
+                q_b_1[2] = qw_17[0];
+                q_b_1[3] = qw_17[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_55;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_59;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_55) : "r"((uint32_t)(codes[4] >> 16)));
+                qn_1[2] = _cvt_f16x2_e2m1x2_55;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_59) : "r"((uint32_t)(codes[4] >> 16)));
+                qn_1[2] = _cvt_f16x2_e2m1x2_59;
+#endif
+                float qw_18[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_18[0]), "=&f"(qw_18[1]) : "r"(qn_1[2]), "f"(0.0f), "f"(0.0f));
+                q_b_1[4] = qw_18[0];
+                q_b_1[5] = qw_18[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_56;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_60;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_56) : "r"((uint32_t)(codes[4] >> 24)));
+                qn_1[3] = _cvt_f16x2_e2m1x2_56;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_60) : "r"((uint32_t)(codes[4] >> 24)));
+                qn_1[3] = _cvt_f16x2_e2m1x2_60;
+#endif
+                float qw_19[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_19[0]), "=&f"(qw_19[1]) : "r"(qn_1[3]), "f"(0.0f), "f"(0.0f));
+                q_b_1[6] = qw_19[0];
+                q_b_1[7] = qw_19[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_57;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_61;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_57) : "r"((uint32_t)(codes[5] >> 0)));
+                qn_1[4] = _cvt_f16x2_e2m1x2_57;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_61) : "r"((uint32_t)(codes[5] >> 0)));
+                qn_1[4] = _cvt_f16x2_e2m1x2_61;
+#endif
+                float qw_20[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_20[0]), "=&f"(qw_20[1]) : "r"(qn_1[4]), "f"(0.0f), "f"(0.0f));
+                q_b_1[8] = qw_20[0];
+                q_b_1[9] = qw_20[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_58;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_62;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_58) : "r"((uint32_t)(codes[5] >> 8)));
+                qn_1[5] = _cvt_f16x2_e2m1x2_58;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_62) : "r"((uint32_t)(codes[5] >> 8)));
+                qn_1[5] = _cvt_f16x2_e2m1x2_62;
+#endif
+                float qw_21[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_21[0]), "=&f"(qw_21[1]) : "r"(qn_1[5]), "f"(0.0f), "f"(0.0f));
+                q_b_1[10] = qw_21[0];
+                q_b_1[11] = qw_21[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_59;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_63;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_59) : "r"((uint32_t)(codes[5] >> 16)));
+                qn_1[6] = _cvt_f16x2_e2m1x2_59;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_63) : "r"((uint32_t)(codes[5] >> 16)));
+                qn_1[6] = _cvt_f16x2_e2m1x2_63;
+#endif
+                float qw_22[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_22[0]), "=&f"(qw_22[1]) : "r"(qn_1[6]), "f"(0.0f), "f"(0.0f));
+                q_b_1[12] = qw_22[0];
+                q_b_1[13] = qw_22[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_60;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_64;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_60) : "r"((uint32_t)(codes[5] >> 24)));
+                qn_1[7] = _cvt_f16x2_e2m1x2_60;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[5] >> 24)));
+                qn_1[7] = _cvt_f16x2_e2m1x2_64;
+#endif
+                float qw_23[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_23[0]), "=&f"(qw_23[1]) : "r"(qn_1[7]), "f"(0.0f), "f"(0.0f));
+                q_b_1[14] = qw_23[0];
+                q_b_1[15] = qw_23[1];
+                float qe_1[16];
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+                    reinterpret_cast<float2*>(qe_1)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_1)[_ls], reinterpret_cast<const float2*>((s_vals + 32))[_ls]);
+                float t8_4[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8_4)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_1 + 0))[_la], reinterpret_cast<const float2*>((qe_1 + 8))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_4)[_la], reinterpret_cast<const float2*>((t8_4 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_4)[_la], reinterpret_cast<const float2*>((t8_4 + 2))[_la]);
+#if __CUDA_ARCH__ == 1030
+                qv[2] = t8_4[0] + t8_4[1];
+#else
+                qv_1[2] = t8_4[0] + t8_4[1];
+#endif
+                uint32_t a0_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_1) : "r"(qn_1[0]), "r"(qn_1[0]), "r"(0));
+                uint32_t b0_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_1) : "r"(qn_1[4]), "r"(qn_1[4]), "r"(0));
+                uint32_t a1_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_1) : "r"(qn_1[1]), "r"(qn_1[1]), "r"(a0_1));
+                uint32_t b1_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_1) : "r"(qn_1[5]), "r"(qn_1[5]), "r"(b0_1));
+                uint32_t a2_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_1) : "r"(qn_1[2]), "r"(qn_1[2]), "r"(a1_1));
+                uint32_t b2_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_1) : "r"(qn_1[6]), "r"(qn_1[6]), "r"(b1_1));
+                uint32_t a3_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_1) : "r"(qn_1[3]), "r"(qn_1[3]), "r"(a2_1));
+                uint32_t b3_1;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_1) : "r"(qn_1[7]), "r"(qn_1[7]), "r"(b2_1));
+                uint32_t v_17;
+                asm("add.f16x2 %0, %1, %2;" : "=r"(v_17) : "r"(a3_1), "r"(b3_1));
+                float w_1[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(w_1[0]), "=&f"(w_1[1]) : "r"(v_17), "f"(0.0f), "f"(0.0f));
+#if __CUDA_ARCH__ == 1030
+                qq[2] = w_1[0] + w_1[1];
+                g_safe[3] = ((g[3] > -CUDART_INF_F) ? g[3] : 0.0f);
+                const float2 _fma_b2_61 = {c_log2, c_log2};
+                const float2 _fma_c2_62 = {-g_safe[3], -g_safe[3]};
+#else
+                qq_1[2] = w_1[0] + w_1[1];
+                float _rcp_65 = approx_rcp(qq_1[2]);
+                sf_fit[2] = ((g_live_2 != 0 && qq_1[2] > 0.0f) ? sf_ex_2 * qv_1[2] * _rcp_65 : 0.0f);
+                int g_live_3 = g[3] > -CUDART_INF_F;
+                float g_safe_3 = ((g_live_3 != 0) ? g[3] : 0.0f);
+                const float2 _fma_b2_66 = {c_log2, c_log2};
+                const float2 _fma_c2_67 = {-g_safe_3, -g_safe_3};
+#endif
+                #pragma unroll
+                for (int _lf = 0; _lf < 8; _lf++)
+#if __CUDA_ARCH__ == 1030
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_61, _fma_c2_62);
+#else
+                    fma_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_lf], _fma_b2_66, _fma_c2_67);
+#endif
+                #pragma unroll
+                for (int _le = 0; _le < 16; _le++) {
+                    s_vals[_le + 48] = approx_exp2(s_vals[_le + 48]);
+                }
+                float t8_5[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8_5)[_la] = add_f32x2(reinterpret_cast<float2*>((s_vals + 48))[_la], reinterpret_cast<const float2*>((s_vals + 56))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_5)[_la], reinterpret_cast<const float2*>((t8_5 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_5)[_la], reinterpret_cast<const float2*>((t8_5 + 2))[_la]);
+                b_sums[3] = t8_5[0] + t8_5[1];
+#if __CUDA_ARCH__ == 1030
+                const float2 _scale2_63 = {6.0f, 6.0f};
+#else
+                float _exp2_68 = approx_exp2(g_safe_3 - m);
+                b_weights[3] = ((g_live_3 != 0) ? _exp2_68 : 0.0f);
+                float _exp2_69 = approx_exp2(g_safe_3 - m - 4.0f);
+                float sf_ex_3 = 448.0f * _exp2_69;
+                float qv_2[4];
+                float qq_2[4];
+                const float2 _scale2_70 = {6.0f, 6.0f};
+#endif
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_63);
+#else
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>((s_vals + 48))[_ls], _scale2_70);
+#endif
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[6]) : "f"(s_vals[48]), "f"(s_vals[49]), "f"(s_vals[50]), "f"(s_vals[51]), "f"(s_vals[52]), "f"(s_vals[53]), "f"(s_vals[54]), "f"(s_vals[55]));
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(codes[7]) : "f"(s_vals[56]), "f"(s_vals[57]), "f"(s_vals[58]), "f"(s_vals[59]), "f"(s_vals[60]), "f"(s_vals[61]), "f"(s_vals[62]), "f"(s_vals[63]));
+                float q_b_2[16];
+                unsigned int qn_2[8];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_64;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_71;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_64) : "r"((uint32_t)(codes[6] >> 0)));
+                qn_2[0] = _cvt_f16x2_e2m1x2_64;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[6] >> 0)));
+                qn_2[0] = _cvt_f16x2_e2m1x2_71;
+#endif
+                float qw_24[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_24[0]), "=&f"(qw_24[1]) : "r"(qn_2[0]), "f"(0.0f), "f"(0.0f));
+                q_b_2[0] = qw_24[0];
+                q_b_2[1] = qw_24[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_65;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_72;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_65) : "r"((uint32_t)(codes[6] >> 8)));
+                qn_2[1] = _cvt_f16x2_e2m1x2_65;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_72) : "r"((uint32_t)(codes[6] >> 8)));
+                qn_2[1] = _cvt_f16x2_e2m1x2_72;
+#endif
+                float qw_25[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_25[0]), "=&f"(qw_25[1]) : "r"(qn_2[1]), "f"(0.0f), "f"(0.0f));
+                q_b_2[2] = qw_25[0];
+                q_b_2[3] = qw_25[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_66;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_73;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_66) : "r"((uint32_t)(codes[6] >> 16)));
+                qn_2[2] = _cvt_f16x2_e2m1x2_66;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_73) : "r"((uint32_t)(codes[6] >> 16)));
+                qn_2[2] = _cvt_f16x2_e2m1x2_73;
+#endif
+                float qw_26[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_26[0]), "=&f"(qw_26[1]) : "r"(qn_2[2]), "f"(0.0f), "f"(0.0f));
+                q_b_2[4] = qw_26[0];
+                q_b_2[5] = qw_26[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_67;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_74;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_67) : "r"((uint32_t)(codes[6] >> 24)));
+                qn_2[3] = _cvt_f16x2_e2m1x2_67;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_74) : "r"((uint32_t)(codes[6] >> 24)));
+                qn_2[3] = _cvt_f16x2_e2m1x2_74;
+#endif
+                float qw_27[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_27[0]), "=&f"(qw_27[1]) : "r"(qn_2[3]), "f"(0.0f), "f"(0.0f));
+                q_b_2[6] = qw_27[0];
+                q_b_2[7] = qw_27[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_68;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_75;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_68) : "r"((uint32_t)(codes[7] >> 0)));
+                qn_2[4] = _cvt_f16x2_e2m1x2_68;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_75) : "r"((uint32_t)(codes[7] >> 0)));
+                qn_2[4] = _cvt_f16x2_e2m1x2_75;
+#endif
+                float qw_28[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_28[0]), "=&f"(qw_28[1]) : "r"(qn_2[4]), "f"(0.0f), "f"(0.0f));
+                q_b_2[8] = qw_28[0];
+                q_b_2[9] = qw_28[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_69;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_76;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_69) : "r"((uint32_t)(codes[7] >> 8)));
+                qn_2[5] = _cvt_f16x2_e2m1x2_69;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_76) : "r"((uint32_t)(codes[7] >> 8)));
+                qn_2[5] = _cvt_f16x2_e2m1x2_76;
+#endif
+                float qw_29[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_29[0]), "=&f"(qw_29[1]) : "r"(qn_2[5]), "f"(0.0f), "f"(0.0f));
+                q_b_2[10] = qw_29[0];
+                q_b_2[11] = qw_29[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_70;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_77;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_70) : "r"((uint32_t)(codes[7] >> 16)));
+                qn_2[6] = _cvt_f16x2_e2m1x2_70;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_77) : "r"((uint32_t)(codes[7] >> 16)));
+                qn_2[6] = _cvt_f16x2_e2m1x2_77;
+#endif
+                float qw_30[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_30[0]), "=&f"(qw_30[1]) : "r"(qn_2[6]), "f"(0.0f), "f"(0.0f));
+                q_b_2[12] = qw_30[0];
+                q_b_2[13] = qw_30[1];
+#if __CUDA_ARCH__ == 1030
+                uint32_t _cvt_f16x2_e2m1x2_71;
+#else
+                uint32_t _cvt_f16x2_e2m1x2_78;
+#endif
+                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
+                "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
+#if __CUDA_ARCH__ == 1030
+                : "=r"(_cvt_f16x2_e2m1x2_71) : "r"((uint32_t)(codes[7] >> 24)));
+                qn_2[7] = _cvt_f16x2_e2m1x2_71;
+#else
+                : "=r"(_cvt_f16x2_e2m1x2_78) : "r"((uint32_t)(codes[7] >> 24)));
+                qn_2[7] = _cvt_f16x2_e2m1x2_78;
+#endif
+                float qw_31[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(qw_31[0]), "=&f"(qw_31[1]) : "r"(qn_2[7]), "f"(0.0f), "f"(0.0f));
+                q_b_2[14] = qw_31[0];
+                q_b_2[15] = qw_31[1];
+                float qe_2[16];
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++)
+                    reinterpret_cast<float2*>(qe_2)[_ls] = mul_f32x2(reinterpret_cast<float2*>(q_b_2)[_ls], reinterpret_cast<const float2*>((s_vals + 48))[_ls]);
+                float t8_6[8];
+                #pragma unroll
+                for (int _la = 0; _la < 4; _la++)
+                    reinterpret_cast<float2*>(t8_6)[_la] = add_f32x2(reinterpret_cast<float2*>((qe_2 + 0))[_la], reinterpret_cast<const float2*>((qe_2 + 8))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 2; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_6)[_la], reinterpret_cast<const float2*>((t8_6 + 4))[_la]);
+                #pragma unroll
+                for (int _la = 0; _la < 1; _la++)
+                    add_f32x2_inplace(&reinterpret_cast<float2*>(t8_6)[_la], reinterpret_cast<const float2*>((t8_6 + 2))[_la]);
+#if __CUDA_ARCH__ == 1030
+                qv[3] = t8_6[0] + t8_6[1];
+#else
+                qv_2[3] = t8_6[0] + t8_6[1];
+#endif
+                uint32_t a0_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a0_2) : "r"(qn_2[0]), "r"(qn_2[0]), "r"(0));
+                uint32_t b0_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b0_2) : "r"(qn_2[4]), "r"(qn_2[4]), "r"(0));
+                uint32_t a1_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a1_2) : "r"(qn_2[1]), "r"(qn_2[1]), "r"(a0_2));
+                uint32_t b1_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b1_2) : "r"(qn_2[5]), "r"(qn_2[5]), "r"(b0_2));
+                uint32_t a2_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a2_2) : "r"(qn_2[2]), "r"(qn_2[2]), "r"(a1_2));
+                uint32_t b2_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b2_2) : "r"(qn_2[6]), "r"(qn_2[6]), "r"(b1_2));
+                uint32_t a3_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(a3_2) : "r"(qn_2[3]), "r"(qn_2[3]), "r"(a2_2));
+                uint32_t b3_2;
+                asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(b3_2) : "r"(qn_2[7]), "r"(qn_2[7]), "r"(b2_2));
+                uint32_t v_18;
+                asm("add.f16x2 %0, %1, %2;" : "=r"(v_18) : "r"(a3_2), "r"(b3_2));
+                float w_2[2];
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 lo, hi;\n\t"
+                    "mov.b32 {lo, hi}, %2;\n\t"
+                    "add.rn.f32.f16 %0, lo, %3;\n\t"
+                    "add.rn.f32.f16 %1, hi, %4;\n\t"
+                    "}\n"
+                    : "=&f"(w_2[0]), "=&f"(w_2[1]) : "r"(v_18), "f"(0.0f), "f"(0.0f));
+#if __CUDA_ARCH__ == 1030
+                qq[3] = w_2[0] + w_2[1];
+                float d_w[4];
+                const float2 _sub2_72 = {m, m};
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    reinterpret_cast<float2*>(d_w)[_ls] = sub_f32x2(reinterpret_cast<float2*>(g_safe)[_ls], _sub2_72);
+                float d_s[4];
+                const float2 _sub2_73 = {4.0f, 4.0f};
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    reinterpret_cast<float2*>(d_s)[_ls] = sub_f32x2(reinterpret_cast<float2*>(d_w)[_ls], _sub2_73);
+                float e_s[4];
+                float r_q[4];
+                float _exp2_74 = approx_exp2(d_w[0]);
+                b_weights[0] = ((g[0] > -CUDART_INF_F) ? _exp2_74 : 0.0f);
+                float _exp2_75 = approx_exp2(d_s[0]);
+                e_s[0] = _exp2_75;
+                float _rcp_76 = approx_rcp(qq[0]);
+                r_q[0] = _rcp_76;
+                float _exp2_77 = approx_exp2(d_w[1]);
+                b_weights[1] = ((g[1] > -CUDART_INF_F) ? _exp2_77 : 0.0f);
+                float _exp2_78 = approx_exp2(d_s[1]);
+                e_s[1] = _exp2_78;
+                float _rcp_79 = approx_rcp(qq[1]);
+                r_q[1] = _rcp_79;
+                float _exp2_80 = approx_exp2(d_w[2]);
+                b_weights[2] = ((g[2] > -CUDART_INF_F) ? _exp2_80 : 0.0f);
+                float _exp2_81 = approx_exp2(d_s[2]);
+                e_s[2] = _exp2_81;
+                float _rcp_82 = approx_rcp(qq[2]);
+                r_q[2] = _rcp_82;
+                float _exp2_83 = approx_exp2(d_w[3]);
+                b_weights[3] = ((g[3] > -CUDART_INF_F) ? _exp2_83 : 0.0f);
+                float _exp2_84 = approx_exp2(d_s[3]);
+                e_s[3] = _exp2_84;
+                float _rcp_85 = approx_rcp(qq[3]);
+                r_q[3] = _rcp_85;
+                float fit[4];
+                const float2 _scale2_86 = {448.0f, 448.0f};
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    reinterpret_cast<float2*>(fit)[_ls] = mul_f32x2(reinterpret_cast<float2*>(e_s)[_ls], _scale2_86);
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>(fit)[_ls], reinterpret_cast<const float2*>(qv)[_ls]);
+                #pragma unroll
+                for (int _ls = 0; _ls < 2; _ls++)
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>(fit)[_ls], reinterpret_cast<const float2*>(r_q)[_ls]);
+                sf_fit[0] = ((g[0] > -CUDART_INF_F && qq[0] > 0.0f) ? fit[0] : 0.0f);
+                sf_fit[1] = ((g[1] > -CUDART_INF_F && qq[1] > 0.0f) ? fit[1] : 0.0f);
+                sf_fit[2] = ((g[2] > -CUDART_INF_F && qq[2] > 0.0f) ? fit[2] : 0.0f);
+                sf_fit[3] = ((g[3] > -CUDART_INF_F && qq[3] > 0.0f) ? fit[3] : 0.0f);
+#else
+                qq_2[3] = w_2[0] + w_2[1];
+                float _rcp_79 = approx_rcp(qq_2[3]);
+                sf_fit[3] = ((g_live_3 != 0 && qq_2[3] > 0.0f) ? sf_ex_3 * qv_2[3] * _rcp_79 : 0.0f);
+#endif
                 unsigned int sf_word[1];
                 {
                     uint32_t _packed;
@@ -4167,11 +2612,11 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                 }
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1030
-                int _warp_vote_176 = __any_sync(0xFFFFFFFF, rescale != 0);
-                if (_warp_vote_176 != 0) {
+                int _warp_vote_87 = __any_sync(0xFFFFFFFF, rescale != 0);
+                if (_warp_vote_87 != 0) {
 #else
-                int _warp_vote_172 = __any_sync(0xFFFFFFFF, rescale != 0);
-                if (_warp_vote_172 != 0) {
+                int _warp_vote_80 = __any_sync(0xFFFFFFFF, rescale != 0);
+                if (_warp_vote_80 != 0) {
 #endif
                     float o_chunk_0[32];
                     unsigned int o_addr_0 = taddr + (unsigned int)lane_base_s;
@@ -4182,16 +2627,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_0));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_177 = {alpha, alpha};
+                    const float2 _scale2_88 = {alpha, alpha};
 #else
-                    const float2 _scale2_173 = {alpha, alpha};
+                    const float2 _scale2_81 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_0)[_ls], _scale2_177);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_0)[_ls], _scale2_88);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_0)[_ls], _scale2_173);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_0)[_ls], _scale2_81);
 #endif
                     tmem_st_x32_f32(o_addr_0, o_chunk_0);
                     float o_chunk_1[32];
@@ -4203,16 +2648,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_1));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_178 = {alpha, alpha};
+                    const float2 _scale2_89 = {alpha, alpha};
 #else
-                    const float2 _scale2_174 = {alpha, alpha};
+                    const float2 _scale2_82 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_1)[_ls], _scale2_178);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_1)[_ls], _scale2_89);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_1)[_ls], _scale2_174);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_1)[_ls], _scale2_82);
 #endif
                     tmem_st_x32_f32(o_addr_1, o_chunk_1);
                     float o_chunk_2[32];
@@ -4224,16 +2669,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_2));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_179 = {alpha, alpha};
+                    const float2 _scale2_90 = {alpha, alpha};
 #else
-                    const float2 _scale2_175 = {alpha, alpha};
+                    const float2 _scale2_83 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_2)[_ls], _scale2_179);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_2)[_ls], _scale2_90);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_2)[_ls], _scale2_175);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_2)[_ls], _scale2_83);
 #endif
                     tmem_st_x32_f32(o_addr_2, o_chunk_2);
                     float o_chunk_3[32];
@@ -4245,16 +2690,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_3));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_180 = {alpha, alpha};
+                    const float2 _scale2_91 = {alpha, alpha};
 #else
-                    const float2 _scale2_176 = {alpha, alpha};
+                    const float2 _scale2_84 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_3)[_ls], _scale2_180);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_3)[_ls], _scale2_91);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_3)[_ls], _scale2_176);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_3)[_ls], _scale2_84);
 #endif
                     tmem_st_x32_f32(o_addr_3, o_chunk_3);
                     float o_chunk_4[32];
@@ -4266,16 +2711,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_4));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_181 = {alpha, alpha};
+                    const float2 _scale2_92 = {alpha, alpha};
 #else
-                    const float2 _scale2_177 = {alpha, alpha};
+                    const float2 _scale2_85 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_4)[_ls], _scale2_181);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_4)[_ls], _scale2_92);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_4)[_ls], _scale2_177);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_4)[_ls], _scale2_85);
 #endif
                     tmem_st_x32_f32(o_addr_4, o_chunk_4);
                     float o_chunk_5[32];
@@ -4287,16 +2732,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_5));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_182 = {alpha, alpha};
+                    const float2 _scale2_93 = {alpha, alpha};
 #else
-                    const float2 _scale2_178 = {alpha, alpha};
+                    const float2 _scale2_86 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_5)[_ls], _scale2_182);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_5)[_ls], _scale2_93);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_5)[_ls], _scale2_178);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_5)[_ls], _scale2_86);
 #endif
                     tmem_st_x32_f32(o_addr_5, o_chunk_5);
                     float o_chunk_6[32];
@@ -4308,16 +2753,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_6));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_183 = {alpha, alpha};
+                    const float2 _scale2_94 = {alpha, alpha};
 #else
-                    const float2 _scale2_179 = {alpha, alpha};
+                    const float2 _scale2_87 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_6)[_ls], _scale2_183);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_6)[_ls], _scale2_94);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_6)[_ls], _scale2_179);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_6)[_ls], _scale2_87);
 #endif
                     tmem_st_x32_f32(o_addr_6, o_chunk_6);
                     float o_chunk_7[32];
@@ -4329,16 +2774,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                         : "r"(o_addr_7));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_184 = {alpha, alpha};
+                    const float2 _scale2_95 = {alpha, alpha};
 #else
-                    const float2 _scale2_180 = {alpha, alpha};
+                    const float2 _scale2_88 = {alpha, alpha};
 #endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_7)[_ls], _scale2_184);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_7)[_ls], _scale2_95);
 #else
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_7)[_ls], _scale2_180);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_chunk_7)[_ls], _scale2_88);
 #endif
                     tmem_st_x32_f32(o_addr_7, o_chunk_7);
                 }
@@ -4375,11 +2820,11 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                 float l_row = l_sum + xch_l[other];
                 float gk_e = *kv_gs;
 #if __CUDA_ARCH__ == 1030
-                float _rcp_185 = approx_rcp(gk_e * l_row);
-                float inv = ((l_row > 0.0f) ? 0.005952381f * _rcp_185 : 0.0f);
+                float _rcp_96 = approx_rcp(gk_e * l_row);
+                float inv = ((l_row > 0.0f) ? 0.005952381f * _rcp_96 : 0.0f);
 #else
-                float _rcp_181 = approx_rcp(gk_e * l_row);
-                float inv = ((l_row > 0.0f) ? 0.005952381f * _rcp_181 : 0.0f);
+                float _rcp_89 = approx_rcp(gk_e * l_row);
+                float inv = ((l_row > 0.0f) ? 0.005952381f * _rcp_89 : 0.0f);
 #endif
                 int direct = num_split == 1;
                 int row_g = row_base_1 + row_local;
@@ -4394,16 +2839,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_186 = {inv, inv};
+                const float2 _scale2_97 = {inv, inv};
 #else
-                const float2 _scale2_182 = {inv, inv};
+                const float2 _scale2_90 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_0)[_ls], _scale2_186);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_0)[_ls], _scale2_97);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_0)[_ls], _scale2_182);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_0)[_ls], _scale2_90);
 #endif
                 unsigned int o_bf16_0[16];
                 #pragma unroll
@@ -4412,26 +2857,68 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_0[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_0 = 0;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_0))[0] = reinterpret_cast<int4*>(o_bf16_0)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_98 = reinterpret_cast<const unsigned*>(o_bf16_0);
+#else
+                            const unsigned* _raw_stv8_91 = reinterpret_cast<const unsigned*>(o_bf16_0);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0))), "r"(_raw_stv8_98[0]), "r"(_raw_stv8_98[1]), "r"(_raw_stv8_98[2]), "r"(_raw_stv8_98[3]), "r"(_raw_stv8_98[4]), "r"(_raw_stv8_98[5]), "r"(_raw_stv8_98[6]), "r"(_raw_stv8_98[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0))), "r"(_raw_stv8_91[0]), "r"(_raw_stv8_91[1]), "r"(_raw_stv8_91[2]), "r"(_raw_stv8_91[3]), "r"(_raw_stv8_91[4]), "r"(_raw_stv8_91[5]), "r"(_raw_stv8_91[6]), "r"(_raw_stv8_91[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_0))[0] = reinterpret_cast<int4*>(o_bf16_0)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_99 = reinterpret_cast<const unsigned*>(o_bf16_0);
+#else
+                            const unsigned* _raw_stv8_92 = reinterpret_cast<const unsigned*>(o_bf16_0);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_0))), "r"(_raw_stv8_99[0]), "r"(_raw_stv8_99[1]), "r"(_raw_stv8_99[2]), "r"(_raw_stv8_99[3]), "r"(_raw_stv8_99[4]), "r"(_raw_stv8_99[5]), "r"(_raw_stv8_99[6]), "r"(_raw_stv8_99[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_0))), "r"(_raw_stv8_92[0]), "r"(_raw_stv8_92[1]), "r"(_raw_stv8_92[2]), "r"(_raw_stv8_92[3]), "r"(_raw_stv8_92[4]), "r"(_raw_stv8_92[5]), "r"(_raw_stv8_92[6]), "r"(_raw_stv8_92[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_0 + 8))[0] = reinterpret_cast<int4*>(o_bf16_0 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_100 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
+#else
+                            const unsigned* _raw_stv8_93 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0 + 16))), "r"(_raw_stv8_100[0]), "r"(_raw_stv8_100[1]), "r"(_raw_stv8_100[2]), "r"(_raw_stv8_100[3]), "r"(_raw_stv8_100[4]), "r"(_raw_stv8_100[5]), "r"(_raw_stv8_100[6]), "r"(_raw_stv8_100[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_0 + 16))), "r"(_raw_stv8_93[0]), "r"(_raw_stv8_93[1]), "r"(_raw_stv8_93[2]), "r"(_raw_stv8_93[3]), "r"(_raw_stv8_93[4]), "r"(_raw_stv8_93[5]), "r"(_raw_stv8_93[6]), "r"(_raw_stv8_93[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_0 + 8))[0] = reinterpret_cast<int4*>(o_bf16_0 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_0 + 16))[0] = reinterpret_cast<int4*>(o_bf16_0 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_0 + 16))[0] = reinterpret_cast<int4*>(o_bf16_0 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_0 + 24))[0] = reinterpret_cast<int4*>(o_bf16_0 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_0 + 24))[0] = reinterpret_cast<int4*>(o_bf16_0 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_101 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
+#else
+                            const unsigned* _raw_stv8_94 = reinterpret_cast<const unsigned*>(o_bf16_0 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_0 + 16))), "r"(_raw_stv8_101[0]), "r"(_raw_stv8_101[1]), "r"(_raw_stv8_101[2]), "r"(_raw_stv8_101[3]), "r"(_raw_stv8_101[4]), "r"(_raw_stv8_101[5]), "r"(_raw_stv8_101[6]), "r"(_raw_stv8_101[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_0 + 16))), "r"(_raw_stv8_94[0]), "r"(_raw_stv8_94[1]), "r"(_raw_stv8_94[2]), "r"(_raw_stv8_94[3]), "r"(_raw_stv8_94[4]), "r"(_raw_stv8_94[5]), "r"(_raw_stv8_94[6]), "r"(_raw_stv8_94[7]) : "memory");
+#endif
+                        }
                     }
                 }
                 float o_vals_1[32];
@@ -4442,16 +2929,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 32));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_187 = {inv, inv};
+                const float2 _scale2_102 = {inv, inv};
 #else
-                const float2 _scale2_183 = {inv, inv};
+                const float2 _scale2_95 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_1)[_ls], _scale2_187);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_1)[_ls], _scale2_102);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_1)[_ls], _scale2_183);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_1)[_ls], _scale2_95);
 #endif
                 unsigned int o_bf16_1[16];
                 #pragma unroll
@@ -4460,26 +2947,68 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_1 = 32;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_1))[0] = reinterpret_cast<int4*>(o_bf16_1)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_103 = reinterpret_cast<const unsigned*>(o_bf16_1);
+#else
+                            const unsigned* _raw_stv8_96 = reinterpret_cast<const unsigned*>(o_bf16_1);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1))), "r"(_raw_stv8_103[0]), "r"(_raw_stv8_103[1]), "r"(_raw_stv8_103[2]), "r"(_raw_stv8_103[3]), "r"(_raw_stv8_103[4]), "r"(_raw_stv8_103[5]), "r"(_raw_stv8_103[6]), "r"(_raw_stv8_103[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1))), "r"(_raw_stv8_96[0]), "r"(_raw_stv8_96[1]), "r"(_raw_stv8_96[2]), "r"(_raw_stv8_96[3]), "r"(_raw_stv8_96[4]), "r"(_raw_stv8_96[5]), "r"(_raw_stv8_96[6]), "r"(_raw_stv8_96[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_1))[0] = reinterpret_cast<int4*>(o_bf16_1)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_104 = reinterpret_cast<const unsigned*>(o_bf16_1);
+#else
+                            const unsigned* _raw_stv8_97 = reinterpret_cast<const unsigned*>(o_bf16_1);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_1))), "r"(_raw_stv8_104[0]), "r"(_raw_stv8_104[1]), "r"(_raw_stv8_104[2]), "r"(_raw_stv8_104[3]), "r"(_raw_stv8_104[4]), "r"(_raw_stv8_104[5]), "r"(_raw_stv8_104[6]), "r"(_raw_stv8_104[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_1))), "r"(_raw_stv8_97[0]), "r"(_raw_stv8_97[1]), "r"(_raw_stv8_97[2]), "r"(_raw_stv8_97[3]), "r"(_raw_stv8_97[4]), "r"(_raw_stv8_97[5]), "r"(_raw_stv8_97[6]), "r"(_raw_stv8_97[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_1 + 8))[0] = reinterpret_cast<int4*>(o_bf16_1 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_105 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
+#else
+                            const unsigned* _raw_stv8_98 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1 + 16))), "r"(_raw_stv8_105[0]), "r"(_raw_stv8_105[1]), "r"(_raw_stv8_105[2]), "r"(_raw_stv8_105[3]), "r"(_raw_stv8_105[4]), "r"(_raw_stv8_105[5]), "r"(_raw_stv8_105[6]), "r"(_raw_stv8_105[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_1 + 16))), "r"(_raw_stv8_98[0]), "r"(_raw_stv8_98[1]), "r"(_raw_stv8_98[2]), "r"(_raw_stv8_98[3]), "r"(_raw_stv8_98[4]), "r"(_raw_stv8_98[5]), "r"(_raw_stv8_98[6]), "r"(_raw_stv8_98[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_1 + 8))[0] = reinterpret_cast<int4*>(o_bf16_1 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_1 + 16))[0] = reinterpret_cast<int4*>(o_bf16_1 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_1 + 16))[0] = reinterpret_cast<int4*>(o_bf16_1 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_1 + 24))[0] = reinterpret_cast<int4*>(o_bf16_1 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_1 + 24))[0] = reinterpret_cast<int4*>(o_bf16_1 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_106 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
+#else
+                            const unsigned* _raw_stv8_99 = reinterpret_cast<const unsigned*>(o_bf16_1 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_1 + 16))), "r"(_raw_stv8_106[0]), "r"(_raw_stv8_106[1]), "r"(_raw_stv8_106[2]), "r"(_raw_stv8_106[3]), "r"(_raw_stv8_106[4]), "r"(_raw_stv8_106[5]), "r"(_raw_stv8_106[6]), "r"(_raw_stv8_106[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_1 + 16))), "r"(_raw_stv8_99[0]), "r"(_raw_stv8_99[1]), "r"(_raw_stv8_99[2]), "r"(_raw_stv8_99[3]), "r"(_raw_stv8_99[4]), "r"(_raw_stv8_99[5]), "r"(_raw_stv8_99[6]), "r"(_raw_stv8_99[7]) : "memory");
+#endif
+                        }
                     }
                 }
                 float o_vals_2[32];
@@ -4490,16 +3019,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 64));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_188 = {inv, inv};
+                const float2 _scale2_107 = {inv, inv};
 #else
-                const float2 _scale2_184 = {inv, inv};
+                const float2 _scale2_100 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_2)[_ls], _scale2_188);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_2)[_ls], _scale2_107);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_2)[_ls], _scale2_184);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_2)[_ls], _scale2_100);
 #endif
                 unsigned int o_bf16_2[16];
                 #pragma unroll
@@ -4508,26 +3037,68 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_2[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_2 = 64;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_2))[0] = reinterpret_cast<int4*>(o_bf16_2)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_108 = reinterpret_cast<const unsigned*>(o_bf16_2);
+#else
+                            const unsigned* _raw_stv8_101 = reinterpret_cast<const unsigned*>(o_bf16_2);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2))), "r"(_raw_stv8_108[0]), "r"(_raw_stv8_108[1]), "r"(_raw_stv8_108[2]), "r"(_raw_stv8_108[3]), "r"(_raw_stv8_108[4]), "r"(_raw_stv8_108[5]), "r"(_raw_stv8_108[6]), "r"(_raw_stv8_108[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2))), "r"(_raw_stv8_101[0]), "r"(_raw_stv8_101[1]), "r"(_raw_stv8_101[2]), "r"(_raw_stv8_101[3]), "r"(_raw_stv8_101[4]), "r"(_raw_stv8_101[5]), "r"(_raw_stv8_101[6]), "r"(_raw_stv8_101[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_2))[0] = reinterpret_cast<int4*>(o_bf16_2)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_109 = reinterpret_cast<const unsigned*>(o_bf16_2);
+#else
+                            const unsigned* _raw_stv8_102 = reinterpret_cast<const unsigned*>(o_bf16_2);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_2))), "r"(_raw_stv8_109[0]), "r"(_raw_stv8_109[1]), "r"(_raw_stv8_109[2]), "r"(_raw_stv8_109[3]), "r"(_raw_stv8_109[4]), "r"(_raw_stv8_109[5]), "r"(_raw_stv8_109[6]), "r"(_raw_stv8_109[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_2))), "r"(_raw_stv8_102[0]), "r"(_raw_stv8_102[1]), "r"(_raw_stv8_102[2]), "r"(_raw_stv8_102[3]), "r"(_raw_stv8_102[4]), "r"(_raw_stv8_102[5]), "r"(_raw_stv8_102[6]), "r"(_raw_stv8_102[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_2 + 8))[0] = reinterpret_cast<int4*>(o_bf16_2 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_110 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
+#else
+                            const unsigned* _raw_stv8_103 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2 + 16))), "r"(_raw_stv8_110[0]), "r"(_raw_stv8_110[1]), "r"(_raw_stv8_110[2]), "r"(_raw_stv8_110[3]), "r"(_raw_stv8_110[4]), "r"(_raw_stv8_110[5]), "r"(_raw_stv8_110[6]), "r"(_raw_stv8_110[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_2 + 16))), "r"(_raw_stv8_103[0]), "r"(_raw_stv8_103[1]), "r"(_raw_stv8_103[2]), "r"(_raw_stv8_103[3]), "r"(_raw_stv8_103[4]), "r"(_raw_stv8_103[5]), "r"(_raw_stv8_103[6]), "r"(_raw_stv8_103[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_2 + 8))[0] = reinterpret_cast<int4*>(o_bf16_2 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_2 + 16))[0] = reinterpret_cast<int4*>(o_bf16_2 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_2 + 16))[0] = reinterpret_cast<int4*>(o_bf16_2 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_2 + 24))[0] = reinterpret_cast<int4*>(o_bf16_2 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_2 + 24))[0] = reinterpret_cast<int4*>(o_bf16_2 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_111 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
+#else
+                            const unsigned* _raw_stv8_104 = reinterpret_cast<const unsigned*>(o_bf16_2 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_2 + 16))), "r"(_raw_stv8_111[0]), "r"(_raw_stv8_111[1]), "r"(_raw_stv8_111[2]), "r"(_raw_stv8_111[3]), "r"(_raw_stv8_111[4]), "r"(_raw_stv8_111[5]), "r"(_raw_stv8_111[6]), "r"(_raw_stv8_111[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_2 + 16))), "r"(_raw_stv8_104[0]), "r"(_raw_stv8_104[1]), "r"(_raw_stv8_104[2]), "r"(_raw_stv8_104[3]), "r"(_raw_stv8_104[4]), "r"(_raw_stv8_104[5]), "r"(_raw_stv8_104[6]), "r"(_raw_stv8_104[7]) : "memory");
+#endif
+                        }
                     }
                 }
                 float o_vals_3[32];
@@ -4538,16 +3109,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 96));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_189 = {inv, inv};
+                const float2 _scale2_112 = {inv, inv};
 #else
-                const float2 _scale2_185 = {inv, inv};
+                const float2 _scale2_105 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_3)[_ls], _scale2_189);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_3)[_ls], _scale2_112);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_3)[_ls], _scale2_185);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_3)[_ls], _scale2_105);
 #endif
                 unsigned int o_bf16_3[16];
                 #pragma unroll
@@ -4556,26 +3127,68 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_3[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_3 = 96;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_3))[0] = reinterpret_cast<int4*>(o_bf16_3)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_113 = reinterpret_cast<const unsigned*>(o_bf16_3);
+#else
+                            const unsigned* _raw_stv8_106 = reinterpret_cast<const unsigned*>(o_bf16_3);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3))), "r"(_raw_stv8_113[0]), "r"(_raw_stv8_113[1]), "r"(_raw_stv8_113[2]), "r"(_raw_stv8_113[3]), "r"(_raw_stv8_113[4]), "r"(_raw_stv8_113[5]), "r"(_raw_stv8_113[6]), "r"(_raw_stv8_113[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3))), "r"(_raw_stv8_106[0]), "r"(_raw_stv8_106[1]), "r"(_raw_stv8_106[2]), "r"(_raw_stv8_106[3]), "r"(_raw_stv8_106[4]), "r"(_raw_stv8_106[5]), "r"(_raw_stv8_106[6]), "r"(_raw_stv8_106[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_3))[0] = reinterpret_cast<int4*>(o_bf16_3)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_114 = reinterpret_cast<const unsigned*>(o_bf16_3);
+#else
+                            const unsigned* _raw_stv8_107 = reinterpret_cast<const unsigned*>(o_bf16_3);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_3))), "r"(_raw_stv8_114[0]), "r"(_raw_stv8_114[1]), "r"(_raw_stv8_114[2]), "r"(_raw_stv8_114[3]), "r"(_raw_stv8_114[4]), "r"(_raw_stv8_114[5]), "r"(_raw_stv8_114[6]), "r"(_raw_stv8_114[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_3))), "r"(_raw_stv8_107[0]), "r"(_raw_stv8_107[1]), "r"(_raw_stv8_107[2]), "r"(_raw_stv8_107[3]), "r"(_raw_stv8_107[4]), "r"(_raw_stv8_107[5]), "r"(_raw_stv8_107[6]), "r"(_raw_stv8_107[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_3 + 8))[0] = reinterpret_cast<int4*>(o_bf16_3 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_115 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
+#else
+                            const unsigned* _raw_stv8_108 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3 + 16))), "r"(_raw_stv8_115[0]), "r"(_raw_stv8_115[1]), "r"(_raw_stv8_115[2]), "r"(_raw_stv8_115[3]), "r"(_raw_stv8_115[4]), "r"(_raw_stv8_115[5]), "r"(_raw_stv8_115[6]), "r"(_raw_stv8_115[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_3 + 16))), "r"(_raw_stv8_108[0]), "r"(_raw_stv8_108[1]), "r"(_raw_stv8_108[2]), "r"(_raw_stv8_108[3]), "r"(_raw_stv8_108[4]), "r"(_raw_stv8_108[5]), "r"(_raw_stv8_108[6]), "r"(_raw_stv8_108[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_3 + 8))[0] = reinterpret_cast<int4*>(o_bf16_3 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_3 + 16))[0] = reinterpret_cast<int4*>(o_bf16_3 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_3 + 16))[0] = reinterpret_cast<int4*>(o_bf16_3 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_3 + 24))[0] = reinterpret_cast<int4*>(o_bf16_3 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_3 + 24))[0] = reinterpret_cast<int4*>(o_bf16_3 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_116 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
+#else
+                            const unsigned* _raw_stv8_109 = reinterpret_cast<const unsigned*>(o_bf16_3 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_3 + 16))), "r"(_raw_stv8_116[0]), "r"(_raw_stv8_116[1]), "r"(_raw_stv8_116[2]), "r"(_raw_stv8_116[3]), "r"(_raw_stv8_116[4]), "r"(_raw_stv8_116[5]), "r"(_raw_stv8_116[6]), "r"(_raw_stv8_116[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_3 + 16))), "r"(_raw_stv8_109[0]), "r"(_raw_stv8_109[1]), "r"(_raw_stv8_109[2]), "r"(_raw_stv8_109[3]), "r"(_raw_stv8_109[4]), "r"(_raw_stv8_109[5]), "r"(_raw_stv8_109[6]), "r"(_raw_stv8_109[7]) : "memory");
+#endif
+                        }
                     }
                 }
                 float o_vals_4[32];
@@ -4586,16 +3199,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 128));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_190 = {inv, inv};
+                const float2 _scale2_117 = {inv, inv};
 #else
-                const float2 _scale2_186 = {inv, inv};
+                const float2 _scale2_110 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_4)[_ls], _scale2_190);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_4)[_ls], _scale2_117);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_4)[_ls], _scale2_186);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_4)[_ls], _scale2_110);
 #endif
                 unsigned int o_bf16_4[16];
                 #pragma unroll
@@ -4604,26 +3217,68 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_4[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_4 = 256;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_4))[0] = reinterpret_cast<int4*>(o_bf16_4)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_118 = reinterpret_cast<const unsigned*>(o_bf16_4);
+#else
+                            const unsigned* _raw_stv8_111 = reinterpret_cast<const unsigned*>(o_bf16_4);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4))), "r"(_raw_stv8_118[0]), "r"(_raw_stv8_118[1]), "r"(_raw_stv8_118[2]), "r"(_raw_stv8_118[3]), "r"(_raw_stv8_118[4]), "r"(_raw_stv8_118[5]), "r"(_raw_stv8_118[6]), "r"(_raw_stv8_118[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4))), "r"(_raw_stv8_111[0]), "r"(_raw_stv8_111[1]), "r"(_raw_stv8_111[2]), "r"(_raw_stv8_111[3]), "r"(_raw_stv8_111[4]), "r"(_raw_stv8_111[5]), "r"(_raw_stv8_111[6]), "r"(_raw_stv8_111[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_4))[0] = reinterpret_cast<int4*>(o_bf16_4)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_119 = reinterpret_cast<const unsigned*>(o_bf16_4);
+#else
+                            const unsigned* _raw_stv8_112 = reinterpret_cast<const unsigned*>(o_bf16_4);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_4))), "r"(_raw_stv8_119[0]), "r"(_raw_stv8_119[1]), "r"(_raw_stv8_119[2]), "r"(_raw_stv8_119[3]), "r"(_raw_stv8_119[4]), "r"(_raw_stv8_119[5]), "r"(_raw_stv8_119[6]), "r"(_raw_stv8_119[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_4))), "r"(_raw_stv8_112[0]), "r"(_raw_stv8_112[1]), "r"(_raw_stv8_112[2]), "r"(_raw_stv8_112[3]), "r"(_raw_stv8_112[4]), "r"(_raw_stv8_112[5]), "r"(_raw_stv8_112[6]), "r"(_raw_stv8_112[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_4 + 8))[0] = reinterpret_cast<int4*>(o_bf16_4 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_120 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
+#else
+                            const unsigned* _raw_stv8_113 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4 + 16))), "r"(_raw_stv8_120[0]), "r"(_raw_stv8_120[1]), "r"(_raw_stv8_120[2]), "r"(_raw_stv8_120[3]), "r"(_raw_stv8_120[4]), "r"(_raw_stv8_120[5]), "r"(_raw_stv8_120[6]), "r"(_raw_stv8_120[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_4 + 16))), "r"(_raw_stv8_113[0]), "r"(_raw_stv8_113[1]), "r"(_raw_stv8_113[2]), "r"(_raw_stv8_113[3]), "r"(_raw_stv8_113[4]), "r"(_raw_stv8_113[5]), "r"(_raw_stv8_113[6]), "r"(_raw_stv8_113[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_4 + 8))[0] = reinterpret_cast<int4*>(o_bf16_4 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_4 + 16))[0] = reinterpret_cast<int4*>(o_bf16_4 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_4 + 16))[0] = reinterpret_cast<int4*>(o_bf16_4 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_4 + 24))[0] = reinterpret_cast<int4*>(o_bf16_4 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_4 + 24))[0] = reinterpret_cast<int4*>(o_bf16_4 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_121 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
+#else
+                            const unsigned* _raw_stv8_114 = reinterpret_cast<const unsigned*>(o_bf16_4 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_4 + 16))), "r"(_raw_stv8_121[0]), "r"(_raw_stv8_121[1]), "r"(_raw_stv8_121[2]), "r"(_raw_stv8_121[3]), "r"(_raw_stv8_121[4]), "r"(_raw_stv8_121[5]), "r"(_raw_stv8_121[6]), "r"(_raw_stv8_121[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_4 + 16))), "r"(_raw_stv8_114[0]), "r"(_raw_stv8_114[1]), "r"(_raw_stv8_114[2]), "r"(_raw_stv8_114[3]), "r"(_raw_stv8_114[4]), "r"(_raw_stv8_114[5]), "r"(_raw_stv8_114[6]), "r"(_raw_stv8_114[7]) : "memory");
+#endif
+                        }
                     }
                 }
                 float o_vals_5[32];
@@ -4634,16 +3289,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 160));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_191 = {inv, inv};
+                const float2 _scale2_122 = {inv, inv};
 #else
-                const float2 _scale2_187 = {inv, inv};
+                const float2 _scale2_115 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_5)[_ls], _scale2_191);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_5)[_ls], _scale2_122);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_5)[_ls], _scale2_187);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_5)[_ls], _scale2_115);
 #endif
                 unsigned int o_bf16_5[16];
                 #pragma unroll
@@ -4652,26 +3307,68 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_5[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_5 = 288;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_5))[0] = reinterpret_cast<int4*>(o_bf16_5)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_123 = reinterpret_cast<const unsigned*>(o_bf16_5);
+#else
+                            const unsigned* _raw_stv8_116 = reinterpret_cast<const unsigned*>(o_bf16_5);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5))), "r"(_raw_stv8_123[0]), "r"(_raw_stv8_123[1]), "r"(_raw_stv8_123[2]), "r"(_raw_stv8_123[3]), "r"(_raw_stv8_123[4]), "r"(_raw_stv8_123[5]), "r"(_raw_stv8_123[6]), "r"(_raw_stv8_123[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5))), "r"(_raw_stv8_116[0]), "r"(_raw_stv8_116[1]), "r"(_raw_stv8_116[2]), "r"(_raw_stv8_116[3]), "r"(_raw_stv8_116[4]), "r"(_raw_stv8_116[5]), "r"(_raw_stv8_116[6]), "r"(_raw_stv8_116[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_5))[0] = reinterpret_cast<int4*>(o_bf16_5)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_124 = reinterpret_cast<const unsigned*>(o_bf16_5);
+#else
+                            const unsigned* _raw_stv8_117 = reinterpret_cast<const unsigned*>(o_bf16_5);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_5))), "r"(_raw_stv8_124[0]), "r"(_raw_stv8_124[1]), "r"(_raw_stv8_124[2]), "r"(_raw_stv8_124[3]), "r"(_raw_stv8_124[4]), "r"(_raw_stv8_124[5]), "r"(_raw_stv8_124[6]), "r"(_raw_stv8_124[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_5))), "r"(_raw_stv8_117[0]), "r"(_raw_stv8_117[1]), "r"(_raw_stv8_117[2]), "r"(_raw_stv8_117[3]), "r"(_raw_stv8_117[4]), "r"(_raw_stv8_117[5]), "r"(_raw_stv8_117[6]), "r"(_raw_stv8_117[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_5 + 8))[0] = reinterpret_cast<int4*>(o_bf16_5 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_125 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
+#else
+                            const unsigned* _raw_stv8_118 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5 + 16))), "r"(_raw_stv8_125[0]), "r"(_raw_stv8_125[1]), "r"(_raw_stv8_125[2]), "r"(_raw_stv8_125[3]), "r"(_raw_stv8_125[4]), "r"(_raw_stv8_125[5]), "r"(_raw_stv8_125[6]), "r"(_raw_stv8_125[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_5 + 16))), "r"(_raw_stv8_118[0]), "r"(_raw_stv8_118[1]), "r"(_raw_stv8_118[2]), "r"(_raw_stv8_118[3]), "r"(_raw_stv8_118[4]), "r"(_raw_stv8_118[5]), "r"(_raw_stv8_118[6]), "r"(_raw_stv8_118[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_5 + 8))[0] = reinterpret_cast<int4*>(o_bf16_5 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_5 + 16))[0] = reinterpret_cast<int4*>(o_bf16_5 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_5 + 16))[0] = reinterpret_cast<int4*>(o_bf16_5 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_5 + 24))[0] = reinterpret_cast<int4*>(o_bf16_5 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_5 + 24))[0] = reinterpret_cast<int4*>(o_bf16_5 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_126 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
+#else
+                            const unsigned* _raw_stv8_119 = reinterpret_cast<const unsigned*>(o_bf16_5 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_5 + 16))), "r"(_raw_stv8_126[0]), "r"(_raw_stv8_126[1]), "r"(_raw_stv8_126[2]), "r"(_raw_stv8_126[3]), "r"(_raw_stv8_126[4]), "r"(_raw_stv8_126[5]), "r"(_raw_stv8_126[6]), "r"(_raw_stv8_126[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_5 + 16))), "r"(_raw_stv8_119[0]), "r"(_raw_stv8_119[1]), "r"(_raw_stv8_119[2]), "r"(_raw_stv8_119[3]), "r"(_raw_stv8_119[4]), "r"(_raw_stv8_119[5]), "r"(_raw_stv8_119[6]), "r"(_raw_stv8_119[7]) : "memory");
+#endif
+                        }
                     }
                 }
                 float o_vals_6[32];
@@ -4682,16 +3379,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 192));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_192 = {inv, inv};
+                const float2 _scale2_127 = {inv, inv};
 #else
-                const float2 _scale2_188 = {inv, inv};
+                const float2 _scale2_120 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_6)[_ls], _scale2_192);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_6)[_ls], _scale2_127);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_6)[_ls], _scale2_188);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_6)[_ls], _scale2_120);
 #endif
                 unsigned int o_bf16_6[16];
                 #pragma unroll
@@ -4700,26 +3397,68 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_6[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_6 = 320;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_6))[0] = reinterpret_cast<int4*>(o_bf16_6)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_128 = reinterpret_cast<const unsigned*>(o_bf16_6);
+#else
+                            const unsigned* _raw_stv8_121 = reinterpret_cast<const unsigned*>(o_bf16_6);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6))), "r"(_raw_stv8_128[0]), "r"(_raw_stv8_128[1]), "r"(_raw_stv8_128[2]), "r"(_raw_stv8_128[3]), "r"(_raw_stv8_128[4]), "r"(_raw_stv8_128[5]), "r"(_raw_stv8_128[6]), "r"(_raw_stv8_128[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6))), "r"(_raw_stv8_121[0]), "r"(_raw_stv8_121[1]), "r"(_raw_stv8_121[2]), "r"(_raw_stv8_121[3]), "r"(_raw_stv8_121[4]), "r"(_raw_stv8_121[5]), "r"(_raw_stv8_121[6]), "r"(_raw_stv8_121[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_6))[0] = reinterpret_cast<int4*>(o_bf16_6)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_129 = reinterpret_cast<const unsigned*>(o_bf16_6);
+#else
+                            const unsigned* _raw_stv8_122 = reinterpret_cast<const unsigned*>(o_bf16_6);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_6))), "r"(_raw_stv8_129[0]), "r"(_raw_stv8_129[1]), "r"(_raw_stv8_129[2]), "r"(_raw_stv8_129[3]), "r"(_raw_stv8_129[4]), "r"(_raw_stv8_129[5]), "r"(_raw_stv8_129[6]), "r"(_raw_stv8_129[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_6))), "r"(_raw_stv8_122[0]), "r"(_raw_stv8_122[1]), "r"(_raw_stv8_122[2]), "r"(_raw_stv8_122[3]), "r"(_raw_stv8_122[4]), "r"(_raw_stv8_122[5]), "r"(_raw_stv8_122[6]), "r"(_raw_stv8_122[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_6 + 8))[0] = reinterpret_cast<int4*>(o_bf16_6 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_130 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
+#else
+                            const unsigned* _raw_stv8_123 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6 + 16))), "r"(_raw_stv8_130[0]), "r"(_raw_stv8_130[1]), "r"(_raw_stv8_130[2]), "r"(_raw_stv8_130[3]), "r"(_raw_stv8_130[4]), "r"(_raw_stv8_130[5]), "r"(_raw_stv8_130[6]), "r"(_raw_stv8_130[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_6 + 16))), "r"(_raw_stv8_123[0]), "r"(_raw_stv8_123[1]), "r"(_raw_stv8_123[2]), "r"(_raw_stv8_123[3]), "r"(_raw_stv8_123[4]), "r"(_raw_stv8_123[5]), "r"(_raw_stv8_123[6]), "r"(_raw_stv8_123[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_6 + 8))[0] = reinterpret_cast<int4*>(o_bf16_6 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_6 + 16))[0] = reinterpret_cast<int4*>(o_bf16_6 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_6 + 16))[0] = reinterpret_cast<int4*>(o_bf16_6 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_6 + 24))[0] = reinterpret_cast<int4*>(o_bf16_6 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_6 + 24))[0] = reinterpret_cast<int4*>(o_bf16_6 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_131 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
+#else
+                            const unsigned* _raw_stv8_124 = reinterpret_cast<const unsigned*>(o_bf16_6 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_6 + 16))), "r"(_raw_stv8_131[0]), "r"(_raw_stv8_131[1]), "r"(_raw_stv8_131[2]), "r"(_raw_stv8_131[3]), "r"(_raw_stv8_131[4]), "r"(_raw_stv8_131[5]), "r"(_raw_stv8_131[6]), "r"(_raw_stv8_131[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_6 + 16))), "r"(_raw_stv8_124[0]), "r"(_raw_stv8_124[1]), "r"(_raw_stv8_124[2]), "r"(_raw_stv8_124[3]), "r"(_raw_stv8_124[4]), "r"(_raw_stv8_124[5]), "r"(_raw_stv8_124[6]), "r"(_raw_stv8_124[7]) : "memory");
+#endif
+                        }
                     }
                 }
                 float o_vals_7[32];
@@ -4730,16 +3469,16 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     : "r"(taddr + (unsigned int)lane_base_s + 224));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                const float2 _scale2_193 = {inv, inv};
+                const float2 _scale2_132 = {inv, inv};
 #else
-                const float2 _scale2_189 = {inv, inv};
+                const float2 _scale2_125 = {inv, inv};
 #endif
                 #pragma unroll
                 for (int _ls = 0; _ls < 16; _ls++)
 #if __CUDA_ARCH__ == 1030
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_193);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_132);
 #else
-                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_189);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_125);
 #endif
                 unsigned int o_bf16_7[16];
                 #pragma unroll
@@ -4748,29 +3487,71 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                     o_bf16_7[_lp] = *(uint32_t*)&_bf2;
                 }
                 int dim0_7 = 352;
-                if (row_ok_1 != 0) {
+                if (row_ok_c != 0) {
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_7))[0] = reinterpret_cast<int4*>(o_bf16_7)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_133 = reinterpret_cast<const unsigned*>(o_bf16_7);
+#else
+                            const unsigned* _raw_stv8_126 = reinterpret_cast<const unsigned*>(o_bf16_7);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7))), "r"(_raw_stv8_133[0]), "r"(_raw_stv8_133[1]), "r"(_raw_stv8_133[2]), "r"(_raw_stv8_133[3]), "r"(_raw_stv8_133[4]), "r"(_raw_stv8_133[5]), "r"(_raw_stv8_133[6]), "r"(_raw_stv8_133[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7))), "r"(_raw_stv8_126[0]), "r"(_raw_stv8_126[1]), "r"(_raw_stv8_126[2]), "r"(_raw_stv8_126[3]), "r"(_raw_stv8_126[4]), "r"(_raw_stv8_126[5]), "r"(_raw_stv8_126[6]), "r"(_raw_stv8_126[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_7))[0] = reinterpret_cast<int4*>(o_bf16_7)[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_134 = reinterpret_cast<const unsigned*>(o_bf16_7);
+#else
+                            const unsigned* _raw_stv8_127 = reinterpret_cast<const unsigned*>(o_bf16_7);
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_7))), "r"(_raw_stv8_134[0]), "r"(_raw_stv8_134[1]), "r"(_raw_stv8_134[2]), "r"(_raw_stv8_134[3]), "r"(_raw_stv8_134[4]), "r"(_raw_stv8_134[5]), "r"(_raw_stv8_134[6]), "r"(_raw_stv8_134[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_7))), "r"(_raw_stv8_127[0]), "r"(_raw_stv8_127[1]), "r"(_raw_stv8_127[2]), "r"(_raw_stv8_127[3]), "r"(_raw_stv8_127[4]), "r"(_raw_stv8_127[5]), "r"(_raw_stv8_127[6]), "r"(_raw_stv8_127[7]) : "memory");
+#endif
+                        }
                     }
                     if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_7 + 8))[0] = reinterpret_cast<int4*>(o_bf16_7 + (4))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_135 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
+#else
+                            const unsigned* _raw_stv8_128 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7 + 16))), "r"(_raw_stv8_135[0]), "r"(_raw_stv8_135[1]), "r"(_raw_stv8_135[2]), "r"(_raw_stv8_135[3]), "r"(_raw_stv8_135[4]), "r"(_raw_stv8_135[5]), "r"(_raw_stv8_135[6]), "r"(_raw_stv8_135[7]) : "memory");
+#else
+                                :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7 + 16))), "r"(_raw_stv8_128[0]), "r"(_raw_stv8_128[1]), "r"(_raw_stv8_128[2]), "r"(_raw_stv8_128[3]), "r"(_raw_stv8_128[4]), "r"(_raw_stv8_128[5]), "r"(_raw_stv8_128[6]), "r"(_raw_stv8_128[7]) : "memory");
+#endif
+                        }
                     } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_7 + 8))[0] = reinterpret_cast<int4*>(o_bf16_7 + (4))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_7 + 16))[0] = reinterpret_cast<int4*>(o_bf16_7 + (8))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_7 + 16))[0] = reinterpret_cast<int4*>(o_bf16_7 + (8))[0];
-                    }
-                    if (direct != 0) {
-                        reinterpret_cast<int4*>(out + (row_g * 512 + 128 * half + dim0_7 + 24))[0] = reinterpret_cast<int4*>(o_bf16_7 + (12))[0];
-                    } else {
-                        reinterpret_cast<int4*>(partial_O + (o_base + dim0_7 + 24))[0] = reinterpret_cast<int4*>(o_bf16_7 + (12))[0];
+                        {
+#if __CUDA_ARCH__ == 1030
+                            const unsigned* _raw_stv8_136 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
+#else
+                            const unsigned* _raw_stv8_129 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
+#endif
+                            asm volatile(
+                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if __CUDA_ARCH__ == 1030
+                                :: "l"((void*)(partial_O + (o_base + dim0_7 + 16))), "r"(_raw_stv8_136[0]), "r"(_raw_stv8_136[1]), "r"(_raw_stv8_136[2]), "r"(_raw_stv8_136[3]), "r"(_raw_stv8_136[4]), "r"(_raw_stv8_136[5]), "r"(_raw_stv8_136[6]), "r"(_raw_stv8_136[7]) : "memory");
+#else
+                                :: "l"((void*)(partial_O + (o_base + dim0_7 + 16))), "r"(_raw_stv8_129[0]), "r"(_raw_stv8_129[1]), "r"(_raw_stv8_129[2]), "r"(_raw_stv8_129[3]), "r"(_raw_stv8_129[4]), "r"(_raw_stv8_129[5]), "r"(_raw_stv8_129[6]), "r"(_raw_stv8_129[7]) : "memory");
+#endif
+                        }
                     }
                 }
-                if (row_ok_1 != 0 && half == 0 && direct == 0) {
+                if (row_ok_c != 0 && half == 0 && direct == 0) {
                     partial_max[row_g * num_split + split_i_1] = m;
                     partial_sum[row_g * num_split + split_i_1] = l_row;
                 }
@@ -4862,10 +3643,10 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                 pw_0[1] = ((lane >= 16) ? even_0 : odd_0);
                 uint32_t u_1;
                 asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_1) : "r"(lw[1]), "r"(lw[3]), "r"(sel_u));
-                uint32_t v_1_1;
-                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_1_1) : "r"(lw[1]), "r"(lw[3]), "r"(sel_v));
-                unsigned int even_1 = u_1 & 252645135 | v_1_1 << 4 & 4042322160u;
-                unsigned int odd_1 = u_1 >> 4 & 252645135 | v_1_1 & 4042322160u;
+                uint32_t v_1;
+                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_1) : "r"(lw[1]), "r"(lw[3]), "r"(sel_v));
+                unsigned int even_1 = u_1 & 252645135 | v_1 << 4 & 4042322160u;
+                unsigned int odd_1 = u_1 >> 4 & 252645135 | v_1 & 4042322160u;
                 pw_0[2] = ((lane >= 16) ? odd_1 : even_1);
                 pw_0[3] = ((lane >= 16) ? even_1 : odd_1);
                 uint32_t _stmatrix_addr_0 = static_cast<uint32_t>(smem_vt_addr + (unsigned int)(vt_x * 2 * 8192 + dim_row * 64 + (0 ^ dim_row >> 1 & 3) * 16));
@@ -4875,18 +3656,18 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                 unsigned int pw_1[4];
                 uint32_t u_2;
                 asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_2) : "r"(lw[4]), "r"(lw[6]), "r"(sel_u));
-                uint32_t v_2_1;
-                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_2_1) : "r"(lw[4]), "r"(lw[6]), "r"(sel_v));
-                unsigned int even_2 = u_2 & 252645135 | v_2_1 << 4 & 4042322160u;
-                unsigned int odd_2 = u_2 >> 4 & 252645135 | v_2_1 & 4042322160u;
+                uint32_t v_2;
+                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_2) : "r"(lw[4]), "r"(lw[6]), "r"(sel_v));
+                unsigned int even_2 = u_2 & 252645135 | v_2 << 4 & 4042322160u;
+                unsigned int odd_2 = u_2 >> 4 & 252645135 | v_2 & 4042322160u;
                 pw_1[0] = ((lane >= 16) ? odd_2 : even_2);
                 pw_1[1] = ((lane >= 16) ? even_2 : odd_2);
                 uint32_t u_3;
                 asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_3) : "r"(lw[5]), "r"(lw[7]), "r"(sel_u));
-                uint32_t v_3_1;
-                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_3_1) : "r"(lw[5]), "r"(lw[7]), "r"(sel_v));
-                unsigned int even_3 = u_3 & 252645135 | v_3_1 << 4 & 4042322160u;
-                unsigned int odd_3 = u_3 >> 4 & 252645135 | v_3_1 & 4042322160u;
+                uint32_t v_3;
+                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_3) : "r"(lw[5]), "r"(lw[7]), "r"(sel_v));
+                unsigned int even_3 = u_3 & 252645135 | v_3 << 4 & 4042322160u;
+                unsigned int odd_3 = u_3 >> 4 & 252645135 | v_3 & 4042322160u;
                 pw_1[2] = ((lane >= 16) ? odd_3 : even_3);
                 pw_1[3] = ((lane >= 16) ? even_3 : odd_3);
                 uint32_t _stmatrix_addr_1 = static_cast<uint32_t>(smem_vt_addr + (unsigned int)(vt_x * 2 * 8192 + dim_row * 64 + (1 ^ dim_row >> 1 & 3) * 16));
@@ -4896,10 +3677,10 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                 unsigned int pw_2[4];
                 uint32_t u_4;
                 asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_4) : "r"(lw[8]), "r"(lw[10]), "r"(sel_u));
-                uint32_t v_4_1;
-                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_4_1) : "r"(lw[8]), "r"(lw[10]), "r"(sel_v));
-                unsigned int even_4 = u_4 & 252645135 | v_4_1 << 4 & 4042322160u;
-                unsigned int odd_4 = u_4 >> 4 & 252645135 | v_4_1 & 4042322160u;
+                uint32_t v_4;
+                asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_4) : "r"(lw[8]), "r"(lw[10]), "r"(sel_v));
+                unsigned int even_4 = u_4 & 252645135 | v_4 << 4 & 4042322160u;
+                unsigned int odd_4 = u_4 >> 4 & 252645135 | v_4 & 4042322160u;
                 pw_2[0] = ((lane >= 16) ? odd_4 : even_4);
                 pw_2[1] = ((lane >= 16) ? even_4 : odd_4);
                 uint32_t u_5;
@@ -5069,8 +3850,8 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
             int k_l = 0;
             int raw_l = 0;
             int vs_l = 0;
-            int n_last_l = my_n_3 - 1;
             unsigned int kb_next[20];
+            int n_last_l = my_n_3 - 1;
             int pid = page_table[b_i_3 * page_stride + my_start_3];
             int phys = ((pid < 0) ? 0 : pid) + page_offset;
             {

@@ -553,6 +553,8 @@ def _check_entry(
             note(f"source {source!r} is not package-relative under csrc/")
         elif not (package_dir / source).is_file():
             note(f"source {source!r} is missing")
+    if "nvrtc" in entry:
+        found.extend(_check_nvrtc(package, package_dir, name, entry["nvrtc"], sources))
     digests = entry["sha256"]
     if not isinstance(digests, dict) or set(digests) != set(sources):
         note("sha256 is not keyed by exactly the sources")
@@ -564,6 +566,43 @@ def _check_entry(
                 and hashlib.sha256(path.read_bytes()).hexdigest() != digest
             ):
                 note(f"sha256 of {source!r} does not match the file")
+    return found
+
+
+def _check_nvrtc(
+    package: Package, package_dir: Path, name: str, nvrtc: Any, sources: list[str]
+) -> list[Finding]:
+    """An entry's optional ``nvrtc`` record: ``{"source", "sha256", "options"}``,
+    the device source NVRTC compiles to the cubin the library embeds (a ``.cu``
+    under ``csrc/`` that is none of the nvcc ``sources``, present, at its
+    digest) and NVRTC's options (strings; the builder adds the target and the
+    include directories)."""
+    found: list[Finding] = []
+
+    def note(message: str) -> None:
+        found.append(Finding(package.name, f"{name}: nvrtc {message}"))
+
+    if not isinstance(nvrtc, dict) or set(nvrtc) != {"source", "sha256", "options"}:
+        note("is not {source, sha256, options}")
+        return found
+    source = nvrtc["source"]
+    if (
+        not isinstance(source, str)
+        or not source.startswith("csrc/")
+        or ".." in source.split("/")
+        or not source.endswith(".cu")
+    ):
+        note(f"source {source!r} is not a package-relative .cu under csrc/")
+        return found
+    if source in sources:
+        note(f"source {source!r} is also an nvcc source")
+    path = package_dir / source
+    if not path.is_file():
+        note(f"source {source!r} is missing")
+    elif hashlib.sha256(path.read_bytes()).hexdigest() != nvrtc["sha256"]:
+        note(f"sha256 of {source!r} does not match the file")
+    if not _is_str_list(nvrtc["options"]):
+        note("options is not a list of strings")
     return found
 
 
@@ -698,6 +737,9 @@ def check_package_data(
     for entry in manifest.get("libraries", []):
         if isinstance(entry, dict) and _is_str_list(entry.get("sources")):
             required.update(entry["sources"])
+        nvrtc = entry.get("nvrtc") if isinstance(entry, dict) else None
+        if isinstance(nvrtc, dict) and isinstance(nvrtc.get("source"), str):
+            required.add(nvrtc["source"])
     return [
         Finding(package.name, f"package-data {globs} does not ship {relative!r}")
         for relative in sorted(required)
