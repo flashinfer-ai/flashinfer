@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import chunk_gated_delta_product, chunk_gated_delta_rule2
-from tests.test_helpers.cudnn_linear_attention import (
+from tests.gdn.test_helpers.cudnn_linear_attention import (
     assert_rel_close,
     requires_cudnn_linear_attention,
     serial_delta_product,
@@ -32,10 +32,6 @@ D, H = 128, 4
 
 @pytest.fixture(params=["gdn2", "gdp"])
 def family(request):
-    import cudnn
-
-    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
-        pytest.skip("state pools require cuDNN frontend 1.31+")
     return request.param
 
 

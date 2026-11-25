@@ -144,6 +144,7 @@ from .jit.gemm import (
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_mm_bf16_cublaslt_module,
+    gen_mm_mxfp8_smallm_sm107_module,
     gen_gemm_sm120_module_cutlass_mxfp8,
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
@@ -218,9 +219,13 @@ from .jit.rmsnorm_silu import (
 )
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
+from .jit.qsa_sparse_paged import gen_qsa_sparse_paged_module
 from .jit.rope import gen_rope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
+from .jit.gdn_batch_invariant import gen_gdn_batch_invariant_module
+from .jit.kda_batch_invariant import gen_kda_batch_invariant_module
 from .jit.sampling import gen_sampling_module
+from .jit.top_p_renorm_specialized import gen_top_p_renorm_specialized_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
@@ -759,6 +764,9 @@ def gen_all_modules(
         jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    # QSA sparse paged attention: one build (SM80 instructions) over the 8.x and 9.x targets.
+    if has_sm80 or has_sm90:
+        jit_specs.append(gen_qsa_sparse_paged_module())
     # Cake SM120 block-64 block-sparse attention (backend="vsa_sm120_blk64" of
     # BlockSparseAttentionWrapper): the bfloat16 and float16 programs, one
     # library each per exact target.
@@ -973,7 +981,9 @@ def gen_all_modules(
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            # The generic module only: the device-specific prebuilt-D variants are
+            # selected at JIT time and must not follow the build host's GPU.
+            jit_specs.append(gen_cutlass_fused_moe_sm90_module(enable_prebuilt_d=False))
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
             # the fixed E=256/N=512/K=2048 shape (BS8).
@@ -1043,6 +1053,11 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm107a_exact:
+            # Small-M MXFP8 "specialized" GEMM backend: sm_107a-exact (fused
+            # scaled cvt + DSMEM cluster reductions), so it ships pre-built
+            # only for exact-SM107a wheels; other targets JIT it on demand.
+            jit_specs.append(gen_mm_mxfp8_smallm_sm107_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
             # fp4_gemm_cutlass also targets SM110 and must ship in its provider
@@ -1056,7 +1071,7 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm120_module())
             # Imported here: the package import initializes flashinfer.moe_ep (every
             # MegaMoE backend), which builds without SM120 do not need.
-            from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+            from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
                 cake_sm120_megamoe_available,
                 gen_cake_sm120_megamoe_aot_modules,
             )
@@ -1180,8 +1195,15 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        # Specialized cluster top-p renorm (top_p_renorm_probs on compute capability 10.3):
+        # one module, built for the exact sm_103a target only.
+        if has_sm103a_exact:
+            jit_specs.append(gen_top_p_renorm_specialized_module())
         if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
+        if has_sm100 or has_sm103 or has_sm107:
+            jit_specs.append(gen_gdn_batch_invariant_module())
+            jit_specs.append(gen_kda_batch_invariant_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
             (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)
@@ -1361,30 +1383,34 @@ def copy_built_kernels(
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
     for jit_spec in jit_specs:
-        src = jit_env.FLASHINFER_JIT_DIR / jit_spec.name / f"{jit_spec.name}.so"
-        dst = out_dir / jit_spec.name / f"{jit_spec.name}.so"
+        # module.dll on Windows and <name>.so elsewhere: the file the loader opens.
+        library_name = jit_env.jit_library_name(jit_spec.name)
+        src = jit_env.FLASHINFER_JIT_DIR / jit_spec.name / library_name
+        dst = out_dir / jit_spec.name / library_name
         dst.parent.mkdir(exist_ok=False, parents=False)
         shutil.copy2(src, dst)
 
 
-def compile_and_package_modules(
-    out_dir: Optional[Path],
-    build_dir: Path,
+def generate_jit_specs(
     project_root: Path,
+    build_dir: Path,
     config: dict = None,
     verbose: bool = False,
-    skip_prebuilt: bool = True,
-) -> None:
+) -> List[JitSpec]:
     """
-    Compile and package modules based on the provided configuration.
+    Generate the AOT JIT specs without compiling them.
+
+    Points the JIT environment at ``project_root`` and ``build_dir`` (generated
+    sources are written below ``build_dir``) and returns every spec the build
+    would compile for ``FLASHINFER_CUDA_ARCH_LIST``. That variable must be set
+    before ``flashinfer`` is first imported, since the compilation context reads
+    it at import.
 
     Args:
-        out_dir: Output directory for packaged modules
-        build_dir: Build directory for compilation
         project_root: Project root directory
+        build_dir: Build directory for generated sources
         config: Configuration dictionary to override defaults (optional)
-        verbose: Whether to print verbose build output
-        skip_prebuilt: Whether to skip pre-built modules
+        verbose: Whether to print a build summary
     """
     # Start with default config and override with user config
     final_config = get_default_config()
@@ -1416,8 +1442,6 @@ def compile_and_package_modules(
     # Print summary
     if verbose:
         print("AOT build summary:")
-        if out_dir is not None:
-            print("  out_dir:", out_dir)
         print("  build_dir:", build_dir)
         print("  fa2_head_dim:", config["fa2_head_dim"])
         print("  fa3_head_dim:", config["fa3_head_dim"])
@@ -1462,6 +1486,33 @@ def compile_and_package_modules(
     )
     if verbose:
         print("Total ops:", len(jit_specs))
+    return jit_specs
+
+
+def compile_and_package_modules(
+    out_dir: Optional[Path],
+    build_dir: Path,
+    project_root: Path,
+    config: dict = None,
+    verbose: bool = False,
+    skip_prebuilt: bool = True,
+) -> None:
+    """
+    Compile and package modules based on the provided configuration.
+
+    Args:
+        out_dir: Output directory for packaged modules
+        build_dir: Build directory for compilation
+        project_root: Project root directory
+        config: Configuration dictionary to override defaults (optional)
+        verbose: Whether to print verbose build output
+        skip_prebuilt: Whether to skip pre-built modules
+    """
+    if verbose and out_dir is not None:
+        print("AOT output directory:", out_dir)
+    jit_specs = generate_jit_specs(
+        project_root, build_dir, config=config, verbose=verbose
+    )
 
     # Build
     build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)
@@ -1720,8 +1771,6 @@ def main():
     config = get_default_config()
     build_dir = jit_env.FLASHINFER_WORKSPACE_DIR
     out_dir: Optional[Path] = None
-
-    # Override with command line arguments
     if args.out_dir:
         out_dir = Path(args.out_dir)
     if args.build_dir:

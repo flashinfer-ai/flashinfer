@@ -42,7 +42,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const int* __restrict__ extra_topk_length_ptr, int extra_topk, int extra_page_block_size,
         size_t extra_page_stride_bytes, int num_tokens, int scratch_split_stride,
         int chunks_per_block, float sm_scale, int page_block_size, size_t page_stride_bytes,
-        bool write_direct, float lse_scale) {
+        bool write_direct, float lse_scale, SparseMlaMegaParams mega = {}) {
   static_assert(NUM_HEADS <= STREAMING_HEADS_PER_CTA || NUM_HEADS % STREAMING_HEADS_PER_CTA == 0);
   static_assert(NUM_HEADS % HPB == 0,
                 "streaming kernel processes full HPB head groups; thinner heads use the decode "
@@ -104,8 +104,12 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const int head = i / D_V;
         const int dim = i - head * D_V;
         if (write_direct) {
-          output[((size_t)token_idx * NUM_HEADS + h_start + head) * D_V + dim] =
-              __float2bfloat16(0.f);
+          const size_t offset = ((size_t)token_idx * NUM_HEADS + h_start + head) * D_V + dim;
+          if (mega.output) {
+            mega.output[offset] = 0;
+            if ((dim & 31) == 0) mega.scales[offset / 32] = 105;
+          } else
+            output[offset] = __float2bfloat16(0.f);
         } else {
           mid_out[(((size_t)token_idx * NUM_HEADS + h_start + head) * scratch_split_stride +
                    split_idx) *
@@ -177,8 +181,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     const bf16* q_base =
         q + (size_t)token_idx * NUM_HEADS * D_QK + (size_t)(h_start + group * HPB) * D_QK;
     quantize_q_nvfp4_to_smem<STREAMING_MATH_THREADS, STREAMING_Q_FP4_STRIDE,
-                             STREAMING_Q_SCALE_STRIDE>(sm.q_fp4(group), sm.q_sc(group),
-                                                       sm.q_rope(group), q_base, HPB);
+                             STREAMING_Q_SCALE_STRIDE>(
+        sm.q_fp4(group), sm.q_sc(group), sm.q_rope(group), q_base, HPB, mega.row(token_idx));
   }
 
   float acc_nope[STREAMING_HEAD_GROUPS][PV_GROUPS_PER_WARP][PV_N8_TILES_PER_GROUP][4] = {0};
@@ -524,6 +528,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
                          split_idx) *
                             D_V;
     const size_t head_stride = write_direct ? D_V : (size_t)scratch_split_stride * D_V;
+    // Producers have finished the final VT tile; raw KV is no longer live.
+    static_assert(2 * StreamingNVFP4Smem::SMEM_KV_FP4_BUF >= HPB * D_V * sizeof(bf16));
+    if (write_direct && mega.output) destination = reinterpret_cast<bf16*>(sm.kv_fp4(0));
 #pragma unroll
     for (int slot = 0; slot < PV_GROUPS_PER_WARP; ++slot) {
       const int scale_group = slot * STREAMING_N_WARPS + warp_id;
@@ -548,6 +555,15 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
                                                       acc_rope[group][nt][3] * inv_sum1);
       *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)gid * head_stride + d0]) = lo;
       *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)(gid + 8) * head_stride + d0]) = hi;
+    }
+    if (write_direct && mega.output) {
+      bar_sync_t<Dsv4Nvfp4Sync::Q_STAGE, STREAMING_MATH_THREADS>();
+      for (int i = threadIdx.x; i < HPB * D_V / 8; i += STREAMING_MATH_THREADS) {
+        mega_store8(*reinterpret_cast<const uint4*>(destination + i * 8),
+                    ((size_t)token_idx * NUM_HEADS + group_h_start) * D_V + i * 8, token_idx, mega);
+      }
+      // Next head group reuses the same dead raw-KV storage.
+      bar_sync_t<Dsv4Nvfp4Sync::Q_STAGE, STREAMING_MATH_THREADS>();
     }
   }
 }

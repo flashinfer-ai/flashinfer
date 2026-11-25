@@ -617,6 +617,56 @@ def test_trace_apply_does_not_replace_the_class():
 
 
 @needs_device
+def test_public_api_skips_backend_selection(monkeypatch):
+    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    for it (host cost only): a selecting call rewrites `bmm_fp8.suitable_auto_backends`, a bypassed one leaves it."""
+    A, B = adv_fp8(2, 16, 4096, seed=131), weights(2, 4096, 4096, 132)
+    sa, sb = scales()
+    sentinel = ["sentinel"]
+    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
+    monkeypatch.setattr(
+        flashinfer.bmm_fp8, "suitable_auto_backends", sentinel, raising=False
+    )
+    bi_bmm(A, B, sa, sb)
+    assert flashinfer.bmm_fp8.suitable_auto_backends is sentinel
+
+
+@needs_device
+@pytest.mark.parametrize("b,M,N,K", [(2, 16, 4096, 4096), (2, 16, 64, 8192)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(b, M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    A, B = adv_fp8(b, M, K, seed=181), weights(b, N, K, 182)
+    sa, sb = scales()
+    ref = bits(bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16))
+    assert torch.equal(bits(bi_bmm(A, B, sa, sb)), ref)
+    out = torch.empty(b, M, N, dtype=torch.bfloat16, device="cuda")
+    assert bi_bmm(A, B, sa, sb, out=out) is out and torch.equal(bits(out), ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        bi_bmm(A, B, sa, sb, out=out)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            bi_bmm(A, B, sa, sb, out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    # a caller's output over an operand's bytes is refused on both paths: the unsplit class's one launch over the batch
+    # and the split classes' launch per element (one byte buffer sized for the larger of the two views)
+    buf = torch.empty(max(b * M * K, 2 * b * M * N), dtype=torch.uint8, device="cuda")
+    a_alias = buf[: b * M * K].view(torch.float8_e4m3fn).view(b, M, K)
+    out_alias = buf[: 2 * b * M * N].view(torch.bfloat16).view(b, M, N)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        bi_bmm(a_alias, B, sa, sb, out=out_alias)
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     A, B = adv_fp8(2, 16, 4096, seed=121), weights(2, 4096, 4096, 122)
     sa, sb = scales()
@@ -638,9 +688,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi_bmm(A, weights(3, 4096, 4096, 126), sa, sb)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="3-D operands"):
         bmm_fp8_batch_invariant(A[0], B[0], sa, sb, torch.bfloat16)
-    with pytest.raises(
-        ValueError
-    ):  # FlashInfer's own output-dtype contract, checked before the flag path
+    # the public API hands batch-invariant calls to the class without running the backend checks: the class's typed
+    # error (a ValueError, as before)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16 output"):
         bi_bmm(A, B, sa, sb, torch.float32)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         bi_bmm(

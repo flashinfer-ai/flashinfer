@@ -19,10 +19,6 @@
 #define CAKE_NEED_INT_WARP_UNIFORM
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
-
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
     unsigned int u;
@@ -83,162 +79,162 @@ kernel_cake_stepfun_moe_5144f41bbd707c277a10(__nv_bfloat16* __restrict__ scores,
         unsigned int raw_bits = 0;
         unsigned int tw_mask = 0;
         int update = 0;
-        unsigned int keys32[4];
+        unsigned int keys[4];
         expert_cand = lane_0;
         raw_bits = 65408;
         if (expert_cand < num_experts) {
             raw_bits = __as_u32((float)scores[token * num_experts + expert_cand]) >> 16;
         }
         tw_mask = (((raw_bits & 32768) != 0) ? 65535 : 32768);
-        keys32[0] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
+        keys[0] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
         expert_cand = 32 + lane_0;
         raw_bits = 65408;
         if (expert_cand < num_experts) {
             raw_bits = __as_u32((float)scores[token * num_experts + expert_cand]) >> 16;
         }
         tw_mask = (((raw_bits & 32768) != 0) ? 65535 : 32768);
-        keys32[1] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
+        keys[1] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
         expert_cand = 64 + lane_0;
         raw_bits = 65408;
         if (expert_cand < num_experts) {
             raw_bits = __as_u32((float)scores[token * num_experts + expert_cand]) >> 16;
         }
         tw_mask = (((raw_bits & 32768) != 0) ? 65535 : 32768);
-        keys32[2] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
+        keys[2] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
         expert_cand = 96 + lane_0;
         raw_bits = 65408;
         if (expert_cand < num_experts) {
             raw_bits = __as_u32((float)scores[token * num_experts + expert_cand]) >> 16;
         }
         tw_mask = (((raw_bits & 32768) != 0) ? 65535 : 32768);
-        keys32[3] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
-        unsigned int _min_0 = ((keys32[0]) < (keys32[2]) ? (keys32[0]) : (keys32[2]));
-        unsigned int _max_0 = ((keys32[0]) > (keys32[2]) ? (keys32[0]) : (keys32[2]));
-        keys32[0] = _max_0;
-        keys32[2] = _min_0;
-        unsigned int _min_1 = ((keys32[1]) < (keys32[3]) ? (keys32[1]) : (keys32[3]));
-        unsigned int _max_1 = ((keys32[1]) > (keys32[3]) ? (keys32[1]) : (keys32[3]));
-        keys32[1] = _max_1;
-        keys32[3] = _min_1;
-        unsigned int _min_2 = ((keys32[0]) < (keys32[1]) ? (keys32[0]) : (keys32[1]));
-        unsigned int _max_2 = ((keys32[0]) > (keys32[1]) ? (keys32[0]) : (keys32[1]));
-        keys32[0] = _max_2;
-        keys32[1] = _min_2;
-        unsigned int _min_3 = ((keys32[2]) < (keys32[3]) ? (keys32[2]) : (keys32[3]));
-        unsigned int _max_3 = ((keys32[2]) > (keys32[3]) ? (keys32[2]) : (keys32[3]));
-        keys32[2] = _max_3;
-        keys32[3] = _min_3;
-        unsigned int _min_4 = ((keys32[1]) < (keys32[2]) ? (keys32[1]) : (keys32[2]));
-        unsigned int _max_4 = ((keys32[1]) > (keys32[2]) ? (keys32[1]) : (keys32[2]));
-        keys32[1] = _max_4;
-        keys32[2] = _min_4;
-        unsigned int refill32 = 8323072 | (unsigned int)(65535 - (96 + lane_0)) & 65535;
-        unsigned int packed_max32 = 0;
+        keys[3] = (raw_bits ^ tw_mask) << 16 | (unsigned int)(65535 - expert_cand) & 65535;
+        unsigned int _min_0 = ((keys[0]) < (keys[2]) ? (keys[0]) : (keys[2]));
+        unsigned int _max_0 = ((keys[0]) > (keys[2]) ? (keys[0]) : (keys[2]));
+        keys[0] = _max_0;
+        keys[2] = _min_0;
+        unsigned int _min_1 = ((keys[1]) < (keys[3]) ? (keys[1]) : (keys[3]));
+        unsigned int _max_1 = ((keys[1]) > (keys[3]) ? (keys[1]) : (keys[3]));
+        keys[1] = _max_1;
+        keys[3] = _min_1;
+        unsigned int _min_2 = ((keys[0]) < (keys[1]) ? (keys[0]) : (keys[1]));
+        unsigned int _max_2 = ((keys[0]) > (keys[1]) ? (keys[0]) : (keys[1]));
+        keys[0] = _max_2;
+        keys[1] = _min_2;
+        unsigned int _min_3 = ((keys[2]) < (keys[3]) ? (keys[2]) : (keys[3]));
+        unsigned int _max_3 = ((keys[2]) > (keys[3]) ? (keys[2]) : (keys[3]));
+        keys[2] = _max_3;
+        keys[3] = _min_3;
+        unsigned int _min_4 = ((keys[1]) < (keys[2]) ? (keys[1]) : (keys[2]));
+        unsigned int _max_4 = ((keys[1]) > (keys[2]) ? (keys[1]) : (keys[2]));
+        keys[1] = _max_4;
+        keys[2] = _min_4;
+        unsigned int refill = 8323072 | (unsigned int)(65535 - (96 + lane_0)) & 65535;
+        unsigned int packed_max = 0;
         unsigned int tw16 = 0;
         if (top_k > 0) {
             unsigned int _warp_redux_5;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_5;
-            out_idx[0] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_5) : "r"(keys[0]));
+            packed_max = _warp_redux_5;
+            out_idx[0] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[0] = tw16 ^ tw_mask;
         }
         if (top_k > 1) {
-            update = ((packed_max32 == keys32[0]) ? 1 : 0);
-            keys32[0] = ((update != 0) ? keys32[1] : keys32[0]);
-            keys32[1] = ((update != 0) ? keys32[2] : keys32[1]);
-            keys32[2] = ((update != 0) ? keys32[3] : keys32[2]);
-            keys32[3] = ((update != 0) ? refill32 : keys32[3]);
+            update = ((packed_max == keys[0]) ? 1 : 0);
+            keys[0] = ((update != 0) ? keys[1] : keys[0]);
+            keys[1] = ((update != 0) ? keys[2] : keys[1]);
+            keys[2] = ((update != 0) ? keys[3] : keys[2]);
+            keys[3] = ((update != 0) ? refill : keys[3]);
             unsigned int _warp_redux_6;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_6) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_6;
-            out_idx[1] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_6) : "r"(keys[0]));
+            packed_max = _warp_redux_6;
+            out_idx[1] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[1] = tw16 ^ tw_mask;
         }
         if (top_k > 2) {
-            update = ((packed_max32 == keys32[0]) ? 1 : 0);
-            keys32[0] = ((update != 0) ? keys32[1] : keys32[0]);
-            keys32[1] = ((update != 0) ? keys32[2] : keys32[1]);
-            keys32[2] = ((update != 0) ? keys32[3] : keys32[2]);
-            keys32[3] = ((update != 0) ? refill32 : keys32[3]);
+            update = ((packed_max == keys[0]) ? 1 : 0);
+            keys[0] = ((update != 0) ? keys[1] : keys[0]);
+            keys[1] = ((update != 0) ? keys[2] : keys[1]);
+            keys[2] = ((update != 0) ? keys[3] : keys[2]);
+            keys[3] = ((update != 0) ? refill : keys[3]);
             unsigned int _warp_redux_7;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_7) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_7;
-            out_idx[2] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_7) : "r"(keys[0]));
+            packed_max = _warp_redux_7;
+            out_idx[2] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[2] = tw16 ^ tw_mask;
         }
         if (top_k > 3) {
-            update = ((packed_max32 == keys32[0]) ? 1 : 0);
-            keys32[0] = ((update != 0) ? keys32[1] : keys32[0]);
-            keys32[1] = ((update != 0) ? keys32[2] : keys32[1]);
-            keys32[2] = ((update != 0) ? keys32[3] : keys32[2]);
-            keys32[3] = ((update != 0) ? refill32 : keys32[3]);
+            update = ((packed_max == keys[0]) ? 1 : 0);
+            keys[0] = ((update != 0) ? keys[1] : keys[0]);
+            keys[1] = ((update != 0) ? keys[2] : keys[1]);
+            keys[2] = ((update != 0) ? keys[3] : keys[2]);
+            keys[3] = ((update != 0) ? refill : keys[3]);
             unsigned int _warp_redux_8;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_8) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_8;
-            out_idx[3] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_8) : "r"(keys[0]));
+            packed_max = _warp_redux_8;
+            out_idx[3] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[3] = tw16 ^ tw_mask;
         }
         if (top_k > 4) {
-            update = ((packed_max32 == keys32[0]) ? 1 : 0);
-            keys32[0] = ((update != 0) ? keys32[1] : keys32[0]);
-            keys32[1] = ((update != 0) ? keys32[2] : keys32[1]);
-            keys32[2] = ((update != 0) ? keys32[3] : keys32[2]);
-            keys32[3] = ((update != 0) ? refill32 : keys32[3]);
+            update = ((packed_max == keys[0]) ? 1 : 0);
+            keys[0] = ((update != 0) ? keys[1] : keys[0]);
+            keys[1] = ((update != 0) ? keys[2] : keys[1]);
+            keys[2] = ((update != 0) ? keys[3] : keys[2]);
+            keys[3] = ((update != 0) ? refill : keys[3]);
             unsigned int _warp_redux_9;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_9) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_9;
-            out_idx[4] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_9) : "r"(keys[0]));
+            packed_max = _warp_redux_9;
+            out_idx[4] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[4] = tw16 ^ tw_mask;
         }
         if (top_k > 5) {
-            update = ((packed_max32 == keys32[0]) ? 1 : 0);
-            keys32[0] = ((update != 0) ? keys32[1] : keys32[0]);
-            keys32[1] = ((update != 0) ? keys32[2] : keys32[1]);
-            keys32[2] = ((update != 0) ? keys32[3] : keys32[2]);
-            keys32[3] = ((update != 0) ? refill32 : keys32[3]);
+            update = ((packed_max == keys[0]) ? 1 : 0);
+            keys[0] = ((update != 0) ? keys[1] : keys[0]);
+            keys[1] = ((update != 0) ? keys[2] : keys[1]);
+            keys[2] = ((update != 0) ? keys[3] : keys[2]);
+            keys[3] = ((update != 0) ? refill : keys[3]);
             unsigned int _warp_redux_10;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_10) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_10;
-            out_idx[5] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_10) : "r"(keys[0]));
+            packed_max = _warp_redux_10;
+            out_idx[5] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[5] = tw16 ^ tw_mask;
         }
         if (top_k > 6) {
-            update = ((packed_max32 == keys32[0]) ? 1 : 0);
-            keys32[0] = ((update != 0) ? keys32[1] : keys32[0]);
-            keys32[1] = ((update != 0) ? keys32[2] : keys32[1]);
-            keys32[2] = ((update != 0) ? keys32[3] : keys32[2]);
-            keys32[3] = ((update != 0) ? refill32 : keys32[3]);
+            update = ((packed_max == keys[0]) ? 1 : 0);
+            keys[0] = ((update != 0) ? keys[1] : keys[0]);
+            keys[1] = ((update != 0) ? keys[2] : keys[1]);
+            keys[2] = ((update != 0) ? keys[3] : keys[2]);
+            keys[3] = ((update != 0) ? refill : keys[3]);
             unsigned int _warp_redux_11;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_11) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_11;
-            out_idx[6] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_11) : "r"(keys[0]));
+            packed_max = _warp_redux_11;
+            out_idx[6] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[6] = tw16 ^ tw_mask;
         }
         if (top_k > 7) {
-            update = ((packed_max32 == keys32[0]) ? 1 : 0);
-            keys32[0] = ((update != 0) ? keys32[1] : keys32[0]);
-            keys32[1] = ((update != 0) ? keys32[2] : keys32[1]);
-            keys32[2] = ((update != 0) ? keys32[3] : keys32[2]);
-            keys32[3] = ((update != 0) ? refill32 : keys32[3]);
+            update = ((packed_max == keys[0]) ? 1 : 0);
+            keys[0] = ((update != 0) ? keys[1] : keys[0]);
+            keys[1] = ((update != 0) ? keys[2] : keys[1]);
+            keys[2] = ((update != 0) ? keys[3] : keys[2]);
+            keys[3] = ((update != 0) ? refill : keys[3]);
             unsigned int _warp_redux_12;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_12) : "r"(keys32[0]));
-            packed_max32 = _warp_redux_12;
-            out_idx[7] = 65535 - (int)(packed_max32 & 65535);
-            tw16 = packed_max32 >> 16;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_12) : "r"(keys[0]));
+            packed_max = _warp_redux_12;
+            out_idx[7] = 65535 - (int)(packed_max & 65535);
+            tw16 = packed_max >> 16;
             tw_mask = (((tw16 & 32768) != 0) ? 32768 : 65535);
             out_bits[7] = tw16 ^ tw_mask;
         }

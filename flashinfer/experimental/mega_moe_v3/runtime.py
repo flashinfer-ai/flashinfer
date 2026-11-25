@@ -17,8 +17,9 @@ LABEL = "Generated MegaMoE v3"
 
 def catalog():
     """The family catalog (schema ``mega_moe_v3.v3``): one program per schedule,
-    compiled for every listed architecture; the pipeline programs take the SM
-    count from the compile line (``-DNUM_CTAS=<physical SMs>``)."""
+    compiled for every listed architecture; the pipeline programs take their
+    persistent grid from the compile line (``-DNUM_CTAS=<route_num_ctas>``: the
+    physical SM count, or the smaller count a route states)."""
     return load_catalog(Path(__file__).with_name("catalog.json"), label=LABEL)
 
 
@@ -41,9 +42,11 @@ def stage_program(stage, arch):
     return program if isinstance(program, str) else program[arch]
 
 
-def load_program(arch, name, num_sms):
-    """Build and load program ``name`` for ``arch``; ``NUM_CTAS`` is the route's SM count."""
-    definitions = catalog().definitions(arch, name, {"NUM_CTAS": int(num_sms)})
+def load_program(arch, name, num_ctas):
+    """Build and load program ``name`` for ``arch``; ``NUM_CTAS`` is the route's
+    persistent grid (``route_num_ctas``: the count the route states, else its
+    SM count)."""
+    definitions = catalog().definitions(arch, name, {"NUM_CTAS": int(num_ctas)})
     return catalog().load_program(arch, name, definitions)
 
 
@@ -136,6 +139,29 @@ def route_grid(route, arch, num_sms):
     return tuple(int(v) for v in grid)
 
 
+def route_num_ctas(route, arch, num_sms):
+    """The persistent grid of ``route``'s programs on ``arch`` at ``num_sms``
+    SMs: the ``NUM_CTAS`` they are built with and the CTAs they launch.
+
+    A route whose metadata states ``num_ctas`` runs that many co-resident CTAs,
+    fewer than the device's SMs, so a stream's next call becomes resident on
+    the free SMs while the previous call's last CTAs finish; its grid is
+    ``[num_ctas, 1, 1]``. Every other route runs one CTA per SM.
+    """
+    stated = route["metadata"].get("num_ctas")
+    if stated is None:
+        return int(num_sms)
+    num_ctas = int(stated)
+    grid = route_grid(route, arch, num_sms)
+    if not 0 < num_ctas <= int(num_sms) or grid != (num_ctas, 1, 1):
+        raise ValueError(
+            f"The exported {arch} route states num_ctas {stated!r} and grid "
+            f"{list(grid)}; a stated count must be the route's grid and fit the "
+            f"{int(num_sms)}-SM device"
+        )
+    return num_ctas
+
+
 def _device_num_sms(device):
     import torch
 
@@ -164,10 +190,10 @@ def _route_arch(route, device):
 
 
 class _Stage:
-    def __init__(self, arch, program, num_sms, bindings):
+    def __init__(self, arch, program, num_ctas, bindings):
         import torch
 
-        module, record = load_program(arch, program, num_sms)
+        module, record = load_program(arch, program, num_ctas)
         self.bindings = dict(bindings)
         grid = self.bindings.pop("grid")
         self.bindings.update(grid_x=grid[0], grid_y=grid[1], grid_z=grid[2])
@@ -240,6 +266,7 @@ class V3Plan:
             if isinstance(v, torch.Tensor)
         )
         self.arch, self.num_sms = _route_arch(route, t.device)
+        self.num_ctas = route_num_ctas(route, self.arch, self.num_sms)
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         # Declared per architecture by the exported catalog route; absent means
@@ -249,7 +276,7 @@ class V3Plan:
             s["name"]: _Stage(
                 self.arch,
                 stage_program(s, self.arch),
-                self.num_sms,
+                self.num_ctas,
                 stage_bindings[s["name"]],
             )
             for s in route["stages"]
@@ -404,8 +431,10 @@ def prepare_pipeline(inputs):
         else f" (logical intermediate {logical} pads to {args['intermediate']})"
     )
     route = _route(arch, "pipeline", args, note=note)
-    # The persistent grid derives from the device's SM count, which the route
-    # must admit; the route's metadata names the program's source-schedule form.
+    # The route must admit the device's SM count; the route's metadata names
+    # the program's source-schedule form and, when it states ``num_ctas``, the
+    # persistent grid (``route_num_ctas``; else one CTA per SM), which the
+    # bindings launch and ``bind_prepared`` checks against the route's grid.
     _, num_sms = _route_arch(route, inputs["x_fp8_packed"].device)
     data = prepare_pipeline_bindings(inputs, num_sms, route_metadata=route["metadata"])
     return bind_prepared(

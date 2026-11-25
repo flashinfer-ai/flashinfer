@@ -18,7 +18,7 @@ def _mxfp8_data_dtype(kind: str) -> torch.dtype:
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/
     # directly); the package import also bootstraps sys.path for the kernel
     # packages.
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import kind_data_dtype
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import kind_data_dtype
 
     return kind_data_dtype(kind)
 
@@ -36,7 +36,7 @@ def stage_mega_moe_inputs(
 ) -> None:
     """bf16 ``hidden_states`` → MXFP8 activation + plain K-major E8M0 block scales."""
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/).
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         Mxfp8BlockSize,
         ceil_div,
         mxfp8_quantize_per_block_32_row,
@@ -103,7 +103,7 @@ def validate_sm120_mxfp8_forward_inputs(
         return
 
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/).
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         ceil_div,

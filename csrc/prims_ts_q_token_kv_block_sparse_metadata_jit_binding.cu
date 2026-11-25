@@ -31,10 +31,18 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
     TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len);
+    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len,
+    Optional<TensorView> route_order, Optional<TensorView> route_order_counter,
+    int64_t route_order_tail);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fixed, PrimsTSQTokenKvBlockSparseMetadataRunFixed);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_packed, PrimsTSQTokenKvBlockSparseMetadataRunPacked);
+
+int64_t PrimsTSQTokenKvBlockSparseWideMetadataSmemBytes(int64_t group_size, int64_t max_seq_len_kv,
+                                                        int64_t sparse_block_size);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(wide_metadata_smem_bytes,
+                              PrimsTSQTokenKvBlockSparseWideMetadataSmemBytes);
 
 void PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor(
     TensorView block_indices, TensorView block_table, Optional<TensorView> token_to_request,
@@ -49,7 +57,9 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPackedQueryMajor(
     TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len);
+    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len,
+    Optional<TensorView> route_order, Optional<TensorView> route_order_counter,
+    int64_t route_order_tail);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fixed_query_major,
                               PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor);

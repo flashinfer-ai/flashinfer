@@ -110,12 +110,12 @@ HEUR_CSV_FIELDS = (
 
 
 def _select_heuristic(tokens: int):
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        bootstrap_paths,
-    )
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import bootstrap_paths
 
     bootstrap_paths()
-    from moe_hopper_bf16.heuristic_config import select_heuristic_config
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_hopper_bf16.heuristic_config import (
+        select_heuristic_config,
+    )
 
     return select_heuristic_config(tokens)
 

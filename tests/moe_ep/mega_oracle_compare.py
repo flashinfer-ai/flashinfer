@@ -2,7 +2,7 @@
 
 Lives outside the per-arch test files so the sm100 and sm120 MXFP8 suites can
 share one band definition without dragging in each other's
-``pytest.importorskip`` (the kernel trees are process-exclusive).
+``pytest.importorskip``.
 """
 
 from __future__ import annotations

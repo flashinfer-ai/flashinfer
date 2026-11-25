@@ -222,6 +222,8 @@ def _program_table(binding: str, name: str) -> list[str | None]:
         # The float16 o110 deferred shared program of world size 8 is not built.
         ("kTwoShotDeferSharedKernels", "_tsds", (4, 8), (("float16", 8, "110"),)),
         ("kTwoShotEarlyKernels", "_tse", (4, 8), ()),
+        ("kTwoShotSharedKernels", "_tss", (4, 8), ()),
+        ("kTwoShotEarlySharedKernels", "_tses", (4,), ()),
         ("kW2QuadKernels", "_quad", (2,), ()),
     ],
 )
@@ -266,6 +268,8 @@ def test_program_tables_cover_the_module_records() -> None:
             "kTwoShotDeferKernels",
             "kTwoShotDeferSharedKernels",
             "kTwoShotEarlyKernels",
+            "kTwoShotSharedKernels",
+            "kTwoShotEarlySharedKernels",
             "kW2QuadKernels",
         )
         for kernel in _program_table(binding, table)
@@ -376,6 +380,7 @@ def _as_python(expression: str) -> str:
         expression.replace(" != nullptr", " is not None")
         .replace("&&", "and")
         .replace("||", "or")
+        .replace("!(", "not (")
     )
 
 
@@ -406,7 +411,7 @@ def test_two_shot_early_program_runs_up_to_128_tokens(world_size: int) -> None:
     )
     assert early_now is not None and first is not None and above_small is not None
     two_shot_kernel = re.findall(
-        r"kernel = two_shot_deferred \? .*? : two_shot_now;", binding
+        r"kernel = two_shot_deferred \? .*? : two_shot_now\);", binding
     )
     assert len(two_shot_kernel) == 2
     _, branch_expression = _small_token_test(binding)
@@ -545,23 +550,30 @@ def test_world_size_2_quad_program_runs_up_to_142_tokens(small_token_max: int) -
 
 
 def _two_shot_select(binding: str) -> str:
-    """The binding's choice among the deferred two-shot programs and two_shot_now, at
-    both two-shot call sites, as a Python expression."""
+    """The binding's choice among the deferred two-shot programs,
+    two_shot_now_shared and two_shot_now, at both two-shot call sites, as a Python
+    expression."""
     selects = re.findall(r"kernel = (two_shot_deferred \? .*?);", binding)
     assert len(selects) == 2 and selects[0] == selects[1], selects
     select = re.fullmatch(
-        r"two_shot_deferred \? \(\((.*)\) \? (\w+) : (\w+)\) : (\w+)", selects[0]
+        r"two_shot_deferred \? \(\((.*?)\) \? (\w+) : (\w+)\)"
+        r" : \(\((.*)\) \? (\w+) : (\w+)\)",
+        selects[0],
     )
     assert select is not None, selects[0]
-    shared, shared_program, defer_program, now = select.groups()
-    assert (shared_program, defer_program, now) == (
+    shared, shared_program, defer_program, now_shared, now_program, now = (
+        select.groups()
+    )
+    assert (shared_program, defer_program, now_program, now) == (
         "defer_shared",
         "two_shot_defer",
+        "two_shot_now_shared",
         "two_shot_now",
     )
     return (
         f"(({shared_program} if ({_as_python(shared)}) else {defer_program})"
-        f" if two_shot_deferred else {now})"
+        f" if two_shot_deferred else"
+        f" ({now_program} if ({_as_python(now_shared)}) else {now}))"
     )
 
 
@@ -581,20 +593,12 @@ def _table_slot(dtype: str, world_size: int, quantize: bool) -> int:
     ) * 2 + int(quantize)
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("small_token_max", [16, 64])
-def test_shared_expert_runs_the_deferred_shared_program(
-    small_token_max: int,
-) -> None:
-    """From the deferred two-shot threshold (kTwoShotDeferMinTokensWorldSize4 = 1536
-    tokens at world size 4, kTwoShotDeferMinTokensWorldSize8 = 768 at world size 8), a
-    rank with a shared expert runs the deferred program that also prefetches the
-    shared-expert row (_tsds): at world size 4 for every top_k, at world size 8 for
-    top_k 8 in every cell but float16 o110, whose slot is empty. Every other deferred call
-    runs the deferred program (_tsd); below the threshold the shared expert changes
-    nothing. Whether a call runs a deferred form reads the token count, the world size and
-    the C11 defer_excluded class alone, so ranks with and without a shared expert, or with
-    different top_k, run forms of the same exchange. World size 2 runs no two-shot form."""
+def _two_shot_model(small_token_max: int):
+    """The binding's program choice for a call, as a function of (world_size, tokens,
+    top_k, use_shared, quantize, dtype) returning the program suffix ("_small" for the
+    small-token program, "one_shot" for any other one-shot program), evaluated from the
+    binding text: the two-shot tests, the small-token test, the deferred and early
+    switches, the shared forms' tables and the two-shot select at both call sites."""
     source_dir = cake_moe_finalize_comm._source_dir()
     binding = (
         source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
@@ -609,8 +613,25 @@ def test_shared_expert_runs_the_deferred_shared_program(
     assert constants["kTwoShotDeferMinTokensWorldSize8"] == 768
     expressions = {
         name: re.search(rf"const (?:bool|void\*) {name} =\s*([^;]+);", binding)
-        for name in ("defer_excluded", "two_shot_deferred", "two_shot_now")
+        for name in (
+            "defer_excluded",
+            "two_shot_deferred",
+            "two_shot_now",
+            "two_shot_early_class",
+        )
     }
+    now_shared = re.search(
+        r"const void\* two_shot_now_shared =\s*(\w+) \? (\w+)\[dtype_index\]"
+        r"\[ws_index\]\[quant_index\]\s*: (\w+)\[dtype_index\]\[ws_index\]"
+        r"\[quant_index\];",
+        binding,
+    )
+    assert now_shared is not None
+    assert now_shared.groups() == (
+        "two_shot_early_class",
+        "kTwoShotEarlySharedKernels",
+        "kTwoShotSharedKernels",
+    )
     first = re.search(r"if \((two_shot != nullptr &&.*?)\) \{", binding, re.S)
     above_small = re.search(
         r"\} else if \((two_shot != nullptr && world_size == 8)\) \{", binding
@@ -630,6 +651,8 @@ def test_shared_expert_runs_the_deferred_shared_program(
     }
     select = compile(_two_shot_select(binding), "two_shot_select", "eval")
     shared_table = _program_table(binding, "kTwoShotDeferSharedKernels")
+    now_table = _program_table(binding, "kTwoShotSharedKernels")
+    early_table = _program_table(binding, "kTwoShotEarlySharedKernels")
 
     def program(
         world_size: int,
@@ -640,7 +663,8 @@ def test_shared_expert_runs_the_deferred_shared_program(
         dtype: str,
     ) -> str:
         two_shot_world = world_size in (4, 8)
-        shared_kernel = shared_table[_table_slot(dtype, world_size, quantize)]
+        slot = _table_slot(dtype, world_size, quantize)
+        shared_kernel = shared_table[slot]
         scope: dict[str, object] = {
             **constants,
             "world_size": world_size,
@@ -657,8 +681,16 @@ def test_shared_expert_runs_the_deferred_shared_program(
             "defer_shared": _program_suffix(shared_kernel),
             "two_shot_early": "_tse" if two_shot_world else None,
         }
-        for name in ("defer_excluded", "two_shot_deferred", "two_shot_now"):
+        for name in (
+            "defer_excluded",
+            "two_shot_deferred",
+            "two_shot_now",
+            "two_shot_early_class",
+        ):
             scope[name] = eval(codes[name], {"__builtins__": {}}, scope)
+        scope["two_shot_now_shared"] = _program_suffix(
+            (early_table if scope["two_shot_early_class"] else now_table)[slot]
+        )
         if eval(codes["two_shot_first"], {"__builtins__": {}}, scope):
             return eval(select, {"__builtins__": {}}, scope)
         if eval(codes["small_token"], {"__builtins__": {}}, scope):
@@ -667,11 +699,47 @@ def test_shared_expert_runs_the_deferred_shared_program(
             return eval(select, {"__builtins__": {}}, scope)
         return "one_shot"
 
+    return program
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_shared_expert_runs_the_deferred_shared_program(
+    small_token_max: int,
+) -> None:
+    """From the deferred two-shot threshold (kTwoShotDeferMinTokensWorldSize4 = 1536
+    tokens at world size 4, kTwoShotDeferMinTokensWorldSize8 = 768 at world size 8), a
+    rank with a shared expert runs the deferred program that also prefetches the
+    shared-expert row (_tsds): at world size 4 for every top_k, at world size 8 for
+    top_k 8 in every cell but float16 o110, whose slot is empty. Every other deferred call
+    runs the deferred program (_tsd); below the threshold a rank with a shared expert
+    at top_k 4 runs the shared form of the two-shot program (_tss) or, at world size 4,
+    of the two-shot early program (_tses).
+    Whether a call runs a deferred form reads the token count, the world size and the
+    C11 defer_excluded class alone, so ranks with and without a shared expert, or with
+    different top_k, run forms of the same exchange. World size 2 runs no two-shot form."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    constants = {
+        name: int(value)
+        for name, value in re.findall(
+            r"^constexpr int64_t (k\w+) = (\d+);$", binding, re.M
+        )
+    }
+    assert constants["kTwoShotDeferMinTokensWorldSize4"] == 1536
+    assert constants["kTwoShotDeferMinTokensWorldSize8"] == 768
+    program = _two_shot_model(small_token_max)
+
+    def now_shared(form: str, top_k: int, use_shared: bool) -> str:
+        return form + "s" if use_shared and top_k == 4 else form
+
     def world_size_8(
         tokens: int, top_k: int, use_shared: bool, quantize: bool, dtype: str
     ) -> str:
         if tokens < 768 or (top_k == 4 and not use_shared and not quantize):
-            return "_ts"
+            return now_shared("_ts", top_k, use_shared)
         built = dtype == "bfloat16" or quantize
         return "_tsds" if use_shared and top_k == 8 and built else "_tsd"
 
@@ -680,15 +748,17 @@ def test_shared_expert_runs_the_deferred_shared_program(
             for top_k in (4, 8):
                 for use_shared in (False, True):
                     case = (top_k, use_shared, quantize, dtype)
+                    now_ts = now_shared("_ts", top_k, use_shared)
+                    now_tse = now_shared("_tse", top_k, use_shared)
                     for tokens in (1535, 1536, 1537, 2048, 4096):
                         deferred = "_tsds" if use_shared else "_tsd"
                         assert program(
                             4, tokens, top_k, use_shared, quantize, dtype
-                        ) == (deferred if tokens >= 1536 else "_ts"), (tokens, *case)
+                        ) == (deferred if tokens >= 1536 else now_ts), (tokens, *case)
                     for tokens in (72, 128):
                         assert (
                             program(4, tokens, top_k, use_shared, quantize, dtype)
-                            == "_tse"
+                            == now_tse
                         )
                     for tokens in (767, 768, 769, 1536, 2048, 4096):
                         assert program(
@@ -697,7 +767,7 @@ def test_shared_expert_runs_the_deferred_shared_program(
                     for tokens in (1535, 1536, 2048):
                         assert program(
                             2, tokens, top_k, use_shared, quantize, dtype
-                        ) not in ("_ts", "_tsd", "_tsds", "_tse")
+                        ) not in ("_ts", "_tsd", "_tsds", "_tse", "_tss", "_tses")
                 # Mixed shared-expert presence among the four ranks of one call.
                 for present in ({0}, {0, 1}, {2, 3}, {1, 2, 3}, {0, 2}):
                     for tokens in (1535, 1536, 2048):
@@ -708,7 +778,7 @@ def test_shared_expert_runs_the_deferred_shared_program(
                         expected = [
                             ("_tsds" if rank in present else "_tsd")
                             if tokens >= 1536
-                            else "_ts"
+                            else now_shared("_ts", top_k, rank in present)
                             for rank in range(4)
                         ]
                         assert programs == expected, (present, tokens, top_k, quantize)
@@ -748,7 +818,7 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
     small_token_max: int,
 ) -> None:
     """At world size 2, a top_k 4 batch the large-token program takes (above
-    kLargeTokenMinTokens = 512 tokens, kLargeTokenMinTokensSharedExpert = 1280 with a
+    kLargeTokenMinTokens = 512 tokens, kLargeTokenMinTokensSharedExpert = 895 with a
     shared expert) runs the large-token program that also prefetches the shared-expert row
     (_lts) on a rank with a shared expert and the large-token program (_lt) on a rank
     without one; the shared form runs the same exchange, so the ranks of one call may mix
@@ -764,7 +834,7 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
         )
     }
     assert constants["kLargeTokenMinTokens"] == 512
-    assert constants["kLargeTokenMinTokensSharedExpert"] == 1280
+    assert constants["kLargeTokenMinTokensSharedExpert"] == 895
     large = re.search(
         r"\} else if \((large_token != nullptr &&.*?)\) \{\s*kernel = (.*?);",
         binding,
@@ -820,8 +890,8 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
         for quantize in (False, True):
             for use_shared in (False, True):
                 case = (use_shared, quantize, dtype)
-                large_min = 1280 if use_shared else 512
-                for tokens in (512, 513, 1280, 1281, 2048, 4096):
+                large_min = 895 if use_shared else 512
+                for tokens in (512, 513, 895, 896, 1280, 1281, 2048, 4096):
                     expected = (
                         ("_lts" if use_shared else "_lt")
                         if tokens > large_min
@@ -838,7 +908,7 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
                         ), (world_size, tokens, *case)
             # Mixed shared-expert presence among the two ranks of one call.
             for present in ({0}, {1}):
-                for tokens in (1281, 2048):
+                for tokens in (896, 1281, 2048):
                     programs = [
                         program(2, tokens, 4, rank in present, quantize, dtype)
                         for rank in range(2)
@@ -846,3 +916,91 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
                     assert programs == [
                         "_lts" if rank in present else "_lt" for rank in range(2)
                     ], (present, tokens, quantize, dtype)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_shared_expert_at_top_k_4_runs_the_two_shot_shared_programs(
+    small_token_max: int,
+) -> None:
+    """Below the deferred two-shot threshold, a rank with a shared expert at top_k 4
+    runs the two-shot program that also prefetches the shared-expert row (_tss) in
+    place of the two-shot program (_ts) at world sizes 4 and 8, and the two-shot early
+    shared program (_tses) in place of the two-shot early program (_tse) at world size
+    4, in every cell. World size 8 has no two-shot early shared program: its two-shot
+    early batches run _tse for every rank. Every other call (no shared expert, top_k 8,
+    the deferred range, world size 2) runs what it ran before. The two-shot test, the
+    deferred and the early switches still read the token count and the world size
+    alone, so ranks with and without a shared expert, or with different top_k, run
+    forms of the same exchange: checked on both sides of every two-shot class edge and
+    for mixed ranks."""
+    program = _two_shot_model(small_token_max)
+    edges = {4: (71, 72, 128, 129, 1535, 1536), 8: (55, 56, 128, 129, 767, 768)}
+    first = {4: 72, 8: min(56, small_token_max + 1)}
+
+    def expected(
+        world_size: int, tokens: int, top_k: int, use_shared: bool, quantize: bool
+    ) -> str:
+        if tokens < first[world_size]:
+            return "_small"
+        deferred_from = 1536 if world_size == 4 else 768
+        excluded = world_size == 8 and top_k == 4 and not use_shared and not quantize
+        if tokens >= deferred_from and not excluded:
+            return "deferred"
+        form = "_tse" if tokens <= 128 else "_ts"
+        if use_shared and top_k == 4 and not (world_size == 8 and form == "_tse"):
+            return form + "s"
+        return form
+
+    for dtype in ("float16", "bfloat16"):
+        for quantize in (False, True):
+            for world_size, tokens_list in edges.items():
+                for tokens in tokens_list:
+                    for top_k in (4, 8):
+                        for use_shared in (False, True):
+                            got = program(
+                                world_size, tokens, top_k, use_shared, quantize, dtype
+                            )
+                            want = expected(
+                                world_size, tokens, top_k, use_shared, quantize
+                            )
+                            case = (world_size, tokens, top_k, use_shared, quantize)
+                            if want == "deferred":
+                                assert got in ("_tsd", "_tsds"), (*case, dtype, got)
+                            else:
+                                assert got == want, (*case, dtype, got)
+                    # Mixed shared-expert presence and top_k among one call's ranks.
+                    ranks = range(world_size)
+                    for present in ({0}, set(ranks) - {0}, set(ranks[::2])):
+                        for top_ks in (
+                            (4,) * world_size,
+                            (4, 8) * (world_size // 2),
+                        ):
+                            programs = [
+                                program(
+                                    world_size,
+                                    tokens,
+                                    top_ks[rank],
+                                    rank in present,
+                                    quantize,
+                                    dtype,
+                                )
+                                for rank in ranks
+                            ]
+                            for rank, got in zip(ranks, programs, strict=True):
+                                want = expected(
+                                    world_size,
+                                    tokens,
+                                    top_ks[rank],
+                                    rank in present,
+                                    quantize,
+                                )
+                                if want in ("deferred", "_small"):
+                                    continue
+                                assert got == want, (present, top_ks, tokens, rank)
+            for tokens in (72, 129, 1535):
+                for top_k in (4, 8):
+                    for use_shared in (False, True):
+                        assert program(
+                            2, tokens, top_k, use_shared, quantize, dtype
+                        ) not in ("_ts", "_tse", "_tss", "_tses")

@@ -28,6 +28,14 @@
 #define TRTLLM_ABI_NAMESPACE _v1
 #endif
 
+// MSVC-mode nvcc does not merge a plain `namespace tensorrt_llm {` with an inline ABI
+// namespace, and most files here open the plain form, so on Windows the ABI namespace is
+// left out and TRTLLM_NAMESPACE_BEGIN opens the same plain namespace as those files.
+#if defined(_MSC_VER) && !defined(TRTLLM_ABI_NAMESPACE_BEGIN)
+#define TRTLLM_ABI_NAMESPACE_BEGIN
+#define TRTLLM_ABI_NAMESPACE_END
+#endif
+
 #ifndef TRTLLM_ABI_NAMESPACE_BEGIN
 #define TRTLLM_ABI_NAMESPACE_BEGIN inline namespace TRTLLM_ABI_NAMESPACE {
 #endif

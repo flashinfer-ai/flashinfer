@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import lru_cache
+from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
 
 from b12x.gemm import trellis_linear
-from b12x.gemm.trellis_linear import api
+from b12x.gemm.trellis_linear import _tuning, api
+from b12x.gemm.trellis_linear._tuning import TrellisConfig, TrellisQuery
 from b12x.preparation import PreparedCall, PreparationSession
+from b12x.preparation.types import require_prepared
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.quant.lut_e4m3 import lut_e4m3_direct_table_cpu
 from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
@@ -16,7 +19,11 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
-from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
+from b12x.moe._shared.kernels.w4a16.kernel import (
+    _trellis256_dense_launch_geometry,
+    _trellis256_dense_split_k_slices,
+    run_trellis256_dense,
+)
 
 _MCG = np.uint64(0xCBAC1FED)
 _MUL1 = np.uint64(0x83DCD12D)
@@ -163,7 +170,16 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
 
 
 @contextmanager
-def _prepared_trellis(x, weight, *, c_tmp, hadamard_128=None, **run_kwargs):
+def _prepared_trellis(
+    x,
+    weight,
+    *,
+    c_tmp,
+    hadamard_128=None,
+    allow_split_k=False,
+    override=None,
+    **run_kwargs,
+):
     query = trellis_linear.query_from_weight(
         weight,
         max_rows=x.shape[0],
@@ -173,6 +189,7 @@ def _prepared_trellis(x, weight, *, c_tmp, hadamard_128=None, **run_kwargs):
         else "functional",
         c_tmp_mode="provided",
         hadamard_128=hadamard_128,
+        allow_split_k=allow_split_k,
         **{
             f"{name}_provided": run_kwargs.get(name) is not None
             for name in (
@@ -190,6 +207,7 @@ def _prepared_trellis(x, weight, *, c_tmp, hadamard_128=None, **run_kwargs):
         weight=weight,
         c_tmp=c_tmp,
         hadamard_128=hadamard_128,
+        override=override,
     )
     request = declaration.request(
         name="trellis",
@@ -271,6 +289,141 @@ def test_dense_launch_geometry_avoids_short_spill_waves(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("size_m", "size_k", "size_n", "block_rows", "tile_n", "expected"),
+    [
+        # Decode/verify projections from the issue: 4, 24 and 16 whole-tile
+        # CTAs on 188 SMs. At most 8 slices that split the K-tiles evenly,
+        # at least 512 of K each, within one SM wave (24 tiles: 7 -> 4).
+        (4, 6144, 1024, 64, 256, 8),
+        (4, 4096, 6144, 64, 256, 4),
+        (4, 2048, 4096, 64, 256, 4),
+        (32, 6144, 1024, 64, 256, 8),
+        # A full 64-row tile needs 1024 of K per slice.
+        (64, 6144, 1024, 64, 256, 6),
+        (64, 2048, 4096, 64, 256, 2),
+        # One SM wave caps the slices: 48 tiles -> 3, which 64 K-tiles round to 2.
+        (128, 4096, 6144, 64, 256, 2),
+        # Whole tiles already fill the device (prefill keeps its schedule).
+        (2048, 4096, 6144, 64, 256, None),
+        (512, 4096, 16384, 64, 256, None),
+        # Too little K for two 512-wide slices.
+        (4, 512, 1024, 64, 256, None),
+        # The M8 decode schedule computes one whole tile per CTA.
+        (4, 6144, 1024, 8, 256, None),
+    ],
+)
+def test_dense_split_k_slices_fill_underused_decode_launches(
+    size_m: int,
+    size_k: int,
+    size_n: int,
+    block_rows: int,
+    tile_n: int,
+    expected: int | None,
+) -> None:
+    assert (
+        _trellis256_dense_split_k_slices(
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            block_rows=block_rows,
+            tile_k=64,
+            tile_n=tile_n,
+            sms=188,
+        )
+        == expected
+    )
+
+
+def _query(*, max_rows: int, allow_split_k: bool) -> TrellisQuery:
+    return TrellisQuery(
+        max_rows=max_rows,
+        in_features=6144,
+        out_features=1024,
+        input_dtype="bfloat16",
+        compute_dtype="bfloat16",
+        output_dtype="bfloat16",
+        codebook="mcg",
+        bits=4,
+        allow_split_k=allow_split_k,
+    )
+
+
+def test_query_defaults_to_the_whole_tile_schedule() -> None:
+    query = TrellisQuery(
+        max_rows=4,
+        in_features=6144,
+        out_features=1024,
+        input_dtype="bfloat16",
+        compute_dtype="bfloat16",
+        output_dtype="bfloat16",
+        codebook="mcg",
+        bits=4,
+    )
+    assert query.allow_split_k is False
+    config = _tuning.default_config(query, SimpleNamespace(sm_count=188))
+    assert config.split_k_slices is None
+
+
+def test_default_config_splits_k_only_when_allowed() -> None:
+    device = SimpleNamespace(sm_count=188)
+    whole = _tuning.default_config(_query(max_rows=4, allow_split_k=False), device)
+    split = _tuning.default_config(_query(max_rows=4, allow_split_k=True), device)
+    assert whole.split_k_slices is None
+    assert split.split_k_slices == 8
+    assert (split.block_rows, split.tile_k, split.tile_n) == (
+        whole.block_rows,
+        whole.tile_k,
+        whole.tile_n,
+    )
+    prefill = _tuning.default_config(_query(max_rows=8192, allow_split_k=True), device)
+    assert prefill.split_k_slices is None
+
+
+def test_tuning_space_searches_split_k_only_when_allowed() -> None:
+    device = SimpleNamespace(sm_count=188)
+    whole = _tuning._tuning_parameters(_query(max_rows=4, allow_split_k=False), device)
+    split = _tuning._tuning_parameters(_query(max_rows=4, allow_split_k=True), device)
+    assert whole["split_k_slices"] == (None,)
+    assert None in split["split_k_slices"]
+    assert len(split["split_k_slices"]) > 1
+
+
+@pytest.mark.parametrize(
+    ("allow_split_k", "block_rows", "split_k_slices", "match"),
+    [
+        (False, 64, 4, "allow_split_k=True"),
+        (True, 8, 4, "block_rows >= 16"),
+        (True, 64, 1, "integer >= 2"),
+        (True, 64, 97, "exceeds the K-tile count"),
+    ],
+)
+def test_validate_config_rejects_unsupported_split_k(
+    allow_split_k: bool,
+    block_rows: int,
+    split_k_slices: int,
+    match: str,
+) -> None:
+    config = TrellisConfig(
+        backend="cutedsl",
+        block_rows=block_rows,
+        tile_k=64,
+        tile_n=256,
+        split_k_slices=split_k_slices,
+    )
+    with pytest.raises(ValueError, match=match):
+        _tuning.validate_config(
+            _query(max_rows=4, allow_split_k=allow_split_k), config, None
+        )
+
+
+def test_validate_config_accepts_allowed_split_k() -> None:
+    config = TrellisConfig(
+        backend="cutedsl", block_rows=64, tile_k=64, tile_n=256, split_k_slices=12
+    )
+    _tuning.validate_config(_query(max_rows=4, allow_split_k=True), config, None)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -599,3 +752,368 @@ def test_prepare_pair_weight_rejects_wrong_tp12_payload_length() -> None:
             pair_kind="P24",
             rate_axis="n",
         )
+
+
+def _identity_hadamard(
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    _left_scale,
+    _right_scale,
+    _scale: float,
+) -> None:
+    destination.copy_(source)
+
+
+@lru_cache(maxsize=None)
+def _split_k_reference_case(size_k: int, size_n: int, bits: int):
+    """One random native weight and its independently decoded fp16 matrix."""
+    generator = torch.Generator().manual_seed(0x9381 + size_k + size_n + bits)
+    trellis = torch.randint(
+        -32768,
+        32767,
+        (size_k // 16, size_n // 16, 16 * bits),
+        dtype=torch.int16,
+        generator=generator,
+    )
+    return trellis, _reconstruct_native(trellis)
+
+
+def _mcg_weight(trellis: torch.Tensor, params_dtype: torch.dtype):
+    device = trellis.device
+    size_k = trellis.shape[0] * 16
+    size_n = trellis.shape[1] * 16
+    return trellis_linear.prepare_weight(
+        trellis,
+        torch.ones(size_k, dtype=torch.float16, device=device),
+        torch.ones(size_n, dtype=torch.float16, device=device),
+        mcg=torch.tensor(0xCBAC1FED, dtype=torch.uint32, device=device),
+        params_dtype=params_dtype,
+    )
+
+
+def _split_k_override(device, *, size_m, size_k, size_n, split_k_slices):
+    block_rows, (tile_k, tile_n) = _trellis256_dense_launch_geometry(
+        size_m=size_m,
+        size_k=size_k,
+        size_n=size_n,
+        sms=torch.cuda.get_device_properties(device).multi_processor_count,
+    )
+    return TrellisConfig(
+        backend="cutedsl",
+        block_rows=block_rows,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        split_k_slices=split_k_slices,
+    )
+
+
+def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return float((actual.float() - expected.float()).norm() / expected.float().norm())
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize(
+    ("m", "split_k_slices"),
+    [
+        (1, 2),
+        # Three slices over eight K-tiles: uneven slices, and with two N tiles
+        # one CTA's stripe straddles the end of tile 0 and the start of tile 1.
+        (4, 3),
+        # One K-tile per slice: the longest lock-ordered finalize chain.
+        (4, 8),
+        (16, 5),
+        # Two route blocks.
+        (65, 3),
+    ],
+)
+def test_dense_split_k_matches_whole_tile_and_reference(
+    m: int, split_k_slices: int
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    size_k, size_n = 512, 512
+    trellis_cpu, reference_cpu = _split_k_reference_case(size_k, size_n, 4)
+    weight = _mcg_weight(trellis_cpu.to(device), torch.float16)
+    reference_weight = reference_cpu.to(device)
+    x = (torch.randn((m, size_k), device=device) * 1.0e-2).to(torch.float16)
+    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+
+    with _prepared_trellis(x, weight, c_tmp=c_tmp, hadamard_128=_identity_hadamard) as (
+        plan,
+        _,
+        _,
+    ):
+        assert require_prepared(plan, "gemm.trellis_linear").split_k_slices is None
+        whole = trellis_linear.run(x, plan=plan).clone()
+
+    override = _split_k_override(
+        device,
+        size_m=m,
+        size_k=size_k,
+        size_n=size_n,
+        split_k_slices=split_k_slices,
+    )
+    with _prepared_trellis(
+        x,
+        weight,
+        c_tmp=c_tmp,
+        hadamard_128=_identity_hadamard,
+        allow_split_k=True,
+        override=override,
+    ) as (plan, _, _):
+        state = require_prepared(plan, "gemm.trellis_linear")
+        assert state.split_k_slices == split_k_slices
+        assert not state.launch.kernel.schedule_whole_tiles
+        split = trellis_linear.run(x, plan=plan).clone()
+        repeated = trellis_linear.run(x, plan=plan).clone()
+    torch.cuda.synchronize(device)
+
+    # The lock-ordered finalize fixes the partial-sum order: bit-stable.
+    assert torch.equal(split, repeated)
+    assert _relative_error(split, whole) <= 2.0e-3
+    expected = (x.float() @ reference_weight.float()).to(torch.float16)
+    assert _relative_error(split, expected) <= 2.0e-2
+    cosine = torch.nn.functional.cosine_similarity(
+        split.float().flatten(), expected.float().flatten(), dim=0
+    )
+    assert float(cosine) >= 0.999
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_dense_split_k_cuda_graph_replay_is_stable() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    m, size_k, size_n = 4, 1024, 512
+    trellis = torch.randint(
+        -32768,
+        32767,
+        (size_k // 16, size_n // 16, 96),
+        dtype=torch.int16,
+        device=device,
+    )
+    weight = _mcg_weight(trellis, torch.float16)
+    x = torch.randn((m, size_k), dtype=torch.float16, device=device)
+    output = torch.empty((m, size_n), dtype=torch.float16, device=device)
+    gemm_output = torch.empty_like(output)
+    rotated_f16 = torch.empty_like(x)
+    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+    kwargs = {
+        "output": output,
+        "gemm_output": gemm_output,
+        "rotated_f16": rotated_f16,
+    }
+    override = _split_k_override(
+        device, size_m=m, size_k=size_k, size_n=size_n, split_k_slices=4
+    )
+    with _prepared_trellis(
+        x,
+        weight,
+        c_tmp=c_tmp,
+        hadamard_128=_identity_hadamard,
+        allow_split_k=True,
+        override=override,
+        **kwargs,
+    ) as (plan, session, _):
+        assert require_prepared(plan, "gemm.trellis_linear").split_k_slices == 4
+        expected = trellis_linear.run(x, plan=plan, **kwargs).clone()
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = trellis_linear.run(x, plan=plan, **kwargs)
+        for _ in range(3):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(captured, expected)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("m", [4, 32])
+def test_dense_allowed_split_k_decode_plan_splits_k(m: int) -> None:
+    """The issue's 6144x1024 K6 projection: the allowed plan splits K by default."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    size_k, size_n = 6144, 1024
+    trellis = torch.randint(
+        -32768,
+        32767,
+        (size_k // 16, size_n // 16, 96),
+        dtype=torch.int16,
+        device=device,
+    )
+    weight = _mcg_weight(trellis, torch.bfloat16)
+    x = (torch.randn((m, size_k), device=device) * 1.0e-2).to(torch.bfloat16)
+    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+
+    with _prepared_trellis(x, weight, c_tmp=c_tmp, hadamard_128=_identity_hadamard) as (
+        plan,
+        _,
+        _,
+    ):
+        assert require_prepared(plan, "gemm.trellis_linear").split_k_slices is None
+        whole = trellis_linear.run(x, plan=plan).clone()
+
+    with _prepared_trellis(
+        x,
+        weight,
+        c_tmp=c_tmp,
+        hadamard_128=_identity_hadamard,
+        allow_split_k=True,
+    ) as (plan, _, _):
+        state = require_prepared(plan, "gemm.trellis_linear")
+        kernel = state.launch.kernel
+        expected_slices = _trellis256_dense_split_k_slices(
+            size_m=m,
+            size_k=size_k,
+            size_n=size_n,
+            block_rows=kernel.moe_block_size,
+            tile_k=kernel.tile_k,
+            tile_n=kernel.tile_n,
+            sms=torch.cuda.get_device_properties(device).multi_processor_count,
+        )
+        assert expected_slices is not None
+        assert state.split_k_slices == expected_slices
+        assert not kernel.schedule_whole_tiles
+        split = trellis_linear.run(x, plan=plan).clone()
+    torch.cuda.synchronize(device)
+
+    assert torch.isfinite(split).all()
+    assert _relative_error(split, whole) <= 5.0e-3
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_dense_whole_tile_rows_do_not_depend_on_planned_m() -> None:
+    """allow_split_k=False keeps a row's bits independent of the planned M.
+
+    The whole-tile default configs fold K in one order for every M (the
+    intra-CTA fold depends on tile_k, which the default keeps at 64); split-K
+    must not leak into these plans.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    size_k, size_n = 1024, 512
+    trellis = torch.randint(
+        -32768,
+        32767,
+        (size_k // 16, size_n // 16, 96),
+        dtype=torch.int16,
+        device=device,
+    )
+    weight = _mcg_weight(trellis, torch.bfloat16)
+    x_all = (torch.randn((512, size_k), device=device) * 1.0e-2).to(torch.bfloat16)
+    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+    outputs = {}
+    for m in (1, 4, 65, 512):
+        x = x_all[:m]
+        with _prepared_trellis(
+            x, weight, c_tmp=c_tmp, hadamard_128=_identity_hadamard
+        ) as (plan, _, _):
+            assert require_prepared(plan, "gemm.trellis_linear").split_k_slices is None
+            outputs[m] = trellis_linear.run(x, plan=plan).clone()
+    torch.cuda.synchronize(device)
+    for m, out in outputs.items():
+        assert torch.equal(out, outputs[512][:m])
+
+
+def _split_k_pair(device):
+    """One weight, two split-K plans of the same M: the same lock slots."""
+    size_k, size_n = 4096, 1024
+    trellis = torch.randint(
+        -32768,
+        32767,
+        (size_k // 16, size_n // 16, 96),
+        dtype=torch.int16,
+        device=device,
+    )
+    weight = _mcg_weight(trellis, torch.bfloat16)
+    xs = [
+        (torch.randn((4, size_k), device=device) * 1.0e-2).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    c_tmps = [
+        torch.empty((1 << 20,), dtype=torch.float32, device=device) for _ in range(2)
+    ]
+    return weight, xs, c_tmps
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_split_k_plans_own_their_lock_counters() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    weight, xs, c_tmps = _split_k_pair(device)
+    with (
+        _prepared_trellis(
+            xs[0],
+            weight,
+            c_tmp=c_tmps[0],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (first, _, _),
+        _prepared_trellis(
+            xs[1],
+            weight,
+            c_tmp=c_tmps[1],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (second, _, _),
+        _prepared_trellis(
+            xs[0], weight, c_tmp=c_tmps[0], hadamard_128=_identity_hadamard
+        ) as (whole, _, _),
+    ):
+        states = [require_prepared(p, "gemm.trellis_linear") for p in (first, second)]
+        assert all(state.split_k_slices is not None for state in states)
+        pointers = {state.locks.data_ptr() for state in states}
+        assert len(pointers) == 2
+        assert weight.workspace.data_ptr() not in pointers
+        assert require_prepared(whole, "gemm.trellis_linear").locks is None
+        for plan, x in zip((first, second), xs):
+            trellis_linear.run(x, plan=plan)
+        torch.cuda.synchronize(device)
+        for state in states:
+            assert int(state.locks.abs().sum()) == 0
+
+        state = states[0]
+        common = {
+            "launch": state.launch,
+            "execution_lut": state.execution_lut,
+            "grid_cap": state.grid_cap,
+            "hadamard_128": state.hadamard_128,
+            "split_k_slices": state.split_k_slices,
+        }
+        with pytest.raises(ValueError, match="its own lock storage"):
+            run_trellis256_dense(xs[0], weight, **common)
+        with pytest.raises(ValueError, match="shared workspace"):
+            run_trellis256_dense(xs[0], weight, locks=weight.workspace, **common)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_concurrent_split_k_plans_on_one_weight_match_sequential() -> None:
+    """Two split-K plans of one weight on two streams: no shared lock counters."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    weight, xs, c_tmps = _split_k_pair(device)
+    with (
+        _prepared_trellis(
+            xs[0],
+            weight,
+            c_tmp=c_tmps[0],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (first, _, _),
+        _prepared_trellis(
+            xs[1],
+            weight,
+            c_tmp=c_tmps[1],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (second, _, _),
+    ):
+        plans = (first, second)
+        expected = [trellis_linear.run(x, plan=p).clone() for p, x in zip(plans, xs)]
+        torch.cuda.synchronize(device)
+        streams = [torch.cuda.Stream(device=device) for _ in plans]
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream(device))
+        results = [[], []]
+        for _ in range(32):
+            for index, (stream, plan, x) in enumerate(zip(streams, plans, xs)):
+                with torch.cuda.stream(stream):
+                    results[index].append(trellis_linear.run(x, plan=plan))
+        torch.cuda.synchronize(device)
+        for index in range(2):
+            for out in results[index]:
+                assert torch.equal(out, expected[index])

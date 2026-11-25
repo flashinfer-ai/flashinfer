@@ -74,7 +74,6 @@ from ...helpers.math import (
     smem_atomic_max_u32,
     u32_to_float_for_atomic_max,
 )
-from ...helpers.mask import MaskType
 from ...helpers.gather import invalid_sparse_token, cache_sparse_mask
 from ...helpers.ops import (
     float_to_u32_bits,
@@ -89,7 +88,9 @@ from ...helpers.tile import (
     batch_idx_for_stage_cfg,
     cta_idx_kv_for_stage,
     cta_idx_q_for_stage,
+    cta_rows_have_distinct_kv_prefix,
     global_kv_tile_idx,
+    kv_tile_needs_mask,
     runtime_seq_len_kv_for_query_row,
     runtime_seq_len_kv_from_task_cache,
     softmax_kv_tile_idx,
@@ -513,6 +514,7 @@ class TmemSResource(MlaResource):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         local_tile_idx = softmax_kv_tile_idx(cfg, stage_info, self.inst_id)
         tile_idx = global_kv_tile_idx(
@@ -524,7 +526,6 @@ class TmemSResource(MlaResource):
             task_cache=task_cache,
         )
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
-        next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         raw_mask_routes = (
             self.page_offsets.select_source_tile(
                 tile_offset_k, batch_idx, for_mask=True
@@ -617,25 +618,13 @@ class TmemSResource(MlaResource):
                 for i in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     s_vals[i] *= scale
 
-        should_apply_dense_mask = (
-            (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
-        ) or (next_tile_offset_k > seq_len_kv)
-        needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
-            and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
+        needs_row_prefix_mask = cutlass.const_expr(
+            cta_rows_have_distinct_kv_prefix(cfg)
         )
-        if cutlass.const_expr(needs_row_causal_mask):
-            min_seq_len_kv = runtime_seq_len_kv_for_query_row(
-                cfg,
-                self.cache_seqs,
-                batch_idx,
-                cta_idx_q,
-                Int32(0),
-                self.cu_seqlens_q,
-            )
-            should_apply_dense_mask = should_apply_dense_mask or (
-                next_tile_offset_k > min_seq_len_kv
-            )
+        # Only K tiles reaching past the keys every row sees take the mask.
+        should_apply_dense_mask = kv_tile_needs_mask(
+            cfg, task_cache, tile_offset_k, seq_len_kv
+        )
         if cutlass.const_expr(cfg.num_tokens_per_page == 1):
             if cutlass.const_expr(
                 (cfg.fixed_seqlen and cfg.logical_seq_len_q == 1)
@@ -648,8 +637,8 @@ class TmemSResource(MlaResource):
             else:
                 should_apply_dense_mask = True
         if should_apply_dense_mask:
-            # The CTA domain follows the latest logical query row in the flat
-            # tile. Earlier rows can have a narrower bottom-right causal limit.
+            # Each row's causal prefix can be narrower than the
+            # shared CTA domain used by the producer and split reduction.
             warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
             lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
             if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
@@ -659,7 +648,7 @@ class TmemSResource(MlaResource):
                     local_row_idx = warp_grp_thread_idx % Int32(64)
                     local_col_base = (warp_grp_thread_idx // Int32(64)) * Int32(64)
                 row_seq_len_kv = seq_len_kv
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(needs_row_prefix_mask):
                     row_seq_len_kv = runtime_seq_len_kv_for_query_row(
                         cfg,
                         self.cache_seqs,
@@ -667,6 +656,7 @@ class TmemSResource(MlaResource):
                         cta_idx_q,
                         local_row_idx,
                         self.cu_seqlens_q,
+                        self.cp_rank,
                     )
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
@@ -696,7 +686,7 @@ class TmemSResource(MlaResource):
                     row_in_tile_1 = row_in_tile_0 + Int32(1)
                     seq_len_kv_0 = seq_len_kv
                     seq_len_kv_1 = seq_len_kv
-                    if cutlass.const_expr(needs_row_causal_mask):
+                    if cutlass.const_expr(needs_row_prefix_mask):
                         seq_len_kv_0 = runtime_seq_len_kv_for_query_row(
                             cfg,
                             self.cache_seqs,
@@ -704,6 +694,7 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_0,
                             self.cu_seqlens_q,
+                            self.cp_rank,
                         )
                         seq_len_kv_1 = runtime_seq_len_kv_for_query_row(
                             cfg,
@@ -712,6 +703,7 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_1,
                             self.cu_seqlens_q,
+                            self.cp_rank,
                         )
                     s_base = repeat_idx * 4
                     s_second_panel_base = q_repeats * 4 + s_base

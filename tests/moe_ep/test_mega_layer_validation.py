@@ -266,6 +266,7 @@ def test_mega_layer_prepare_workspace_requires_dist(mock_dist_init):
     layer = _mega_layer()
     with (
         mock.patch.dict(sys.modules, {"deep_gemm": mock.MagicMock()}),
+        mock.patch("torch.cuda.current_device", return_value=0),
         pytest.raises(RuntimeError, match="torch.distributed"),
     ):
         layer._ensure_workspace()
@@ -521,6 +522,31 @@ def test_mega_layer_init_accepts_valid_transformed_weights():
     assert layer._transformed is not None
 
 
+def test_mega_layer_transformed_weight_aliases_include_scales():
+    transformed = _fake_deep_gemm_transformed()
+    layer = _mega_layer(transformed_weights=transformed)
+    try:
+        prepared = layer.get_transformed_weights()
+        assert prepared is transformed
+        for stage in prepared:
+            for tensor in stage:
+                tensor.fill_(3)
+        for stage in transformed:
+            for tensor in stage:
+                assert (tensor == 3).all()
+    finally:
+        layer.destroy()
+
+
+def test_mega_layer_transformed_weights_reject_destroyed_layer():
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer = _mega_layer()
+    layer.destroy()
+    with pytest.raises(MoEEpConfigError, match="destroyed"):
+        layer.get_transformed_weights()
+
+
 def test_mega_layer_init_rejects_invalid_transformed_weight_dtype():
     import torch
 
@@ -701,9 +727,9 @@ def test_mega_layer_workspace_alloc_raises_during_capture():
 
 def test_shim_capture_guard_raises_when_capturing():
     """ensure_not_capturing raises with a warmup hint during capture."""
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         ensure_not_capturing,
     )
 
@@ -760,9 +786,10 @@ def test_nvfp4_stage_epilogues_preserve_copy_semantics(
         x_sf=None,
         topk_idx=None,
         topk_weights=None,
+        _epilogue_default_ones=torch.ones(16, device=device),
         **{name: torch.full((16,), -1.0, device=device) for name in names},
     )
-    expected = {name: getattr(workspace, name).clone() for name in names}
+    expected = {name: torch.ones_like(getattr(workspace, name)) for name in names}
     sources = []
     for i in range(3):
         source = torch.arange(32, dtype=torch.float32, device=device) + i
@@ -796,10 +823,11 @@ def test_nvfp4_stage_epilogues_preserve_copy_semantics(
             getattr(workspace, name), expected[name], rtol=0, atol=0
         )
         setattr(t, name, None)
+    # Omitted overrides restore the configuration defaults (ones here).
     backend.stage_inputs(t, workspace, quantize_input=True)
     for name in names:
         torch.testing.assert_close(
-            getattr(workspace, name), expected[name], rtol=0, atol=0
+            getattr(workspace, name), torch.ones_like(expected[name]), rtol=0, atol=0
         )
 
 
@@ -821,6 +849,7 @@ def test_nvfp4_stage_epilogues_graph_shared_workspace(monkeypatch, layout):
         x_sf=None,
         topk_idx=None,
         topk_weights=None,
+        _epilogue_default_ones=torch.ones(16, device="cuda"),
         **{name: torch.zeros(16, device="cuda") for name in names},
     )
     layers = []
@@ -867,6 +896,8 @@ def test_nvfp4_stage_epilogues_graph_shared_workspace(monkeypatch, layout):
         for name, source in sources.items():
             if source is not None:
                 expected[name].copy_(source)
+            else:
+                expected[name].fill_(1)
             torch.testing.assert_close(
                 getattr(workspace, name), expected[name], rtol=0, atol=0
             )
@@ -897,6 +928,7 @@ def test_nvfp4_stage_epilogues_preserve_workspace_alias_order(monkeypatch, devic
         fc1_alpha=torch.ones(16, device=device),
         fc2_alpha=torch.full((16,), 2.0, device=device),
         fc1_norm_const=torch.ones(16, device=device),
+        _epilogue_default_ones=torch.ones(16, device=device),
     )
     t = MoEEpTensors(
         hidden_states=torch.empty(0, 128, device=device),

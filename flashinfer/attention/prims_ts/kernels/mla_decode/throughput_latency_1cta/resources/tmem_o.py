@@ -158,6 +158,7 @@ class TmemOResource(MlaResource):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         return runtime_local_kv_tiles(
             self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
@@ -379,7 +380,10 @@ class TmemOResource(MlaResource):
         cfg = self.cfg
         if cutlass.const_expr(cfg.ws_pv):
             assert (
-                cfg.async_nvfp4_kv_gather
+                (
+                    cfg.async_nvfp4_kv_gather
+                    or (cfg.is_fp8_qkv() and cfg.sparse_reuse_kv)
+                )
                 and cfg.tile_size_q == 64
                 and cfg.tile_size_kv == 128
             )

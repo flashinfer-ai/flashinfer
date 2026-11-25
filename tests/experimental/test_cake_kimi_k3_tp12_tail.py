@@ -29,6 +29,7 @@ Single-process runs skip it.
 """
 
 import os
+import sys
 
 import pytest
 import torch
@@ -371,7 +372,10 @@ def test_clear_cuda_last_error_reaches_the_runtime_torch_reads():
 
     torch.ones(1, device="cuda").sum().item()
     major = torch.version.cuda.split(".")[0]
-    cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+    if sys.platform == "win32":
+        cudart = ctypes.CDLL(f"cudart64_{major}.dll")
+    else:
+        cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
     cudart.cudaFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     cudart.cudaFuncSetAttribute.restype = ctypes.c_int
     cudart.cudaPeekAtLastError.restype = ctypes.c_int

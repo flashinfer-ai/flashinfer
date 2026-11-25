@@ -28,7 +28,7 @@ from flashinfer.kda import recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 
-from tests.test_helpers.kda_prefill import (
+from tests.kda.test_helpers.kda_prefill import (
     _chunk16_debug_reference,
     _h12_bf16_residual_carriers,
     _make_inputs,
@@ -6443,6 +6443,82 @@ def test_small_bh_indexed_state_slot_beyond_int32_element_offset(
     # Only the selected slot may change; a wrapped offset would land elsewhere.
     pool[slot].zero_()
     assert not storage.any()
+
+
+def test_small_bh_k1_keeps_results_on_a_small_grid(small_bh_device):
+    """A three-block Small-BH K1 launch writes bitwise the same tiles as a clean reference.
+
+    Each block of a small persistent grid passes many tiles through its two
+    shared-memory stages, so a tile TMA-stored before its shared-memory writes
+    were visible to the store would keep values of the stage's previous tile.
+    Repeated launches give such a store many chances to show. The reference
+    launch gives every scheduled tile its own block, so no reference block
+    reuses a stage and a stale value cannot land in the expected tensors.
+    """
+    small_bh = importlib.import_module(_SMALL_BH_KERNEL_MODULE)
+
+    heads = 8
+    head_dim = 128
+    sequence_lengths = [640, 100, 1000, 37]
+    tokens = sum(sequence_lengths)
+    device = small_bh_device
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.int64,
+        device=device,
+    )
+    gen = torch.Generator(device=device).manual_seed(0)
+    q, k, g = (
+        torch.randn(tokens, heads, head_dim, generator=gen, device=device).to(
+            torch.bfloat16
+        )
+        for _ in range(3)
+    )
+    beta = torch.randn(tokens, heads, generator=gen, device=device).to(torch.bfloat16)
+    dt_bias = torch.zeros(heads, head_dim, device=device)
+    a_log = torch.zeros(heads, device=device)
+
+    def run(max_active_clusters, like=None):
+        # Padding rows between packed sequences are never written; zero-filled
+        # preallocated outputs keep launches comparable.
+        outputs = None if like is None else tuple(torch.zeros_like(t) for t in like)
+        return small_bh.chunk_kda_fwd_k1(
+            q,
+            k,
+            g,
+            beta,
+            dt_bias,
+            a_log,
+            scale=head_dim**-0.5,
+            gate_scale=-5.0,
+            gate_lower_bound=True,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=tokens,
+            outputs=outputs,
+            max_active_clusters=max_active_clusters,
+        )
+
+    # A grid at least as large as the scheduled tile count gives the reference
+    # launch one block per tile (the scheduler clamps the grid to the problem
+    # size), so no reference block runs a second tile and reuses a stage.
+    scheduled_tiles = (
+        ((tokens + small_bh._TT - 1) // small_bh._TT) * heads * len(sequence_lengths)
+    )
+    expected = run(scheduled_tiles, like=run(scheduled_tiles))
+    for launch in range(32):
+        for name, got, want in zip(
+            ("qd", "kd", "kr", "mqk", "mkk", "gk"),
+            run(3, like=expected),
+            expected,
+            strict=True,
+        ):
+            if not torch.equal(got, want):
+                diff = got != want
+                raise AssertionError(
+                    f"{name} differs on launch {launch}: "
+                    f"{int(diff.sum())} of {got.numel()} elements differ, "
+                    f"first at {diff.nonzero()[0].tolist()}"
+                )
 
 
 @pytest.mark.parametrize("packed", [False, True])

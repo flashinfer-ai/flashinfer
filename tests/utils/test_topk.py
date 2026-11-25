@@ -24,7 +24,8 @@ import flashinfer
 import flashinfer.utils as flashinfer_utils
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.parametrize import parametrize_product
+from tests.infra.test_helpers.parametrize import parametrize_product
+from tests.utils.test_helpers.pdl import late_store
 
 
 @pytest.fixture
@@ -533,6 +534,51 @@ def test_multi_cta_reuses_row_states_buffer_on_one_stream_across_regimes(
         run_and_check(multi_cta_logits, deterministic=True)
         assert _cached_row_states_buffer(multi_cta_logits.device) is buf
     torch.cuda.synchronize()
+
+
+def test_multi_cta_top_k_under_torch_compile_keeps_row_states_per_stream(
+    set_topk_algo,
+):
+    """``top_k`` traced by ``torch.compile(dynamic=True)`` runs, and its cached
+    ``row_states`` still follow the stream the compiled code runs on.
+
+    With dynamic shapes Dynamo may hand the stream-cache lookup a symbolic
+    device index, which raw CUDA bindings such as
+    ``torch._C._cuda_getCurrentRawStream`` reject while tracing.
+    """
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    batch_size, k = 4, 512
+    logits = _build_strictly_descending_logits(batch_size, 131072, device)
+    expected_indices = (
+        torch.arange(k, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
+    def fn(x):
+        values, indices = flashinfer.top_k(x, k, sorted=True)
+        return values * 2, indices
+
+    compiled = torch.compile(fn, dynamic=True, backend="eager")
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    try:
+        for stream in (stream_a, stream_b):
+            with torch.cuda.stream(stream):
+                values, indices = compiled(logits)
+                torch.testing.assert_close(values, logits[:, :k] * 2)
+                assert torch.equal(indices, expected_indices)
+        torch.cuda.synchronize()
+    finally:
+        torch._dynamo.reset()
+
+    with torch.cuda.stream(stream_a):
+        buf_a = _cached_row_states_buffer(logits.device)
+    with torch.cuda.stream(stream_b):
+        buf_b = _cached_row_states_buffer(logits.device)
+    assert buf_a is not None and buf_b is not None
+    assert buf_a is not buf_b
 
 
 def test_multi_cta_row_states_graph_replay_isolated_from_eager_stream(set_topk_algo):
@@ -2228,6 +2274,116 @@ def test_ragged_transform_multi_cta_short_rows(num_rows, top_k, dtype):
             os.environ["FLASHINFER_TOPK_ALGO"] = old_algo
 
 
+# Regression tests for cross-CTA races in the multi-CTA radix kernels. A row long enough
+# to span several CTAs is processed by one CTA group, and each group walks rows
+# group_id, group_id + num_groups, ... The races need a peer CTA of the group to run late,
+# so plain runs rarely hit them; these tests repeat the triggering row sequences and check
+# every row exactly. num_groups depends on the SM count and the shared-memory budget, so the
+# first num_sms rows are ordinary (k < vocab) and the next 2 * num_sms rows have k >= vocab:
+# for any num_groups <= num_sms, every group runs an ordinary row followed by at least two
+# k >= vocab rows.
+_RACE_VOCAB = 128256  # fp32 rows of this length always need more than one CTA
+_RACE_REPEATS = 10
+
+
+def _race_row_k(num_sms, vocab_size, device, generator):
+    k = torch.full((3 * num_sms,), vocab_size, dtype=torch.int32, device=device)
+    k[:num_sms] = torch.randint(
+        1, vocab_size, (num_sms,), device=device, generator=generator
+    ).to(torch.int32)
+    return k
+
+
+def _race_num_sms():
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if num_sms <= 16:
+        pytest.skip("multi-CTA radix top-k requires more than 16 SMs")
+    return num_sms
+
+
+def test_top_k_mask_logits_multi_cta_trivial_rows_after_ordinary_row():
+    """A k >= vocab row must not clear the group histogram while a peer CTA still reads it
+    for the group's previous ordinary row."""
+    num_sms = _race_num_sms()
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(0)
+    k = _race_row_k(num_sms, _RACE_VOCAB, device, generator)
+    logits = torch.randn(
+        k.numel(), _RACE_VOCAB, device=device, generator=generator, dtype=torch.float32
+    )
+
+    sorted_logits = logits.sort(dim=-1, descending=True).values
+    kth = sorted_logits.gather(-1, (k.long().clamp(max=_RACE_VOCAB) - 1)[:, None])
+    kept = (logits >= kth) | (k[:, None] >= _RACE_VOCAB)
+    expected = torch.where(kept, logits, torch.full_like(logits, float("-inf")))
+
+    for _ in range(_RACE_REPEATS):
+        out = flashinfer.sampling.top_k_mask_logits(logits, k)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_top_k_renorm_probs_multi_cta_trivial_row_after_ordinary_row(deterministic):
+    """A k >= vocab row must not reset the group's top-k sum while a peer CTA still reads
+    the previous ordinary row's sum."""
+    num_sms = _race_num_sms()
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(0)
+    k = _race_row_k(num_sms, _RACE_VOCAB, device, generator)
+    probs = torch.rand(
+        k.numel(), _RACE_VOCAB, device=device, generator=generator, dtype=torch.float32
+    )
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    sorted_probs = probs.sort(dim=-1, descending=True).values
+    kth = sorted_probs.gather(-1, (k.long().clamp(max=_RACE_VOCAB) - 1)[:, None])
+    kept = torch.where(
+        (probs >= kth) | (k[:, None] >= _RACE_VOCAB), probs, torch.zeros_like(probs)
+    )
+    expected = kept / kept.sum(dim=-1, keepdim=True)
+
+    for _ in range(_RACE_REPEATS):
+        out = flashinfer.sampling.top_k_renorm_probs(
+            probs, k, is_deterministic=deterministic
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-7)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_top_k_page_table_transform_multi_cta_publishes_all_indices(
+    deterministic, set_topk_algo
+):
+    """Every CTA's pass-2 index writes must be visible to the peers that translate them
+    through the page table after the group barrier."""
+    num_sms = _race_num_sms()
+    set_topk_algo("multi_cta")
+    device = "cuda"
+    num_rows, max_len, k = 2 * num_sms, 131072, 2048
+    generator = torch.Generator(device=device).manual_seed(0)
+    # Four score levels: every selected index ties with the pivot, so all k slots are
+    # written in pass 2 (the == pivot pass).
+    scores = torch.randint(
+        0, 4, (num_rows, max_len), device=device, generator=generator
+    ).to(torch.float32)
+    # Odd page ids: an untranslated (stale) index shows up as an even value.
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32) * 2 + 1
+    ).repeat(num_rows, 1)
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+    kth = scores.topk(k, dim=-1).values[:, -1:]
+
+    for _ in range(_RACE_REPEATS):
+        out = torch.full((num_rows, k), -7, device=device, dtype=torch.int32)
+        flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k, deterministic=deterministic, out=out
+        )
+        assert bool(((out % 2 == 1) & (out > 0) & (out < 2 * max_len)).all())
+        raw = ((out - 1) // 2).long()
+        assert bool((scores.gather(-1, raw) >= kth).all())
+        sorted_raw = raw.sort(dim=-1).values
+        assert bool((sorted_raw[:, 1:] != sorted_raw[:, :-1]).all())
+
+
 @pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
 def test_bf16_long_seq_regression_across_algorithms(algo, set_topk_algo):
     """Regression for bf16 long-seq topk across algorithm overrides."""
@@ -3581,6 +3737,81 @@ def test_topk_clusters_exact_variable_seq_lens(batch_size, seq_len, k, dtype):
         row_accuracy = len(test_set & ref_set) / k
         acc = 0.95 if dtype == torch.bfloat16 else 0.99
         assert row_accuracy >= acc, f"Row {i} accuracy {row_accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize(
+    "variant,seq_len",
+    [
+        pytest.param("exact", 1000, id="exact"),
+        pytest.param("page_table", 1000, id="page_table"),
+        pytest.param("ragged", 1000, id="ragged"),
+        pytest.param("page_table", 4096, id="page_table_long_row"),
+        pytest.param("ragged", 4096, id="ragged_long_row"),
+    ],
+)
+def test_topk_clusters_pdl_waits_before_reading(variant, seq_len):
+    _require_sm100_or_sm103()
+    torch.manual_seed(42)
+    batch_size, top_k = 4, 2048
+    width = seq_len if variant == "exact" else 4096
+    logits = torch.randn(batch_size, width, device="cuda")
+    if seq_len > top_k:
+        # Unique scores give the long-row selection an unambiguous reference.
+        logits = torch.randperm(width, device="cuda").float().repeat(batch_size, 1)
+    seq_lens = torch.full((batch_size,), seq_len, device="cuda", dtype=torch.int32)
+    page_table = torch.arange(
+        batch_size * width, device="cuda", dtype=torch.int32
+    ).view(batch_size, width)
+    offsets = torch.arange(batch_size, device="cuda", dtype=torch.int32) * width
+    # Keep the original copy-through cases; long rows must select top_k instead.
+    if variant == "exact":
+        late_input, late_value, run = (
+            logits,
+            logits[0, 0].item(),
+            # Values past seq_len are left unwritten.
+            lambda: tuple(
+                t[:, :seq_len]
+                for t in flashinfer.topk.topk_clusters_exact(
+                    logits, top_k, output_values=True, pdl=True
+                )
+            ),
+        )
+    elif variant == "page_table":
+        late_input, late_value, run = (
+            seq_lens,
+            seq_len,
+            lambda: flashinfer.topk.topk_clusters_page_table_transform(
+                logits, seq_lens, page_table, top_k, pdl=True
+            ),
+        )
+    else:
+        late_input, late_value, run = (
+            seq_lens if seq_len > top_k else offsets,
+            seq_len if seq_len > top_k else 0,
+            lambda: flashinfer.topk.topk_clusters_ragged_transform(
+                logits, seq_lens, offsets, top_k, pdl=True
+            ),
+        )
+    expected = run()
+    if seq_len > top_k:
+        ref_indices = torch.topk(logits, top_k, dim=-1).indices
+        if variant == "page_table":
+            expected = page_table.gather(1, ref_indices)
+        else:
+            expected = ref_indices.to(offsets.dtype) + offsets[:, None]
+        # The cluster kernel does not promise sorted output.
+        expected = expected.sort(dim=-1).values
+
+    # Row 0's first input is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the top-k kernel.
+    # For long rows, stale seq_lens=1 would incorrectly select copy-through.
+    late_input.view(-1)[0] = 1
+    late_store(late_input, late_value)
+    out = run()
+    if seq_len > top_k:
+        out = out.sort(dim=-1).values
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_rows", [1, 16, 64])

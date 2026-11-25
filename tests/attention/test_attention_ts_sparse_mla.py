@@ -459,6 +459,23 @@ def test_rope_quant_graph(
         assert torch.count_nonzero(actual[0]) == 0
 
 
+def _plan_with_deferred_compilation(wrapper, *args, **kwargs):
+    cache_info = mla_decode_module._get_compiled_mla_decode.cache_info()
+    wrapper.plan(*args, **kwargs, compile=False)
+    spec = wrapper._state["compile_spec"]
+    assert wrapper._state["compiled"] is None
+    assert mla_decode_module._get_compiled_mla_decode.cache_info() == cache_info
+    with pytest.raises(RuntimeError, match=r"plan\(compile=True\)"):
+        wrapper.run(None, None, None, None, validate=False)
+    wrapper.plan(*args, **kwargs)
+    compiled = wrapper._state["compiled"]
+    assert compiled is not None and wrapper._state["compile_spec"] == spec
+    wrapper.plan(*args, **kwargs, compile=False)
+    assert wrapper._state["compiled"] is None
+    wrapper.plan(*args, **kwargs)
+    assert wrapper._state["compiled"] is compiled
+
+
 @pytest.mark.parametrize("block", [32, 128])
 @pytest.mark.parametrize("fmt", ["fp32", "ue8m0"])
 def test_rope_quant_scales_and_contract(block, fmt):
@@ -476,7 +493,8 @@ def test_rope_quant_scales_and_contract(block, fmt):
         device="cuda",
     )
     wrapper = BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(
+    _plan_with_deferred_compilation(
+        wrapper,
         "cuda",
         1,
         8,
@@ -904,7 +922,231 @@ def test_large_query_native_graph(dtype):
     test_native_graph(dtype, 1, 8 * sms, 32, 513, True, False, True)
 
 
-def test_caller_workspace_single_source_and_eager_api():
+@pytest.mark.parametrize("scheduler", ["static", "clc"])
+def test_keep_ab_runtime_task_cache(scheduler, monkeypatch):
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    # Pin the affected task and scheduler independently of dispatch policy.
+    profile = SparseMlaProfile(
+        family="keep",
+        tile_size_q=64,
+        split_kv=1,
+        scheduler=scheduler,
+        head_dim_ctas=1,
+        gather_issue_warps=4,
+        reuse_kv=True,
+        reuse_kv_stages=8,
+        kv_tile_size=64,
+        page_pipeline_stages=1,
+    )
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    compile_kernel = mla_decode._get_compiled_mla_decode
+    configs = []
+
+    def checked_compile(spec):
+        cfg = spec.kernel._make_config()
+        assert cfg.kernel_variant == "keeps_mma_ab"
+        assert cfg.num_insts_kv == 1
+        assert cfg.tile_size_q == cfg.tile_size_kv == 64
+        # Generic sparse kernels take the KV capacity at run time.
+        assert cfg.seq_len_kv is None
+        assert cfg.num_ctas_per_seq_kv == cfg.num_ctas_per_head_dim == 1
+        assert cfg.fixed_sparse_kv_tiles == 0
+        assert cfg.kv_stages == 8
+        assert cfg.batch_size == sms + 1
+        assert cfg.use_persistent_scheduler == 1
+        assert cfg.use_clc_dynamic_persistent_scheduler == int(scheduler == "clc")
+        configs.append(cfg)
+        return compile_kernel(spec)
+
+    monkeypatch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+    # Keep the independent oracle and changed-metadata replay gates unchanged.
+    test_native_graph(torch.bfloat16, sms + 1, 1, 64, 513, True, False, True)
+    assert configs
+
+
+# The 64-head WS FP8 gather schedule on a persistent grid: warp-specialized M64
+# MMAs, Q copied into TMEM, and TMA tensor stores of the output.
+_WS_GATHER_PROFILE = dict(
+    family="keep",
+    tile_size_q=64,
+    split_kv=1,
+    scheduler="static",
+    head_dim_ctas=1,
+    gather_issue_warps=8,
+    reuse_kv=True,
+    kv_tile_size=128,
+    uniform_offset_cache=True,
+    paired_correction=True,
+    ws_mma=True,
+    ws_store_cols=64,
+    ws_tma_store=True,
+    page_pipeline_stages=2,
+)
+
+
+@pytest.mark.parametrize("q_in_kv", [False, True])
+def test_keep_ab_ws_gather_graph(q_in_kv, monkeypatch):
+    """Q staged in two K/V ring slices lets the WS schedule retain ten D128 stages."""
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    options = dict(ws_q_in_kv=True, reuse_kv_stages=10) if q_in_kv else {}
+    profile = SparseMlaProfile(**_WS_GATHER_PROFILE, **options)
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    compile_kernel = mla_decode._get_compiled_mla_decode
+    configs = []
+
+    def checked_compile(spec):
+        cfg = spec.kernel._make_config()
+        assert cfg.kernel_variant == "keeps_mma_ab"
+        assert cfg.ws_pv and cfg.ws_tma_output
+        assert cfg.q_in_kv == q_in_kv
+        # The Q stage shrinks to a stub, so the ring keeps two more slices.
+        assert cfg.kv_stages == (10 if q_in_kv else 8)
+        configs.append(cfg)
+        return compile_kernel(spec)
+
+    monkeypatch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+    # Keep the independent oracle and changed-metadata replay gates unchanged.
+    test_native_graph(torch.float8_e4m3fn, sms + 1, 1, 64, 513, True, False, True)
+    assert configs
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        pytest.param(
+            dict(ws_tma_store=False, ws_store_cols=0, ws_tail_staged_stripes=4),
+            "staged WS tail needs WS TMA output stores",
+            id="staged-tail-without-tma-store",
+        ),
+        pytest.param(
+            dict(ws_tail_staged_stripes=9),
+            r"ws_tail_staged_stripes must be in \[0, 8\]",
+            id="staged-tail-stripes",
+        ),
+        pytest.param(
+            dict(ws_mma=False, ws_store_cols=0, ws_tma_store=False, ws_q_in_kv=True),
+            "Q in the K/V ring needs the keeps-MMA-AB WS FP8 schedule",
+            id="q-in-kv-without-ws",
+        ),
+    ],
+)
+def test_keep_ab_ws_gather_profile_rejected(overrides, message, monkeypatch):
+    """Profile options a schedule cannot honor fail at plan time."""
+    from dataclasses import replace
+
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    profile = replace(SparseMlaProfile(**_WS_GATHER_PROFILE), **overrides)
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    w = BatchSparseMLADecodePagedTSWrapper()
+    with pytest.raises(ValueError, match=message):
+        w.plan(
+            torch.device("cuda"),
+            sms + 1,
+            64,
+            max_topk=128,
+            max_extra_topk=513,
+            max_q_len=1,
+            q_dtype=torch.float8_e4m3fn,
+            kv_layout="NHD",
+            use_attention_sinks=True,
+            return_lse=True,
+            assume_valid_prefix=True,
+        )
+
+
+def test_keep_ab_ws_tma_store_rejects_two_cta_output_quant(monkeypatch):
+    """WS TMA output needs a quantizer that stages SW128 WS rows.
+
+    MlaOutputQuant's shared output is the two-CTA box layout, so the WS TMA
+    quantized store must refuse it instead of writing past the warp's slice.
+    """
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.output_quant import (
+        MlaOutputQuant,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    assert not MlaOutputQuant.stages_ws_sw128_rows
+    profile = SparseMlaProfile(**_WS_GATHER_PROFILE)
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    w = BatchSparseMLADecodePagedTSWrapper()
+    with pytest.raises(ValueError, match="stages_ws_sw128_rows"):
+        w.plan(
+            torch.device("cuda"),
+            sms + 1,
+            64,
+            max_topk=128,
+            max_extra_topk=513,
+            q_dtype=torch.float8_e4m3fn,
+            use_attention_sinks=True,
+            assume_valid_prefix=True,
+            output_quant_block_size=32,
+            # A WS TMA box holds whole groups of at most 32 heads.
+            num_output_groups=2,
+        )
+
+
+def test_retained_nvfp4_keep_ab_rejects_v_split(monkeypatch):
+    """Retained NVFP4 Keep-AB runs WS N256 PV passes, which cannot split V."""
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    profile = SparseMlaProfile(
+        family="keep",
+        tile_size_q=64,
+        split_kv=1,
+        scheduler="nonpersistent",
+        head_dim_ctas=4,
+        gather_issue_warps=8,
+        reuse_kv=True,
+        kv_tile_size=128,
+    )
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    w = BatchSparseMLADecodePagedTSWrapper()
+    with pytest.raises(ValueError, match="requires one V owner"):
+        w.plan(
+            torch.device("cuda"),
+            1,
+            64,
+            max_topk=128,
+            q_dtype=torch.float8_e4m3fn,
+            kv_cache_format="nvfp4",
+        )
+
+
+def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
+    from flashinfer.jit import cute_dsl_core
+
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device="cuda", dtype=torch.bfloat16)
     kv[1] *= 2
@@ -915,7 +1157,19 @@ def test_caller_workspace_single_source_and_eager_api():
     size = get_prims_ts_sparse_mla_decode_workspace_size(**args)
     workspace = torch.empty(size, device=q.device, dtype=torch.uint8)
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace)
-    wrapper.plan(**args)
+    with monkeypatch.context() as empty_cache:
+        empty_cache.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+        discovery = BatchSparseMLADecodePagedTSWrapper()
+        allocations = torch.cuda.memory_stats(q.device)["allocation.all.allocated"]
+        discovery.plan(**args, compile=False)
+        assert (
+            torch.cuda.memory_stats(q.device)["allocation.all.allocated"] == allocations
+        )
+        assert discovery.workspace_size_bytes == size
+        assert not discovery.is_kernel_cached()
+        assert not list(tmp_path.iterdir())
+    _plan_with_deferred_compilation(wrapper, **args)
+    assert wrapper.is_kernel_cached() == (not cute_dsl_core.cute_dsl_cache_disabled())
     metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
     result, lse = wrapper.run(q, kv, **metadata)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
@@ -932,8 +1186,9 @@ def test_caller_workspace_single_source_and_eager_api():
     torch.testing.assert_close(next_lse, torch.zeros_like(next_lse), atol=0, rtol=0)
     torch.testing.assert_close(lse, first_lse, atol=0, rtol=0)
     short = BatchSparseMLADecodePagedTSWrapper(workspace[:-1])
-    with pytest.raises(ValueError, match="workspace"):
-        short.plan(**args)
+    for compile_kernel in (False, True):
+        with pytest.raises(ValueError, match="workspace"):
+            short.plan(**args, compile=compile_kernel)
     bad = indices.clone()
     bad[..., 0] = 2
     with pytest.raises(ValueError, match="outside pool"):

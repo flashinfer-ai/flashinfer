@@ -102,9 +102,12 @@ pip install flashinfer-python
 
 ```bash
 pip install flashinfer-python
-flashinfer install-cubin-wheel
-flashinfer install-jit-cache-wheel
+flashinfer download-kernels
 ```
+
+`flashinfer download-kernels` installs the `flashinfer-cubin` and `flashinfer-jit-cache` wheels that match the installed `flashinfer-python` and CUDA versions. By default it installs pre-built kernels for every supported GPU architecture (several GB); pass `--mode minimal` to install the jit-cache provider only for the visible GPUs, or `--sm` (e.g. `--sm sm90a`, repeatable) to choose architectures explicitly.
+
+> **Upgrading:** the kernel wheels must match `flashinfer-python` exactly and are not upgraded with it. Run `flashinfer download-kernels` again after every `pip install -U flashinfer-python`; until then FlashInfer warns at import and ignores the old wheels (falling back to on-demand downloads and JIT compilation). Also note that `flashinfer-cubin` is no longer published to PyPI (0.6.13 was the last release there): a plain `pip install -U flashinfer-cubin` installs that stale wheel, so install it through `flashinfer download-kernels` or from `--index-url https://flashinfer.ai/whl`. See [Upgrading](https://docs.flashinfer.ai/installation.html#upgrading).
 
 **For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 
@@ -184,8 +187,7 @@ For more details, see the [Install from Source documentation](https://docs.flash
 ```bash
 pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps
 pip install flashinfer-python  # Install dependencies from PyPI
-flashinfer install-cubin-wheel --nightly
-flashinfer install-jit-cache-wheel --nightly
+flashinfer download-kernels --nightly
 ```
 
 ### CLI Tools
@@ -201,10 +203,10 @@ flashinfer list-modules
 flashinfer module-status
 
 # Manage artifacts and cache
-flashinfer download-cubin
+flashinfer download-kernels      # flashinfer-cubin + flashinfer-jit-cache wheels
 flashinfer install-cubin-wheel
 flashinfer install-jit-cache-wheel
-flashinfer download-kernels
+flashinfer download-cubin
 flashinfer clear-cache
 
 # For developers: generate compile_commands.json for IDE integration
@@ -255,7 +257,7 @@ FlashInfer powers inference in:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, pull request guidelines
 (PR template, performance numbers for optimizations), and how CI is triggered. Coding
-agents pick up the same guidance from [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md);
+agents pick up the same guidance from [AGENTS.md](AGENTS.md);
 the review guidance is in [docs/code_review_guidance_human.md](docs/code_review_guidance_human.md).
 
 ## Acknowledgement

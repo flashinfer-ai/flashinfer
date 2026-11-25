@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_dsv4_e5e9d7f2a2798aec29ff(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int* __restrict__ seq_lens, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int ragged_query, int max_q_len, int batch_size, int has_sinks, int total_work_items);
+extern "C" __global__ void kernel_cake_dsv4_e5e9d7f2a2798aec29ff(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int* __restrict__ seq_lens, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int ragged_query, int max_q_len, int batch_size, int has_sinks, int total_work_items, int num_query_tokens);
 
 namespace cake_binding_kernel_cake_dsv4_e5e9d7f2a2798aec29ff {
 
@@ -192,7 +192,7 @@ CUtensorMap EncodeTma_tmap_compressed_kv(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compressed_kv, TensorView a_O, TensorView a_cum_seq_lens_q, TensorView a_seq_lens, TensorView a_swa_indices, TensorView a_compressed_indices, TensorView a_sparse_topk_lens, TensorView a_sinks, TensorView a_bmm1_scale, TensorView a_bmm2_scale, int64_t a_num_heads, int64_t a_swa_index_stride, int64_t a_compressed_index_stride, int64_t a_sparse_topk_lens_offset, int64_t a_sparse_topk, int64_t a_ragged_query, int64_t a_max_q_len, int64_t a_batch_size, int64_t a_has_sinks, int64_t a_total_work_items, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compressed_kv, TensorView a_O, TensorView a_cum_seq_lens_q, TensorView a_seq_lens, TensorView a_swa_indices, TensorView a_compressed_indices, TensorView a_sparse_topk_lens, TensorView a_sinks, TensorView a_bmm1_scale, TensorView a_bmm2_scale, int64_t a_num_heads, int64_t a_swa_index_stride, int64_t a_compressed_index_stride, int64_t a_sparse_topk_lens_offset, int64_t a_sparse_topk, int64_t a_ragged_query, int64_t a_max_q_len, int64_t a_batch_size, int64_t a_has_sinks, int64_t a_total_work_items, int64_t a_num_query_tokens, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_tmap_q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_tmap_q, "tmap_q");
@@ -248,6 +248,9 @@ void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compre
       << " is outside the i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(a_total_work_items >= -2147483648LL && a_total_work_items <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'total_work_items' = " << a_total_work_items
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_num_query_tokens >= -2147483648LL && a_num_query_tokens <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'num_query_tokens' = " << a_num_query_tokens
       << " is outside the i32 range [-2147483648, 2147483647]";
   check_contiguous(a_tmap_q, "tmap_q");
   check_same_device(a_tmap_swa_kv, a_tmap_q, "tmap_swa_kv", "tmap_q");
@@ -307,7 +310,8 @@ void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compre
   int32_t v_batch_size = static_cast<int32_t>(a_batch_size);
   int32_t v_has_sinks = static_cast<int32_t>(a_has_sinks);
   int32_t v_total_work_items = static_cast<int32_t>(a_total_work_items);
-  void* kernel_args[] = {&v_tmap_q, &v_tmap_swa_kv, &v_tmap_compressed_kv, &v_O, &v_cum_seq_lens_q, &v_seq_lens, &v_swa_indices, &v_compressed_indices, &v_sparse_topk_lens, &v_sinks, &v_bmm1_scale, &v_bmm2_scale, &v_num_heads, &v_swa_index_stride, &v_compressed_index_stride, &v_sparse_topk_lens_offset, &v_sparse_topk, &v_ragged_query, &v_max_q_len, &v_batch_size, &v_has_sinks, &v_total_work_items};
+  int32_t v_num_query_tokens = static_cast<int32_t>(a_num_query_tokens);
+  void* kernel_args[] = {&v_tmap_q, &v_tmap_swa_kv, &v_tmap_compressed_kv, &v_O, &v_cum_seq_lens_q, &v_seq_lens, &v_swa_indices, &v_compressed_indices, &v_sparse_topk_lens, &v_sinks, &v_bmm1_scale, &v_bmm2_scale, &v_num_heads, &v_swa_index_stride, &v_compressed_index_stride, &v_sparse_topk_lens_offset, &v_sparse_topk, &v_ragged_query, &v_max_q_len, &v_batch_size, &v_has_sinks, &v_total_work_items, &v_num_query_tokens};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(512, 1, 1);

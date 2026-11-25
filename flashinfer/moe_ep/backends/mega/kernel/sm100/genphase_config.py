@@ -10,6 +10,9 @@ import torch
 from .....config import FinalizeMode, FleetParams
 from .....core.validation.common import MoEEpConfigError
 
+from .common.activation_batch_invariant import batch_invariant_numerical_metadata
+from .ep_tuning import BlackwellEpTuningMixin
+
 if TYPE_CHECKING:
     from .mxfp8_mxfp8_bf16_cutedsl.config import (
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
@@ -19,7 +22,7 @@ if TYPE_CHECKING:
     )
 
 
-class GenphaseConfigMixin:
+class GenphaseConfigMixin(BlackwellEpTuningMixin):
     """Resolve dtype-aware geometry and agree on the selection across EP ranks."""
 
     _config: (
@@ -53,7 +56,9 @@ class GenphaseConfigMixin:
                 "Blackwell GenPhase does not support AUTO finalize with "
                 "num_valid_tokens_tensor; persistent finalization is unsupported."
             )
-        if k.activation != "swiglu" or k.swiglu_alpha is not None:
+        if not getattr(k, "batch_invariant", False) and (
+            k.activation != "swiglu" or k.swiglu_alpha is not None
+        ):
             raise MoEEpConfigError("Blackwell GenPhase supports standard SwiGLU.")
         if getattr(k, "enable_fc1_activation_per_token_scale", False):
             raise MoEEpConfigError(
@@ -82,9 +87,15 @@ class GenphaseConfigMixin:
 
     def _genphase_base_config(self, fleet_params):
         """Describe the EP workload before selecting performance knobs."""
-        from .....kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseMoeConfig
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            Sm100GenphaseMoeConfig,
+        )
 
         k = self._config
+        from .common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_metadata,
+        )
+
         return Sm100GenphaseMoeConfig(
             num_total_experts=fleet_params.num_experts,
             max_tokens_per_rank=fleet_params.max_tokens_per_rank,
@@ -98,6 +109,8 @@ class GenphaseConfigMixin:
                 k.gate_up_clamp if k.gate_up_clamp is not None else k.activation_clamp
             ),
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            **block_scaled_batch_invariant_metadata(k),
+            **batch_invariant_numerical_metadata(k),
         )
 
     def _genphase_config(self, fleet_params: FleetParams):
@@ -106,7 +119,9 @@ class GenphaseConfigMixin:
         Automatic workspaces start from the capacity heuristic. Their v2
         selection uses the actual staged batch size during warmup or forward.
         """
-        from .....kernel_src.sm100.next_cutedsl_megamoe import resolve_genphase_knobs
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            resolve_genphase_knobs,
+        )
 
         try:
             base = self._genphase_base_config(fleet_params)
@@ -138,8 +153,8 @@ class GenphaseConfigMixin:
 
     def _check_genphase_selection(self, config):
         """Require identical configuration selection across EP ranks at allocation."""
-        # Selection is construction-time work; never inspect live routing on forward.
-        if self.ep_world_size > 1:
+        # Initial validation precedes bootstrap; workspace preparation checks again.
+        if self.ep_world_size > 1 and self._ep_comm_group is not None:
             import torch.distributed as dist
 
             proposal = dataclasses.asdict(config)

@@ -53,7 +53,11 @@ multiply-add epilogue), SM100 groups of 4 ranks and SM103 groups of 8 or 4 ranks
 the ``ow256_fma`` build (wide operand loads and the fused multiply-add
 epilogue), SM100 and SM103 groups of 2 ranks the ``fma`` build (the fused
 multiply-add epilogue), SM107 groups of 4 ranks the ``bulk`` build (bulk row
-stores), the other groups and SM90 the baseline build.  The builds without the
+stores), SM90 the ``sw3`` build (SMEM-staged epilogue with three storer warps),
+the other groups the baseline build.  Under the default build, the rows of
+``plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD`` launch the baseline build (SM90
+groups of 8 ranks at hidden 6144 and above from 8192 rows on); a build named by
+the environment variable runs on every row.  The builds without the
 fused multiply-add epilogue store identical bits; an ``fma`` build rounds the
 norm and RoPE multiply-adds once, so its stored bits can differ from theirs
 within the kernel's accuracy tolerance.  Every build requires ``cos_sin`` and
@@ -118,7 +122,7 @@ ranks ship the cross-destination-band gate (``plans.XBAND_MIN_M_DEFAULT_BY_ARCH_
 :func:`resolve_xband_min_m`; ``xband_min_m=0`` switches it off): a call whose
 destination band is not a multiple of 256 columns while every Q / K / V group is
 (e.g. hidden 3072 over 8 ranks) runs the 256-column pair tile across band edges
-from ``4096`` rows on, as one persistent launch of the cross-destination-band
+from ``2048`` rows on, as one persistent launch of the cross-destination-band
 build of the session's producer build (``loader.xband_variant``: its staged
 twin for a bulk build; its tiles carry both heads' destinations).  The default
 yields where that build is not delivered.  Neither changes the stored bits.
@@ -130,6 +134,20 @@ order and ``group_m`` stay the band policy's and the row-count gates read the
 band width.  The session loads the 128-column producer beside its own; the
 table yields where that producer is not delivered.  ``describe()`` reports the
 bound (``bn128_max_m``) and the tile width of such a prepared row (``block_n``).
+SM100 and SM103 groups of 8 ranks at hidden 4096 run their 2-CTA pair calls of
+at most ``512`` rows on the 128-column pair tile the same way
+(``plans.BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD``).
+
+On the band rows of ``plans.DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD`` the cells of
+``plans.DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD`` (SM100 and SM103 at hidden 3072)
+interleave the destinations of the tile table (``lt``: token-tile group, column
+tile, destination, with about one wave of local runs at the end) and run it as
+one persistent launch: a fired per-destination launch gate yields there.  SM90
+groups of 2 and 4 at hidden 3072 and 4096 take ``il`` (no local tail) without that
+precedence (``plans.DEST_INTERLEAVE_DEFAULT_WITHOUT_PD``)
+(``plans.resolve_dest_interleave``, :func:`plans.plan_row`).  Only the order of
+the tile rows changes; ``describe()`` reports the session's mode
+(``dest_interleave``) and the prepared rows' plans.
 
 Eager calls publish a monotonic epoch; a call issued while the current stream
 is capturing publishes the sentinel ``0xFFFFFFFF``, clears its slot's words
@@ -563,6 +581,9 @@ class _RowPlan:
     parts: tuple[tuple[int, int, int, torch.Tensor], ...]
     # SMs every producer launch of this row leaves free (0 when the large-row gate fired, else plans.RESERVED_SMS).
     reserved_sms: int
+    # The producer build of this row's programs: the session's build, the baseline build ("") on a row of
+    # plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD, or the cross-destination-band build.
+    variant: str = ""
 
     @property
     def launches_per_call(self) -> int:
@@ -696,6 +717,11 @@ class CakeQkvExchangeSession:
         self.xband_min_m, self.xband_min_m_source = resolve_xband_min_m(
             arch, self.world_size
         )
+        (
+            self.dest_interleave,
+            self.dest_interleave_pd,
+            self.dest_interleave_max_m,
+        ) = plans.resolve_dest_interleave(arch, self.world_size)
         if layout not in plans.LAYOUTS:
             raise ValueError(f"layout must be one of {plans.LAYOUTS}, got {layout!r}")
         if (
@@ -801,12 +827,13 @@ class CakeQkvExchangeSession:
             and self.xband_eligible
             and self.max_tokens >= self.xband_min_m
         )
-        # 128-column tile table (plans.HOPPER_BN128_MAX_M_BY_ARCH_WORLD): a 256-column session of a table cell runs
-        # its rows up to the cell's bound on the 128-column tile with the band policy's pair flag (no such row is a
-        # cross-destination-band row: the table has no pair-architecture cell).  It yields where this delivery
-        # lacks the 128-column producer of the session's build.
+        # 128-column tile table (plans.default_bn128_max_m: HOPPER_BN128_MAX_M_BY_ARCH_WORLD on SM90,
+        # BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD on the pair architectures): a 256-column session of a table cell runs
+        # its rows up to the cell's bound on the 128-column tile with the band policy's pair flag (on the pair
+        # architectures its pair rows only; a cross-destination-band row keeps its plan).  It yields where this
+        # delivery lacks the 128-column producer of the session's build.
         self.bn128_max_m, self.bn128_max_m_source = 0, "default"
-        bn128_cell = plans.hopper_bn128_max_m(self.arch, self.world_size, self.hidden)
+        bn128_cell = plans.default_bn128_max_m(self.arch, self.world_size, self.hidden)
         if bn128_cell and self.bn != plans.HOPPER_BN128_BN:
             if all(
                 loader.has_producer(
@@ -862,6 +889,18 @@ class CakeQkvExchangeSession:
                     pair,
                     per_dest=bn128_top.producer_launches == "per_dest",
                     bn=plans.HOPPER_BN128_BN,
+                ):
+                    self._producers[name] = loader.load(name, self.arch)
+        # The rows of plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD launch the baseline build (the gate fires from a
+        # row count on, so max_tokens says whether any row reaches it).
+        if self._row_variant(self.max_tokens) != self.producer_variant:
+            for pair in self._reachable_pairs():
+                if not loader.has_producer(
+                    self.arch, self.bn, pair, loader.SHIPPED_VARIANT
+                ):
+                    continue
+                for name in self._launched_producers(
+                    pair, per_dest=per_dest_reachable, variant=loader.SHIPPED_VARIANT
                 ):
                     self._producers[name] = loader.load(name, self.arch)
 
@@ -947,6 +986,18 @@ class CakeQkvExchangeSession:
             self.prepare_rows(int(sample_batch), int(sample_s_local))
 
     # ------------------------------------------------------------------ preparation
+
+    def _row_variant(self, rows: int) -> str:
+        """The producer build of a call of ``rows`` rows outside the cross-destination-band plan: the session's
+        build, or the baseline build on a row of ``plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD`` while the session
+        runs its default build (a build named by the environment variable runs on every row)."""
+
+        if self.producer_variant_source != "default":
+            return self.producer_variant
+        shipped = plans.default_shipped_producer_row(
+            self.arch, self.world_size, self.hidden, rows
+        )
+        return loader.SHIPPED_VARIANT if shipped else self.producer_variant
 
     def _reachable_pairs(self) -> tuple[bool, ...]:
         """Pair flags the policy and the pair-tile gate can select for row counts up to ``max_tokens`` (programs to
@@ -1120,20 +1171,25 @@ class CakeQkvExchangeSession:
             words_capacity_per_dest=self.words_cap,
             group_m_scale=self.group_m_scale,
             bn128_max_m=self.bn128_max_m,
+            dest_interleave=self.dest_interleave,
+            dest_interleave_pd=self.dest_interleave_pd,
+            dest_interleave_max_m=self.dest_interleave_max_m,
         )
         row_bn = (
             plans.HOPPER_BN128_BN
-            if self.bn128_max_m and geometry.rows <= self.bn128_max_m
+            if self.bn128_max_m
+            and geometry.rows <= self.bn128_max_m
+            and (plan.pair or self.arch not in plans.PAIR_ARCHES)
             else self.bn
         )
         expected_bn = plans.XBAND_BN if plan.xband else row_bn
         if plan.bn != expected_bn or plan.num_words > self.words_cap:
             raise RuntimeError("tile plan disagrees with the session capacity")
-        variant = (
-            loader.xband_variant(self.producer_variant)
-            if plan.xband
-            else self.producer_variant
-        )
+        variant = self._row_variant(geometry.rows)
+        if plan.xband:
+            variant = loader.xband_variant(self.producer_variant)
+        elif not loader.has_producer(self.arch, plan.bn, plan.pair, variant):
+            variant = self.producer_variant
         program = loader.producer_program(self.arch, plan.bn, plan.pair, variant)
         per_dest = verdict.producer_launches == "per_dest"
         for name in self._launched_producers(
@@ -1185,14 +1241,16 @@ class CakeQkvExchangeSession:
             verdict=verdict,
             parts=parts,
             reserved_sms=int(reserved_sms),
+            variant=variant,
         )
         self._plans[key] = row
         return row
 
     def bound_programs(self, batch: int, s_local: int) -> dict[str, str]:
         """Program names of every delivered stage of a ``(batch, s_local)`` call (prepares the row eagerly):
-        the barrier programs, the plain producer of the session's build, its folded producers where delivered
-        (``producer_fold0`` / ``producer_fold1``), the baseline build's three programs where the session's build
+        the barrier programs, the plain producer of the row's build (the session's, or the baseline build on a row of
+        ``plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``), its folded producers where delivered
+        (``producer_fold0`` / ``producer_fold1``), the baseline build's three programs where the row's build
         is a variant (``producer_shipped``, ``producer_shipped_fold0`` / ``producer_shipped_fold1``: the
         ``shipped`` opt-out path of this row) and the wait kernel -- six or nine names.  On a row that runs the
         cross-destination-band plan the ``producer*`` names stay the programs of the session's tile width (the
@@ -1204,18 +1262,19 @@ class CakeQkvExchangeSession:
         row = self.prepare_rows(batch, s_local)
         pair = bool(row.policy.pair)
         bn = int(row.policy.bn)
+        # The build of the row's band programs: the row's own (the baseline build on a row of
+        # plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD), the session's on a cross-destination-band row.
+        variant = self.producer_variant if row.plan.xband else row.variant
         bound = {
             "barrier_p0": self._barrier_names[0],
             "barrier_p1": self._barrier_names[1],
-            "producer": loader.producer_program(
-                self.arch, bn, pair, self.producer_variant
-            ),
+            "producer": loader.producer_program(self.arch, bn, pair, variant),
         }
-        folds = self._fold_producer_names(pair, bn=bn)
+        folds = self._fold_producer_names(pair, variant, bn=bn)
         if folds:
             for phase, name in zip(loader.FOLD_PHASES, folds, strict=True):
                 bound[f"producer_fold{phase}"] = name
-        if self.producer_variant != loader.SHIPPED_VARIANT:
+        if variant != loader.SHIPPED_VARIANT:
             bound["producer_shipped"] = loader.producer_program(
                 self.arch, bn, pair, loader.SHIPPED_VARIANT
             )
@@ -1569,7 +1628,15 @@ class CakeQkvExchangeSession:
             "bn128_max_m": {
                 "value": self.bn128_max_m,
                 "source": self.bn128_max_m_source,
-                "default": plans.hopper_bn128_max_m(
+                "default": plans.default_bn128_max_m(
+                    self.arch, self.world_size, self.hidden
+                ),
+            },
+            "dest_interleave": {
+                "value": self.dest_interleave,
+                "per_dest_precedence": self.dest_interleave_pd,
+                "max_m": self.dest_interleave_max_m,
+                "band": plans.dest_interleave_band(
                     self.arch, self.world_size, self.hidden
                 ),
             },
@@ -1593,6 +1660,11 @@ class CakeQkvExchangeSession:
                         if row.plan.xband
                         else {"block_n": row.plan.bn}
                         if row.plan.bn != self.bn
+                        else {}
+                    ),
+                    **(
+                        {"producer_variant": row.variant}
+                        if not row.plan.xband and row.variant != self.producer_variant
                         else {}
                     ),
                     "num_words": row.plan.num_words,
