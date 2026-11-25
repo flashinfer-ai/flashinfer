@@ -96,7 +96,11 @@ FAKE_WORKER = textwrap.dedent(
 
 
 @pytest.fixture
-def fake_cmd(tmp_path):
+def fake_cmd(tmp_path, monkeypatch):
+    # Fake workers need no GPU, but the pool maps device 0 through
+    # CUDA_VISIBLE_DEVICES; a synthetic device keeps these tests independent of
+    # how a CPU-only job sets it (an empty value hides every device).
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     script = tmp_path / "fake_worker.py"
     script.write_text(
         FAKE_WORKER.format(module=str(BUILD_MODULE), candidates=CANDIDATES)
