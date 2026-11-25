@@ -1,0 +1,55 @@
+name: Bot Run Request
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to re-evaluate'
+        type: number
+        required: true
+
+# The stable required Check is published on the PR head through the Checks API,
+# not on issue_comment's default-branch SHA. Never execute PR-head code here.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+concurrency:
+  group: bot-run-request-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: Evaluate bot run request
+    if: >-
+      github.event_name != 'issue_comment' ||
+      github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Explicitly trusted default-branch source for *every* event.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Test request gate
+        run: python3 -m unittest discover -s scripts/infra/tests -p test_check_bot_run_request.py -v
+      - name: Publish Bot Run Request Check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INFERENCE_API_KEY: ${{ secrets.INFERENCE_API_KEY }}
+          INFERENCE_BASE_URL: ${{ vars.INFERENCE_BASE_URL }}
+          CI_BOT_TARGET_MODEL: ${{ vars.CI_BOT_TARGET_MODEL }}
+          CI_BOT_TARGET_TIMEOUT_SECONDS: ${{ vars.CI_BOT_TARGET_TIMEOUT_SECONDS }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+        run: >-
+          python3 scripts/infra/pr_checks/check_bot_run_request.py
+          --repo "$REPOSITORY" --pr "$PR_NUMBER"

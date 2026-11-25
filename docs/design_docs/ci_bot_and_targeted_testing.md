@@ -209,3 +209,74 @@ bounded to 15 seconds each, with a five-second forced-termination grace period.
 A helper timeout follows the rejection path before publishing statuses or
 applying a CI label. Feedback still depends on GitHub availability and the runner
 remaining alive within the ten-minute job limit.
+
+## Bot Run Request Check
+
+`Bot Run Request Check` is a separate merge gate for internal `/bot run`
+requests. It does **not** aggregate pipeline results or establish test coverage.
+All prompts and diagnostics appear in Check Details and the Actions summary;
+the check never posts conversation comments or reactions.
+
+The gate first scans the PR's paginated comment history for a response from the
+trusted `flashinfer-bot` account to an internal `/bot run` request. Pipeline
+acknowledgements, AI advice saying no pipeline was started, authorization
+rejections and trigger errors all qualify. A qualifying historical response
+continues to satisfy this policy after new commits. The gate does not require
+pipeline creation, a passing result or a matching tested commit. Unrelated
+bot reports, public `@flashinfer-bot` suggestions and copied replies do not count.
+Finding a qualifying response skips source inspection and inference entirely.
+
+Without a reply, the gate exempts documentation-only or CPU-only changes.
+The optional GPU-impact analysis extends `ai_test_scope.py` with the same
+inspected source/test/CI evidence and an independent impact assessment. File
+extensions and `tests/cpu/` alone cannot establish CPU-only behavior. Kernels,
+launchers, bindings, dispatch, shapes/dtypes/layouts, workspace, JIT/AOT, CUDA
+graphs, synchronization and communication generally need GPU validation. New
+PR tests are included even if they are not among the recommended targets.
+GPU impact with no corresponding selected case still requires a bot response;
+the missing/uncertain test coverage is reported rather than treated as exempt.
+An incomplete diff, evidence failure or uncertain model answer is not an
+exemption. A verified response remains sufficient even when analysis is unavailable.
+
+| State without a qualifying bot response | Check result |
+| --- | --- |
+| Documentation/CPU-only change | Success: bot run not required, with reason |
+| GPU change, no command | Failure: comment `/bot run` |
+| GPU change, command found | Failure: waiting for `flashinfer-bot`, with command link |
+| Unable to establish GPU impact | Failure: specific missing evidence/error and next action |
+
+Commands with multiple spaces or tabs, such as `/bot  run tests/attention`, are
+recognized. This check does not repeat the internal bot's path validation;
+invalid trailing arguments still count as a request for the waiting message,
+and the bot's rejection response satisfies the agreed response-only policy.
+Quoted examples, fenced code and prose mentions do not issue commands.
+
+The trusted default-branch workflow handles PR open/synchronize/reopen/ready and
+base-edit events, plus PR comment creation/edit/deletion. It publishes a stable
+Check on the PR head through the Checks API (not on `issue_comment`'s default
+branch SHA). A per-head/base/analysis-version result can reuse its impact
+assessment, but comments are read again on every event so deleted responses do
+not persist as cached exemptions. Stale head/base completions are discarded.
+A manual dispatch with `pr_number` can re-evaluate an existing PR.
+PR source is evidence only: no imports, installs or test collection are allowed
+in the credential-bearing job. A separate read-only PR workflow runs CPU tests
+of this implementation before its default-branch handler is deployed.
+
+### Enabling the merge blocker
+
+After the implementation is merged to the default branch and has emitted its
+first check, a repository administrator must add the exact **Bot Run Request
+Check** context from GitHub Actions as a required status check in the `main`
+branch protection/ruleset. Preserve other required checks and review/bypass
+settings. Verify that a missing/failing result blocks merging and that a
+qualifying response or CPU/docs exemption satisfies this requirement. The
+workflow alone does not configure branch protection. If merge queue is enabled,
+add merge-group evaluation before requiring this context for queued merges;
+this version handles individual PR heads.
+
+Verify comment-trigger refresh in the target repository after deployment;
+GitHub suppresses follow-up workflows for events produced using `GITHUB_TOKEN`,
+whereas the internal bot uses its separate account token. Existing bot replies
+can be consumed without changing the internal service or accessing GitLab APIs.
+The existing `PR Test / Test Results Summary` remains independent: passing this
+response check does not waive any other required test result.

@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Publish a response-only internal /bot run gate without posting PR comments."""
+
+import argparse
+from dataclasses import dataclass
+import html
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from ai_test_scope import (
+    GitHub,
+    PytestTargetSelector,
+    TargetSelectionError,
+    _public_prose,
+    _remaining,
+)
+
+CHECK_NAME = "Bot Run Request Check"
+BOT_ID = 236526959  # Stable GitHub account ID; never rely on copied display text.
+PUBLIC_NOTE = "<!-- flashinfer-bot:ci-bot-commands-note -->"
+VERSION = "bot-run-request-v1"
+
+
+def is_run_command(body):
+    """Match a command at the start, as the internal bot does; ignore examples."""
+    return bool(re.match(r"\A[ \t]*/bot[ \t]+run(?:[ \t\r\n]|$)", body.strip(), re.I))
+
+
+def is_bot_response(item):
+    user = item.get("user", {})
+    if user.get("id") != BOT_ID or user.get("login", "").lower() != "flashinfer-bot":
+        return False
+    body = item.get("body", "").strip()
+    if not body or body.startswith((">", "`", "~")) or PUBLIC_NOTE in body:
+        return False
+    # Internal acknowledgements may follow scope/cost or stacked-PR notes.
+    if not body.startswith("##") and "\n\n---\n\n" in body:
+        body = body.rsplit("\n\n---\n\n", 1)[1].strip()
+    if body.startswith("**Stacked PR**") and "\n\n" in body:
+        body = body.split("\n\n", 1)[1].strip()
+    # These are the internal service's replies, including failures/advice. Public
+    # Actions suggestions carry a different marker and must not satisfy this gate.
+    patterns = (
+        r"GitLab MR \[!\d+\].*?(?:pipeline|trigger failed)",
+        r"\*\*AI[- ](?:found|suggested|recommends|could not).*?No CI pipeline was started",
+        r"\*\*Automatic target selection unavailable\.\*\*",
+        r"The PR changed during target selection\. No CI pipeline was started",
+        r"Invalid `/bot run` path\(s\):",
+        r"Too many test paths \(",
+        r"@\S+ is not authorized to trigger this CI job\.",
+        r"\*\*Mirroring Failed\*\*",
+        r"\*\*Warning\*\*: Failed to sync latest changes\.",
+        r"\*\*Error\*\*: Failed to update branch\.",
+        r"The PR head or base changed before CI launch\. No pipeline was started",
+        r"\[(?:SUCCESS|FAILED|FAILURE|CANCELED)\] Pipeline \[#\d+\]",
+    )
+    return any(re.match(pattern, body, re.S | re.I) for pattern in patterns)
+
+
+@dataclass(frozen=True)
+class Result:
+    conclusion: str
+    reason: str
+    title: str
+    summary: str
+    analysis: dict = None
+
+
+def evidence_link(item, label):
+    # Construct the link from validated IDs, not a comment-supplied URL/body.
+    url = item.get("html_url", "")
+    if re.fullmatch(
+        r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+#issuecomment-\d+", url
+    ):
+        return f"[{label}]({url})"
+    return f"{label} (comment #{int(item['id'])})"
+
+
+def evaluate(comments, analyze):
+    reply = next((item for item in reversed(comments) if is_bot_response(item)), None)
+    if reply:
+        return Result(
+            "success",
+            "bot_response_found",
+            "Bot response found",
+            evidence_link(reply, "Internal bot response")
+            + "\n\nSource and LLM analysis skipped. Pipeline creation, result and commit correspondence are not evaluated.",
+        )
+    command = next(
+        (item for item in reversed(comments) if is_run_command(item.get("body", ""))),
+        None,
+    )
+    try:
+        impact = analyze()
+    except (TargetSelectionError, ValueError) as error:
+        impact = {
+            "classification": "unknown",
+            "reason": str(error),
+            "evidence_paths": [],
+            "targets": [],
+            "case_gap": "",
+        }
+    kind = impact["classification"]
+    details = _public_prose(
+        impact["reason"],
+        (os.getenv("GH_TOKEN"), os.getenv("INFERENCE_API_KEY")),
+        limit=1500,
+    )
+    if impact.get("evidence_paths"):
+        details += "\n\nEvidence: " + ", ".join(
+            html.escape(path) for path in impact["evidence_paths"]
+        )
+    if impact.get("targets"):
+        details += "\n\nSuggested tests: " + ", ".join(
+            html.escape(path) for path in impact["targets"]
+        )
+    if impact.get("case_gap"):
+        details += "\n\nTest selection gap: " + _public_prose(
+            impact["case_gap"], limit=1000
+        )
+    if kind in {"cpu_only", "docs_only"}:
+        return Result("success", kind, "Bot run not required", details, impact)
+    if kind == "unknown":
+        title, reason = "Unable to determine GPU impact", "unknown"
+        details += "\n\nNo CPU-only exemption could be established. Rerun this check, or comment `/bot run` and wait for the bot response."
+    elif command:
+        title, reason = "Waiting for flashinfer-bot", "waiting_for_bot"
+    else:
+        title, reason = "Bot run required", "command_missing"
+        details += "\n\nGPU-related changes: comment `/bot run` and wait for `flashinfer-bot` to reply."
+    if command:
+        details += (
+            "\n\nDetected "
+            + evidence_link(command, "/bot run command")
+            + "; waiting for the bot response."
+        )
+    return Result("failure", reason, title, details, impact)
+
+
+class Client(GitHub):
+    def request(self, endpoint, method="GET", data=None):
+        args = ["gh", "api", "--method", method, endpoint]
+        if data is not None:
+            args += ["--input", "-"]
+        try:
+            response = subprocess.run(
+                args,
+                input=json.dumps(data) if data is not None else None,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=_remaining(self.deadline, 45),
+            )
+            if len(response.stdout) > 10_000_000:
+                raise TargetSelectionError(
+                    "GitHub response exceeds the evidence size limit"
+                )
+            return json.loads(response.stdout) if response.stdout.strip() else None
+        except (subprocess.SubprocessError, OSError, ValueError) as error:
+            raise TargetSelectionError(
+                f"GitHub {method} request failed; check permissions or rerun the check"
+            ) from error
+
+    def pages(self, endpoint, field=None):
+        items = []
+        for page in range(1, 101):
+            data = self.request(
+                f"{endpoint}{'&' if '?' in endpoint else '?'}per_page=100&page={page}"
+            )
+            batch = data[field] if field else data
+            items.extend(batch)
+            if len(batch) < 100:
+                return items
+        raise TargetSelectionError(
+            "GitHub comment/check history exceeds 100 pages; evidence is incomplete"
+        )
+
+    def comments(self, number):
+        return self.pages(f"repos/{self.repository}/issues/{number}/comments")
+
+    def checks(self, sha):
+        return self.pages(
+            f"repos/{self.repository}/commits/{sha}/check-runs?filter=all", "check_runs"
+        )
+
+    def begin(self, pr, check_id=None):
+        data = {
+            "name": CHECK_NAME,
+            "status": "in_progress",
+            "external_id": f"{VERSION}:{pr['number']}",
+            "output": {
+                "title": "Checking bot run request",
+                "summary": "Reading existing bot responses and exemption evidence.",
+            },
+        }
+        if check_id:
+            return self.request(
+                f"repos/{self.repository}/check-runs/{int(check_id)}", "PATCH", data
+            )["id"]
+        data["head_sha"] = pr["head"]["sha"]
+        return self.request(f"repos/{self.repository}/check-runs", "POST", data)["id"]
+
+    def publish(self, pr, result, check_id=None, base_sha=None):
+        data = {
+            "name": CHECK_NAME,
+            "status": "completed",
+            "conclusion": result.conclusion,
+            "external_id": f"{VERSION}:{pr['number']}",
+            "output": {
+                "title": result.title,
+                "summary": result.summary,
+                "text": json.dumps(
+                    {
+                        "reason": result.reason,
+                        "analysis": result.analysis,
+                        "base_sha": base_sha,
+                        "version": analysis_version(),
+                    }
+                ),
+            },
+        }
+        run = os.getenv("GITHUB_RUN_ID")
+        if run:
+            data["details_url"] = (
+                f"https://github.com/{self.repository}/actions/runs/{int(run)}"
+            )
+        if check_id:
+            return self.request(
+                f"repos/{self.repository}/check-runs/{int(check_id)}", "PATCH", data
+            )
+        data["head_sha"] = pr["head"]["sha"]
+        return self.request(f"repos/{self.repository}/check-runs", "POST", data)
+
+
+def analysis_version():
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name in (
+        "ai_test_scope.py",
+        "gpu_impact.py",
+        "scope_evidence.py",
+        "check_bot_run_request.py",
+    ):
+        digest.update(Path(__file__).with_name(name).read_bytes())
+    digest.update(os.getenv("CI_BOT_TARGET_MODEL", "default").encode())
+    return digest.hexdigest()
+
+
+def cached_analysis(checks, pr, base_sha):
+    for item in sorted(checks, key=lambda check: check["id"], reverse=True):
+        if (
+            item.get("app", {}).get("slug") != "github-actions"
+            or item.get("external_id") != f"{VERSION}:{pr['number']}"
+        ):
+            continue
+        try:
+            stored = json.loads(item["output"]["text"])
+            if (
+                stored["base_sha"] == base_sha
+                and stored["version"] == analysis_version()
+                and isinstance(stored.get("analysis"), dict)
+                and stored["analysis"].get("classification")
+                in {"docs_only", "cpu_only", "gpu_required"}
+            ):
+                return stored["analysis"]
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def docs_only(changed, expected_count):
+    def is_doc(path):
+        return isinstance(path, str) and path.endswith((".md", ".rst"))
+
+    return (
+        bool(changed)
+        and len(changed) == expected_count
+        and all(
+            is_doc(item.get("filename"))
+            and (not item.get("previous_filename") or is_doc(item["previous_filename"]))
+            for item in changed
+        )
+    )
+
+
+def run_pr(client, number):
+    pr = client.get_pr_details(number)
+    if pr["state"] != "open" or pr["base"]["ref"] != "main":
+        return None
+    checks = client.checks(pr["head"]["sha"])
+    owned = [
+        item
+        for item in checks
+        if item.get("app", {}).get("slug") == "github-actions"
+        and item.get("external_id") == f"{VERSION}:{number}"
+        and item.get("name") == CHECK_NAME
+    ]
+    existing_id = max((item["id"] for item in owned), default=None)
+    existing_id = client.begin(pr, existing_id)
+    base_sha = client.get_current_base_sha(pr)
+    try:
+        comments = client.comments(number)
+        saved = cached_analysis(owned, pr, base_sha)
+
+        def analyze():
+            if saved:
+                return saved
+            changed = client.get_pr_files(number)
+            if docs_only(changed, pr.get("changed_files")):
+                return {
+                    "classification": "docs_only",
+                    "reason": "Only Markdown/RST documentation changed.",
+                    "evidence_paths": [item["filename"] for item in changed],
+                    "case_gap": "",
+                    "targets": [],
+                }
+            root = Path(__file__).resolve().parents[3]
+            selector = PytestTargetSelector(
+                client, lambda path: (root / path).read_text()
+            )
+            # Inference has its own shorter deadline. Reserve the outer budget
+            # so even a timed-out analysis can publish a useful failing Check.
+            deadline = client.deadline
+            try:
+                selection = selector.select(pr, include_gpu_impact=True)
+            finally:
+                client.deadline = deadline
+            return {**selection.gpu_impact, "targets": selection.paths}
+
+        result = evaluate(comments, analyze)
+    except TargetSelectionError as error:
+        result = Result(
+            "failure",
+            "evidence_error",
+            "Unable to read bot request evidence",
+            _public_prose(str(error)),
+        )
+    latest = client.get_pr_details(number)
+    if (
+        latest["head"]["sha"] != pr["head"]["sha"]
+        or latest["base"]["ref"] != pr["base"]["ref"]
+        or latest["state"] != "open"
+        or client.get_current_base_sha(latest) != base_sha
+    ):
+        print("PR changed during evaluation; discard stale result")
+        return None
+    client.publish(pr, result, existing_id, base_sha)
+    summary = (
+        f"## {CHECK_NAME} — PR #{number}\n\n**{result.title}**\n\n{result.summary}\n"
+    )
+    if os.getenv("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+            stream.write(summary)
+    print(f"PR #{number}: {result.reason} ({result.conclusion})")
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--pr", type=int, required=True)
+    args = parser.parse_args()
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo) or args.pr <= 0:
+        parser.error("Invalid repository or PR")
+    result = run_pr(Client(args.repo, timeout=540), args.pr)
+    return 1 if result and result.conclusion == "failure" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
