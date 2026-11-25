@@ -636,10 +636,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     def _staged_output_scale(self) -> Float32:
         """Return the ``output_scale`` folded into O staged in SMEM.
 
-        A quantized output stages O in its 16-bit carrier without
-        ``output_scale``; the quantizing drains apply it in FP32 instead, so a
-        large scale cannot overflow FP16 or lose BF16 precision before the block
-        scale is chosen. A plain output folds it here as before, with unchanged
+        A quantized output stages O without ``output_scale`` and the
+        quantizing drains apply it in FP32, so the block scale follows the
+        FP32 value. A plain output folds it here as before, with unchanged
         rounding.
         """
         if cutlass.const_expr(self.cfg.quant_output is not None):
@@ -2340,7 +2339,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     .load(count=4, alignment=16)
                 )
                 staged_vals = _load_partial_o_vec8_as_f32(
-                    staged_regs, cfg.use_bf16_output
+                    staged_regs, cfg.use_bf16_stage_output
                 )
                 physical_dst_row_idx = _q_physical_output_row(
                     cfg,
@@ -4107,7 +4106,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     )
                     .data_ptr()
                     .load(count=4, alignment=16),
-                    cfg.use_bf16_output,
+                    cfg.use_bf16_stage_output,
                 )
                 physical_row = _q_physical_output_row(
                     cfg,
@@ -4227,7 +4226,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                             packed[pair_idx] = self._pack_separate_partial_o_pair(
                                 value0, value1
                             )
-                        elif cutlass.const_expr(cfg.use_bf16_output):
+                        elif cutlass.const_expr(cfg.use_bf16_stage_output):
                             packed[pair_idx] = _pack_float2_to_bf16(value0, value1)
                         else:
                             packed[pair_idx] = _pack_float2_to_fp16(value0, value1)
@@ -4766,7 +4765,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                             (o1_vals[reg_base], o1_vals[reg_base + 1]),
                         ),
                     )
-                if cutlass.const_expr(cfg.use_bf16_output):
+                if cutlass.const_expr(cfg.use_bf16_stage_output):
                     regs_o[pair_idx] = _pack_float2_to_bf16(
                         final_pair[0], final_pair[1]
                     )
@@ -5272,7 +5271,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                             (o1_vals[reg_base], o1_vals[reg_base + 1]),
                         ),
                     )
-                if cutlass.const_expr(cfg.use_bf16_output):
+                if cutlass.const_expr(cfg.use_bf16_stage_output):
                     regs_o[reg_idx] = _pack_float2_to_bf16(final_pair[0], final_pair[1])
                 else:
                     regs_o[reg_idx] = _pack_float2_to_fp16(final_pair[0], final_pair[1])

@@ -2410,6 +2410,22 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def use_bf16_stage_output(self) -> bool:
+        """Whether O staged in SMEM for a direct final store is BF16.
+
+        A quantized output stages BF16 even for an FP16 carrier: its FP32
+        exponent range holds O on either side of ``output_scale``. FP16 spans
+        only 2^-24..65504, so folding the scale first overflows a large O *
+        scale, and folding it after flushes an O below 2^-25 to zero, both of
+        which MXFP8 represents. BF16 keeps 8 significant bits ahead of E4M3's
+        4, as the BF16 carrier already does. Split-KV partials keep their
+        carrier format.
+        """
+        return self.use_bf16_output or (
+            self.quant_output is not None and not self.use_split_kv
+        )
+
+    @property
     def supports_reduction_dtypes(self) -> bool:
         """Whether split reduction supports the configured input/output dtypes."""
         return (

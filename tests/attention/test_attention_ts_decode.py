@@ -11616,6 +11616,7 @@ def test_attention_ts_decode_mxfp8_output_large_tile_size_q(
 
 
 @_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("regime", ("overflow", "underflow"))
 @pytest.mark.parametrize(
     "qkv_dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16")
 )
@@ -11629,13 +11630,24 @@ def test_attention_ts_decode_mxfp8_output_large_tile_size_q(
     ids=("swaps8-direct", "swaps16-direct", "swaps16-separate"),
 )
 def test_attention_ts_decode_mxfp8_output_scale_beyond_carrier(
-    monkeypatch, qkv_dtype: torch.dtype, tile_size_q: int, split_kv_mode: str
+    monkeypatch,
+    regime: str,
+    qkv_dtype: torch.dtype,
+    tile_size_q: int,
+    split_kv_mode: str,
 ) -> None:
     """The block scale follows the FP32 output, not its 16-bit carrier.
 
-    With V = 1 every output equals ``output_scale``. At 1e5, past the FP16
-    maximum, the recipe stores exponent byte 127 + 16 - 8 = 135 and E4M3 code
-    384 (1e5 / 2**8 = 390.6 rounds to 384) for every block.
+    FP16 spans only 2^-24..65504, so O must not pass through it on either
+    side of ``output_scale``. Every output equals one exact value:
+
+    - overflow: V = 1 and ``output_scale`` = 1e5, past the FP16 maximum. The
+      recipe stores exponent byte 127 + 16 - 8 = 135 and E4M3 code 384
+      (1e5 / 2**8 = 390.6 rounds to 384).
+    - underflow: Q = 0 makes softmax uniform over 4096 tokens, and V = 2^-14
+      at one token gives O = 2^-26, below FP16's flush point 2^-25. With
+      ``output_scale`` = 2^20 the output is 2^-6, so exponent byte
+      127 - 6 - 8 = 113 and E4M3 code 256.
     """
     original = fmha_decode_config.make_decode_config
     split = split_kv_mode != "disabled"
@@ -11656,8 +11668,9 @@ def test_attention_ts_decode_mxfp8_output_scale_beyond_carrier(
     monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
     _resolve_decode_launch_spec.cache_clear()
     try:
+        kv_lens = (1024, 777) if regime == "overflow" else (4096, 4096)
         case = _make_decode_case(
-            kv_lens=(1024, 777),
+            kv_lens=kv_lens,
             num_qo_heads=tile_size_q,
             num_kv_heads=1,
             head_dim=128,
@@ -11670,9 +11683,21 @@ def test_attention_ts_decode_mxfp8_output_scale_beyond_carrier(
             device="cuda",
             seed=11,
         )
-        case.paged_kv_cache[1].fill_(1.0)
+        if regime == "overflow":
+            output_scale, expected_value, expected_byte = 1e5, 1e5, 135
+            case.paged_kv_cache[1].fill_(1.0)
+        else:
+            output_scale, expected_value, expected_byte = 2.0**20, 2.0**-6, 113
+            case.q.zero_()
+            v_cache = case.paged_kv_cache[1]
+            v_cache.zero_()
+            # V = 2^-14 at each request's first token (HND: [page, h, slot, d]).
+            for batch in range(2):
+                v_cache[int(case.block_tables[batch, 0]), :, 0, :] = 2.0**-14
         wrapper = _plan_case(
-            replace(case, out_dtype=_FP8), max_kv_len=1024, out_scale_dtype=_E8M0
+            replace(case, out_dtype=_FP8),
+            max_kv_len=max(kv_lens),
+            out_scale_dtype=_E8M0,
         )
         config = wrapper._plan_state.config
         assert config.tile_size_q == tile_size_q
@@ -11685,14 +11710,14 @@ def test_attention_ts_decode_mxfp8_output_scale_beyond_carrier(
             case.paged_kv_cache,
             case.seq_lens_kv,
             case.block_tables,
-            output_scale=1e5,
+            output_scale=output_scale,
             out=out,
             out_scale=out_scale,
         )
         expected_data, expected_exponents = mxfp8_reference_quantize(
-            torch.full((2, cols), 1e5, device="cuda")
+            torch.full((2, cols), expected_value, device="cuda")
         )
-        assert int(expected_exponents.unique().item()) == 135
+        assert int(expected_exponents.unique().item()) == expected_byte
         exponents = unswizzle_mxfp8_scales(out_scale, 2, cols // 32)
         assert torch.equal(exponents, expected_exponents)
         assert torch.equal(
