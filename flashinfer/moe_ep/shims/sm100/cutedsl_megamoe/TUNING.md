@@ -1,15 +1,18 @@
 # SM100 MegaMoE tuning
 
 The unsuffixed NVFP4 and MXFP8 selectors use the provider's `sources/`
-implementation. Set `kernel_variant="genphase"` for GenPhase. The retained
+implementation. Set `kernel_variant="genphase"` to pin GenPhase, or use
+`kernel_variant="auto", knobs="auto"` to compare eligible variants during
+`autotune_v2()` warmup. The retained
 NVFP4 implementation uses `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy`; BF16/BF16
 and BF16/MXFP8 keep their selectors. The `_next` selectors and the short
 `nvfp4_cutedsl` / `mxfp8_cutedsl` aliases are removed.
 
 Standard and GenPhase tuning keep their existing production grids. Compatible
 records from the former `_next` route keep their identities through the rename;
-legacy MXFP8 records do not apply to the replacement. The offline NVFP4 tuner's
-existing `--implementation next` option selects the sources-backed route.
+legacy MXFP8 records do not apply to the replacement. The offline NVFP4 tuner
+defaults to standard inference. Use `--implementation legacy` for the retained
+NVFP4 inference kernel. The `next` option is a deprecated alias for the default.
 Keep graph workspace capacity representative of the serving workload.
 Native SM100 knobs use `cluster_shape_mn=(M, N)`. Legacy
 `cluster_shape_mnk` dictionaries require retuning; renaming the key does not

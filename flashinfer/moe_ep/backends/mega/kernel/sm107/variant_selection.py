@@ -8,24 +8,23 @@ import json
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
-import torch
+from flashinfer.autotuner import TuningContext, TuningResult
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
+    NAMESPACE as NATIVE_NAMESPACE,
+)
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
+    validate_context,
+)
 
-from flashinfer.autotuner import AutoTuner, TuningContext, TuningResult
-
-from .....core.kernel.base import MegaKernelBackend
-from .....core.tuning_state import AutoTuningState
+from .....core.tuning_state import prepared_for_serving as prepared_for_serving
 from .....core.validation.common import MoEEpConfigError
+from ..variant_selection import VariantBackend, VariantWorkspace
 from .forward_tuning import ForwardExecution
-from .automatic import prepared_for_serving, record_prepared
 from .shared_expert import Sm107SharedExpertWeights
 
 if TYPE_CHECKING:
-    from .....config import FleetParams
-    from .....tensors import MoEEpTensors
-    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
-        Sm107BlockScaledSymmBuffer,
-    )
-    from .automatic import RubinBackend
+    import torch
+
     from .mxfp8_mxfp8_bf16_cutedsl.config import (
         Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     )
@@ -44,54 +43,7 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _context() -> TuningContext:
-    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
-        validate_context,
-    )
-
-    context = AutoTuner.get().protocol_context(NAMESPACE)
-    validate_context(context)
-    return context
-
-
-def _cache_identity(context: TuningContext) -> tuple:
-    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
-        NAMESPACE as NATIVE_NAMESPACE,
-    )
-
-    return context.cache_identity, context.tuner.protocol_context(
-        NATIVE_NAMESPACE
-    ).skipped
-
-
-def _identity(context: TuningContext) -> tuple:
-    from .....core.tuning_measurement import measurement_settings
-
-    return _cache_identity(context), measurement_settings(context)
-
-
-def _pending(state: AutoTuningState, context: TuningContext) -> bool:
-    if state.cache_identity != _cache_identity(context):
-        return True
-    if context.tuning_enabled:
-        return state.tuned_identity != _identity(context)
-    return state.winner is None and state.lookup_scope != (
-        context.scope,
-        _cache_identity(context),
-    )
-
-
-@dataclasses.dataclass
-class VariantWorkspace:
-    fleet: FleetParams
-    kernel: RubinBackend
-    workspace: Sm107BlockScaledSymmBuffer
-    _tuning_state: AutoTuningState = dataclasses.field(default_factory=AutoTuningState)
-    tensors: MoEEpTensors | None = None
-    quantize_input: bool = True
-
-
-class RubinVariantBackend(MegaKernelBackend):
+class RubinVariantBackend(VariantBackend):
     """Select a variant and its knobs by complete-forward latency."""
 
     _config: (
@@ -99,92 +51,16 @@ class RubinVariantBackend(MegaKernelBackend):
         | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
         | Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     )
-    supports_output_view = True
-    supports_auto_workspaces = True
-
     supports_shared_expert = True
+    variant_namespace = NAMESPACE
+    native_namespace = NATIVE_NAMESPACE
+    _validate_context = staticmethod(validate_context)
 
-    def __init__(self, config, backend_type):
-        super().__init__(config)
-        if config.knobs != "auto":
-            raise MoEEpConfigError("kernel_variant='auto' requires knobs='auto'")
-        self._backend_type = backend_type
-        self._fallback = backend_type(
-            dataclasses.replace(config, kernel_variant="inference")
-        )
+    def _protocol(self, workspace, weights, output):
+        return _VariantProtocol(self, workspace, weights, output)
 
-    def ep_weight_pack(self, weights):
-        return self._fallback.ep_weight_pack(weights)
-
-    def ep_selected_config(self, workspace):
-        return workspace.kernel.ep_selected_config(workspace.workspace)
-
-    def ep_tuning_fallback(self):
-        return self._fallback.ep_tuning_fallback()
-
-    def ep_force_tune(self, workspace, tensors, weights, output):
-        self.stage_inputs(tensors, workspace, quantize_input=True)
-        AutoTuner.get().choose_with_protocol(
-            NAMESPACE,
-            _VariantProtocol(self, workspace, weights, output),
-            force_tune=True,
-        )
-
-    def ep_tuning_contract(self, fleet_params):
-        return self._fallback.ep_tuning_contract(fleet_params)
-
-    @classmethod
-    def kernel_name(cls):
-        return NAMESPACE
-
-    def bind_ep_bootstrap(self, bootstrap):
-        super().bind_ep_bootstrap(bootstrap)
-        self._fallback.bind_ep_bootstrap(bootstrap)
-
-    def runtime_requirements(self, bootstrap):
-        return self._fallback.runtime_requirements(bootstrap)
-
-    def validate_init(self, bootstrap, fleet_params):
-        self._ensure_ep_bootstrap(bootstrap)
-        self._fallback.validate_init(bootstrap, fleet_params)
-
-    def preprocess_weights(self, weights, fleet_params):
-        # Both variants consume the same format-specific weight layout.
-        return self._fallback.preprocess_weights(weights, fleet_params)
-
-    def validate_transformed_weights(self, weights, bootstrap, fleet_params):
-        self._fallback.validate_transformed_weights(weights, bootstrap, fleet_params)
-
-    def validate_forward(self, t, fleet_params, *, quantize_input):
-        self._fallback.validate_forward(t, fleet_params, quantize_input=quantize_input)
-
-    def _gather(self, value):
-        if self.ep_world_size == 1:
-            return [value]
-        import torch.distributed as dist
-
-        values = [None] * self.ep_world_size
-        dist.all_gather_object(values, value, group=self.ep_comm_group)
-        return values
-
-    def _backend(self, variant, knobs="auto"):
-        backend = self._backend_type(
-            dataclasses.replace(
-                self._config, kernel_variant=variant, knobs=deepcopy(knobs)
-            )
-        )
-        backend.bind_ep_bootstrap(self._ep_bootstrap)
-        return backend
-
-    def _fixed_backend(self, workspace):
-        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
-
-        knobs = {key: getattr(workspace.config, key) for key in KNOB_KEYS}
-        return self._backend(workspace.config.kernel_variant, knobs)
-
-    def _allocate_workspace(self, fleet_params):
-        workspace = self._fallback.prepare_workspace(self._ep_bootstrap, fleet_params)
-        return VariantWorkspace(fleet_params, self._fixed_backend(workspace), workspace)
+    def _prepare_capture(self, workspace, weights):
+        workspace.kernel.ep_prepare_fixed(workspace.workspace, weights)
 
     def _eligible(self, fleet):
         from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
@@ -232,115 +108,11 @@ class RubinVariantBackend(MegaKernelBackend):
             )
         return eligible
 
-    def coordinate_workspace_replacement(self, workspace):
-        context = _context()
-        state = workspace._tuning_state
-        if torch.cuda.is_current_stream_capturing():
-            if state.cache_identity != _cache_identity(context):
-                raise RuntimeError(
-                    "Warm up variant selection after changing the autotune context"
-                )
-            return False
-        if prepared_for_serving(state, context):
-            return False
-        replace = (
-            state.graph_captured
-            and _pending(state, context)
-            and (
-                context.tuning_enabled
-                or state.cache_identity != _cache_identity(context)
-            )
-        )
-        decisions = self._gather((context.tuning_enabled, replace))
-        if any(enabled != context.tuning_enabled for enabled, _ in decisions):
-            raise ValueError("EP ranks disagree on whether variant tuning is enabled")
-        return any(replace for _, replace in decisions)
 
-    def validate_capture_ready(self, workspace, weights):
-        context = _context()
-        if _pending(workspace._tuning_state, context) and context.tuning_enabled:
-            raise RuntimeError(
-                "Warm up pending variant tuning before CUDA graph capture"
-            )
-        from .shared_expert import bind_shared_weights
-
-        bind_shared_weights(workspace.workspace, weights)
-        workspace.workspace.prepare(*weights)
-
-    def stage_inputs(self, t, workspace, *, quantize_input):
-        workspace.tensors = t
-        workspace.quantize_input = quantize_input
-        workspace.kernel.stage_inputs(
-            t, workspace.workspace, quantize_input=quantize_input
-        )
-
-    def workspace_output(self, workspace):
-        return workspace.workspace.output_activation
-
-    def get_tuned_knobs(self, workspace=None):
-        if workspace is None or workspace._tuning_state.winner is None:
-            raise RuntimeError(
-                "MegaMoE has no completed variant selection for this workspace"
-            )
-        return deepcopy(workspace._tuning_state.winner["knobs"])
-
-    def get_tuned_config(self, workspace=None):
-        knobs = self.get_tuned_knobs(workspace)
-        return dataclasses.replace(
-            self._config,
-            kernel_variant=workspace._tuning_state.winner["variant"],
-            knobs=knobs,
-        )
-
-    def compute(self, workspace, transformed_weights, *, output):
-        context = _context()
-        state = workspace._tuning_state
-        if torch.cuda.is_current_stream_capturing():
-            state.graph_captured = True
-        elif not prepared_for_serving(state, context):
-            decisions = self._gather(
-                (
-                    context.tuning_enabled,
-                    _pending(state, context),
-                    state.graph_captured,
-                    context.skipped and state.winner is not None,
-                )
-            )
-            if any(enabled != context.tuning_enabled for enabled, *_ in decisions):
-                raise ValueError(
-                    "EP ranks disagree on whether variant tuning is enabled"
-                )
-            select = any(pending for _, pending, _, _ in decisions)
-            if select and any(captured for _, _, captured, _ in decisions):
-                if context.tuning_enabled or any(
-                    fallback for *_, fallback in decisions
-                ):
-                    raise RuntimeError(
-                        "Create another explicit workspace before later variant selection"
-                    )
-                # Another replay context may retry an earlier miss. Captured
-                # storage keeps its prepared fallback without another lookup.
-                select = False
-            if select:
-                AutoTuner.get().choose_with_protocol(
-                    NAMESPACE,
-                    _VariantProtocol(self, workspace, transformed_weights, output),
-                )
-                # Selection can replace the staged storage.
-                workspace.kernel.stage_inputs(
-                    workspace.tensors,
-                    workspace.workspace,
-                    quantize_input=workspace.quantize_input,
-                )
-            record_prepared(state, context)
-        workspace.tensors = None
-        return workspace.kernel.compute(
-            workspace.workspace, transformed_weights, output=output
-        )
-
-    def destroy(self, workspace):
-        if workspace is not None:
-            workspace.kernel.destroy(workspace.workspace)
+_context = RubinVariantBackend._context
+_cache_identity = RubinVariantBackend._cache_identity
+_identity = RubinVariantBackend._identity
+_pending = RubinVariantBackend._pending
 
 
 class _VariantProtocol:

@@ -1,9 +1,9 @@
 """Offline tuning for CuTe DSL MegaMoE backends.
 
 ``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
-``sm90_fp8_*`` / ``sm90_mxfp4`` / ``sm90_bf16`` dtypes select the Hopper tuners. BF16 and
-mixed BF16/MXFP8 are supported by the SM100 tuner only. MXFP4/MXFP8 is
-wired for SM107.
+``sm90_fp8_*`` / ``sm90_mxfp4`` / ``sm90_bf16`` dtypes select the Hopper tuners.
+BF16 and mixed BF16/MXFP8 use the SM100 tuner. MXFP4/MXFP8 is supported
+on SM100 and SM107.
 
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
@@ -11,7 +11,7 @@ Match the deployment's GPU, EP world size, geometry, and token capacity::
         --arch sm100 --dtype nvfp4 --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
-Use ``--implementation legacy`` to tune the retained SM100 NVFP4 kernel.
+Use ``--implementation legacy`` to tune the retained SM100 NVFP4 inference kernel.
 
 Hopper Humming MXFP4 fused (the scale ABI is selected automatically)::
 
@@ -101,9 +101,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--implementation",
         choices=("default", "legacy", "next"),
         default="default",
-        help="SM100 NVFP4 Standard uses the serving kernel by default. "
-        "Select legacy for the retained NVFP4 kernel. "
-        "The next option remains an alias for default on SM100 block-scaled kernels.",
+        help="legacy selects the retained SM100 NVFP4 inference kernel. "
+        "next is a deprecated alias for default on SM100 block-scaled kernels.",
     )
     parser.add_argument(
         "--shared-expert",
@@ -138,7 +137,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--kernel-variant",
         choices=("inference", "genphase", "auto"),
         default="inference",
-        help="kernel composition; auto compares eligible SM107 variants; "
+        help="kernel composition; auto compares eligible SM100 and SM107 variants; "
         "GenPhase capacity <= 1024",
     )
     parser.add_argument(
@@ -262,14 +261,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def _argument_error(args: argparse.Namespace) -> Optional[str]:
     """Return an error for unsupported dtype-specific tuning options."""
     if args.kernel_variant == "auto":
-        if args.arch not in ("auto", "sm107") or args.dtype not in (
+        if args.arch not in ("auto", "sm100", "sm107") or args.dtype not in (
             "nvfp4",
             "mxfp8_e4m3",
             "mxfp8_e5m2",
             "mxfp4_mxfp8",
             "mxfp4",
         ):
-            return "--kernel-variant auto requires SM107 block-scaled quantization"
+            return "--kernel-variant auto requires SM100 or SM107 block-scaled quantization"
         if args.warmup_iters < 1 or args.timed_iters < 1:
             return "--warmup-iters and --timed-iters must be positive"
         if args.max_candidates is not None and args.max_candidates < 1:
@@ -404,10 +403,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    if args.kernel_variant == "auto" and family != "sm107":
-        print("--kernel-variant auto requires SM107", file=sys.stderr)
-        return 2
-
     sm100_block_scaled = family == "sm100" and args.dtype in (
         "nvfp4",
         "mxfp8_e4m3",
@@ -416,7 +411,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if args.implementation == "next" and not sm100_block_scaled:
         print(
-            "--implementation next requires SM100 block-scaled inference",
+            "--implementation next requires SM100 block-scaled quantization",
             file=sys.stderr,
         )
         return 2
@@ -432,6 +427,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     use_sm100_native = sm100_block_scaled and args.implementation != "legacy"
 
+    if family == "sm100" and args.kernel_variant == "auto":
+        if not args.do_finalize:
+            print("Blackwell variant auto requires --do-finalize", file=sys.stderr)
+            return 2
+        if args.base_knobs is not None:
+            print(
+                "Blackwell --base-knobs requires an explicit --kernel-variant",
+                file=sys.stderr,
+            )
+            return 2
+
     if not args.do_finalize or (
         not args.apply_routing_weights_before_fc2
         and args.kernel_variant != "genphase"
@@ -439,7 +445,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         if family != "sm100" or not (
             args.dtype == "nvfp4"
-            or (use_sm100_native and args.kernel_variant == "inference")
+            or (use_sm100_native and args.kernel_variant in ("inference", "auto"))
         ):
             print(
                 "caller finalization and routing-weight placement require SM100 "
@@ -463,7 +469,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         and args.dtype != "nvfp4"
         and not use_sm100_native
     ):
-        print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)
+        print("--combine-dtype requires block-scaled SM100 or SM107", file=sys.stderr)
         return 2
     if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":
         print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
@@ -494,7 +500,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if (
         family != "sm107"
-        and not (use_sm100_native and args.kernel_variant == "inference")
+        and not (use_sm100_native and args.kernel_variant in ("inference", "auto"))
         and not (
             family == "sm100"
             and args.kernel_variant == "genphase"

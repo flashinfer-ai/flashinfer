@@ -145,6 +145,7 @@ class GenphaseConfigMixin(BlackwellEpTuningMixin):
                     live_tokens=live_tokens,
                     constraints=constraints,
                     use_cache=gpu and not automatic,
+                    allow_live_token_fallback=self._config.knobs is None,
                 )
                 self._genphase_configs[key] = dataclasses.replace(base, **knobs)
             return self._genphase_configs[key]

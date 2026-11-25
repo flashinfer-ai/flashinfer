@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, TypeAlias
 
+from .....core.tuning_state import prepared_for_serving, record_prepared
+
 if TYPE_CHECKING:
     import torch
 
@@ -60,6 +62,8 @@ def coordinate_workspace_replacement(
         return False
     context = tuning_context()
     state = workspace._tuning_state
+    if prepared_for_serving(state, context):
+        return False
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         if state.cache_identity != context.cache_identity:
             raise RuntimeError(
@@ -110,7 +114,12 @@ def prepare_auto_configuration(
     """
     if backend._config.knobs != "auto":
         return
+    inputs = getattr(workspace, "_tuning_inputs", None)
+    workspace._tuning_inputs = None
     context = tuning_context()
+    state = workspace._tuning_state
+    if prepared_for_serving(state, context):
+        return
     select = needs_selection(workspace, context)
     import torch
 
@@ -127,6 +136,7 @@ def prepare_auto_configuration(
             raise ValueError("EP ranks disagree on whether MegaMoE tuning is enabled")
         select = any(pending for _, pending in decisions)
     if not select:
+        record_prepared(state, context)
         return
     from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
         autotune_sm100_block_scaled_mega_moe,
@@ -134,12 +144,34 @@ def prepare_auto_configuration(
     from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import knob_keys
 
     cfg = workspace.config
-    state = workspace._tuning_state
     if state.initial_knobs is None:
         state.initial_knobs = {name: getattr(cfg, name) for name in knob_keys(cfg)}
     constraints = (
         backend._genphase_constraints() if cfg.kernel_variant == "genphase" else None
     )
+    extra = {}
+    if inputs is not None:
+        from .forward_tuning import ForwardExecution
+
+        tensors, quantize_input = inputs
+        execution = ForwardExecution(
+            backend, tensors, quantize_input=quantize_input, output=output
+        )
+        if context.tuning_enabled:
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
+                _prepare_collectively,
+            )
+
+            _prepare_collectively(
+                execution.prepare_trial_output,
+                backend.ep_world_size,
+                backend.ep_comm_group if backend.ep_world_size > 1 else None,
+            )
+            output = execution.output
+        extra = {
+            "make_trial": execution.make_trial,
+            "execution_contract": execution.contract(),
+        }
     winner = autotune_sm100_block_scaled_mega_moe(
         output,
         weights[0],
@@ -151,9 +183,11 @@ def prepare_auto_configuration(
         force_tune=False,
         install_winner=True,
         allow_nondeterministic=backend._config.enable_in_kernel_fc2_reduce,
+        **extra,
     )
     if winner is None and state.graph_captured:
         # Captured explicit handles retain their prepared configuration.
+        record_prepared(state, context)
         return
     if winner is None and state.winner is not None:
         from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
@@ -177,3 +211,4 @@ def prepare_auto_configuration(
             else None
         ),
     )
+    record_prepared(state, context)

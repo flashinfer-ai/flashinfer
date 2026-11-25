@@ -57,17 +57,18 @@ def blackwell_bootstrap(request):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("requires SM100/SM103")
     bootstrap = moe_ep.BootstrapConfig(rank=rank, world_size=world)
-    if world == 1:
-        os.environ["MEGA_NO_DIST"] = "1"
-    runtime = moe_ep.bootstrap_moe_ep_runtime(
-        bootstrap,
-        create_mega_kernel(config("nvfp4", "inference")).runtime_requirements(
-            bootstrap
-        ),
-    )
-    yield dataclasses.replace(bootstrap, auto_bootstrap=False)
-    if not request.session.testsfailed:
-        moe_ep.finalize_moe_ep_runtime(runtime)
+    with pytest.MonkeyPatch.context() as patch:
+        if world == 1:
+            patch.setenv("MEGA_NO_DIST", "1")
+        runtime = moe_ep.bootstrap_moe_ep_runtime(
+            bootstrap,
+            create_mega_kernel(config("nvfp4", "inference")).runtime_requirements(
+                bootstrap
+            ),
+        )
+        yield dataclasses.replace(bootstrap, auto_bootstrap=False)
+        if not request.session.testsfailed:
+            moe_ep.finalize_moe_ep_runtime(runtime)
 
 
 @pytest.mark.arch_blackwell
@@ -366,3 +367,209 @@ def test_auto_nvfp4_n64_persistence_and_capture(
     test_auto_persistence_and_capture(
         "nvfp4", "inference", "native", blackwell_bootstrap, monkeypatch, tmp_path
     )
+
+
+def _check_auto_variant(kind, requested, bootstrap, monkeypatch, tmp_path):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100 import variant_selection
+
+    rank, world = bootstrap.rank, bootstrap.world_size
+    hidden, intermediate, capacity, live = 512, 256, 128, 65 - rank
+    generator = torch.Generator(device="cuda").manual_seed(433 + rank)
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", generator=generator)
+
+    weights = moe_ep.MoEWeightPack(
+        (randn(4, 2 * intermediate, hidden) / hidden**0.5).bfloat16(),
+        (randn(4, hidden, intermediate) / intermediate**0.5).bfloat16(),
+    )
+    ids = (
+        torch.rand(live, 4 * world, device="cuda", generator=generator)
+        .topk(3, dim=-1)
+        .indices.int()
+    )
+    ids[0].fill_(-1)
+    scores = torch.full((live, 3), 1 / 3, device="cuda")
+    tensors = moe_ep.MoEEpTensors(randn(live, hidden).bfloat16(), ids, scores)
+    if kind == "nvfp4":
+        config_type = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        options = {}
+    elif kind == "mxfp4_mxfp8":
+        config_type = moe_ep.Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        options = {}
+    else:
+        config_type = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        options = {"kind": kind}
+    if requested == "inference":
+        options.update(swiglu_alpha=1.702, swiglu_beta=1.0)
+    config = config_type(
+        intermediate_size=intermediate,
+        top_k=3,
+        kernel_variant="auto",
+        knobs="auto",
+        finalize_mode=moe_ep.FinalizeMode.DEFAULT,
+        **options,
+    )
+    fleet = moe_ep.FleetParams(4 * world, capacity, hidden)
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    cache_root = str(tmp_path / "managed")
+    calls = []
+    sweep = native._sweep_sm100_mega_moe
+
+    def sample(*args, **kwargs):
+        variant = args[3].config.kernel_variant
+        assert kwargs["make_trial"] is not None
+        kwargs.update(warmup_iters=1, timed_iters=2, calls_per_sample=1)
+        kwargs["candidates"] = kwargs["candidates"][:1]
+        knobs, score, count = sweep(*args, **kwargs)
+        assert count > 0
+        calls.append(variant)
+        # Use the real trial and oracle, then fix the ranking to cover handoff.
+        return knobs, 1.0 if variant == requested else max(2.0, score), count
+
+    monkeypatch.setattr(native, "_sweep_sm100_mega_moe", sample)
+    tuner = AutoTuner.get()
+
+    def clear_cache():
+        tuner.clear_cache()
+        tuner._managed_cache = None
+        tuner._managed_stores.clear()
+
+    def make_layer(options=config, transformed=None):
+        layer = MoEEpMegaLayer(
+            bootstrap,
+            fleet,
+            weights,
+            moe_ep.MegaConfig(megakernel=options, transformed_weights=transformed),
+        )
+        layers.append(layer)
+        return layer
+
+    def check(layer, output, workspace):
+        indices, expected = pkg.sampled_reference(
+            workspace, *layer.get_transformed_weights(), live
+        )
+        error = torch.tensor(pkg.output_error(output, indices, expected), device="cuda")
+        if world > 1:
+            dist.all_reduce(error, op=dist.ReduceOp.MAX)
+        assert error.item() < 0.02
+
+    clear_cache()
+    layers = []
+    graph = torch.cuda.CUDAGraph()
+    try:
+        layer = make_layer()
+        if world == 1 and kind == "nvfp4":
+            with autotune_v2(
+                mode="replay",
+                skip_ops={variant_selection.NAMESPACE},
+                tuning_buckets=(64,),
+                cache_root=cache_root,
+            ):
+                layer.warmup(tensors)
+        with autotune_v2(mode="replay", cache_root=cache_root):
+            layer.warmup(tensors)
+            fallback = layer._workspace
+            assert fallback.workspace.config.kernel_variant == "inference"
+            with torch.cuda.graph(graph):
+                fallback_output = layer.forward(tensors)
+        assert not calls
+        tune_input = tensors
+        if world == 1 and kind == "nvfp4":
+            aliased = tensors.hidden_states.clone()
+            tune_input = dataclasses.replace(
+                tensors, hidden_states=aliased, output=aliased
+            )
+        with autotune_v2(cache_root=cache_root):
+            layer.warmup(tune_input)
+        assert calls == (
+            ["inference", "genphase"] if requested == "genphase" else ["inference"]
+        )
+        assert fallback in layer._retired_tuning_workspaces
+        selected = layer.get_tuned_config()
+        assert selected.kernel_variant == requested
+        assert selected.knobs == layer.get_tuned_knobs()
+        with autotune_v2(mode="replay", cache_root=cache_root):
+            expected = layer.forward(tensors)
+            check(layer, expected, layer._workspace.workspace)
+            if tune_input is not tensors:
+                torch.testing.assert_close(tune_input.output, expected, rtol=0, atol=0)
+                padded = torch.full(
+                    (capacity + 1, hidden), -17, dtype=torch.bfloat16, device="cuda"
+                )
+                assert (
+                    layer.forward(dataclasses.replace(tensors, output=padded)) is padded
+                )
+                torch.testing.assert_close(padded[:live], expected, rtol=0, atol=0)
+                assert (padded[live:] == -17).all()
+        graph.replay()
+        torch.cuda.synchronize()
+        check(layer, fallback_output, fallback.workspace)
+        graph.reset()
+
+        transformed = layer.get_transformed_weights()
+        fixed = make_layer(selected, transformed)
+        fixed.warmup(tensors)
+        check(fixed, fixed.forward(tensors), fixed._workspace)
+        clear_cache()
+        if rank == 0:
+            native_file = tmp_path / "restored-knobs.json"
+            monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(native_file))
+        replay = make_layer(transformed=transformed)
+        with autotune_v2(mode="replay", cache_root=cache_root):
+            replay.warmup(tensors)
+            assert replay.get_tuned_config() == selected
+            assert replay.get_tuned_knobs() == selected.knobs
+            assert len(calls) == (2 if requested == "genphase" else 1)
+            if rank == 0:
+                records = tuner.get_protocol_records(variant_selection.NAMESPACE)
+                assert records
+                entry = json.loads(native_file.read_text())["entries"][0]
+                assert entry["timing_boundary"] == "complete_forward"
+                assert entry["problem"]["kernel_variant"] == requested
+                assert (
+                    knob_cache._decode(entry, replay._workspace.workspace.config)
+                    == selected.knobs
+                )
+            with torch.cuda.graph(graph):
+                replay_output = replay.forward(tensors)
+            tensors.hidden_states.mul_(0.75)
+            graph.replay()
+            torch.cuda.synchronize()
+            check(replay, replay_output, replay._workspace.workspace)
+        graph.reset()
+    except BaseException:
+        if world > 1:
+            # A rank-local failure can leave a peer inside a collective launch.
+            layers.clear()
+        raise
+    finally:
+        for layer in reversed(layers):
+            layer.destroy()
+        clear_cache()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "kind,requested",
+    [
+        ("nvfp4", "genphase"),
+        ("mxfp8_e4m3", "genphase"),
+        ("mxfp8_e5m2", "genphase"),
+        ("mxfp4_mxfp8", "genphase"),
+        ("mxfp8_e4m3", "inference"),
+    ],
+)
+def test_auto_variant_single_rank(
+    kind, requested, blackwell_bootstrap, monkeypatch, tmp_path
+):
+    if blackwell_bootstrap.world_size != 1:
+        pytest.skip("requires one rank")
+    _check_auto_variant(kind, requested, blackwell_bootstrap, monkeypatch, tmp_path)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp4_mxfp8"])
+def test_auto_variant_multirank(kind, blackwell_bootstrap, monkeypatch, tmp_path):
+    _check_auto_variant(kind, "genphase", blackwell_bootstrap, monkeypatch, tmp_path)

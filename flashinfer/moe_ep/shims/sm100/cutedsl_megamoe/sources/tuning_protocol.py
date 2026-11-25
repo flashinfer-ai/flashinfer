@@ -11,9 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from flashinfer.autotuner import TuningContext, TuningResult
 from flashinfer.jit.core import logger
+from flashinfer.moe_ep.core.tuning import token_bucket_sort_key
 
 from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import knob_cache
 from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
+    NoPassingCandidate,
     _prepare_collectively,
 )
 from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
@@ -70,6 +72,7 @@ class BlackwellTuningProtocol:
         allow_nondeterministic: bool | None = None,
         make_trial=None,
         execution_contract: dict | None = None,
+        remeasure_cached: bool = False,
     ) -> None:
         if (make_trial is None) != (execution_contract is None):
             raise ValueError(
@@ -96,6 +99,9 @@ class BlackwellTuningProtocol:
         self.warmup_iters, self.timed_iters = warmup_iters, timed_iters
         self.group = process_group
         self.install_winner = install_winner
+        self.remeasure_cached = remeasure_cached
+        self.latency_us: float | None = None
+        self.selected_record: dict[str, Any] | None = None
 
     def _gather(self, value):
         import torch.distributed as dist
@@ -117,13 +123,18 @@ class BlackwellTuningProtocol:
             else base
         )
 
-    def _compatible(self, record, contract, context, measurement):
+    def _compatible(
+        self, record, contract, context, measurement, *, kernel_replay=False
+    ):
         if not isinstance(record, dict):
             return False
-        boundary = "complete_forward" if self.make_trial is not None else "kernel"
+        if knob_cache.allows_nondeterministic(record) != self.allow_nondeterministic:
+            return False
+        complete_forward = self.make_trial is not None and not kernel_replay
+        boundary = "complete_forward" if complete_forward else "kernel"
         if record.get("timing_boundary", "kernel") != boundary:
             return False
-        if self.make_trial is not None and record.get("protocol_contract") != contract:
+        if complete_forward and record.get("protocol_contract") != contract:
             return False
         if record.get("protocol_contract") not in (None, contract):
             return False
@@ -163,7 +174,17 @@ class BlackwellTuningProtocol:
             )
             return False
 
-    def _lookup(self, entries, query, contract, context, measurement):
+    def _lookup(
+        self,
+        entries,
+        query,
+        contract,
+        context,
+        measurement,
+        *,
+        kernel_replay=False,
+        allow_live_token_fallback=False,
+    ):
         records = {}
         for rank_entries in self._gather(entries):
             for entry in rank_entries:
@@ -171,17 +192,52 @@ class BlackwellTuningProtocol:
                     records.setdefault(_json(entry), entry)
                 except (TypeError, ValueError):
                     continue
+        workload = (
+            {key: value for key, value in query.items() if key != "live_tokens"}
+            if allow_live_token_fallback
+            else query
+        )
         entries = [
             e
             for e in records.values()
-            if isinstance(e, dict) and all(e.get(k) == v for k, v in query.items())
+            if isinstance(e, dict) and all(e.get(k) == v for k, v in workload.items())
         ]
-        valid = [self._compatible(e, contract, context, measurement) for e in entries]
+        if allow_live_token_fallback:
+            entries = knob_cache._replay_entries(
+                reversed(entries), query["live_tokens"], self.cfg.max_tokens_per_rank
+            )
+        valid = [
+            self._compatible(
+                e, contract, context, measurement, kernel_replay=kernel_replay
+            )
+            for e in entries
+        ]
         ranks = self._gather(valid)
         matches = [e for i, e in enumerate(entries) if all(rank[i] for rank in ranks)]
-        # Native lookup prefers the latest exact-workload entry. Agree even if
-        # ranks loaded different winners from independent stores.
-        return matches[-1] if matches else None
+        # Agree even if ranks loaded different winners from independent stores.
+        if not matches:
+            return None
+        return matches[0] if allow_live_token_fallback else matches[-1]
+
+    def _sweep(self, candidates, measurement):
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
+            _sweep_sm100_mega_moe,
+        )
+
+        return _sweep_sm100_mega_moe(
+            self.y,
+            self.l1,
+            self.l2,
+            self.workspace,
+            num_tokens=self.num_tokens,
+            candidates=candidates,
+            warmup_iters=self.warmup_iters,
+            timed_iters=self.timed_iters,
+            calls_per_sample=self.calls_per_sample,
+            process_group=self.group,
+            measurement=measurement,
+            make_trial=self.make_trial,
+        )
 
     def run(self, context: TuningContext) -> TuningResult:
         import torch
@@ -249,6 +305,7 @@ class BlackwellTuningProtocol:
             self.constraints,
             self.allow_nondeterministic,
             self.install_winner,
+            self.remeasure_cached,
             context.tuning_enabled,
             context.force_tune,
             context.disk_cache_enabled,
@@ -311,20 +368,82 @@ class BlackwellTuningProtocol:
                 "EP ranks disagree on the Blackwell tuning implementation or device"
             )
         record = None
+        record_contract = contract
         if not context.force_tune:
-            record = self._lookup(
-                list(context.records().values()), query, contract, context, measurement
-            )
+            memory_entries = list(context.records().values())
+            disk_entries: list[dict[str, Any]] = []
+            record = self._lookup(memory_entries, query, contract, context, measurement)
             if record is None and context.disk_cache_enabled:
                 path = knob_cache.knob_cache_path()
                 try:
-                    entries = [] if path is None else knob_cache._read(path)["entries"]
+                    disk_entries = (
+                        [] if path is None else knob_cache._read(path)["entries"]
+                    )
                 except Exception as exc:
                     logger.warning(
                         f"[Autotuner]: Cannot read MegaMoE cache file: {exc}"
                     )
-                    entries = []
-                record = self._lookup(entries, query, contract, context, measurement)
+                record = self._lookup(
+                    disk_entries, query, contract, context, measurement
+                )
+            kernel_replay_allowed = (
+                self.make_trial is not None
+                and self.install_winner
+                and not context.tuning_enabled
+            )
+            if record is None and kernel_replay_allowed:
+                # Honor older fixed-variant offline records on replay misses.
+                # Keep them in the kernel timing boundary.
+                for entries in (memory_entries, disk_entries):
+                    record = self._lookup(
+                        entries,
+                        query,
+                        contract["kernel"],
+                        context,
+                        measurement,
+                        kernel_replay=True,
+                    )
+                    if record is not None:
+                        record_contract = contract["kernel"]
+                        break
+            if record is None and not context.tuning_enabled:
+                # Exact records in either store take precedence over bucket replay.
+                entries = [*disk_entries, *memory_entries]
+                live_tokens = query["live_tokens"]
+                record = self._lookup(
+                    entries,
+                    query,
+                    contract,
+                    context,
+                    measurement,
+                    allow_live_token_fallback=True,
+                )
+                if kernel_replay_allowed:
+                    kernel_record = self._lookup(
+                        entries,
+                        query,
+                        contract["kernel"],
+                        context,
+                        measurement,
+                        kernel_replay=True,
+                        allow_live_token_fallback=True,
+                    )
+                    if kernel_record is not None and (
+                        record is None
+                        or token_bucket_sort_key(
+                            kernel_record["live_tokens"], live_tokens
+                        )
+                        < token_bucket_sort_key(record["live_tokens"], live_tokens)
+                    ):
+                        record = kernel_record
+                        record_contract = contract["kernel"]
+        if record is not None and self.remeasure_cached and context.tuning_enabled:
+            try:
+                _, self.latency_us, _ = self._sweep(
+                    [knob_cache._decode(record, cfg)], measurement
+                )
+            except NoPassingCandidate:
+                record = None
         cache_hit = record is not None
         if record is None:
             if not context.tuning_enabled:
@@ -333,26 +452,14 @@ class BlackwellTuningProtocol:
                     context.cache_identity,
                 )
                 return TuningResult(None)
-            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
-                _sweep_sm100_mega_moe,
-            )
-
-            knobs, score, successful = _sweep_sm100_mega_moe(
-                self.y,
-                self.l1,
-                self.l2,
-                workspace,
-                num_tokens=self.num_tokens,
-                candidates=self.candidates,
-                warmup_iters=self.warmup_iters,
-                timed_iters=self.timed_iters,
-                calls_per_sample=self.calls_per_sample,
-                process_group=self.group,
-                measurement=measurement,
-                make_trial=self.make_trial,
-            )
+            knobs, score, successful = self._sweep(self.candidates, measurement)
+            self.latency_us = score
             record = knob_cache.make_record(
-                knobs, cfg, live_tokens=max(counts), p50_us=score
+                knobs,
+                cfg,
+                live_tokens=max(counts),
+                p50_us=score,
+                allow_nondeterministic=self.allow_nondeterministic,
             )
             record["measurement_policy"] = policy_fields
             record["profiling_policy"] = {
@@ -383,10 +490,13 @@ class BlackwellTuningProtocol:
                 self.group,
             )
 
+        record = {**record, "protocol_contract": record_contract}
+        if self.allow_nondeterministic:
+            record["allow_nondeterministic"] = True
+        self.selected_record = record
         error = None
         if cfg.rank == 0:
             try:
-                record = {**record, "protocol_contract": contract}
                 key = hashlib.sha256(
                     _json(
                         {
@@ -408,7 +518,10 @@ class BlackwellTuningProtocol:
                 # File consumers must see winners selected from either cache.
                 if context.disk_cache_enabled:
                     try:
-                        knob_cache.write_record(record)
+                        knob_cache.write_record(
+                            record,
+                            overwrite=record["live_tokens"] == query["live_tokens"],
+                        )
                     except Exception as exc:
                         logger.warning(
                             f"[Autotuner]: Cannot write MegaMoE cache file: {exc}"

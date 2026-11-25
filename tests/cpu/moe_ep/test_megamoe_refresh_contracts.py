@@ -45,7 +45,7 @@ def test_public_nvfp4_preparation_matches_default_selector():
         assert legacy_leg[1].dtype == torch.uint8
 
 
-@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("variant", ["inference", "genphase", "auto"])
 @pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e4m3fn, torch.int8])
 def test_sm100_nvfp4_loads_transformed_scale_views(monkeypatch, variant, scale_dtype):
     from flashinfer import moe_ep
@@ -77,7 +77,10 @@ def test_sm100_nvfp4_loads_transformed_scale_views(monkeypatch, variant, scale_d
         None,
         moe_ep.MegaConfig(
             megakernel=moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                intermediate_size=128, top_k=1, kernel_variant=variant
+                intermediate_size=128,
+                top_k=1,
+                kernel_variant=variant,
+                knobs="auto" if variant == "auto" else None,
             ),
             preprocess_weights=False,
             transformed_weights=transformed,

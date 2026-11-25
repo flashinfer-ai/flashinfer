@@ -836,8 +836,8 @@ output = layer.forward(tensors, workspace=workspace)
 selected = layer.get_selected_plan(workspace=workspace)
 ```
 
-Set Rubin's `knobs="auto"` and `kernel_variant="auto"` to search its eligible
-variants and knobs. Explicit Mega variants or knob dictionaries retain their
+Set `knobs="auto"` and `kernel_variant="auto"` on a supported Blackwell or Rubin
+config to search its eligible variants and knobs. Explicit Mega variants or knob dictionaries retain their
 meaning. For each split configuration, the selector enumerates eligible
 compute backends and tactics without using MoELayer's compute-only winner.
 Every tactic is measured through input preparation, dispatch, compute, combine
@@ -895,18 +895,19 @@ with the same kernel configuration and capacity. The getter performs no tuning
 or file access and raises before a successful automatic search or after layer
 destruction. `warmup()` continues to return `None`.
 
-On Rubin, `kernel_variant="auto"` together with `knobs="auto"` selects between
-inference and GenPhase. An enabled `autotune_v2()` warmup selects each variant's
-knobs, then compares the winners. Candidate measurements
-include input staging, compute and output handling at both levels.
-The same numerical settings apply to both variants;
-GenPhase is excluded when its capacity or combine requirements are not met.
+On supported Blackwell and Rubin configs, `kernel_variant="auto"` and
+`knobs="auto"` select between inference and GenPhase. The default variant is
+`"inference"` on both architectures. An enabled `autotune_v2()` warmup selects
+knobs for each eligible variant, then compares the winners. Both searches
+measure staging, compute and output handling. GenPhase participates when it
+supports the requested workload and numerical settings.
 Explicit inference or GenPhase with `knobs="auto"` uses the same complete-forward
-boundary, restricted to that variant. The Rubin offline CLI also measures staging,
-compute and writing an owned output, matching the default layer forward with
-BF16 inputs. Pass `--kernel-variant auto` to search both eligible variants and
-save their winners and the overall selection; explicit variants restrict the
-search. Offline searches bypass cached winners and do not install the result.
+boundary for finalized output, restricted to that variant. The native offline
+CLI also measures staging, compute and writing an owned output, matching the
+default layer forward with BF16 inputs. Pass `--kernel-variant auto` to search
+both eligible variants and save their knobs and the overall selection. An
+explicit variant restricts the search. Offline searches bypass cached winners
+and leave installation to the caller.
 Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
 checks are outside measurement. Match the deployment's input and output layouts
 when reusing automatic results; kernel-only records do not satisfy this objective.
@@ -915,28 +916,36 @@ Each variant's winning knobs are stored in its fixed-variant managed-cache
 records and the MegaMoE compatibility file when persistence is enabled. The
 overall selection has a separate managed entry containing the variant and knobs,
 matched to the workspace capacity, per-rank live-token counts, eligible variants
-and execution contract. Enabled tuning reuses fixed-variant records only when
-their capacity and EP-wide live-token count match the requested workload;
-otherwise it searches that variant's knob grid. Replay retains token-bucket and
-capacity fallbacks for fixed variants. On an overall miss, cached winners are
-checked and timed before comparing variants; a rejected cached choice triggers
-a fresh search within that variant. Reused records retain their search score.
-Overall selections from the previous fallback-only search are invalidated.
-An explicit fresh search bypasses both levels. Skipping fixed-variant tuning
-compares heuristic knobs
-without publishing fixed-variant managed records. A variant-selection replay
+and execution contract. Enabled tuning reuses fixed-variant records only
+when their capacity, EP-wide live-token count, and permission to search
+in-kernel reduction match. At the same capacity, fixed-variant replay on
+Blackwell and Rubin prefers an exact live count, then the smallest compatible
+upper count, then the largest lower count. Rubin can also use compatible
+capacity fallbacks. On an overall miss, cached winners are checked
+and timed before comparing variants. A rejected cached choice triggers a
+fresh search within that variant. Reused records retain their search score.
+Managed variant replay can restore the winner's missing compatibility file
+entry from its measured knob record.
+Older Rubin overall selections from the fallback-only search are invalidated.
+Blackwell fixed-variant replay can use a compatible kernel-only record if it
+matches a higher-priority live bucket. It prefers complete-forward records at the same
+live count. Kernel-only records are never used to time comparisons between
+variants.
+An explicit fresh search bypasses both levels. A candidate rejected by CUDA
+graph capture is dropped from the search. Skipping fixed-variant tuning
+compares heuristic knobs without publishing fixed-variant managed records. A variant-selection replay
 miss uses the inference heuristic and leaves selection pending. Low-level tuning
 of already-staged workspaces remains available for kernel measurements.
 
 Use `layer.get_tuned_config()` to reconstruct a fixed layer after variant
 selection. It returns the concrete kernel config with the selected variant and
 knobs. The knobs-only getter retains its meaning; those knobs alone do not
-identify the variant. Weight preprocessing is shared between Rubin variants.
+identify the variant. Both variants share weight preprocessing on each architecture.
 Automatic workspace handles own separate selection state. Later selection can
 replace a captured default workspace while its old storage remains available to
 existing graphs; captured explicit handles require a new handle.
 
-Rubin automatic workspaces reuse their agreed configuration during ordinary
+Automatic variant workspaces reuse their agreed configuration during ordinary
 eager execution, without selection collectives or cache lookups on each forward.
 Calling the layer inside an explicit tuning or replay context performs collective
 checks; the first bare forward afterward reconciles the ambient cache and controls.

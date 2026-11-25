@@ -53,6 +53,14 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     _workspace_mismatch = "Standard configuration differs across EP ranks"
     quant_kind: str | None = None
 
+    @classmethod
+    def create(cls, config):
+        if config.kernel_variant == "auto":
+            from .variant_selection import BlackwellVariantBackend
+
+            return BlackwellVariantBackend(config, cls)
+        return cls(config)
+
     def __init__(self, config):
         """Validate selector constraints and initialize output capabilities."""
         super().__init__(config)
@@ -138,6 +146,12 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
 
     def _kind(self):
         return self.quant_kind or self._config.kind
+
+    def ep_tuning_contract(self, fleet_params):
+        contract = super().ep_tuning_contract(fleet_params)
+        if self._config.knobs == "auto" and self._config.enable_in_kernel_fc2_reduce:
+            contract["revision"] = "blackwell-complete-ep-ikr-v2"
+        return contract
 
     def runtime_requirements(self, bootstrap):
         require = (
@@ -248,6 +262,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 config,
                 live_tokens=fleet.tuning_live_tokens,
                 constraints=self._standard_cache_constraints(config, fleet),
+                allow_live_token_fallback=True,
             )
             self._standard_profiles[key] = (
                 dataclasses.replace(config, **knobs) if knobs is not None else config
@@ -691,6 +706,9 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             else:
                 target.copy_(value)
 
+        if self._config.knobs == "auto" and not self.supports_unfinalized_output:
+            workspace._tuning_inputs = (t, quantize_input)
+
     def validate_capture_ready(self, workspace, transformed_weights):
         """Require the workspace and any terminal reducer to be warmed up."""
         if workspace._compiled is None:
@@ -723,11 +741,15 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             )
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
+        n = workspace.staged_tokens()
+        if n is None:
+            raise ValueError("compute() requires stage_inputs() first")
         if not getattr(workspace.config, "use_custom_finalize", False):
             view = sm100_block_scaled_mega_moe(
                 output,
                 *transformed_weights,
                 workspace,
+                num_tokens=n,
                 fast_math=self._config.fast_math,
             )
             return output if output is not None else view
@@ -735,9 +757,6 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             get_cake_megamoe_topk_reduce_module,
         )
 
-        n = workspace.staged_tokens()
-        if n is None:
-            raise ValueError("compute() requires stage_inputs() first")
         partials = workspace.custom_finalize_workspace()
         thunk = sm100_block_scaled_mega_launch_thunk(*transformed_weights, workspace)
         reducer = get_cake_megamoe_topk_reduce_module(workspace.device)
@@ -756,7 +775,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             reducer.run(partials, workspace.output_activation, n, stream)
         if output is None:
             return workspace.output_activation[:n]
-        output.copy_(workspace.output_activation[:n])
+        output[:n].copy_(workspace.output_activation[:n])
         return output
 
     def compute_unfinalized(self, workspace, transformed_weights):

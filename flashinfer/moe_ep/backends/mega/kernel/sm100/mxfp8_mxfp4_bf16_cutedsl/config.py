@@ -20,10 +20,13 @@ class Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
     Blackwell caller-validated contract: unique, in-range IDs with finite
     scores, or masked IDs of -1. Masked scores are staged as zero.
 
-    This selects standard inference. ``knobs="auto"`` tunes during collective
-    ``autotune_v2()`` warmup, before CUDA graph capture.
+    Standard inference is the default. Select ``kernel_variant="genphase"``
+    to tune GenPhase directly, or use ``kernel_variant="auto", knobs="auto"``
+    to compare both variants during collective ``autotune_v2()`` warmup.
     """
 
     kernel_name: str = field(default="sm100_mxfp8_mxfp4_bf16_cutedsl", init=False)
     kind: Literal["mxfp4_mxfp8"] = field(default="mxfp4_mxfp8", init=False)
-    kernel_variant: Literal["inference"] = field(default="inference", init=False)
+    kernel_variant: Literal["inference", "genphase", "auto"] = field(
+        default="inference", kw_only=True
+    )

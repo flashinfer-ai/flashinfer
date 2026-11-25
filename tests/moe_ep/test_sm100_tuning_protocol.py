@@ -1,4 +1,4 @@
-"""Blackwell managed tuning, exact native-cache lookup and workspace state."""
+"""Blackwell managed tuning, cache replay and workspace state."""
 
 import dataclasses
 import json
@@ -129,11 +129,12 @@ def state(request, monkeypatch, tmp_path):
         rank=0,
         world_size=1,
     )
-    knobs = (
+    candidates = (
         tuning.sm100_genphase_candidates(cfg, sm_count=148, live_tokens=4)
         if request.param == "genphase"
         else tuning.sm100_standard_candidates(cfg)
-    )[0]
+    )
+    knobs = candidates[0]
     workspace = Workspace(
         config=cfg,
         staged_tokens=lambda: 4,
@@ -156,6 +157,7 @@ def state(request, monkeypatch, tmp_path):
     yield SimpleNamespace(
         workspace=workspace,
         knobs=knobs,
+        other_knobs=candidates[-1],
         sweep=sweep,
         run=run,
         tuner=tuner,
@@ -193,16 +195,17 @@ def test_deferred_search_and_fresh_store_replay_writes_native_file(state):
     state.sweep.assert_called_once()
 
 
-def test_native_import_exact_workload_and_configuration(state):
+def test_native_import_requires_matching_capacity_and_configuration(state):
     cfg = state.workspace.config
     knob_cache.record_knobs(state.knobs, cfg, live_tokens=4, p50_us=1.0)
     with autotune_v2(mode="replay"):
         assert state.run() == state.knobs
+    with autotune_v2(mode="replay"):
+        assert state.run(num_tokens=5) == state.knobs
     assert state.tuner.get_protocol_records(tuning_protocol.NAMESPACE)
     assert not list(state.root.glob("v2/*/entries/*.json"))
     for changes, count in [
         ({"max_tokens_per_rank": 256}, 4),
-        ({}, 5),
         ({"gate_up_clamp": 7.0}, 4),
         ({"max_sm_count": 16}, 4),
     ]:
@@ -210,6 +213,110 @@ def test_native_import_exact_workload_and_configuration(state):
         with autotune_v2(mode="replay"):
             assert state.run(num_tokens=count) is None
     state.sweep.assert_not_called()
+
+
+def test_replay_uses_saved_profile_without_satisfying_exact_tuning(state):
+    cfg = state.workspace.config
+    with autotune_v2():
+        assert state.run(num_tokens=96) == state.knobs
+
+    anchor = knob_cache._read(str(state.path))["entries"][0]
+    assert knob_cache.write_record({**anchor, "p50_us": 3.0})
+
+    with autotune_v2(mode="replay"):
+        assert state.run(num_tokens=65) == state.knobs
+    assert [e["live_tokens"] for e in knob_cache._read(str(state.path))["entries"]] == [
+        96
+    ]
+
+    exact = state.other_knobs
+    assert exact != state.knobs
+    assert knob_cache.record_knobs(exact, cfg, live_tokens=65, p50_us=2.0)
+    with autotune_v2(mode="replay"):
+        assert state.run(num_tokens=65) == exact
+    state.sweep.assert_called_once()
+
+    with autotune_v2():
+        assert state.run(num_tokens=97) == state.knobs
+    assert state.sweep.call_count == 2
+    entries = knob_cache._read(str(state.path))["entries"]
+    assert {e["live_tokens"]: e["p50_us"] for e in entries} == {
+        65: 2.0,
+        96: 3.0,
+        97: 1.0,
+    }
+
+
+@pytest.mark.parametrize("state", ["standard"], indirect=True)
+def test_ikr_permission_requires_expanded_search(state):
+    with autotune_v2():
+        assert state.run() == state.knobs
+
+        protocol = tuning_protocol.BlackwellTuningProtocol(
+            None, None, None, state.workspace, allow_nondeterministic=True
+        )
+        assert (
+            state.tuner.choose_with_protocol(tuning_protocol.NAMESPACE, protocol)
+            == state.knobs
+        )
+        assert any(
+            knobs["reduce_topk_in_kernel"]
+            for knobs in state.sweep.call_args.kwargs["candidates"]
+        )
+
+        assert state.run() == state.knobs
+        assert state.run(allow_nondeterministic=True) == state.knobs
+
+    assert state.sweep.call_count == 2
+    narrow, expanded = json.loads(state.path.read_text())["entries"]
+    assert not knob_cache.allows_nondeterministic(narrow)
+    assert knob_cache.allows_nondeterministic(expanded)
+    assert narrow["knobs"] == expanded["knobs"]
+
+    # A managed replay can fill a missing profile without replacing a newer one.
+    assert knob_cache.write_record({**expanded, "p50_us": 2.0})
+    assert knob_cache.write_record(expanded, overwrite=False)
+    assert json.loads(state.path.read_text())["entries"][-1]["p50_us"] == 2.0
+
+
+def test_complete_forward_replay_preserves_kernel_only_record(state):
+    knob_cache.record_knobs(
+        state.knobs, state.workspace.config, live_tokens=4, p50_us=1.0
+    )
+    forward = dict(make_trial=Mock(), execution_contract={"quantize_input": True})
+    with autotune_v2(mode="replay"):
+        assert state.run(**forward) == state.knobs
+    with autotune_v2(mode="replay"):
+        assert state.run(num_tokens=3, **forward) == state.knobs
+    state.sweep.assert_not_called()
+    assert [e["live_tokens"] for e in knob_cache._read(str(state.path))["entries"]] == [
+        4
+    ]
+    with autotune_v2():
+        assert state.run(**forward) == state.knobs
+    state.sweep.assert_called_once()
+    entries = json.loads(state.path.read_text())["entries"]
+    assert {entry.get("timing_boundary", "kernel") for entry in entries} == {
+        "kernel",
+        "complete_forward",
+    }
+    with autotune_v2(mode="replay"):
+        assert state.run(**forward) == state.knobs
+    state.sweep.assert_called_once()
+
+    assert knob_cache.record_knobs(
+        state.other_knobs, state.workspace.config, live_tokens=3, p50_us=2.0
+    )
+    with autotune_v2(mode="replay"):
+        assert state.run(num_tokens=2, **forward) == state.other_knobs
+    with autotune_v2(mode="replay"):
+        assert state.run(num_tokens=5, **forward) == state.knobs
+    assert knob_cache.record_knobs(
+        state.other_knobs, state.workspace.config, live_tokens=6, p50_us=2.0
+    )
+    with autotune_v2(mode="replay"):
+        assert state.run(num_tokens=5, **forward) == state.other_knobs
+    state.sweep.assert_called_once()
 
 
 def test_memory_partition_skip_and_forced_offline_search(state):
@@ -437,7 +544,16 @@ def test_standard_fixed_workspace_profiles(monkeypatch, tmp_path):
     assert selected.max_tokens_per_rank == 128
     assert (
         fixed._workspace_config(dataclasses.replace(fleet, tuning_live_tokens=4))
-        == base
+        == selected
+    )
+    assert fixed._workspace_config(
+        dataclasses.replace(fleet, tuning_live_tokens=17)
+    ) == dataclasses.replace(base, **full)
+    larger_fleet = dataclasses.replace(
+        fleet, max_tokens_per_rank=256, tuning_live_tokens=17
+    )
+    assert fixed._workspace_config(larger_fleet) == fixed._standard_base_config(
+        larger_fleet
     )
     assert backend(full)._workspace_config(profile) == dataclasses.replace(base, **full)
     assert automatic._workspace_config(profile) == base
@@ -515,7 +631,7 @@ def test_standard_cached_workspace_agrees_before_pool_lookup(
     assert second in pool.call_args.args[0]
 
 
-def test_genphase_auto_ignores_fixed_profile_count(monkeypatch):
+def test_genphase_auto_ignores_fixed_profile_count(monkeypatch, tmp_path):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
@@ -535,10 +651,28 @@ def test_genphase_auto_ignores_fixed_profile_count(monkeypatch):
     )
     assert resolve.call_count == 1
     assert resolve.call_args.kwargs["live_tokens"] is None
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setattr(knob_cache, "device_identity", lambda: "test-device")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            major=10, minor=0, name="test-device", multi_processor_count=148
+        ),
+    )
     fixed = create_mega_kernel(dataclasses.replace(cfg, knobs=None))
     fixed.bind_ep_bootstrap(BootstrapConfig(rank=0, world_size=1))
-    fixed._genphase_config(dataclasses.replace(fleet, tuning_live_tokens=16))
-    assert resolve.call_args.kwargs["live_tokens"] == 16
+    base = fixed._genphase_base_config(fleet)
+    candidates = tuning.sm100_genphase_candidates(base, sm_count=148)
+    lower, upper = candidates[-2:]
+    assert knob_cache.record_knobs(lower, base, live_tokens=64, p50_us=1.0)
+    assert knob_cache.record_knobs(upper, base, live_tokens=96, p50_us=1.0)
+    for live, knobs in [(64, lower), (65, upper), (97, upper), (None, upper)]:
+        assert fixed._genphase_config(
+            dataclasses.replace(fleet, tuning_live_tokens=live)
+        ) == dataclasses.replace(base, **knobs)
 
 
 def _subgroup_worker(rank, rendezvous):
@@ -686,7 +820,8 @@ def test_ep_subgroup_agreement_and_preparation_failure(tmp_path):
     )
 
 
-def test_cli_forces_search_and_persists_by_default(state, monkeypatch):
+@pytest.mark.parametrize("limited", [False, True])
+def test_cli_forces_search_and_persists_by_default(state, limited, monkeypatch):
     from flashinfer.moe_ep import tune
     from flashinfer.moe_ep.backends.mega.kernel.sm100 import next_tuning
 
@@ -718,10 +853,12 @@ def test_cli_forces_search_and_persists_by_default(state, monkeypatch):
     ]
     if state.workspace.config.kernel_variant == "genphase":
         options.extend(["--kernel-variant", "genphase"])
+    if limited:
+        options.extend(["--max-candidates", "1"])
     for _ in range(2):
         assert tune.main(options) == 0
-        assert state.path.is_file()
-        assert list(state.root.glob("v2/*/entries/*.json"))
+        assert state.path.is_file() is not limited
+        assert bool(list(state.root.glob("v2/*/entries/*.json"))) is not limited
     assert state.sweep.call_count == 2
     state.workspace.install_tuned_knobs.assert_not_called()
 

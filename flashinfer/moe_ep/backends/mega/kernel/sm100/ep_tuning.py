@@ -177,22 +177,31 @@ class BlackwellEpTuningMixin:
             return
         from flashinfer.autotuner import AutoTuner
         from .forward_tuning import ForwardExecution
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
+            _prepare_collectively,
+        )
         from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning_protocol import (
             NAMESPACE,
             BlackwellTuningProtocol,
         )
 
-        self.stage_inputs(tensors, workspace, quantize_input=True)
         execution = ForwardExecution(self, tensors, quantize_input=True, output=output)
+        group = self.ep_comm_group if self.ep_world_size > 1 else None
+
+        def prepare_inputs():
+            execution.prepare_trial_output()
+            self.stage_inputs(tensors, workspace, quantize_input=True)
+
+        _prepare_collectively(prepare_inputs, self.ep_world_size, group)
         AutoTuner.get().choose_with_protocol(
             NAMESPACE,
             BlackwellTuningProtocol(
-                output,
+                execution.output,
                 *weights,
                 workspace,
                 num_tokens=tensors.num_tokens,
                 install_winner=True,
-                process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
+                process_group=group,
                 allow_nondeterministic=getattr(
                     self._config, "enable_in_kernel_fc2_reduce", False
                 ),
