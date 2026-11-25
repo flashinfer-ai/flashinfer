@@ -51,11 +51,28 @@ STATEFUL_ADAPTERS: dict[str, StatefulAdapter] = {
         plan_inputs={
             "kv_indptr": "indptr",
             "kv_indices": "indices",
+            "kv_last_page_len": "last_page_len",
             "sm_scale": "sm_scale",
         },
         self_attrs={
             "kv_indptr": "_paged_kv_indptr_buf",
             "kv_indices": "_paged_kv_indices_buf",
+            "kv_last_page_len": "_paged_kv_last_page_len_buf",
+            "sm_scale": "_sm_scale",
+        },
+    ),
+    "flashinfer.decode.CUDAGraphBatchDecodeWithPagedKVCacheWrapper.run": StatefulAdapter(
+        plan_attr="plan",
+        plan_inputs={
+            "kv_indptr": "indptr",
+            "kv_indices": "indices",
+            "kv_last_page_len": "last_page_len",
+            "sm_scale": "sm_scale",
+        },
+        self_attrs={
+            "kv_indptr": "_paged_kv_indptr_buf",
+            "kv_indices": "_paged_kv_indices_buf",
+            "kv_last_page_len": "_paged_kv_last_page_len_buf",
             "sm_scale": "_sm_scale",
         },
     ),
