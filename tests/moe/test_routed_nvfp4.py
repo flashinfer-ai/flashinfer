@@ -21,6 +21,9 @@ import torch
 
 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 from flashinfer.fp4_quantization import fp4_quantize
+from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    PRE_FC2_COMPACT_ROWS,
+)
 from flashinfer.fused_moe.cute_dsl.moe_utils import moe_permute, moe_sort
 from flashinfer.fused_moe.cute_dsl.fused_moe import (
     CuteDslMoEWrapper,
@@ -393,7 +396,7 @@ def _reference(inputs, decoded, clamp, fused):
 
 @pytest.mark.parametrize(
     "tokens,hidden,intermediate",
-    [(1, 128, 256), (17, 128, 256), (129, 128, 256), (17, 768, 4096)],
+    [(1, 128, 256), (17, 128, 256), (129, 128, 256), (300, 128, 256), (17, 768, 4096)],
 )
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("per_expert_scale", [False, True])
@@ -833,6 +836,8 @@ def _fc1_bitwise_case(
     clamp_value,
     gpu,
     all_local=False,
+    ids=None,
+    sm_count=None,
 ):
     from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
         blockscaled_contiguous_gather_grouped_gemm_act_fusion as gather_gemm,
@@ -845,11 +850,14 @@ def _fc1_bitwise_case(
         PRE_FC2_MMA_SHAPE,
     )
 
+    explicit_ids = ids
     inputs, _ = _case(tokens, gpu, per_expert_scale, hidden, intermediate)
     x, x_sf = inputs["x"], inputs["x_sf"]
     ids = inputs["token_selected_experts"]
     if all_local:
         ids.copy_(2 + torch.arange(ids.numel(), device=gpu).reshape(ids.shape) % 3)
+    if explicit_ids is not None:
+        ids.copy_(explicit_ids)
     weights = inputs["token_final_scales"].clone()
     # A zero weight yields an all-zero block: scale 0 and no division.
     weights.view(-1)[0] = 0
@@ -926,6 +934,17 @@ def _fc1_bitwise_case(
     _quantize(raw, scale2, weights, inverse, ids, 2, clamp, expected, expected_sf)
     del raw
 
+    # Caller-allocated outputs prefilled with bytes no valid row can hold, so a
+    # skipped store fails: every output value is >= 0, so no FP4 code has its
+    # sign bit set (0xFF holds two -6), and scales saturate at 448 (0x7E) while
+    # 0x7F is E4M3 NaN.
+    out = torch.full((rows, intermediate // 2), 0xFF, dtype=torch.uint8, device=gpu)
+    out_scale = torch.full(
+        (32, 4, rows // 128, 4, (intermediate + 63) // 64, 1),
+        0x7F,
+        dtype=torch.uint8,
+        device=gpu,
+    )
     actual, actual_sf = gather_gemm(
         a=x,
         b=inputs["w1_weight"],
@@ -941,14 +960,21 @@ def _fc1_bitwise_case(
         gated=False,
         clamped_relu2_limit=clamp,
         routing_weights=weights.reshape(-1).float(),
+        sm_count=sm_count,
+        out=out,
+        out_scale=out_scale,
         **common,
     )
+    assert actual.data_ptr() == out.data_ptr()
+    assert actual_sf.data_ptr() == out_scale.data_ptr()
     live_tiles = int(active.item())
     valid = torch.cat(
         [torch.arange(t * 128, int(limits[t]), device=gpu) for t in range(live_tiles)]
     )
     assert valid.numel() == int((inverse >= 0).sum())
     expected_scales = _linear_scales(expected_sf, valid, intermediate)
+    # The sentinels cannot match a valid row by coincidence.
+    assert not (expected[valid] & 0x88).any() and not (expected_scales == 0x7F).any()
     if regime == "saturating":
         # The fixture must reach the E4M3 maximum, 448 (code 0x7E).
         assert (expected_scales == 0x7E).any()
@@ -990,6 +1016,41 @@ def test_fused_fc1_epilogue_matches_separate_quantizer_bitwise(
     )
 
 
+# Each local expert gets tokens / 4 routes: tiles of 32, 33 and PRE_FC2_COMPACT_ROWS
+# valid rows take the compact epilogue, one row more the per-subtile one.
+@pytest.mark.parametrize(
+    "rows", [32, 33, PRE_FC2_COMPACT_ROWS, PRE_FC2_COMPACT_ROWS + 1]
+)
+def test_fused_fc1_epilogue_compact_tile_boundary(rows, gpu):
+    """Tiles on both sides of the compact-row threshold keep the bitwise reference."""
+    _fc1_bitwise_case(4 * rows, 768, 4096, True, torch.float32, "calibrated", 0.15, gpu)
+
+
+def test_fused_fc1_epilogue_mixed_tiles_on_one_cta(gpu):
+    """One persistent CTA runs full and compact tiles back to back, bitwise."""
+    c = PRE_FC2_COMPACT_ROWS
+    tokens = 128 + c // 2
+    ids = torch.empty((tokens, 2), dtype=torch.int32, device=gpu)
+    # Expert 2: a full tile and a compact tail; expert 3: c routes (compact);
+    # expert 4: c + 1 routes (full); the remaining routes are not local.
+    ids[:, 0] = 2
+    ids[:, 1] = 5
+    ids[:c, 1] = 3
+    ids[c : 2 * c + 1, 1] = 4
+    _fc1_bitwise_case(
+        tokens,
+        768,
+        4096,
+        True,
+        torch.float32,
+        "calibrated",
+        0.15,
+        gpu,
+        ids=ids,
+        sm_count=1,
+    )
+
+
 def test_fused_fc1_epilogue_addresses_beyond_signed_int32(gpu):
     """FP4 output rows past 2**31 bytes keep their bitwise reference."""
     intermediate = 8192
@@ -1005,6 +1066,8 @@ def test_fused_fc1_epilogue_addresses_beyond_signed_int32(gpu):
         all_local=True,
     )
     assert rows * intermediate // 2 > 2**31
+    # The last expert's tail tile, stored past 2**31 bytes, takes the compact path.
+    assert 0 < (270_000 * 2 // 3) % 128 <= PRE_FC2_COMPACT_ROWS
 
 
 @pytest.mark.parametrize("fused", [False, True])
