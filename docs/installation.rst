@@ -13,7 +13,7 @@ Prerequisites
 
 - OS: Linux only
 
-- Python: 3.10, 3.11, 3.12, 3.13, 3.14
+- Python: 3.11, 3.12, 3.13, 3.14
 
 - CUDA: 12.9, 13.0, 13.4 (PyTorch nightly)
 
@@ -50,7 +50,7 @@ FlashInfer provides three packages:
     pip install flashinfer-python
     flashinfer download-kernels
 
-This eliminates compilation and downloading overhead at runtime.
+This reduces compilation and downloading overhead at runtime.
 ``flashinfer download-kernels`` installs the ``flashinfer-cubin`` and
 ``flashinfer-jit-cache`` wheels that match the installed ``flashinfer-python``
 version and the CUDA version of the installed PyTorch. By default it installs

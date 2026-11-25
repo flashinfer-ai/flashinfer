@@ -34,13 +34,13 @@ def _mxfp8_data_dtype(kind: Sm120Mxfp8Kind) -> "torch.dtype":
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/
     # directly); the package import also bootstraps sys.path for the kernel
     # packages.
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import kind_data_dtype
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import kind_data_dtype
 
     return kind_data_dtype(kind)
 
 
 def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import to_blocked
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import to_blocked
 
     return to_blocked(raw_sf)
 
@@ -50,7 +50,7 @@ def _interleave_gate_up_8(
 ) -> "torch.Tensor":
     """Interleave gate||up rows in groups of SWAP_AB_INTERLEAVE (= 8)."""
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/).
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import SWAP_AB_INTERLEAVE
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import SWAP_AB_INTERLEAVE
 
     block = int(SWAP_AB_INTERLEAVE)
     if intermediate_size % (2 * block) != 0:
@@ -99,7 +99,7 @@ def _quantize_mxfp8_weight_k_major(
     import torch
 
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/).
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         mxfp8_quantize_per_block_32_row,
     )
 
@@ -115,7 +115,7 @@ def _as_mxfp8_scale(scale: "torch.Tensor") -> "torch.Tensor":
     import torch
 
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/).
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import Mxfp8ScaleDtype
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import Mxfp8ScaleDtype
 
     if scale.dtype == Mxfp8ScaleDtype:
         return scale
@@ -141,7 +141,7 @@ def preprocess_mega_weights(
 
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/);
     # the shim exposes the cutlass-pulling stacking helper lazily.
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         Mxfp8BlockSize,
         _stack_byte_reinterpretable_tensors,
         ceil_div,
@@ -290,7 +290,7 @@ def _mxfp8_swizzled_flat_sf_size(rows: int, cols: int) -> int:
     import torch
 
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/).
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         Mxfp8ScaleDtype,
         to_blocked,
     )
@@ -329,7 +329,7 @@ def validate_transformed_mega_weights(
     data_dtype = _mxfp8_data_dtype(kind)
 
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/).
-    from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         Mxfp8BlockSize,
         ceil_div,
     )

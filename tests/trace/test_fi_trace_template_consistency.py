@@ -1252,6 +1252,13 @@ def test_attention_ts_trace_semantic_and_storage_pages(
         attention_ts_decode_trace_dispatch(**standalone_kwargs),
     )
     for template in direct_templates:
+        # The registry samples native pages and encoded page size 4; other
+        # encoded sizes are generated dynamically by the same factory.
+        if not encoded or semantic_page_size == 4:
+            assert any(
+                template is registered
+                for registered in attention_ts_decode_trace_dispatch.templates
+            )
         assert ("_encoded_page" in template.name_prefix) == encoded
         if encoded:
             assert f"_encoded_page{semantic_page_size}" in template.name_prefix
@@ -1635,6 +1642,106 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     ] == [64, 64, 64, 128]
     assert "mask:causal" in mla_definitions[0]["tags"]
     assert "mask:dense" in mla_definitions[1]["tags"]
+
+
+def test_prims_ts_mla_cp_trace_contract() -> None:
+    """CP traces retain causal semantics and distinguish static/runtime metadata."""
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+        batch_mla_decode_with_paged_kv_cache,
+    )
+    from flashinfer.fi_trace import fi_trace
+    from flashinfer.trace.templates.attention import (
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+    )
+
+    query = torch.empty((2, 8, 96, 576), dtype=torch.float8_e4m3fn)
+    kwargs = {
+        "query": query,
+        "kv_cache": torch.empty((2, 1, 128, 576), dtype=torch.float8_e4m3fn),
+        "block_tables": torch.tensor(((-1, -1), (0, 1)), dtype=torch.int32),
+        "seq_lens_kv": torch.tensor((0, 65), dtype=torch.int32),
+    }
+    default_template = prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs)
+    assert any(
+        default_template is registered
+        for registered in prims_ts_decode_mla_one_shot_trace_dispatch.templates
+    )
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        packed_query=False,
+        mask_type="causal",
+        max_q_len=8,
+        max_kv_len=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        cp_world=1,
+        cp_interleave_size=1,
+    )
+    ordinary = fi_trace(wrapper.run, **kwargs)
+    wrapper._plan_state.cp_world = 8
+    wrapper._plan_state.cp_interleave_size = 128
+    bounded = fi_trace(wrapper.run, **kwargs, cp_rank=7)
+    assert ordinary["name"] != bounded["name"]
+    assert bounded["axes"]["causal"]["value"] == 1
+    assert ordinary["axes"]["causal"]["value"] == 1
+    assert "min(seq_lens_kv) >= 0" in bounded["constraints"]
+    assert "min(seq_lens_kv) >= 1" not in bounded["constraints"]
+    assert "min(seq_lens_kv) >= 1" in ordinary["constraints"]
+    assert "context_parallel" in bounded["tags"]
+    assert "mask:causal" in bounded["tags"]
+    assert "kv_bounds" not in ordinary["inputs"]
+
+    one_shot_kwargs = dict(kwargs)
+    ordinary_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs)
+    bounded_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
+        **one_shot_kwargs, cp_world=8, cp_interleave_size=128, cp_rank=7
+    )
+    assert ordinary_one_shot["name"] != bounded_one_shot["name"]
+    assert "kv_bounds" not in ordinary_one_shot["inputs"]
+    for definition in (bounded, bounded_one_shot):
+        assert "_cp8_i128" in definition["name"]
+        assert definition["axes"]["cp_world"]["value"] == 8
+        assert definition["axes"]["cp_interleave_size"]["value"] == 128
+        assert definition["axes"]["zero_empty_rows"]["value"] == 1
+        assert "cp_rank" not in definition["axes"]
+        assert definition["inputs"]["cp_rank"]["dtype"] == "int32"
+        assert "max(seq_lens_kv) <= max_kv_len" not in definition["constraints"]
+        assert "Global logical" in definition["inputs"]["seq_lens_kv"]["description"]
+        assert "unknown" not in str(definition["inputs"])
+    for template in (
+        prims_ts_decode_mla_wrapper_trace_dispatch(self=wrapper, **kwargs, cp_rank=7),
+        prims_ts_decode_mla_one_shot_trace_dispatch(
+            **one_shot_kwargs, cp_world=8, cp_interleave_size=128, cp_rank=7
+        ),
+    ):
+        assert_template_constraints_valid(template, label=template.name_prefix)
+
+    wrapper._plan_state.zero_empty_rows = False
+    opt_out = fi_trace(wrapper.run, **kwargs, cp_rank=7)
+    opt_out_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
+        **one_shot_kwargs,
+        cp_world=8,
+        cp_interleave_size=128,
+        cp_rank=7,
+        zero_empty_rows=False,
+    )
+    for definition in (opt_out, opt_out_one_shot):
+        assert "_no_zero_empty_rows" in definition["name"]
+        assert definition["axes"]["zero_empty_rows"]["value"] == 0
+        assert "unspecified" in definition["description"]
+    assert opt_out["name"] != bounded["name"]
+    assert opt_out_one_shot["name"] != bounded_one_shot["name"]
+    assert "zero_empty_rows" in opt_out_one_shot["inputs"]
+    # Ignored flags must not break canonical template identity without CP.
+    assert (
+        prims_ts_decode_mla_one_shot_trace_dispatch(
+            **kwargs,
+            zero_empty_rows=False,
+        )
+        is default_template
+    )
 
 
 # ---------------------------------------------------------------------------

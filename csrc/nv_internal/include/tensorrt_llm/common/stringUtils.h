@@ -69,6 +69,20 @@ void printElement(std::ostream& os, std::tuple<Args...> const& t) {
   printTupleImpl(os, t, std::index_sequence_for<Args...>{});
 }
 
+// Ends the va_list on every path out of fmtstr, including a throwing fmtstr_.
+class va_list_guard {
+ public:
+  explicit va_list_guard(va_list& args) : mArgs(args) {}
+  ~va_list_guard() { va_end(mArgs); }
+  va_list_guard(va_list_guard const&) = delete;
+  va_list_guard& operator=(va_list_guard const&) = delete;
+  va_list_guard(va_list_guard&&) = delete;
+  va_list_guard& operator=(va_list_guard&&) = delete;
+
+ private:
+  va_list& mArgs;
+};
+
 }  // namespace
 
 // Override operator<< for any tuple
@@ -103,6 +117,7 @@ inline std::string fmtstr(char const* format, ...) {
 
   va_list args;
   va_start(args, format);
+  va_list_guard args_guard(args);
   fmtstr_(
       format,
       [](void* target, size_t count) -> char* {
@@ -115,7 +130,6 @@ inline std::string fmtstr(char const* format, ...) {
         return str->data();
       },
       &result, args);
-  va_end(args);
 
   return result;
 }

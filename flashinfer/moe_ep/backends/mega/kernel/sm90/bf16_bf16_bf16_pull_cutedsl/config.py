@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass
 class Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm90.pull_style_cutedsl_megakernel.hopper_bf16_mega_moe``.
+    """Kernel params for ``shims.sm90.cutedsl_megamoe.hopper_bf16_mega_moe``.
 
     Native BF16 twin of ``Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig``: bf16
     dispatch payload, BF16 WGMMA FC1/FC2 with fp32 accumulation and a bf16

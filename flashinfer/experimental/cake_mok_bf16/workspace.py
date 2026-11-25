@@ -322,9 +322,9 @@ def create_workspace(
     )
     barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
 
-    dist.barrier(
-        group=group, async_op=True, device_ids=[device_index]
-    ).block_current_stream()
+    # A blocking barrier: torch's nccl2 backend deadlocks in
+    # barrier(async_op=True).block_current_stream(). Setup waits only once.
+    dist.barrier(group=group, device_ids=[device_index])
 
     workspace = MoKWorkspace(
         group_name=group_name,

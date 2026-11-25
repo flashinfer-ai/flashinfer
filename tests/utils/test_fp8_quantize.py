@@ -139,6 +139,55 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
         torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("m", [1, 3, 127, 1024, 8192])
+@pytest.mark.parametrize(
+    "k,alignment",
+    [(2880, 128), (2880, 256), (96, 128), (32, 256), (1056, 1024), (4064, 4096)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_mxfp8_quantize_cute_dsl_linear_pads_in_kernel(
+    m, k, alignment, dtype, enable_pdl
+):
+    """The linear layout zero-fills the padded columns and scales in the kernel.
+
+    The result must equal quantizing an explicitly zero-padded input, byte for byte,
+    including the padding. The output buffers are allocated uninitialized, so the
+    allocator is first handed a block full of 0xFF of the same size: padding that
+    the kernel does not write shows up as nonzero bytes.
+    """
+    device = torch.device("cuda")
+    if not _is_mxfp8_supported(device):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    padded_k = (k + alignment - 1) // alignment * alignment
+    a = 16 * torch.randn([m, k], dtype=dtype, device=device)
+    a_padded = torch.nn.functional.pad(a, (0, padded_k - k))
+
+    want_fp8, want_sf = mxfp8_quantize(
+        a_padded, False, alignment=32, enable_pdl=enable_pdl, backend="cute-dsl"
+    )
+
+    poison = torch.full((m, padded_k), 0xFF, dtype=torch.uint8, device=device)
+    poison_sf = torch.full(
+        (m * padded_k // 32,), 0xFF, dtype=torch.uint8, device=device
+    )
+    del poison, poison_sf
+    got_fp8, got_sf = mxfp8_quantize(
+        a, False, alignment=alignment, enable_pdl=enable_pdl, backend="cute-dsl"
+    )
+    torch.cuda.synchronize()
+
+    assert got_fp8.shape == (m, padded_k)
+    assert got_sf.shape == want_sf.shape
+    assert torch.equal(got_fp8.view(torch.uint8), want_fp8.view(torch.uint8))
+    assert torch.equal(got_sf, want_sf)
+    assert not got_fp8[:, k:].view(torch.uint8).any()
+    assert not got_sf.view(m, -1)[:, k // 32 :].any()
+
+
 @pytest.mark.parametrize("sf_layout", [SfLayout.layout_linear, SfLayout.layout_128x4])
 def test_mxfp8_quantize_empty(sf_layout):
     if not torch.cuda.is_available() or not _is_mxfp8_supported(torch.device("cuda")):
@@ -1085,6 +1134,82 @@ def test_mxfp8_grouped_quantize_cake_exact_misaligned_mask(batch_shape, dtype):
 
 
 @pytest.mark.parametrize(
+    ("batch_shape", "program"),
+    [
+        ((3, 200, 160), "BULK"),
+        ((7, 512, 2048), "ROW2D"),
+        ((8, 512, 2048), "HEAD2048"),
+        ((64, 128, 4096), "HEAD4096"),
+        ((32, 1024, 256), "TILED"),
+        ((16, 1024, 2048), "TILED_K2048"),
+        ((16, 1024, 4096), "TILED_K4096"),
+        ((16, 1024, 7168), "TILED_WIDE"),
+    ],
+)
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_cake_keeps_scale_byte_zero_blocks(batch_shape, program):
+    """A nonzero BF16 block whose amax is at most 448 * 2**-127 gets scale byte
+    0, and every program quantizes it with the reciprocal 2**127 instead of
+    writing zero codes."""
+    dtype = torch.bfloat16
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not is_cake_grouped_mxfp8_available(dtype):
+        pytest.skip(
+            f"a generated Cake grouped MXFP8 profile for {dtype} is not installed"
+        )
+    import flashinfer.jit.cake_grouped_mxfp8_quantize as loader
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_program,
+    )
+
+    b, m, k = batch_shape
+    x = _mxfp8_grouped_test_input(batch_shape, dtype, "boundaries")
+    mask_values = _cake_mask_values(b, m)
+    mask = torch.tensor(mask_values, dtype=torch.int32, device="cuda")
+    name = "BF16" if program == "ROW2D" else f"{program}_BF16"
+    selected = cake_grouped_mxfp8_quantize_program(
+        dtype, b, m, k, None, mask.data_ptr() % 16 == 0
+    )
+    assert selected is getattr(loader, name)
+    out, out_scale = mxfp8_grouped_quantize(x, mask, backend="cake")
+    out = out.permute(2, 0, 1)
+    out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
+    padded_k = (k + 127) // 128 * 128
+
+    for group, valid_rows in enumerate(mask_values):
+        if valid_rows == 0:
+            continue
+        ref, ref_scale = mxfp8_quantize_reference(
+            x[group], alignment=128, sf_swizzle_layout=SfLayout.layout_128x4
+        )
+        expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
+        # The reference writes zero codes for scale byte 0; the reciprocal
+        # 2**127 is exact and keeps every payload of such a block in range.
+        blocks = torch.zeros((m, padded_k), dtype=torch.float32, device="cuda")
+        blocks[:, :k] = x[group].float()
+        blocks = blocks.reshape(m, padded_k // 32, 32)
+        byte0 = (expected_scale == 0).unsqueeze(-1)
+        kept = (blocks * 2.0**127).to(torch.float8_e4m3fn)
+        expected = torch.where(
+            byte0, kept.view(torch.uint8), ref.reshape(m, -1, 32).view(torch.uint8)
+        ).reshape(m, padded_k)
+        if group == 0:
+            nonzero_byte0 = byte0.squeeze(-1) & (blocks.abs().amax(dim=-1) > 0)
+            assert nonzero_byte0[:valid_rows].any()
+        torch.testing.assert_close(
+            out[group, :valid_rows].contiguous().view(torch.uint8),
+            expected[:valid_rows],
+            rtol=0,
+            atol=0,
+        )
+        got_scale = _unswizzle_mxfp8_scales_128x4(out_scale[group], m, padded_k)
+        torch.testing.assert_close(
+            got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
     ("batch_shape", "padded_k"),
     [
         ((2, 128, 128), 4224),  # 132 blocks a row: one CTA of each row past K
@@ -1434,6 +1559,10 @@ def test_mxfp8_grouped_quantize_cuda_matches_other_backends(
     """The ``cuda`` backend reproduces the other backends' valid-row bits."""
     _skip_unless_grouped_backend("cuda")
     _skip_unless_grouped_backend(other_backend, dtype)
+    # The cuda backend writes zero codes for blocks with scale byte 0, while
+    # the cake programs quantize them with the reciprocal 2**127 (see
+    # test_mxfp8_grouped_quantize_cake_keeps_scale_byte_zero_blocks).
+    skip_byte0_codes = other_backend == "cake"
 
     torch.manual_seed(0)
     b, m, k = batch_shape
@@ -1452,12 +1581,18 @@ def test_mxfp8_grouped_quantize_cuda_matches_other_backends(
     got_sf = got_sf.permute(5, 2, 4, 0, 1, 3)
     ref_sf = ref_sf.permute(5, 2, 4, 0, 1, 3)
     for i, mask_i in enumerate(mask_values):
-        torch.testing.assert_close(got_q[i, :mask_i], ref_q[i, :mask_i], rtol=0, atol=0)
+        ref_scale = _unswizzle_mxfp8_scales_128x4(ref_sf[i], m, padded_k)[:mask_i]
         torch.testing.assert_close(
             _unswizzle_mxfp8_scales_128x4(got_sf[i], m, padded_k)[:mask_i],
-            _unswizzle_mxfp8_scales_128x4(ref_sf[i], m, padded_k)[:mask_i],
+            ref_scale,
             rtol=0,
             atol=0,
+        )
+        keep = torch.ones_like(got_q[i, :mask_i], dtype=torch.bool)
+        if skip_byte0_codes:
+            keep = (ref_scale != 0).repeat_interleave(32, dim=-1)
+        torch.testing.assert_close(
+            got_q[i, :mask_i][keep], ref_q[i, :mask_i][keep], rtol=0, atol=0
         )
 
 

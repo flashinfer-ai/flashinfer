@@ -14,24 +14,9 @@ import pytest
 
 
 def _pkg():
-    # The SM90 tree shares top-level kernel module names with the SM100
-    # cutedsl_megamoe tree and the shim refuses to mix them in one process
-    # (see shim/_paths.py).  tests/moe_ep/run_tests.sh runs this file in its
-    # own interpreter; an ad-hoc whole-directory pytest run skips it instead.
-    import os
-    import sys
-
-    common = sys.modules.get("common")
-    common_file = getattr(common, "__file__", None) if common is not None else None
-    if (
-        common_file is not None
-        and "pull_style_cutedsl_megakernel" not in os.path.abspath(common_file)
-    ):
-        pytest.skip(
-            "SM100 cutedsl_megamoe kernel tree already imported in this process; "
-            "run tests/moe_ep/test_sm90_pull_fp8_tuner.py in its own interpreter"
-        )
-    from flashinfer.moe_ep.kernel_src.sm90 import pull_style_cutedsl_megakernel
+    from flashinfer.moe_ep.shims.sm90 import (
+        cutedsl_megamoe as pull_style_cutedsl_megakernel,
+    )
 
     return pull_style_cutedsl_megakernel
 
@@ -42,10 +27,12 @@ class TestDefaultKnobs:
     def test_matches_heuristic_table(self, scale_mode, tokens):
         pkg = _pkg()
         pkg.bootstrap_paths()
-        from moe_hopper_fp8.heuristic_config import select_heuristic_config
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_hopper_fp8.heuristic_config import (
+            select_heuristic_config,
+        )
 
         knobs = pkg.default_knobs(tokens, fp8_scale_mode=scale_mode)
-        sel = select_heuristic_config(scale_mode, tokens)
+        sel = select_heuristic_config(scale_mode, tokens, fc2_activation_scale_k=64)
         assert knobs["swap_ab"] == sel.config.swap_ab
         assert knobs["pingpong"] == sel.config.pingpong
         assert knobs["mma_tiler_mnk"] == tuple(sel.config.mma_tiler_mnk)
@@ -103,6 +90,37 @@ class TestIsValid:
             {**ok, "in_kernel_fc2_reduce": True},
             apply_routing_weights_before_fc2=False,
         )
+        # Batched dispatch pull: 4-slot buffer, epi_warps token-back, no
+        # dispatch dedup, batch x active dispatch warps <= 4.
+        batched = {**ok, "compact_pull_buffer": False, "dispatch_pull_batch": 3}
+        assert pkg.is_valid(batched)
+        assert not pkg.is_valid({**batched, "compact_pull_buffer": True})
+        assert not pkg.is_valid({**batched, "token_back_mode": "reuse_dispatch_warps"})
+        assert not pkg.is_valid({**batched, "dedup_dispatch": True})
+        assert not pkg.is_valid({**batched, "active_dispatch_warps": 2})
+        assert pkg.is_valid(
+            {**batched, "dispatch_pull_batch": 2, "active_dispatch_warps": 2}
+        )
+        # Swap-AB N72/N80: M=256, blockwise only.
+        n72 = dict(swap_ab=True, mma_tiler_mnk=(256, 72, 128))
+        assert pkg.is_valid(n72, fp8_scale_mode="blockwise")
+        assert not pkg.is_valid(n72, fp8_scale_mode="per_tensor")
+        assert not pkg.is_valid(dict(swap_ab=True, mma_tiler_mnk=(128, 80, 128)))
+        # Rotation needs token-back in the epilogue warps.
+        assert pkg.is_valid({**ok, "dispatch_pull_rotate": True})
+        assert not pkg.is_valid(
+            {**ok, "dispatch_pull_rotate": True, "token_back_mode": "standalone_warps"}
+        )
+        # The explicit mode overrides the legacy dispatch-side token-back flag.
+        for pull in (batched, {**ok, "dispatch_pull_rotate": True}):
+            assert not pkg.is_valid({**pull, "token_back_by_dispatch": True})
+            assert not pkg.is_valid(
+                {**pull, "token_back_by_dispatch": True, "token_back_mode": None}
+            )
+            assert pkg.is_valid({**pull, "token_back_by_dispatch": False})
+            assert pkg.is_valid(
+                {**pull, "token_back_by_dispatch": True, "token_back_mode": "epi_warps"}
+            )
 
     def test_iter_candidates_all_valid(self):
         pkg = _pkg()
@@ -115,14 +133,41 @@ class TestIsValid:
         assert seen > 0
 
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
-    def test_autotune_candidates(self, scale_mode):
+    @pytest.mark.parametrize("max_tokens", [512, 2048])
+    def test_autotune_candidates(self, scale_mode, max_tokens):
         pkg = _pkg()
-        cands = pkg.hopper_fp8_candidates(fp8_scale_mode=scale_mode, max_tokens=2048)
+        cands = pkg.hopper_fp8_candidates(
+            fp8_scale_mode=scale_mode, max_tokens=max_tokens
+        )
         # 16 sweep geometries x {epi_warps, reuse_dispatch_warps}.
         assert len(cands) >= 30
         assert all(pkg.is_valid(c) for c in cands)
         # heuristic winner leads (ties keep the established default).
-        assert cands[0] == pkg.default_knobs(2048, fp8_scale_mode=scale_mode)
+        assert cands[0] == pkg.default_knobs(max_tokens, fp8_scale_mode=scale_mode)
+        # Dispatch-pull variants of the epi_warps candidates for large buffers.
+        pull_keys = ("dispatch_pull_batch", "dispatch_pull_rotate")
+        pulled = [c for c in cands if any(k in c for k in pull_keys)]
+        assert bool(pulled) == (max_tokens >= 1024)
+        assert all(c["token_back_mode"] == "epi_warps" for c in pulled)
+        assert not any(c["pingpong"] and "dispatch_pull_batch" in c for c in pulled)
+        if max_tokens >= 1024:
+            for candidate in cands:
+                if (
+                    candidate["token_back_mode"] != "epi_warps"
+                    or candidate["pingpong"]
+                    or any(k in candidate for k in pull_keys)
+                ):
+                    continue
+                batched = {
+                    **candidate,
+                    "compact_pull_buffer": False,
+                    "dispatch_pull_batch": 3,
+                }
+                assert batched in cands
+                assert {**batched, "dispatch_pull_rotate": True} in cands
+        # Blockwise also gets the swap-AB M256 N72/N80 tiles.
+        rows_fit = [c for c in cands if c["mma_tiler_mnk"][1] in (72, 80)]
+        assert bool(rows_fit) == (scale_mode == "blockwise")
         # deduplicated.
         keys = [json.dumps(c, sort_keys=True, default=list) for c in cands]
         assert len(keys) == len(set(keys))
@@ -162,6 +207,26 @@ class TestWithKnobs:
         assert out.flag_batch == 4
         assert out.resolved_token_back_mode == "reuse_dispatch_warps"
         assert not hasattr(out, "not_a_field")
+        frontend = pkg.MegaMoEHopperFp8Frontend(cfg)
+        frontend.apply_knobs(
+            dict(
+                compact_pull_buffer=False,
+                dispatch_pull_batch=3,
+                dispatch_pull_rotate=True,
+                flag_batch=4,
+            )
+        )
+        previous = frontend.config
+        assert not previous.compact_pull_buffer
+        assert previous.dispatch_pull_batch == 3
+        assert previous.dispatch_pull_rotate
+        frontend.apply_knobs(None)
+        assert frontend.config is previous
+        frontend.apply_knobs({})
+        assert frontend.config.compact_pull_buffer
+        assert frontend.config.dispatch_pull_batch == 1
+        assert not frontend.config.dispatch_pull_rotate
+        assert frontend.config.flag_batch == 4
 
     def test_none_is_identity_and_invalid_raises(self):
         pkg = _pkg()
@@ -169,6 +234,17 @@ class TestWithKnobs:
         assert pkg.with_knobs(cfg, None) is cfg
         with pytest.raises(ValueError):
             pkg.with_knobs(cfg, dict(swap_ab=True, mma_tiler_mnk=(64, 128, 128)))
+        for tile_n in (64, 72, 80, 128):
+            blockwise = self._cfg(
+                fp8_scale_mode="blockwise",
+                swap_ab=True,
+                mma_tiler_mnk=(256, tile_n, 128),
+            )
+            if tile_n in (72, 80):
+                with pytest.raises(ValueError, match="generate_c"):
+                    pkg.with_knobs(blockwise, {"generate_c": True})
+            else:
+                assert pkg.with_knobs(blockwise, {"generate_c": True}).generate_c
 
 
 class TestKnobCache:
@@ -260,6 +336,33 @@ class TestKnobCache:
 
 
 class TestShimAndBackendWiring:
+    @pytest.mark.parametrize(
+        ("swap_ab", "tile"), [(False, (64, 128, 256)), (True, (256, 32, 256))]
+    )
+    def test_blockwise_requires_k128(self, swap_ab, tile):
+        pkg = _pkg()
+        base = dict(
+            num_total_experts=4,
+            num_max_tokens=64,
+            num_topk=4,
+            hidden=1024,
+            intermediate=512,
+            rank=0,
+            world_size=1,
+        )
+        geometry = dict(swap_ab=swap_ab, pingpong=False, mma_tiler_mnk=tile)
+        assert not pkg.is_valid(geometry, fp8_scale_mode="blockwise")
+        assert pkg.is_valid(geometry, fp8_scale_mode="per_tensor")
+        for selection in (geometry, {"knobs": geometry}):
+            with pytest.raises(ValueError, match="requires MMA tile K=128"):
+                pkg.resolve_hopper_fp8_mega_moe_config(
+                    **base, **selection, fp8_scale_mode="blockwise"
+                )
+            resolved = pkg.resolve_hopper_fp8_mega_moe_config(
+                **base, **selection, fp8_scale_mode="per_tensor"
+            )
+            assert resolved.mma_tiler_mnk == tile
+
     def test_symm_buffer_rejects_knobs_plus_manual_geometry(self):
         pkg = _pkg()
         with pytest.raises(ValueError, match="not both"):
@@ -273,6 +376,69 @@ class TestShimAndBackendWiring:
                 1,
                 knobs={"flag_batch": 4},
                 swap_ab=False,
+            )
+        base = dict(
+            num_total_experts=4,
+            num_max_tokens=64,
+            num_topk=4,
+            hidden=1024,
+            intermediate=512,
+            rank=0,
+            world_size=1,
+            token_back_mode="epi_warps",
+        )
+        manual = pkg.resolve_hopper_fp8_mega_moe_config(
+            **base,
+            swap_ab=False,
+            pingpong=False,
+            mma_tiler_mnk=(64, 128, 128),
+            cluster_shape_mnk=(1, 1, 1),
+            dispatch_pull_batch=3,
+            dispatch_pull_rotate=True,
+        )
+        assert manual.dispatch_pull_batch == 3
+        assert manual.dispatch_pull_rotate
+        assert not manual.compact_pull_buffer
+        # Validate the explicit pull against the tactic's final warp count.
+        out = pkg.resolve_hopper_fp8_mega_moe_config(
+            **base,
+            active_dispatch_warps=2,
+            dispatch_pull_batch=3,
+            dispatch_pull_rotate=True,
+            knobs=dict(
+                active_dispatch_warps=1,
+                compact_pull_buffer=True,
+                dispatch_pull_batch=1,
+                dispatch_pull_rotate=False,
+            ),
+        )
+        assert out.active_dispatch_warps == 1
+        assert out.dispatch_pull_batch == 3
+        assert out.dispatch_pull_rotate
+        assert not out.compact_pull_buffer
+        with pytest.raises(ValueError, match="4 pull slots"):
+            pkg.resolve_hopper_fp8_mega_moe_config(
+                **base,
+                active_dispatch_warps=1,
+                dispatch_pull_batch=3,
+                knobs={"active_dispatch_warps": 2},
+            )
+        tactic = dict(
+            compact_pull_buffer=False,
+            dispatch_pull_batch=3,
+            dispatch_pull_rotate=True,
+        )
+        for layout in (
+            {"active_dispatch_warps": 2},
+            {"dedup_dispatch": True},
+            {"token_back_mode": "reuse_dispatch_warps"},
+        ):
+            out = pkg.resolve_hopper_fp8_mega_moe_config(
+                **{**base, **layout}, knobs=tactic
+            )
+            assert out.dispatch_pull_batch == 1
+            assert out.dispatch_pull_rotate == (
+                out.resolved_token_back_mode == "epi_warps"
             )
 
     def test_backend_config_knobs_field(self):
@@ -301,9 +467,25 @@ class TestShimAndBackendWiring:
                 Sm90PullFp8MegaKernelBackend(
                     dataclasses.replace(base, knobs=knobs, swap_ab=True)
                 )
+        for pull in (
+            {"dispatch_pull_batch": 1},
+            {"dispatch_pull_batch": 3},
+            {"dispatch_pull_rotate": False},
+            {"dispatch_pull_rotate": True},
+        ):
+            with pytest.raises(ValueError, match="dispatch_pull"):
+                Sm90PullFp8MegaKernelBackend(
+                    dataclasses.replace(base, knobs="auto", **pull)
+                )
+            for knobs in (None, {}):
+                backend = Sm90PullFp8MegaKernelBackend(
+                    dataclasses.replace(base, knobs=knobs, **pull)
+                )
+                assert not backend._autotune_pending
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # knobs="auto" collective warning
-            backend = Sm90PullFp8MegaKernelBackend(
-                dataclasses.replace(base, knobs="auto")
-            )
-        assert backend._autotune_pending
+            for compact in (True, False):
+                backend = Sm90PullFp8MegaKernelBackend(
+                    dataclasses.replace(base, knobs="auto", compact_pull_buffer=compact)
+                )
+                assert backend._autotune_pending

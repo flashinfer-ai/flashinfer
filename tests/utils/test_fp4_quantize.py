@@ -60,7 +60,17 @@ def _is_fp4_supported(device: torch.device) -> bool:
 
 DTYPES = [torch.float16, torch.bfloat16]
 # The batch dimension doesn't need to be multiple of 128
-SHAPES = [(128, 64), (256, 128), (120, 64), (200, 256), (2048, 2048)]
+SHAPES = [
+    (128, 64),
+    (256, 128),
+    (120, 64),
+    (200, 256),
+    (2048, 2048),
+    # 4800 / 8 = 600 column threads: a 512-thread block covers the row in two passes and the
+    # second one ends inside a warp (88 = 2 * 32 + 24), so the scale-factor shuffle runs in a
+    # partially active warp.
+    (8, 4800),
+]
 BATCH_SHAPES = [
     (1, 256, 128),
     (2, 128, 64),
@@ -278,6 +288,31 @@ def test_fp4_quantization(
             scale_ans = out_scale
         torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
         torch.testing.assert_close(scale_ans, scale_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sf_use_ue8m0", [False, True])
+@pytest.mark.parametrize("is_swizzled", [False, True])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_fp4_quantize_zero_rows(sf_use_ue8m0, is_swizzled, device):
+    """An input with no rows returns empty outputs and leaves no CUDA error behind.
+
+    The launcher used to launch a zero-sized grid, which fails with
+    cudaErrorInvalidValue that the next CUDA call then reports.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    n = 64
+    sf_vec_size = 32 if sf_use_ue8m0 else 16
+    x = torch.empty((0, n), dtype=torch.bfloat16, device=device)
+    global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    out, out_scale = fp4_quantize(
+        x, global_scale, sf_vec_size, sf_use_ue8m0, is_swizzled, backend="cuda"
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (0, n // 2)
+    assert out_scale.dtype == torch.uint8 and out_scale.device == out.device
+    # The next kernel must run: a sticky launch error would surface here.
+    assert torch.ones(4, device=device).sum().item() == 4.0
 
 
 @pytest.mark.parametrize("backend", FP4_BACKENDS)
@@ -2816,3 +2851,43 @@ def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("m", [1, 7, 64, 129, 512])
+@pytest.mark.parametrize("k", [64, 3072, 6144])
+@pytest.mark.parametrize("seed", [0, 1])
+@torch.inference_mode()
+def test_nvfp4_per_token_linear_scales_need_no_zero_fill(dtype, m, k, seed):
+    """The per-token NVFP4 quant writes every scale byte of the linear layout,
+    so its output does not depend on the scale buffer's previous contents."""
+    device = torch.device("cuda")
+    if not _is_fp4_supported(device):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    from flashinfer.quantization.fp4_quantization import get_fp4_quantization_module
+
+    major, minor = torch.cuda.get_device_capability(device)
+    module = get_fp4_quantization_module(f"{major * 10 + minor}")
+    torch.manual_seed(seed)
+    x = torch.randn((m, k), dtype=dtype, device=device) * 3
+    x[0, :16] = 0  # an all-zero block: scale byte 0
+    if m > 1:
+        x[1] = 0  # an all-zero row: its scale bytes must still be written
+    linear = SfLayout.layout_linear.value
+
+    def run(fill):
+        out = torch.empty((m, k // 2), dtype=torch.uint8, device=device)
+        scale = torch.full((m, k // 16), fill, dtype=torch.uint8, device=device)
+        per_token = torch.empty((m,), dtype=torch.float32, device=device)
+        module.nvfp4_quant_and_per_token_scale_out_sm100(
+            x, 1.0, out, scale, per_token, None, linear
+        )
+        return out, scale, per_token
+
+    ref = run(0)
+    for fill in (0xAB, 0xFF):
+        for a, b in zip(run(fill), ref, strict=True):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    got = module.nvfp4_quant_and_per_token_scale_sm100(x, 1.0, None, linear)
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))

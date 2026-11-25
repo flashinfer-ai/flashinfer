@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -91,7 +92,7 @@ def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> d
     io["shape"] = shape or (4608, 1024, 5120, 48, 128)
     io["launch_early_exit_max_token_ctas"] = 96
     io["c_row_stride"] = io["shape"][0]
-    io["cfg"] = object()
+    io["cfg"] = SimpleNamespace(fused_finalize_top_k=0)
     return io
 
 
@@ -141,7 +142,7 @@ def test_disk_kernel_name_covers_compile_time_inputs(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
+def test_compiled_gemm_targets_the_launch_device(monkeypatch, request, tmp_path):
     # The launch tensors live on device 1 (SM103) while device 0 (SM100) is
     # current: the GEMM must be keyed, named, compiled and persisted for SM103.
     capabilities = {0: (10, 0), 1: (10, 3)}
@@ -166,12 +167,14 @@ def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
     monkeypatch.setattr(compile_cache, "_kernel_source_sha256", lambda: "sources")
 
     specs = []
+    monkeypatch.setattr(cute_dsl_core, "get_tmpdir", lambda: tmp_path)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
 
     class MissingSpec(cute_dsl_core.JitSpecCuteDsl):
         def try_load(self):
             return None
 
-        def compile_and_persist(self):
+        def build(self):
             specs.append((self, current[0]))
 
         def load(self):
@@ -195,3 +198,15 @@ def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
     assert spec.module_dir_name == f"{compile_cache._DISK_MODULE_NAME}_sm103a_cute_dsl"
     assert spec.expected_meta["arch"] == "sm103a"
     assert spec.kernel_name.startswith("fc1_sm103_")
+
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    monkeypatch.setattr(compile_cache, "_kernel_source_sha256", lambda: None)
+    monkeypatch.setattr(
+        batched_gemm_run, "_compile_for_launch", lambda io, stream: current[0]
+    )
+    with mock.patch.object(
+        cute_dsl_core, "_compile_in_process", wraps=cute_dsl_core._compile_in_process
+    ) as guarded:
+        assert compile_cache.get_compiled_gemm("uncacheable", "fc1", io, None) == 1
+        guarded.assert_called_once()

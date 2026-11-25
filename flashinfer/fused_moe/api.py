@@ -684,17 +684,48 @@ class TrtllmFp4Config:
 
 @dataclass(frozen=True)
 class CakeWarpDecodeConfig:
-    """Explicit Cake NVFP4 warp-decode backend for exact SM100 and SM103.
+    """Cake NVFP4 warp-decode backend for exact SM100 and SM103.
 
     This backend is intentionally narrow: it accepts only the
     activation-qualified expert geometries documented by
-    :class:`CakeWarpDecodeRunner`, 1--32 tokens, and unpacked precomputed routing.
-    It is never part of the default backend list; users opt in with
-    ``CakeWarpDecodeConfig(backend="cake")``.
+    :class:`CakeWarpDecodeRunner`, 1--32 tokens, BF16 routing weights, and
+    unpacked precomputed routing.
+
+    The default backend list ends with
+    ``CakeWarpDecodeConfig(default_candidate=True)``. ``MoELayer`` times every
+    eligible candidate on the first call for each token bucket and keeps a
+    later candidate only when it is strictly faster, so this entry is selected
+    only when it measures faster than every earlier eligible backend. It is
+    eligible only for weight packs with a ``"cake"`` view and for activation
+    packs it can serve; other calls select exactly as without it. Like the
+    TRT-LLM routing kernels, this entry drops a ``topk_ids`` value outside
+    ``[0, num_experts)``, such as ``-1`` padding, on the device without a host
+    sync: the slot adds nothing to the output. During CUDA Graph
+    capture it is eligible only for a token count it already served in an
+    eager call, and while an autotune process group tunes
+    (:func:`flashinfer.autotuner.set_autotune_process_group`) it is not
+    eligible. Setting ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` before a
+    ``MoELayer`` is built leaves this entry out of that layer (see
+    :func:`flashinfer.api_logging.cake_auto_candidates_enabled`). The default
+    entry resolves ``ExecutionConfig(enable_pdl=None)`` from the device, still
+    rejects ``enable_pdl=False``, and loads its kernel module on first use; if
+    that load fails, the entry is left out and the other candidates serve the
+    call.
+
+    An explicit ``CakeWarpDecodeConfig(backend="cake")`` is not affected by
+    that switch, requires ``ExecutionConfig(enable_pdl=True)``, and drops a
+    ``topk_ids`` value outside ``[0, num_experts)`` in the same way.
 
     The physical weight and activation layouts are exactly those produced by
     :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
     representation usable by both runners.
+
+    A routing slot whose ``topk_ids`` value lies outside ``[0, num_experts)``,
+    such as a ``-1`` padding slot, is dropped inside the kernels: it adds
+    nothing to the output and its weight is ignored, even if NaN or Inf. A
+    token may have several dropped slots, and a token without a valid slot
+    outputs zeros. No host check reads ``topk_ids``, so CUDA Graph replays may
+    change the ids freely.
 
     CUDA Graph capture requires a warmed workspace. Graph replays and eager
     calls that share a workspace must be ordered by the caller; captured calls
@@ -703,6 +734,8 @@ class CakeWarpDecodeConfig:
     """
 
     backend: Literal["cake"] = "cake"
+    # Marks the default backend list's entry; see the class docstring.
+    default_candidate: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.backend != "cake":
@@ -801,6 +834,8 @@ class CakeWarpDecodeConfig:
         )
 
     def __repr__(self) -> str:
+        if self.default_candidate:
+            return "CakeWarpDecodeConfig(backend='cake', default_candidate=True)"
         return "CakeWarpDecodeConfig(backend='cake')"
 
 
@@ -1136,13 +1171,35 @@ def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
     }
 
 
+def _block_major_k_fp4_weights(view: dict, *, block_bytes: int) -> dict:
+    """Store the packed FP4 weights of ``view`` BlockMajorK.
+
+    ``[experts, Mn, K_bytes]`` becomes ``[experts, K_bytes / block_bytes, Mn,
+    block_bytes]``. The rows of a weight tile are then contiguous within each
+    K block, so a GEMM pipeline stage reads a few contiguous regions instead
+    of one short segment per row.
+    """
+    view = dict(view)
+    for name in ("gemm1_weights", "gemm2_weights"):
+        weights = view[name]
+        num_experts, mn, k_bytes = weights.shape
+        view[name] = (
+            weights.view(num_experts, mn, k_bytes // block_bytes, block_bytes)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+    return view
+
+
 @dataclass(frozen=True)
 class PrimsTsConfig:
     """Explicit Prims-TS backend for SM100 and SM103.
 
     Opt-in only: this config is never part of the default backend list.
     NVFP4×NVFP4, MXFP4×MXFP8, and MXFP4×BF16 reuse
-    :class:`TrtllmFp4Config`. BF16×BF16 reuses :class:`TrtllmBf16Config`.
+    :class:`TrtllmFp4Config`; MXFP4×MXFP8 then stores the weights BlockMajorK
+    in 64-byte K blocks, so that whole weight tiles stream from contiguous
+    memory. BF16×BF16 reuses :class:`TrtllmBf16Config`.
     MXFP8×MXFP8 and FP8PerTensor×FP8PerTensor reuse
     :class:`TrtllmFp8BlockConfig` and :class:`TrtllmFp8PerTensorConfig`.
     DeepSeekFp8×DeepSeekFp8 reuses the TRT-LLM scales and activations, then
@@ -1176,13 +1233,26 @@ class PrimsTsConfig:
 
         Register the returned dictionary with
         ``MoEWeightPack.prepare_for("prims_ts", view)``. Except for
-        DeepSeekFp8, the same dictionary may also be registered for the
-        matching TRT-LLM backend key.
+        DeepSeekFp8 and MXFP4×MXFP8, the same dictionary may also be
+        registered for the matching TRT-LLM backend key. The Prims-TS backend
+        also accepts the MajorK TRT-LLM MXFP4×MXFP8 view.
         """
         pair = quant.pair
+        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            view = TrtllmFp4Config.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                quant=quant,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+                permute_cache=permute_cache,
+            )
+            return _block_major_k_fp4_weights(view, block_bytes=64)
         if pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
-            (QuantFormat.MXFP4, QuantFormat.MXFP8),
             (QuantFormat.MXFP4, QuantFormat.BF16),
         ):
             return TrtllmFp4Config.prepare_weights(
@@ -3411,6 +3481,111 @@ class BatchInvariantBf16Config:
         return "BatchInvariantBf16Config()"
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE
+# GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's fp8 per-tensor decode tactics; the fused
+# activation and e4m3 requantisation at the static per-tensor multiplier in GEMM1's epilogue follows Prims-TS's fused
+# activation and TRTLLM-Gen's fp8 per-tensor contract, whose surface this backend mirrors; the PDL wait / trigger
+# placement and the launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation,
+# combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits,
+# placed as those kernels place theirs.
+@dataclass(frozen=True)
+class BatchInvariantFp8PerTensorConfig:
+    """The batch-invariant fp8 per-tensor MoE backend: the W8A8 classes ``moe.e4m3.<act>`` of the mode documented in
+    ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
+    SM100 / SM103 / SM107.
+
+    The surface is :class:`TrtllmFp8PerTensorConfig`'s: ``QuantConfig(weight=QuantFormat.FP8PerTensor,
+    activation=QuantFormat.FP8PerTensor)``, ``prepare_weights`` from the bf16 experts with the two calibrated E4M3
+    multipliers (``hidden_states_scale_global``, ``intermediate_scale_global``: ``q = x * s``), ``prepare_activations``
+    quantizing the bf16 activations with the input multiplier (an e4m3 ``[num_tokens, H]`` and no scale tensor), all three
+    routing input modes. The class declares every rounding: the experts quantized with one multiplier per expert and GEMM
+    (``448 / amax``), the dequantization scales the correctly rounded reciprocals of the multipliers, GEMM1's activation on
+    the alpha-scaled fp32 accumulators followed by the ``mul.rn`` by the intermediate multiplier and one saturating RNE
+    conversion to e4m3, GEMM2's ``cvt_bf16(mul(acc, alpha2))``, the slot-order fp32 combine. Every output bit is a function of
+    the token's own e4m3 row, its ``top_k`` experts and routing weights, the expert bytes and the scales; ``do_finalize=True``
+    only (the unfinalized triple is refused) and the dense expert set only (an expert-parallel shard,
+    ``local_expert_offset`` / ``local_num_experts``, is refused); unsupported inputs raise
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default candidate (name it in
+    ``BackendOptions``). ``H`` and ``I`` are multiples of 16 (16-byte e4m3 rows).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16: torch.Tensor,
+        w2_bf16: torch.Tensor,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the experts quantized to e4m3 per expert, the gate / up rows interleaved for a gated
+        activation, the dequantization scales of the two multipliers and of the experts, the activation's chain
+        (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.api_fp8 import MoEWeightsE4M3
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1_bf16.dim() != 3 or w2_bf16.dim() != 3:
+            raise TypeError(
+                "BatchInvariantFp8PerTensorConfig.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1_bf16.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantFp8PerTensorConfig.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1_bf16.shape)}, w2 {tuple(w2_bf16.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
+        w1 = w1_bf16.to(device=device) if device is not None else w1_bf16
+        w2 = w2_bf16.to(device=device) if device is not None else w2_bf16
+        return MoEWeightsE4M3.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            hidden_states_scale_global,
+            intermediate_scale_global,
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16: torch.Tensor, *, hidden_states_scale_global
+    ) -> Tuple[torch.Tensor, None]:
+        """The static input quantization ``cvt.rn.satfinite.e4m3(mul(x, hidden_states_scale_global))`` (the class's declared
+        chain as torch ops; graph-capturable with a device scale)."""
+        from .batch_invariant.reference_fp8 import quantize_e4m3_static
+
+        x = hidden_states_bf16.to(torch.bfloat16).contiguous()
+        m = torch.as_tensor(
+            hidden_states_scale_global, dtype=torch.float32, device=x.device
+        )
+        if m.numel() != 1:
+            raise ValueError(
+                "BatchInvariantFp8PerTensorConfig.prepare_activations: hidden_states_scale_global must be one fp32 value, "
+                f"got shape {tuple(m.shape)}"
+            )
+        # a 0-d multiplier: a one-element tensor of any rank must not broadcast the activations to its rank
+        return quantize_e4m3_static(x, m.reshape(())), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantFp8PerTensorConfig()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     BatchInvariantBf16Config,
@@ -3456,6 +3631,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8PerTensorConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3502,6 +3678,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8PerTensorConfig,
 )
 
 
@@ -3567,6 +3744,8 @@ _DEFAULT_BACKEND = BackendOptions(
         CudnnFrostMxfp8Config(),
         CudnnFrostNvfp4Config(),
         CudnnFrostMxfp8Mxfp4Config(),
+        # Last, so it never displaces an earlier backend on a timing tie.
+        CakeWarpDecodeConfig(default_candidate=True),
     )
 )
 
@@ -3815,6 +3994,17 @@ class MoEActivationPack:
     routing_bias: Optional[Tensor] = field(
         default=None, kw_only=True
     )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
+    # Optional contiguous, 16-byte aligned [M, H] bfloat16 buffer on the
+    # device of the activations, for the finalized output.
+    # Runners that write it in place (Prims-TS) write it here and return it;
+    # the others allocate their own. Callers use the returned tensor.
+    output: Optional[Tensor] = field(default=None, kw_only=True)
+    # Whether the output rows of tokens without a local expert (no top-k id in
+    # this rank's local expert range) are written as zeros. False is for
+    # callers that never read those rows, such as an all-to-all combine that
+    # reads only rows with a local expert: the runners that honor it
+    # (Prims-TS) then leave them as they are, the others still write zeros.
+    zero_rows_without_local_expert: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         """Fail fast on mode/field mismatches at construction time.

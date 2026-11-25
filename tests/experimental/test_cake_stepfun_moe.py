@@ -60,6 +60,7 @@ import torch
 
 from tests.experimental.test_helpers import cake_stepfun_moe_reference as ref
 from tests.cake.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 pkg = cake_package("cake_stepfun_moe")
 cb = cake_package("cake_stepfun_moe", "cake_backend")
@@ -73,7 +74,7 @@ PRECISIONS = tuple(ref.PRECISION_FAMILY)
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 STAGE_TABLE_SIZES = {"routing": 50, "fc1": 27, "requant": 2, "fc2": 28, "finalize": 4}
 ROUTE_COUNT = 138
-ARG_PLAN_COUNT = 21
+ARG_PLAN_COUNT = 24
 # The export's measurement catalogue (``ROUTES``), delivered with the tests.
 ROUTES_PATH = (
     Path(__file__).resolve().parent / "test_helpers" / "cake_stepfun_moe_routes.json"
@@ -232,27 +233,6 @@ def _plan_kernels(launch) -> list[str]:
     if launch.finalize_program is not None:
         programs.append(launch.finalize_program)
     return [loader.PROGRAMS[program]["kernel"] for program in programs]
-
-
-def _profiled_kernel_names(fn) -> list[str]:
-    """CUDA kernel names of one call of ``fn`` (memcpy / memset activities excluded).  The profiler's
-    warm-up step runs one call whose records are discarded: CUDA activity collection starts
-    asynchronously once the profiler is entered."""
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-    ) as profile:
-        fn()
-        _sync()
-        profile.step()
-        fn()
-        _sync()
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-        and not event.name.startswith(("Memcpy", "Memset"))
-    ]
 
 
 def _capture(launch, outputs):
@@ -453,6 +433,9 @@ def test_unit_blocks_carry_the_stage_facts():
             )
             assert unit["per_token"] is families[unit["family"]]["per_token"]
             assert unit["weight_layout"] == families[unit["family"]]["weight_layout"]
+            assert unit["grid_rule"] in ("tiles", "resident"), program
+            if unit["grid_rule"] == "resident":
+                assert unit["stage"] == "fc1" or unit["split_k"] == 1, program
             if unit["stage"] == "fc1":
                 assert unit["output_rows_per_cta"] == ref.FC1_OUTPUT_ROWS_PER_CTA
             else:
@@ -609,7 +592,7 @@ def test_package_sources_carry_no_target_minor_and_no_fast_math():
 
 def test_program_rows_expand_over_the_shared_argument_plans():
     """Every ``PROGRAMS`` record is expanded from a compact row: its argument plan is one of the
-    shared ``ARG_PLANS`` (21 distinct ``[kind, name]`` sequences, each serving at least one
+    shared ``ARG_PLANS`` (24 distinct ``[kind, name]`` sequences, each serving at least one
     program), the tensor-map operands of that plan are exactly the keys of ``unit["tma_ranks"]``,
     and the derived fields hold -- ``library`` is the program name, ``ffi_entry`` is ``run``,
     ``arches`` is ``ARCHES``, ``kernel`` is ``kernel_<program>`` unless ``_KERNEL_OVERRIDES`` names
@@ -1351,7 +1334,8 @@ def test_unfinalized_outputs_follow_the_native_layout(precision, weights_cache):
 @pytest.mark.parametrize("precision", PRECISIONS)
 def test_cuda_graph_replay_equals_eager(precision, num_tokens, weights_cache):
     """A prepared launch captured in a CUDA graph (after one eager launch) replays the eager bytes,
-    on the first and on the second replay."""
+    on the first and on the second replay, and leaves every resident unit's work counter zeroed
+    (no launch resets it)."""
     family = ref.PRECISION_FAMILY[precision]
     device, _arch = _require_device(family)
     weights = _weights(weights_cache, family, 0, device)
@@ -1369,6 +1353,12 @@ def test_cuda_graph_replay_equals_eager(precision, num_tokens, weights_cache):
             assert torch.equal(tensor, expected), (
                 f"{precision} T={num_tokens}: replay {replay} differs"
             )
+        for name, counter in launch.buffers.items():
+            if name.endswith("_work_counter"):
+                assert counter.tolist() == [0, 0], (
+                    f"{precision} T={num_tokens}: {name} is {counter.tolist()} after "
+                    f"replay {replay}"
+                )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1390,7 +1380,7 @@ def test_whole_graph_launches_only_cake_kernels(precision, num_tokens, weights_c
     launch = _prepare_graph(case, logits)
     launch.launch()
     _sync()
-    names = _profiled_kernel_names(launch.launch)
+    names = cuda_kernel_names(launch.launch)
     assert names, "the profiler captured no kernel"
     offenders = [name for name in names if CAKE_KERNEL_SYMBOL.search(name) is None]
     assert not offenders, (

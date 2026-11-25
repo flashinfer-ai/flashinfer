@@ -4054,6 +4054,25 @@ def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
         gemm1_clamp_limit=per_expert(2.0),
     )
 
+    # Distinct values per expert: the reference applies each expert's own alpha, beta and
+    # clamp, so an activation kernel that resolved the wrong expert for a row would not match.
+    # Neighbouring experts get values far apart (a lookup off by one GEMM tile lands on a
+    # neighbour), well beyond the FP8 block-scale tolerance of the comparison.
+    expert_ids = torch.arange(num_experts, device="cuda", dtype=torch.float32)
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+        routing_config,
+        weight_processing,
+        ActivationType.Swiglu,
+        cache_permute_indices,
+        gemm1_alpha=0.5 + 0.5 * (expert_ids % 4),
+        gemm1_beta=0.25 * (expert_ids % 3),
+        gemm1_clamp_limit=1.0 + 1.0 * (expert_ids % 5),
+    )
+
 
 # ====================================================================================
 # MoE LoRA: gemm1_lora_delta

@@ -9,25 +9,25 @@ import pytest
 from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.config import (
     Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.bf16 import (
     MegaMoEBf16Config,
 )
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.autotune import (
     bf16_candidates,
 )
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
     default_knobs,
     is_valid_bf16,
 )
 
 
 @pytest.mark.cpu_only
-def test_bf16_knobs_only_expose_valid_fixed_geometry():
+def test_bf16_ordinary_autotuning_preserves_its_baseline_geometry():
     knobs = default_knobs(256, dtype="bf16")
     assert knobs["mma_tiler_mnk"] == (256, 256, 64)
     assert knobs["cluster_shape_mnk"] == (2, 1, 1)
     assert is_valid_bf16(knobs)
-    assert not is_valid_bf16({**knobs, "mma_tiler_mnk": (256, 256, 256)})
+    assert not is_valid_bf16({**knobs, "mma_tiler_mnk": (256, 256, 32)})
     assert not is_valid_bf16(
         {**knobs, "in_kernel_fc2_reduce": True, "token_back_mode": "epi_warps"}
     )
@@ -69,7 +69,7 @@ def test_bf16_frontend_rejects_unsupported_shapes(
 def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -100,7 +100,7 @@ def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
 def test_bf16_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16
 
     monkeypatch.setattr(
         bf16, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
@@ -123,7 +123,7 @@ def test_bf16_factory_resolves_ikr_from_knobs_when_permitted(monkeypatch):
     """The permission is a ceiling: either knob value is now servable."""
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -153,7 +153,7 @@ def test_bf16_factory_resolves_ikr_from_knobs_when_permitted(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_bf16_frontend_rejects_unpermitted_ikr_knobs():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.bf16 import (
         MegaMoEBf16Frontend,
     )
 
@@ -182,8 +182,8 @@ def test_bf16_frontend_rejects_unpermitted_ikr_knobs():
 
 @pytest.mark.cpu_only
 def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.bf16 import (
         MegaMoEBf16Frontend,
     )
 
@@ -203,7 +203,9 @@ def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     buffer = SimpleNamespace(_frontend=frontend)
     with pytest.warns(
@@ -220,8 +222,8 @@ def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
 @pytest.mark.cpu_only
 def test_bf16_autotune_sweeps_the_ikr_axis_when_permitted(monkeypatch):
     """A permitted session times both ikr modes; both must be runnable as-is."""
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.bf16 import (
         MegaMoEBf16Frontend,
     )
 
@@ -240,7 +242,9 @@ def test_bf16_autotune_sweeps_the_ikr_axis_when_permitted(monkeypatch):
     monkeypatch.setattr(
         autotune,
         "autotune_knobs",
-        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+        lambda _frontend, _launch, candidates, **kwargs: kwargs["candidate_filter"](
+            candidates
+        ),
     )
     candidates = autotune.autotune_bf16_mega_moe(
         None, None, None, SimpleNamespace(_frontend=frontend)
