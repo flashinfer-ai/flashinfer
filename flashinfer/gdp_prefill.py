@@ -99,8 +99,7 @@ def chunk_gated_delta_product(
     initial_state : torch.Tensor, optional
         Incoming recurrent state ``[num_seqs, num_sab_heads, head_size,
         head_size]``, V-major (``[..., V, K]``), float32 or bfloat16 (also
-        float16 on the Cake backend on SM100 / SM103).  A zero state when
-        ``None``.
+        float16 on the Cake backend).  A zero state when ``None``.
     output_final_state : bool
         Return the outgoing recurrent state alongside the output.
     cu_seqlens : torch.Tensor
@@ -130,17 +129,19 @@ def chunk_gated_delta_product(
         ``head_size == 128`` with a 64-wide value / state row, one head count
         for q, k and v, ``num_householder`` in 1..4 on an SM90 (H100 / H200)
         device and 3 on an SM100 (B200 / GB200) or SM103 (B300 / GB300) device; the argument
-        contract is this function's.  On SM90 ``initial_state`` /
-        ``output_state`` are float32 (a bfloat16 per-sequence
-        ``initial_state`` is converted) and pools contiguous.  On SM100 /
-        SM103 the state is float32, bfloat16 or float16, one dtype for the
-        initial and the output state (the bfloat16-to-float32 conversion
-        above aside): a bfloat16 / float16 state is read widened exactly and
-        its final value rounded once when it is stored, to nearest even, or
-        stochastically with ``rand_seed``; pools and dense bfloat16 / float16
-        state tensors may pad the slot stride (see ``state_indices``), a dense
-        float32 ``output_state`` must be contiguous (a padded dense float32
-        ``initial_state`` is copied once).  One Cake kernel launch per call;
+        contract is this function's.  The state is float32, bfloat16 or
+        float16, one dtype for the initial and the output state (the
+        bfloat16-to-float32 conversion above aside): a bfloat16 / float16
+        state is read widened exactly and its final value rounded once when
+        it is stored, to nearest even, or stochastically with ``rand_seed``.
+        On SM100 / SM103 pools and dense bfloat16 / float16 state tensors
+        may pad the slot stride (see
+        ``state_indices``), a dense float32 ``output_state`` must be
+        contiguous (a padded dense float32 ``initial_state`` is copied once).
+        On SM90 a float32 call without ``output_state_indices`` takes
+        contiguous float32 tensors; a bfloat16 / float16 state or
+        ``output_state_indices`` runs the pool programs with write slots,
+        whose state tensors follow the SM100 / SM103 rules above.  One Cake kernel launch per call;
         the split programs add a workspace clear and the item-table upload
         (from pinned host memory into a cached device buffer, so the call
         captures into a CUDA graph when ``cu_seqlens_cpu`` is given).  On
@@ -160,10 +161,10 @@ def chunk_gated_delta_product(
         unit-gate program and ``beta=None`` the unit-beta program, from a zero
         state (on SM100 / SM103 unit tensors are filled in); ``g=None``
         together with ``beta=None``, on SM90 a unit-gate / unit-beta call with
-        an ``initial_state`` or a ``state_indices`` pool, on SM90 a bfloat16 /
-        float16 state, ``output_state_indices`` or ``rand_seed``, and a device
-        without an exported route raise ``ValueError`` naming what is
-        exported.  Only ``backend="cake"`` takes ``output_state_indices`` and
+        a float32 ``initial_state`` or a float32 ``state_indices`` pool and no
+        ``output_state_indices`` (the pool programs fill unit tensors in),
+        and a device without an exported route raise ``ValueError`` naming
+        what is exported.  Only ``backend="cake"`` takes ``output_state_indices`` and
         ``rand_seed``; the other backends raise ``ValueError`` when they are
         given.
     cu_seqlens_cpu : torch.Tensor, optional
@@ -207,11 +208,13 @@ def chunk_gated_delta_product(
         dense); the read slot is checked against ``initial_state`` and the
         write slot against ``output_state``: a read slot outside
         ``initial_state`` (such as -1) starts that sequence from a zero state,
-        and a write slot outside ``output_state`` stores nothing.  On SM90 its
-        pools are float32 and contiguous, and a slot outside either pool
-        starts that sequence from a zero state and stores nothing.
+        and a write slot outside ``output_state`` stores nothing.  On SM90 a
+        float32 pool without ``output_state_indices`` is contiguous, and a
+        slot outside either pool starts that sequence from a zero state and
+        stores nothing; bfloat16 / float16 pools, or ``output_state_indices``,
+        follow the SM100 / SM103 rules.
     output_state_indices : torch.Tensor, optional
-        ``backend="cake"`` on SM100 / SM103 only: int32 / int64
+        ``backend="cake"`` only: int32 / int64
         ``[num_seqs]`` slots of ``output_state`` the final states are written
         to (a slot outside the pool, such as -1, stores nothing).
         ``state_indices`` stays the read slots.  Defaults to
@@ -224,7 +227,8 @@ def chunk_gated_delta_product(
         replay).  With it, the final state is rounded stochastically: each
         element takes 16 (bfloat16) or 13 (float16) random bits of a
         Philox-4x32 draw keyed by the seed, through the hardware ``cvt.rs``
-        instruction.  One draw covers columns ``k .. k+3`` and
+        instruction on SM100 / SM103 and a software form of it on SM90, which
+        has no ``cvt.rs``.  One draw covers columns ``k .. k+3`` and
         ``k+64 .. k+67`` (``k`` a multiple of 4 below 64) of one state row,
         and its counter is the element offset of column ``k`` of that row
         from the base of ``initial_state`` at the sequence's read slot when
@@ -233,7 +237,9 @@ def chunk_gated_delta_product(
         counter carries no step, layer or token term: advance the seed per
         step and use one per layer.  Sequences that read one slot get the
         same random bits.  Without a seed the final state is rounded to
-        nearest even.  A seed with a float32 state raises ``ValueError``.
+        nearest even.  A seed with a float32 state raises ``ValueError``, as
+        does a seed with a per-sequence ``initial_state`` the kernel cannot
+        read in place (a copy would change the counters).
     philox_rounds : int
         Philox rounds of a stochastic rounding, 5 to 16 (default 10); read
         only with ``rand_seed``.
