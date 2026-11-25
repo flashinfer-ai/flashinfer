@@ -15,7 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Builds one runner per compatible backend, picks the cross-backend winner
-by measuring each runner's best tactic, then dispatches to the winner.
+by measuring each runner's best tactic on serving-like inputs (see
+``selection``), then dispatches to the winner.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import replace
 from statistics import median
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 
@@ -130,6 +131,12 @@ from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .batch_invariant.runner import BatchInvariantMoeRunner
 from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
+from .selection import (
+    is_capturing,
+    representative_pack,
+    selects_on_call_inputs,
+    validate_expert_load,
+)
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
@@ -247,6 +254,7 @@ class MoELayer:
     Example
     -------
     >>> layer = MoELayer(config)
+    >>> layer.warmup(act_pack, weight_pack)  # optional: select before capture
     >>> out = layer(act_pack, weight_pack)
     """
 
@@ -407,6 +415,28 @@ class MoELayer:
         Candidate pools containing Frost low-latency use exact token counts
         because their bounded tactics need not cover every row in a bucket.
 
+        The first call of a bucket selects its winner. With several eligible
+        backends they are timed on a synthetic pack with this call's shapes,
+        dtypes, strides, weights and routing bias but serving-like values
+        (iid routing, normal activations, fixed seed), not on this call's
+        tensors: frameworks usually make that call with a warm-up batch on
+        static, often zero-filled CUDA-graph buffers, whose tokens are all
+        identical and so all pick the same experts, and backends rank
+        differently on that than on served traffic. ``warmup()`` selects
+        ahead of time, optionally on a recorded expert load or on the caller's
+        own values.
+        ``FLASHINFER_MOE_SELECT_ON_CALL_INPUTS=1`` (temporary, for A/B tests)
+        times this call's tensors again.
+
+        Selection is meant to happen before CUDA-graph capture, on an eager
+        call or ``warmup()`` for every captured token count; a captured graph
+        keeps the winner it recorded. A first call of a bucket inside a
+        capture synthesizes nothing (nothing may be generated into the
+        caller's graph) and selects on the call's own tensors: with one
+        eligible backend it runs that backend; with several, the cross-backend
+        timing synchronizes the device, which a capture does not allow, and
+        the call fails.
+
         Parameters
         ----------
         act_pack : MoEActivationPack
@@ -434,10 +464,108 @@ class MoELayer:
             If no usable backend supports this pack's ``routing_input_mode``.
         """
         eligible = self._eligible_runners(act_pack, weight_pack)
-        ceiling = self.config.execution.tune_max_num_tokens
-        mode = act_pack.routing_input_mode
+        winner_key = self._winner_key(act_pack, eligible)
+        winner = self._winners.get(winner_key)
+        if winner is None:
+            runners = [self.runners[index] for index in eligible]
+            selection_pack = (
+                act_pack
+                if selects_on_call_inputs()
+                else self._selection_pack(act_pack, runners)
+            )
+            winner = self._select_winner(selection_pack, weight_pack, runners)
+            self._cache_winner(winner_key, winner)
+        else:
+            self._winners.move_to_end(winner_key)
+        runner, tactic = winner
+        self._last_winner_backend = runner.backend_key
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        return runner.forward(
+            inputs,
+            tactic=tactic,
+            **runner.launch_kwargs_for(inputs),
+        )
 
-        bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
+    @flashinfer_api
+    def warmup(
+        self,
+        act_pack: MoEActivationPack,
+        weight_pack: MoEWeightPack,
+        *,
+        expert_load: Optional[Union[torch.Tensor, Sequence[float]]] = None,
+        use_pack_values: bool = False,
+    ) -> str:
+        """Select and cache the winner for ``act_pack``'s bucket before capture.
+
+        An optional hook for integrations: call it once per token count the
+        framework will capture, before capturing, to select on representative
+        routing rather than on what the first call happens to carry. The
+        selection replaces any winner already cached for that bucket (a
+        captured graph keeps the winner it recorded). Without the hook,
+        ``__call__`` selects on its first call of a bucket, on synthetic
+        serving-like inputs.
+
+        Parameters
+        ----------
+        act_pack : MoEActivationPack
+            A pack with the geometry of the calls to serve: token count,
+            routing input mode, dtypes and strides, and the routing bias.
+            Its values are used only with ``use_pack_values=True``.
+        weight_pack : MoEWeightPack
+            The expert weights the calls will use.
+        expert_load : torch.Tensor or sequence of float, optional
+            Relative load of each global expert (``[routing.num_experts]``),
+            e.g. a histogram of the experts served traffic selected. The
+            synthetic routing then draws each token's ``top_k`` distinct
+            experts in proportion to it (Gumbel top-k) instead of uniformly;
+            for ``FromLogits`` the drawn experts get high logits, so the
+            kernel's router selects them whatever the method. Grouped
+            DeepSeekV3 routing draws ``topk_group`` groups first.
+        use_pack_values : bool
+            Time the candidates on ``act_pack``'s own activations and routing,
+            e.g. logits recorded from served traffic, instead of synthetic
+            values. Exclusive with ``expert_load``.
+
+        Returns
+        -------
+        str
+            The backend key of the selected winner.
+
+        Raises
+        ------
+        RuntimeError
+            Inside a CUDA-graph capture: selection times the candidates and
+            must run before capture.
+        ValueError
+            For a malformed ``expert_load``, both ``expert_load`` and
+            ``use_pack_values``, or a token count above the layer's ceiling.
+        NotImplementedError
+            If no usable backend supports this pack's ``routing_input_mode``.
+        """
+        if is_capturing(act_pack):
+            raise RuntimeError(
+                "MoELayer.warmup times the candidate backends and cannot run "
+                "inside a CUDA-graph capture; call it before capturing."
+            )
+        if use_pack_values and expert_load is not None:
+            raise ValueError("Pass expert_load or use_pack_values=True, not both.")
+        validate_expert_load(expert_load, self.config.routing)
+        eligible = self._eligible_runners(act_pack, weight_pack)
+        runners = [self.runners[index] for index in eligible]
+        selection_pack = (
+            act_pack
+            if use_pack_values
+            else self._selection_pack(act_pack, runners, expert_load=expert_load)
+        )
+        winner = self._select_winner(selection_pack, weight_pack, runners)
+        self._cache_winner(self._winner_key(act_pack, eligible), winner)
+        return winner[0].backend_key
+
+    def _winner_key(self, act_pack, eligible: tuple[int, ...]) -> tuple:
+        """Winner-cache key of a call: (token bucket, routing mode, eligible set)."""
+        bucket = map_to_hybrid_bucket(
+            act_pack.num_tokens, self.config.execution.tune_max_num_tokens
+        )
         # Frost's bounded decode tactics can require exactly T=4 or T=8.
         # Sharing their winner with T=3 or T=5..7 is not a valid specialization.
         # Other candidate pools retain hybrid bucketing; Frost admits at most
@@ -448,23 +576,37 @@ class MoELayer:
             bucket = act_pack.num_tokens
         # Candidate positions distinguish different options for the same backend
         # and prevent changing weight views or shape eligibility from reusing a winner.
-        winner_key = (bucket, mode, eligible)
-        winner = self._winners.get(winner_key)
-        if winner is None:
-            runners = [self.runners[index] for index in eligible]
-            winner = self._select_winner(act_pack, weight_pack, runners)
-            self._winners[winner_key] = winner
-            if len(self._winners) > 128:
-                self._winners.popitem(last=False)
-        else:
-            self._winners.move_to_end(winner_key)
-        runner, tactic = winner
-        self._last_winner_backend = runner.backend_key
-        inputs = runner.pack_inputs(act_pack, weight_pack)
-        return runner.forward(
-            inputs,
-            tactic=tactic,
-            **runner.launch_kwargs_for(inputs),
+        return (bucket, act_pack.routing_input_mode, eligible)
+
+    def _cache_winner(self, winner_key: tuple, winner: Tuple[_RunnerT, Any]) -> None:
+        self._winners[winner_key] = winner
+        self._winners.move_to_end(winner_key)
+        if len(self._winners) > 128:
+            self._winners.popitem(last=False)
+
+    def _selection_pack(
+        self,
+        act_pack: MoEActivationPack,
+        runners: List[_RunnerT],
+        *,
+        expert_load: Optional[Union[torch.Tensor, Sequence[float]]] = None,
+    ) -> MoEActivationPack:
+        """The pack ``_select_winner`` times the candidates on.
+
+        A serving-like synthetic pack (``selection.representative_pack``),
+        except with a single candidate (no cross-backend timing; its tactic
+        choice never reads the pack's values) and inside a CUDA-graph capture,
+        where nothing may be generated into the caller's graph.
+        """
+        if len(runners) < 2 or not isinstance(act_pack, MoEActivationPack):
+            return act_pack
+        if is_capturing(act_pack):
+            return act_pack
+        return representative_pack(
+            act_pack,
+            self.config.routing,
+            self.config.quant.activation,
+            expert_load=expert_load,
         )
 
     def _eligible_runners(self, act_pack, weight_pack) -> tuple[int, ...]:
@@ -570,7 +712,14 @@ class MoELayer:
         weight_pack: MoEWeightPack,
         runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
-        """Tune each runner, then select by packing + forward GPU latency."""
+        """Tune each runner, then select by packing + forward GPU latency.
+
+        ``act_pack`` is the pack the candidates are timed on (see
+        ``_selection_pack``). ``bench_gpu_time`` gathers every timing sample
+        across the default ``torch.distributed`` group (maximum per sample)
+        when one is initialized, so ranks that select together compare the
+        same medians and pick the same winner.
+        """
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
