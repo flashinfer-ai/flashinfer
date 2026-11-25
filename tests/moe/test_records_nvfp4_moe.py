@@ -459,6 +459,8 @@ def test_valid_sizes(gated):
     if gated:
         torch.testing.assert_close(padded[2][:, :I], base[2], atol=0, rtol=0)
         assert padded[2].shape[1] == ip and not padded[2][:, I:].any()
+        with pytest.raises(ValueError, match="gemm1_lora_delta"):  # SM100's top_k slots
+            _trt(*args, gemm1_lora_delta=lora[:, :1].contiguous())
 
 
 @pytest.mark.parametrize("width", [H - 128, H - 2])
@@ -775,7 +777,18 @@ def test_zero_tokens():
             x, xsf, ids, weights, model["w1"], model["r1"], model["w1_g"], a2, model["w2"],
             model["r2"], model["w2_g"], E, K, quant_mode=mode, activation_type=model["act"].value,
         ))  # fmt: skip
-    assert all(o.shape == (0, H) for o in outs)
+    # TRT-LLM with a LoRA delta, and per token with fc2_input_out
+    lora = torch.empty(0, K, 2 * I, device="cuda", dtype=torch.bfloat16)
+    lo = _trt(
+        m, codes, sf, ids, weights, m["w1_g"], m["w1_g"], m["w2_g"], gemm1_lora_delta=lora
+    )  # fmt: skip
+    fo = [torch.empty(0, K, n, dtype=torch.uint8, device="cuda") for n in (I // 2, I // 16)]  # fmt: skip
+    fo.append(torch.empty(0, K, device="cuda"))
+    outs.append(_trt(
+        m, codes, sf, ids, weights, torch.ones(E, device="cuda"), m["w1_g"], m["w2_g"],
+        per_token_scale=torch.empty(0, device="cuda"), fc2_input_out=fo,
+    )[0])  # fmt: skip
+    assert all(o.shape == (0, H) for o in outs + [lo[0]]) and lo[2].shape == (0, I)
 
 
 def _fp8_rows(a):

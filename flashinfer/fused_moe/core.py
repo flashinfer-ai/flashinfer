@@ -2881,9 +2881,15 @@ def _trtllm_fp4_records_moe(
         )
     experts, inf, g = r1.shape[0], float("inf"), 2 if gated else 1
     lora, act_out = a.get("gemm1_lora_delta"), None
-    if lora is not None:  # fused shared experts last: no delta
-        lora = torch.nn.functional.pad(lora, (0, 0, 0, top_k - lora.shape[1]))
-        lora = valid(lora.view(ids.numel(), -1), iv, g)
+    if lora is not None:  # the routed slots: fused shared experts last, no delta
+        nfse = a.get("_nfse") or 0
+        shape = (tokens, top_k - nfse, 2 * inter)  # as SM100's launcher
+        if lora.dtype != torch.bfloat16 or lora.shape != shape:
+            raise ValueError(
+                "gemm1_lora_delta must be BF16 [num_tokens, top_k, 2 * intermediate_size]."
+            )
+        lora = torch.nn.functional.pad(lora, (0, 0, 0, nfse))
+        lora = valid(lora.flatten(0, 1), iv, g)
         act_out = x.new_empty(ids.numel(), iv, dtype=torch.bfloat16)
     # Limits in accumulator units with NVFP4 activations, as SM100's; MoELayer's in output units
     unit = ActivationType.Situ, ActivationType.SwigluStep
@@ -2902,8 +2908,7 @@ def _trtllm_fp4_records_moe(
         if experts < a["num_experts"] or a.get("routing_logits") is None:
             for t in fo:
                 t[:tokens].zero_()
-        n = tokens * top_k
-        fo = (fo[0][:tokens].view(n, -1), fo[1][:tokens].view(torch.uint8).view(n, -1),
+        fo = (fo[0][:tokens].flatten(0, 1), fo[1][:tokens].view(torch.uint8).flatten(0, 1),
               fo[2][:tokens].view(-1))  # fmt: skip
     ext = _RecordsExt(
         act,
