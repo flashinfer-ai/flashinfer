@@ -126,9 +126,9 @@ class Tier:
 
 
 TIERS: Tuple[Tier, ...] = (
-    Tier(1024, False, 25280, 25984, 109, 1, 3, 3),
-    Tier(4096, True, 99008, 99712, 397, 2, 48, 48),
-    Tier(8192, True, 197312, 198016, 781, 3, 24, 24),
+    Tier(1024, False, 25280, 25984, 109, 1, 12, 12),
+    Tier(4096, True, 99008, 99712, 397, 6, 48, 48),
+    Tier(8192, True, 197312, 198016, 781, 12, 96, 96),
 )
 PROGRAM_IDENTIFIERS: Tuple[str, ...] = (
     STAGE,
@@ -179,7 +179,8 @@ def validate_geometry(
 #: Symmetric buffers: name -> (shape, dtype); ``cap`` is the tier's tokens.
 #: ``metadata_ready`` holds the mega program's launch count and the rows each
 #: copy of the records filled; ``x_ready[s]`` the launch count source ``s``'s
-#: router released its activations at.
+#: router released its activations at; ``tail_ready[s]`` the launch count rank
+#: ``s``'s mega program met the rank rendezvous at.
 def symmetric_buffers(tier: Tier) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype]]:
     cap = tier.tokens
     return {
@@ -190,6 +191,7 @@ def symmetric_buffers(tier: Tier) -> Dict[str, Tuple[Tuple[int, ...], torch.dtyp
         "sizes_ready": ((1,), torch.int32),
         "metadata_ready": ((3,), torch.int32),
         "x_ready": ((PEER_TABLE_CAPACITY,), torch.int32),
+        "tail_ready": ((PEER_TABLE_CAPACITY,), torch.int32),
         "token_src_metadata": ((tier.pool_rows, 2), torch.int64),
         "fc1_topk_scores": (
             (tier.pool_rows, 2) if tier.dedup else (tier.pool_rows,),
@@ -251,8 +253,13 @@ def local_buffers(tier: Tier) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype]]:
 def mega_grid(sm_count: int, tier: Tier) -> int:
     """One CTA per SM, rounded down to whole clusters of the tier's preferred
     shape (:attr:`Tier.mega_grid_multiple`): the CTAs wait on one another, so
-    the grid is what the device holds at once beside nothing else."""
-    return tier.mega_grid_multiple * (sm_count // tier.mega_grid_multiple)
+    the grid is what the device holds at once. The route-major program leaves
+    the router's CTAs their SMs: it launches beside the router, and a cluster
+    those CTAs displace starts only once they exit, late under eager launches.
+    The rank-major tiers' routers are too wide to leave room for; that program
+    waits for the router's grid instead."""
+    ctas = sm_count - (0 if tier.dedup else tier.router_ctas)
+    return tier.mega_grid_multiple * (ctas // tier.mega_grid_multiple)
 
 
 def scale_multiplier(input_norm_const: float) -> float:

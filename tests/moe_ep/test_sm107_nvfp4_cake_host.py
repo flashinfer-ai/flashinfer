@@ -85,8 +85,9 @@ def test_tiers_and_geometry() -> None:
         )
     route, rank = cake_plan.TIERS[0], cake_plan.TIERS[1]
     assert [tier.mega_grid_multiple for tier in cake_plan.TIERS] == [2, 4, 4]
-    assert cake_plan.mega_grid(212, route) == 212
-    assert cake_plan.mega_grid(211, route) == 210
+    assert cake_plan.mega_grid(212, route) == 200
+    assert cake_plan.mega_grid(211, route) == 198
+    assert cake_plan.mega_grid(213, route) == 200
     assert cake_plan.mega_grid(212, rank) == 212
     assert cake_plan.mega_grid(210, rank) == 208
     assert cake_plan.scale_multiplier(1.0) == float(
@@ -107,6 +108,7 @@ def test_buffers() -> None:
         assert symmetric["sizes_by_rank"][0] == (16, 48)
         assert symmetric["metadata_ready"][0] == (3,)
         assert symmetric["x_ready"][0] == (8,)
+        assert symmetric["tail_ready"][0] == (8,)
         fills = cake_plan.symmetric_fills(tier)
         assert set(fills) <= set(symmetric)
         assert ("fc1_topk_scores" in fills) is tier.dedup
@@ -150,7 +152,7 @@ def _workspace(tier: cake_plan.Tier) -> cake_backend.CakeNvfp4Workspace:
             for name, (shape, dtype) in cake_plan.local_buffers(tier).items()
         },
         output=torch.empty((tier.tokens, 7168), dtype=torch.bfloat16, device=META),
-        mega_ctas=212,
+        mega_ctas=cake_plan.mega_grid(212, tier),
         ones=torch.empty(12, dtype=torch.float32, device=META),
     )
 
@@ -249,7 +251,11 @@ def test_a_forward_launches_router_mega_and_reduce(monkeypatch, tokens) -> None:
         tier.reduce,
     ]
     grids = [values[-3:] for _, values in table.calls]
-    assert grids == [(tier.router_ctas, 1, 1), (212, 1, 1), (tokens, 1, 1)]
+    assert grids == [
+        (tier.router_ctas, 1, 1),
+        (cake_plan.mega_grid(212, tier), 1, 1),
+        (tokens, 1, 1),
+    ]
 
 
 class _NullContext:
