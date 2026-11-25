@@ -327,3 +327,17 @@ class FollowupReviewTest(unittest.TestCase):
         self.assertIn("Mode = int | str", finding.before)
         self.assertIn("Mode = int", finding.after)
         self.assertNotEqual(finding.before, finding.after)
+
+    def test_alias_diff_presentation_handles_unpack_annotations(self):
+        from dataclasses import replace
+
+        before = replace(
+            api_function("def api(*args)"),
+            signature="def api(*args: *Ts)",
+            vararg=checker.ApiParameter("args", "*Ts", None),
+            type_aliases=(("Ts", "tuple[int, ...]"),),
+        )
+        after = replace(before, type_aliases=(("Ts", "tuple[str, ...]"),))
+        self.assertEqual(
+            checker.classify_signature(before, after).classification, "LIKELY_BREAKING"
+        )

@@ -504,7 +504,7 @@ def classify_signature(before: ApiFunction, after: ApiFunction) -> PrFinding:
             annotations.extend(p.annotation for p in (api.vararg, api.kwarg) if p)
             annotations.append(api.return_annotation)
             nodes = ast.Tuple(
-                elts=[ast.parse(a, mode="eval").body for a in annotations if a],
+                elts=[ast.parse(f"({a},)", mode="eval").body for a in annotations if a],
                 ctx=ast.Load(),
             )
             return reachable_aliases(nodes, annotation_aliases(api))
