@@ -60,7 +60,7 @@ def _stats_ms(values: list[float]) -> dict[str, float | list[float]]:
         "mean_ms": sum(sorted_values) / count,
         "std_ms": statistics.stdev(sorted_values) if count > 1 else 0.0,
         "min_ms": sorted_values[0],
-        "median_ms": sorted_values[count // 2],
+        "median_ms": statistics.median(sorted_values),
         "max_ms": sorted_values[-1],
         "raw_ms": values,
     }

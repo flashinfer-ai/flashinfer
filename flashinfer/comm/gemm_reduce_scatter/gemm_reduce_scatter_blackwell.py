@@ -26,6 +26,8 @@ from typing import Any, Literal
 import torch
 import torch.distributed as dist
 
+from ...api_logging import flashinfer_api
+
 _ALIGNMENT_BYTES = 16
 
 
@@ -402,6 +404,7 @@ class BlackwellGemmRSWorkspace:
     tensors, and barrier flags required by the two-shot reduce-scatter epilogue.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         *,
@@ -519,6 +522,7 @@ class BlackwellGemmRSWorkspace:
         # and would dominate measured latency.
         return
 
+    @flashinfer_api
     def is_compatible(
         self,
         *,
@@ -539,6 +543,7 @@ class BlackwellGemmRSWorkspace:
             and not self._destroyed
         )
 
+    @flashinfer_api
     def destroy(self) -> None:
         """Synchronize outstanding work and collectively release NVSHMEM storage."""
         if self._destroyed:
@@ -752,6 +757,7 @@ def run_blackwell_gemm_rs_with_kernel(
     return workspace.local_output
 
 
+@flashinfer_api
 def gemm_reduce_scatter_blackwell_cutlass(
     X_local: torch.Tensor,
     W_local: torch.Tensor,
