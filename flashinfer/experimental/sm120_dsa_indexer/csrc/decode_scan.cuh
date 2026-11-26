@@ -114,7 +114,11 @@ __device__ __forceinline__ void produce_candidates(
     const int kend = piece(rq, t0, t1, len);
     const int qb = n & 1;
     if (lane == 0) {
-      if (n >= 2) mbar_wait(empty_q + qb, static_cast<uint32_t>(((n - 2) >> 1) & 1));
+      if (n >= 2) {
+        mbar_wait(empty_q + qb, static_cast<uint32_t>(((n - 2) >> 1) & 1));
+        // Order the consumers' generic reads before the async-proxy refill.
+        fence_proxy_async();
+      }
       mbar_expect_tx(full_q + qb, L::kQBytes + L::kWBytes + (kFp4 ? L::kWBytes : 0));
       tma_load_2d(smem + L::q_off(qb), &tmap_q, full_q + qb, 0, u * kNumHeads);
       tma_load_2d(smem + L::w_off(stages, qb), &tmap_w, full_q + qb, 0, u);
@@ -160,6 +164,7 @@ __device__ __forceinline__ void produce_candidates(
       }
       __syncwarp();
       if (lane < boxes_per_tile) {
+        fence_proxy_async();  // as above
         const int r = lane << shift;
         tma_load_3d(smem + L::k_off(st) + r * F::kRow, &tmap_k, full_k + st, 0, row, page);
         // A box's scales are 4 << shift bytes, too few for a tensor copy's
@@ -283,7 +288,10 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
       const int kend = piece(rq, t0, t1, len);
       const int qb = n & 1;
       if (lane == 0) {
-        if (n >= 2) mbar_wait(empty_q + qb, static_cast<uint32_t>(((n - 2) >> 1) & 1));
+        if (n >= 2) {
+          mbar_wait(empty_q + qb, static_cast<uint32_t>(((n - 2) >> 1) & 1));
+          fence_proxy_async();  // as above
+        }
         mbar_expect_tx(full_q + qb, L::kQBytes + L::kWBytes + (kFp4 ? L::kWBytes : 0));
         const int row0 = u * kNextN;
         tma_load_2d(smem + L::q_off(qb), &tmap_q, full_q + qb, 0, row0 * kNumHeads);
@@ -305,6 +313,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
       for (int i = 0; i < t1 - t0; ++i) {
         if (lane == 0) {
           mbar_wait(empty_k + st, parity ^ 1u);
+          fence_proxy_async();  // as above
           mbar_expect_tx(full_k + st, L::kKBytes + kBlockKV * 4);
         }
         const int key0 = (t0 + i) * kBlockKV;
