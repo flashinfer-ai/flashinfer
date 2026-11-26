@@ -21,6 +21,7 @@ if __package__ in (None, ""):
 from pr_checks.api_report import publish_report
 from pr_checks.api_codeowners import owners_for_paths
 from pr_checks.github_api import GitHub, GitHubError, warning as emit_warning
+from pr_checks.git_compare import resolve_pr_comparison
 
 GATE = "API compatibility"
 
@@ -278,21 +279,25 @@ class Gate:
             for side in ("base", "head")
         ):
             raise ValueError("Invalid PR revisions")
+        number = pr["number"]
+        if type(number) is not int or number <= 0:
+            raise ValueError("Invalid PR number")
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        # Inspect GitHub's test merge as data. The checkout stays trusted.
         subprocess.run(
             [
                 "git",
                 "fetch",
                 "--no-tags",
                 "origin",
-                pr["base"]["sha"],
-                pr["head"]["sha"],
+                f"refs/pull/{number}/merge",
             ],
             env=env,
             check=True,
             timeout=180,
             capture_output=True,
         )
+        base, head = resolve_pr_comparison("FETCH_HEAD", pr["head"]["sha"], env=env)
         # The executable path belongs to the trusted checkout, never a PR tree.
         scanner = Path(__file__).resolve().parents[1] / "check_pr_api_diff.py"
         with tempfile.TemporaryDirectory(
@@ -304,9 +309,9 @@ class Gate:
                     sys.executable,
                     str(scanner),
                     "--base",
-                    pr["base"]["sha"],
+                    base,
                     "--head",
-                    pr["head"]["sha"],
+                    head,
                     "--fail-on",
                     "error",
                     "--report-json",

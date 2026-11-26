@@ -1,6 +1,10 @@
 # Per-PR API compatibility gate
 
 The API checker compares a PR's merge base with its head using Python ASTs.
+The target commit comes from the first parent of GitHub's PR test merge;
+the second parent must match the expected PR head. A stale event base can
+predate main changes already synchronized into the branch, as in #9244,
+so applying merge-base to that stale SHA alone does not isolate the PR.
 The scanner, gate, report publisher, inline anchor selection, REST client, and
 regression tests all use Python and its standard library. No Node.js runtime or
 third-party Python package is required by this API check.
@@ -115,8 +119,13 @@ in workflow logs. Execution failures/incomplete scans cannot be waived.
 `pr-api-compatibility.yml` uses `pull_request_target` with a default-branch
 checkout. It fetches PR git objects and parses source; it never checks out,
 installs, imports or executes PR-head code. PR-produced artifacts are not gate
-inputs. The bot also executes default-branch code. The existing documentation
-producer/reporter remains advisory and handles documentation only.
+inputs. Both trusted scans and bot command rescans fetch `refs/pull/<PR>/merge`
+as git objects and resolve the aligned target/head pair without checking out
+the merge. Missing merge snapshots or a mismatched head fail the scan; they
+never fall back to the stale event base. The bot also executes default-branch
+code. The advisory documentation producer resolves the same pair from its
+checked-out PR test merge. This integrates the baseline fix from #9338;
+the documentation producer/reporter still handles documentation only.
 
 The CLI preserves `--strict` (fail for any alert) and adds `--fail-on error`:
 
@@ -156,7 +165,10 @@ pre-commit run --files <changed-paths>
 ```
 
 The retained tests cover signature comparison, type aliases, compatible
-re-exports, table-driven exports, and experimental API exclusions.
+re-exports, table-driven exports, and experimental API exclusions. Git-history
+regressions cover main synchronization with a stale event base, preservation
+of PR-introduced API/documentation findings, invalid merge/head rejection,
+the comparison CLI, and the trusted scanner's git-object-only path.
 
 ## Rollout and rollback
 

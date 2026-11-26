@@ -23,12 +23,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Resolve PR comparison commits
+        id: comparison
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/infra/pr_checks/git_compare.py \
+            --head "$PR_HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Check all new static documentation drift
         id: static_documentation
         continue-on-error: true
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.comparison.outputs.base }}
+          HEAD_SHA: ${{ steps.comparison.outputs.head }}
         run: |
           set -o pipefail
           if python scripts/infra/check_pr_document.py \
