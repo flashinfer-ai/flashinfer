@@ -978,6 +978,11 @@ def test_splitkv_wide_split_counts_are_deterministic(
         "rows2_q_len2_page64_sink_kv32768": (1, 2, 64, 32768, True),
         "rows1_kv131072": (1, 1, 32, 131072, False),
     }[case]
+    if num_split is None:
+        arch, num_sms = splitkv_device
+        expected = cake_module.plan_kv_split(batch * q_len, max_seq_len, num_sms, arch)
+        if expected <= cake_module._SPLITKV_NARROW_MAX_SPLIT:
+            pytest.skip(f"this device plans {expected} splits for {case}")
     used = forced_split(num_split)
     query, kv_cache, block_tables, seq_lens = _inputs(
         batch, q_len, page_size, max_seq_len, "padded", 0

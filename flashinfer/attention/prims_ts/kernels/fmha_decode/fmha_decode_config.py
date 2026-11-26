@@ -6029,8 +6029,12 @@ def _resolve_grouped_q_launch_candidates(
     if probe.use_keeps_mma_ab:
         # A lone resident CTA cannot hide pipeline fills behind another CTA.
         # Keep underfilled grids within one wave unless the native SM107
-        # BF16-output converter qualifies for long extra waves.
-        multi_wave = multi_wave and (fills_wave or sm107_smem_transform)
+        # BF16-output converter qualifies for long extra waves. D512 NVFP4
+        # Keeps Q64 scores the same extra waves as Swaps Q64, so a long
+        # max_kv_len plan keeps Keeps instead of falling back to Swaps.
+        multi_wave = multi_wave and (
+            fills_wave or sm107_smem_transform or probe.headdim == 512
+        )
 
     split_candidates = (
         (cfg.splits_kv if cfg.use_split_kv else 1,)

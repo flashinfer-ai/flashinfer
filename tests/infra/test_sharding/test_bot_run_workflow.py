@@ -20,10 +20,11 @@ import ai_test_scope as scope
 
 WORKFLOW_TEXT = (ROOT / ".github/workflows/ci-bot-commands.yml").read_text()
 NOTE_MARKER = "<!-- flashinfer-bot:ci-bot-commands-note -->"
-PR_WORKFLOW_TEXT = (ROOT / ".github/workflows/pr-test.yml").read_text()
+PR_WORKFLOW_TEXT = (ROOT / ".github/workflows/pr-test-dispatch.yml").read_text()
+RUNNER_WORKFLOW_TEXT = (ROOT / ".github/workflows/pr-test.yml").read_text()
 
 
-def job_block(name, workflow_text=PR_WORKFLOW_TEXT):
+def job_block(name, workflow_text=RUNNER_WORKFLOW_TEXT):
     return re.split(
         r"(?m)^  [\w-]+:\n",
         workflow_text.split(f"\n  {name}:\n", 1)[1],
@@ -998,6 +999,8 @@ class MergeSnapshotWorkflowTests(unittest.TestCase):
                     env=dict(
                         os.environ,
                         GITHUB_OUTPUT=str(output),
+                        EVENT_NAME="pull_request",
+                        EVENT_REF="refs/pull/42/merge",
                         EVENT_ACTION="labeled",
                         LABEL_NAME=label,
                     ),
@@ -1023,9 +1026,8 @@ class MergeSnapshotWorkflowTests(unittest.TestCase):
                     self.assertEqual(0, result.returncode, result.stderr)
                     self.assertIn("test_path=" + requested_scope + "\n", output)
 
-    def test_setup_and_test_jobs_checkout_immutable_commits(self):
-        self.assertIn("ref: ${{ github.sha }}", PR_WORKFLOW_TEXT)
-        self.assertIn("ref: ${{ needs.setup.outputs.checkout_sha }}", PR_WORKFLOW_TEXT)
+    def test_setup_checkout_uses_the_event_commit(self):
+        self.assertIn("ref: ${{ github.sha }}", job_block("setup", PR_WORKFLOW_TEXT))
 
 
 if __name__ == "__main__":

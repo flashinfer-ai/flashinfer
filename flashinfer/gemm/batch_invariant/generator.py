@@ -181,6 +181,7 @@ class Knobs:
     cluster_k: int = 1  # in-cluster split-K factor (block-scaled body): the record computes the class kchunk[cluster_k]
     swap_ab: bool = False  # the decode specialisation (block-scaled body): operands swapped, one token tile for all tokens
     k_block: int = 0  # K elements per smem stage: 0 = the format's default, else a value of K_BLOCK_VALUES[in_fmt] (a lowering choice)
+    gather_a: bool = False  # the gather form (block-scaled swapped body): the token rows read by the kernel through the plan's map
 
     # named views
     @property
@@ -313,6 +314,7 @@ class Knobs:
             + ("_swap" if self.swap_ab else "")
             + ("_cc" if self.cta_chunks else "")
             + (f"_kb{self.k_block}" if self.k_block else "")
+            + ("_ga" if self.gather_a else "")
         )
 
     def describe_object(self) -> str:

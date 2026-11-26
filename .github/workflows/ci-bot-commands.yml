@@ -191,7 +191,7 @@ jobs:
           #     gh: Resource not accessible by personal access token (HTTP 403)
           # The PAT is still required for the label, because a `labeled` event raised by
           # GITHUB_TOKEN does not trigger workflows. A status needs to trigger nothing;
-          # pr-test.yml reads it with GITHUB_TOKEN too. So splitting by purpose is safe
+          # pr-test-dispatch.yml reads it with GITHUB_TOKEN too. So splitting by purpose is safe
           # and keeps the privileged token's blast radius smaller.
           STATUS_TOKEN: ${{ github.token }}
           # Only this authorized step receives the inference key. PR data is

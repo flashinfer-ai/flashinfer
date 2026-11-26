@@ -162,7 +162,7 @@ printf ' %s %s' "${{FLASHINFER_SCCACHE_INSTALL_SOURCE}}" "${{FLASHINFER_SCCACHE_
 
 @pytest.mark.cpu_only
 def test_pr_aot_matrix_waits_for_published_cuda_image_tag():
-    workflow = (REPO_ROOT / ".github" / "workflows" / "pr-test.yml").read_text(
+    workflow = (REPO_ROOT / ".github" / "workflows" / "pr-test-dispatch.yml").read_text(
         encoding="utf-8"
     )
 
