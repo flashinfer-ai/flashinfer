@@ -438,6 +438,125 @@ def test_ragged_cuda_graph_rest(role, fp4, heads, whole):
                 _check_row(idx[u], sc[u], full[u, :n], top_k, True, f"{c}/{u}")
 
 
+def _rest_rules_agree(run, result, what):
+    """The call's bits with the rest left to the device, forced to leave and
+    forced to stay."""
+    from flashinfer.experimental.sm120_dsa_indexer import _api
+
+    run()
+    got = result()
+    for rule in ("always", "never"):
+        _api._REST_RULE = rule
+        try:
+            run()
+        finally:
+            _api._REST_RULE = None
+        assert all(torch.equal(a, b) for a, b in zip(result(), got, strict=True)), (
+            f"{what}: {rule}"
+        )
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+def test_ragged_rest_longer_class(fp4):
+    """One segment whose rows see 16K-32K keys: the second class alone, with
+    fewer blocks than SMs, so every block is in the rest and no waves launch
+    before the split launch."""
+    dev = torch.device("cuda")
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    heads, top_k, Tkv = 32, 512, 24000
+    T = max(1, sms // 2) * (128 // heads)
+    gen = torch.Generator(device=dev).manual_seed(T + fp4)
+    q = _queries(fp4, (T, heads), gen, dev)
+    k = _keys(fp4, (Tkv,), gen, dev)
+    w = _weights((T, heads), gen, dev)
+    cu_q = torch.tensor([0, T], dtype=torch.int32, device=dev)
+    cu_k = torch.tensor([0, Tkv], dtype=torch.int32, device=dev)
+    idx = torch.empty(T, top_k, dtype=torch.int32, device=dev)
+    sc = torch.empty(T, top_k, dtype=torch.float32, device=dev)
+
+    def run():
+        dsa_indexer_det_topk(
+            q.data,
+            k.data,
+            w,
+            cu_q,
+            cu_k,
+            top_k=top_k,
+            backend="sm120",
+            k_scale=k.scale,
+            q_scale=q.scale,
+            indices=idx,
+            scores=sc,
+        )
+
+    def result():
+        torch.cuda.synchronize()
+        return idx.clone(), sc.view(torch.int32).clone()
+
+    full = _scores(q.value, w, k.value)
+    for it in range(8):
+        _rest_rules_agree(run, result, f"call {it}")
+        for u in range(0, T, max(1, T // 32)):
+            n = _visible(T, Tkv, u, None, 1)
+            _check_row(idx[u], sc[u], full[u, :n], top_k, True, f"{it}/{u}")
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+def test_ragged_rest_straddling_blocks(fp4):
+    """Requests of a few rows over 10K keys each, one class: blocks straddle
+    two requests, so a block's key span exceeds the class's cap while every
+    row fits it. Such blocks in the rest are still scored when they leave."""
+    dev = torch.device("cuda")
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    heads, top_k, lq, ctx = 32, 512, 6, 10000
+    block_q = 128 // heads
+    # Whole waves and a quarter wave of blocks.
+    n_seg = ((sms + max(1, sms // 4)) * block_q + lq - 1) // lq
+    seg_q, seg_k = [lq] * n_seg, [ctx + lq] * n_seg
+    T, Tkv = sum(seg_q), sum(seg_k)
+    gen = torch.Generator(device=dev).manual_seed(n_seg + fp4)
+    q = _queries(fp4, (T, heads), gen, dev)
+    k = _keys(fp4, (Tkv,), gen, dev)
+    w = _weights((T, heads), gen, dev)
+    cu_q = torch.arange(0, T + 1, lq, dtype=torch.int32, device=dev)
+    cu_k = torch.arange(0, Tkv + 1, ctx + lq, dtype=torch.int32, device=dev)
+    offs = torch.full((n_seg,), ctx, dtype=torch.int64, device=dev)
+    idx = torch.empty(T, top_k, dtype=torch.int32, device=dev)
+    sc = torch.empty(T, top_k, dtype=torch.float32, device=dev)
+
+    def run():
+        dsa_indexer_det_topk(
+            q.data,
+            k.data,
+            w,
+            cu_q,
+            cu_k,
+            top_k=top_k,
+            backend="sm120",
+            k_scale=k.scale,
+            q_scale=q.scale,
+            q_causal_offsets=offs,
+            indices=idx,
+            scores=sc,
+            max_seqlen_k=ctx + lq,
+        )
+
+    def result():
+        torch.cuda.synchronize()
+        return idx.clone(), sc.view(torch.int32).clone()
+
+    _rest_rules_agree(run, result, "straddling")
+    # The last segments: their blocks are in the rest.
+    for s_ in range(n_seg - 8, n_seg):
+        q0, k0 = s_ * lq, s_ * (ctx + lq)
+        full = _scores(
+            q.value[q0 : q0 + lq], w[q0 : q0 + lq], k.value[k0 : k0 + ctx + lq]
+        )
+        for u in range(lq):
+            n = _visible(lq, ctx + lq, u, ctx, 1)
+            _check_row(idx[q0 + u], sc[q0 + u], full[u, :n], top_k, True, f"{s_}/{u}")
+
+
 def test_ragged_scratch_bound():
     """The scratch is bounded by the rows, not the keys: a 16K-row call of
     long rows (the scan, in chunks) and short rows (resident) stays within
@@ -514,7 +633,7 @@ def test_ragged_scratch_bound():
             heads,
             dev,
             candidate=role,
-            max_seqlen_k=C + T,
+            max_seqlen_k=k.shape[0],
             candidate_block_size=bs,
         )
         assert used <= bound + 24 * 512, (role, used, bound)
@@ -1358,9 +1477,12 @@ def test_ragged_schedules_bitwise(role, fp4, heads):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    streams, _ = split_device_green_ctx_by_sm_count(
-        torch.device("cuda", torch.cuda.current_device()), [64]
-    )
+    # The 64-SM partition only where the device has more SMs.
+    streams = None
+    if torch.cuda.get_device_properties(dev).multi_processor_count > 64:
+        streams, _ = split_device_green_ctx_by_sm_count(
+            torch.device("cuda", torch.cuda.current_device()), [64]
+        )
     for cs in (ctx_sets[1], ctx_sets[0]):
         contexts(cs)
         graph.replay()
@@ -1373,13 +1495,14 @@ def test_ragged_schedules_bitwise(role, fp4, heads):
         assert all(torch.equal(a, b) for a, b in zip(result(), got, strict=True)), (
             f"{cs}: serial"
         )
-        streams[0].wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(streams[0]):
-            run()
-        torch.cuda.current_stream().wait_stream(streams[0])
-        assert all(torch.equal(a, b) for a, b in zip(result(), got, strict=True)), (
-            f"{cs}: partition"
-        )
+        if streams is not None:
+            streams[0].wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(streams[0]):
+                run()
+            torch.cuda.current_stream().wait_stream(streams[0])
+            assert all(torch.equal(a, b) for a, b in zip(result(), got, strict=True)), (
+                f"{cs}: partition"
+            )
         k0 = 0
         for s_, (c, lq) in enumerate(zip(cs, seg_q, strict=True)):
             q0 = int(cu_q[s_])

@@ -2699,9 +2699,10 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
             }
           }
         }
-        // A listed block is in the class by its longest row; its key span
-        // across segments may be longer than the cap.
-        if (end > start && (p.res_list != nullptr || p.res_cap <= 0 || end - start <= p.res_cap))
+        // A block is the resident route's by its rows, as in the waves
+        // (short_block); its key span across segments may exceed the cap.
+        if (end > start && (p.res_list != nullptr || p.res_cap <= 0 ||
+                            short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, qb, p.res_cap)))
           tiles = (end - tile_base(start, kSeg) + kBlockKV - 1) / kBlockKV;
       }
       int incl = tiles;

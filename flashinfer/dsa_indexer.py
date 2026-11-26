@@ -168,11 +168,12 @@ def dsa_indexer_det_topk(
         int32 ``[B * next_n, C]`` (paged) or ``[T, C]`` (ragged) block ids,
         local to the row's request, of ``candidate_block_size`` keys each; any
         order, with duplicates and ``-1`` padding allowed (DeepSeek-V4.1's
-        consumer layers).  Each row ranks only the visible keys of its listed
-        blocks.  Paged: the ids and scores are the plain form's over those
-        keys, and ``C * candidate_block_size <= 16384``.  Ragged: the row's
-        other keys score ``-inf`` (they rank last), and a row has at most
-        393216 blocks.  ``C`` and the block size fix the launches, so a
+        consumer layers).  Paged: a row ranks only the visible keys of its
+        listed blocks, with the plain form's ids and scores over them, and
+        ``C * candidate_block_size <= 16384``.  Ragged: a row ranks all its
+        visible keys with the unlisted ones at ``-inf``, so a row with fewer
+        than ``top_k`` listed keys also returns unlisted keys (score
+        ``-inf``, not padding); a row has at most 393216 blocks.  ``C`` and the block size fix the launches, so a
         captured graph replays for any lists.
     candidate_block_size : int
         Keys a candidate block: a power of two from 8 to

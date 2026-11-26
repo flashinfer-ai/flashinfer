@@ -18,6 +18,7 @@
 // sm120_dsa_indexer.cuh) and run_decode (the paged form, decode_*.cuh), each
 // launching a fixed sequence of kernels on the caller's stream.
 #include <algorithm>
+#include <exception>
 
 #include "decode_candidates.cuh"
 #include "decode_scan.cuh"
@@ -435,6 +436,10 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
     rp.cb.shift = static_cast<int>(cand_shift);
     rp.cb.listed = ptr<int32_t>(cand_listed.value());
     const int bytes = static_cast<int>(cand_bits.value().size(1) * 4);  // <= 48 KB (above)
+    // With its static shared memory, a 48 KB bitmap passes the default limit.
+    TVM_FFI_ICHECK_EQ(
+        cudaFuncSetAttribute(rows_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes),
+        cudaSuccess);
     launch_ex(rows_kernel<1>, rp.rows_ctas + static_cast<int>(num_rows), rows_threads, bytes,
               stream, enable_pdl, false, rp);
   } else if (source) {
@@ -573,6 +578,16 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
   int side_dev = 0, device_sms = 0;
   cudaGetDevice(&side_dev);
   cudaDeviceGetAttribute(&device_sms, cudaDevAttrMultiProcessorCount, side_dev);
+  // The scan's checks come before any side stream forks.
+  int sort_slots = 1;
+  while (sort_slots < top_k) sort_slots <<= 1;
+  const int fsmem = finalize_smem_bytes(static_cast<int>(capacity), sort_slots);
+  if (run_scan) {
+    const int64_t chunk = cand_score.size(0);
+    TVM_FFI_ICHECK(chunk >= num_rows || (chunk > 0 && chunk % block_q == 0))
+        << "the scan buffers hold all rows or a multiple of block_q rows";
+    TVM_FFI_ICHECK_LE(fsmem, kSmemLimit - 4096) << "top_k too large for the finalize";
+  }
   const bool res_side = res_concurrent && planned && res_queue && num_sms == device_sms;
   constexpr int kSides = 1 + kResClasses;  // [0] the queue, [1 + i] class i's splits
   // Per host thread and device: other threads' calls (or captures) never
@@ -594,6 +609,19 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
     cudaEventRecord(fork_ev[side_dev], stream);
   }
   bool joined[kSides] = {};
+  auto join_res = [&] {
+    for (int c = 0; c < kSides; ++c)
+      if (joined[c]) cudaStreamWaitEvent(stream, join_ev[side_dev][c], 0);
+  };
+  // A failure after the fork still joins the side streams, so the caller's
+  // buffers are not freed under their work.
+  struct JoinOnThrow {
+    decltype(join_res)& join;
+    const int pending = std::uncaught_exceptions();
+    ~JoinOnThrow() {
+      if (std::uncaught_exceptions() > pending) join();
+    }
+  } join_on_throw{join_res};
   if (res_scratch.has_value()) {
     const TensorView& rs = res_scratch.value();
     CHECK_INPUT_TYPE(rs, dl_float32);
@@ -759,7 +787,9 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
         xp.res_split = ptr<float>(res_split.value());
         xp.res_first = first;
         xp.res_ws = res_ws_p;
-        xp.res_wait = !waves || wp.res_early;  // started early: wait for the waves
+        // Wait at entry unless a waves launch, which waits for rows_kernel
+        // before it lets this one start, runs first (none with no unit).
+        xp.res_wait = !waves || wp.num_units == 0 || wp.res_early;
         dispatch_score<Mode::kResident, kResSlots, true>(xp, in, num_heads, fp4, stream, false, 0,
                                                          enable_pdl);
         const int64_t r0 = int64_t{first} * block_q;
@@ -779,6 +809,8 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
           ss.cand_shift = static_cast<int>(cand_shift);
         }
         ss.row_ke = ptr<const int32_t>(row_ke) + r0;
+        ss.split_bq = static_cast<int>(block_q);
+        ss.split_cap = xp.res_cap;
         if (xp.res_done != nullptr) {
           ss.waves_done = xp.res_done;
           ss.waves_ctas = std::min(q_blocks, num_sms);  // launch_score's grid
@@ -791,10 +823,6 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
     sp.row_classes = nullptr;
     sp.tile_prefix = nullptr;
   }
-  auto join_res = [&] {
-    for (int c = 0; c < kSides; ++c)
-      if (joined[c]) cudaStreamWaitEvent(stream, join_ev[side_dev][c], 0);
-  };
   if (!run_scan) {
     join_res();
     select_blocks();
@@ -804,17 +832,11 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
   // blocks), the same launch sequence a chunk: its memory is bounded by the
   // chunk, not the call.
   const int chunk_rows = static_cast<int>(cand_score.size(0));
-  TVM_FFI_ICHECK(chunk_rows >= num_rows || (chunk_rows > 0 && chunk_rows % block_q == 0))
-      << "the scan buffers hold all rows or a multiple of block_q rows";
   int top_class = 0;
   while (res_classes >> (top_class + 1)) ++top_class;
   // The scan skips the resident classes' blocks.
   const int scan_cap =
       res_scratch.has_value() ? static_cast<int>(res_cap * res_class_cap(top_class)) : 0;
-  int sort_slots = 1;
-  while (sort_slots < top_k) sort_slots <<= 1;
-  const int fsmem = finalize_smem_bytes(static_cast<int>(capacity), sort_slots);
-  TVM_FFI_ICHECK_LE(fsmem, kSmemLimit - 4096) << "top_k too large for the finalize";
   static_assert(sizeof(ExactState) == 32, "exact_state is [T, 8] int32");
   auto scan_chunk = [&](int row0, int num_rows) {
     const int q_blocks = (num_rows + block_q - 1) / block_q;

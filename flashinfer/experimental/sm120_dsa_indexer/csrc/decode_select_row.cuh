@@ -67,6 +67,9 @@ struct SplitSelParams : SelParams {
   // Or null: the waves' CTAs count their ends here (waves_ctas in all).
   const int32_t* waves_done;
   int waves_ctas;
+  // Without split_list: blocks of split_bq rows, the scan's (not
+  // short_block(split_cap)) skipped.
+  int split_cap;
   // Consumer rows (or null): listed keys, and the listed-block bitmap.
   const int32_t* split_listed;
   const uint32_t* split_bits;
@@ -649,6 +652,9 @@ __device__ __forceinline__ void rowsel_body(const Params& p, RowSelShared& sh, i
       if (j >= *p.split_n) return;
       out_row = __ldg(p.split_list + j) * p.split_bq + row % p.split_bq;
       if (out_row >= p.split_rows) return;
+    } else if (p.split_cap > 0 && !short_block(p.row_ks, p.row_ke, p.num_rows, p.split_bq,
+                                               row / p.split_bq, p.split_cap)) {
+      return;
     }
     split_len = max(0, __ldg(p.row_ke + out_row) - __ldg(p.row_ks + out_row));
     if (p.split_listed != nullptr && split_len > kRowSelKeys) {
