@@ -336,6 +336,33 @@ class TestKnobCache:
 
 
 class TestShimAndBackendWiring:
+    @pytest.mark.parametrize(
+        ("swap_ab", "tile"), [(False, (64, 128, 256)), (True, (256, 32, 256))]
+    )
+    def test_blockwise_requires_k128(self, swap_ab, tile):
+        pkg = _pkg()
+        base = dict(
+            num_total_experts=4,
+            num_max_tokens=64,
+            num_topk=4,
+            hidden=1024,
+            intermediate=512,
+            rank=0,
+            world_size=1,
+        )
+        geometry = dict(swap_ab=swap_ab, pingpong=False, mma_tiler_mnk=tile)
+        assert not pkg.is_valid(geometry, fp8_scale_mode="blockwise")
+        assert pkg.is_valid(geometry, fp8_scale_mode="per_tensor")
+        for selection in (geometry, {"knobs": geometry}):
+            with pytest.raises(ValueError, match="requires MMA tile K=128"):
+                pkg.resolve_hopper_fp8_mega_moe_config(
+                    **base, **selection, fp8_scale_mode="blockwise"
+                )
+            resolved = pkg.resolve_hopper_fp8_mega_moe_config(
+                **base, **selection, fp8_scale_mode="per_tensor"
+            )
+            assert resolved.mma_tiler_mnk == tile
+
     def test_symm_buffer_rejects_knobs_plus_manual_geometry(self):
         pkg = _pkg()
         with pytest.raises(ValueError, match="not both"):

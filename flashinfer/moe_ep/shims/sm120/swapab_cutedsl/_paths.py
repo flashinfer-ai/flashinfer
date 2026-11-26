@@ -11,15 +11,13 @@ from flashinfer.moe_ep.shims._sources import source_root
 
 _BOOTSTRAPPED = False
 
-# Any of these already imported from a DIFFERENT src tree means a sibling
-# backend owns this process's kernel modules.  ``common`` / ``src`` catch the
-# SM90 tree; ``moe_nvfp4_swapab`` / ``moe_mxfp8_glu`` additionally catch the
-# SM100 tree (which ships both packages at its own drop revision).
+# These packages are imported without a namespace by the SM120 swap-AB
+# sources. Reject copies already loaded from a different source tree.
 _SENTINEL_MODULES = ("common", "src", "moe_nvfp4_swapab", "moe_mxfp8_glu")
 
 
 def bootstrap_paths() -> None:
-    """Idempotently prepend the vendored ``src/`` directory to ``sys.path``."""
+    """Idempotently prepend the SM120 swap-AB source directory to ``sys.path``."""
     global _BOOTSTRAPPED
     if _BOOTSTRAPPED:
         return
@@ -34,11 +32,8 @@ def bootstrap_paths() -> None:
         ):
             raise RuntimeError(
                 f"kernel module {name!r} is already imported from "
-                f"{mod_file!r}; the SM100 cutedsl_megamoe, SM90 "
-                "pull_style_cutedsl_megakernel, and SM120 "
-                "swapab_cutedsl_megakernel trees share top-level module names "
-                "and cannot be active in one process. Use a separate process "
-                "for the other architecture's backend."
+                f"{mod_file!r}; SM120 swap-AB requires its own copy. "
+                "Run the workloads that load these packages in separate processes."
             )
 
     if src_dir not in sys.path:

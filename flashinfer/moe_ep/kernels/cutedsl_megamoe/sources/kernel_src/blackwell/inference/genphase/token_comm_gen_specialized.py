@@ -431,6 +431,7 @@ class GenphaseTokenComm(KernelComponent):
             "token_padding_block",
             "sf_padding_block",
             "pusher_cta_count",
+            "sf_pusher_cta_count",
             "refine_participant_groups",
             "refine_output_stages",
             "smem_limit_bytes",
@@ -668,7 +669,7 @@ class GenphaseTokenComm(KernelComponent):
         return self.refine_run_count * self.refine_run_columns
 
     # Runs one refine work item covers. A block is split into column parts so that
-    # the otherwise idle groups share its serial run loop (see profiles/NOTES.md).
+    # the otherwise idle groups share its serial run loop.
     refine_item_runs: ClassVar[int] = 7
 
     @property

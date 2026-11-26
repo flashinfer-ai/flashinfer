@@ -607,7 +607,9 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             square and the weighted value to BF16, then quantizes to NVFP4
             with ``global_scale`` of the row's expert. Requires non-gated
             ClampedRelu2 with NVFP4 output, ``mma_tiler_mn=(128, 128)`` and
-            ``cluster_shape_mn=(1, 1)``; SM100/SM103 only.
+            ``cluster_shape_mn=(1, 1)``; SM100/SM103 only. Padding rows of
+            ``out`` and ``out_scale`` (rows of a tile past its
+            ``tile_idx_to_mn_limit``) may be left unwritten.
 
     Returns:
         Tuple of:

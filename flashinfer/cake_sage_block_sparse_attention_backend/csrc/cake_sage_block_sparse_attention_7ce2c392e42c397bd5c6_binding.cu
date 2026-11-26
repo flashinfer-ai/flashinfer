@@ -178,11 +178,11 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_out, Tenso
   DLDevice dev = a_q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_q, "q");
-  check_dtype(a_q, DLDataType{kDLUInt, 8, 1}, "q");
+  check_dtype(a_q, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "q");
   check_cuda_tensor(a_k, "k");
-  check_dtype(a_k, DLDataType{kDLUInt, 8, 1}, "k");
+  check_dtype(a_k, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "k");
   check_cuda_tensor(a_v, "v");
-  check_dtype(a_v, DLDataType{kDLUInt, 8, 1}, "v");
+  check_dtype(a_v, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "v");
   check_cuda_tensor(a_out, "out");
   check_dtype(a_out, DLDataType{kDLBfloat, 16, 1}, "out");
   check_cuda_tensor(a_lse, "lse");

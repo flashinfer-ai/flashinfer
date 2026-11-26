@@ -255,8 +255,6 @@ void ExecuteAttentionRopeFp8Plan(ffi::Module descriptor, TensorView q, TensorVie
       << "DSV4 NVFP4 execution plan query mismatch";
   const auto mega =
       check_attention_rope_fp8_inputs(q, positions, cos_sin, fp8_output, output_scales);
-  TVM_FFI_ICHECK(plan.metadata.variant == 1)
-      << "NVFP4 run_mega requires a prefill plan; decode mega is not supported";
   TVM_FFI_ICHECK(plan.merge != execution::Merge::Stage1) << "mega requires a final output plan";
   attention(q, cache, indices, mid, mlse, output, lse, plan.chunk_capacity, scale, lengths, sink,
             extra_cache, extra_indices, extra_lengths, plan.cpb,

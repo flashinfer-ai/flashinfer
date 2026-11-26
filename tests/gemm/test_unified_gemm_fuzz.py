@@ -39,7 +39,7 @@ convention-compat fix) makes two previously-divergent APIs share a convention, m
 same conformance group and the test will *enforce* they now agree -- and the ledger entry's removal
 becomes the proof the convention was unified.
 
-STATUS: framework + 7 grounded adapters (bf16 mm+bmm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm /
+STATUS: framework + 8 grounded adapters (bf16 mm+bmm / tf32 mm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm /
 mxfp8 mm+bmm) + a standalone quantize-root fuzzer. This file REPLACES the earlier per-op
 ``test_mm_fp4_fuzz.py`` / ``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded
 in here). Validated on A100/SM80, L40S/SM89, H100/SM90, B200/SM100. The mxfp8 adapters surfaced two
@@ -84,6 +84,7 @@ from flashinfer import (
     mm_bf16,
     mm_fp4,
     mm_mxfp8,
+    mm_tf32,
     mxfp4_quantize,
     mxfp8_dequantize_host,
     mxfp8_quantize,
@@ -92,6 +93,9 @@ from flashinfer import (
 from flashinfer.autotuner import AutoTuner
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float, mxfp4_dequantize
 from flashinfer.utils import LibraryError, get_compute_capability
+from flashinfer.cute_dsl import is_cute_dsl_available
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 
 try:
     from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
@@ -122,6 +126,19 @@ pytestmark = [
     pytest.mark.skipif(_SKIP is not None, reason=str(_SKIP)),
 ]
 _SM = _CC[0] * 10 + _CC[1]
+
+
+def _b12x_backends(quant_mode):
+    # Match each backend's toolkit/DSL requirements; torch's build CUDA may differ.
+    if _SM not in (120, 121) or not is_cute_dsl_available():
+        return ()
+    min_cuda = "12.9" if quant_mode == "nvfp4" else "13.0"
+    if not is_cuda_version_at_least(min_cuda):
+        return ()
+    if quant_mode == "mxfp8" and not _b12x_mxfp8_dsl_supported():
+        return ()
+    return ("b12x",)
+
 
 # A clean rejection ("not supported on this shape/arch/dtype") must SKIP, never fail; a crash
 # (CUDA error / illegal access / device assert) is always a finding and re-raises.
@@ -205,6 +222,19 @@ def _run_bf16_mm(a, b, out, backend, cfg):
     o = mm_bf16(a, b.transpose(0, 1), out=out, out_dtype=out.dtype, backend=backend)
     if out.data_ptr() != o.data_ptr():
         out.copy_(o)
+
+
+# --- tf32 mm: fp32 in / fp32 out, TF32 MMAs. bf16 inputs are exact in TF32, so the bf16 snap
+# keeps the reference exact; the fp32 result is rounded to the harness's out dtype. ---------------
+def _run_tf32_mm(a, b, out, backend, cfg):
+    # The cuBLAS backend follows the caller's TF32 setting.
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        o = mm_tf32(a.float(), b.float().transpose(0, 1), backend=backend)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    out.copy_(o)
 
 
 # --- fp8 bmm: per-tensor A/B scales passed as separate args, no output scale -------------------
@@ -339,6 +369,19 @@ _ADAPTERS = [
         align=1,
     ),
     GemmAdapter(
+        key="mm_tf32",
+        op_shape="mm",
+        quant_mode="tf32",
+        backends=("cublas", "auto")
+        + (("cute-dsl",) if _CC in ((10, 0), (10, 3), (10, 7)) else ()),
+        convention={"a_scale": "none", "b_scale": "none", "global": "none"},
+        supported=lambda sm: sm >= 80,
+        run=_run_tf32_mm,
+        deterministic=True,
+        align=64,  # the cute-dsl kernel splits K into 2+ slices of 32+
+        min_dim=64,
+    ),
+    GemmAdapter(
         key="bmm_fp8",
         op_shape="bmm",
         quant_mode="fp8",
@@ -358,7 +401,7 @@ _ADAPTERS = [
         key="mm_nvfp4",
         op_shape="mm",
         quant_mode="nvfp4",
-        backends=("cutlass", "cudnn", "auto"),
+        backends=("cutlass", "cudnn", "auto") + _b12x_backends("nvfp4"),
         convention={
             "a_scale": "block-16",
             "b_scale": "block-16",
@@ -374,7 +417,7 @@ _ADAPTERS = [
         key="mm_mxfp4",
         op_shape="mm",
         quant_mode="mxfp4",
-        backends=("cudnn", "auto"),
+        backends=("cudnn", "auto") + _b12x_backends("mxfp4"),
         convention={
             "a_scale": "block-32",
             "b_scale": "block-32",
@@ -401,7 +444,7 @@ _ADAPTERS = [
         key="mm_mxfp8",
         op_shape="mm",
         quant_mode="mxfp8",
-        backends=("cudnn", "cutlass", "auto"),
+        backends=("cudnn", "cutlass", "auto") + _b12x_backends("mxfp8"),
         convention={
             "a_scale": "block-32",
             "b_scale": "block-32",
@@ -637,6 +680,14 @@ def _gen(seed) -> Cfg:
         cfg = replace(
             cfg, m=ad.unit * rng.randint(1, 32), n=ad.unit * rng.randint(1, 16)
         )
+    if cfg.backend == "b12x":
+        # Reuse the shape pool, adding supported N tails rather than rejection
+        # cases. MXFP8 needs whole BK128 tiles; FP4 already has legal K.
+        cfg = replace(
+            cfg,
+            n=cfg.n + rng.choice((0, 1, 2, 7)),
+            k=(cfg.k + 127) // 128 * 128 if ad.quant_mode == "mxfp8" else cfg.k,
+        )
     return cfg
 
 
@@ -706,6 +757,8 @@ _QMODE = {
     # Calibrated on SM100 (60-config sweep, observed max-ratio): bf16 .0027, fp8 .0092 (incl e5m2),
     # mxfp4 .0039, nvfp4 .053. atol_frac set ~3-5x that (extra margin on bf16/fp8 for cross-arch).
     "bf16": (_snap_bf16, 1.5e-2, 1.0e-2),
+    # bf16-grid inputs are exact in TF32 and the sum is fp32: same floor as bf16.
+    "tf32": (_snap_bf16, 1.5e-2, 1.0e-2),
     "fp8": (_snap_fp8, 4.0e-2, 5.0e-2),
     "mxfp8": (_snap_mxfp8, 4.0e-2, 5.0e-2),
     "nvfp4": (_snap_nvfp4, 1.2e-1, 1.0e-1),
@@ -910,7 +963,7 @@ def test_unified_gemm_fuzz(cfg: Cfg):
     except pytest.skip.Exception:
         raise
     except Exception as e:
-        if _is_unsupported(e):
+        if cfg.backend != "b12x" and _is_unsupported(e):
             pytest.skip(f"unsupported {cfg.label}: {e}")
         raise  # a crash is a finding
 
@@ -949,11 +1002,13 @@ def test_unified_gemm_fuzz(cfg: Cfg):
     if cfg.seed % 20 == 0:
         a_out = _out_buffer(cfg)
         try:
-            with autotune(True):
+            with autotune(
+                True, tuning_buckets=(cfg.m,) if cfg.backend == "b12x" else None
+            ):
                 cfg.adapter.run(a, b, a_out, cfg.backend, cfg)
             torch.cuda.synchronize()
         except Exception as e:
-            if not _is_unsupported(e):
+            if cfg.backend == "b12x" or not _is_unsupported(e):
                 raise
         else:
             _validate(cfg, a_out, ref)

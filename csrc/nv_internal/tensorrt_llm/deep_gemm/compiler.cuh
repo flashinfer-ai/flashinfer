@@ -354,6 +354,8 @@ class Compiler {
       for (auto const& arg : command) {
         cmd += arg + " ";
       }
+      // popen captures stdout only; keep nvcc's diagnostics for the error below.
+      cmd += "2>&1";
 
       // Buffer to store the output
       std::array<char, 128> buffer;
@@ -369,7 +371,10 @@ class Compiler {
       FILE* pipe = popen(cmd.c_str(), "r");
 #endif
 
-      if (pipe) {
+      if (!pipe) {
+        throw std::runtime_error("DeepGEMM JIT cannot start nvcc: " + cmd);
+      }
+      {
         // Read the output
         while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
           result += buffer.data();
@@ -377,10 +382,14 @@ class Compiler {
 
 // Close the pipe
 #ifdef _MSC_VER
-        _pclose(pipe);
+        int const status = _pclose(pipe);
 #else
-        pclose(pipe);
+        int const status = pclose(pipe);
 #endif
+        if (status != 0 || !std::filesystem::exists(tmpCubinPath)) {
+          throw std::runtime_error("DeepGEMM JIT nvcc failed (status " + std::to_string(status) +
+                                   ") for " + name + ": " + cmd + "\n" + result);
+        }
 
         // Output result if debug enabled
         if (kJitDebugging) {
