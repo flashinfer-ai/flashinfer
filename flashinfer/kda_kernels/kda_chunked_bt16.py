@@ -4595,6 +4595,56 @@ def tcgen05_store_final_state_tmem(
 PACKED_METADATA_THREADS: int = 256
 
 
+@cute.jit
+def die_claim_item(
+    die_claim: cute.Tensor, tidx: cutlass.Int32, DIE1_SM_MASK: cutlass.Constexpr
+) -> cutlass.Int32:
+    """Die-local work claim for a GPU with two locality domains (two dies).
+
+    The CTA does not take its work item from its block index.  Thread 0 reads
+    the SM it runs on, looks that SM's domain up in the compile-time bit mask
+    `DIE1_SM_MASK` (bit `s % 32` of word `s // 32` is set when SM `s` is on
+    domain 1) and claims an item with one atomic add on `die_claim[0]`:
+    CTAs on domain 0 take items from the front of the grid's linear order,
+    CTAs on domain 1 from the back.  The grid has exactly one CTA per item, so
+    every item is computed exactly once wherever the CTAs land (a die that runs
+    out of its own half simply continues into the other); the per-item body is
+    unchanged.  With the low-index half of the requests homed on domain 0 and
+    the rest on domain 1, each CTA then works on memory of its own die.
+    """
+
+    claimed = cutlass.Array(
+        cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4
+    )
+    if tidx == 0:
+        gx, gy, _ = cute.arch.grid_dim()
+        items = cutlass.Int32(gx * gy)
+        smid = cute.arch.smid()
+        sm_word = cutlass.Int32(0)
+        for word in cutlass.range_constexpr(len(DIE1_SM_MASK)):
+            if (smid >> 5) == word:
+                sm_word = cutlass.Int32(DIE1_SM_MASK[word])
+        on_die1 = (sm_word >> (smid & 31)) & 1
+        # One int64 word, zero between launches: the low half counts claims
+        # from the front, the high half claims from the back.
+        step = cutlass.Int64(1)
+        if on_die1 != 0:
+            step = cutlass.Int64(1 << 32)
+        before = cute.arch.atomic_add(die_claim.iterator, step)
+        front = cutlass.Int32(before & 0xFFFFFFFF)
+        back = cutlass.Int32(before >> 32)
+        item = front
+        if on_die1 != 0:
+            item = items - 1 - back
+        # The last claim of a launch zeroes the word for the next launch on
+        # this stream (prep, then chain; the next call or graph replay).
+        if front + back == items - 1:
+            die_claim[0] = cutlass.Int64(0)
+        claimed[0] = item
+    cute.arch.sync_threads()
+    return claimed[0]
+
+
 @cute.kernel
 def packed_metadata_kernel(
     cu_seqlens: cute.Tensor,
@@ -4602,6 +4652,7 @@ def packed_metadata_kernel(
     cu_chunks: cute.Tensor,
     generate_seq_order: cutlass.Int32,
     generate_cu_chunks: cutlass.Int32,
+    DIE_MAJOR: cutlass.Constexpr,
 ) -> None:
     """Build packed scheduling metadata from device-resident prefix offsets."""
 
@@ -4628,6 +4679,19 @@ def packed_metadata_kernel(
                 swap = (right_len > left_len) | (
                     (right_len == left_len) & (right_seq < left_seq)
                 )
+                if cutlass.const_expr(DIE_MAJOR):
+                    # Die-local claim: each half of the requests stays in its
+                    # half of the order.  Domain 0 claims from the front, so
+                    # its half is longest-first; domain 1 claims from the
+                    # back, so its half is longest-last.
+                    die_split = (n_seq + cutlass.Int32(1)) // cutlass.Int32(2)
+                    swap = ((right < die_split) & swap) | (
+                        (left >= die_split)
+                        & (
+                            (left_len > right_len)
+                            | ((left_len == right_len) & (right_seq < left_seq))
+                        )
+                    )
                 if swap:
                     seq_order[left] = right_seq
                     seq_order[right] = left_seq
@@ -4668,9 +4732,11 @@ def kernel(
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
+    die_claim: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    DIE1_SM_MASK: cutlass.Constexpr,
 ) -> None:
     """BT=16 KDA forward kernel.
 
@@ -4683,6 +4749,10 @@ def kernel(
     # linear launch order. sequence_slot follows the automatic longest-first
     # permutation; bidx/bidy remain the original sequence/head indices below.
     bidy, sequence_slot, _ = cute.arch.block_idx()
+    if cutlass.const_expr(die_claim is not None):
+        item = die_claim_item(die_claim, tidx, DIE1_SM_MASK)
+        sequence_slot = item // cute.arch.grid_dim()[0]
+        bidy = item % cute.arch.grid_dim()[0]
     bidx = cutlass.Int32(seq_order[sequence_slot])
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tidx % THREADS_PER_WARP
@@ -6130,10 +6200,12 @@ def host(
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
+    die_claim: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     THREADS: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    DIE1_SM_MASK: cutlass.Constexpr,
 ) -> None:
     num_sequences = cu_seqlens.shape[0] - 1
     heads = q.shape[2]
@@ -6232,9 +6304,11 @@ def host(
         cu_ckpts,
         checkpoint_state_indices,
         checkpoint_stride_chunks,
+        die_claim,
         SAFE_GATE,
         GATE_SCALE_LOG2,
         gate_dtype,
+        DIE1_SM_MASK,
     ).launch(
         grid=(heads, num_sequences, 1),
         block=(THREADS, 1, 1),
@@ -6793,10 +6867,12 @@ def host_prep(
     chunks_per_cta: cutlass.Int32,
     head_base: cutlass.Int32,
     launch_heads: cutlass.Int32,
+    die_claim: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     THREADS: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    DIE1_SM_MASK: cutlass.Constexpr,
 ) -> None:
     heads = q.shape[2]
     raw_f16_tma_box = (RAW_F16_TMA_SWIZZLE_ELEMS, BT, 1, 1)
@@ -6874,9 +6950,11 @@ def host_prep(
         ws_diag,
         chunks_per_cta,
         head_base,
+        die_claim,
         SAFE_GATE,
         GATE_SCALE_LOG2,
         gate_dtype,
+        DIE1_SM_MASK,
     ).launch(
         grid=(num_ctas, launch_heads, 1),
         block=(K1_THREADS, 1, 1),
@@ -7715,9 +7793,11 @@ def kernel_prep(
     ws_diag: cute.Tensor,
     chunks_per_cta: cutlass.Int32,
     head_base: cutlass.Int32,
+    die_claim: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    DIE1_SM_MASK: cutlass.Constexpr,
 ) -> None:
     """kernel 1: per-chunk-tile factor prep (4-warp CTA, no rings).
 
@@ -7728,6 +7808,11 @@ def kernel_prep(
 
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
+    if cutlass.const_expr(die_claim is not None):
+        # Chunk ranges are in request order: the front half is domain 0's.
+        item = die_claim_item(die_claim, tidx, DIE1_SM_MASK)
+        bidx = item // cute.arch.grid_dim()[1]
+        bidy = item % cute.arch.grid_dim()[1]
     bidy = bidy + head_base
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tidx % THREADS_PER_WARP
@@ -8661,6 +8746,8 @@ def kernel_chain_dv2(
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
+    die_claim: cute.Tensor | None,
+    DIE1_SM_MASK: cutlass.Constexpr,
 ) -> None:
     """kernel 2, DV-split: each CTA owns half the hidden dimension.
 
@@ -8673,6 +8760,10 @@ def kernel_chain_dv2(
 
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
+    if cutlass.const_expr(die_claim is not None):
+        item = die_claim_item(die_claim, tidx, DIE1_SM_MASK)
+        bidx = item // cute.arch.grid_dim()[1]
+        bidy = item % cute.arch.grid_dim()[1]
     dv_half = bidy % 2
     bidy = head_base + bidy // 2
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -9414,7 +9505,9 @@ def host_chain_dv2(
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
+    die_claim: cute.Tensor | None,
     THREADS: cutlass.Constexpr,
+    DIE1_SM_MASK: cutlass.Constexpr,
 ) -> None:
     """DV2 host: identical tensor maps to the base chain host, doubled grid-y."""
 
@@ -9516,6 +9609,8 @@ def host_chain_dv2(
         cu_ckpts,
         checkpoint_state_indices,
         checkpoint_stride_chunks,
+        die_claim,
+        DIE1_SM_MASK,
     ).launch(
         grid=(num_sequences, launch_heads * 2, 1),
         block=(THREADS, 1, 1),
@@ -9573,11 +9668,13 @@ def host_unified(
     state_ckpt: cute.Tensor | None,
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
+    die_claim: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     THREADS: cutlass.Constexpr,
     MODE: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    DIE1_SM_MASK: cutlass.Constexpr,
 ) -> None:
     n_seq = cu_seqlens.shape[0] - 1
     heads = q.shape[2]
@@ -9593,6 +9690,7 @@ def host_unified(
             cu_chunks,
             generate_seq_order,
             generate_cu_chunks,
+            die_claim is not None,
         ).launch(
             grid=(1, 1, 1),
             block=(PACKED_METADATA_THREADS, 1, 1),
@@ -9641,10 +9739,12 @@ def host_unified(
             prep_cpc,
             z,
             h32,
+            die_claim,
             SAFE_GATE,
             GATE_SCALE_LOG2,
             THREADS,
             gate_dtype,
+            DIE1_SM_MASK,
         )
         host_chain_dv2(
             v,
@@ -9667,7 +9767,9 @@ def host_unified(
             cu_ckpts,
             checkpoint_state_indices,
             checkpoint_stride_chunks,
+            die_claim,
             THREADS,
+            DIE1_SM_MASK,
         )
     else:
         # ------------------------------ ENGINE ------------------------------
@@ -9691,10 +9793,12 @@ def host_unified(
             cu_ckpts,
             checkpoint_state_indices,
             checkpoint_stride_chunks,
+            die_claim,
             SAFE_GATE,
             GATE_SCALE_LOG2,
             THREADS,
             gate_dtype,
+            DIE1_SM_MASK,
         )
 
 
@@ -9967,6 +10071,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         generate_planned_metadata=False,
         state_indices=None,
         checkpoint_state_indices=None,
+        die_claim=None,
     ):
         if checkpoint_state_indices is not None and state_ckpt is None:
             raise ValueError("checkpoint_state_indices requires state_ckpt")
@@ -9981,6 +10086,8 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             state_indices is not None,
             checkpoint_state_indices is not None,
         )
+        if (die_claim is not None) != bool(spec["die1_sm_mask"]):
+            raise ValueError("die_claim requires a die1_sm_mask build, and vice versa")
         if want != built_states:
             sibling = compile(
                 dtype=spec["dtype"],
@@ -9993,6 +10100,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 has_state_ckpt=want[2],
                 has_state_indices=want[3],
                 has_checkpoint_state_indices=want[4],
+                die1_sm_mask=spec["die1_sm_mask"],
                 mode=spec["mode"],
             )
             return sibling(
@@ -10019,6 +10127,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 planned_cu_chunks=planned_cu_chunks,
                 planned_total_chunks=planned_total_chunks,
                 generate_planned_metadata=generate_planned_metadata,
+                die_claim=die_claim,
             )
         # One stream.  There used to be an optional `stream_b` that opted into a
         # co-resident k1/k2 overlap; it was removed because the flag-ring it
@@ -10207,6 +10316,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 state_ckpt,
                 cu_ckpts_arg,
                 checkpoint_state_indices,
+                die_claim,
             )
             return
 
@@ -10280,6 +10390,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             state_ckpt,
             cu_ckpts_arg,
             checkpoint_state_indices,
+            die_claim,
         )
 
     def _ws_size(cu_seqlens, heads, mode=None, *, batch=None, seqlen=None):
@@ -10317,6 +10428,7 @@ def compile(  # noqa: A001
     has_state_indices: bool = False,
     has_checkpoint_state_indices: bool = False,
     mode=None,
+    die1_sm_mask: tuple = (),
 ) -> CompiledKDA:
     """Compile KDA; the returned callable is the single host entry.
 
@@ -10333,6 +10445,12 @@ def compile(  # noqa: A001
       * "engine" -> engine-only build (decomp branch const-folds away).
       * "decomp" -> decomp-only build (engine branch const-folds away).
     ("auto" is accepted as an alias for None.)
+
+    A non-empty `die1_sm_mask` (signed 32-bit words, bit `s % 32` of word
+    `s // 32` set when SM `s` is on locality domain 1) builds the die-local
+    variant (see `die_claim_item`): the callable then takes `die_claim`, one
+    int64 claim counter that is zero on entry and not shared with a launch
+    this one can overlap.  Outputs are bitwise those of the default build.
     """
 
     if dtype not in CLI_DTYPES.values():
@@ -10371,11 +10489,22 @@ def compile(  # noqa: A001
         fckpt,
         fcuk,
         fcheckpoint_state_indices,
+        (
+            make_fake_compact_tensor(
+                cutlass.Int64,
+                (cute.sym_int64(divisibility=1),),
+                stride_order=(0,),
+                assumed_align=8,
+            )
+            if die1_sm_mask
+            else None
+        ),
         safe_gate,
         gate_scale_log2,
         THREADS_PER_CTA,
         mode,  # MODE constexpr (route specialization)
         gate_dtype,  # gate ABI dtype constexpr (32-bit vs 16-bit gate path)
+        die1_sm_mask,
         options="--enable-tvm-ffi",
     )
     fn = _make_call(
@@ -10391,6 +10520,7 @@ def compile(  # noqa: A001
             has_state_ckpt=has_state_ckpt,
             has_state_indices=has_state_indices,
             has_checkpoint_state_indices=has_checkpoint_state_indices,
+            die1_sm_mask=die1_sm_mask,
             mode=mode,
         ),
     )
@@ -10408,6 +10538,7 @@ def compile(  # noqa: A001
             has_state_indices,
             has_checkpoint_state_indices,
             gate_dtype,
+            bool(die1_sm_mask),
         )
     return fn
 
@@ -10422,6 +10553,7 @@ def _eager_module_load(
     has_state_indices: bool = False,
     has_checkpoint_state_indices: bool = False,
     gate_dtype: type = cutlass.BFloat16,
+    has_die_claim: bool = False,
 ) -> None:
     """One launch to make the device module resident so no real call lazy-loads.
 
@@ -10490,6 +10622,11 @@ def _eager_module_load(
             checkpoint_state_indices=(
                 torch.arange(64, dtype=torch.int32, device="cuda")
                 if has_checkpoint_state_indices
+                else None
+            ),
+            die_claim=(
+                torch.zeros(1, dtype=torch.int64, device="cuda")
+                if has_die_claim
                 else None
             ),
         )

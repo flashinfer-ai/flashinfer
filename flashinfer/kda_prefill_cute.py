@@ -324,6 +324,37 @@ def force_route(mode: Optional[str]) -> Iterator[None]:
         _ROUTE_MODE.reset(token)
 
 
+def _die_claim(
+    sm_locality_domains,
+    device: torch.device,
+    workspace: Optional[RecurrentKDAPrefillWorkspace],
+) -> tuple[tuple, Optional[torch.Tensor]]:
+    """Operands of the die-local kernel variant: (SM mask, claim counter).
+
+    The mask is the kernel's compile-time ``DIE1_SM_MASK``: signed 32-bit
+    words, bit ``s % 32`` of word ``s // 32`` set when SM ``s`` is on locality
+    domain 1.  The counter is one int64 word; a launch must not share it with
+    a launch it can overlap, so it is kept on the caller's workspace (one
+    stream) or is new for every call.  ``((), None)`` keeps the stock mapping:
+    the map must cover every SM and name exactly domains 0 and 1.
+    """
+
+    domains = [int(domain) for domain in sm_locality_domains]
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    if len(domains) != sm_count or set(domains) != {0, 1}:
+        return (), None
+    words = [0] * ((sm_count + 31) // 32)
+    for sm, domain in enumerate(domains):
+        words[sm // 32] |= domain << (sm % 32)
+    mask = tuple(word - (1 << 32) if word >> 31 else word for word in words)
+    counter = getattr(workspace, "_cute_dsl_die_claim", None)
+    if counter is None:
+        counter = torch.zeros(1, dtype=torch.int64, device=device)
+        if workspace is not None:
+            workspace.__dict__["_cute_dsl_die_claim"] = counter
+    return mask, counter
+
+
 def _get_compiled_cute_dsl_kda(
     *,
     mode: Optional[str] = None,
@@ -334,6 +365,7 @@ def _get_compiled_cute_dsl_kda(
     has_state_ckpt: bool,
     has_state_indices: bool,
     has_checkpoint_state_indices: bool,
+    die1_sm_mask: tuple = (),
 ):
     # Keep the large CuTe DSL module lazy so normal Cake and decode imports do
     # not initialize its compilation stack.
@@ -357,6 +389,7 @@ def _get_compiled_cute_dsl_kda(
         has_state_indices=has_state_indices,
         has_checkpoint_state_indices=has_checkpoint_state_indices,
         mode=mode,
+        die1_sm_mask=die1_sm_mask,
     )
 
 
@@ -382,6 +415,7 @@ def _run_cute_dsl_kda_prefill(
     checkpoint_every_n_tokens: int,
     state_indices: Optional[torch.Tensor] = None,
     checkpoint_state_indices: Optional[torch.Tensor] = None,
+    sm_locality_domains=None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -481,6 +515,13 @@ def _run_cute_dsl_kda_prefill(
         cu_seqlens = cu_seqlens.to(torch.int64)
 
     route = _ROUTE_MODE.get()
+    # Die-local claim: requests [0, ceil(N / 2)) are taken by SMs of locality
+    # domain 0 first, the rest by SMs of domain 1.  One request has no split.
+    die1_sm_mask, die_claim = (), None
+    if sm_locality_domains is not None and num_sequences >= 2:
+        die1_sm_mask, die_claim = _die_claim(
+            sm_locality_domains, q.device, prefill_workspace
+        )
     compiled = _get_compiled_cute_dsl_kda(
         **({} if route is None else {"mode": route}),
         lower_bound=float(lower_bound),
@@ -490,6 +531,7 @@ def _run_cute_dsl_kda_prefill(
         has_state_ckpt=state_checkpoints is not None,
         has_state_indices=state_indices is not None,
         has_checkpoint_state_indices=checkpoint_state_indices is not None,
+        die1_sm_mask=die1_sm_mask,
     )
     planned_cu_chunks = (
         getattr(prefill_workspace, "_cute_dsl_cu_chunks", None)
@@ -574,6 +616,7 @@ def _run_cute_dsl_kda_prefill(
             planned_cu_chunks=planned_cu_chunks,
             planned_total_chunks=planned_total_chunks,
             generate_planned_metadata=generate_planned_metadata,
+            die_claim=die_claim,
             **checkpoint_kwargs,
         )
 

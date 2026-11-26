@@ -26,7 +26,7 @@ decode and speculative decode retain the backend exposed by
 
 import functools
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 
@@ -206,6 +206,7 @@ def recurrent_kda(
         "cudnn",
     ] = "auto",
     batch_invariant: bool = False,
+    sm_locality_domains: Optional[Sequence[int]] = None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -405,6 +406,19 @@ def recurrent_kda(
             selects the row of the ``state_checkpoints`` pool written for packed
             completed-boundary entry ``i``. The kernel writes the pool directly;
             no temporary checkpoint tensor or scatter is used.
+        sm_locality_domains (Optional[Sequence[int]]):
+            Opt-in die-local scheduling of the CuTe DSL BT=16 prefill on a GPU
+            with two locality domains (two dies, each with its own memory):
+            the locality domain (0 or 1) of every SM, by SM id. Blocks on
+            domain-0 SMs then take requests ``[0, ceil(N / 2))`` first and
+            blocks on domain-1 SMs the rest, so a caller that homes the two
+            halves of its packed tensors and state rows on the matching
+            domains gets die-local memory traffic. A device-generated
+            longest-first order is kept within each half; an explicit
+            ``seq_order`` is used as given. Results are bitwise unchanged.
+            Ignored (stock scheduling) for one request, when the map does not
+            cover every SM or does not name exactly domains 0 and 1, and by
+            the other backends and ``batch_invariant=True``.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
@@ -1173,6 +1187,7 @@ def recurrent_kda(
                     checkpoint_cu_starts=checkpoint_cu_starts,
                     checkpoint_state_indices=checkpoint_state_indices,
                     checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    sm_locality_domains=sm_locality_domains,
                 )
 
     use_flash_kda_prefill = (
@@ -1394,6 +1409,7 @@ class RecurrentKDAPrefillWrapper:
         checkpoint_every_n_tokens: int = 0,
         checkpoint_state_indices: Optional[torch.Tensor] = None,
         ssm_state_indices: Optional[torch.Tensor] = None,
+        sm_locality_domains: Optional[Sequence[int]] = None,
     ) -> (
         tuple[torch.Tensor, Optional[torch.Tensor]]
         | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -1421,4 +1437,5 @@ class RecurrentKDAPrefillWrapper:
             checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             ssm_state_indices=ssm_state_indices,
+            sm_locality_domains=sm_locality_domains,
         )
