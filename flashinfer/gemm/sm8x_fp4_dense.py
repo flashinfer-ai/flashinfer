@@ -4,7 +4,8 @@
 
 Every ``mm_bf16_fp4`` backend name keeps its SM100+ requirements and runs here on SM8x as the
 records GEMM2 of one expert: activation none, top-k 1, no finalize, the identity row map of
-the MoE prep (one expert keeps the entries in token order). No CUDA change.
+the MoE prep (one expert keeps the entries in token order). A float16 output runs the BF16
+module whose GEMM2 writes FP16 (``RECORDS_OUT_F16``), rounded once from FP32.
 
 ``prepare_bf16_fp4_weights`` on SM8x returns the records of every backend: ``b`` uint8
 ``[N, ceil(size / N)]`` whose first ``size`` bytes are the records, ``b_descale`` an empty
@@ -12,6 +13,7 @@ float8_e4m3fn tensor, ``alpha`` unchanged. ``mm_bf16_fp4`` also takes each backe
 format (``cute-dsl-native``'s canonical weight among them) and builds its records per call.
 """
 
+import functools
 from typing import List, Optional, Tuple
 
 import torch
@@ -24,6 +26,7 @@ from ..fused_moe.prepare import (
     _w4a16_records,
     _w4a16_records_geometry,
 )
+from ..jit.fused_moe import gen_w4a16_moe_sm80_module
 from ..utils import get_compute_capability
 
 # (row tile, GEMM2 variant) of the MoE tactics, GEMM1's variant dropped
@@ -51,14 +54,27 @@ def _pad(x: int, y: int) -> int:
     return -(-x // y) * y
 
 
-def _flat_bytes(t: torch.Tensor, nbytes: int) -> torch.Tensor:
-    """``nbytes`` bytes of ``t``'s storage from its first element, as a flat uint8 alias (no
-    copy). A strided view of one dense block (the 6-D scale view of the SM10x cute-dsl prep)
-    is read by its base pointer."""
+def _flat_bytes(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s bytes in storage order as a flat uint8 alias (no copy). A strided view must
+    cover one dense block (the 6-D scale view of the SM10x cute-dsl prep), read from its
+    first element."""
     if t.is_contiguous():
         return t.view(torch.uint8).reshape(-1)
+    span = 1
+    for stride, size in sorted(
+        (st, sz) for st, sz in zip(t.stride(), t.shape, strict=True) if sz != 1
+    ):
+        if stride != span:
+            raise ValueError(
+                f"b_descale of shape {tuple(t.shape)} and strides {t.stride()} is not a "
+                "view of one dense block"
+            )
+        span *= size
+    offset, nbytes = t.storage_offset() * t.element_size(), span * t.element_size()
+    if t.untyped_storage().nbytes() - offset < nbytes:
+        raise ValueError("b_descale's view runs past its storage")
     return torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-        t.untyped_storage(), t.storage_offset() * t.element_size(), (nbytes,), (1,)
+        t.untyped_storage(), offset, (nbytes,), (1,)
     )
 
 
@@ -174,7 +190,7 @@ def _unswizzle(b_descale: torch.Tensor, n: int, k_sf: int) -> torch.Tensor:
     from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 
     nbytes = _pad(n, 128) * _pad(k_sf, 4)
-    flat = _flat_bytes(b_descale, nbytes)
+    flat = _flat_bytes(b_descale)
     if flat.numel() < nbytes:
         raise ValueError(
             f"b_descale has {flat.numel()} bytes but the 128x4-swizzled layout for "
@@ -334,6 +350,11 @@ def sm8x_prepare_bf16_fp4(
     )
 
 
+@functools.cache
+def _out_f16_module():
+    return gen_w4a16_moe_sm80_module(out_f16=True).build_and_load()
+
+
 def _run(
     a: torch.Tensor,
     rec: torch.Tensor,
@@ -342,7 +363,8 @@ def _run(
     out: torch.Tensor,
     tactic: Tuple[int, int],
 ) -> None:
-    """``out[:, :n] = a @ W^T * alpha`` on the records: one expert's GEMM2, rows in token order."""
+    """``out[:, :n] = a @ W^T * alpha`` (``out`` BF16 or FP16) on the records: one expert's
+    GEMM2, rows in token order."""
     r, g2 = tactic
     m, k = int(a.shape[0]), int(a.shape[1])
     max_blocks = -(-m // r)
@@ -352,12 +374,14 @@ def _run(
     ).split(ints)
     topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=a.device)
     module = _w4a16_moe_sm80_module(None, False, None, False)
+    # the BF16 module's prep; an FP16 output takes the FP16-output module's GEMM2
+    gemm = _out_f16_module().gemm if out.dtype == torch.float16 else module.gemm
     module.prep(
         topk_ids, meta, rowmap, workspace, 1, r, max_blocks, None, None, None, False, None,
         None, 0, None, None, None, None, None,
     )  # fmt: skip
     cols = _w4a16_records_geometry(n, k, False)[0]
-    module.gemm(
+    gemm(
         rec, alpha, a, meta, rowmap, out, r, 0, 1, cols, k, int(out.shape[1]), max_blocks,
         g2, None, None, None, None, None, None, None, 1, *_RECORDS_NO_EXT,
     )  # fmt: skip
@@ -365,8 +389,8 @@ def _run(
 
 class Sm8xFp4DenseRunner(TunableRunner):
     """``_run`` behind ``mm_bf16_fp4`` as an autotuner candidate; inputs ``[a, records,
-    b_descale, alpha, out_dtype, out]`` (``out`` the BF16 GEMM target); tactic (row tile,
-    GEMM2 variant)."""
+    b_descale, alpha, out_dtype, out]`` (``out`` the GEMM target, of ``out_dtype``); tactic
+    (row tile, GEMM2 variant)."""
 
     def __init__(self, key: tuple, n: int):
         self.key, self.n = key, n
@@ -399,8 +423,8 @@ def sm8x_mm_bf16_fp4(
     out: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """``mm_bf16_fp4`` on SM8x (after the backend's requirement check), with that backend's
-    output contract. A non-BF16, unaligned or N % 8 != 0 output is written through a BF16
-    buffer."""
+    output contract. An unaligned, strided or N % 8 != 0 output is written through a buffer
+    of its dtype."""
     if backend == "cute-dsl" and out_dtype != torch.bfloat16:
         raise NotImplementedError(
             f"cute-dsl currently requires a bfloat16 output; got {out_dtype}."
@@ -415,22 +439,19 @@ def sm8x_mm_bf16_fp4(
         raise ValueError(f"out shape {tuple(out.shape)} != expected {(m, n)}")
     elif out.dtype != out_dtype:
         raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
+    elif out.device != a.device:
+        raise ValueError(f"out is on {out.device} but a is on {a.device}")
     if m == 0:
         return out
     if a.data_ptr() % 16:
         a = a.clone()
     if alpha is None:
         alpha = _ones(a.device)
-    direct = (
-        out.dtype == torch.bfloat16
-        and n % 8 == 0
-        and out.is_contiguous()
-        and out.data_ptr() % 16 == 0
-    )
+    direct = n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
     target = (
         out
         if direct
-        else torch.empty((m, _pad(n, 8)), dtype=torch.bfloat16, device=a.device)
+        else torch.empty((m, _pad(n, 8)), dtype=out.dtype, device=a.device)
     )
     from .gemm_bf16_fp4_cudnn import _BF16_FP4_TUNING_CONFIG
 

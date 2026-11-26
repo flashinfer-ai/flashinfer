@@ -253,13 +253,18 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_w4a16_moe_sm80_module(
-    recipe=None, exact: bool = False, act: Optional[int] = None, f16: bool = False
+    recipe=None,
+    exact: bool = False,
+    act: Optional[int] = None,
+    f16: bool = False,
+    out_f16: bool = False,
 ) -> JitSpec:
     """NVFP4 MoE records kernels (BF16, or FP16 if ``f16``, or NVFP4 activations): sm_80 code for SM80 to SM89,
     plus sm_87 for SM87, and sm_90 for SM90. The NVFP4 activation quantizer runs in software (FLASHINFER_FP4_SW_CVT),
     with the 4over6 ``recipe`` (an ``NVFP44Over6Config``) and without fast math if ``exact``
     (FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH), a module each; with ``act`` (an
-    ``ActivationType``) the GEMMs' epilogue extensions for that activation."""
+    ``ActivationType``) the GEMMs' epilogue extensions for that activation. ``out_f16``: a BF16
+    module whose GEMM2 (alone: no finalize, no row scales) writes FP16."""
     from ..quantization.nvfp4_quantization_utils import nvfp4_4over6_cache_key
 
     archs = current_compilation_context.TARGET_CUDA_ARCHS
@@ -281,6 +286,10 @@ def gen_w4a16_moe_sm80_module(
         defines, name = defines + f" RECORDS_ACT={int(act)}", name + f"_act{int(act)}"
     if f16:
         defines, name = defines + " RECORDS_F16", name + "_f16"
+    if out_f16:
+        if f16:
+            raise ValueError("out_f16 is a BF16 module's")
+        defines, name = defines + " RECORDS_OUT_F16", name + "_out_f16"
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     return gen_jit_spec(
         name,

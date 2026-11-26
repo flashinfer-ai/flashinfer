@@ -181,9 +181,10 @@ def test_sm100_formats_match_records(backend, fmt, m, monkeypatch):
     assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tactic", dense._TACTICS)
 @pytest.mark.parametrize("m", [1, 33, 200])
-def test_every_tactic(tactic, m):
+def test_every_tactic(tactic, m, out_dtype):
     n, k = 256, 512
     codes, sf, alpha, deq = _weights(n, k, 31)
     b_p, sf_p, _ = prepare_bf16_fp4_weights(codes, sf, alpha, backend="cudnn")
@@ -192,18 +193,45 @@ def test_every_tactic(tactic, m):
     assert n_rec == n
 
     def run():
-        out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        out = torch.empty((m, n), dtype=out_dtype, device="cuda")
         dense._run(a, rec, n, alpha, out, tactic)
         return out
 
-    _run_checked(run, (a.float() @ deq.T) * 0.75, f"tactic {tactic} m={m}")
+    _run_checked(run, (a.float() @ deq.T) * 0.75, f"tactic {tactic} m={m} {out_dtype}")
+
+
+@pytest.mark.parametrize("n", [8, 12])
+@pytest.mark.parametrize(
+    "a1,alpha,expected", [(2.0**-9, 1.0, 1.0 + 2.0**-10), (0.0, 65505.0, 65504.0)]
+)
+def test_float16_output_rounds_once(n, a1, alpha, expected):
+    """A float16 output is rounded once from FP32: 1 + 2^-10 stays (through BF16: 1.0) and
+    65505 gives 65504 (through BF16: 65536, then inf). N 12 goes through the buffer."""
+    k = 16
+    codes = torch.zeros((n, k // 2), dtype=torch.uint8, device="cuda")
+    codes[:, 0] = 0x12  # W[:, 0] = 1.0 (code 2), W[:, 1] = 0.5 (code 1)
+    sf = torch.full((n, 1), 0x38, dtype=torch.uint8, device="cuda")  # E4M3 1.0
+    al = torch.tensor([alpha], device="cuda", dtype=torch.float32)
+    b_p, sf_p, al_p = prepare_bf16_fp4_weights(
+        codes, _swizzle_128x4(sf), al, backend="cudnn"
+    )
+    a = torch.zeros((1, k), dtype=torch.bfloat16, device="cuda")
+    a[0, 0], a[0, 1] = 1.0, a1
+    out, names = _run_profiled(
+        lambda: mm_bf16_fp4(
+            a, b_p, sf_p, al_p, backend="cudnn", out_dtype=torch.float16
+        )
+    )
+    assert any(KERNEL_SYMBOL in s for s in names), names
+    assert out.dtype == torch.float16
+    assert torch.equal(out.float(), torch.full_like(out.float(), expected)), out
 
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n,k", [(72, 160), (100, 256), (8, 16), (200, 4096)])
 @pytest.mark.parametrize("m", [3, 70])
 def test_unaligned_shapes(n, k, m, out_dtype):
-    """N % 128 != 0, N % 8 != 0 (through the BF16 buffer) and K % 128 != 0."""
+    """N % 128 != 0, N % 8 != 0 (through a buffer of the output dtype) and K % 128 != 0."""
     codes, sf, alpha, deq = _weights(n, k, 41)
     b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(codes, sf, alpha, backend="cudnn")
     a = _rand(m, k, 42)
@@ -246,8 +274,19 @@ def test_alpha_none_and_errors():
     with pytest.raises(TypeError):
         out = torch.empty((m, n), dtype=torch.float16, device="cuda")
         mm_bf16_fp4(a, b_p, sf_p, None, backend="cudnn", out=out)
+    with pytest.raises(ValueError):  # out on another device
+        out = torch.empty((m, n), dtype=torch.bfloat16)
+        mm_bf16_fp4(a, b_p, sf_p, None, backend="cudnn", out=out)
     with pytest.raises(NotImplementedError):
         mm_bf16_fp4(a, b_p, sf_p, None, backend="cute-dsl", out_dtype=torch.float16)
+
+
+def test_flat_bytes():
+    """A permuted dense block is read in storage order; a view with gaps is refused."""
+    t = torch.arange(24, dtype=torch.uint8, device="cuda")
+    assert torch.equal(dense._flat_bytes(t.view(2, 3, 4).permute(2, 0, 1)), t)
+    with pytest.raises(ValueError):
+        dense._flat_bytes(t[::2])
 
 
 def test_cuda_graph_replay():
@@ -264,6 +303,25 @@ def test_cuda_graph_replay():
     graph.replay()
     torch.cuda.synchronize()
     _check(out, (a.float() @ deq.T) * 0.75, "graph replay")
+
+
+def test_cuda_graph_alpha_none():
+    """alpha None: the call before the capture makes the constant 1 the captured call reads."""
+    n, k, m = 256, 512, 24
+    codes, sf, _, deq = _weights(n, k, 74)
+    b_p, sf_p, _ = prepare_bf16_fp4_weights(codes, sf, None, backend="cudnn")
+    a = _rand(m, k, 75)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    dense._ones_cache.clear()
+    mm_bf16_fp4(a, b_p, sf_p, None, out=out, backend="cudnn")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mm_bf16_fp4(a, b_p, sf_p, None, out=out, backend="cudnn")
+    a.copy_(_rand(m, k, 76))
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(out, a.float() @ deq.T, "graph replay, alpha None")
 
 
 def test_vllm_padded_weight():

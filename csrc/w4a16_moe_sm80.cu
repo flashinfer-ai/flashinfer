@@ -129,6 +129,21 @@ __device__ __forceinline__ float2 x2_f(XT2 v) {
   return RECORDS_X(__bfloat1622float2, __half22float2)(v);
 }
 __device__ __forceinline__ float x_round(float v) { return static_cast<float>(to_x(v)); }
+// RECORDS_OUT_F16 (a BF16 module): GEMM2 alone (no finalize, no row scales) writes FP16, rounded
+// once from FP32 (the dense mm_bf16_fp4's float16 output). OT: GEMM2's output type.
+#ifdef RECORDS_OUT_F16
+static_assert(!kF16, "RECORDS_OUT_F16 is a BF16 module's");
+constexpr bool kOutF16 = true;
+using OT = __half;
+__device__ __forceinline__ OT to_o(float v) { return __float2half_rn(v); }
+__device__ __forceinline__ __half2 to_o2(float lo, float hi) { return __floats2half2_rn(lo, hi); }
+#else
+constexpr bool kOutF16 = false;
+using OT = XT;
+__device__ __forceinline__ OT to_o(float v) { return to_x(v); }
+__device__ __forceinline__ XT2 to_o2(float lo, float hi) { return to_x2(lo, hi); }
+#endif
+constexpr DLDataType kOdl = kOutF16 ? dl_float16 : kXdl;
 
 __device__ __forceinline__ void lds64v(uint32_t* d, uint32_t a) {
   asm volatile("ld.volatile.shared.v2.u32 {%0, %1}, [%2];" : "=r"(d[0]), "=r"(d[1]) : "r"(a));
@@ -472,6 +487,10 @@ __device__ __forceinline__ void restore_nvfp4x8(uint32_t codes, uint8_t sf, uint
 // piece and gets the same positions of the transposed piece.
 __device__ __forceinline__ uint32_t pack_x2(float lo, float hi) {
   XT2 h = to_x2(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&h);
+}
+__device__ __forceinline__ uint32_t pack_o2(float lo, float hi) {
+  auto h = to_o2(lo, hi);
   return *reinterpret_cast<uint32_t*>(&h);
 }
 
@@ -880,10 +899,10 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
                 lo += bb;
                 hi += bb;
               }
-              t[s][hh] = movm_trans(pack_x2(lo, hi));
+              t[s][hh] = movm_trans(pack_o2(lo, hi));
             }
           if (drow[gi] >= 0) {
-            XT* o = p.out + static_cast<long>(drow[gi]) * Nout + n0;
+            OT* o = reinterpret_cast<OT*>(p.out) + static_cast<long>(drow[gi]) * Nout + n0;
 #pragma unroll
             for (int s = 0; s < SC; ++s)
 #pragma unroll
@@ -980,17 +999,22 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
                 const float r = PT ? (h ? rs2[gi].y : rs2[gi].x) : 0.f;
                 const float y0 = PT ? mul_ftz(v[s][gi][h] * 128.f, r) : v[s][gi][h] * a;
                 const float y1 = PT ? mul_ftz(v[s][gi][2 + h] * 128.f, r) : v[s][gi][2 + h] * a;
-                if (n < Nout) p.out[f * Nout + n] = to_x(y0 + ext_b2(b, n));
-                if (n + 8 < Nout) p.out[f * Nout + n + 8] = to_x(y1 + ext_b2(b, n + 8));
+                if (n < Nout) reinterpret_cast<OT*>(p.out)[f * Nout + n] = to_o(y0 + ext_b2(b, n));
+                if (n + 8 < Nout)
+                  reinterpret_cast<OT*>(p.out)[f * Nout + n + 8] = to_o(y1 + ext_b2(b, n + 8));
               } else if constexpr (PT) {  // the sum times the row's scale (alpha folded in), as
                                           // reference
                 const float r = h ? rs2[gi].y : rs2[gi].x;
-                if (n < Nout) p.out[f * Nout + n] = to_x(mul_ftz(v[s][gi][h] * 128.f, r));
+                if (n < Nout)
+                  reinterpret_cast<OT*>(p.out)[f * Nout + n] =
+                      to_o(mul_ftz(v[s][gi][h] * 128.f, r));
                 if (n + 8 < Nout)
-                  p.out[f * Nout + n + 8] = to_x(mul_ftz(v[s][gi][2 + h] * 128.f, r));
+                  reinterpret_cast<OT*>(p.out)[f * Nout + n + 8] =
+                      to_o(mul_ftz(v[s][gi][2 + h] * 128.f, r));
               } else {
-                if (n < Nout) p.out[f * Nout + n] = to_x(v[s][gi][h] * a);
-                if (n + 8 < Nout) p.out[f * Nout + n + 8] = to_x(v[s][gi][2 + h] * a);
+                if (n < Nout) reinterpret_cast<OT*>(p.out)[f * Nout + n] = to_o(v[s][gi][h] * a);
+                if (n + 8 < Nout)
+                  reinterpret_cast<OT*>(p.out)[f * Nout + n + 8] = to_o(v[s][gi][2 + h] * a);
               }
             }
           }
@@ -2426,7 +2450,10 @@ void w4a16_moe_sm80_gemm(
   CHECK_INPUT_AND_TYPE(records, dl_uint8);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(act, kXdl);
-  CHECK_INPUT_AND_TYPE(out, kXdl);
+  CHECK_INPUT_AND_TYPE(out, kOdl);
+  TVM_FFI_ICHECK(!kOutF16 ||
+                 (activation == 0 && !topk_weights.has_value() && !row_scales.has_value()))
+      << "the FP16-output module runs GEMM2 alone";
   TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(act.data_ptr()) & 15) == 0 &&
                  (reinterpret_cast<uintptr_t>(records.data_ptr()) & 15) == 0)
       << "act and records must be 16 B aligned";

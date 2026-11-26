@@ -987,6 +987,9 @@ def gen_all_modules(
             jit_specs.append(gen_w4a16_moe_sm80_module())
             jit_specs.append(gen_w4a16_moe_sm80_module(f16=True))
             jit_specs.append(gen_trtllm_gen_routing_module())  # FP4 MoE routing
+        if has_sm80 and get_cuda_version() >= Version("12.8"):
+            # mm_bf16_fp4's float16 output on SM8x (the records GEMM2 writing FP16)
+            jit_specs.append(gen_w4a16_moe_sm80_module(out_f16=True))
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
