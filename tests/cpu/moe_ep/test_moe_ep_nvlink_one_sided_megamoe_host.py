@@ -43,9 +43,7 @@ TOPK = 6
 CLAMP = 10.0
 SHARED = {"shared_expert": "fp8_in_kernel"}
 SENTINEL = {"dispatch_protocol": "sentinel", "combine_protocol": "sentinel"}
-COUNTER = {"dispatch_protocol": "counter", "combine_protocol": "counter"}
 PULL = {"dispatch_protocol": "pull", "combine_protocol": "counter"}
-COUNTER_DISPATCH = {"dispatch_protocol": "counter", "combine_protocol": "sentinel"}
 POOL = {**PULL, "fc1_token_pool": True}
 JIT = {"just_in_time_claims": True}
 NO_JIT = {"just_in_time_claims": False}
@@ -148,14 +146,16 @@ def test_config_validation(fields, message):
         (128, {"hidden": 1024}, {}, "unknown"),
         (128, {"weight_layout": "kmajor"}, {}, "unknown"),
         (8200, None, {}, "at most 8192 tokens per rank"),
-        # Dispatch rounds need the counter dispatch and the counter combine.
-        (1024, {**COUNTER, "dispatch_rounds": 3}, {}, "dispatch_rounds must be"),
-        (1024, {**COUNTER_DISPATCH, "dispatch_rounds": 4}, {}, "combine_protocol"),
-        (1024, {**PULL, "dispatch_rounds": 4}, {}, "dispatch_protocol='counter'"),
-        # The pull dispatch needs the counter combine; its knobs need it.
+        (1024, {"dispatch_rounds": 4}, {}, "unknown"),
+        # Two dispatch protocols; "counter" names the Fence combine only.
+        (1024, {"dispatch_protocol": "counter"}, {}, "'sentinel' or 'pull'"),
+        # The pull dispatch needs the counter combine, also where knobs switch
+        # the combine; its knobs need the pull dispatch.
         (128, {**SENTINEL, "dispatch_protocol": "pull"}, {}, "protocol='counter'"),
-        (512, {**COUNTER, "comm_pull_depth": 2}, {}, "comm_pull_depth"),
-        (512, {**COUNTER, "pull_warps": 4}, {}, "pull_warps"),
+        (1024, {"combine_protocol": "sentinel"}, {}, "protocol='counter'"),
+        (512, {**SENTINEL, "comm_pull_depth": 2}, {}, "comm_pull_depth"),
+        (512, {**SENTINEL, "pull_warps": 4}, {}, "pull_warps"),
+        (512, {**SENTINEL, "comm_exchange_ctas": 8}, {}, "comm_exchange_ctas"),
         (512, {**PULL, "pull_warps": 5}, {}, "pull_warps"),
         # FC1's token pool takes the walking CTAs' rows and four Gather-B warps.
         (2048, {**PULL, "fc1_token_pool": 1}, {}, "fc1_token_pool"),
@@ -206,17 +206,51 @@ def test_engine_config_validation():
         quant_kind="mxfp4_mxfp8",
         cluster_shape_mn=(2, 1),
         mma_tiler_mnk=(256, 128, 128),
-        **COUNTER_DISPATCH,
+        **SENTINEL,
     )
     Sm100GenphaseMoeConfig(**SHARED, **common)
     shared_rounding = {**SHARED, "shared_bf16_rounding": True}
     for fields, message in (
+        ({"dispatch_protocol": "counter"}, "'sentinel' or 'pull'"),
         (IN_KERNEL, "only under combine_protocol='counter'"),
         ({**SHARED, "cluster_shape_mn": (4, 1)}, "shared_expert needs GenPhase"),
-        ({**shared_rounding, **IN_KERNEL, **COUNTER}, "in-kernel top-k reduce"),
+        ({**shared_rounding, **IN_KERNEL, **PULL}, "in-kernel top-k reduce"),
     ):
         with pytest.raises(ValueError, match=message):
             Sm100GenphaseMoeConfig(**{**common, **fields})
+
+
+@pytest.mark.parametrize(
+    "tokens, world, experts, topk, dispatch",
+    [
+        # DeepSeek-V4.1-Flash, top-6 of 384: 1.35 routes per reached rank at EP8.
+        (192, 8, 384, 6, "sentinel"),
+        (256, 8, 384, 6, "sentinel"),
+        (257, 8, 384, 6, "pull"),
+        (4096, 8, 384, 6, "pull"),
+        # 1.8 routes at EP4 and 6 at EP1.
+        (192, 4, 384, 6, "sentinel"),
+        (193, 4, 384, 6, "pull"),
+        (193, 1, 48, 6, "pull"),
+        # Kimi-K3, top-16 of 896 (2.26), and HY4, top-8 of 256 (1.51), at EP8.
+        (192, 8, 896, 16, "sentinel"),
+        (193, 8, 896, 16, "pull"),
+        (192, 8, 256, 8, "sentinel"),
+        (256, 8, 256, 8, "pull"),
+    ],
+)
+def test_dispatch_rule(tokens, world, experts, topk, dispatch):
+    """The Sentinel dispatch to 192 tokens per rank, to 256 within 1.5 routes per reached rank; the combine follows."""
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+        dispatch_protocol,
+        nvlink_one_sided_tiling,
+    )
+
+    assert dispatch_protocol(tokens, world, experts, topk) == dispatch
+    tiling = nvlink_one_sided_tiling(tokens, world, experts, topk)
+    assert tiling["dispatch_protocol"] == dispatch
+    combine = "sentinel" if dispatch == "sentinel" else "counter"
+    assert tiling["combine_protocol"] == combine
 
 
 def test_init_rejections(dist_not_initialized, monkeypatch):
@@ -344,7 +378,7 @@ def test_situ_engine_config_validation():
         quant_kind="mxfp4_mxfp8",
         cluster_shape_mn=(2, 1),
         mma_tiler_mnk=(256, 128, 128),
-        **COUNTER_DISPATCH,
+        **SENTINEL,
     )
     Sm100GenphaseMoeConfig(**SITU, **common)
     for fields, message in (

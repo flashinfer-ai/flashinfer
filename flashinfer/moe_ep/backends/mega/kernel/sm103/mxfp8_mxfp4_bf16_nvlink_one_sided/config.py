@@ -18,11 +18,12 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     One compiled call launches the EP dispatch, the fused FC1 / gated activation /
     MXFP8 requantization / FC2 kernel with its combine pushes, and the top-k reduce,
     over PyTorch symmetric memory on the EP process group. Activations and
-    weights carry UE8M0 scales per 32 values. The dispatch is a Sentinel
-    (data-as-flag) protocol up to 128 tokens per rank and a counter protocol
-    (per-peer payload counters) above that; the combine is Sentinel up to 256
-    tokens per rank and above that a counter protocol (one all-rank barrier at
-    the tail of the fused kernel).
+    weights carry UE8M0 scales per 32 values. The dispatch is the Sentinel
+    (data-as-flag) protocol up to 192 tokens per rank, and up to 256 where a
+    reached rank takes at most 1.5 routes per token (DeepSeek-V4.1-Flash at
+    EP8), with the Sentinel combine; above that each target rank pulls its rows
+    from the source ranks, with the counter (Fence) combine, one all-rank barrier
+    at the tail of the fused kernel (``dispatch_protocol``).
 
     Landing rows move in runs of 32 x 16 bytes, so ``token_hidden_size`` must
     be a multiple of 512, and their reset checks one route per lane of a warp,
@@ -67,7 +68,7 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     so the combine slots and the separate top-k reduce go. The adds round to BF16
     one at a time in arrival order instead of one FP32 sum per token, so the
     output changes and is not reproducible from run to run; it is opt-in. It
-    applies where the combine is the counter protocol (above 256 tokens per rank
+    applies where the combine is the counter protocol (under the pull dispatch,
     unless knobs pick it); the Sentinel combine's slots announce their own
     arrival, which a sum cannot, so there the separate reduce stays.
 
@@ -88,18 +89,17 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     (its intermediate width must be ``intermediate_size``). Its FP32 FC2 partial
     is rounded to BF16 like a route's and summed after the routes in the same
     FP32 sum; under ``reduce_topk_in_kernel`` it is added into the output like a
-    route. Its FC1 tiles run from the fused kernel's entry, so where they fill
-    the counter dispatch's window before the first routed tile, the engine takes
-    that dispatch over the pull (``nvlink_one_sided_tiling``; knobs may pin either).
-    ``shared_gate_up_clamp`` is its own SwiGLU clamp (``None``: none; the
-    routed ``gate_up_clamp`` never applies to it). The shared expert runs
-    SwiGLU only, so ``activation="situ"`` rejects ``shared_expert`` and with it
-    ``shared_gate_up_clamp``; Kimi-K3's shared expert runs on the full hidden
-    state, outside its routed experts' latent MoE. ``shared_bf16_rounding``
-    rounds its gate, up and SwiGLU product to BF16 and the routes' FP32 sum to
-    BF16 before its output joins it, the order of a BF16 shared expert added to
-    a BF16 routed output; it changes the output and is opt-in, and the in-kernel
-    top-k reduce, which adds in arrival order, cannot round that way.
+    route. Its FC1 tiles run from the fused kernel's entry, in the window before
+    the first routed tile is ready. ``shared_gate_up_clamp`` is its own SwiGLU
+    clamp (``None``: none; the routed ``gate_up_clamp`` never applies to it).
+    The shared expert runs SwiGLU only, so ``activation="situ"`` rejects
+    ``shared_expert`` and with it ``shared_gate_up_clamp``; Kimi-K3's shared
+    expert runs on the full hidden state, outside its routed experts' latent
+    MoE. ``shared_bf16_rounding`` rounds its gate, up and SwiGLU product to BF16
+    and the routes' FP32 sum to BF16 before its output joins it, the order of a
+    BF16 shared expert added to a BF16 routed output; it changes the output and
+    is opt-in, and the in-kernel top-k reduce, which adds in arrival order,
+    cannot round that way.
 
     ``routing_weights_after_fc2`` applies each route's routing weight to its FC2
     output in FP32 instead of to its activation output before the MXFP8

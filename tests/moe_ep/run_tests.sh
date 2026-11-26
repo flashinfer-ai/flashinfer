@@ -466,10 +466,10 @@ run_mega_sm107() {
 # Blackwell sm103_mxfp8_mxfp4_bf16_nvlink_one_sided MoEEpLayer tests against the
 # Torch oracle, once per EP size in NPROC_SM103_NVLINK_ONE_SIDED (each needs that many
 # SM103 or SM100 GPUs of GPU 0's architecture). The default is "2 4", plus 8
-# when eight such GPUs are visible: the dispatch-round cases need at most 32
-# local experts and run at EP8 only, as do the Kimi-K3 cases. CUTE_DSL_ARCH
-# must name GPU 0's target (sm_103a on B300, sm_100a on B200) before cutlass is
-# first imported, which already happens while pytest loads the conftests.
+# when eight such GPUs are visible: the Kimi-K3 cases, SiTU's included, run at EP8 only.
+# CUTE_DSL_ARCH must name GPU 0's target (sm_103a on B300, sm_100a on B200)
+# before cutlass is first imported, which already happens while pytest loads
+# the conftests.
 sm103_gpu_count() {
   "${PY}" -c '
 import torch

@@ -3,16 +3,16 @@
 """Genphase MegaMoE token communication.
 
 Every dispatch sends this rank's routing at kernel entry, with no routing
-dependency. The push dispatches (Sentinel, Fence push) send the payload at entry
-as well, so a single cross-rank transfer sits on their critical path; under the
-pull dispatch the target ranks fetch the payload once the routing has arrived:
+dependency. The Sentinel dispatch sends the payload at entry as well, so a
+single cross-rank transfer sits on its critical path; under the pull dispatch
+the target ranks fetch the payload once the routing has arrived:
 
   exchange CTA c   writes this rank's whole top-k planes into peer c's inbox
                    (Sentinel), or sends every peer its count row and its routes
-                   among chunk c of this rank's top-k plane (Fence dispatches;
-                   see "Expert-id lists")
+                   among chunk c of this rank's top-k plane (pull; see
+                   "Expert-id lists")
   pusher CTA p     sends a slice of this rank's tokens to every peer that wants
-                   them (push dispatches only)
+                   them (Sentinel only)
 
 The rest runs on the target rank:
 
@@ -22,17 +22,14 @@ The rest runs on the target rank:
                inbox"); the helper and the pushers refine the landed rows,
                verifying their bytes and rewriting their scale factors into the
                layout the block-scaled MMA wants
-  Fence push   one helper CTA folds the received count rows into per-expert
+  pull         one helper CTA folds the received count rows into per-expert
                sizes, the processing order and the row-space prefixes; the
-               exchange CTAs copy slices of the received lists into the index
-               lists and leave (under round gating the first
-               ``refine_exchange_ctas`` refine instead); the helper and the
-               pushers refine once the payload counters publish the rows
-  Fence pull   the helper folds as under the push, and the exchange and pusher
-               CTAs copy the lists; the helper and the pushers then walk this
-               rank's routes in processing order and fetch each row from its
-               source rank's staging, or with ``pull_warps`` the main kernel
-               fetches and this grid ends with the plan ("Pull dispatch")
+               exchange and pusher CTAs copy slices of the received lists into
+               the index lists, and the exchange CTAs leave; the helper and the
+               pushers then walk this rank's routes in processing order and
+               fetch each row from its source rank's staging, or with
+               ``pull_warps`` the main kernel fetches and this grid ends with
+               the plan ("Pull dispatch")
 
 The exchange CTAs leave instead of joining that last phase because the dependent
 main kernel sizes its grid to fill the device: whatever this component holds comes
@@ -68,18 +65,17 @@ bases this component writes must reproduce the scheduler's formula bit for bit.
 
 Payload representations
 -----------------------
-Activation scale factors exist twice, and the counters say which one is meant:
-
-  token_sf_plain_ready   the linear per-token plane pushed over NVLink
-  fc1_sf_ready[expert]   the canonical atom-major pool the MMA reads, counted in
-                         refine blocks so one expert opens without the others
+Activation scale factors exist twice: the linear per-token plane the Sentinel
+dispatch pushes over NVLink, and the canonical atom-major pool the MMA reads,
+whose readiness ``fc1_sf_ready[expert]`` counts so that one expert opens
+without the others.
 
 Expert-id lists
 ---------------
-Under the Fence dispatches (counter and pull) the expert-id slots carry lists
-rather than planes. Exchange CTA ``c`` of a source rank stages routes
-``[c * exchange_chunk_routes, (c + 1) * exchange_chunk_routes)`` of its top-k
-plane (route ``token * topk + slot``) and counting-sorts them in SMEM by
+Under the pull dispatch the expert-id slots carry lists rather than planes.
+Exchange CTA ``c`` of a source rank stages routes ``[c * exchange_chunk_routes,
+(c + 1) * exchange_chunk_routes)`` of its top-k plane (route ``token * topk +
+slot``) and counting-sorts them in SMEM by
 (destination rank, local expert), so every route is sorted once, on the source.
 Destination ``d`` receives under (source, chunk) its count row, one count per
 local expert (``topk_count_inbox``), and its routes and their scores in list
@@ -113,25 +109,10 @@ CTAs' wait for the index lists carries them (``pull_acquire_in_copy``, on by
 default; off, every walking CTA acquires all W slots before its first fetch);
 every lane of a main-kernel pull warp acquires all W before its first fetch.
 That edge orders every source's staged activations before the fetches (see
-"Pull dispatch"). The counter dispatch leaves ``topk_ready`` unused. Either way a rank's resets precede the writes two rounds later into
-the same landing set: they complete with the rank's communication grid, and
-every peer acquires a system-scope release the rank issues in the next round
-(its ``topk_ready`` under pull, its payload counters under counter) before the
+"Pull dispatch"). A rank's resets precede the writes two rounds later into the
+same landing set: they complete with the rank's communication grid, and every
+peer acquires the rank's ``topk_ready`` release of the next round before the
 peer's grid of the round after that starts.
-
-Dispatch rounds
----------------
-Under the counter dispatch with ``dispatch_rounds`` R > 1 every rank's local
-experts split into R contiguous rounds of ``experts_per_rank / R``, the same
-split on every rank. A token travels to a peer once, in the round of its first
-expert there, scale factors and data together. Each pushing warp walks the
-rounds in order and reports every round, empty or not, to its CTA once its
-writes of the round have landed; one publisher warp per pusher CTA then
-publishes the round to every peer with a relaxed system add after a system
-fence. The helper lays the experts out round-major (load-descending inside a
-round), so the refine claims blocks round by round and gates each one on its
-expert's round alone; ``fc1_sf_ready`` then certifies the expert's data rows
-for the main kernel, which needs no whole-payload wait.
 
 Sentinel top-k inbox
 -------------------
@@ -161,8 +142,8 @@ rank; counting every plane removes that hand-off from the plan's critical
 path. The duplicate work is cheap: its loads read this rank's own inbox within
 the poll that waits for the planes, its atomics are CTA-scope SMEM atomics, a
 thread counts its vectors as soon as they have landed, and the planners hold
-SMs that have no other work yet. The Fence dispatches, which serve larger
-batches, count each route once, on its source, and send count rows instead
+SMs that have no other work yet. The pull dispatch, which serves larger
+batches, counts each route once, on its source, and sends count rows instead
 (see "Expert-id lists").
 
 Only the counts agree across planners. The value a route's SMEM atomic
@@ -185,7 +166,7 @@ launched for as long as it takes, and trap only once every source's
 Pull dispatch
 -------------
 Under the pull dispatch no source rank sends payload. The expert-id lists, the
-helper and the index copy run as under the counter dispatch, with the pusher
+helper and the index copy run as "Expert-id lists" describes, with the pusher
 CTAs copying slices of the lists as well; the helper and the pusher CTAs then
 walk this rank's routes in processing order and fetch the rows themselves. A
 warp claims up to ``pull_chunk_rows`` consecutive routes of one token tile of one
@@ -291,7 +272,7 @@ import cutlass.cute as cute
 import cutlass.utils
 from cutlass import pipeline
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32, Int64, Uint32, Uint64
+from cutlass.cutlass_dsl import Int32, Int64, Uint32
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc
@@ -307,7 +288,6 @@ from .....helpers.ptx_helpers import (
     ldg_volatile_b32_if,
     lds128_v4_b32,
     nanosleep,
-    red_add_relaxed_sys_s32,
     red_async_add_release_gpu_s32,
     red_async_add_release_sys_u32,
     stg_b32,
@@ -502,14 +482,14 @@ class GenphaseTokenComm(KernelComponent):
     # stretches its smaller claims well past the first wave, where they only
     # slow it down.
     pull_lead_max_expected_load: ClassVar[int] = 384
-    # List positions one thread of the Fence index copy resolves per batch; the
-    # batch's loads all go out before its stores.
+    # List positions one thread of the pull dispatch's index copy resolves per
+    # batch; the batch's loads all go out before its stores.
     index_copy_batch: ClassVar[int] = 8
-    # Route vectors (four routes each) one thread of a Fence exchange CTA loads
+    # Route vectors (four routes each) one thread of a pull exchange CTA loads
     # per step of its count and list passes, before it uses any of them.
     exchange_vector_batch: ClassVar[int] = 4
-    # Fence dispatches: the CTAs that split this rank's top-k plane, at least
-    # one per peer by default (``comm_exchange_ctas`` overrides it). Each sorts
+    # Pull dispatch: the CTAs that split this rank's top-k plane, at least one
+    # per peer by default (``comm_exchange_ctas`` overrides it). Each sorts
     # its chunk of routes once for every destination, so more of them shorten
     # the sort; every destination then folds one count row per (source, chunk).
     default_exchange_ctas: ClassVar[int] = 8
@@ -518,71 +498,44 @@ class GenphaseTokenComm(KernelComponent):
     # chunk would then outgrow SMEM: every index-copy CTA holds three words per
     # segment in SMEM and searches them per list position.
     max_list_segments: ClassVar[int] = 4096
-    # Rounds the counter dispatch may split the local experts into.
-    supported_dispatch_rounds: ClassVar[tuple] = (1, 2, 4, 8)
-    # Default bulk groups a pusher warp commits after a round closes before it
-    # publishes that round (``round_publish_lag`` overrides it).
-    default_round_publish_lag: ClassVar[int] = 4
-    # A round-gate poll that sees no progress for this long traps with a message
-    # instead of hanging; a peer that has not launched yet (still compiling, say)
-    # is the longest legitimate wait.
-    round_wait_deadline_ns: ClassVar[int] = 120 * 1000 * 1000 * 1000
     # Diagnostic timestamps (``stamps``): one Int64 %globaltimer value per
     # (site, column). The column is the comm or main CTA, or as noted per row.
     stamp_columns: ClassVar[int] = 256
     stamp_comm_entry: ClassVar[int] = 0
     stamp_comm_exit: ClassVar[int] = 1
     # metadata_ready contribution, per contributing CTA (``index_copy_cta_count``
-    # of them under the Fence dispatches, one per planner under the Sentinel one)
+    # of them under the pull dispatch, one per planner under the Sentinel one)
     stamp_sort_done: ClassVar[int] = 2
     # Column 0: sizes_ready; column 1: prefix_ready, or under the Sentinel dispatch
     # planner 0's row-space bases published.
     stamp_helper: ClassVar[int] = 3
     stamp_push_done: ClassVar[int] = 4  # last bulk push issued, per pusher CTA
-    stamp_published: ClassVar[int] = 5  # last publication done, per pusher CTA
+    stamp_published: ClassVar[int] = 5  # pushes drained, per pusher CTA
     stamp_refine_open: ClassVar[int] = 6  # refine entry wait passed, per CTA
     stamp_expert_ready: ClassVar[int] = 7  # last fc1_sf_ready release, per local expert
-    stamp_round_arrival: ClassVar[int] = (
-        8  # observer: round r of source s complete, column r * W + s
-    )
-    stamp_round_final: ClassVar[int] = (
-        9  # observer: count of round r of source s at its exit
-    )
-    stamp_round_entry: ClassVar[int] = (
-        10  # observer: count of round r of source s at its entry
-    )
-    stamp_payload_arrival: ClassVar[int] = (
-        11  # observer: column 0 data, column 1 SF whole-payload counter
-    )
-    stamp_main_entry: ClassVar[int] = 12
+    stamp_main_entry: ClassVar[int] = 8
     stamp_main_gather_open: ClassVar[int] = (
-        13  # Gather-B passed its entry waits, per main CTA
+        9  # Gather-B passed its entry waits, per main CTA
     )
-    stamp_main_first_fc1: ClassVar[int] = 14  # TMA-B passed its first fc1_sf_ready wait
-    stamp_main_epilogue_done: ClassVar[int] = 15
-    stamp_main_exit: ClassVar[int] = 16
-    # Latest publication of round r by a warp of pusher CTA p, column p * R + r
-    # (pairs past the column count are not recorded).
-    stamp_round_published: ClassVar[int] = 17
-    # When the publisher warp of pusher CTA p saw round r's barrier complete, same columns.
-    stamp_round_reported: ClassVar[int] = 18
-    # Fence dispatches: the plan's steps, one column range per step
+    stamp_main_first_fc1: ClassVar[int] = 10  # TMA-B passed its first fc1_sf_ready wait
+    stamp_main_epilogue_done: ClassVar[int] = 11
+    stamp_main_exit: ClassVar[int] = 12
+    # Pull dispatch: the plan's steps, one column range per step
     # (``plan_detail_columns``).
-    stamp_plan_detail: ClassVar[int] = 19
+    stamp_plan_detail: ClassVar[int] = 13
     # Main kernel, per main CTA: its scheduler left a shared expert's entry
     # head, passed sizes_ready, and claimed past its last tile.
-    stamp_main_head_done: ClassVar[int] = 20
-    stamp_main_plan_seen: ClassVar[int] = 21
-    stamp_main_last_claim: ClassVar[int] = 22
-    stamp_rows: ClassVar[int] = 23
+    stamp_main_head_done: ClassVar[int] = 14
+    stamp_main_plan_seen: ClassVar[int] = 15
+    stamp_main_last_claim: ClassVar[int] = 16
+    stamp_rows: ClassVar[int] = 17
     # Named barrier ids the refine groups synchronize on. Barrier 0 belongs to the
     # block-wide `sync_threads`, so the groups start at 1.
     refine_barrier_base: ClassVar[int] = 1
     # Row-stride padding for the two linear payload planes and the top-k inbox
     # slabs. Sixteen bytes is `cp.async.bulk`'s address and length granularity,
     # which is the only reason this padding exists, so it is a constant rather
-    # than a knob: nothing here benefits from a wider stride (the bank-conflict
-    # skew in `refine_staging_row_stride` uses its own 128), and at sixteen the
+    # than a knob: nothing here benefits from a wider stride, and at sixteen the
     # padding is a no-op for any hidden extent that already fills whole atoms.
     # It must be known at construction because `register_device_workspace` sizes
     # the symmetric payload regions from it, before any caller tensor exists --
@@ -614,7 +567,7 @@ class GenphaseTokenComm(KernelComponent):
     sentinel_ticket_lines: ClassVar[int] = 32
     topk_score_inbox_region: ClassVar[str] = "genphase.token_comm.topk_score_inbox"
     topk_ready_region: ClassVar[str] = "genphase.token_comm.topk_ready"
-    # Fence dispatches only: per (source rank, exchange CTA of that source), its
+    # Pull dispatch only: per (source rank, exchange CTA of that source), its
     # routes to this rank per local expert, which say where each expert's
     # segment of that CTA's list starts in the index and score inbox slabs.
     topk_count_inbox_region: ClassVar[str] = "genphase.token_comm.topk_count_inbox"
@@ -622,14 +575,9 @@ class GenphaseTokenComm(KernelComponent):
     plain_activation_sf_region: ClassVar[str] = (
         "genphase.token_comm.plain_activation_sf"
     )
-    token_data_ready_region: ClassVar[str] = "genphase.token_comm.token_data_ready"
-    token_sf_plain_ready_region: ClassVar[str] = (
-        "genphase.token_comm.token_sf_plain_ready"
-    )
-    # One 128-byte line per (round, source rank): pusher warps of that source add
-    # one per round once their pushes of the round have landed.
-    round_ready_region: ClassVar[str] = "genphase.token_comm.token_data_round_ready"
-    round_ready_line_words: ClassVar[int] = 32
+    # Words no role reads or writes, at the head of the symmetric reset span; see
+    # ``_register_symmetric_regions``.
+    shared_layout_pad_region: ClassVar[str] = "genphase.token_comm.shared_layout_pad"
 
     # Local regions: produced and consumed on this rank only.
     expert_sizes_region: ClassVar[str] = "genphase.token_comm.expert_sizes"
@@ -679,7 +627,7 @@ class GenphaseTokenComm(KernelComponent):
     )
 
     # SMEM regions, grouped into mutually exclusive role lifetimes.
-    # Fence dispatches: per (destination, local expert) bucket its routes and
+    # Pull dispatch: per (destination, local expert) bucket its routes and
     # where its list segment starts; per destination its list's shift from the
     # unpadded bucket offsets, start and length; the scan's warp totals; and the
     # routes and scores in list order.
@@ -705,11 +653,6 @@ class GenphaseTokenComm(KernelComponent):
         "genphase.token_comm.smem.exchange_mbarrier"
     )
     pusher_mbarrier_region: ClassVar[str] = "genphase.token_comm.smem.pusher_mbarrier"
-    # One per dispatch round: the pushing warps of a CTA arrive once their writes
-    # of that round have landed, and the CTA's publisher warp waits on it.
-    pusher_round_mbarrier_region: ClassVar[str] = (
-        "genphase.token_comm.smem.pusher_round_mbarrier"
-    )
     exchange_topk_stage_region: ClassVar[str] = "genphase.token_comm.smem.exchange_topk"
     exchange_score_stage_region: ClassVar[str] = (
         "genphase.token_comm.smem.exchange_score"
@@ -734,11 +677,11 @@ class GenphaseTokenComm(KernelComponent):
         "genphase.token_comm.smem.helper_expert_sizes_in_order"
     )
     helper_load_bin_region: ClassVar[str] = "genphase.token_comm.smem.helper_load_bin"
-    # Fence dispatches only: every (source, chunk) count row.
+    # Pull dispatch only: every (source, chunk) count row.
     helper_chunk_counts_region: ClassVar[str] = (
         "genphase.token_comm.smem.helper_chunk_counts"
     )
-    # Fence dispatches with up to ``cta_rank_experts`` local expert buckets: per
+    # Pull dispatch with up to ``cta_rank_experts`` local expert buckets: per
     # share of the buckets and per expert, how many experts of that share outrank
     # it (``_rank_by_counting_in_cta``).
     helper_rank_shares_region: ClassVar[str] = (
@@ -762,7 +705,6 @@ class GenphaseTokenComm(KernelComponent):
     # ``_bin_experts_in_index_order``.
     helper_warp_bins_region: ClassVar[str] = "genphase.token_comm.smem.helper_warp_bins"
     pusher_data_stage_region: ClassVar[str] = "genphase.token_comm.smem.pusher_data"
-    pusher_items_region: ClassVar[str] = "genphase.token_comm.smem.pusher_items"
     pusher_sf_stage_region: ClassVar[str] = "genphase.token_comm.smem.pusher_sf"
     refine_mbarrier_region: ClassVar[str] = "genphase.token_comm.smem.refine_mbarrier"
     refine_claim_region: ClassVar[str] = "genphase.token_comm.smem.refine_claim"
@@ -773,7 +715,6 @@ class GenphaseTokenComm(KernelComponent):
     refine_block_count_region: ClassVar[str] = (
         "genphase.token_comm.smem.refine_block_count"
     )
-    refine_staging_region: ClassVar[str] = "genphase.token_comm.smem.refine_staging"
     refine_output_region: ClassVar[str] = "genphase.token_comm.smem.refine_output"
     # Pull dispatch only: per walking warp, a ring of data rows and its barriers;
     # per CTA, the claim table (rows below).
@@ -797,7 +738,7 @@ class GenphaseTokenComm(KernelComponent):
     pull_table_tile_base: ClassVar[int] = 3
     pull_table_claim_rows: ClassVar[int] = 4
     pull_table_route_base: ClassVar[int] = 5
-    # Fence dispatches only, in the helper lifetime of every index-copy CTA:
+    # Pull dispatch only, in the helper lifetime of every index-copy CTA:
     # where each (source, chunk) list starts among all received lists laid end
     # to end, plus their total past the last list. Then one entry per (source,
     # chunk, local expert) segment in that row-major order
@@ -858,10 +799,8 @@ class GenphaseTokenComm(KernelComponent):
             "sf_padding_block": int,
             "pusher_cta_count": int,
             "refine_participant_groups": int,
-            "refine_output_stages": int,
             "smem_limit_bytes": OptionalRequirement(int),
             "dispatch_protocol": OptionalRequirement(str),
-            "dispatch_rounds": OptionalRequirement(int),
             "comm_push_depth": OptionalRequirement(int),
             "comm_pull_depth": OptionalRequirement(int),
             "comm_pull_chunk_rows": OptionalRequirement(int),
@@ -874,11 +813,6 @@ class GenphaseTokenComm(KernelComponent):
             "fc1_token_pool": OptionalRequirement(bool),
             "fc1_token_pool_capacity": OptionalRequirement(int),
             "fc1_token_pool_fallback": OptionalRequirement(str),
-            "refine_exchange_ctas": OptionalRequirement(int),
-            "dispatch_round_mode": OptionalRequirement(str),
-            "round_publish_delay_ns": OptionalRequirement(int),
-            "round_publish_lag": OptionalRequirement(int),
-            "refine_gate_round0_only": OptionalRequirement(bool),
             "stamps": OptionalRequirement(bool),
             "shared_expert_rows": OptionalRequirement(tuple),
         }
@@ -899,15 +833,13 @@ class GenphaseTokenComm(KernelComponent):
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.pusher_cta_count = impl_desc["pusher_cta_count"]
         self.refine_participant_groups = impl_desc["refine_participant_groups"]
-        self.refine_output_stages = impl_desc["refine_output_stages"]
         # "sentinel": landing rows are armed with 0xFF and the refine verifies every
-        # byte before publishing an expert; "counter": each pusher publishes its
-        # finished payload with per-peer counters after a system fence; "pull":
-        # this rank fetches every row from its source rank (see "Pull dispatch").
+        # byte before publishing an expert; "pull": this rank fetches every row
+        # from its source rank (see "Pull dispatch").
         self.dispatch_protocol = impl_desc.get("dispatch_protocol", "sentinel")
-        if self.dispatch_protocol not in ("sentinel", "counter", "pull"):
+        if self.dispatch_protocol not in ("sentinel", "pull"):
             raise ValueError(
-                f"dispatch_protocol must be sentinel, counter or pull, got {self.dispatch_protocol!r}."
+                f"dispatch_protocol must be sentinel or pull, got {self.dispatch_protocol!r}."
             )
         # Under the pull dispatch, the warps of every main-kernel CTA that fetch the
         # routed rows (``run_pull_warp``); with none, the helper and the pusher
@@ -939,39 +871,17 @@ class GenphaseTokenComm(KernelComponent):
         # of gathering them by index; the landing slots then go unused.
         self.fc1_token_pool = bool(impl_desc.get("fc1_token_pool", False))
         # The Sentinel dispatch keeps one exchange CTA per peer; see "Expert-id
-        # lists" for the Fence dispatches, whose default may grow once the SMEM
-        # plan can be priced (``_fit_exchange_ctas``).
+        # lists" for the pull dispatch, whose default may grow once the SMEM plan
+        # can be priced (``_fit_exchange_ctas``).
         self.exchange_cta_count = self.default_exchange_cta_count = self.world_size
-        if self.dispatch_protocol != "sentinel":
+        if self.dispatch_protocol == "pull":
             self.default_exchange_cta_count = self._default_exchange_ctas()
             self.exchange_cta_count = impl_desc.get(
                 "comm_exchange_ctas", self.default_exchange_cta_count
             )
-        # See "Dispatch rounds" above. One round is the whole-payload dispatch.
-        self.dispatch_rounds = impl_desc.get("dispatch_rounds", 1)
-        # What the rounds change, for isolating their costs: "order" only lays the
-        # experts out round-major; "push" also sends and publishes by round while
-        # the consumers still wait for the whole payload; "gate" (the protocol)
-        # gates each refine block on its expert's round alone.
-        self.dispatch_round_mode = impl_desc.get("dispatch_round_mode", "gate")
         self.pusher_pipeline_depth = impl_desc.get(
             "comm_push_depth", type(self).pusher_pipeline_depth
         )
-        # Exchange CTAs that join the refine after their sort under round gating,
-        # so blocks of early rounds are refined while the pushers still push.
-        self.refine_exchange_ctas = impl_desc.get(
-            "refine_exchange_ctas", self.world_size if self.round_gated else 0
-        )
-        # Fault injection: every pusher warp publishes round 0, then waits this long
-        # before pushing any later round.
-        self.round_publish_delay_ns = impl_desc.get("round_publish_delay_ns", 0)
-        # See `_push_rounds`.
-        self.round_publish_lag = impl_desc.get(
-            "round_publish_lag", self.default_round_publish_lag
-        )
-        # Negative control: the refine gates every block on round 0 only, which
-        # lets FC1 read rows of later rounds before they land.
-        self.refine_gate_round0_only = impl_desc.get("refine_gate_round0_only", False)
         self.stamps = impl_desc.get("stamps", False)
         self.smem_limit_bytes = impl_desc.get(
             "smem_limit_bytes", self.default_smem_limit_bytes
@@ -1058,7 +968,7 @@ class GenphaseTokenComm(KernelComponent):
         )
 
         self._validate_configuration()
-        if self.dispatch_protocol != "sentinel":
+        if self.dispatch_protocol == "pull":
             self.default_exchange_cta_count = self._fit_exchange_ctas(
                 self.default_exchange_cta_count
             )
@@ -1080,7 +990,6 @@ class GenphaseTokenComm(KernelComponent):
             "token_padding_block",
             "sf_padding_block",
             "refine_participant_groups",
-            "refine_output_stages",
             "smem_limit_bytes",
         )
         for field_name in positive_fields:
@@ -1171,12 +1080,12 @@ class GenphaseTokenComm(KernelComponent):
                 f"got {self.routes_per_rank * 4}."
             )
         if (
-            self.dispatch_protocol != "sentinel"
+            self.dispatch_protocol == "pull"
             and (self.exchange_chunk_routes << self.exchange_record_bucket_bits)
             >= 1 << 31
         ):
             raise ValueError(
-                f"a Fence exchange record of {self.exchange_chunk_routes} routes and "
+                f"a pull exchange record of {self.exchange_chunk_routes} routes and "
                 f"{self.exchange_bucket_count} buckets does not fit 31 bits; raise comm_exchange_ctas."
             )
         if self.dispatch_protocol == "sentinel":
@@ -1208,28 +1117,14 @@ class GenphaseTokenComm(KernelComponent):
             raise ValueError(
                 "A refine group must be exactly four warps so one thread owns one row."
             )
-        # The staging load reads a run-aligned row straight out of the linear
-        # plane, so the plane's row has to be at least that wide. Both extents
-        # round the same value up to sixteen, from a payload alignment and from an
-        # atom count respectively; this catches the two drifting apart.
-        if self.plain_activation_sf_row_elements < self.refine_row_columns:
-            raise ValueError(
-                f"the linear scale-factor row covers {self.plain_activation_sf_row_elements} columns, "
-                f"short of the {self.refine_row_columns} the staging load reads."
-            )
-        if self.refine_staging_row_stride < self.refine_row_columns:
-            raise ValueError(
-                f"the staging row stride {self.refine_staging_row_stride} is short of the "
-                f"{self.refine_row_columns} columns the refine runs traverse."
-            )
         if self.refine_barrier_base + self.refine_participant_groups > 16:
             raise ValueError(
                 f"{self.refine_participant_groups} refine groups starting at barrier "
                 f"{self.refine_barrier_base} exceed the 16 CTA barriers."
             )
-        self._validate_rounds()
+        self._validate_pipelines()
 
-    def _validate_rounds(self) -> None:
+    def _validate_pipelines(self) -> None:
         if not 1 <= self.pusher_pipeline_depth <= 4:
             raise ValueError(
                 f"comm_push_depth must be in [1, 4], got {self.pusher_pipeline_depth}."
@@ -1250,66 +1145,6 @@ class GenphaseTokenComm(KernelComponent):
                 raise ValueError(
                     f"comm_pull_lead_rows must be in [1, 32], got {self.pull_lead_chunk_rows}."
                 )
-        if self.round_pushes and self.pusher_pipeline_depth < 2:
-            raise ValueError(
-                "Round pushes stage ahead of the token they send and need comm_push_depth >= 2."
-            )
-        if self.dispatch_rounds not in self.supported_dispatch_rounds:
-            raise ValueError(
-                f"dispatch_rounds must be one of {self.supported_dispatch_rounds}, got {self.dispatch_rounds}."
-            )
-        if self.dispatch_round_mode not in ("order", "push", "gate"):
-            raise ValueError(
-                f"dispatch_round_mode must be order, push or gate, got {self.dispatch_round_mode!r}."
-            )
-        if not 1 <= self.round_publish_lag <= 16:
-            raise ValueError(
-                f"round_publish_lag must be in [1, 16], got {self.round_publish_lag}."
-            )
-        if self.round_publish_delay_ns < 0:
-            raise ValueError(
-                f"round_publish_delay_ns must be nonnegative, got {self.round_publish_delay_ns}."
-            )
-        if not 0 <= self.refine_exchange_ctas <= self.world_size:
-            raise ValueError(
-                f"refine_exchange_ctas must be in [0, {self.world_size}], got {self.refine_exchange_ctas}."
-            )
-        if self.dispatch_rounds == 1:
-            if (
-                self.round_publish_delay_ns
-                or self.refine_gate_round0_only
-                or self.refine_exchange_ctas
-            ):
-                raise ValueError(
-                    "round_publish_delay_ns, refine_gate_round0_only and refine_exchange_ctas need dispatch_rounds > 1."
-                )
-            return
-        if self.dispatch_protocol != "counter":
-            raise ValueError(
-                "dispatch_rounds > 1 requires the counter dispatch protocol."
-            )
-        if self.experts_per_rank % self.dispatch_rounds != 0:
-            raise ValueError(
-                f"experts_per_rank ({self.experts_per_rank}) must be divisible by dispatch_rounds "
-                f"({self.dispatch_rounds})."
-            )
-        if not self.ranks_experts_in_warp:
-            raise ValueError("dispatch_rounds > 1 requires at most 32 local experts.")
-        # A token's first round per peer is one bit per (round, peer) in a 64-bit word.
-        if self.world_size * self.dispatch_rounds > 64:
-            raise ValueError(
-                f"world_size * dispatch_rounds must be at most 64, got {self.world_size} * {self.dispatch_rounds}."
-            )
-        if (
-            self.refine_exchange_ctas or self.refine_gate_round0_only
-        ) and not self.round_gated:
-            raise ValueError(
-                'refine_exchange_ctas and refine_gate_round0_only need dispatch_round_mode="gate".'
-            )
-        if self.round_publish_delay_ns and self.dispatch_round_mode == "order":
-            raise ValueError(
-                'round_publish_delay_ns needs round pushes (dispatch_round_mode "push" or "gate").'
-            )
 
     # ------------------------------------------------------------------
     # Static geometry
@@ -1361,7 +1196,7 @@ class GenphaseTokenComm(KernelComponent):
         return exchange_ctas
 
     def _smem_plan_bytes(self, exchange_ctas: int) -> int:
-        """Bytes of this kernel's SMEM plan with ``exchange_ctas`` Fence exchange CTAs."""
+        """Bytes of this kernel's SMEM plan with ``exchange_ctas`` pull exchange CTAs."""
         resolved = self.exchange_cta_count
         self.exchange_cta_count = exchange_ctas
         try:
@@ -1371,34 +1206,34 @@ class GenphaseTokenComm(KernelComponent):
 
     @property
     def list_segment_count(self) -> int:
-        """(source rank, source chunk, local expert) segments of the Fence lists, padded buckets included."""
+        """(source rank, source chunk, local expert) segments of the pull dispatch's lists, padded buckets included."""
         return (
             self.world_size * self.exchange_cta_count * self.local_expert_bucket_count
         )
 
     @property
     def exchange_chunk_routes(self) -> int:
-        """Routes of the top-k plane one Fence exchange CTA sorts, whole 16-byte vectors of ids."""
+        """Routes of the top-k plane one pull exchange CTA sorts, whole 16-byte vectors of ids."""
         return int(round_up(ceil_div(self.routes_per_rank, self.exchange_cta_count), 4))
 
     @property
     def exchange_bucket_count(self) -> int:
-        """(destination rank, local expert) buckets of a Fence exchange CTA's sort."""
+        """(destination rank, local expert) buckets of a pull exchange CTA's sort."""
         return self.world_size * self.local_expert_bucket_count
 
     @property
     def exchange_record_bucket_bits(self) -> int:
-        """Low bits of a Fence exchange record that name its bucket; the bits above count within it."""
+        """Low bits of a pull exchange record that name its bucket; the bits above count within it."""
         return max(1, (self.exchange_bucket_count - 1).bit_length())
 
     @property
     def exchange_list_capacity(self) -> int:
-        """Entries of a Fence exchange CTA's lists: its routes, each destination's padded to 16 bytes."""
+        """Entries of a pull exchange CTA's lists: its routes, each destination's padded to 16 bytes."""
         return int(round_up(self.exchange_chunk_routes + 3 * self.world_size, 4))
 
     @property
     def fence_inbox_slab_elements(self) -> int:
-        """Per-source index and score inbox slab under the Fence dispatches: one chunk's room per exchange CTA."""
+        """Per-source index and score inbox slab under the pull dispatch: one chunk's room per exchange CTA."""
         return self.exchange_cta_count * self.exchange_chunk_routes
 
     @property
@@ -1408,9 +1243,9 @@ class GenphaseTokenComm(KernelComponent):
 
     @property
     def ranks_experts_in_cta(self) -> bool:
-        """Whether the Fence planning CTAs rank the experts with every thread (``_rank_by_counting_in_cta``)."""
+        """Whether the pull dispatch's planning CTAs rank the experts with every thread (``_rank_by_counting_in_cta``)."""
         return (
-            self.dispatch_protocol != "sentinel"
+            self.dispatch_protocol == "pull"
             and self.local_expert_bucket_count <= self.cta_rank_experts
         )
 
@@ -1513,15 +1348,8 @@ class GenphaseTokenComm(KernelComponent):
         return self.fc1_token_pool_capacity or self.worst_case_data_rows
 
     @property
-    def pusher_push_warp_count(self) -> int:
-        """Warps of a pusher CTA that push; with round pushes the last one publishes instead."""
-        return (
-            self.pusher_warp_count - 1 if self.round_pushes else self.pusher_warp_count
-        )
-
-    @property
     def pusher_global_warp_count(self) -> int:
-        return self.pusher_cta_count * self.pusher_push_warp_count
+        return self.pusher_cta_count * self.pusher_warp_count
 
     @property
     def pusher_tokens_per_warp(self) -> int:
@@ -1539,21 +1367,6 @@ class GenphaseTokenComm(KernelComponent):
         return int(ceil_div(self.topk, 32))
 
     @property
-    def refine_staging_row_stride(self) -> int:
-        """Byte stride between staging rows.
-
-        128 bytes is exactly the 32 shared-memory banks, so the skew rotates each
-        successive row by four banks. A lane reads sixteen bytes, the warp is
-        served in four phases of eight lanes, and eight lanes four banks apart
-        cover all thirty-two -- conflict-free.
-        """
-        return int(round_up(self.hidden_sf, 128)) + 16
-
-    @property
-    def refine_staging_group_stride(self) -> int:
-        return 128 * self.refine_staging_row_stride
-
-    @property
     def refine_atoms_per_stage(self) -> int:
         """Atoms flushed per bulk store; four keeps the 16-byte value mode whole."""
         return 4
@@ -1566,13 +1379,10 @@ class GenphaseTokenComm(KernelComponent):
     def refine_output_slots(self) -> int:
         """Run slots of a refine group's output stage.
 
-        The Sentinel refine writes every run of a block before it stores any, so it
-        holds one slot per run; the counter refine cycles its runs through
-        ``refine_output_stages`` slots.
+        The refine writes every run of a block before it stores any, so it holds
+        one slot per run.
         """
-        if self.dispatch_protocol == "sentinel":
-            return self.refine_run_count
-        return self.refine_output_stages
+        return self.refine_run_count
 
     @property
     def refine_run_columns(self) -> int:
@@ -1589,17 +1399,10 @@ class GenphaseTokenComm(KernelComponent):
     def refine_run_count(self) -> int:
         """Runs per row, rounded up.
 
-        The atom count need not be a multiple of the four atoms a run builds, so
-        the last run is partial. It still reads and builds a whole run -- the extra
-        columns live in the staging row's padding -- and only its live atoms are
-        stored.
+        The atom count need not be a multiple of the four atoms a run holds, so
+        the last run is partial, and only its live atoms are stored.
         """
         return int(ceil_div(self.refine_total_atoms, self.refine_atoms_per_stage))
-
-    @property
-    def refine_row_columns(self) -> int:
-        """Padded column extent the runs traverse, so runs tile the row exactly."""
-        return self.refine_run_count * self.refine_run_columns
 
     @property
     def refine_static_blocks(self) -> int:
@@ -1613,11 +1416,8 @@ class GenphaseTokenComm(KernelComponent):
         groups the last indices, which small batches never reach, so no other
         group's verification shares block 0's SM. The pushers' groups take the
         indices between, in CTA order. The work counter hands out the blocks past
-        these. The counter dispatch's refine claims every block, since under
-        round gating exchange CTAs join it as well.
+        these.
         """
-        if self.dispatch_protocol != "sentinel":
-            return 0
         return (1 + self.pusher_cta_count) * self.refine_participant_groups
 
     @property
@@ -1690,12 +1490,7 @@ class GenphaseTokenComm(KernelComponent):
 
     @property
     def grid_cta_count(self) -> int:
-        return (
-            self.exchange_cta_count
-            + 1
-            + self.pusher_cta_count
-            + (1 if self.stamps else 0)
-        )
+        return self.exchange_cta_count + 1 + self.pusher_cta_count
 
     @property
     def launch_cluster_count(self) -> int:
@@ -1710,29 +1505,26 @@ class GenphaseTokenComm(KernelComponent):
     def sentinel_inbox_regions(self) -> tuple:
         """Symmetric regions whose words announce their own arrival, holding the 0xFF init sentinel from allocation.
 
-        Both dispatch families: the index and score inboxes; the Fence ones also
-        the count inbox. No word sent into them is 0xFFFFFFFF.
+        Both dispatches: the index and score inboxes; the pull dispatch also the
+        count inbox. No word sent into them is 0xFFFFFFFF.
         """
         regions = [self.topk_index_inbox_region]
         if self.apply_topk_at_fc1:
             regions.append(self.topk_score_inbox_region)
-        if self.dispatch_protocol != "sentinel":
+        if self.dispatch_protocol == "pull":
             regions.append(self.topk_count_inbox_region)
         return tuple(regions)
 
     @property
     def index_copy_cta_count(self) -> int:
-        """CTAs that copy the Fence route lists into the index lists, one slice each.
+        """CTAs that copy the pull dispatch's route lists into the index lists, one slice each.
 
-        The exchange CTAs always; under the pull dispatch also the pusher CTAs,
-        which push nothing and would otherwise wait for the lists, or, when the
-        main kernel's pull warps fetch the rows, copy and leave. The helper,
-        whose ranking and prefixes the other roles wait for, copies nothing.
+        The exchange CTAs and the pusher CTAs, which push nothing under the pull
+        dispatch and would otherwise wait for the lists, or, when the main
+        kernel's pull warps fetch the rows, copy and leave. The helper, whose
+        ranking and prefixes the other roles wait for, copies nothing.
         """
-        copiers = self.exchange_cta_count
-        if self.dispatch_protocol == "pull":
-            copiers += self.pusher_cta_count
-        return copiers
+        return self.exchange_cta_count + self.pusher_cta_count
 
     @property
     def metadata_ready_target(self) -> int:
@@ -1768,49 +1560,6 @@ class GenphaseTokenComm(KernelComponent):
             first += count
         return columns
 
-    @property
-    def payload_ready_target(self) -> int:
-        """Every pusher publishes to every peer, whether or not it sent that peer bytes."""
-        return self.pusher_cta_count * self.world_size
-
-    # ------------------------------------------------------------------
-    # Dispatch rounds
-    # ------------------------------------------------------------------
-
-    @property
-    def round_ordered(self) -> bool:
-        """Whether the helper lays the experts out round-major."""
-        return self.dispatch_rounds > 1
-
-    @property
-    def round_pushes(self) -> bool:
-        """Whether the pushers send and publish by round."""
-        return self.dispatch_rounds > 1 and self.dispatch_round_mode != "order"
-
-    @property
-    def round_gated(self) -> bool:
-        """Whether each refine block waits for its expert's round instead of the whole payload."""
-        return self.dispatch_rounds > 1 and self.dispatch_round_mode == "gate"
-
-    @property
-    def experts_per_round(self) -> int:
-        return self.experts_per_rank // self.dispatch_rounds
-
-    @property
-    def round_push_item_capacity(self) -> int:
-        """Most (token, round) items one pushing warp can send: each token once per round."""
-        return self.dispatch_rounds * self.pusher_tokens_per_warp
-
-    @property
-    def round_publish_target(self) -> int:
-        """Every pusher CTA publishes every round to every peer, empty or not."""
-        return self.pusher_cta_count
-
-    @property
-    def observer_cta_index(self) -> int:
-        """With stamps, one extra CTA after the pushers timestamps the payload counters."""
-        return self.pusher_cta_begin + self.pusher_cta_count
-
     def variant_suffix(self) -> str:
         """Name fragment for every non-default dispatch knob; empty for the default build."""
         parts = []
@@ -1836,19 +1585,6 @@ class GenphaseTokenComm(KernelComponent):
             parts.append(f"pull{self.pull_chunk_rows}w{self.main_pull_warps}")
         if self.exchange_cta_count != self.default_exchange_cta_count:
             parts.append(f"exchange{self.exchange_cta_count}")
-        if self.dispatch_rounds > 1:
-            parts.append(
-                f"rounds{self.dispatch_rounds}{self.dispatch_round_mode}x{self.refine_exchange_ctas}"
-            )
-        if (
-            self.round_pushes
-            and self.round_publish_lag != self.default_round_publish_lag
-        ):
-            parts.append(f"lag{self.round_publish_lag}")
-        if self.round_publish_delay_ns:
-            parts.append(f"delay{self.round_publish_delay_ns}")
-        if self.refine_gate_round0_only:
-            parts.append("gateround0")
         if self.stamps:
             parts.append("stamps")
         return "".join(f"_{part}" for part in parts)
@@ -1862,7 +1598,7 @@ class GenphaseTokenComm(KernelComponent):
 
         Ready counters are ``tail_reset`` so exactly the leading span can be
         zeroed between launches. This component never resets from inside: it exits
-        while the dependent main kernel is still consuming ``token_data_ready``,
+        while the dependent main kernel is still consuming ``metadata_ready``,
         so clearing counters here would strand any CTA that had not yet observed
         them. The reset therefore belongs to whoever outlives it -- normally the
         main kernel's tail, which zeroes the span between two NVLink barriers. A
@@ -1873,7 +1609,7 @@ class GenphaseTokenComm(KernelComponent):
         self._register_local_regions(workspace)
 
     def _register_symmetric_regions(self, workspace: DeviceWorkspace) -> None:
-        # The Sentinel inbox holds each source's whole top-k plane; the Fence one
+        # The Sentinel inbox holds each source's whole top-k plane; the pull one
         # holds, per source, one chunk's room per exchange CTA of that source,
         # filled with its routes to this rank in list order.
         inboxes = [(self.topk_index_inbox_region, cutlass.Int32)]
@@ -1907,7 +1643,7 @@ class GenphaseTokenComm(KernelComponent):
             (self.world_size,),
             buffer_space="shared",
         )
-        if self.dispatch_protocol != "sentinel":
+        if self.dispatch_protocol == "pull":
             # Rewritten whole by every source each round, so it needs no reset.
             buckets = self.local_expert_bucket_count
             workspace.register(
@@ -1949,38 +1685,18 @@ class GenphaseTokenComm(KernelComponent):
                 stride=(self.max_tokens_per_rank * row_elements, row_elements, 1),
                 byte_alignment=128,
             )
-        for region_name in (
-            self.token_data_ready_region,
-            self.token_sf_plain_ready_region,
-        ):
-            workspace.register(
-                region_name,
-                cutlass.Int32,
-                (1,),
-                buffer_space="shared",
-                reset="tail_reset",
-            )
-        if self.round_pushes:
-            # A line per (round, source) keeps each word's adders to one source's
-            # pusher warps instead of every source's. Reused like the counters
-            # above: this rank's reduce clears its set before the kernel boundary
-            # that precedes this rank's next publications into the peers. Under
-            # round gating, though, a rank does not acquire every word before its
-            # reduce: the refine waits only for the rounds its own blocks belong
-            # to, and nothing waits for the whole payload. The adds into the other
-            # words are ordered before the clear only by the counter combine's
-            # tail barrier, which each peer enters after its communication grid
-            # has completed, so dispatch rounds require the counter combine.
-            line = self.round_ready_line_words
-            workspace.register(
-                self.round_ready_region,
-                cutlass.Int32,
-                (self.dispatch_rounds, self.world_size, line),
-                buffer_space="shared",
-                stride=(self.world_size * line, line, 1),
-                byte_alignment=128,
-                reset="tail_reset",
-            )
+        # Thirty-two bytes at the head of the symmetric reset span that no role
+        # reads or writes. They hold every later symmetric region (the inboxes,
+        # the landing planes, the combine slots) at the offset the engine was
+        # measured with; the small-batch latency moves with such offsets (see
+        # ``sentinel_layout_pad_regions``).
+        workspace.register(
+            self.shared_layout_pad_region,
+            cutlass.Int32,
+            (8,),
+            buffer_space="shared",
+            reset="tail_reset",
+        )
 
     def _register_local_regions(self, workspace: DeviceWorkspace) -> None:
         # Both start at zero: every rank begins on landing set 0, and the reduce's
@@ -2124,7 +1840,7 @@ class GenphaseTokenComm(KernelComponent):
             )
         # The readiness counters and the first experts' `fc1_sf_ready` share
         # 128-byte lines, which they are polled and released through. Under the
-        # Fence dispatches `metadata_ready` starts a line that the refine counters
+        # pull dispatch `metadata_ready` starts a line that the refine counters
         # and the first experts' `fc1_sf_ready` share; under the Sentinel dispatch
         # a spare word leads the counters, and all of them, 16 bytes apart, share
         # one line with the first four experts' `fc1_sf_ready`. Placements with
@@ -2208,10 +1924,6 @@ class GenphaseTokenComm(KernelComponent):
         workspace.register_mbarrier(
             self.pusher_mbarrier_region, warp_count * self.pusher_pipeline_depth
         )
-        if self.round_pushes:
-            workspace.register_mbarrier(
-                self.pusher_round_mbarrier_region, self.dispatch_rounds
-            )
         workspace.register_mbarrier(
             self.refine_mbarrier_region, self.refine_participant_groups
         )
@@ -2225,7 +1937,7 @@ class GenphaseTokenComm(KernelComponent):
         # whole padded slab so that its byte count is bulk-copy aligned even when
         # `max_tokens_per_rank * topk` is not, and the staging buffer has to cover
         # what the transfer reads.
-        # The Sentinel exchange stages the whole plane; a Fence exchange CTA
+        # The Sentinel exchange stages the whole plane; a pull exchange CTA
         # stages its chunk, sorts it into lists and keeps those until they leave.
         exchange = overlay.add_lifetime("exchange")
         if self.dispatch_protocol == "sentinel":
@@ -2235,7 +1947,7 @@ class GenphaseTokenComm(KernelComponent):
                 self.sentinel_exchange_pad_region, cutlass.Int32, (warp_count,)
             )
         staged_routes = self.topk_slab_elements
-        if self.dispatch_protocol != "sentinel":
+        if self.dispatch_protocol == "pull":
             staged_routes = self.exchange_chunk_routes
         exchange.register_tensor(
             self.exchange_topk_stage_region,
@@ -2250,7 +1962,7 @@ class GenphaseTokenComm(KernelComponent):
                 (staged_routes,),
                 byte_alignment=16,
             )
-        if self.dispatch_protocol != "sentinel":
+        if self.dispatch_protocol == "pull":
             for region_name in (
                 self.exchange_histogram_region,
                 self.exchange_list_base_region,
@@ -2331,7 +2043,7 @@ class GenphaseTokenComm(KernelComponent):
                 (self.load_bin_count,),
                 byte_alignment=16,
             )
-        if self.dispatch_protocol != "sentinel":
+        if self.dispatch_protocol == "pull":
             # The helper and every index-copy CTA plan from the same rows in
             # this lifetime; the copy's own tables sit beside the plan's.
             segments = self.list_segment_count
@@ -2385,7 +2097,7 @@ class GenphaseTokenComm(KernelComponent):
                 stride=(self.cta_rank_experts, 1),
                 byte_alignment=16,
             )
-        if self.dispatch_protocol != "sentinel" and not self.ranks_experts_in_warp:
+        if self.dispatch_protocol == "pull" and not self.ranks_experts_in_warp:
             helper.register_tensor(
                 self.helper_warp_bins_region,
                 cutlass.Int32,
@@ -2446,21 +2158,12 @@ class GenphaseTokenComm(KernelComponent):
                 stride=(self.pusher_pipeline_depth * row_elements, row_elements, 1),
                 byte_alignment=16,
             )
-        if self.round_pushes:
-            # Per pushing warp, its (token | round << 16, peers) items in send order.
-            pusher.register_tensor(
-                self.pusher_items_region,
-                cutlass.Int32,
-                (warp_count, self.round_push_item_capacity, 2),
-                stride=(self.round_push_item_capacity * 2, 2, 1),
-                byte_alignment=16,
-            )
 
         # The pull walk takes this lifetime too, with the expert table, its claim
         # bases and its rings only: its warps claim on their own and write
         # canonical atoms directly.
         refine = overlay.add_lifetime("refine")
-        if self.dispatch_protocol != "pull":
+        if self.dispatch_protocol == "sentinel":
             refine.register_tensor(
                 self.refine_claim_region,
                 cutlass.Int32,
@@ -2479,22 +2182,7 @@ class GenphaseTokenComm(KernelComponent):
             refine.register_tensor(
                 self.refine_block_count_region, cutlass.Int32, (1,), byte_alignment=16
             )
-        # The column extent is what the runs traverse rather than `hidden_sf`: a
-        # staging row is written and read at that width, and `hidden_sf` is only
-        # the live prefix of it. The Sentinel refine writes atoms directly.
-        if self.dispatch_protocol == "counter":
-            refine.register_tensor(
-                self.refine_staging_region,
-                self.activation_sf_dtype,
-                (self.refine_participant_groups, 128, self.refine_row_columns),
-                stride=(
-                    self.refine_staging_group_stride,
-                    self.refine_staging_row_stride,
-                    1,
-                ),
-                byte_alignment=16,
-            )
-        if self.dispatch_protocol != "pull":
+        if self.dispatch_protocol == "sentinel":
             refine.register_tensor(
                 self.refine_output_region,
                 self.activation_sf_dtype,
@@ -2678,17 +2366,6 @@ class GenphaseTokenComm(KernelComponent):
         if cutlass.const_expr(not self.apply_topk_at_fc1):
             return None
         return device_workspace.tensor(self.fc1_topk_scores_region)
-
-    @cute.jit
-    def round_ready_ptr(
-        self, device_workspace: DeviceWorkspace, round_idx: Int32, source_rank: Int32
-    ) -> cute.Pointer:
-        """This set's counter of one round from one source rank."""
-        line = Int32(self.round_ready_line_words)
-        return (
-            device_workspace.ptr(self.round_ready_region)
-            + (round_idx * Int32(self.world_size) + source_rank) * line
-        )
 
     @cute.jit
     def stamp(self, device_workspace: DeviceWorkspace, row: int, column: Int32) -> None:
@@ -2937,20 +2614,12 @@ class GenphaseTokenComm(KernelComponent):
         elif linear_cta_idx == Int32(self.helper_cta_index):
             # The planners publish everything the helper would under the Sentinel
             # dispatch, so there it goes straight to the refine.
-            if cutlass.const_expr(self.dispatch_protocol != "sentinel"):
+            if cutlass.const_expr(self.dispatch_protocol == "pull"):
                 self._run_helper(device_workspace, local_rank, smem_base, thread_idx)
         else:
-            if cutlass.const_expr(self.stamps):
-                if linear_cta_idx == Int32(self.observer_cta_index):
-                    self._run_observer(device_workspace, thread_idx)
-                    if thread_idx == Int32(0):
-                        self.stamp(
-                            device_workspace, self.stamp_comm_exit, linear_cta_idx
-                        )
-                    exit()
             # Under the pull dispatch the target ranks fetch the payload, so the
             # pusher CTAs push nothing.
-            if cutlass.const_expr(self.dispatch_protocol != "pull"):
+            if cutlass.const_expr(self.dispatch_protocol == "sentinel"):
                 self._run_pusher(
                     device_workspace,
                     peer_rank_ptr_mapper,
@@ -2963,10 +2632,9 @@ class GenphaseTokenComm(KernelComponent):
                     thread_idx,
                 )
 
-        if cutlass.const_expr(self.dispatch_protocol != "sentinel"):
-            # The exchange CTAs and, under the pull dispatch, the pushers each copy
-            # one slice of every source's lists into the index lists, from this
-            # one call site.
+        if cutlass.const_expr(self.dispatch_protocol == "pull"):
+            # The exchange CTAs and the pushers each copy one slice of every
+            # source's lists into the index lists, from this one call site.
             copier = linear_cta_idx
             if linear_cta_idx > Int32(self.helper_cta_index):
                 copier = linear_cta_idx - Int32(1)
@@ -2976,18 +2644,14 @@ class GenphaseTokenComm(KernelComponent):
                 self._run_index_copy(
                     device_workspace, smem_base, local_rank, copier, thread_idx
                 )
-            # Under round gating the first `refine_exchange_ctas` exchange CTAs
-            # refine early rounds while the pushers are still pushing later ones;
-            # the others leave.
-            if cutlass.const_expr(self.refine_exchange_ctas < self.exchange_cta_count):
-                if (linear_cta_idx >= Int32(self.refine_exchange_ctas)) & (
-                    linear_cta_idx < Int32(self.exchange_cta_count)
-                ):
-                    if thread_idx == Int32(0):
-                        self.stamp(
-                            device_workspace, self.stamp_comm_exit, linear_cta_idx
-                        )
-                    exit()
+            # The exchange CTAs, [0, exchange_cta_count), leave once their slice is
+            # copied.
+            if (linear_cta_idx >= Int32(0)) & (
+                linear_cta_idx < Int32(self.exchange_cta_count)
+            ):
+                if thread_idx == Int32(0):
+                    self.stamp(device_workspace, self.stamp_comm_exit, linear_cta_idx)
+                exit()
 
         if cutlass.const_expr(self.pull_walks):
             self._run_pull(
@@ -2999,17 +2663,15 @@ class GenphaseTokenComm(KernelComponent):
                 activation_sf,
                 staging_peer_rank_ptr_mapper,
             )
-        elif cutlass.const_expr(self.dispatch_protocol != "pull"):
+        elif cutlass.const_expr(self.dispatch_protocol == "sentinel"):
             self._run_refine(device_workspace, smem_base, linear_cta_idx, thread_idx)
-        if cutlass.const_expr(self.dispatch_protocol != "sentinel"):
-            # Every index-copy CTA had read the count rows before the refine or
-            # the walk opened; the helper resets them on its way out. When the
-            # main kernel's pull warps fetch the rows the helper neither refines
-            # nor walks, so it waits for the index lists itself.
+        if cutlass.const_expr(self.dispatch_protocol == "pull"):
+            # Every index-copy CTA had read the count rows before the walk
+            # opened; the helper resets them on its way out. When the main
+            # kernel's pull warps fetch the rows the helper does not walk, so it
+            # waits for the index lists itself.
             if linear_cta_idx == Int32(self.helper_cta_index):
-                if cutlass.const_expr(
-                    self.dispatch_protocol == "pull" and not self.pull_walks
-                ):
+                if cutlass.const_expr(not self.pull_walks):
                     if thread_idx == Int32(0):
                         spin_wait(
                             device_workspace.ptr(self.metadata_ready_region),
@@ -3042,7 +2704,7 @@ class GenphaseTokenComm(KernelComponent):
         round_set: Int32,
         thread_idx: Int32,
     ) -> None:
-        """Sort one chunk of this rank's routes into a list per destination rank and send them (Fence dispatches).
+        """Sort one chunk of this rank's routes into a list per destination rank and send them (pull dispatch).
 
         This is the only cross-rank round trip on the critical path, and it has no
         routing dependency, so it leaves at kernel entry. See "Expert-id lists"
@@ -3374,18 +3036,17 @@ class GenphaseTokenComm(KernelComponent):
                         )
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0)
-                if cutlass.const_expr(self.dispatch_protocol == "pull"):
-                    self._clear_previous_topk_ready(
-                        device_workspace, destination, round_set
-                    )
-                    # One add per exchange CTA of this rank; the destination's
-                    # walking CTAs wait for all of them.
-                    own_ready_slot = (
-                        device_workspace.ptr(self.topk_ready_region) + local_rank
-                    )
-                    red_async_add_release_sys_u32(
-                        own_ready_slot.toint() + peer_offset, Int32(1)
-                    )
+                self._clear_previous_topk_ready(
+                    device_workspace, destination, round_set
+                )
+                # One add per exchange CTA of this rank; the destination's
+                # walking CTAs wait for all of them.
+                own_ready_slot = (
+                    device_workspace.ptr(self.topk_ready_region) + local_rank
+                )
+                red_async_add_release_sys_u32(
+                    own_ready_slot.toint() + peer_offset, Int32(1)
+                )
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             self.stamp_plan_step(device_workspace, "x_released", chunk)
@@ -3560,7 +3221,7 @@ class GenphaseTokenComm(KernelComponent):
 
     @cute.jit
     def _wire_index_view(self, index_stage: cute.Tensor) -> cute.Tensor:
-        """Int32 view of a Fence exchange CTA's staged chunk.
+        """Int32 view of a pull exchange CTA's staged chunk.
 
         For Int64 input this aliases the front half of the same bytes, which is
         where ``_canonicalize_wire_indices`` compacted the narrowed values.
@@ -3576,7 +3237,7 @@ class GenphaseTokenComm(KernelComponent):
     def _canonicalize_wire_indices(
         self, index_stage: cute.Tensor, thread_idx: Int32
     ) -> None:
-        """Rewrite a Fence exchange CTA's staged Int64 chunk into Int32 ids in place."""
+        """Rewrite a pull exchange CTA's staged Int64 chunk into Int32 ids in place."""
         wire_indices = self._wire_index_view(index_stage)
         routes = self.exchange_chunk_routes
         narrow_rounds = ceil_div(routes, self.threads_per_cta)
@@ -3686,146 +3347,81 @@ class GenphaseTokenComm(KernelComponent):
         pusher_idx: Int32,
         thread_idx: Int32,
     ) -> None:
-        """Push this rank's tokens to every peer that routed to them.
+        """Push this rank's tokens to every peer that routed to them (Sentinel dispatch).
 
-        Both planes go out before either flag does. Publishing the scale factors
-        early -- so that a peer's rewrite could start while the activation was
-        still on the wire -- cost a full ``cp_async_bulk_wait_group(0)`` and a
-        block-wide barrier between the two passes, which held the activation pass
-        behind the last scale-factor store. With a single publication point the
-        pass order no longer reaches the consumer and the staging pipeline runs
-        straight through.
+        Both planes go out back to back through one staging pipeline; receivers
+        detect each landing byte leaving the 0xFF sentinel, so no flag follows
+        either plane.
         """
         warp_idx = cute.arch.make_warp_uniform(thread_idx // Int32(32))
         lane_idx = thread_idx % Int32(32)
         mbarriers = self._smem_workspace.ptr(self.pusher_mbarrier_region, smem_base)
-        global_warp_idx = pusher_idx * Int32(self.pusher_push_warp_count) + warp_idx
+        global_warp_idx = pusher_idx * Int32(self.pusher_warp_count) + warp_idx
         sf_stage = self._smem_workspace.tensor(self.pusher_sf_stage_region, smem_base)
         data_stage = self._smem_workspace.tensor(
             self.pusher_data_stage_region, smem_base
         )
 
-        # Initialized once for both passes. The barriers used to be reset on entry
-        # to each pass because the phase was a compile-time function of the round
-        # index, which is only true of a pass that starts from a known phase; the
-        # state below carries the real phase across both instead.
+        # Initialized once for both passes; the state below carries the phase
+        # across both.
         if thread_idx < Int32(self.pusher_warp_count * self.pusher_pipeline_depth):
             cute.arch.mbarrier_init(mbarriers + thread_idx, 1)
-        if cutlass.const_expr(self.round_pushes):
-            round_barriers = self._smem_workspace.ptr(
-                self.pusher_round_mbarrier_region, smem_base
-            )
-            if thread_idx < Int32(self.dispatch_rounds):
-                cute.arch.mbarrier_init(
-                    round_barriers + thread_idx, self.pusher_push_warp_count
-                )
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
-        if cutlass.const_expr(self.round_pushes):
-            if warp_idx < Int32(self.pusher_push_warp_count):
-                iket.range_push("pusher.rounds")
-                self._push_rounds(
+        iket.range_push("pusher.classify")
+        destination_masks = self._classify_tokens(
+            topk_indices, global_warp_idx, lane_idx
+        )
+        iket.range_pop()
+        stage_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.pusher_pipeline_depth
+        )
+
+        iket.range_push("pusher.sf")
+        stage_state = self._push_one_plane(
+            peer_rank_ptr_mapper,
+            local_rank,
+            destination_masks,
+            stage_state,
+            activation_sf,
+            self.plain_activation_sf_tensor(device_workspace),
+            sf_stage,
+            mbarriers,
+            self.plain_activation_sf_row_elements
+            * int(self.activation_sf_dtype.width)
+            // 8,
+            global_warp_idx,
+            warp_idx,
+            lane_idx,
+        )
+        iket.range_pop()
+
+        iket.range_push("pusher.data")
+        stage_state = self._push_one_plane(
+            peer_rank_ptr_mapper,
+            local_rank,
+            destination_masks,
+            stage_state,
+            activation,
+            self.plain_activation_tensor(device_workspace),
+            data_stage,
+            mbarriers,
+            self.plain_activation_row_elements * int(self.activation_dtype.width) // 8,
+            global_warp_idx,
+            warp_idx,
+            lane_idx,
+        )
+        iket.range_pop()
+        if cutlass.const_expr(self.stamps):
+            if lane_idx == Int32(0):
+                self.stamp_latest(
                     device_workspace,
-                    topk_indices,
-                    activation,
-                    activation_sf,
-                    peer_rank_ptr_mapper,
-                    local_rank,
-                    sf_stage,
-                    data_stage,
-                    self._smem_workspace.tensor(self.pusher_items_region, smem_base),
-                    mbarriers,
-                    round_barriers,
-                    global_warp_idx,
-                    warp_idx,
-                    lane_idx,
+                    self.stamp_push_done,
                     pusher_idx + Int32(self.pusher_cta_begin),
                 )
-                iket.range_pop()
-            else:
-                iket.range_push("pusher.publish_rounds")
-                self._publish_rounds(
-                    device_workspace,
-                    peer_rank_ptr_mapper,
-                    local_rank,
-                    round_barriers,
-                    lane_idx,
-                    pusher_idx,
-                )
-                iket.range_pop()
-            if cutlass.const_expr(not self.round_gated):
-                # The consumers still wait for the whole payload.
-                iket.range_push("pusher.publish")
-                self._publish_payload_flags(
-                    device_workspace, peer_rank_ptr_mapper, thread_idx
-                )
-                iket.range_pop()
-        else:
-            iket.range_push("pusher.classify")
-            destination_masks = self._classify_tokens(
-                topk_indices, global_warp_idx, lane_idx
-            )
-            iket.range_pop()
-            stage_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.pusher_pipeline_depth
-            )
-
-            iket.range_push("pusher.sf")
-            stage_state = self._push_one_plane(
-                peer_rank_ptr_mapper,
-                local_rank,
-                destination_masks,
-                stage_state,
-                activation_sf,
-                self.plain_activation_sf_tensor(device_workspace),
-                sf_stage,
-                mbarriers,
-                self.plain_activation_sf_row_elements
-                * int(self.activation_sf_dtype.width)
-                // 8,
-                global_warp_idx,
-                warp_idx,
-                lane_idx,
-            )
-            iket.range_pop()
-
-            iket.range_push("pusher.data")
-            stage_state = self._push_one_plane(
-                peer_rank_ptr_mapper,
-                local_rank,
-                destination_masks,
-                stage_state,
-                activation,
-                self.plain_activation_tensor(device_workspace),
-                data_stage,
-                mbarriers,
-                self.plain_activation_row_elements
-                * int(self.activation_dtype.width)
-                // 8,
-                global_warp_idx,
-                warp_idx,
-                lane_idx,
-            )
-            iket.range_pop()
-            if cutlass.const_expr(self.stamps):
-                if lane_idx == Int32(0):
-                    self.stamp_latest(
-                        device_workspace,
-                        self.stamp_push_done,
-                        pusher_idx + Int32(self.pusher_cta_begin),
-                    )
-
-            if cutlass.const_expr(self.dispatch_protocol == "counter"):
-                iket.range_push("pusher.publish")
-                self._publish_payload_flags(
-                    device_workspace, peer_rank_ptr_mapper, thread_idx
-                )
-                iket.range_pop()
-            else:
-                # No completion flag: receivers detect each landing byte leaving the
-                # 0xFF sentinel. Draining here only keeps the staging slots valid until exit.
-                cute.arch.cp_async_bulk_wait_group(0)
+        # Draining here only keeps the staging slots valid until exit.
+        cute.arch.cp_async_bulk_wait_group(0)
         if cutlass.const_expr(self.stamps):
             if lane_idx == Int32(0):
                 self.stamp_latest(
@@ -3921,531 +3517,6 @@ class GenphaseTokenComm(KernelComponent):
         return stage_state
 
     @cute.jit
-    def _publish_payload_flags(
-        self,
-        device_workspace: DeviceWorkspace,
-        peer_rank_ptr_mapper: SymmetricBufferDevice,
-        thread_idx: Int32,
-    ) -> None:
-        """Drain both payload passes, then tell every peer this pusher is finished.
-
-        The flags go to all peers, including ones this CTA sent nothing to: a peer
-        counts publications, so a silent pusher would leave it short.
-
-        The fan-out gives each lane a different peer, so the address is not
-        warp-uniform and the asynchronous release reduction -- whose operands come
-        from uniform registers -- cannot be used here. Each adding lane's system
-        fence before its relaxed adds replaces it, so every add is a release of
-        the writes the CTA barrier handed over. One fence covers both counters,
-        which is why the two passes share this publication point.
-        """
-        cute.arch.cp_async_bulk_wait_group(0)
-        cute.arch.sync_threads()
-        if thread_idx < Int32(self.world_size):
-            # Orders every drained payload write of this CTA before this lane's adds to its peer's counters.
-            cute.arch.fence_acq_rel_sys()
-            for region_name in (
-                self.token_sf_plain_ready_region,
-                self.token_data_ready_region,
-            ):
-                counter_address = device_workspace.ptr(region_name).toint()
-                red_add_relaxed_sys_s32(
-                    peer_rank_ptr_mapper.map(counter_address, thread_idx, Int64(0)),
-                    Int32(1),
-                )
-
-    @cute.jit
-    def _classify_token_rounds(
-        self, topk_indices: cute.Tensor, global_warp_idx: Int32, lane_idx: Int32
-    ) -> cute.Tensor:
-        """Per token of this warp, the round in which it travels to each peer.
-
-        Bit ``r * W + d`` of a token's 64-bit code is set when round ``r`` holds
-        the first of the token's experts that peer ``d`` owns. A lane owns one
-        top-k slot and contributes its slot's (round, peer) bit; the warp-wide OR
-        gives every (round, peer) the token reaches, and keeping each peer's
-        lowest round leaves one bit per peer. A token whose experts on one peer
-        span several rounds therefore lands there once, in the round FC1 needs it
-        first, and a token routed twice to one expert counts once. Codes are kept
-        as (low, high) 32-bit words because the reduction is 32 bits wide.
-
-        Like ``_classify_tokens``, every load issues before any reduction.
-        """
-        tokens_per_warp = self.pusher_tokens_per_warp
-        world = self.world_size
-        code_bits = world * self.dispatch_rounds
-        codes = cute.make_rmem_tensor((tokens_per_warp, 2), Uint32)
-
-        for token_round in cutlass.range_constexpr(tokens_per_warp):
-            token = global_warp_idx + Int32(token_round * self.pusher_global_warp_count)
-            codes[token_round, 0] = Uint32(0)
-            codes[token_round, 1] = Uint32(0)
-            for slot_round in cutlass.range_constexpr(self.topk_lane_rounds):
-                slot = Int32(slot_round * 32) + lane_idx
-                lane_owns_slot = token < Int32(self.max_tokens_per_rank)
-                if cutlass.const_expr((slot_round + 1) * 32 > self.topk):
-                    lane_owns_slot = lane_owns_slot & (slot < Int32(self.topk))
-                if lane_owns_slot:
-                    raw_index = topk_indices[token, slot]
-                    if not self._is_unowned_expert(raw_index):
-                        expert = Uint32(raw_index)
-                        peer = expert // Uint32(self.experts_per_rank)
-                        expert_round = (
-                            expert % Uint32(self.experts_per_rank)
-                        ) // Uint32(self.experts_per_round)
-                        bit = expert_round * Uint32(world) + peer
-                        if bit < Uint32(32):
-                            codes[token_round, 0] = codes[token_round, 0] | (
-                                Uint32(1) << bit
-                            )
-                        else:
-                            codes[token_round, 1] = codes[token_round, 1] | (
-                                Uint32(1) << (bit - Uint32(32))
-                            )
-
-        peer_mask = Uint64((1 << world) - 1)
-        for token_round in cutlass.range_constexpr(tokens_per_warp):
-            reached = Uint64(
-                Uint32(cute.arch.warp_redux_sync(codes[token_round, 0], "or"))
-            )
-            if cutlass.const_expr(code_bits > 32):
-                high = Uint32(cute.arch.warp_redux_sync(codes[token_round, 1], "or"))
-                reached = reached | (Uint64(high) << Uint64(32))
-            first = Uint64(0)
-            seen = Uint64(0)
-            for round_idx in cutlass.range_constexpr(self.dispatch_rounds):
-                round_peers = (reached >> Uint64(round_idx * world)) & peer_mask
-                first = first | ((round_peers & ~seen) << Uint64(round_idx * world))
-                seen = seen | round_peers
-            codes[token_round, 0] = Uint32(first & Uint64(0xFFFFFFFF))
-            codes[token_round, 1] = Uint32(first >> Uint64(32))
-        return codes
-
-    @cute.jit
-    def _round_peers(
-        self, codes: cute.Tensor, token_round: int, round_idx: Int32
-    ) -> Uint32:
-        """Peers one token of this warp travels to in one round, as a bitmask."""
-        code = (Uint64(codes[token_round, 1]) << Uint64(32)) | Uint64(
-            codes[token_round, 0]
-        )
-        peers = (code >> Uint64(round_idx * Int32(self.world_size))) & Uint64(
-            (1 << self.world_size) - 1
-        )
-        return Uint32(peers)
-
-    @cute.jit
-    def _push_rounds(
-        self,
-        device_workspace: DeviceWorkspace,
-        topk_indices: cute.Tensor,
-        activation: cute.Tensor,
-        activation_sf: cute.Tensor,
-        peer_rank_ptr_mapper: SymmetricBufferDevice,
-        local_rank: Int32,
-        sf_stage: cute.Tensor,
-        data_stage: cute.Tensor,
-        items: cute.Tensor,
-        mbarriers: cute.Pointer,
-        round_barriers: cute.Pointer,
-        global_warp_idx: Int32,
-        warp_idx: Int32,
-        lane_idx: Int32,
-        stamp_column: Int32,
-    ) -> None:
-        """Push this warp's tokens round by round and report every round to the publisher.
-
-        The warp first lists its items, one per (token, round) with the peers the
-        token travels to in that round, rounds in order. One slot holds an item's
-        scale-factor row and data row under one barrier, and the loads run
-        ``depth - 1`` items ahead of the one being sent, so a row's load latency
-        hides behind the sends of the items before it. Lane 0 issues every bulk
-        store, because bulk groups belong to the issuing thread and the reports
-        wait on them there; item ``i`` is bulk group ``i``.
-
-        A round closes when the first item of a later round is reached, and it is
-        reported once ``round_publish_lag`` more bulk groups have been committed
-        after it: the wait for every group but the newest ``round_publish_lag``
-        then covers its writes, while those newer groups keep the wire busy.
-        Rounds without items close with the previous one, and whatever is left is
-        reported after a full drain at the end. The report is an arrival on the
-        round's CTA barrier; no fence or release is issued from a pushing warp,
-        because either one stalls the warp behind its own bulk stores still in
-        flight.
-        """
-        depth = self.pusher_pipeline_depth
-        lookahead = depth - 1
-        rounds = self.dispatch_rounds
-        lag = self.round_publish_lag
-        sf_bytes = (
-            self.plain_activation_sf_row_elements
-            * int(self.activation_sf_dtype.width)
-            // 8
-        )
-        data_bytes = (
-            self.plain_activation_row_elements * int(self.activation_dtype.width) // 8
-        )
-        sf_plane = self.plain_activation_sf_tensor(device_workspace)
-        data_plane = self.plain_activation_tensor(device_workspace)
-        warp_items = items[warp_idx, None, None]
-
-        iket.range_push("pusher.classify")
-        codes = self._classify_token_rounds(topk_indices, global_warp_idx, lane_idx)
-        # Every lane holds the same codes, so every lane counts the same items;
-        # lane 0 alone writes them.
-        item_count = Int32(0)
-        for round_idx in cutlass.range_constexpr(rounds):
-            for token_round in cutlass.range_constexpr(self.pusher_tokens_per_warp):
-                peers = self._round_peers(codes, token_round, Int32(round_idx))
-                if peers != Uint32(0):
-                    if lane_idx == Int32(0):
-                        token = global_warp_idx + Int32(
-                            token_round * self.pusher_global_warp_count
-                        )
-                        warp_items[item_count, 0] = token | Int32(round_idx << 16)
-                        warp_items[item_count, 1] = Int32(peers)
-                    item_count = item_count + Int32(1)
-        cute.arch.sync_warp()
-        iket.range_pop()
-
-        for ahead in cutlass.range_constexpr(lookahead):
-            if Int32(ahead) < item_count:
-                self._stage_round_item(
-                    activation,
-                    activation_sf,
-                    sf_stage,
-                    data_stage,
-                    warp_items,
-                    mbarriers,
-                    Int32(ahead),
-                    warp_idx,
-                )
-
-        # Bulk groups committed so far, and per round the count at its close; an
-        # open round's mark is out of reach so it never qualifies.
-        close_marks = cute.make_rmem_tensor((rounds,), Int32)
-        for round_idx in cutlass.range_constexpr(rounds):
-            close_marks[round_idx] = Int32(1 << 30)
-        reported = Int32(0)
-        delayed = cutlass.Boolean(False)
-        for item in cutlass.range(item_count, unroll=1):
-            item_word = warp_items[item, 0]
-            token = item_word & Int32(0xFFFF)
-            item_round = item_word >> Int32(16)
-            peers = Uint32(warp_items[item, 1])
-            for closing in cutlass.range_constexpr(rounds - 1):
-                if (Int32(closing) < item_round) & (
-                    close_marks[closing] == Int32(1 << 30)
-                ):
-                    close_marks[closing] = item
-            if cutlass.const_expr(self.round_publish_delay_ns > 0):
-                if (item_round > Int32(0)) & (not delayed):
-                    reported = self._report_rounds(
-                        round_barriers, reported, Int32(1), 0, lane_idx
-                    )
-                    self._spin_for_ns(self.round_publish_delay_ns)
-                    delayed = cutlass.Boolean(True)
-
-            slot = item % Int32(depth)
-            cute.arch.mbarrier_wait(
-                mbarriers + (warp_idx * Int32(depth) + slot),
-                (item // Int32(depth)) % Int32(2),
-            )
-            if lane_idx == Int32(0):
-                for destination_rank in cutlass.range_constexpr(self.world_size):
-                    peer_offset = peer_rank_ptr_mapper.map(
-                        Int64(0), Int32(destination_rank), Int64(0)
-                    )
-                    if (peers & Uint32(1 << destination_rank)) != Uint32(0):
-                        cp_async_bulk_s2g(
-                            cute.make_ptr(
-                                sf_plane.element_type,
-                                sf_plane[local_rank, token, None].iterator.toint()
-                                + peer_offset,
-                                AddressSpace.gmem,
-                                assumed_align=16,
-                            ),
-                            sf_stage[warp_idx, slot, None].iterator,
-                            Int32(sf_bytes),
-                        )
-                        cp_async_bulk_s2g(
-                            cute.make_ptr(
-                                data_plane.element_type,
-                                data_plane[local_rank, token, None].iterator.toint()
-                                + peer_offset,
-                                AddressSpace.gmem,
-                                assumed_align=16,
-                            ),
-                            data_stage[warp_idx, slot, None].iterator,
-                            Int32(data_bytes),
-                        )
-            cute.arch.cp_async_bulk_commit_group()
-            committed = item + Int32(1)
-            # Rounds are reported in order, each once `lag` groups follow its close.
-            for candidate in cutlass.range_constexpr(rounds - 1):
-                if (reported == Int32(candidate)) & (
-                    committed - close_marks[candidate] >= Int32(lag)
-                ):
-                    reported = self._report_rounds(
-                        round_barriers, reported, Int32(candidate + 1), lag, lane_idx
-                    )
-
-            # Stage the item `lookahead` ahead into the slot the previous item
-            # used, once the newest-but-one bulk group has read it out.
-            if item + Int32(lookahead) < item_count:
-                cute.arch.sync_warp()
-                cute.arch.cp_async_bulk_wait_group(1, read=True)
-                self._stage_round_item(
-                    activation,
-                    activation_sf,
-                    sf_stage,
-                    data_stage,
-                    warp_items,
-                    mbarriers,
-                    item + Int32(lookahead),
-                    warp_idx,
-                )
-        if cutlass.const_expr(self.stamps):
-            if lane_idx == Int32(0):
-                self.stamp_latest(device_workspace, self.stamp_push_done, stamp_column)
-        self._report_rounds(round_barriers, reported, Int32(rounds), 0, lane_idx)
-
-    @cute.jit
-    def _stage_round_item(
-        self,
-        activation: cute.Tensor,
-        activation_sf: cute.Tensor,
-        sf_stage: cute.Tensor,
-        data_stage: cute.Tensor,
-        warp_items: cute.Tensor,
-        mbarriers: cute.Pointer,
-        item: Int32,
-        warp_idx: Int32,
-    ) -> None:
-        """Load one item's scale-factor and data rows into its slot under one barrier."""
-        depth = self.pusher_pipeline_depth
-        sf_bytes = (
-            self.plain_activation_sf_row_elements
-            * int(self.activation_sf_dtype.width)
-            // 8
-        )
-        data_bytes = (
-            self.plain_activation_row_elements * int(self.activation_dtype.width) // 8
-        )
-        token = warp_items[item, 0] & Int32(0xFFFF)
-        slot = item % Int32(depth)
-        slot_mbarrier = mbarriers + (warp_idx * Int32(depth) + slot)
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                slot_mbarrier, Int32(sf_bytes + data_bytes)
-            )
-            tma_load_1d(
-                sf_stage[warp_idx, slot, None].iterator,
-                activation_sf[token, None].iterator,
-                slot_mbarrier,
-                Int32(sf_bytes),
-            )
-            tma_load_1d(
-                data_stage[warp_idx, slot, None].iterator,
-                activation[token, None].iterator,
-                slot_mbarrier,
-                Int32(data_bytes),
-            )
-
-    @cute.jit
-    def _report_rounds(
-        self,
-        round_barriers: cute.Pointer,
-        first_round: Int32,
-        end_round: Int32,
-        pending_groups: cutlass.Constexpr[int],
-        lane_idx: Int32,
-    ) -> Int32:
-        """Arrive on the CTA barriers of this warp's rounds ``[first_round, end_round)``.
-
-        The caller guarantees that every write of those rounds belongs to a bulk
-        group older than the newest ``pending_groups``, so once lane 0, which
-        issued them, has waited for the rest they have landed. Its arrival is a
-        CTA-scope release, which hands that to the publisher warp's wait. Returns
-        ``end_round``, the new first unreported round.
-        """
-        cute.arch.cp_async_bulk_wait_group(pending_groups)
-        if lane_idx == Int32(0):
-            for round_idx in cutlass.range(first_round, end_round, unroll=1):
-                cute.arch.mbarrier_arrive(round_barriers + round_idx)
-        cute.arch.sync_warp()
-        return end_round
-
-    @cute.jit
-    def _publish_rounds(
-        self,
-        device_workspace: DeviceWorkspace,
-        peer_rank_ptr_mapper: SymmetricBufferDevice,
-        local_rank: Int32,
-        round_barriers: cute.Pointer,
-        lane_idx: Int32,
-        pusher_idx: Int32,
-    ) -> None:
-        """The publisher warp: tell every peer when each round of this CTA has landed.
-
-        Rounds complete in order. The warp waits for the oldest unpublished
-        round's barrier, extends the batch over every later round whose barrier
-        has also completed, and publishes the batch with one fence: every lane
-        adding to a peer fences for itself before its relaxed system adds, so each
-        add is the release of the writes the barriers handed over. Under a loaded
-        fabric a system fence costs microseconds, so batching keeps this warp from
-        falling behind the pushers when rounds close faster than it can fence.
-        One lane per peer, because the peers' counters are different addresses
-        (as in ``_publish_payload_flags``).
-        """
-        rounds = self.dispatch_rounds
-        published = Int32(0)
-        while published < Int32(rounds):
-            cute.arch.mbarrier_wait(round_barriers + published, 0)
-            batch_end = published + Int32(1)
-            if lane_idx == Int32(0):
-                extending = cutlass.Boolean(True)
-                while extending & (batch_end < Int32(rounds)):
-                    if cute.arch.mbarrier_test_wait(round_barriers + batch_end, 0):
-                        batch_end = batch_end + Int32(1)
-                    else:
-                        extending = cutlass.Boolean(False)
-            # Every lane takes lane 0's batch and acquires each of its barriers,
-            # which had completed when lane 0 observed them.
-            batch_end = Int32(cute.arch.shuffle_sync(batch_end, Int32(0)))
-            for round_idx in cutlass.range(published + Int32(1), batch_end, unroll=1):
-                cute.arch.mbarrier_wait(round_barriers + round_idx, 0)
-            if cutlass.const_expr(self.stamps):
-                if lane_idx == Int32(0):
-                    for round_idx in cutlass.range(published, batch_end, unroll=1):
-                        column = pusher_idx * Int32(rounds) + round_idx
-                        if column < Int32(self.stamp_columns):
-                            self.stamp(
-                                device_workspace, self.stamp_round_reported, column
-                            )
-            if lane_idx < Int32(self.world_size):
-                cute.arch.fence_acq_rel_sys()
-                for round_idx in cutlass.range(published, batch_end, unroll=1):
-                    counter_address = self.round_ready_ptr(
-                        device_workspace, round_idx, local_rank
-                    ).toint()
-                    red_add_relaxed_sys_s32(
-                        peer_rank_ptr_mapper.map(counter_address, lane_idx, Int64(0)),
-                        Int32(1),
-                    )
-            if cutlass.const_expr(self.stamps):
-                if lane_idx == Int32(0):
-                    for round_idx in cutlass.range(published, batch_end, unroll=1):
-                        column = pusher_idx * Int32(rounds) + round_idx
-                        if column < Int32(self.stamp_columns):
-                            self.stamp(
-                                device_workspace, self.stamp_round_published, column
-                            )
-            cute.arch.sync_warp()
-            published = batch_end
-
-    @cute.jit
-    def _spin_for_ns(self, duration_ns: int) -> None:
-        start = sentinel_ptx.globaltimer_ns()
-        while sentinel_ptx.globaltimer_ns() - start < Int64(duration_ns):
-            sentinel_ptx.nanosleep(Int32(500))
-
-    @cute.jit
-    def _wait_round(self, device_workspace: DeviceWorkspace, round_idx: Int32) -> None:
-        """Acquire one round's counters from every source rank.
-
-        The W words are polled with relaxed system loads issued together, so a
-        sweep costs one load latency rather than W serialized acquires, and once
-        all of them show the target each is read once more with a system acquire.
-        A count other than the exact target never passes, so a counter left over
-        from an earlier launch stalls here and traps at the deadline rather than
-        letting stale rows through.
-        """
-        target = Uint32(self.round_publish_target)
-        pending = Int32(1)
-        deadline = Int64(0)
-        while pending != Int32(0):
-            pending = Int32(0)
-            for source_rank in cutlass.range_constexpr(self.world_size):
-                counter_address = self.round_ready_ptr(
-                    device_workspace, round_idx, Int32(source_rank)
-                ).toint()
-                if sentinel_ptx.ld_volatile_u32(counter_address) != target:
-                    pending = Int32(1)
-            if pending != Int32(0):
-                now = sentinel_ptx.globaltimer_ns()
-                if deadline == Int64(0):
-                    deadline = now + Int64(self.round_wait_deadline_ns)
-                if now > deadline:
-                    cute.printf(
-                        "genphase dispatch: round %d never completed\n", round_idx
-                    )
-                    sentinel_ptx.trap()
-                sentinel_ptx.nanosleep(Int32(100))
-        for source_rank in cutlass.range_constexpr(self.world_size):
-            counter_address = self.round_ready_ptr(
-                device_workspace, round_idx, Int32(source_rank)
-            ).toint()
-            sentinel_ptx.ld_acquire_sys_u32(counter_address)
-
-    @cute.jit
-    def _run_observer(
-        self, device_workspace: DeviceWorkspace, thread_idx: Int32
-    ) -> None:
-        """Timestamp the completion of this rank's payload counters (stamps only).
-
-        Thread ``r * W + s`` watches round ``r`` of source ``s``; under the
-        whole-payload counters two more threads watch those. A word that never
-        completes is given up on after a deadline rather than trapped on, because
-        this CTA only observes.
-        """
-        stamps = device_workspace.tensor(self.stamps_region)
-        give_up_ns = Int64(50 * 1000 * 1000)
-        round_words = self.dispatch_rounds * self.world_size
-        if cutlass.const_expr(self.round_pushes):
-            if thread_idx < Int32(round_words):
-                counter_address = self.round_ready_ptr(
-                    device_workspace,
-                    thread_idx // Int32(self.world_size),
-                    thread_idx % Int32(self.world_size),
-                ).toint()
-                start = sentinel_ptx.globaltimer_ns()
-                value = sentinel_ptx.ld_volatile_u32(counter_address)
-                stamps[self.stamp_round_entry, thread_idx] = Int64(value)
-                while (value != Uint32(self.round_publish_target)) & (
-                    sentinel_ptx.globaltimer_ns() - start < give_up_ns
-                ):
-                    sentinel_ptx.nanosleep(Int32(64))
-                    value = sentinel_ptx.ld_volatile_u32(counter_address)
-                stamps[self.stamp_round_arrival, thread_idx] = (
-                    sentinel_ptx.globaltimer_ns()
-                )
-                stamps[self.stamp_round_final, thread_idx] = Int64(value)
-        if cutlass.const_expr(
-            self.dispatch_protocol == "counter" and not self.round_gated
-        ):
-            watcher = thread_idx - Int32(round_words if self.round_pushes else 0)
-            if (watcher >= Int32(0)) & (watcher < Int32(2)):
-                region_address = device_workspace.ptr(
-                    self.token_data_ready_region
-                ).toint()
-                if watcher == Int32(1):
-                    region_address = device_workspace.ptr(
-                        self.token_sf_plain_ready_region
-                    ).toint()
-                start = sentinel_ptx.globaltimer_ns()
-                value = sentinel_ptx.ld_volatile_u32(region_address)
-                while (value != Uint32(self.payload_ready_target)) & (
-                    sentinel_ptx.globaltimer_ns() - start < give_up_ns
-                ):
-                    sentinel_ptx.nanosleep(Int32(64))
-                    value = sentinel_ptx.ld_volatile_u32(region_address)
-                stamps[self.stamp_payload_arrival, watcher] = (
-                    sentinel_ptx.globaltimer_ns()
-                )
-        cute.arch.sync_threads()
-
-    @cute.jit
     def _run_index_copy(
         self,
         device_workspace: DeviceWorkspace,
@@ -4454,7 +3525,7 @@ class GenphaseTokenComm(KernelComponent):
         copier: Int32,
         thread_idx: Int32,
     ) -> None:
-        """Copy one slice of the received route lists into the index lists (Fence dispatches).
+        """Copy one slice of the received route lists into the index lists (pull dispatch).
 
         The lists of every (source, chunk), laid end to end in that order, are cut
         into ``index_copy_cta_count`` equal slices, and ``copier`` takes its own.
@@ -5027,7 +4098,7 @@ class GenphaseTokenComm(KernelComponent):
         warp_idx: Int32,
         poll: bool = True,
     ) -> None:
-        """Bring every count row into SMEM, fold it into per-expert loads and rank them (Fence dispatches).
+        """Bring every count row into SMEM, fold it into per-expert loads and rank them (pull dispatch).
 
         The helper (``publish``) and every index-copy CTA run this on the same
         rows. Ties resolve the same way in all of them
@@ -5108,14 +4179,14 @@ class GenphaseTokenComm(KernelComponent):
         that pair into the pipeline fill, and the tail becomes a run of small
         experts whose FC1-to-FC2 waits are short and cover each other.
 
-        Three implementations: the Fence dispatches rank up to 64 experts with
-        the whole CTA, the Sentinel planners up to 32 in one warp, and either
+        Three implementations: the pull dispatch ranks up to 64 experts with the
+        whole CTA, the Sentinel planners up to 32 in one warp, and either
         dispatch more by load histogram. All write the same four outputs through
         ``_place_expert_at_position``, so nothing downstream can tell which one
         ran.
 
         ``replicated`` is for CTAs that each rank the same loads (the Sentinel
-        planners, the Fence index copy): only the two SMEM outputs are written,
+        planners, the pull index copy): only the two SMEM outputs are written,
         and every tie resolves by a fixed key (the expert index, or the
         alternating halves of ``_rank_by_counting_in_cta``), so all of them
         settle on the same order. ``ordered_ties`` resolves ties by expert index
@@ -5224,17 +4295,14 @@ class GenphaseTokenComm(KernelComponent):
         thread_idx: Int32,
         publish: bool = True,
     ) -> None:
-        """Rank up to 64 experts with every thread of the CTA, counting how many outrank each (Fence dispatches).
+        """Rank up to 64 experts with every thread of the CTA, counting how many outrank each (pull dispatch).
 
         Thread ``t`` counts, for expert ``t % 64``, the experts of share ``t //
         64`` of the buckets that outrank it, and the shares' counts meet in SMEM:
         a few independent SMEM loads per thread and two barriers, where one warp
         would take one dependent shuffle round per expert. The comparison is on
-        the exact load: a higher load outranks. With dispatch rounds (at most 32
-        local experts) the dispatch round is the leading key: an expert of an
-        earlier round outranks every expert of a later one, and padded buckets
-        rank after every round, so the experts are processed in the order their
-        rows arrive. Equal loads keep expert order up to 32 buckets. Above, they
+        the exact load: a higher load outranks. Equal loads keep expert order up
+        to 32 buckets. Above, they
         alternate between the two halves of the local experts (0, half, 1, half
         + 1, ...), so experts of equal load processed back to back come from
         opposite halves; that measured faster than plain index order with every
@@ -5250,7 +4318,6 @@ class GenphaseTokenComm(KernelComponent):
         per_share = ceil_div(buckets, shares)
         half = buckets // 2
         index_ties = self.ranks_experts_in_warp
-        round_experts = max(self.experts_per_round, 1)
 
         expert = thread_idx % Int32(experts)
         share = thread_idx // Int32(experts)
@@ -5262,13 +4329,6 @@ class GenphaseTokenComm(KernelComponent):
                     expert < Int32(half),
                     expert * Int32(2),
                     (expert - Int32(half)) * Int32(2) + Int32(1),
-                )
-            own_round = Int32(self.dispatch_rounds)
-            if cutlass.const_expr(self.round_ordered):
-                own_round = cutlass.select_(
-                    expert < Int32(self.experts_per_rank),
-                    expert // Int32(round_experts),
-                    Int32(self.dispatch_rounds),
                 )
             outranked = Int32(0)
             for step in cutlass.range_constexpr(per_share):
@@ -5284,15 +4344,6 @@ class GenphaseTokenComm(KernelComponent):
                 outranks = (other_load > own_load) | (
                     (other_load == own_load) & (other_key < own_key)
                 )
-                if cutlass.const_expr(self.round_ordered):
-                    other_round = cutlass.select_(
-                        other < Int32(self.experts_per_rank),
-                        other // Int32(round_experts),
-                        Int32(self.dispatch_rounds),
-                    )
-                    outranks = (other_round < own_round) | (
-                        (other_round == own_round) & outranks
-                    )
                 outranked = outranked + cutlass.select_(
                     (other < Int32(buckets)) & outranks, Int32(1), Int32(0)
                 )
@@ -5332,7 +4383,7 @@ class GenphaseTokenComm(KernelComponent):
 
         A single pass, because the atomic does double duty: what it returns is
         this expert's index inside its own bin and what it leaves behind is that
-        bin's population. The Fence exchange's count pass carries the same trick;
+        bin's population. The pull exchange's count pass carries the same trick;
         only the bucket definition differs. The atomic orders a bin's experts by arrival;
         ``ordered_ties`` orders them by expert index instead
         (``_bin_experts_in_index_order``).
@@ -5664,9 +4715,9 @@ class GenphaseTokenComm(KernelComponent):
     ) -> None:
         """Reset every count row of this landing set to the sentinel once the helper and every index-copy CTA read it.
 
-        The set is reused two rounds later; the system-scope releases of the
-        round in between (``topk_ready`` under pull, the payload counters under
-        counter) order this reset before those writes (see "Expert-id lists").
+        The set is reused two rounds later; the system-scope ``topk_ready``
+        releases of the round in between order this reset before those writes
+        (see "Expert-id lists").
         """
         vectors = self.list_segment_count // 4
         row_base = device_workspace.ptr(self.topk_count_inbox_region).toint()
@@ -6055,7 +5106,7 @@ class GenphaseTokenComm(KernelComponent):
         """Each expert's data-row base and ``source_rank``'s segment base in it, into SMEM.
 
         Sources are laid out in ring order from this rank
-        (``_store_plan_bases``), the order the Fence index copy gives the
+        (``_store_plan_bases``), the order the pull index copy gives the
         segments as well. With ``publishes`` the data-row, SF-row and
         refine-block bases and the refine block total go out as well, for the
         refine, which reads them once ``metadata_ready`` is complete. Up to 32
@@ -6309,13 +5360,11 @@ class GenphaseTokenComm(KernelComponent):
         linear_cta_idx: Int32,
         thread_idx: Int32,
     ) -> None:
-        """Rewrite the received scale factors into the layout the MMA reads.
+        """Verify the landed rows and rewrite their scale factors into the layout the MMA reads (Sentinel dispatch).
 
-        Under round gating no whole-payload wait precedes the claims: each block
-        waits for its own expert's round in ``_stage_block_rows``. Under the
-        Sentinel dispatch the table and the first block may be settled from
-        ``sizes_ready`` alone (``refine_plans_table``), so ``metadata_ready`` then
-        gates the first block's rows only.
+        The table and the first block may be settled from ``sizes_ready`` alone
+        (``refine_plans_table``), so ``metadata_ready`` then gates the first
+        block's rows only.
         """
         group_threads = self.refine_warps_per_group * 32
         group_idx = thread_idx // Int32(group_threads)
@@ -6327,6 +5376,9 @@ class GenphaseTokenComm(KernelComponent):
         if cutlass.const_expr(not self.refine_plans_table):
             self._wait_refine_open(device_workspace, linear_cta_idx, thread_idx)
 
+        # One mbarrier per refine group sits in the SMEM plan and is initialized
+        # here, though no refine step waits on it: the plan and this entry keep
+        # the layout and instruction stream the refine was measured with.
         group_mbarriers = self._smem_workspace.ptr(
             self.refine_mbarrier_region, smem_base
         )
@@ -6334,9 +5386,6 @@ class GenphaseTokenComm(KernelComponent):
             cute.arch.mbarrier_init(group_mbarriers + thread_idx, 1)
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
-        stage_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, 1
-        )
 
         iket.range_push("refine.table")
         if cutlass.const_expr(self.refine_plans_table):
@@ -6395,21 +5444,14 @@ class GenphaseTokenComm(KernelComponent):
         if cutlass.const_expr(self.refine_plans_table):
             # The first block is settled; its rows are what the scatter still owes.
             self._wait_refine_open(device_workspace, linear_cta_idx, thread_idx)
-        # The latest round this group's first thread has acquired; claims run in
-        # processing order, which is round-major, so a group's rounds never
-        # decrease.
-        acquired_round = Int32(-1)
 
         while claimed[self.refine_claim_block] < block_total:
-            stage_state, acquired_round = self._refine_one_block(
+            self._refine_one_block(
                 device_workspace,
                 smem_base,
-                stage_state,
                 claimed[self.refine_claim_data_row],
                 claimed[self.refine_claim_sf_row],
                 claimed[self.refine_claim_live_rows],
-                owning_expert,
-                acquired_round,
                 group_idx,
                 thread_in_group,
                 group_barrier,
@@ -6446,14 +5488,12 @@ class GenphaseTokenComm(KernelComponent):
     ) -> None:
         """Wait until the gather index is complete (``metadata_ready``).
 
-        Under the counter dispatch without round gating, also until the whole
-        payload has landed. Under the pull dispatch the index-copy CTAs acquired
-        every source's ``topk_ready`` before their ``metadata_ready`` adds
+        Under the pull dispatch the index-copy CTAs acquired every source's
+        ``topk_ready`` before their ``metadata_ready`` adds
         (``pull_acquire_in_copy``), or else this CTA acquires them as well
         (``_acquire_topk_ready``); that orders every source rank's staging before
-        this CTA's fetches (see "Pull dispatch" above). Under either Fence
-        dispatch each thread then fences its later bulk loads (of the landed
-        scale-factor rows, or of the sources' staged rows) behind these generic
+        this CTA's fetches (see "Pull dispatch" above). Each thread then fences
+        its later bulk loads of the sources' staged rows behind these generic
         acquires.
         """
         iket.range_push("refine.wait")
@@ -6470,22 +5510,9 @@ class GenphaseTokenComm(KernelComponent):
                 lambda value: value == Int32(self.metadata_ready_target),
                 scope="gpu",
             )
-            if cutlass.const_expr(
-                self.dispatch_protocol == "counter" and not self.round_gated
-            ):
-                # Relaxed system polls notice the last publication within one
-                # load latency, then one system acquire takes it.
-                payload_address = device_workspace.ptr(
-                    self.token_sf_plain_ready_region
-                ).toint()
-                while sentinel_ptx.ld_volatile_u32(payload_address) != Uint32(
-                    self.payload_ready_target
-                ):
-                    sentinel_ptx.nanosleep(Int32(32))
-                sentinel_ptx.ld_acquire_sys_u32(payload_address)
             self.stamp(device_workspace, self.stamp_refine_open, linear_cta_idx)
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.dispatch_protocol != "sentinel"):
+        if cutlass.const_expr(self.dispatch_protocol == "pull"):
             # Orders the generic acquires above before this thread's async-proxy loads of the rows they publish.
             sentinel_ptx.fence_proxy_async_global()
         iket.range_pop()
@@ -6743,38 +5770,25 @@ class GenphaseTokenComm(KernelComponent):
         self,
         device_workspace: DeviceWorkspace,
         smem_base: cute.Pointer,
-        stage_state: pipeline.PipelineState,
         data_row_begin: Int32,
         sf_row_begin: Int32,
         live_rows: Int32,
-        owning_expert: Int32,
-        acquired_round: Int32,
         group_idx: Int32,
         thread_in_group: Int32,
         group_barrier: Int32,
         group_threads: int,
-    ):
-        """Turn one 128-row block of plain scale factors into canonical atoms.
+    ) -> None:
+        """Turn one 128-row block of landed scale factors into canonical atoms.
 
         Takes the rows to move rather than the block to resolve: which expert the
-        block landed in was settled when it was claimed. ``owning_expert`` and
-        ``acquired_round`` are meaningful in the group's first warp only, which is
-        the one that gates on the expert's round; the round acquired is returned
-        with the pipeline state.
-
-        Both global memory legs are fully coalesced and the whole permutation
-        happens in shared memory addressing: rows arrive as contiguous per-token
-        runs and leave as contiguous atom runs.
+        block landed in was settled when it was claimed.
         """
         iket.range_push("refine.into_smem")
-        stage_state, acquired_round = self._stage_block_rows(
+        self._stage_block_rows(
             device_workspace,
             smem_base,
-            stage_state,
             data_row_begin,
             live_rows,
-            owning_expert,
-            acquired_round,
             group_idx,
             thread_in_group,
             group_barrier,
@@ -6789,11 +5803,8 @@ class GenphaseTokenComm(KernelComponent):
             sf_row_begin,
             group_idx,
             thread_in_group,
-            group_barrier,
-            group_threads,
         )
         iket.range_pop()
-        return stage_state, acquired_round
 
     @cute.jit
     def _resolve_block_expert(
@@ -6838,105 +5849,41 @@ class GenphaseTokenComm(KernelComponent):
         self,
         device_workspace: DeviceWorkspace,
         smem_base: cute.Pointer,
-        stage_state: pipeline.PipelineState,
         data_row_begin: Int32,
         live_rows: Int32,
-        owning_expert: Int32,
-        acquired_round: Int32,
         group_idx: Int32,
         thread_in_group: Int32,
         group_barrier: Int32,
         group_threads: int,
-    ):
-        """Pull 128 gathered scale-factor rows into shared memory.
+    ) -> None:
+        """Verify a block's landing rows and write their scale factors into the group's output stage.
 
-        The permutation the canonical layout needs lives here, in where a block row
-        is written to, rather than in which row is read back: block row ``r`` takes
-        canonical row position ``t = 4 * (r % 32) + r // 32``. Both orders are
-        equivalent, but this one leaves the ``gather_index`` read sequential and
-        costs nothing, since the writer's destination is per-row anyway.
-
-        Under the Sentinel dispatch the rows come out of the landing verification:
-        the loads that prove a row has arrived already hold its scale factors, so
-        the lanes holding them write them as atom words straight into the output
-        stage, and the landed rows are never read a second time. Under the counter
-        dispatch one thread owns one row, so the padded row is a single bulk copy
-        into staging row ``t``.
+        The rows come out of the landing verification: the loads that prove a
+        row has arrived already hold its scale factors, so the lanes holding
+        them write them as atom words straight into the output stage, and the
+        landed rows are never read a second time. Block row ``r`` takes
+        canonical row position ``t = 4 * (r % 32) + r // 32`` of each atom, so
+        the ``gather_index`` read stays sequential.
 
         Rows past the expert's live count are left holding whatever the previous
         block put there. They land in atoms the MMA does read, but only in N
         columns its dynamic instruction extent excludes.
-
-        Under round gating the group's first thread first acquires the round of
-        the block's expert, unless it already holds that round or a later one.
-        The group barrier hands that acquire to the other threads, and each thread
-        fences its own bulk reads of the landed rows behind it. The same
-        acquisition is what ``fc1_sf_ready`` passes on to the main kernel for the
-        expert's data rows.
         """
         gather_index = device_workspace.tensor(self.gather_index_region)
-
-        if cutlass.const_expr(self.dispatch_protocol == "sentinel"):
-            output = self._smem_workspace.tensor(self.refine_output_region, smem_base)
-            self._verify_block_rows(
-                device_workspace,
-                gather_index,
-                data_row_begin,
-                live_rows,
-                output[group_idx, 0, None].iterator,
-                thread_in_group,
-            )
-            # Publish every writer's generic SMEM stores before the async bulk reads
-            # of `_scatter_block_atoms`; every live row is verified and its atoms
-            # written once the whole group is here.
-            cute.arch.fence_proxy(kind="async.shared", space="cta")
-            cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
-            return stage_state, acquired_round
-
-        staging = self._smem_workspace.tensor(self.refine_staging_region, smem_base)
-        plain_sf = self.dense_activation_sf_tensor(device_workspace)
-        mbarrier = (
-            self._smem_workspace.ptr(self.refine_mbarrier_region, smem_base) + group_idx
+        output = self._smem_workspace.tensor(self.refine_output_region, smem_base)
+        self._verify_block_rows(
+            device_workspace,
+            gather_index,
+            data_row_begin,
+            live_rows,
+            output[group_idx, 0, None].iterator,
+            thread_in_group,
         )
-        # The staging tile's own column extent, which is also the destination row's
-        # whole width. Reading it out of the linear plane goes past that plane's
-        # `hidden_sf` columns into its row padding, which is why the plane's region
-        # has to own that padding rather than just address it.
-        row_bytes = self.refine_row_columns * int(self.activation_sf_dtype.width) // 8
-
-        if cutlass.const_expr(self.round_gated):
-            if thread_in_group == Int32(0):
-                block_round = Int32(0)
-                if cutlass.const_expr(not self.refine_gate_round0_only):
-                    block_round = owning_expert // Int32(self.experts_per_round)
-                if block_round > acquired_round:
-                    self._wait_round(device_workspace, block_round)
-                    acquired_round = block_round
-
-        if thread_in_group == Int32(0):
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                mbarrier, live_rows * Int32(row_bytes)
-            )
+        # Publish every writer's generic SMEM stores before the async bulk reads
+        # of `_scatter_block_atoms`; every live row is verified and its atoms
+        # written once the whole group is here.
+        cute.arch.fence_proxy(kind="async.shared", space="cta")
         cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
-        if cutlass.const_expr(self.round_gated):
-            sentinel_ptx.fence_proxy_async_global()
-
-        if thread_in_group < live_rows:
-            staging_row = Int32(4) * (
-                thread_in_group % Int32(32)
-            ) + thread_in_group // Int32(32)
-            tma_load_1d(
-                staging[group_idx, staging_row, None].iterator,
-                plain_sf[gather_index[data_row_begin + thread_in_group], None].iterator,
-                mbarrier,
-                Int32(row_bytes),
-            )
-        cute.arch.mbarrier_wait(mbarrier, stage_state.phase)
-        # One stage, so every advance flips the phase. All 128 threads run the same
-        # number of blocks, which is what keeps the phase group-uniform. Returned
-        # because the state is a value: an advance made here is invisible upstream.
-        stage_state.advance()
-        return stage_state, acquired_round
 
     @cute.jit
     def _run_pull(
@@ -8305,121 +7252,38 @@ class GenphaseTokenComm(KernelComponent):
         sf_row_begin: Int32,
         group_idx: Int32,
         thread_in_group: Int32,
-        group_barrier: Int32,
-        group_threads: int,
     ) -> None:
-        """Build canonical atoms from the staging tile and store them.
+        """Store a block's canonical atoms from the group's output stage.
 
-        Thread ``t`` reads staging row ``t``, which the stage side arranged to hold
-        the source row whose canonical position is word ``t`` of the atom. Both
-        legs are therefore linear across the warp: the read walks consecutive rows
-        four banks apart, the store walks consecutive words. The counter refine
-        cycles its runs through ``refine_output_stages`` slots, a fence, a barrier
-        and a bulk group per run.
-
-        Under the Sentinel dispatch the verification has already written every run
-        into its own output slot and published them, so the bulk stores leave back
-        to back in one bulk group, which the caller drains once before it releases
-        the block.
+        The verification has already written every run into its own output
+        slot and published them, so the bulk stores leave back to back in one
+        bulk group, which the caller drains once before it releases the block.
+        One elected thread of the group's first warp stores each slot whole, and
+        only a run's live atoms: a partial last run's other atoms have no place
+        in the pool.
         """
         output = self._smem_workspace.tensor(self.refine_output_region, smem_base)
         canonical = self.canonical_activation_sf_tensor(device_workspace)
         sf_vec_size = self.quant_kind.sf_vec_size
         columns_per_run = self.refine_run_columns
 
-        if cutlass.const_expr(self.dispatch_protocol == "sentinel"):
-            # One elected thread of the group's first warp stores each slot whole, and
-            # only a run's live atoms; see the per-run stores below.
-            if thread_in_group // Int32(32) == Int32(0):
-                with cute.arch.elect_one():
-                    for run in cutlass.range_constexpr(self.refine_run_count):
-                        live_atoms = min(
-                            self.refine_atoms_per_stage,
-                            self.refine_total_atoms - run * self.refine_atoms_per_stage,
-                        )
-                        destination = cute.domain_offset(
-                            (sf_row_begin, Int32(run * columns_per_run * sf_vec_size)),
-                            canonical,
-                        )
-                        cp_async_bulk_s2g(
-                            destination.iterator,
-                            output[group_idx, run, None].iterator,
-                            Int32(live_atoms * 512),
-                        )
-            cute.arch.cp_async_bulk_commit_group()
-            return
-
-        staging = self._smem_workspace.tensor(self.refine_staging_region, smem_base)
-
-        atom_row_group = thread_in_group % Int32(4)
-        atom_row = thread_in_group // Int32(4)
-        # The runs tile the row exactly: the staging tile's column extent is the
-        # run-aligned one, so a partial last run reads columns past `hidden_sf`
-        # that belong to this row rather than to the next.
-        staged_runs = cute.zipped_divide(
-            staging[group_idx, thread_in_group, None], (columns_per_run,)
-        )
-
-        load_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.activation_sf_dtype,
-            num_bits_per_copy=8 * columns_per_run,
-        )
-        store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.activation_sf_dtype, num_bits_per_copy=32
-        )
-        staged_values = cute.make_rmem_tensor(
-            cute.make_layout((columns_per_run,)), self.activation_sf_dtype
-        )
-        value_atoms = cute.zipped_divide(staged_values, (4,))
-        # One run of atoms, addressed the way the MMA reads it: 32 rows by 4
-        # row-groups against 4 scale factors by 4 atoms.
-        run_layout = cute.make_layout(
-            ((32, 4), (4, self.refine_atoms_per_stage)), stride=((16, 4), (1, 512))
-        )
-
-        for run in cutlass.range_constexpr(self.refine_run_count):
-            stage_slot = run % self.refine_output_stages
-            live_atoms = min(
-                self.refine_atoms_per_stage,
-                self.refine_total_atoms - run * self.refine_atoms_per_stage,
-            )
-            run_output = cute.make_tensor(
-                output[group_idx, stage_slot, None].iterator, run_layout
-            )
-            cute.copy(load_atom, staged_runs[None, run], staged_values)
-            for atom in cutlass.range_constexpr(self.refine_atoms_per_stage):
-                cute.copy(
-                    store_atom,
-                    value_atoms[None, atom],
-                    run_output[(atom_row, atom_row_group), (None, atom)],
-                )
-            # Publish every writer's generic SMEM stores before the async bulk read.
-            cute.arch.fence_proxy(kind="async.shared", space="cta")
-            cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
-
-            # `sf_row_begin` is atom-aligned and the run starts on an atom
-            # boundary, so the tensor's own layout hands back the run base.
-            destination = cute.domain_offset(
-                (sf_row_begin, Int32(run * columns_per_run * sf_vec_size)), canonical
-            )
-            # Elected inside the group's first warp, not in every warp: the stage
-            # slot is written cooperatively by all `group_threads` threads, so it
-            # leaves as one store. A bare `elect_one` would issue the same address
-            # once per warp.
-            #
-            # Only the live atoms are stored; a partial last run built the rest
-            # from staging padding and they have no place in the pool.
-            if thread_in_group // Int32(32) == Int32(0):
-                with cute.arch.elect_one():
+        if thread_in_group // Int32(32) == Int32(0):
+            with cute.arch.elect_one():
+                for run in cutlass.range_constexpr(self.refine_run_count):
+                    live_atoms = min(
+                        self.refine_atoms_per_stage,
+                        self.refine_total_atoms - run * self.refine_atoms_per_stage,
+                    )
+                    destination = cute.domain_offset(
+                        (sf_row_begin, Int32(run * columns_per_run * sf_vec_size)),
+                        canonical,
+                    )
                     cp_async_bulk_s2g(
                         destination.iterator,
-                        output[group_idx, stage_slot, None].iterator,
+                        output[group_idx, run, None].iterator,
                         Int32(live_atoms * 512),
                     )
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(self.refine_output_stages - 1, read=True)
-            cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
+        cute.arch.cp_async_bulk_commit_group()
 
     # ------------------------------------------------------------------
     # DSL plumbing

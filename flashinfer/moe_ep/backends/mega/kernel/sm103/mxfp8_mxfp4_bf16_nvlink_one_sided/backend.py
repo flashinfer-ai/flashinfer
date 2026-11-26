@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
 # Landing rows move in warp-wide runs of 32 lanes x 16 bytes of E4M3 data with
 # one 16-byte vector of UE8M0 scales per lane: so the Sentinel dispatch, which
-# every capacity up to 128 tokens per rank runs, verifies them and the
+# every capacity up to 192 tokens per rank runs, verifies them and the
 # end-of-round kernel resets them, and the pull dispatch moves whole scale
 # vectors too. The landing-row reset also checks one route per lane of a warp.
 _HIDDEN_ALIGNMENT = 32 * 16
@@ -153,51 +153,13 @@ class Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend(MegaKernelBackend):
                 f"{KERNEL_NAME} supports top_k up to {_MAX_TOP_K}, got {k.top_k}"
             )
         frontend = _frontend()
-        # A fused shared expert's FC1 tiles fill the dispatch's window, which the
-        # tiling weighs in its dispatch choice.
-        shared_shape = (
-            dict(
-                hidden=fleet_params.token_hidden_size,
-                shared_intermediate=k.intermediate_size,
-            )
-            if k.shared_expert
-            else {}
-        )
         fields = frontend.nvlink_one_sided_tiling(
             fleet_params.max_tokens_per_rank,
             self.ep_world_size,
             fleet_params.num_experts,
             k.top_k,
-            **shared_shape,
         )
-        overrides = self._knob_overrides()
-        fields.update(overrides)
-        # The tiling's pull dispatch needs the counter combine; knobs that switch
-        # the combine to Sentinel take the counter dispatch unless they also set
-        # the dispatch.
-        if (
-            "dispatch_protocol" not in overrides
-            and fields["dispatch_protocol"] == "pull"
-            and fields["combine_protocol"] != "counter"
-        ):
-            fields["dispatch_protocol"] = "counter"
-        # Dispatch rounds need both counter protocols. Unless knobs set them, they
-        # follow the capacity wherever both protocols end up counter, also where
-        # knobs pick the counter dispatch over the tiling's pull dispatch, and are
-        # one elsewhere.
-        if "dispatch_rounds" not in overrides:
-            both_counter = (
-                fields["dispatch_protocol"] == fields["combine_protocol"] == "counter"
-            )
-            fields["dispatch_rounds"] = (
-                frontend.counter_dispatch_rounds(
-                    fleet_params.max_tokens_per_rank,
-                    self.ep_world_size,
-                    fleet_params.num_experts,
-                )
-                if both_counter
-                else 1
-            )
+        fields.update(self._knob_overrides())
         try:
             config = frontend.Sm100GenphaseMoeConfig(
                 num_total_experts=fleet_params.num_experts,

@@ -81,32 +81,19 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
             )
 
 
-SENTINEL_MAX_TOKENS = 128
-SENTINEL_COMBINE_MAX_TOKENS = 256
+# The dispatch rule's bounds, in tokens per rank (``dispatch_protocol``): the
+# Sentinel dispatch up to SENTINEL_MAX_TOKENS, and up to the bounds of
+# SENTINEL_DISPATCH_THRESHOLDS, as (routes per reached target rank, most tokens per
+# rank) pairs, where a reached rank takes few routes per token.
+SENTINEL_MAX_TOKENS = 192
+SENTINEL_DISPATCH_THRESHOLDS = ((1.5, 256),)
 SINGLE_GROUP_MAX_TOKENS = 256
 PIPELINED_GROUPS_MIN_TOKENS = 1024
 # FC1 tiles of a schedule group, and of a pipelined group under the pull dispatch
 # (see ``nvlink_one_sided_tiling``).
 SCHEDULE_GROUP_FC1_TILES = 256
 PULL_PIPELINED_GROUP_FC1_TILES = 128
-FENCE_JUST_IN_TIME_MIN_TOKENS = 512
-FOUR_ROUNDS_MIN_TOKENS = 1024
-EIGHT_ROUNDS_MIN_TOKENS = 2048
-# Where the pull dispatch takes over, as (routes per reached target rank, least
-# tokens per rank) pairs; see ``dispatch_protocol``.
-PULL_THRESHOLDS = ((1.5, 512), (2.0, 2048))
-# Where the Sentinel dispatch reaches past ``SENTINEL_MAX_TOKENS``, as (routes per
-# reached target rank, most tokens per rank) pairs; see ``dispatch_protocol``.
-SENTINEL_DISPATCH_THRESHOLDS = ((1.5, 256),)
-# The selection model of a fused shared expert (``shared_head_fills_counter_window``),
-# measured on B300 at EP8 (H=6144, top-8 of 256 experts, eight rounds): the rate at
-# which the shared FC1 tiles run once the GPU holds its 1100 W power cap, in FLOP
-# per us, and the counter dispatch's window before the first routed FC1 tile, a
-# fixed part (sizes, plan, the first round's publication and refine) plus the
-# first round's rows at the rate they land on a target rank, in bytes per us.
-SUSTAINED_GEMM_FLOP_PER_US = 2.0e9
-COUNTER_WINDOW_FIXED_US = 32.0
-COUNTER_FIRST_ROUND_BYTES_PER_US = 3.24e5
+PULL_JUST_IN_TIME_MIN_TOKENS = 512
 # The window model of a fused shared expert's entry head (``shared_head_token_tiles``
 # "window"), measured on B300 at EP8 (DeepSeek-V4.1-Flash, H=5120, one shared expert,
 # before the power cap engages): the pull dispatch's window before its first routed
@@ -145,29 +132,6 @@ def token_tile_n(expected_load: float) -> int:
     return 192 if share <= 192 else 240
 
 
-def counter_dispatch_rounds(
-    max_tokens_per_rank: int, world_size: int, num_experts: int
-) -> int:
-    """Dispatch rounds of the counter protocols for a capacity.
-
-    Rounds let each expert's FC1 wait for its own round of the payload instead of
-    all of it. Publishing a round costs a system fence on the pushing SM and a
-    counter update that queues behind bulk data on NVLink, so rounds only pay
-    where the whole-payload wait is long: four rounds from
-    ``FOUR_ROUNDS_MIN_TOKENS`` tokens per rank, eight from
-    ``EIGHT_ROUNDS_MIN_TOKENS``. The kernel takes rounds for at most 32 local
-    experts, splits them evenly over the rounds, and keeps one bit per (round,
-    peer) in a 64-bit word.
-    """
-    experts_per_rank = num_experts // world_size
-    if max_tokens_per_rank < FOUR_ROUNDS_MIN_TOKENS or experts_per_rank > 32:
-        return 1
-    rounds = 8 if max_tokens_per_rank >= EIGHT_ROUNDS_MIN_TOKENS else 4
-    while rounds > 1 and (experts_per_rank % rounds or world_size * rounds > 64):
-        rounds //= 2
-    return rounds
-
-
 def routes_per_target_token(world_size: int, num_experts: int, num_topk: int) -> float:
     """Expected routes of one token to one target rank it reaches, under uniform routing.
 
@@ -182,80 +146,6 @@ def routes_per_target_token(world_size: int, num_experts: int, num_topk: int) ->
     for drawn in range(num_topk):
         miss *= max(num_experts - experts_per_rank - drawn, 0) / (num_experts - drawn)
     return num_topk / (world_size * (1.0 - miss))
-
-
-def counter_first_round_rows(
-    max_tokens_per_rank: int, world_size: int, num_experts: int, num_topk: int
-) -> float:
-    """Expected token rows one target rank receives in the counter dispatch's first round.
-
-    A token travels to a target rank once, in the round of its first expert
-    there (``counter_dispatch_rounds``), so under uniform routing it is in the
-    first round when any of its ``num_topk`` distinct experts is one of the
-    target's first-round experts; every source rank, the target included, sends
-    its share of the capacity.
-    """
-    rounds = counter_dispatch_rounds(max_tokens_per_rank, world_size, num_experts)
-    first_round_experts = num_experts // world_size // rounds
-    miss = 1.0
-    for drawn in range(num_topk):
-        miss *= max(num_experts - first_round_experts - drawn, 0) / (
-            num_experts - drawn
-        )
-    return max_tokens_per_rank * world_size * (1.0 - miss)
-
-
-def counter_dispatch_window_us(
-    max_tokens_per_rank: int,
-    world_size: int,
-    num_experts: int,
-    num_topk: int,
-    hidden: int,
-) -> float:
-    """Time from kernel entry to the counter dispatch's first routed FC1 tile, in us.
-
-    The first tile in processing order belongs to a first-round expert and waits
-    for that round from every source rank: ``COUNTER_WINDOW_FIXED_US`` plus the
-    round's rows (``counter_first_round_rows``, E4M3 data and one UE8M0 scale per
-    32 values each) at ``COUNTER_FIRST_ROUND_BYTES_PER_US``.
-    """
-    rows = counter_first_round_rows(
-        max_tokens_per_rank, world_size, num_experts, num_topk
-    )
-    row_bytes = hidden + hidden // 32
-    return COUNTER_WINDOW_FIXED_US + rows * row_bytes / COUNTER_FIRST_ROUND_BYTES_PER_US
-
-
-def shared_fc1_head_us(
-    max_tokens_per_rank: int, hidden: int, shared_intermediate: int
-) -> float:
-    """Time of a fused shared expert's FC1 tiles at ``SUSTAINED_GEMM_FLOP_PER_US``, in us.
-
-    The shared expert computes every token of the capacity: ``2 * hidden * 2 *
-    shared_intermediate`` FLOP per token for its gate and up projections.
-    """
-    flop = 2.0 * max_tokens_per_rank * hidden * 2 * shared_intermediate
-    return flop / SUSTAINED_GEMM_FLOP_PER_US
-
-
-def shared_head_fills_counter_window(
-    max_tokens_per_rank: int,
-    world_size: int,
-    num_experts: int,
-    num_topk: int,
-    hidden: int,
-    shared_intermediate: int,
-) -> bool:
-    """Whether a fused shared expert's FC1 tiles take the counter dispatch's whole window.
-
-    See ``dispatch_protocol``: the shared FC1 time against the window before the
-    counter dispatch's first routed FC1 tile.
-    """
-    head = shared_fc1_head_us(max_tokens_per_rank, hidden, shared_intermediate)
-    window = counter_dispatch_window_us(
-        max_tokens_per_rank, world_size, num_experts, num_topk, hidden
-    )
-    return head >= window
 
 
 def pull_dispatch_window_us(
@@ -284,16 +174,11 @@ def dispatch_window_us(
 ) -> float:
     """Time from kernel entry to the first routed FC1 tile under a dispatch protocol, in us.
 
-    ``pull_dispatch_window_us``, ``counter_dispatch_window_us``, or
-    ``SENTINEL_WINDOW_US`` for the Sentinel dispatch, whose experts become ready
-    as their rows are verified.
+    ``pull_dispatch_window_us``, or ``SENTINEL_WINDOW_US`` for the Sentinel
+    dispatch, whose experts become ready as their rows are verified.
     """
     if dispatch == "pull":
         return pull_dispatch_window_us(max_tokens_per_rank, num_topk, hidden)
-    if dispatch == "counter":
-        return counter_dispatch_window_us(
-            max_tokens_per_rank, world_size, num_experts, num_topk, hidden
-        )
     return SENTINEL_WINDOW_US
 
 
@@ -328,87 +213,49 @@ def shared_head_token_tiles(
 
 
 def dispatch_protocol(
-    max_tokens_per_rank: int,
-    world_size: int,
-    num_experts: int,
-    num_topk: int,
-    *,
-    hidden: int | None = None,
-    shared_intermediate: int | None = None,
+    max_tokens_per_rank: int, world_size: int, num_experts: int, num_topk: int
 ) -> str:
-    """Dispatch protocol for a capacity: ``sentinel``, ``counter`` or ``pull``.
+    """Dispatch protocol for a capacity: ``sentinel`` or ``pull``; the combine follows it.
 
-    The Sentinel dispatch up to ``SENTINEL_MAX_TOKENS`` tokens per rank (see
-    ``nvlink_one_sided_tiling``), and up to the bounds of ``SENTINEL_DISPATCH_THRESHOLDS``
-    where a reached rank takes few routes per token. There the pull dispatch
-    takes over at 512 tokens per rank, and below that the counter dispatch would
-    run in one round, holding every FC1 tile until the whole payload has landed.
-    The Sentinel dispatch releases FC1 per expert instead; with the larger entry
-    prefetch it then takes (``resolved_entry_prefetch_bytes``) the earlier start
-    outweighs its per-byte verification and the reduce's landing-row reset:
-    V4.1-Flash on eight GPUs (1.35 routes per reached rank) gains about 2.7 us
-    at 256 tokens per rank. Above these bounds the pull dispatch where it
-    repays its extra fetches, the counter dispatch elsewhere. The pull dispatch makes experts
-    ready one by one in processing order from the end of the plan on, so the
-    first FC1 starts long before the whole payload, or the counter dispatch's
-    first round, has landed. It fetches a token once per local route, though,
-    where one push per target rank moves it once, and its walk holds SMs the
-    engine waits for. ``routes_per_target_token`` is the ratio of those fetches
-    under uniform routing (top-6: 1.35 at EP8, 1.8 at EP4, 3.0 at EP2, 6 at
-    EP1); the more routes a reached rank takes per token, the larger the
-    capacity at which the earlier start outweighs the extra bytes.
-    ``PULL_THRESHOLDS`` gives, for each bound on that ratio, the least tokens
-    per rank that take the pull dispatch; above the last bound the counter
-    dispatch stays.
+    The Sentinel dispatch up to ``SENTINEL_MAX_TOKENS`` tokens per rank, and up to
+    the bounds of ``SENTINEL_DISPATCH_THRESHOLDS`` where a reached target rank
+    takes few routes per token; the pull dispatch everywhere else. The Sentinel
+    dispatch runs under the Sentinel combine and the pull dispatch under the
+    counter (Fence) combine (``nvlink_one_sided_tiling``).
 
-    A fused shared expert of width ``shared_intermediate`` (with the layer's
-    ``hidden``) runs its FC1 tiles from the main kernel's entry, before any
-    routed tile is ready, so the window before the first routed FC1 tile is
-    tensor time it can fill. The pull dispatch's window is short (the plan and
-    the first fetches), and past it the grouped GEMMs run at their sustained
-    rate, so the shared FC1 tiles that do not fit add their whole time. The
-    counter dispatch's window lasts until the first round of the payload has
-    landed. Where the pull dispatch would be chosen, the counter dispatch takes
-    over once the shared FC1 tiles take that whole window
-    (``shared_head_fills_counter_window``): then its later start leaves no tensor
-    core idle, and it moves each token once per target rank, holds no walking
-    CTAs and allocates no token pool. Where they do not, the counter dispatch
-    would have to repay its idle tensor time with what it saves past its start,
-    which the rule does not count on, so the pull dispatch stays.
+    The Sentinel dispatch pushes the payload at kernel entry and releases FC1 per
+    expert as its rows verify, and its combine resets only the combine slots the
+    reduce consumed. Its costs grow with the routes a rank receives: it verifies
+    every landing byte while its CTAs hold SMs the engine waits for, and the
+    reduce resets every landing row and combine slot. The pull dispatch fetches
+    only once the plan exists, and fetches a token once per local route where a
+    push moves it once per target rank (``routes_per_target_token``: top-6 of 384
+    experts takes 1.35 routes per reached rank at EP8, 1.8 at EP4, 3.0 at EP2, 6
+    at EP1); its combine's all-rank tail barrier costs 2 to 5 us up to 256 tokens
+    per rank.
+
+    Measured on B300 (the slowest rank's span), the Sentinel dispatch beats the
+    pull at every point up to 192 tokens per rank: by 5 to 18 us on one to four
+    GPUs, and by 2 to 5 us on Kimi-K3 (top-16 of 896 experts, 2.26 routes per
+    reached rank) and HY4 (top-8 of 256, 1.51) on eight. Above 192 the pull is the
+    faster at EP8 (Kimi-K3 by 11 us at 255; HY4 by up to 7 us at 256), except
+    where a reached rank takes at most 1.5 routes per token: DeepSeek-V4.1-Flash
+    on eight GPUs (1.35) keeps the Sentinel dispatch 5 to 7 us ahead at 256. Past
+    256 the Sentinel's lead shrinks (3 to 6 us at 288 to 320, a tie near 384), and
+    on one to four GPUs it stays 1 to 12 us ahead up to 320, both of which this
+    rule leaves to the pull.
     """
-    if (hidden is None) != (shared_intermediate is None):
-        raise ValueError("hidden and shared_intermediate go together")
     if max_tokens_per_rank <= SENTINEL_MAX_TOKENS:
         return "sentinel"
     routes = routes_per_target_token(world_size, num_experts, num_topk)
     for max_routes, max_tokens in SENTINEL_DISPATCH_THRESHOLDS:
         if routes <= max_routes and max_tokens_per_rank <= max_tokens:
             return "sentinel"
-    for max_routes, min_tokens in PULL_THRESHOLDS:
-        if routes <= max_routes:
-            if max_tokens_per_rank < min_tokens:
-                return "counter"
-            if shared_intermediate is not None and shared_head_fills_counter_window(
-                max_tokens_per_rank,
-                world_size,
-                num_experts,
-                num_topk,
-                hidden,
-                shared_intermediate,
-            ):
-                return "counter"
-            return "pull"
-    return "counter"
+    return "pull"
 
 
 def nvlink_one_sided_tiling(
-    max_tokens_per_rank: int,
-    world_size: int,
-    num_experts: int,
-    num_topk: int,
-    *,
-    hidden: int | None = None,
-    shared_intermediate: int | None = None,
+    max_tokens_per_rank: int, world_size: int, num_experts: int, num_topk: int
 ) -> dict:
     """Engine geometry and schedule for a capacity, as config keyword arguments.
 
@@ -436,42 +283,20 @@ def nvlink_one_sided_tiling(
     of the group before. There the FC2 epilogue also pushes with warp-wide stores
     (``combine_warp_stores``): bulk copies into peers' slots drain at the link's
     pace through the TMA unit that also issues the mainloop's loads. From
-    ``FENCE_JUST_IN_TIME_MIN_TOKENS`` the
-    Fence dispatches (counter and pull) claim work just in time: a cluster takes
-    its next tile only once the current one has passed its readiness gate, so FC2
-    tiles are not claimed long before their FC1 tiles finish and the last tiles go
-    to the clusters that free up first.
+    ``PULL_JUST_IN_TIME_MIN_TOKENS`` the pull dispatch claims work just in time: a
+    cluster takes its next tile only once the current one has passed its readiness
+    gate, so FC2 tiles are not claimed long before their FC1 tiles finish and the
+    last tiles go to the clusters that free up first.
 
-    The Sentinel protocols save the fence-and-flag round trips but cost work that
-    grows with capacity, and the two directions pay it differently. The Sentinel
-    dispatch verifies every landing byte while its CTAs hold SMs the engine waits
-    for, and the reduce resets every landing row, so past ``SENTINEL_MAX_TOKENS``
-    tokens per rank the counter dispatch's per-peer payload counters are cheaper,
-    except where its whole-payload wait costs more (``dispatch_protocol``).
-    The Sentinel combine only resets the combine slots the reduce consumed, while
-    the counter combine holds every rank's main kernel in an all-rank tail barrier,
-    so the Sentinel combine stays up to ``SENTINEL_COMBINE_MAX_TOKENS``. Large
-    capacities take the pull dispatch where it repays its extra fetches
-    (``dispatch_protocol``); it runs under the counter combine in one round.
-    Elsewhere the counter dispatch travels in rounds from
-    ``FOUR_ROUNDS_MIN_TOKENS`` (``counter_dispatch_rounds``), which need the
-    counter combine as well. With a fused shared expert (``hidden`` and its
-    ``shared_intermediate``) the counter dispatch also replaces the pull where
-    the shared FC1 tiles fill its window (``dispatch_protocol``).
+    The combine follows the dispatch (``dispatch_protocol``). The Sentinel
+    dispatch runs with the Sentinel combine, which only resets the combine slots
+    the reduce consumed. The pull dispatch runs with the counter (Fence) combine,
+    whose all-rank tail barrier is what orders every peer's fetches of a rank's
+    staged activations before that rank stages again.
     """
     expected_load = max_tokens_per_rank * world_size * num_topk / num_experts
     tile_n = token_tile_n(expected_load)
-    dispatch = dispatch_protocol(
-        max_tokens_per_rank,
-        world_size,
-        num_experts,
-        num_topk,
-        hidden=hidden,
-        shared_intermediate=shared_intermediate,
-    )
-    combine = (
-        "sentinel" if max_tokens_per_rank <= SENTINEL_COMBINE_MAX_TOKENS else "counter"
-    )
+    dispatch = dispatch_protocol(max_tokens_per_rank, world_size, num_experts, num_topk)
     single_group = max_tokens_per_rank <= SINGLE_GROUP_MAX_TOKENS
     pipelined = max_tokens_per_rank >= PIPELINED_GROUPS_MIN_TOKENS
     pull_pipelined = pipelined and dispatch == "pull"
@@ -486,19 +311,14 @@ def nvlink_one_sided_tiling(
         pipelined_groups=pipelined,
         just_in_time_claims=(
             True
-            if dispatch != "sentinel"
-            and max_tokens_per_rank >= FENCE_JUST_IN_TIME_MIN_TOKENS
+            if dispatch == "pull"
+            and max_tokens_per_rank >= PULL_JUST_IN_TIME_MIN_TOKENS
             else None
         ),
         work_id_mode="atomic_counter",
         epi_flag_batches=(1, 2),
         dispatch_protocol=dispatch,
-        combine_protocol=combine,
-        dispatch_rounds=(
-            counter_dispatch_rounds(max_tokens_per_rank, world_size, num_experts)
-            if dispatch == combine == "counter"
-            else 1
-        ),
+        combine_protocol="sentinel" if dispatch == "sentinel" else "counter",
     )
 
 
@@ -524,7 +344,6 @@ TUNING_FIELDS = frozenset(
         "alternate_weight_evict",
         "token_tile_choice",
         "comm_pusher_ctas",
-        "dispatch_rounds",
         "comm_push_depth",
         "comm_pull_depth",
         "comm_pull_chunk_rows",
@@ -537,8 +356,6 @@ TUNING_FIELDS = frozenset(
         "pull_tile_ready",
         "fc1_token_pool",
         "fc1_token_pool_fallback",
-        "refine_exchange_ctas",
-        "round_publish_lag",
         "gather_padding_spread",
         "max_sm_count",
         "just_in_time_claims",

@@ -105,24 +105,22 @@ JUST_IN_TIME_CLAIMS_MAX_TOKENS = 16
 DISCARD_COMBINE_SLOTS_MIN_BYTES = 80 * 1024 * 1024
 
 # FC1 weight bytes the main kernel requests into L2 at entry, while the dispatched
-# payload lands (``entry_prefetch_bytes``). Under the counter dispatch in one round
-# every FC1 tile waits for the whole payload, which at up to
-# WHOLE_PAYLOAD_ENTRY_PREFETCH_MAX_TOKENS tokens per rank keeps HBM mostly idle for
-# about 25 us after entry on eight GPUs; there the prefetch takes about the L2's
-# capacity (126.5 MiB on B300). Its allocations also evict the dirty lines earlier
-# kernels left in L2 while HBM has time for their write-back, which during the
-# grouped GEMMs slows the weight stream by about 6%: V4.1-Flash at 256 tokens per
-# rank gains about 4 us on eight GPUs (nothing with a clean L2). The Sentinel
-# dispatch releases FC1 per expert and the pull dispatch per token tile, after 10
-# to 20 us, where a larger prefetch gains nothing or loses, except under the
-# Sentinel dispatch past SENTINEL_DISPATCH_ENTRY_PREFETCH_MIN_TOKENS tokens per rank:
-# its payload then lands long enough for the larger prefetch to pay as well
-# (V4.1-Flash at 256 tokens per rank on eight GPUs: 2.6 us; at 64 and 128 about
-# 0.5 us).
+# payload lands (``entry_prefetch_bytes``). The Sentinel dispatch releases FC1 per
+# expert and the pull dispatch per token tile, 10 to 20 us after entry, where a
+# prefetch larger than ENTRY_PREFETCH_BYTES gains nothing or loses, except under
+# the Sentinel dispatch from SENTINEL_DISPATCH_ENTRY_PREFETCH_MIN_TOKENS tokens per
+# rank: its payload then lands late enough for a prefetch of about the L2's
+# capacity (126.5 MiB on B300) to pay. Its allocations also evict the dirty lines
+# earlier kernels left in L2 while HBM has time for their write-back, which during
+# the grouped GEMMs slows the weight stream by about 6%. V4.1-Flash on eight GPUs
+# gains 2.6 us at 256 tokens per rank (about 0.5 us at 64 and 128), and the
+# larger prefetch applies up to SENTINEL_DISPATCH_ENTRY_PREFETCH_MAX_TOKENS, the
+# largest capacity at which ``nvlink_one_sided_tiling`` picks the Sentinel
+# dispatch.
 ENTRY_PREFETCH_BYTES = 64 * 1024 * 1024
-WHOLE_PAYLOAD_ENTRY_PREFETCH_BYTES = 128 * 1024 * 1024
-WHOLE_PAYLOAD_ENTRY_PREFETCH_MAX_TOKENS = 256
+SENTINEL_DISPATCH_ENTRY_PREFETCH_BYTES = 128 * 1024 * 1024
 SENTINEL_DISPATCH_ENTRY_PREFETCH_MIN_TOKENS = 129
+SENTINEL_DISPATCH_ENTRY_PREFETCH_MAX_TOKENS = 256
 
 # Expected routes per local expert from which die-local weights are on by
 # default (``die_local_weights``). From there each weight M tile feeds a token
@@ -273,13 +271,14 @@ class BlockScaledMoeConfig:
     # (evict-first only for an expert's last, partial token tile).
     weight_evict: Literal["normal", "first", "adaptive"] = "adaptive"
     # Combine completion: "sentinel" (data-as-flag slots the reduce resets) or
-    # "counter" (bulk pushes published by one all-rank barrier at the tail).
+    # "counter" (the Fence combine: bulk pushes published by one all-rank barrier
+    # at the tail).
     combine_protocol: Literal["sentinel", "counter"] = "sentinel"
-    # Dispatch completion: "sentinel" (0xFF-armed landing rows verified byte by
-    # byte), "counter" (per-peer payload counters after a system fence) or
-    # "pull" (each target rank fetches its rows from the source ranks' staged
+    # Dispatch: "sentinel" (the source ranks push into landing rows that hold
+    # the 0xFF init sentinel, which the target verifies byte by byte) or "pull"
+    # (each target rank fetches its rows from the source ranks' staged
     # activations in its own processing order; needs the counter combine).
-    dispatch_protocol: Literal["sentinel", "counter", "pull"] = "sentinel"
+    dispatch_protocol: Literal["sentinel", "pull"] = "sentinel"
     # Pull dispatch only: data-row ring slots per walking warp, routes per work
     # claim, and with walking CTAs routes per claim of the experts that start
     # within the first wave of claims, one claim per walking warp (None: the
@@ -287,9 +286,9 @@ class BlockScaledMoeConfig:
     comm_pull_depth: Optional[int] = None
     comm_pull_chunk_rows: Optional[int] = None
     comm_pull_lead_rows: Optional[int] = None
-    # Counter and pull dispatches only: communication CTAs that each sort one
-    # chunk of this rank's routes into per-destination lists (None: the kernel
-    # default, at least one per rank).
+    # Pull dispatch only: communication CTAs that each sort one chunk of this
+    # rank's routes into per-destination lists (None: the kernel default, at
+    # least one per rank).
     comm_exchange_ctas: Optional[int] = None
     # Pull dispatch only: warps of every main-kernel CTA that fetch the routed
     # rows (1 to 4), or 0 to fetch them in walking CTAs of the communication grid,
@@ -342,26 +341,9 @@ class BlockScaledMoeConfig:
     # with pull warps only copy index lists). Each one holds an SM that a
     # main-kernel cluster waits for until it exits.
     comm_pusher_ctas: Optional[int] = None
-    # Counter dispatch and combine only: split every rank's local experts into
-    # this many rounds (1, 2, 4 or 8). Tokens travel and are published round by
-    # round and each expert's FC1 waits for its own round instead of the whole
-    # payload.
-    dispatch_rounds: int = 1
-    # Per-warp payload staging slots of the pushers (None: the kernel default).
+    # Sentinel dispatch: per-warp payload staging slots of the pushers (None:
+    # the kernel default).
     comm_push_depth: Optional[int] = None
-    # Rounds only: exchange CTAs that join the scale-factor refine after their
-    # sort (None: all of them).
-    refine_exchange_ctas: Optional[int] = None
-    # Rounds diagnostics: "order" lays experts out round-major only, "push" also
-    # pushes by round behind the whole-payload wait, "gate" is the protocol.
-    dispatch_round_mode: Literal["order", "push", "gate"] = "gate"
-    # Rounds only: bulk groups a pusher warp commits after a round closes before
-    # publishing it (None: the kernel default).
-    round_publish_lag: Optional[int] = None
-    # Rounds fault injection: pushers hold rounds >= 1 back by this long.
-    round_publish_delay_ns: int = 0
-    # Rounds negative control: gate every expert on round 0 only (incorrect).
-    refine_gate_round0_only: bool = False
     # Diagnostic %globaltimer stamps in a local workspace region.
     comm_stamps: bool = False
     # Physical weight layout the kernel addresses; it must match the layout the
@@ -497,6 +479,11 @@ class BlockScaledMoeConfig:
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
+        if self.dispatch_protocol not in ("sentinel", "pull"):
+            raise ValueError(
+                f"dispatch_protocol must be 'sentinel' or 'pull', got {self.dispatch_protocol!r} "
+                "('counter' is a combine_protocol, the Fence combine)."
+            )
         if self.kernel_variant not in ("inference", "genphase"):
             raise ValueError(f"unsupported kernel_variant {self.kernel_variant!r}.")
         if self.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
@@ -669,19 +656,6 @@ class BlockScaledMoeConfig:
                 "combine_warp_stores must be None or a Python bool, and True requires GenPhase with "
                 f"combine_protocol='counter', got {self.combine_warp_stores!r}."
             )
-        if self.dispatch_rounds not in (1, 2, 4, 8):
-            raise ValueError(
-                f"dispatch_rounds must be 1, 2, 4 or 8, got {self.dispatch_rounds!r}."
-            )
-        if self.dispatch_rounds > 1 and self.dispatch_protocol != "counter":
-            raise ValueError(
-                "dispatch_rounds > 1 requires dispatch_protocol='counter'."
-            )
-        # A rank acquires only the rounds its own experts need, so the clear of
-        # the round counters relies on the counter combine's all-rank barrier to
-        # order every peer's publications before it.
-        if self.dispatch_rounds > 1 and self.combine_protocol != "counter":
-            raise ValueError("dispatch_rounds > 1 requires combine_protocol='counter'.")
         # Peers read a rank's staged activations until their communication grids
         # complete, and only the counter combine's all-rank tail barrier orders
         # that before the rank's next staging.
@@ -699,12 +673,12 @@ class BlockScaledMoeConfig:
                     f"got {value!r}."
                 )
         if self.comm_exchange_ctas is not None and (
-            self.dispatch_protocol == "sentinel"
+            self.dispatch_protocol != "pull"
             or type(self.comm_exchange_ctas) is not int
             or self.comm_exchange_ctas < 1
         ):
             raise ValueError(
-                "comm_exchange_ctas must be None or a positive Python integer under the counter or pull dispatch, "
+                "comm_exchange_ctas must be None or a positive Python integer under the pull dispatch, "
                 f"got {self.comm_exchange_ctas!r}."
             )
         if self.pull_warps is not None and (
@@ -1131,19 +1105,14 @@ class BlockScaledMoeConfig:
         if self.entry_prefetch_bytes is not None:
             return self.entry_prefetch_bytes
         prefetch = ENTRY_PREFETCH_BYTES
-        whole_payload = (
-            self.dispatch_protocol == "counter" and self.dispatch_rounds == 1
-        )
-        long_sentinel_dispatch = (
-            self.dispatch_protocol == "sentinel"
-            and self.max_tokens_per_rank >= SENTINEL_DISPATCH_ENTRY_PREFETCH_MIN_TOKENS
-        )
         if (
             self.kernel_variant == "genphase"
-            and (whole_payload or long_sentinel_dispatch)
-            and self.max_tokens_per_rank <= WHOLE_PAYLOAD_ENTRY_PREFETCH_MAX_TOKENS
+            and self.dispatch_protocol == "sentinel"
+            and SENTINEL_DISPATCH_ENTRY_PREFETCH_MIN_TOKENS
+            <= self.max_tokens_per_rank
+            <= SENTINEL_DISPATCH_ENTRY_PREFETCH_MAX_TOKENS
         ):
-            prefetch = WHOLE_PAYLOAD_ENTRY_PREFETCH_BYTES
+            prefetch = SENTINEL_DISPATCH_ENTRY_PREFETCH_BYTES
         if self.resolved_shared_expert_entry:
             shared_fc1_bytes = (
                 2 * self.intermediate * self.hidden * (1 + 1 / self.sf_vec_size)
@@ -1798,9 +1767,6 @@ class BlockScaledSymmBuffer:
             impl_fields["die_local_weights"] = True
         if cfg.comm_pusher_ctas is not None:
             impl_fields["comm_pusher_ctas"] = cfg.comm_pusher_ctas
-        if cfg.dispatch_rounds != 1:
-            impl_fields["dispatch_rounds"] = cfg.dispatch_rounds
-            impl_fields["dispatch_round_mode"] = cfg.dispatch_round_mode
         if cfg.comm_push_depth is not None:
             impl_fields["comm_push_depth"] = cfg.comm_push_depth
         if cfg.comm_pull_depth is not None:
@@ -1828,14 +1794,6 @@ class BlockScaledSymmBuffer:
                     cfg.resolved_fc1_token_pool_capacity
                 )
                 impl_fields["fc1_token_pool_fallback"] = cfg.fc1_token_pool_fallback
-        if cfg.refine_exchange_ctas is not None:
-            impl_fields["refine_exchange_ctas"] = cfg.refine_exchange_ctas
-        if cfg.round_publish_lag is not None:
-            impl_fields["round_publish_lag"] = cfg.round_publish_lag
-        if cfg.round_publish_delay_ns:
-            impl_fields["round_publish_delay_ns"] = cfg.round_publish_delay_ns
-        if cfg.refine_gate_round0_only:
-            impl_fields["refine_gate_round0_only"] = True
         if cfg.comm_stamps:
             impl_fields["stamps"] = True
         if cfg.resolved_just_in_time_claims:

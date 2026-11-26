@@ -10,10 +10,9 @@ eligible immediately and streams weights while the payload is still on the wire.
 Three consequences of that split shape the kernel.
 
 Readiness is whole-rank except at FC1's gate. The communication component
-publishes the plan through counters for its entire grid (``sizes_ready``,
-``metadata_ready``, and under the whole-payload Fence push dispatch the payload
-counters), which each consumer warp waits on once before its work loop. TMA-B
-alone waits per tile: before every FC1 tile it acquires its expert's
+publishes the plan through counters for its entire grid (``sizes_ready`` and
+``metadata_ready``), which each consumer warp waits on once before its work
+loop. TMA-B alone waits per tile: before every FC1 tile it acquires its expert's
 ``fc1_sf_ready`` or, under the pull dispatch with ``pull_tile_ready``, its token
 tile's ``fc1_tile_ready``, and Gather-B issues the tile's rows only behind that
 gate. The FC12 extension's scheduler-side FC1 ready counter stays unused.
@@ -39,11 +38,11 @@ poller CTAs poll their combine slots while FC2 is still running; its
 housekeeping CTAs wait for this grid, which has itself drained the
 communication grid, before they reset landing rows and clear the local counters
 this round used. Under the Sentinel combine no cross-rank barrier is needed:
-every peer-written region is a landing set whose bytes, or under the Fence push
-dispatch the payload counters, announce its arrival. The counter (Fence) combine
-ends this kernel with one all-rank tail barrier instead (``tail_barrier``):
-after the grid's last FC2 store it publishes this rank's pushes, and leaving it
-means every peer's pushes into this rank have landed.
+every peer-written region is a landing set whose bytes announce their arrival.
+The counter (Fence) combine ends this kernel with one all-rank tail barrier
+instead (``tail_barrier``): after the grid's last FC2 store it publishes this
+rank's pushes, and leaving it means every peer's pushes into this rank have
+landed.
 
 Under the counter combine the top-k reduce can run in this kernel instead
 (``reduce_topk_in_kernel``): the FC2 epilogue adds each route's BF16 partial
@@ -71,7 +70,7 @@ clusters that start with the kernel hold all the work at no more FC1 tiles each
 than all clusters would, and late clusters taking FC1 tiles would only slow
 every SM's weight stream, so claims stay eager.
 
-The same claims serve the Fence dispatch at large capacities. With eager claims
+The same claims serve the pull dispatch at large capacities. With eager claims
 every cluster holds several tiles beyond the one it runs: the last tiles are
 bound to clusters before it is known which ones free up first, and an FC2 tile
 can wait at the head of its cluster's queue for FC1 tiles that a later claim
@@ -314,7 +313,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     # they measure 0.5 to 7 us slower than the walking CTAs at EP8.
     main_pull_warp_count: ClassVar[int] = 0
     refine_participant_groups: ClassVar[int] = 2
-    refine_output_stages: ClassVar[int] = 4
 
     cluster_shape_mn: ClassVar[Tuple[int, int]] = (4, 1)
     mma_k_mode: ClassVar[str] = "1x"
@@ -363,7 +361,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             "entry_prefetch_bytes": OptionalRequirement(int),
             "die_local_weights": OptionalRequirement(bool),
             # Dispatch knobs the communication component consumes (see GenphaseTokenComm).
-            "dispatch_rounds": OptionalRequirement(int),
             "comm_push_depth": OptionalRequirement(int),
             "comm_pull_depth": OptionalRequirement(int),
             "comm_pull_chunk_rows": OptionalRequirement(int),
@@ -378,11 +375,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             "fc1_token_pool_fallback": OptionalRequirement(str),
             "pull_walk_dedup": OptionalRequirement(bool),
             "pull_tile_ready": OptionalRequirement(bool),
-            "refine_exchange_ctas": OptionalRequirement(int),
-            "dispatch_round_mode": OptionalRequirement(str),
-            "round_publish_delay_ns": OptionalRequirement(int),
-            "round_publish_lag": OptionalRequirement(int),
-            "refine_gate_round0_only": OptionalRequirement(bool),
             "stamps": OptionalRequirement(bool),
             "just_in_time_claims": OptionalRequirement(bool),
             "claim_lead_k_tiles": OptionalRequirement(int),
@@ -664,7 +656,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 **impl_desc,
                 "pusher_cta_count": self.pusher_cta_count,
                 "refine_participant_groups": self.refine_participant_groups,
-                "refine_output_stages": self.refine_output_stages,
                 "dispatch_protocol": self.dispatch_protocol,
                 "pull_warps": self.pull_warps,
                 **(
@@ -718,15 +709,6 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.shared_expert_tiles = (
             self._shared_expert_tiles() if self.shared_expert else None
         )
-        # A rank's refine acquires only the dispatch rounds its experts need, so a
-        # peer's publication of another round may still be in flight when this
-        # rank's reduce clears the round counters. Only the tail barrier, which
-        # every rank enters after its communication grid completed, orders all of
-        # them before the clear.
-        if self.token_comm.dispatch_rounds > 1 and self.tail_barrier is None:
-            raise ValueError(
-                "dispatch_rounds > 1 requires the counter combine protocol."
-            )
 
         fc12_problem_desc = ProblemDesc(
             {**problem_desc, "expert_count": self.local_expert_count}
@@ -1516,7 +1498,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"{f'gatherwarps{self.active_gather_b_warp_count}' if self.token_pool_capacity else ''}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
-            f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}x{self.refine_output_stages}_"
+            f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
             f"{'' if self.situ_beta is None else f'situ{float(self.situ_beta)}x{float(self.situ_linear_beta)}_'}"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
@@ -2583,22 +2565,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     def _wait_gather_input_ready(
         self, warp_idx: Int32, thread_idx: Int32, linear_cta_idx: Int32
     ) -> None:
-        """A Gather-B warp's wait for the index lists, and under the whole-payload Fence dispatch for the payload.
+        """A Gather-B warp's wait for the index lists.
 
         ``gather_index`` is local, published by this rank's index-copy CTAs (the
-        planners under the Sentinel dispatch); the payload flag is written by
-        peers, hence the wider scope. Per-expert and per-tile readiness is
-        TMA-B's gate, which it passes before releasing the Gather4 issue barrier.
+        planners under the Sentinel dispatch). Per-expert and per-tile readiness
+        is TMA-B's gate, which it passes before releasing the Gather4 issue
+        barrier.
         """
         iket.range_push("gather_b1.wait_input_ready")
-        if cutlass.const_expr(
-            self.dispatch_protocol == "counter" and not self.token_comm.round_gated
-        ):
-            spin_wait(
-                self._device_workspace.ptr(self.token_comm.token_data_ready_region),
-                lambda value: value == Int32(self.token_comm.payload_ready_target),
-                scope="sys",
-            )
         spin_wait(
             self._device_workspace.ptr(self.token_comm.metadata_ready_region),
             lambda value: value == Int32(self.token_comm.metadata_ready_target),
@@ -3713,27 +3687,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                     else:
                         iket.range_push("gather_b1.wait_input_ready")
                         # `gather_index` is local, published by this rank's index-copy CTAs
-                        # (the planners under the Sentinel dispatch); the payload flag is
-                        # written by peers, hence the wider scope.
-                        # Under the Sentinel dispatch payload readiness is per expert: TMA-B
-                        # acquires each expert's verified-rows count before releasing the
-                        # Gather4 issue barrier. So it is under round gating, where an
-                        # expert's refine blocks acquire its round's counters first, and
-                        # under the pull dispatch, where this rank fetches the expert's rows
-                        # and counts them once they have landed. The whole-payload counter
-                        # dispatch publishes everything with one per-peer counter.
-                        if cutlass.const_expr(
-                            self.dispatch_protocol == "counter"
-                            and not self.token_comm.round_gated
-                        ):
-                            spin_wait(
-                                self._device_workspace.ptr(
-                                    self.token_comm.token_data_ready_region
-                                ),
-                                lambda value: value
-                                == Int32(self.token_comm.payload_ready_target),
-                                scope="sys",
-                            )
+                        # (the planners under the Sentinel dispatch). Payload readiness is
+                        # per expert or token tile: TMA-B acquires each expert's
+                        # verified-rows count under the Sentinel dispatch, or the routes
+                        # this rank fetched and counted once they landed under the pull
+                        # dispatch, before releasing the Gather4 issue barrier.
                         spin_wait(
                             self._device_workspace.ptr(
                                 self.token_comm.metadata_ready_region
