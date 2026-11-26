@@ -454,7 +454,12 @@ def _check_borrowed_input_contract(pack, transformed, hidden, intermediate):
         )
 
 
-def _weight_layout_worker(rank, duplicate_destinations=False, dedup_compact=False):
+def _weight_layout_worker(
+    rank,
+    duplicate_destinations=False,
+    dedup_compact=False,
+    capacity_override: int | None = None,
+):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -482,7 +487,11 @@ def _weight_layout_worker(rank, duplicate_destinations=False, dedup_compact=Fals
     raw1, ref1 = _weights(experts // ep, 2 * intermediate, hidden, generator)
     raw2, ref2 = _weights(experts // ep, hidden, intermediate, generator)
     args = _args(ep=ep)
-    capacity = 16 if dedup_compact else 128
+    capacity = (
+        capacity_override
+        if capacity_override is not None
+        else (16 if dedup_compact else 128)
+    )
     output = torch.empty(capacity, hidden, dtype=torch.bfloat16, device="cuda")
     for interleave, scale_layout in (
         (True, "kernel"),
@@ -628,7 +637,12 @@ def _weight_layout_worker(rank, duplicate_destinations=False, dedup_compact=Fals
                 ),
             )
             dedup_layer.warmup()
-        for bound in (1, 16) if dedup_compact else (1, 12, 128):
+        bounds = (
+            (1, capacity)
+            if capacity_override is not None
+            else ((1, 16) if dedup_compact else (1, 12, 128))
+        )
+        for bound in bounds:
             rows = (
                 bound if dedup_compact else (bound, 0, max(bound // 2, 1), 1)[rank % 4]
             )
@@ -879,6 +893,15 @@ def test_sm120_nosync_dedup_compact_workspace():
     )
 
 
+def test_sm120_nosync_dedup_workspace_192():
+    """A larger capacity preserves leader masking and exact original outputs."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    torch.multiprocessing.spawn(
+        _weight_layout_worker, args=(False, True, 192), nprocs=4, join=True
+    )
+
+
 def test_sm120_nosync_weight_layouts():
     """Default and borrowed weight layouts preserve numerics across DP and graph replay."""
     if not _sm120_gpus(4):
@@ -891,6 +914,13 @@ def test_sm120_nosync(ep):
     if not _sm120_gpus(ep):
         pytest.skip(f"requires {ep} SM120 GPUs")
     _run(_args(ep=ep))
+
+
+def test_sm120_nosync_wrapper_192():
+    """NosyncOptions runs 192 tokens and uses the larger base backend at 193."""
+    if not _sm120_gpus(2):
+        pytest.skip("requires 2 SM120 GPUs")
+    _run(_args(ep=2, capacity=193, threshold=192, tokens=[192, 193], repeats=1))
 
 
 @pytest.mark.parametrize("routing", ["hot", "empty", "invalid"])

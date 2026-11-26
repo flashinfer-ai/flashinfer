@@ -24,12 +24,12 @@ TOKENS_PER_ITEM = (8, 16, 24, 32)
 # The kernel is measured faster than cake and cutedsl up to 128 tokens per rank (RTX 6000D and
 # RTX PRO 6000, DeepSeek-V4-Flash, DeepSeek-V4.1-Flash and GLM-5.3-Flash MoE shapes); its expert
 # pools hold max_tokens_per_rank rows per (local expert, source rank).
-MAX_TOKENS_PER_RANK = 128
+MAX_TOKENS_PER_RANK = 192
 
 
 @dataclass
 class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
-    """Static parameters of the nosync kernel (at most 128 tokens per rank).
+    """Static parameters of the nosync kernel (at most 192 tokens per rank).
 
     Deployments normally reach it through :class:`NosyncSwitchConfig`, which runs it for
     small batches and the deployment's own backend for the rest.
