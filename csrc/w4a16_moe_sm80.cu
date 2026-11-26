@@ -246,11 +246,14 @@ __device__ __forceinline__ uint32_t nib2(uint32_t w, uint32_t w4) {
   const uint32_t q = __byte_perm(w4, w, (I << 4) | ((4 + I) << 12));
   return (q & 0x80008000u) | ((q >> 6) & 0x01C001C0u);
 }
-// OW MXFP4: acc + RN(d 2^(ea + eb - 247)) for the E8M0 bytes ea, eb (255: NaN), d exact; two
-// power-of-two steps, so a subnormal or overflowing product is rounded once.
+// OW MX: acc + RN(d 2^(ea + eb - BIAS)) for the E8M0 bytes ea, eb (255: NaN); two power-of-two
+// steps, the first exact (d 2^LO keeps d's last bit, d 2^HI overflows only past the result's
+// range), so a subnormal or overflowing product is rounded once. MXFP4: <247, -109, 117>; MXFP8
+// (F8): E4M3 weights <246, -100, 112>, E5M2 <254, -94, 90>.
+template <int BIAS, int LO, int HI>
 __device__ __forceinline__ float mx_slow(float acc, float d, uint32_t ea, uint32_t eb) {
-  const int e = static_cast<int>(ea + eb) - 247;
-  const int e1 = min(max(e, -109), 117), e2 = min(max(e - e1, -149), 127);
+  const int e = static_cast<int>(ea + eb) - BIAS;
+  const int e1 = min(max(e, LO), HI), e2 = min(max(e - e1, -149), 127);
   const float s1 = __uint_as_float((e1 + 127) << 23);
   const float s2 = __uint_as_float(e2 >= -126 ? (e2 + 127) << 23 : 1u << (e2 + 149));
   const float r = __fmul_rn(__fmul_rn(d, s1), s2);
@@ -366,10 +369,22 @@ struct GemmParamsMx : GemmParamsOw {
 // n row_stride + (k / 128) kstep_stride + k % 128, b the block's expert (its batch); act prep's
 // BF16 activation [rows][kp] (kp = pad(K, 32)); the sum times alpha[0], times bs[0] (bmm's B scale;
 // null: 1) first. block_expert indexes no alpha.
+// MX (MXFP8): sf the weights' E8M0 scales (128x4, batch b at b sf_bstride), asf the
+// activation's, rows stacked over the batches (128x4, or 8x4 with a8x4), alpha[0] 1.
+// GW (the groupwise FP8 GEMM): FP32 scales per k-step, gsa's of activation row t at
+// (t / gm) sa_r + k sa_k, gsb's of batch b and weight rows 128 c .. at b sf_bstride + c sb_n +
+// k sb_k, alpha[0] 1.
 struct GemmParamsF8 : GemmParamsOw {
   long row_stride, kstep_stride, batch_stride;
   const float* bs;
   int kp;
+  const uint8_t* asf;
+  long sf_bstride;
+  bool a8x4;
+  const float* gsa;
+  const float* gsb;
+  long sa_r, sa_k, sb_n, sb_k;
+  int gm;
 };
 template <bool FQ, bool OW = false, bool MX = false, int F8 = 0>
 using GemmParamsT = std::conditional_t<
@@ -729,15 +744,17 @@ __device__ __forceinline__ int shuffled_row(int n) {
 // shuffle (shuffle_matrix_a, shuffle_matrix_sf_a), each row read from where it is stored. F8 (OW,
 // 1: E4M3 weights, 2: E5M2; gemm_f8, the dense mm_fp8 / bmm_fp8): the FP8 weights (GemmParamsF8) in
 // 128 B rows, chunk c of row r at c ^ (r & 7), each word as two bf16x2 of w 2^-120 / 2^-112; the
-// activation (prep, x 2^112) in the matching k order, its rows gathered by rowmap.
+// activation (prep, x 2^112) in the matching k order, its rows gathered by rowmap. GW (F8): each
+// k-step's sum times its FP32 scales (GemmParamsF8).
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
           bool Q12F = false, bool VS = false, bool FQ = false, bool PT = false, bool OW = false,
-          bool MX = false, bool SH = false, int F8 = 0>
+          bool MX = false, bool SH = false, int F8 = 0, bool GW = false>
 __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) {
   static_assert(!FQ || ACT != 0 || R == 8, "FQ: a GEMM1 epilogue or the R 8 GEMM2 sum");
   static_assert(!MX || OW, "MX: OW");
-  static_assert(!SH || (OW && !MX), "SH: OW, not MX");
-  static_assert(!F8 || (OW && !MX), "F8: OW, not MX");
+  static_assert(!SH || (OW && (!MX || F8)), "SH: OW, not MXFP4");
+  static_assert(!F8 || OW, "F8: OW");
+  static_assert(!GW || (F8 && !MX && !SH), "GW: F8, not MX or shuffled");
   using C = Cfg<R, NC>;
   constexpr int NT = NW * 32;
   constexpr int SC = 8 * NC / WC, WT = NW / WC, TW = R / WT, G = TW / 8;
@@ -761,9 +778,13 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
   constexpr int AP = SWZ || OW ? 256 : kActPitch;
   static_assert(!SWZ || (RP % 8 == 0 && TW % 8 == 0),
                 "swizzle: r & 7 is fixed per thread and per lane");
-  // F8: a stage is the 128 weight rows (128 B each), then the activation
+  // F8: a stage is the 128 weight rows (128 B each), then the activation (MX: then the weights'
+  // E8M0 atom and R activation words; GW: the weights' scale, at 16 B the R activation scales)
   constexpr uint32_t kActOff = F8 ? kF8WBytes : NC * kRec;
-  constexpr uint32_t kStage = F8 ? kF8WBytes + R * 256 : C::kStageBytes;  // ow_stage_bytes
+  constexpr uint32_t kSfOff = F8 ? kF8WBytes + R * 256 : kWBytes;
+  constexpr uint32_t kStage =
+      F8 ? kSfOff + (MX || GW ? ((MX ? 512 : 16) + R * 4 + 127) / 128 * 128 : 0)
+         : C::kStageBytes;  // ow_stage_bytes
   constexpr uint32_t kRing = STAGES * kStage;
   extern __shared__ __align__(128) uint8_t smem[];
   const int nb = *p.nblocks;
@@ -825,6 +846,8 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
   [[maybe_unused]] int ow_rows = 0;
   [[maybe_unused]] const uint8_t* gsf = nullptr;
   [[maybe_unused]] const uint8_t* gasf = nullptr;
+  [[maybe_unused]] const float* gsa = nullptr;  // GW: row tid's scale, the tile's
+  [[maybe_unused]] const float* gsb = nullptr;
   // PT GEMM1: the s_t of this thread's rows (aq 0) and alpha, stored past the ring as row scales
   [[maybe_unused]] float pt_s[PT && ACT ? RJ : 1];
   [[maybe_unused]] float pt_a = 0.f;
@@ -840,6 +863,10 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
         ow_rows = p.N - (c * kTileN + (tid >> 3));
         gws[rec] = p.w + e * p.batch_stride + (c * kTileN + (SH ? 0 : tid >> 3)) * p.row_stride +
                    iks * p.kstep_stride + (tid & 7) * 16;
+        if constexpr (MX)  // threads 0..31: 16 B of the k-step's 512 B atom (SH: the stored row's)
+          gsf = p.sf + e * p.sf_bstride + (static_cast<long>(c) * p.nka + iks) * 512 +
+                (SH ? shuffled_row(tid & 31) : tid & 31) * 16;
+        if constexpr (GW) gsb = p.gsb + e * p.sf_bstride + c * p.sb_n + iks * p.sb_k;
       } else if constexpr (OW) {
         ow_rows = p.N - (c * kTileN + (tid >> 2));
         gws[rec] = p.w +
@@ -856,8 +883,15 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
     }
     if constexpr (MX) {  // row tid's E8M0 word of k-step iks (a padding row: the last real row's)
       const int t = p.rowmap[ib * R + min(tid, brows - 1)];
-      gasf = p.asf + ((static_cast<long>(t) >> 7) * p.nka + iks) * 512 + (t & 31) * 16 +
-             ((t >> 5) & 3) * 4;
+      bool a8x4 = false;  // F8: the trtllm 8x4 activation layout
+      if constexpr (F8 != 0) a8x4 = p.a8x4;
+      gasf = a8x4 ? p.asf + ((static_cast<long>(t) >> 3) * p.nka + iks) * 32 + (t & 7) * 4
+                  : p.asf + ((static_cast<long>(t) >> 7) * p.nka + iks) * 512 + (t & 31) * 16 +
+                        ((t >> 5) & 3) * 4;
+    }
+    if constexpr (GW) {  // row tid's scale (a padding row: the last real row's)
+      const int t = p.rowmap[ib * R + min(tid, brows - 1)];
+      gsa = p.gsa + t / p.gm * p.sa_r + iks * p.sa_k;
     }
 #pragma unroll
     for (int j = 0; j < RJ; ++j) {
@@ -900,6 +934,14 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
         const bool in = kin && q * (NT / 8) < ow_rows;
         const int r = SH ? shuffled_row((tid >> 3) + q * (NT / 8)) : q * (NT / 8);
         cp16z(dst + q * NT * 16, in ? gws[0] + r * p.row_stride : p.w, in);
+      }
+      if constexpr (MX) {  // the weights' E8M0 atom of the k-step, then R activation words
+        if (tid < 32) cp16z(sw_i + islot + kSfOff, gsf, true);
+        if (tid < R) cp4(sbase + islot + kSfOff + 512 + tid * 4, gasf);
+      }
+      if constexpr (GW) {
+        if (tid == NT - 1) cp4(sbase + islot + kSfOff, gsb);
+        if (tid < R) cp4(sbase + islot + kSfOff + 16 + tid * 4, gsa);
       }
     } else if constexpr (OW) {
       // row tid / 4 + q NT / 4 of the record's 128 rows (64 B each), its 16 B chunk tid & 3 (k
@@ -962,6 +1004,14 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
     islot = islot + kStage == kRing ? 0u : islot + kStage;
     if constexpr (F8 != 0) {
       gws[0] += p.kstep_stride;
+      if constexpr (MX) {
+        gsf += 512;
+        gasf += p.a8x4 ? 32 : 512;
+      }
+      if constexpr (GW) {
+        gsa += p.sa_k;
+        gsb += p.sb_k;
+      }
     } else if constexpr (OW) {
       gws[0] += kTileK / 2;
       gsf += MX ? 512 : kSBytes;
@@ -1183,7 +1233,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
                   reinterpret_cast<OT*>(p.out)[f * Nout + n + 8] =
                       to_o(mul_ftz(v[s][gi][2 + h] * 128.f, r));
               } else if constexpr (OW) {  // the sum (times 2^7, exact; F8: 2^8 E4M3, 1) times alpha
-                constexpr float kSum = MX ? 1.f : F8 == 1 ? 256.f : F8 ? 1.f : 128.f;
+                constexpr float kSum = MX || GW ? 1.f : F8 == 1 ? 256.f : F8 ? 1.f : 128.f;
                 const float r = p.alpha_rows ? p.alpha[f] : a;
                 if (n < Nout)
                   reinterpret_cast<OT*>(p.out)[f * Nout + n] = to_o(v[s][gi][h] * kSum * r);
@@ -1392,7 +1442,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
                               : (SC > 1 && G % 4 == 0 ? 4 : 1);
   auto step = [&](auto ngc, uint32_t sb, bool hf) {
     constexpr int NG = decltype(ngc)::value;
-    if constexpr (OW && MX) {
+    if constexpr (OW && MX && F8 == 0) {
       // Each k32 group j: d = the exact MMA sum of (e2m1 2^-126) x (e2m1 2^119), then
       // acc += RN(d 2^(ea + eb - 247)). When every scale byte the warp reads keeps the
       // power of two normal (weights 96..159, activations 64..191) that is one FFMA.
@@ -1464,7 +1514,91 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
                 if constexpr (decltype(fast_c)::value)
                   c = __fmaf_rn(d[q], __uint_as_float((ea + eb - 120u) << 23), c);
                 else
-                  c = mx_slow(c, d[q], ea, eb);
+                  c = mx_slow<247, -109, 117>(c, d[q], ea, eb);
+              }
+            }
+          }
+        }
+      };
+      if (fast)
+        blocks(std::true_type{});
+      else
+        blocks(std::false_type{});
+    } else if constexpr (F8 != 0 && MX) {
+      // MXFP8: each k32 group j: d = the exact MMA sum of the weights (x 2^-120 E4M3, 2^-112
+      // E5M2; the F8 words below) times the activation (x 2^112, prep), then acc += RN(d 2^(ea +
+      // eb - B)): one FFMA when the warp's weights hold no Inf / NaN and its scale bytes keep the
+      // power of two normal (weights 96..159, activations 64..191), as MXFP4 above
+      constexpr int B = F8 == 1 ? 246 : 254;
+      const int mx_rows = p.N - (blockIdx.x % chunks) * kTileN;
+      const uint32_t sa_mx = sbase + kSfOff + 512 + (wt * TW + 2 * tq) * 4;
+      uint32_t wq[SC][16], sq[SC][2], aq2[NG][2];
+      uint32_t sp = 0;
+#pragma unroll
+      for (int s = 0; s < SC; ++s) {
+        const int ws = wc * SC + s;
+        const uint32_t ss = sbase + kSfOff + sb + ((ws & 1) * 16 + g8) * 16 + (ws >> 1) * 4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          ldsm_x4(wq[s] + 4 * j, sbase + (sw_f ^ (j << 5)) + sb + s * 2048);
+#pragma unroll
+          for (int i = 0; i < 4; ++i) sp |= f8_special<F8>(wq[s][4 * j + i]);
+        }
+        lds32v(sq[s], ss);
+        lds32v(sq[s] + 1, ss + 128);
+      }
+#pragma unroll
+      for (int gi = 0; gi < NG; ++gi) lds64v(aq2[gi], sa_mx + sb + gi * 32);
+      const uint32_t vm = KT && mx_nj < 4 ? (1u << 8 * mx_nj) - 1 : ~0u;
+      uint32_t m7 = ~0u, m6 = 0u;
+#pragma unroll
+      for (int s = 0; s < SC; ++s)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t mk = (wc * SC + s) * 16 + h * 8 + g8 < mx_rows ? vm : 0u;
+          const uint32_t x = sq[s][h] ^ (sq[s][h] << 1);
+          m7 &= x | ~mk;
+          m6 |= x & mk;
+        }
+#pragma unroll
+      for (int gi = 0; gi < NG; ++gi)
+#pragma unroll
+        for (int t = 0; t < 2; ++t) m7 &= (aq2[gi][t] ^ (aq2[gi][t] << 1)) | ~vm;
+      const bool fast =
+          __all_sync(~0u, sp == 0 && (m7 & 0x80808080u) == 0x80808080u && !(m6 & 0x40404040u));
+      auto blocks = [&](auto fast_c) {
+        constexpr bool FAST = decltype(fast_c)::value;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          if (KT && j >= mx_nj) break;
+          uint32_t a[SC][2][4];
+#pragma unroll
+          for (int s = 0; s < SC; ++s)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+              f8_bf16x2<F8, !FAST>(wq[s][4 * j + 2 * h], a[s][h][0], a[s][h][2]);
+              f8_bf16x2<F8, !FAST>(wq[s][4 * j + 2 * h + 1], a[s][h][1], a[s][h][3]);
+            }
+#pragma unroll
+          for (int gi = 0; gi < NG; ++gi) {
+            uint32_t bf[4];
+            lds128(bf, ((j & 1) ? sa_o1 : sa_o0) + sb + gi * 8 * 256 + (j >> 1) * 128);
+#pragma unroll
+            for (int s = 0; s < SC; ++s) {
+              float d[4] = {0.f, 0.f, 0.f, 0.f};
+              mma_x(d, a[s][0], bf);
+              mma_x(d, a[s][1], bf + 2);
+#pragma unroll
+              for (int q = 0; q < 4; ++q) {
+                const uint32_t ea = (sq[s][q >> 1] >> 8 * j) & 255u;
+                const uint32_t eb = (aq2[gi][q & 1] >> 8 * j) & 255u;
+                float& c = acc[s][gi][q];
+                if constexpr (FAST)
+                  c = __fmaf_rn(d[q], __uint_as_float((ea + eb - (B - 127)) << 23), c);
+                else if constexpr (F8 == 1)
+                  c = mx_slow<246, -100, 112>(c, d[q], ea, eb);
+                else
+                  c = mx_slow<254, -94, 90>(c, d[q], ea, eb);
               }
             }
           }
@@ -1489,6 +1623,20 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
 #pragma unroll
           for (int i = 0; i < 4; ++i) sp |= f8_special<F8>(wq[s][4 * j + i]);
         }
+      // GW: the k-step's scale of activation rows wt TW + gi 8 + 2 tq (+ 1) times the tile's
+      // (x 2^8 for E4M3, whose products carry 2^-8)
+      [[maybe_unused]] float gs[GW ? NG : 1][2];
+      if constexpr (GW) {
+        uint32_t v[2];
+        lds32v(v, sbase + kSfOff + sb);
+        const float sw = __uint_as_float(v[0]) * (F8 == 1 ? 256.f : 1.f);
+#pragma unroll
+        for (int gi = 0; gi < NG; ++gi) {
+          lds64v(v, sbase + kSfOff + 16 + sb + (wt * TW + gi * 8 + 2 * tq) * 4);
+          gs[gi][0] = __uint_as_float(v[0]) * sw;
+          gs[gi][1] = __uint_as_float(v[1]) * sw;
+        }
+      }
       auto run = [&](auto spec) {
         constexpr bool SPEC = decltype(spec)::value;
 #pragma unroll
@@ -1499,15 +1647,34 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
           for (int gi = 0; gi < NG; ++gi)
             lds128(bf[gi], ((j & 1) ? sa_o1 : sa_o0) + sb + gi * 8 * 256 + (j >> 1) * 128);
 #pragma unroll
-          for (int s = 0; s < SC; ++s)
+          for (int s = 0; s < SC; ++s) {
+            if constexpr (GW) {  // group j's exact sum d, then acc += RN(d scale), as MXFP8
+              uint32_t a[2][4];
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {  // chunk 2 j + h: words of rows g (m = 2 h), g + 8
-              uint32_t a[4];
-              f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h], a[0], a[2]);
-              f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h + 1], a[1], a[3]);
+              for (int h = 0; h < 2; ++h) {
+                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h], a[h][0], a[h][2]);
+                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h + 1], a[h][1], a[h][3]);
+              }
 #pragma unroll
-              for (int gi = 0; gi < NG; ++gi) mma_x(acc[s][gi], a, bf[gi] + 2 * h);
+              for (int gi = 0; gi < NG; ++gi) {
+                float d[4] = {0.f, 0.f, 0.f, 0.f};
+                mma_x(d, a[0], bf[gi]);
+                mma_x(d, a[1], bf[gi] + 2);
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                  acc[s][gi][q] = __fmaf_rn(d[q], gs[gi][q & 1], acc[s][gi][q]);
+              }
+            } else {
+#pragma unroll
+              for (int h = 0; h < 2; ++h) {  // chunk 2 j + h: words of rows g (m = 2 h), g + 8
+                uint32_t a[4];
+                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h], a[0], a[2]);
+                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h + 1], a[1], a[3]);
+#pragma unroll
+                for (int gi = 0; gi < NG; ++gi) mma_x(acc[s][gi], a, bf[gi] + 2 * h);
+              }
             }
+          }
         }
       };
       if (__any_sync(~0u, sp != 0))
@@ -1692,7 +1859,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
     cslot = cslot + kStage == kRing ? 0u : cslot + kStage;
     bool hf = false;
     if constexpr (KT) hf = half && u == S - 1;
-    if constexpr (MX && KT) mx_nj = u == S - 1 ? kr / 32 : 4;
+    if constexpr (MX && KT) mx_nj = u == S - 1 ? (F8 ? kra : kr) / 32 : 4;
     // clang-format off
 #define W4A16_STEP(n) case n: if constexpr (n < Q) { \
         step(std::integral_constant<int, n * G / Q>{}, sb, hf); break; } [[fallthrough]];
@@ -1731,9 +1898,11 @@ __global__ void __launch_bounds__(NW * 32) gemm_pt(GemmParamsT<FQ> p) {
 #if !defined(RECORDS_F16) && !defined(RECORDS_ACT) && !defined(RECORDS_EXACT) && \
     !defined(RECORDS_E4M3_MAX)
 #define RECORDS_OW
-template <int R, int WC, int NW, int STAGES, bool KT, bool MX = false, bool SH = false, int F8 = 0>
+template <int R, int WC, int NW, int STAGES, bool KT, bool MX = false, bool SH = false, int F8 = 0,
+          bool GW = false>
 __global__ void __launch_bounds__(NW * 32) gemm_ow(GemmParamsT<false, true, MX, F8> p) {
-  gemm_body<R, WC, NW, 0, STAGES, KT, 1, false, false, false, false, false, true, MX, SH, F8>(p);
+  gemm_body<R, WC, NW, 0, STAGES, KT, 1, false, false, false, false, false, true, MX, SH, F8, GW>(
+      p);
 }
 
 // gemm_f8's input: the threads stride over the routing of b batches of bm rows to blocks of R
@@ -2546,38 +2715,39 @@ void launch_tile(int R, GemmParamsT<FQ> const& p, int grid, cudaStream_t st) {
 }
 
 #ifdef RECORDS_OW
-template <int R, int F8>
+template <int R, int F8, bool MX = false, bool GW = false>
 constexpr int ow_stage_bytes() {  // gemm_body's kStage
-  return F8 ? kF8WBytes + R * 256 : Cfg<R, 1>::kStageBytes;
+  return F8 ? kF8WBytes + R * 256 + (MX || GW ? ((MX ? 512 : 16) + R * 4 + 127) / 128 * 128 : 0)
+            : Cfg<R, 1>::kStageBytes;
 }
-template <int R, int WC, int NW, int STAGES, bool KT, bool MX, bool SH, int F8>
+template <int R, int WC, int NW, int STAGES, bool KT, bool MX, bool SH, int F8, bool GW>
 void launch_gemm_ow(GemmParamsT<false, true, MX, F8> const& p, int grid, cudaStream_t st) {
-  const int smem = STAGES * ow_stage_bytes<R, F8>();
+  const int smem = STAGES * ow_stage_bytes<R, F8, MX, GW>();
   TVM_FFI_ICHECK(smem <= max_smem_optin()) << "W4A16 MoE GEMM: tile exceeds device shared memory";
-  cudaFuncSetAttribute(gemm_ow<R, WC, NW, STAGES, KT, MX, SH, F8>,
+  cudaFuncSetAttribute(gemm_ow<R, WC, NW, STAGES, KT, MX, SH, F8, GW>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  gemm_ow<R, WC, NW, STAGES, KT, MX, SH, F8><<<grid, NW * 32, smem, st>>>(p);
+  gemm_ow<R, WC, NW, STAGES, KT, MX, SH, F8, GW><<<grid, NW * 32, smem, st>>>(p);
 }
 
 // OW: launch_tile's kBase tiles
-template <bool KT, bool MX, bool SH, int F8 = 0>
+template <bool KT, bool MX, bool SH, int F8 = 0, bool GW = false>
 void launch_tile_ow(int R, GemmParamsT<false, true, MX, F8> const& p, int grid, cudaStream_t st) {
   if (R == 8) {  // as launch_tile_pt
-    constexpr int s = ow_stage_bytes<8, F8>();
-    if (ctas_per_sm<gemm_ow<8, 8, 8, 3, KT, MX, SH, F8>, 3 * s>() >
-        ctas_per_sm<gemm_ow<8, 8, 8, 4, KT, MX, SH, F8>, 4 * s>())
-      launch_gemm_ow<8, 8, 8, 3, KT, MX, SH, F8>(p, grid, st);
+    constexpr int s = ow_stage_bytes<8, F8, MX, GW>();
+    if (ctas_per_sm<gemm_ow<8, 8, 8, 3, KT, MX, SH, F8, GW>, 3 * s>() >
+        ctas_per_sm<gemm_ow<8, 8, 8, 4, KT, MX, SH, F8, GW>, 4 * s>())
+      launch_gemm_ow<8, 8, 8, 3, KT, MX, SH, F8, GW>(p, grid, st);
     else
-      launch_gemm_ow<8, 8, 8, 4, KT, MX, SH, F8>(p, grid, st);
+      launch_gemm_ow<8, 8, 8, 4, KT, MX, SH, F8, GW>(p, grid, st);
   } else if (R == 16)
-    launch_gemm_ow<16, 8, 8, 2, KT, MX, SH, F8>(p, grid, st);
+    launch_gemm_ow<16, 8, 8, 2, KT, MX, SH, F8, GW>(p, grid, st);
   else if (R == 32) {
     if (max_smem_per_sm() <= 100 * 1024)
-      launch_gemm_ow<32, 8, 8, 2, KT, MX, SH, F8>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 2, KT, MX, SH, F8, GW>(p, grid, st);
     else
-      launch_gemm_ow<32, 8, 8, 4, KT, MX, SH, F8>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 4, KT, MX, SH, F8, GW>(p, grid, st);
   } else
-    launch_gemm_ow<64, 4, 4, 3, KT, MX, SH, F8>(p, grid, st);
+    launch_gemm_ow<64, 4, 4, 3, KT, MX, SH, F8, GW>(p, grid, st);
 }
 #endif
 
@@ -3266,19 +3436,29 @@ void w4a16_moe_sm80_prep_f8(TensorView x, TensorView x_out, TensorView meta, Ten
 // scales' product first) over prep_f8's act, meta and rowmap; w FP8 as uint8 (w_fmt 1: E4M3, 2:
 // E5M2), byte (batch, n, k) at batch batch_stride + n row_stride + (k / 128) kstep_stride + k %
 // 128; shuffled (N % 32 == 0): row n stored at row shuffled_row(n) (TRT-LLM's epilogue-tile-128
-// shuffle, prepare_low_latency_gemm_weights; E4M3). Columns N .. Nout - 1 are 0.
+// shuffle, prepare_low_latency_gemm_weights; E4M3). Columns N .. Nout - 1 are 0. MXFP8 (sf):
+// the E8M0 block scales, sf the weights' (128x4 [pad(N, 128)][pad(K / 32, 4)], batch b at b
+// sf_bstride; shuffled: the rows in the weights' shuffle) and asf the activation's (128x4, or 8x4
+// with a8x4, over the b bm rows), alpha 1. GW (gsb): the groupwise FP32 scales per k-step, gsa
+// [ceil(rows / gm)][nka] of the activation's rows in gm-row groups and gsb [batches][ceil(N /
+// 128)][nka] of each batch's 128-row weight groups (any strides), alpha 1.
 void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<TensorView> bs,
                             TensorView act, TensorView meta, TensorView rowmap, TensorView out,
                             int64_t row_tile, int64_t N, int64_t K, int64_t max_blocks,
                             int64_t batches, int64_t row_stride, int64_t kstep_stride,
-                            int64_t batch_stride, int64_t w_fmt, bool shuffled) {
+                            int64_t batch_stride, int64_t w_fmt, bool shuffled,
+                            tvm::ffi::Optional<TensorView> sf, tvm::ffi::Optional<TensorView> asf,
+                            bool a8x4, int64_t sf_bstride, tvm::ffi::Optional<TensorView> gsa,
+                            tvm::ffi::Optional<TensorView> gsb, int64_t gm) {
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(act, kXdl);
   CHECK_INPUT_AND_TYPE(out, kOdl);
   CHECK_DIM(2, act);
   CHECK_DIM(2, out);
-  if (bs.has_value()) CHECK_INPUT_AND_TYPE(bs.value(), dl_float32);
+  if (bs.has_value()) {
+    CHECK_INPUT_AND_TYPE(bs.value(), dl_float32);
+  }
   TVM_FFI_ICHECK(w_fmt == 1 || w_fmt == 2) << "w_fmt: 1 (E4M3) or 2 (E5M2)";
   TVM_FFI_ICHECK(!shuffled || (w_fmt == 1 && N % 32 == 0)) << "shuffled weights: E4M3, N % 32 == 0";
   const int64_t Nout = out.size(1), n_pad = (N + kTileN - 1) / kTileN * kTileN;
@@ -3295,6 +3475,39 @@ void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<T
       << "w and act must be 16 B aligned";
   TVM_FFI_ICHECK(row_tile == 8 || row_tile == 16 || row_tile == 32 || row_tile == 64)
       << "row_tile must be 8, 16, 32 or 64";
+  const bool mx = sf.has_value();
+  TVM_FFI_ICHECK(mx == asf.has_value()) << "MXFP8: sf and asf together";
+  const int64_t nka = (K + kTileK - 1) / kTileK;
+  const bool gw = gsb.has_value();
+  TVM_FFI_ICHECK(gw == gsa.has_value() && !(gw && (mx || shuffled)))
+      << "GW: gsa and gsb together, not MXFP8 or shuffled";
+  if (gw) {
+    const TensorView ga = gsa.value(), gb = gsb.value();
+    CHECK_CUDA(ga);
+    CHECK_INPUT_TYPE(ga, dl_float32);
+    CHECK_CUDA(gb);
+    CHECK_INPUT_TYPE(gb, dl_float32);
+    CHECK_DIM(2, ga);
+    CHECK_DIM(3, gb);
+    TVM_FFI_ICHECK(gm >= 1 && ga.size(0) >= (out.size(0) + gm - 1) / gm && ga.size(1) >= nka &&
+                   gb.size(0) >= batches && gb.size(1) >= n_pad / kTileN && gb.size(2) >= nka &&
+                   ga.stride(0) >= 0 && ga.stride(1) >= 0 && gb.stride(0) >= 0 &&
+                   gb.stride(1) >= 0 && gb.stride(2) >= 0)
+        << "GW: gsa [ceil(rows / gm)][ceil(K / 128)], gsb [batches][ceil(N / 128)][ceil(K / 128)]";
+  }
+  if (mx) {
+    CHECK_INPUT_AND_TYPE(sf.value(), dl_uint8);
+    CHECK_INPUT_AND_TYPE(asf.value(), dl_uint8);
+    const int64_t rows = out.size(0);
+    TVM_FFI_ICHECK(sf_bstride % 16 == 0 &&
+                   sf.value().numel() >= (batches - 1) * sf_bstride + n_pad * nka * 4 &&
+                   (reinterpret_cast<uintptr_t>(sf.value().data_ptr()) & 15) == 0)
+        << "sf [pad(N, 128), pad(K / 32, 4)] per batch (sf_bstride: a 16 B multiple), 16 B aligned";
+    TVM_FFI_ICHECK(asf.value().numel() >=
+                       (a8x4 ? (rows + 7) / 8 * 8 : (rows + 127) / 128 * 128) * nka * 4 &&
+                   (reinterpret_cast<uintptr_t>(asf.value().data_ptr()) & 3) == 0)
+        << "asf [pad(rows, 128) (8x4: 8), pad(K / 32, 4)], 4 B aligned";
+  }
   ffi::CUDADeviceGuard device_guard(act.device().device_id);
   const cudaStream_t st = get_stream(act.device());
   const int* m = static_cast<const int*>(meta.data_ptr());
@@ -3315,13 +3528,38 @@ void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<T
   p.row_stride = row_stride;
   p.kstep_stride = kstep_stride;
   p.batch_stride = batch_stride;
+  if (mx) {
+    p.sf = static_cast<const uint8_t*>(sf.value().data_ptr());
+    p.nka = static_cast<int>(nka);
+    p.asf = static_cast<const uint8_t*>(asf.value().data_ptr());
+    p.sf_bstride = sf_bstride;
+    p.a8x4 = a8x4;
+  }
+  if (gw) {
+    p.gsa = static_cast<const float*>(gsa.value().data_ptr());
+    p.gsb = static_cast<const float*>(gsb.value().data_ptr());
+    p.sa_r = gsa.value().stride(0);
+    p.sa_k = gsa.value().stride(1);
+    p.sf_bstride = gsb.value().stride(0);
+    p.sb_n = gsb.value().stride(1);
+    p.sb_k = gsb.value().stride(2);
+    p.gm = static_cast<int>(gm);
+  }
   const int grid = static_cast<int>(max_blocks * (n_pad / kTileN));
   const int rt = static_cast<int>(row_tile);
   auto tile = [&](auto kt) {
     constexpr bool T = decltype(kt)::value;
-    shuffled     ? launch_tile_ow<T, false, true, 1>(rt, p, grid, st)
-    : w_fmt == 1 ? launch_tile_ow<T, false, false, 1>(rt, p, grid, st)
-                 : launch_tile_ow<T, false, false, 2>(rt, p, grid, st);
+    if (gw)
+      w_fmt == 1 ? launch_tile_ow<T, false, false, 1, true>(rt, p, grid, st)
+                 : launch_tile_ow<T, false, false, 2, true>(rt, p, grid, st);
+    else if (mx)
+      shuffled     ? launch_tile_ow<T, true, true, 1>(rt, p, grid, st)
+      : w_fmt == 1 ? launch_tile_ow<T, true, false, 1>(rt, p, grid, st)
+                   : launch_tile_ow<T, true, false, 2>(rt, p, grid, st);
+    else
+      shuffled     ? launch_tile_ow<T, false, true, 1>(rt, p, grid, st)
+      : w_fmt == 1 ? launch_tile_ow<T, false, false, 1>(rt, p, grid, st)
+                   : launch_tile_ow<T, false, false, 2>(rt, p, grid, st);
   };
   K % kTileK != 0 ? tile(std::true_type{}) : tile(std::false_type{});
 }

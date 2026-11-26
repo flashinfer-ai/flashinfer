@@ -773,6 +773,8 @@ def test_mm_mxfp8_cute_dsl_quantize_pdl_cuda_graph(m, n, k, dtype):
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
     """A low-M cached tactic must not fail when reused for a larger M."""
     _skip_if_unsupported("cute-dsl")
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip("SM8x runs no CuTe-DSL kernel")
 
     m, n, k = 64, 256, 2048
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -817,6 +819,8 @@ def test_mm_mxfp8_cute_dsl_stale_narrow_tile_tactic_falls_back(m, tile_n):
     a larger runtime M used to fault with cudaErrorMisalignedAddress.
     """
     _skip_if_unsupported("cute-dsl")
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip("SM8x runs no CuTe-DSL kernel")
 
     n, k = 256, 2048
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)

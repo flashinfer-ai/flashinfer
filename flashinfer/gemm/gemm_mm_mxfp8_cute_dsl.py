@@ -46,7 +46,7 @@ def _b12x_mxfp8_dsl_supported() -> bool:
         return False
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([80, 86, 87, 89, 120, 121])
 def _b12x_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
