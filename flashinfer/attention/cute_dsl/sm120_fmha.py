@@ -27,6 +27,9 @@ Causal mask conventions
   ``j >= i + (kv_len - q_len) - window_left``, with or without causal masking,
   matching the other FlashInfer prefill backends. K/V tiles left of a Q tile's
   window are skipped, not masked.
+- ``sinks`` holds one float32 logit per Q head, in the natural-log units of
+  ``sm_scale * q.k``. It adds ``exp(sinks[h])`` to head ``h``'s softmax
+  denominator and contributes no V row.
 
 Sequence lengths are runtime metadata. ``max_seqlen_q`` only sizes the launch
 grid and is not part of the compiled kernel cache key.
@@ -84,10 +87,15 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
     }[torch_dtype]
 
 
-def _mask_kwargs(window_left: int) -> dict:
-    """Compile options for the sliding window; empty when unused so the default
-    kernels keep their compile cache keys."""
-    return {"sliding_window": True} if window_left >= 0 else {}
+def _mask_kwargs(window_left: int, with_sinks: bool) -> dict:
+    """Compile options for the sliding window and sinks; empty when unused so
+    the default kernels keep their compile cache keys."""
+    kwargs = {}
+    if window_left >= 0:
+        kwargs["sliding_window"] = True
+    if with_sinks:
+        kwargs["with_sinks"] = True
+    return kwargs
 
 
 def _check_sm120(device: torch.device) -> None:
@@ -172,6 +180,25 @@ def _kernel_window_left(window_left: int) -> int:
     """Clamp the window passed to the kernel so its Int32 window bounds cannot
     overflow; any window wider than 2**30 keys already covers every sequence."""
     return min(window_left, 1 << 30)
+
+
+def _validate_sinks(q: torch.Tensor, sinks: Optional[torch.Tensor]) -> None:
+    """Validate the optional per-Q-head attention-sink logits."""
+    if sinks is None:
+        return
+    if not isinstance(sinks, torch.Tensor):
+        raise TypeError(f"sinks must be a torch.Tensor, got {type(sinks).__name__}")
+    if tuple(sinks.shape) != (q.shape[1],):
+        raise ValueError(
+            f"sinks must have shape ({q.shape[1]},) (one logit per Q head), got "
+            f"{tuple(sinks.shape)}"
+        )
+    if sinks.dtype != torch.float32:
+        raise ValueError(f"sinks must have dtype torch.float32, got {sinks.dtype}")
+    if sinks.device != q.device:
+        raise ValueError("sinks and q must be on the same device")
+    if not sinks.is_contiguous():
+        raise ValueError("sinks must be contiguous")
 
 
 def _validate_lse(q: torch.Tensor, lse: Optional[torch.Tensor]) -> None:
@@ -272,6 +299,7 @@ def sm120_fmha_fp8_ragged_prefill(
     enable_pdl: bool = False,
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     window_left: int = -1,
+    sinks: Optional[torch.Tensor] = None,
 ) -> None:
     """Run SM120 FP8 FMHA on packed contiguous ragged Q/K/V.
 
@@ -322,6 +350,9 @@ def sm120_fmha_fp8_ragged_prefill(
     window_left : int
         Sliding-window size. ``-1`` disables it; otherwise key ``j`` is visible
         to query ``i`` only when ``j >= i + kv_len - q_len - window_left``.
+    sinks : torch.Tensor, optional
+        Float32 attention-sink logits, shape ``(Hq,)``, contiguous, on the
+        device of ``q``. Not multiplied by ``sm_scale``.
     Raises
     ------
     RuntimeError
@@ -340,6 +371,7 @@ def sm120_fmha_fp8_ragged_prefill(
     _check_sm120(q.device)
     _validate_lse(q, lse)
     _validate_window_left(window_left)
+    _validate_sinks(q, sinks)
 
     batch_size = cu_seqlens_q.numel() - 1
     threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, batch_size)
@@ -358,7 +390,10 @@ def sm120_fmha_fp8_ragged_prefill(
     if k.shape[0] == 0:
         o.zero_()
         if lse is not None:
-            lse.fill_(-float("inf"))
+            if sinks is None:
+                lse.fill_(-float("inf"))
+            else:
+                lse.copy_((sinks * math.log2(math.e)).expand_as(lse))
         return
     cu_seqlens_q_i32 = cu_seqlens_q.to(torch.int32)
     cu_seqlens_k_i32 = cu_seqlens_k.to(torch.int32)
@@ -392,7 +427,7 @@ def sm120_fmha_fp8_ragged_prefill(
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
         enable_skip_softmax=threshold is not None,
-        **_mask_kwargs(window_left),
+        **_mask_kwargs(window_left, sinks is not None),
     )
 
     if sm_scale is None:
@@ -417,6 +452,7 @@ def sm120_fmha_fp8_ragged_prefill(
         enable_pdl,
         None,  # kv_tile_ranges
         Int32(_kernel_window_left(window_left)),
+        sinks,
     )
 
 
@@ -445,6 +481,7 @@ def sm120_fmha_fp8_paged_prefill(
     kv_tile_ranges: Optional[torch.Tensor] = None,
     gqa_pack_size: int = 1,
     window_left: int = -1,
+    sinks: Optional[torch.Tensor] = None,
 ) -> None:
     """Run SM120 FP8 FMHA prefill with paged K/V cache.
 
@@ -516,6 +553,11 @@ def sm120_fmha_fp8_paged_prefill(
     window_left : int
         Sliding-window size. ``-1`` disables it; otherwise key ``j`` is visible
         to query ``i`` only when ``j >= i + kv_len - q_len - window_left``.
+    sinks : torch.Tensor, optional
+        Float32 attention-sink logits, shape ``(Hq,)``, contiguous, on the
+        device of ``q``. Not multiplied by ``sm_scale``.
+        With ``kv_tile_ranges``, the sinks are folded into chunk 0's partial
+        output and LSE only, so ``merge_states`` counts them once.
     Raises
     ------
     RuntimeError
@@ -533,6 +575,7 @@ def sm120_fmha_fp8_paged_prefill(
     _check_sm120(q.device)
     _validate_lse(o, lse)
     _validate_window_left(window_left)
+    _validate_sinks(q, sinks)
 
     assert q.ndim == 3, f"q must be packed (total_q, Hq, D), got {q.shape}"
     _, Hq, D = q.shape
@@ -617,7 +660,7 @@ def sm120_fmha_fp8_paged_prefill(
         enable_skip_softmax=threshold is not None,
         **({"with_kv_tile_ranges": True} if kv_tile_ranges is not None else {}),
         **({"gqa_pack_size": gqa_pack_size} if gqa_pack_size > 1 else {}),
-        **_mask_kwargs(window_left),
+        **_mask_kwargs(window_left, sinks is not None),
     )
 
     if sm_scale is None:
@@ -647,6 +690,7 @@ def sm120_fmha_fp8_paged_prefill(
         enable_pdl,
         kv_tile_ranges,
         Int32(_kernel_window_left(window_left)),
+        sinks,
     )
 
 
@@ -790,7 +834,7 @@ class SM120PrimsBatchPrefillBackend:
         self._mode: Optional[str] = None
         self._window_left = -1
         self._kv_split: Optional[SimpleNamespace] = None
-        self._compiled_lse_variants: set[bool] = set()
+        self._compiled_variants: set[tuple[bool, bool]] = set()
 
     @staticmethod
     def _scalar_scale(name: str, value: Optional[float]) -> float:
@@ -908,9 +952,9 @@ class SM120PrimsBatchPrefillBackend:
             with_lse=False,
             balanced_scheduler=_use_balanced_scheduler(causal),
             enable_skip_softmax=False,
-            **_mask_kwargs(window_left),
+            **_mask_kwargs(window_left, False),
         )
-        self._compiled_lse_variants = {False}
+        self._compiled_variants = {(False, False)}
 
     def plan_paged(
         self,
@@ -991,9 +1035,9 @@ class SM120PrimsBatchPrefillBackend:
             balanced_scheduler=_use_balanced_scheduler(causal),
             enable_skip_softmax=False,
             **self._pack_kwargs(),
-            **_mask_kwargs(window_left),
+            **_mask_kwargs(window_left, False),
         )
-        self._compiled_lse_variants = {False}
+        self._compiled_variants = {(False, False)}
         self._plan_kv_split(
             qo_indptr_host=qo_indptr_host,
             seqlens_kv_host=seqlens_kv_host,
@@ -1144,7 +1188,7 @@ class SM120PrimsBatchPrefillBackend:
             enable_skip_softmax=False,
             with_kv_tile_ranges=True,
             **self._pack_kwargs(),
-            **_mask_kwargs(self._window_left),
+            **_mask_kwargs(self._window_left, False),
         )
 
     def _pack_kwargs(self) -> dict:
@@ -1195,16 +1239,17 @@ class SM120PrimsBatchPrefillBackend:
                     f"{tuple(k.shape)} and {tuple(v.shape)}"
                 )
 
-    def _ensure_kernel(self, *, with_lse: bool) -> None:
-        if with_lse in self._compiled_lse_variants:
+    def _ensure_kernel(self, *, with_lse: bool, with_sinks: bool = False) -> None:
+        if (with_lse, with_sinks) in self._compiled_variants:
             return
         if torch.cuda.is_current_stream_capturing():
+            variant = f"return_lse={with_lse}" + (", sinks=True" if with_sinks else "")
             raise RuntimeError(
-                "backend='cute-dsl-prims' kernel specialization "
-                f"(return_lse={with_lse}) was not compiled before CUDA Graph "
-                "capture; warm up the same run configuration before capture"
+                f"backend='cute-dsl-prims' kernel specialization ({variant}) was "
+                "not compiled before CUDA Graph capture; warm up the same run "
+                "configuration before capture"
             )
-        mask_kwargs = _mask_kwargs(self._window_left)
+        mask_kwargs = _mask_kwargs(self._window_left, with_sinks)
         from flashinfer.cute_dsl.attention.fmha.sm120 import (
             compile_sm120_fmha_fp8_paged_kernel,
             compile_sm120_fmha_fp8_ragged_kernel,
@@ -1264,7 +1309,7 @@ class SM120PrimsBatchPrefillBackend:
                 **self._pack_kwargs(),
                 **mask_kwargs,
             )
-        self._compiled_lse_variants.add(with_lse)
+        self._compiled_variants.add((with_lse, with_sinks))
 
     def run_ragged(
         self,
@@ -1278,11 +1323,13 @@ class SM120PrimsBatchPrefillBackend:
         q_scale: Optional[float],
         k_scale: Optional[float],
         v_scale: Optional[float],
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
         self._validate_run(q, k, v, out)
         if self._mode != "ragged":
             raise RuntimeError("SM120 PRIMS backend was not planned for ragged KV")
-        self._ensure_kernel(with_lse=lse is not None)
+        _validate_sinks(q, sinks)
+        self._ensure_kernel(with_lse=lse is not None, with_sinks=sinks is not None)
         sm_scale = (
             self._sm_scale
             if self._sm_scale is not None
@@ -1305,6 +1352,7 @@ class SM120PrimsBatchPrefillBackend:
             lse=lse,
             enable_pdl=enable_pdl,
             window_left=self._window_left,
+            sinks=sinks,
         )
 
     def run_paged(
@@ -1320,10 +1368,12 @@ class SM120PrimsBatchPrefillBackend:
         q_scale: Optional[float],
         k_scale: Optional[float],
         v_scale: Optional[float],
+        sinks: Optional[torch.Tensor] = None,
     ):
         self._validate_run(q, k, v, out)
         if self._mode != "paged":
             raise RuntimeError("SM120 PRIMS backend was not planned for paged KV")
+        _validate_sinks(q, sinks)
         if return_lse:
             if lse is None:
                 lse = torch.empty(
@@ -1333,7 +1383,7 @@ class SM120PrimsBatchPrefillBackend:
                 )
         else:
             lse = None
-        self._ensure_kernel(with_lse=return_lse)
+        self._ensure_kernel(with_lse=return_lse, with_sinks=sinks is not None)
         sm_scale = (
             self._sm_scale
             if self._sm_scale is not None
@@ -1363,6 +1413,7 @@ class SM120PrimsBatchPrefillBackend:
                 kv_tile_ranges=split.kv_tile_ranges,
                 gqa_pack_size=self._gqa_pack_size,
                 window_left=self._window_left,
+                sinks=sinks,
             )
             rows, n = split.total_q, split.num_chunks
             get_cascade_module().merge_states(
@@ -1390,6 +1441,7 @@ class SM120PrimsBatchPrefillBackend:
             enable_pdl=enable_pdl,
             gqa_pack_size=self._gqa_pack_size,
             window_left=self._window_left,
+            sinks=sinks,
         )
         if return_lse:
             return out, lse

@@ -5400,10 +5400,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not accept custom run arguments"
                 )
-            if sinks is not None:
-                raise NotImplementedError(
-                    "backend='cute-dsl-prims' does not support attention sinks"
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
@@ -5452,6 +5448,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                sinks=sinks,
             )
             if isinstance(res, tuple):
                 return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
@@ -7858,11 +7855,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not accept custom run arguments"
                 )
-            if getattr(self, "_sinks", None) is not None:
-                raise NotImplementedError(
-                    "attention sinks were set on the wrapper (_sinks) but "
-                    "backend='cute-dsl-prims' does not support attention sinks"
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
@@ -7881,6 +7873,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                # vLLM's metadata builder stashes attention sinks on the wrapper.
+                sinks=getattr(self, "_sinks", None),
             )
             return (
                 (out, _finish_lse(lse, lse_base, lse_layout, lse_out))

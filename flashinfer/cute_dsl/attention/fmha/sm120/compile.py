@@ -37,6 +37,10 @@ _CUTLASS_DTYPE = {
 }
 
 
+def _fake_sinks(num_qo_heads: int):
+    return make_fake_compact_tensor(cutlass.Float32, (num_qo_heads,), assumed_align=4)
+
+
 def _validate_balanced_scheduler(is_causal: bool, balanced_scheduler: bool) -> None:
     if balanced_scheduler and not is_causal:
         raise ValueError("balanced_scheduler=True requires is_causal=True")
@@ -56,6 +60,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
     sliding_window: bool = False,
+    with_sinks: bool = False,
 ):
     """Compile one sequence-length-independent packed ragged kernel."""
 
@@ -144,6 +149,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
         True,  # use_pdl placeholder (runtime-dynamic)
         None,  # kv_tile_ranges (split KV is paged-only)
         cutlass.Int32(-1),  # runtime window_left placeholder
+        _fake_sinks(num_qo_heads) if with_sinks else None,
         options="--enable-tvm-ffi",
     )
 
@@ -165,6 +171,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     with_kv_tile_ranges: bool = False,
     gqa_pack_size: int = 1,
     sliding_window: bool = False,
+    with_sinks: bool = False,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -291,6 +298,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         True,  # use_pdl placeholder (runtime-dynamic)
         fake_kv_tile_ranges,
         cutlass.Int32(-1),  # runtime window_left placeholder
+        _fake_sinks(num_qo_heads) if with_sinks else None,
         options="--enable-tvm-ffi",
     )
 
@@ -322,6 +330,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
     sliding_window: bool = False,
+    with_sinks: bool = False,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -335,7 +344,9 @@ def compile_sm120_fmha_fp8_ragged_kernel(
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"
         f"_causal{int(is_causal)}_kt{kv_tile}_qt{q_tile}"
         f"_lse{int(with_lse)}_balanced{int(balanced_scheduler)}"
-        f"_skip{int(enable_skip_softmax)}" + ("_swa" if sliding_window else "")
+        f"_skip{int(enable_skip_softmax)}"
+        + ("_swa" if sliding_window else "")
+        + ("_sinks" if with_sinks else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -354,6 +365,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
             balanced_scheduler,
             enable_skip_softmax,
             sliding_window,
+            with_sinks,
         ),
         extra_key_files=_cache_key_files(),
     )
@@ -377,6 +389,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     with_kv_tile_ranges: bool = False,
     gqa_pack_size: int = 1,
     sliding_window: bool = False,
+    with_sinks: bool = False,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -395,6 +408,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
         + ("_kvsplit" if with_kv_tile_ranges else "")
         + (f"_gqa{gqa_pack_size}" if gqa_pack_size > 1 else "")
         + ("_swa" if sliding_window else "")
+        + ("_sinks" if with_sinks else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -416,6 +430,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
             with_kv_tile_ranges,
             gqa_pack_size,
             sliding_window,
+            with_sinks,
         ),
         extra_key_files=_cache_key_files(),
     )

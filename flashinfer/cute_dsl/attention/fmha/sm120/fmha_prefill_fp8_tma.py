@@ -23,7 +23,8 @@ The kernel implements key optimizations including:
 - Shared-memory epilogue staging that aliases the K/V buffer after compute warps
   finish reading the last tile
 - Optional causal masking for autoregressive models
-- Optional sliding-window masking that skips K/V tiles left of the window
+- Optional sliding-window masking that skips K/V tiles left of the window, and
+  per-head attention-sink logits folded into the softmax denominator
 - Grouped-query attention (GQA), packed variable lengths, and paged K/V pools
 
 The kernel is compiled and launched through the ``cute-dsl-prims`` backend.
@@ -339,6 +340,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     # flushing to zero in E4M3 before the PV MMA. It cancels in O = acc / row_sum;
     # the LSE subtracts it.
     P_FP8_PRESCALE_LOG2 = 8.0
+    LOG2_E = 1.4426950408889634
     # Barrier 0 is the CTA-wide initialization barrier; barrier 1 synchronizes
     # compute warps before the K/V storage is aliased for the output epilogue.
     COMPUTE_BARRIER_ID = 1
@@ -2482,6 +2484,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         cu_seqlens_k: cute.Tensor | None = None,
         kv_tile_ranges: cute.Tensor | None = None,
         window_left: cutlass.Int32 = NO_SLIDING_WINDOW,
+        sinks: cute.Tensor | None = None,
     ) -> None:
         """SM120 FMHA prefill FP8 kernel.
 
@@ -2504,6 +2507,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param kv_tile_ranges: Optional split-KV tile ranges.
         :param window_left: Sliding-window size; read only when the kernel is
             compiled with ``sliding_window=True``.
+        :param sinks: Optional float32 per-Q-head sink logits ``[Hq]``.
         """
         tidx, _, _ = cute.arch.thread_idx()
         block_x, block_y, block_z = cute.arch.block_idx()
@@ -3239,6 +3243,54 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 row_sum_0 = row_sum[0]
                 row_sum_1 = row_sum[1]
 
+            # log2-domain running max (the LSE base) and the factor folded into
+            # the output normalization for each of this lane's two rows.
+            row_max_log2_0 = row_max_0 * softmax_scale_log2
+            row_max_log2_1 = row_max_1 * softmax_scale_log2
+            o_factor_0 = output_scale
+            o_factor_1 = output_scale
+            if cutlass.const_expr(sinks is not None):
+                # A sink is one more softmax term exp(sink) with no V row. Fold
+                # it into the final state once per Q row; with split KV only
+                # chunk 0 carries it, so merge_states counts it exactly once.
+                for row_half in cutlass.range_constexpr(2):
+                    sink_row_in_cta = q_warp_row0 + lane_div4 + row_half * 8
+                    sink_log2 = -cutlass.Float32.inf
+                    if kv_chunk == 0:
+                        sink_log2 = (
+                            cutlass.Float32(
+                                sinks[
+                                    q_head_idx
+                                    + self.q_row_head_offset(
+                                        sink_row_in_cta, cutlass.Int32(1)
+                                    )
+                                ]
+                            )
+                            * self.LOG2_E
+                        )
+                    if cutlass.const_expr(row_half == 0):
+                        row_max_log2, row_sum_h = row_max_log2_0, row_sum_0
+                    else:
+                        row_max_log2, row_sum_h = row_max_log2_1, row_sum_1
+                    new_max_log2 = cute.arch.fmax(row_max_log2, sink_log2)
+                    prev_scale = cutlass.Float32(1.0)
+                    sink_p = cutlass.Float32(0.0)
+                    if new_max_log2 != -cutlass.Float32.inf:
+                        prev_scale = cute.math.exp2(
+                            row_max_log2 - new_max_log2, fastmath=True
+                        )
+                        sink_p = cute.math.exp2(
+                            sink_log2 - new_max_log2 + self.P_FP8_PRESCALE_LOG2,
+                            fastmath=True,
+                        )
+                    row_sum_h = row_sum_h * prev_scale + sink_p
+                    if cutlass.const_expr(row_half == 0):
+                        row_max_log2_0, row_sum_0 = new_max_log2, row_sum_h
+                        o_factor_0 = output_scale * prev_scale
+                    else:
+                        row_max_log2_1, row_sum_1 = new_max_log2, row_sum_h
+                        o_factor_1 = output_scale * prev_scale
+
             # The four lanes in each lane quad hold identical final online
             # softmax state for one Q row. Have one leader write each of the
             # two rows owned by the quad. FlashInfer LSE is log2-base:
@@ -3253,10 +3305,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         lse_q_seq_idx = q_seq_idx + self.q_row_token(lse_row_in_cta)
                         if lse_q_seq_idx < seqlen_q:
                             if cutlass.const_expr(row_half == 0):
-                                lse_row_max = row_max_0
+                                lse_row_max = row_max_log2_0
                                 lse_row_sum = row_sum_0
                             else:
-                                lse_row_max = row_max_1
+                                lse_row_max = row_max_log2_1
                                 lse_row_sum = row_sum_1
                             lse[
                                 (q_token_base + lse_q_seq_idx) * num_kv_chunks
@@ -3266,7 +3318,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                                     lse_row_in_cta, cutlass.Int32(1)
                                 ),
                             ] = (
-                                lse_row_max * softmax_scale_log2
+                                lse_row_max
                                 + cute.math.log2(lse_row_sum, fastmath=True)
                                 - self.P_FP8_PRESCALE_LOG2
                             )
@@ -3275,12 +3327,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             # final sV tile. After that lifetime barrier, normalize O, stage an
             # stmatrix-friendly layout, and store 128b per lane to GMEM.
             sO = cutlass.Pointer(sKV.data_ptr(), dtype=o.dtype)
-            row_sum_inv_0 = (
-                cute.math.rcp(row_sum_0, approx=True, ftz=True) * output_scale
-            )
-            row_sum_inv_1 = (
-                cute.math.rcp(row_sum_1, approx=True, ftz=True) * output_scale
-            )
+            row_sum_inv_0 = cute.math.rcp(row_sum_0, approx=True, ftz=True) * o_factor_0
+            row_sum_inv_1 = cute.math.rcp(row_sum_1, approx=True, ftz=True) * o_factor_1
             if cutlass.const_expr(self.sliding_window):
                 # A split-KV chunk can hold no key inside a row's window. Its
                 # partial O is 0 and its LSE is -inf, which merge_states drops.
@@ -3373,11 +3421,20 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             zero_q_seq_idx = q_seq_idx + self.q_row_token(zero_row_in_cta)
             if cutlass.const_expr(lse is not None):
                 if lane < self.MMA_TILER[0] and zero_q_seq_idx < seqlen_q:
+                    zero_q_head_idx = q_head_idx + self.q_row_head_offset(
+                        zero_row_in_cta, cutlass.Int32(1)
+                    )
+                    zero_lse = -cutlass.Float32.inf
+                    if cutlass.const_expr(sinks is not None):
+                        # Only the sink remains: O = 0 and LSE = sink.
+                        if kv_chunk == 0:
+                            zero_lse = (
+                                cutlass.Float32(sinks[zero_q_head_idx]) * self.LOG2_E
+                            )
                     lse[
                         (q_token_base + zero_q_seq_idx) * num_kv_chunks + kv_chunk,
-                        q_head_idx
-                        + self.q_row_head_offset(zero_row_in_cta, cutlass.Int32(1)),
-                    ] = -cutlass.Float32.inf
+                        zero_q_head_idx,
+                    ] = zero_lse
             for head_chunk in cutlass.range_constexpr(self.head_tile // 16):
                 zero_head_col = head_chunk * 16 + lane_div16 * 8
                 if zero_q_seq_idx < seqlen_q:
@@ -3417,6 +3474,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         use_pdl: bool = False,
         kv_tile_ranges: cute.Tensor | None = None,
         window_left: cutlass.Int32 = NO_SLIDING_WINDOW,
+        sinks: cute.Tensor | None = None,
     ) -> None:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
@@ -3448,6 +3506,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             with ``sliding_window=True``: key ``j`` is visible to query ``i``
             only when ``j >= i + kv_len - q_len - window_left``. Ignored
             otherwise.
+        :param sinks: Optional float32 ``(Hq,)`` attention-sink logits, in the
+            natural-log units of ``sm_scale * q.k``. Each adds ``exp(sink)`` to
+            its head's softmax denominator and contributes no V row.
 
         Direct callers must satisfy the same shape contract enforced by
         :meth:`can_implement_paged`.
@@ -3463,6 +3524,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             raise ValueError(
                 "gqa_pack_size must divide the number of Q heads per K/V head"
             )
+        if cutlass.const_expr(
+            sinks is not None
+            and (cute.rank(sinks) != 1 or cute.size(sinks) != num_heads_q)
+        ):
+            raise ValueError("sinks must have shape (num_qo_heads,)")
         num_head_groups = num_heads_q // self.gqa_pack_size
         num_items = batch_size
         if cutlass.const_expr(kv_tile_ranges is not None):
@@ -3560,6 +3626,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             cu_seqlens_k,
             kv_tile_ranges,
             window_left,
+            sinks,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
