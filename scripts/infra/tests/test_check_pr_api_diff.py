@@ -1048,7 +1048,123 @@ apps/ @apps
             report, repo="org/repo", head="a" * 40, maintainers=["owner", "org/team"]
         )
         self.assertIn("Code owners: @owner, @org/team", body)
-        self.assertIn("maintain/admin permission", body)
+        self.assertIn("non-author maintainer/admin", body)
+
+
+class CompactReportTest(unittest.TestCase):
+    def finding(self, before, after):
+        from dataclasses import asdict
+
+        return asdict(
+            api_diff.classify_signature(api_function(before), api_function(after))
+        )
+
+    def test_moved_parameter_does_not_repeat_shifted_parameters(self):
+        from pr_checks.api_report import render_inline
+
+        args = ", ".join(f"p{i}: Tensor" for i in range(40))
+        f = self.finding(
+            f"def api(x, scale: Tensor, {args})",
+            f"def api(x, {args}, scale: Tensor=None)",
+        )
+        body = render_inline(f)
+        self.assertLess(len(body), 900)
+        self.assertNotIn("p20", body)
+        self.assertIn("scale=None", body)
+        self.assertIn("became optional", body)
+        self.assertIn("`scale` moved", body)
+        self.assertEqual(body.count("Existing positional calls"), 1)
+        self.assertNotIn("accepted calling convention", body)
+
+    def test_separate_changes_and_return_annotation_are_preserved(self):
+        from pr_checks.api_report import diff
+
+        args = ", ".join(f"p{i}" for i in range(30))
+        body = diff(
+            self.finding(
+                f"def api(x, {args}, z=0) -> Tensor",
+                f"def api(x, added, {args}, z=1) -> Tuple[Tensor, Tensor]",
+            )
+        )
+        for changed in ("added", "z=0", "z=1", "-> Tensor", "-> Tuple[Tensor, Tensor]"):
+            self.assertIn(changed, body)
+        self.assertNotIn("p15", body)
+
+    def test_annotation_changes_and_nested_defaults_survive(self):
+        from pr_checks.api_report import diff
+
+        body = diff(
+            self.finding(
+                'def api(x: Tensor | None, cfg=(1, 2), mode="a,b")',
+                'def api(x: Tensor, cfg=(1, 3), mode="a,c")',
+            )
+        )
+        for changed in ("Tensor | None", "x: Tensor", "(1, 2)", "(1, 3)", "a,b", "a,c"):
+            self.assertIn(changed, body)
+
+    def test_removed_long_signature_only_needs_the_removed_api(self):
+        from pr_checks.api_report import diff
+
+        args = ", ".join(f"p{i}: Tensor" for i in range(40))
+        body = diff({"before": f"def removed_api({args})", "after": "(removed)"})
+        self.assertIn("removed_api(...)", body)
+        self.assertNotIn("p20", body)
+
+    def test_moved_positional_only_parameter_can_become_optional(self):
+        from pr_checks.api_report import render_inline
+
+        body = render_inline(
+            self.finding("def api(scale, x, /)", "def api(x, scale=None, /)")
+        )
+        self.assertIn("became optional", body)
+
+    def test_alias_only_changes_remain_visible(self):
+        from pr_checks.api_report import diff
+
+        body = diff(
+            {
+                "before": "def api(x: Alias)  # Alias = Tensor | None",
+                "after": "def api(x: Alias)  # Alias = Tensor",
+            }
+        )
+        self.assertIn("Alias = Tensor | None", body)
+        self.assertIn("Alias = Tensor", body)
+
+    def test_owners_are_limited_and_link_to_target_revision(self):
+        from pr_checks.api_report import render_summary
+
+        f = self.finding("def api(x, y)", "def api(x)")
+        body = render_summary(
+            {"execution_status": "COMPLETE", "base": "b" * 40, "findings": [f]},
+            repo="org/repo",
+            head="a" * 40,
+            maintainers=["one", "two", "three", "four", "five"],
+        )
+        self.assertIn("@one, @two, @three", body)
+        self.assertNotIn("@four", body)
+        self.assertIn("+2 owners", body)
+        self.assertIn("/blob/" + "b" * 40 + "/.github/CODEOWNERS", body)
+        self.assertIn("API BREAK expected, reason: ...", body)
+
+    def test_expected_reason_is_optional_but_must_be_nonempty_when_present(self):
+        from pr_checks.api_gate import parse_command, can_approve
+
+        for body in (
+            "@flashinfer-bot API BREAK expected",
+            "@flashinfer-bot API BREAK expected, reason: intentional cleanup",
+            "@flashinfer-bot API BREAK expected, REASON: migration: v2",
+        ):
+            self.assertEqual(parse_command(body), "expected")
+        for body in (
+            "@flashinfer-bot API BREAK expected, reason:",
+            "@flashinfer-bot API BREAK expected, reason:   ",
+            "@flashinfer-bot API BREAK expected, reason: ok\nextra command",
+            "@flashinfer-bot API BREAK expected please",
+        ):
+            self.assertIsNone(parse_command(body))
+        self.assertEqual(parse_command("@flashinfer-bot API BREAK revoke"), "revoke")
+        self.assertFalse(can_approve("admin", "author", "author", "User"))
+        self.assertFalse(can_approve("write", "owner", "author", "User"))
 
 
 if __name__ == "__main__":

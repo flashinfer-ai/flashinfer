@@ -2,9 +2,11 @@
 
 import hashlib
 import html
+import re
 from urllib.parse import quote
 
 from .api_anchors import select_anchor
+from .api_compact import explanation, focused_pair
 from .github_api import anchor_validation_error, warning as emit_warning
 
 MARKER = "<!-- flashinfer-api-compatibility -->"
@@ -63,6 +65,11 @@ def group_findings(findings: list[dict]) -> list[dict]:
 
 def diff(finding: dict) -> str:
     before, after = str(finding.get("before") or ""), str(finding.get("after") or "")
+    pair = focused_pair(before, after)
+    if pair:
+        return "\n".join(
+            ["```diff", f"- {code_text(pair[0])}", f"+ {code_text(pair[1])}", "```"]
+        )
     prefix = suffix = 0
     if max(len(before), len(after)) > 220 and before != after:
         while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
@@ -93,7 +100,8 @@ def inline_key(finding: dict) -> str:
 
 
 def render_inline(finding: dict) -> str:
-    return f"{INLINE}<!-- key:{inline_key(finding)} -->\n**{heading(finding)}**\n\n{diff(finding)}\n\n{text(finding.get('message'))}"
+    details = re.sub(r"ˋ([A-Za-z_]\w*)ˋ", r"`\1`", text(explanation(finding)))
+    return f"{INLINE}<!-- key:{inline_key(finding)} -->\n**{heading(finding)}**\n\n{diff(finding)}\n\n{details}"
 
 
 def render_summary(
@@ -105,6 +113,7 @@ def render_summary(
     maintainers: list[str] | None = None,
     run_url: str = "",
     blocked_reason: str = "",
+    codeowners_ref: str = "",
 ) -> str | None:
     findings = group_findings(report.get("findings", []))
     counts = {kind: sum(f["classification"] == kind for f in findings) for kind in RANK}
@@ -184,14 +193,19 @@ def render_summary(
                 [
                     "",
                     "Code owners: "
-                    + ", ".join(f"@{name}" for name in maintainers)
+                    + ", ".join(f"@{name}" for name in maintainers[:3])
+                    + (
+                        f" · [+{len(maintainers) - 3} owners](https://github.com/{repo}/blob/{codeowners_ref or report.get('base') or head}/.github/CODEOWNERS)"
+                        if len(maintainers) > 3
+                        else ""
+                    )
                     + ".",
                 ]
             )
         lines.extend(
             [
                 "",
-                "Maintainers with maintain/admin permission (other than the PR author) can comment `@flashinfer-bot API BREAK expected` as the entire comment to unblock all API BREAK findings for the current head. Reason: … (provide separately in the PR description or discussion).",
+                "A non-author maintainer/admin can comment `@flashinfer-bot API BREAK expected, reason: ...` to unblock all API BREAKs for merging this head.",
             ]
         )
     if run_url:
@@ -237,6 +251,7 @@ def publish_report(
         maintainers=maintainers,
         run_url=run_url,
         blocked_reason=blocked_reason,
+        codeowners_ref=pr.get("base", {}).get("sha", ""),
     )
     previous = next(
         (

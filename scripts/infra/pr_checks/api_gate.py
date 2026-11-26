@@ -28,11 +28,11 @@ GATE = "API compatibility"
 
 def parse_command(body: str) -> str | None:
     match = re.fullmatch(
-        r"@flashinfer-bot[ \t]+API[ \t]+BREAK[ \t]+(expected|revoke)",
+        r"@flashinfer-bot[ \t]+API[ \t]+BREAK[ \t]+(?:(expected)(?:[ \t]*,[ \t]*reason:[ \t]*(\S[^\r\n]*))?|(revoke))",
         str(body).strip(),
         re.IGNORECASE,
     )
-    return match[1].lower() if match else None
+    return (match[1] or match[3]).lower() if match else None
 
 
 def can_approve(role: str, actor: str, author: str, kind: str) -> bool:

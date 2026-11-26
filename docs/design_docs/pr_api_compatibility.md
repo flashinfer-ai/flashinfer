@@ -62,17 +62,24 @@ diff reads so stale findings are not attached to a newer diff.
 
 All report text is English. A blocked report ends with:
 
-> Maintainers @xxxx can comment `@flashinfer-bot API BREAK expected` as the entire comment to unblock all API BREAK findings for the current head. Reason: … (provide separately in the PR description or discussion).
+> A non-author maintainer/admin can comment `@flashinfer-bot API BREAK expected, reason: ...` to unblock all API BREAKs for merging this head.
 
-`@xxxx` is replaced by maintainer accounts where accessible, with a permission
-based fallback. Reason is explanatory text outside the command, not a mandatory
-argument. The accepted command itself is the standalone line below.
+At most three matching code owners are shown, with a link to the target revision's
+CODEOWNERS file for the rest. They are ownership hints, not approval permissions.
+Signature diffs fold unchanged parameters and annotations. Inline explanations
+combine argument shifts caused by one moved parameter; full signatures and
+per-parameter diagnostics remain in the report artifact.
 
 ## Maintainer exception
 
 ```text
-@flashinfer-bot API BREAK expected
+@flashinfer-bot API BREAK expected, reason: intentional API cleanup
 ```
+
+The original standalone `@flashinfer-bot API BREAK expected` is also accepted.
+When `, reason:` is present, its value must be nonempty and stay on the same line.
+The reason is retained in the source comment; it does not change authorization,
+revision binding, or edit/deletion invalidation. `revoke` remains standalone.
 
 A non-author human maintainer with repository `maintain` or `admin` role can
 accept **all** API breaks for the current PR head. Ordinary CI permission
