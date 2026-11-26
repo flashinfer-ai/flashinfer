@@ -681,17 +681,21 @@ def sm8x_deepgemm_fp8_nt_groupwise(
     groups, n = int(b.shape[0]), int(b.shape[1])
     if m == 0:
         return
+    if any(t.device != a.device for t in (b, a_scale, b_scale, rows, out)):
+        raise ValueError("FP8 GEMM operands, scales and output must be on one device")
     if recipe is None:  # the SM100 default recipe
         assert a_scale.dtype in (torch.float, torch.int)
         recipe = (1, 128, 128) if b_scale.dtype == torch.float else (1, 1, 128)
     ea = _ue8m0(a_scale, m, k, recipe, groups if masked else None, True)
     eb = _ue8m0(b_scale, n, k, recipe, groups, False)
+    if masked and groups > 1:  # the SM100 masked kernel's 128-row block
+        assert m % 128 == 0
     nka = int(ea.shape[-1])
     # A's scales of the stacked rows; B's of each group at a 128-row atom (masked: stacked,
     # _run_fp8 restacks the batches)
     a_sf = _mx_rows(ea.reshape(-1, nka))
     b_sf = _mx_rows(eb.reshape(-1, nka) if masked else eb)
-    inputs = [a, b, a_sf, b_sf, rows, out]
+    inputs = [a, b, a_sf, b_sf, rows.reshape(-1), out]
     chosen, tactic = AutoTuner.get().choose_one(
         f"{'batch' if masked else 'group'}_deepgemm_fp8_nt_groupwise_sm8x",
         [Sm8xDeepGemmFp8Runner()],
