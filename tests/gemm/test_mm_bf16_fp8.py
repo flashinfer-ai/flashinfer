@@ -58,10 +58,18 @@ def _major() -> int:
 
 
 def _skip_unless_arch(tactic: str) -> None:
-    """Skip a case whose forced variant belongs to the other architecture."""
-    table = _TACTICS_SM100 if _major() == 10 else _TACTICS_SM90
+    """Skip a case whose forced variant belongs to another architecture."""
+    table = {10: _TACTICS_SM100, 9: _TACTICS_SM90}.get(_major(), [])
     if tactic not in table:
         pytest.skip(f"{tactic} is not a variant of this architecture")
+
+
+def _arch_tactic(sm90: str, sm100: str) -> str:
+    """This architecture's forced variant of a case (SM8x has none: skip)."""
+    tactic = {9: sm90, 10: sm100}.get(_major())
+    if tactic is None:
+        pytest.skip("no forced variants on this architecture")
+    return tactic
 
 
 def _check_against_reference(out, act, w_fp8, scale, bias, tag):
@@ -280,7 +288,7 @@ def test_mm_bf16_fp8_workspace_bytes_extreme_dims():
     2**28 - 1 tiles of 64x64 their 32-bit tile product."""
     dev = torch.device("cuda")
     big = _MAX_DIM
-    tactics = [None] + (_TACTICS_SM100 if _major() == 10 else _TACTICS_SM90)
+    tactics = [None] + {10: _TACTICS_SM100, 9: _TACTICS_SM90}.get(_major(), [])
     # ceil(big / 64) is 2^25 - 8, so 8 tile columns (N = 512) give 2^28 - 64 output
     # tiles of 64x64, still under the cap; K at the bound exercises the k-tile count of
     # the stream-K sizing and the split rules.
@@ -320,7 +328,7 @@ def test_mm_bf16_fp8_workspace_bytes_splitk_overflow():
     leave the range are rejected by the tile-count bound before the query is
     asked."""
     dev = torch.device("cuda")
-    tactic = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[_major()]
+    tactic = _arch_tactic("128x128_splitk", "2sm256x128_splitk")
     big = _MAX_DIM
     # 2 slices x 2^20 x 2^19 floats = 2^42 bytes (4 TiB).  The forced split on this
     # short K is the smallest, 2.
@@ -416,8 +424,7 @@ def test_mm_bf16_fp8_rejects_aliasing():
     including on an empty call."""
     torch.manual_seed(0)
     dev = torch.device("cuda")
-    major = get_compute_capability(dev)[0]
-    tactic = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
+    tactic = _arch_tactic("128x128_splitk", "2sm256x128_splitk")
     m, n, k = 256, 1024, 5120
     act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
     w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
@@ -563,8 +570,7 @@ def test_mm_bf16_fp8_forced_splitk_unsplittable_k():
     the workspace query as well as by the call (both resolve the same plan), instead
     of the query reporting a size and the launch failing."""
     dev = torch.device("cuda")
-    major = get_compute_capability(dev)[0]
-    tactic = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
+    tactic = _arch_tactic("128x128_splitk", "2sm256x128_splitk")
     m, n, k = (
         256,
         1024,
@@ -597,8 +603,7 @@ def test_mm_bf16_fp8_rejects_misaligned_storage():
     """A contiguous view at an odd storage offset is rejected (a misaligned pointer
     would otherwise fault the CUDA context from the TMA / vector-store paths)."""
     dev = torch.device("cuda")
-    major = get_compute_capability(dev)[0]
-    tactic = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
+    tactic = _arch_tactic("128x128_splitk", "2sm256x128_splitk")
     m, n, k = 7, 8, 1024
     act = torch.ones(m, k, device=dev, dtype=torch.bfloat16)
     w_fp8 = torch.ones(n, k, device=dev).to(torch.float8_e4m3fn)
@@ -650,7 +655,7 @@ def test_mm_bf16_fp8_empty_m():
             w_fp8,
             scale,
             out=given,
-            tactic="128x128" if get_compute_capability(dev)[0] == 9 else "1sm128x128",
+            tactic={9: "128x128", 10: "1sm128x128"}.get(get_compute_capability(dev)[0]),
         )
         is given
     )
@@ -1024,7 +1029,7 @@ def test_mm_bf16_fp8_streamk_medium_k_tail(tactic, m, n):
 def _tail_tactic_and_shape(dev):
     """A forced variant and a shape on which this architecture splits K and needs a
     workspace (Hopper: a stream-K tail; Blackwell: split-K)."""
-    tactic = {9: "128x256_streamk", 10: "2sm256x128_splitk"}[_major()]
+    tactic = _arch_tactic("128x256_streamk", "2sm256x128_splitk")
     return tactic, _shape_needing_workspace(tactic, dev)
 
 
@@ -1118,7 +1123,7 @@ def test_mm_bf16_fp8_scalar_scale_minimally_aligned(split, monkeypatch):
         tactic, (m, n, k) = _tail_tactic_and_shape(dev)
     else:
         tactic, (m, n, k) = (
-            {9: "128x256", 10: "2sm256x128"}[_major()],
+            _arch_tactic("128x256", "2sm256x128"),
             (256, 1024, 2048),
         )
     torch.manual_seed(0)

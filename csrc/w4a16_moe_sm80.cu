@@ -278,10 +278,10 @@ __device__ __forceinline__ uint32_t e4m3x2(uint32_t y) {
   asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(r), "r"(0x7B007B00u), "r"(0x80008000u));
   return r | (((mag + 0x00100010u) & 0x08000800u) >> 11) * 0x7FC0u;
 }
-// F8 (F8 1: E4M3, 2: E5M2): bit 7 of each byte of v set where the byte is Inf or NaN
+// F8 (F8 1, 3: E4M3, 2: E5M2): bit 7 of each byte of v set where the byte is Inf or NaN
 template <int F8>
 __device__ __forceinline__ uint32_t f8_special(uint32_t v) {
-  return ((v & (F8 == 1 ? 0x7F7F7F7Fu : 0x7C7C7C7Cu)) + (F8 == 1 ? 0x01010101u : 0x04040404u)) &
+  return ((v & (F8 != 2 ? 0x7F7F7F7Fu : 0x7C7C7C7Cu)) + (F8 != 2 ? 0x01010101u : 0x04040404u)) &
          0x80808080u;
 }
 // F8: the FP8 bytes 0..3 of v as the bf16x2 pairs lo (bytes 0, 2) and hi (1, 3), each w x 2^-120
@@ -297,6 +297,30 @@ __device__ __forceinline__ void f8_bf16x2(uint32_t v, uint32_t& lo, uint32_t& hi
     const uint32_t x = f8_special<F8>(v);
     lo |= (x & 0x00800080u) * 0xFFu;
     hi |= ((x >> 8) & 0x00800080u) * 0xFFu;
+  }
+}
+// F8 3 (A16: E4M3 weights against the raw 16-bit activation): f8_bf16x2's pairs as the weights
+// themselves, exact in either type (subnormals too): BF16 w 2^-120 times 2^120, FP16 the byte's
+// exponent and mantissa at bits 7..13 (w 2^-8) times 2^8; SPEC: a NaN byte stays NaN.
+template <int F8, bool SPEC>
+__device__ __forceinline__ void f8_w(uint32_t v, uint32_t& lo, uint32_t& hi) {
+  if constexpr (F8 != 3) {
+    f8_bf16x2<F8, SPEC>(v, lo, hi);
+  } else {
+    if constexpr (kF16) {
+      lo = ((v << 7) & 0x3F803F80u) | ((v << 8) & 0x80008000u);
+      hi = ((v >> 1) & 0x3F803F80u) | (v & 0x80008000u);
+      if constexpr (SPEC) {
+        const uint32_t x = f8_special<3>(v);
+        lo |= (x & 0x00800080u) * 0xF8u;
+        hi |= ((x >> 8) & 0x00800080u) * 0xF8u;
+      }
+    } else {
+      f8_bf16x2<1, SPEC>(v, lo, hi);
+    }
+    constexpr uint32_t s = kF16 ? 0x5C005C00u : 0x7B807B80u;
+    asm(RECORDS_FMA_X2 " %0, %1, %2, %3;" : "=r"(lo) : "r"(lo), "r"(s), "r"(0x80008000u));
+    asm(RECORDS_FMA_X2 " %0, %1, %2, %3;" : "=r"(hi) : "r"(hi), "r"(s), "r"(0x80008000u));
   }
 }
 
@@ -400,6 +424,7 @@ struct GemmParamsF8 : GemmParamsOw {
   const float* gsb;
   long sa_r, sa_k, sb_n, sb_k;
   int gm;
+  const XT* bias;  // F8 3: [Nout] (null: none), added to the FP32 result
 };
 template <bool FQ, bool OW = false, bool MX = false, int F8 = 0>
 using GemmParamsT = std::conditional_t<
@@ -770,14 +795,15 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
   static_assert(!SH || (OW && (!MX || F8)), "SH: OW, not MXFP4");
   static_assert(!F8 || OW, "F8: OW");
   static_assert(!GW || (F8 && !MX && !SH), "GW: F8, not MX or shuffled");
+  static_assert(F8 != 3 || (!MX && !SH && !GW), "F8 3: plain E4M3 weights");
   using C = Cfg<R, NC>;
   constexpr int NT = NW * 32;
   constexpr int SC = 8 * NC / WC, WT = NW / WC, TW = R / WT, G = TW / 8;
   static_assert(!PT || (NC == 1 && SC < 4 && !G1E && !Q12F && !VS && (!FQ || !ACT)),
                 "PT: the kBase GEMM1 or GEMM2");
   static_assert(!OW || (ACT == 0 && NC == 1 && SC < 4 && !G1E && !Q12F && !VS && !FQ && !PT &&
-                        !kF16 && !kExt),
-                "OW: the kBase GEMM2 on BF16");
+                        (!kF16 || F8 == 3) && !kExt),
+                "OW: the kBase GEMM2 on BF16 (F8 3: or FP16)");
   constexpr int RP = NT / 16;  // activation rows per pass: 16 threads x 16 B per 256 B row
   constexpr int WP = kWBytes / (NT * 16);  // weight cp16 per thread and record
   static_assert((WC == 4 || WC == 8) && NW % WC == 0 && (R % RP == 0 || RP % R == 0) && TW % 8 == 0,
@@ -1254,10 +1280,17 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
               } else if constexpr (OW) {  // the sum (times 2^7, exact; F8: 2^8 E4M3, 1) times alpha
                 constexpr float kSum = MX || GW ? 1.f : F8 == 1 ? 256.f : F8 ? 1.f : 128.f;
                 const float r = p.alpha_rows ? p.alpha[f] : a;
+                const auto fin = [&](int c, float x) {  // F8 3: the bias in FP32, one rounding
+                  if constexpr (F8 == 3) {
+                    if (p.bias) x += static_cast<float>(p.bias[c]);
+                  }
+                  return to_o(x);
+                };
                 if (n < Nout)
-                  reinterpret_cast<OT*>(p.out)[f * Nout + n] = to_o(v[s][gi][h] * kSum * r);
+                  reinterpret_cast<OT*>(p.out)[f * Nout + n] = fin(n, v[s][gi][h] * kSum * r);
                 if (n + 8 < Nout)
-                  reinterpret_cast<OT*>(p.out)[f * Nout + n + 8] = to_o(v[s][gi][2 + h] * kSum * r);
+                  reinterpret_cast<OT*>(p.out)[f * Nout + n + 8] =
+                      fin(n + 8, v[s][gi][2 + h] * kSum * r);
               } else {
                 if (n < Nout) reinterpret_cast<OT*>(p.out)[f * Nout + n] = to_o(v[s][gi][h] * a);
                 if (n + 8 < Nout)
@@ -1672,8 +1705,8 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
               uint32_t a[2][4];
 #pragma unroll
               for (int h = 0; h < 2; ++h) {
-                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h], a[h][0], a[h][2]);
-                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h + 1], a[h][1], a[h][3]);
+                f8_w<F8, SPEC>(wq[s][4 * j + 2 * h], a[h][0], a[h][2]);
+                f8_w<F8, SPEC>(wq[s][4 * j + 2 * h + 1], a[h][1], a[h][3]);
               }
 #pragma unroll
               for (int gi = 0; gi < NG; ++gi) {
@@ -1688,8 +1721,8 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
 #pragma unroll
               for (int h = 0; h < 2; ++h) {  // chunk 2 j + h: words of rows g (m = 2 h), g + 8
                 uint32_t a[4];
-                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h], a[0], a[2]);
-                f8_bf16x2<F8, SPEC>(wq[s][4 * j + 2 * h + 1], a[1], a[3]);
+                f8_w<F8, SPEC>(wq[s][4 * j + 2 * h], a[0], a[2]);
+                f8_w<F8, SPEC>(wq[s][4 * j + 2 * h + 1], a[1], a[3]);
 #pragma unroll
                 for (int gi = 0; gi < NG; ++gi) mma_x(acc[s][gi], a, bf[gi] + 2 * h);
               }
@@ -1914,10 +1947,13 @@ __global__ void __launch_bounds__(NW * 32) gemm_pt(GemmParamsT<FQ> p) {
 }
 
 // OW (gemm_fp4, the dense mm_fp4; F8: gemm_f8, the dense mm_fp8 / bmm_fp8): the BF16 modules of
-// the default recipe without epilogue extensions (w4a16_moe_sm80 and its out_f16 module)
-#if !defined(RECORDS_F16) && !defined(RECORDS_ACT) && !defined(RECORDS_EXACT) && \
-    !defined(RECORDS_E4M3_MAX)
+// the default recipe without epilogue extensions (w4a16_moe_sm80 and its out_f16 module);
+// RECORDS_F8 (gemm_f8, prep_f8): those and the FP16 module, which runs F8 3 (mm_fp16_fp8) only
+#if !defined(RECORDS_ACT) && !defined(RECORDS_EXACT) && !defined(RECORDS_E4M3_MAX)
+#define RECORDS_F8
+#ifndef RECORDS_F16
 #define RECORDS_OW
+#endif
 template <int R, int WC, int NW, int STAGES, bool KT, bool MX = false, bool SH = false, int F8 = 0,
           bool GW = false>
 __global__ void __launch_bounds__(NW * 32) gemm_ow(GemmParamsT<false, true, MX, F8> p) {
@@ -1929,9 +1965,10 @@ __global__ void __launch_bounds__(NW * 32) gemm_ow(GemmParamsT<false, true, MX, 
 // (block blk: batch blk / nbb, its rows (blk % nbb) R .. ; meta and rowmap as prep's), then over
 // x [b bm][K] FP8 (F8A 1: E4M3, 2: E5M2) restored times 2^112 into x_out [b bm][kp] BF16, a k32
 // group stored as gemm_f8 reads it (position 8 t + 4 h + j: k 16 h + 4 t + {0, 2, 1, 3}[j]), zeros
-// past K (K % 16 == 0). Every FP8 value is exact in BF16 times 2^112; NaN and Inf stay.
+// past K (K % 16 == 0). Every FP8 value is exact in BF16 times 2^112; NaN and Inf stay. F8A 0
+// (F8 3's): x [b bm][K] XT, moved as it is.
 template <int F8A>
-__global__ void prep_f8(const uint8_t* __restrict__ x, XT* __restrict__ xo, int* __restrict__ meta,
+__global__ void prep_f8(const void* __restrict__ xv, XT* __restrict__ xo, int* __restrict__ meta,
                         int* __restrict__ rowmap, int max_blocks, int R, int nbb, long tokens,
                         int bm, int K, int kp) {
   const long n = static_cast<long>(gridDim.x) * blockDim.x;
@@ -1951,7 +1988,21 @@ __global__ void prep_f8(const uint8_t* __restrict__ x, XT* __restrict__ xo, int*
   for (long u = i0; u < tokens * gk * 4; u += n) {  // (token, k32 group G, t)
     const int t = static_cast<int>(u & 3), G = static_cast<int>((u >> 2) % gk);
     const long tok = (u >> 2) / gk;
-    const uint8_t* xr = x + tok * K + 32 * G + 4 * t;
+    if constexpr (F8A == 0) {  // XT k .. k + 3 (8 B): the pairs (k, k + 2), (k + 1, k + 3)
+      const XT* xr = static_cast<const XT*>(xv) + tok * K + 32 * G + 4 * t;
+      uint32_t o[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+        if (h == 0 || 32 * G + 16 < K) {
+          const uint2 w = *reinterpret_cast<const uint2*>(xr + 16 * h);
+          o[2 * h] = __byte_perm(w.x, w.y, 0x5410);
+          o[2 * h + 1] = __byte_perm(w.x, w.y, 0x7632);
+        }
+      *reinterpret_cast<uint4*>(xo + tok * kp + 32 * G + 8 * t) =
+          make_uint4(o[0], o[1], o[2], o[3]);
+      continue;
+    }
+    const uint8_t* xr = static_cast<const uint8_t*>(xv) + tok * K + 32 * G + 4 * t;
     const uint32_t v[2] = {*reinterpret_cast<const uint32_t*>(xr),
                            32 * G + 16 < K ? *reinterpret_cast<const uint32_t*>(xr + 16) : 0u};
     // f8_bf16x2: the value times 2^-120 (E4M3) or 2^-112 (E5M2), in two exact steps to 2^112
@@ -2734,7 +2785,7 @@ void launch_tile(int R, GemmParamsT<FQ> const& p, int grid, cudaStream_t st) {
                                                                                          st);
 }
 
-#ifdef RECORDS_OW
+#ifdef RECORDS_F8
 template <int R, int F8, bool MX = false, bool GW = false>
 constexpr int ow_stage_bytes() {  // gemm_body's kStage
   return F8 ? kF8WBytes + R * 256 + (MX || GW ? ((MX ? 512 : 16) + R * 4 + 127) / 128 * 128 : 0)
@@ -3427,17 +3478,26 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   K % kTileK != 0 ? tile(std::true_type{}) : tile(std::false_type{});
 }
 
-// gemm_f8's input (prep_f8): x [b bm][K] FP8 as uint8 (fmt 1: E4M3, 2: E5M2), x_out [b bm][pad(K,
-// 32)] BF16; meta and rowmap route the b batches of bm = rows / b to blocks of row_tile.
+#endif
+
+#ifdef RECORDS_F8
+// gemm_f8's input (prep_f8): x [b bm][K] FP8 as uint8 (fmt 1: E4M3, 2: E5M2; BF16 modules) or
+// 16-bit (fmt 0: the module's type, w_fmt 3's), x_out [b bm][pad(K, 32)] of that type; meta and
+// rowmap route the b batches of bm = rows / b to blocks of row_tile.
 void w4a16_moe_sm80_prep_f8(TensorView x, TensorView x_out, TensorView meta, TensorView rowmap,
                             int64_t b, int64_t K, int64_t row_tile, int64_t max_blocks,
                             int64_t fmt) {
-  CHECK_INPUT_AND_TYPE(x, dl_uint8);
+  TVM_FFI_ICHECK(fmt == 0 || (!kF16 && (fmt == 1 || fmt == 2)))
+      << "fmt: 0 (16-bit), 1 (E4M3) or 2 (E5M2; BF16 modules)";
+  if (fmt == 0) {
+    CHECK_INPUT_AND_TYPE(x, kXdl);
+  } else {
+    CHECK_INPUT_AND_TYPE(x, dl_uint8);
+  }
   CHECK_INPUT_AND_TYPE(x_out, kXdl);
   CHECK_INPUT_AND_TYPE(meta, dl_int32);
   CHECK_INPUT_AND_TYPE(rowmap, dl_int32);
   CHECK_DIM(2, x_out);
-  TVM_FFI_ICHECK(fmt == 1 || fmt == 2) << "fmt: 1 (E4M3) or 2 (E5M2)";
   TVM_FFI_ICHECK(row_tile == 8 || row_tile == 16 || row_tile == 32 || row_tile == 64)
       << "row_tile must be 8, 16, 32 or 64";
   const int64_t rows = x_out.size(0), kp = (K + 31) / 32 * 32, R = row_tile;
@@ -3448,21 +3508,24 @@ void w4a16_moe_sm80_prep_f8(TensorView x, TensorView x_out, TensorView meta, Ten
   TVM_FFI_ICHECK(b * nbb <= max_blocks && meta.numel() >= 1 + 2 * max_blocks &&
                  rowmap.numel() >= max_blocks * R)
       << "max_blocks, meta or rowmap is too small";
-  TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 3) == 0 &&
+  TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & (fmt == 0 ? 7 : 3)) == 0 &&
                  (reinterpret_cast<uintptr_t>(x_out.data_ptr()) & 15) == 0)
-      << "x must be 4 B aligned, x_out 16 B";
+      << "x must be 4 B aligned (fmt 0: 8 B), x_out 16 B";
   ffi::CUDADeviceGuard device_guard(x.device().device_id);
   const int64_t work = std::max(rows * (kp / 8), b * nbb * R);
   const int grid =
       static_cast<int>(std::max<int64_t>(1, std::min<int64_t>((work + 255) / 256, 1 << 20)));
   auto run = [&](auto kern) {
     kern<<<grid, 256, 0, get_stream(x.device())>>>(
-        static_cast<const uint8_t*>(x.data_ptr()), static_cast<XT*>(x_out.data_ptr()),
-        static_cast<int*>(meta.data_ptr()), static_cast<int*>(rowmap.data_ptr()),
-        static_cast<int>(max_blocks), static_cast<int>(R), static_cast<int>(nbb), rows,
-        static_cast<int>(bm), static_cast<int>(K), static_cast<int>(kp));
+        x.data_ptr(), static_cast<XT*>(x_out.data_ptr()), static_cast<int*>(meta.data_ptr()),
+        static_cast<int*>(rowmap.data_ptr()), static_cast<int>(max_blocks), static_cast<int>(R),
+        static_cast<int>(nbb), rows, static_cast<int>(bm), static_cast<int>(K),
+        static_cast<int>(kp));
   };
-  fmt == 1 ? run(prep_f8<1>) : run(prep_f8<2>);
+  if constexpr (kF16)
+    run(prep_f8<0>);
+  else
+    fmt == 0 ? run(prep_f8<0>) : fmt == 1 ? run(prep_f8<1>) : run(prep_f8<2>);
 }
 
 // The dense mm_fp8 / bmm_fp8 (F8): out [b bm][Nout] = alpha[0] x act w^T (bmm: alpha[0] bs[0], the
@@ -3474,7 +3537,9 @@ void w4a16_moe_sm80_prep_f8(TensorView x, TensorView x_out, TensorView meta, Ten
 // sf_bstride; shuffled: the rows in the weights' shuffle) and asf the activation's (128x4, or 8x4
 // with a8x4, over the b bm rows), alpha 1. GW (gsb): the groupwise FP32 scales per k-step, gsa
 // [ceil(rows / gm)][nka] of the activation's rows in gm-row groups and gsb [batches][ceil(N /
-// 128)][nka] of each batch's 128-row weight groups (any strides), alpha 1.
+// 128)][nka] of each batch's 128-row weight groups (any strides), alpha 1. w_fmt 3 (mm_bf16_fp8,
+// mm_fp16_fp8; the FP16 module's only, not an out module's): E4M3 weights restored exactly
+// against prep_f8's fmt 0 act, out = alpha[0] act w^T + bias (bias [Nout] of act's type, or none).
 void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<TensorView> bs,
                             TensorView act, TensorView meta, TensorView rowmap, TensorView out,
                             int64_t row_tile, int64_t N, int64_t K, int64_t max_blocks,
@@ -3482,7 +3547,8 @@ void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<T
                             int64_t batch_stride, int64_t w_fmt, bool shuffled,
                             tvm::ffi::Optional<TensorView> sf, tvm::ffi::Optional<TensorView> asf,
                             bool a8x4, int64_t sf_bstride, tvm::ffi::Optional<TensorView> gsa,
-                            tvm::ffi::Optional<TensorView> gsb, int64_t gm) {
+                            tvm::ffi::Optional<TensorView> gsb, int64_t gm,
+                            tvm::ffi::Optional<TensorView> bias) {
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(act, kXdl);
@@ -3492,7 +3558,15 @@ void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<T
   if (bs.has_value()) {
     CHECK_INPUT_AND_TYPE(bs.value(), dl_float32);
   }
-  TVM_FFI_ICHECK(w_fmt == 1 || w_fmt == 2) << "w_fmt: 1 (E4M3) or 2 (E5M2)";
+  TVM_FFI_ICHECK(kF16 ? w_fmt == 3 : w_fmt == 1 || w_fmt == 2 || (w_fmt == 3 && !kOutOnly))
+      << "w_fmt: 1 (E4M3) or 2 (E5M2; BF16 modules), 3 (E4M3 over a 16-bit act; no out module)";
+  TVM_FFI_ICHECK(w_fmt == 3 ? !(shuffled || sf.has_value() || gsb.has_value() || bs.has_value())
+                            : !bias.has_value())
+      << "w_fmt 3: plain weights, no bs; bias: w_fmt 3 only";
+  if (bias.has_value()) {
+    CHECK_INPUT_AND_TYPE(bias.value(), kXdl);
+    TVM_FFI_ICHECK(bias.value().numel() >= out.size(1)) << "bias [Nout]";
+  }
   TVM_FFI_ICHECK(!shuffled || (w_fmt == 1 && N % 32 == 0)) << "shuffled weights: E4M3, N % 32 == 0";
   const int64_t Nout = out.size(1), n_pad = (N + kTileN - 1) / kTileN * kTileN;
   TVM_FFI_ICHECK(N > 0 && K > 0 && K % 16 == 0 && Nout <= n_pad && batches >= 1 &&
@@ -3561,6 +3635,7 @@ void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<T
   p.row_stride = row_stride;
   p.kstep_stride = kstep_stride;
   p.batch_stride = batch_stride;
+  p.bias = bias.has_value() ? static_cast<const XT*>(bias.value().data_ptr()) : nullptr;
   if (mx) {
     p.sf = static_cast<const uint8_t*>(sf.value().data_ptr());
     p.nka = static_cast<int>(nka);
@@ -3582,17 +3657,21 @@ void w4a16_moe_sm80_gemm_f8(TensorView w, TensorView alpha, tvm::ffi::Optional<T
   const int rt = static_cast<int>(row_tile);
   auto tile = [&](auto kt) {
     constexpr bool T = decltype(kt)::value;
-    if (gw)
-      w_fmt == 1 ? launch_tile_ow<T, false, false, 1, true>(rt, p, grid, st)
-                 : launch_tile_ow<T, false, false, 2, true>(rt, p, grid, st);
-    else if (mx)
-      shuffled     ? launch_tile_ow<T, true, true, 1>(rt, p, grid, st)
-      : w_fmt == 1 ? launch_tile_ow<T, true, false, 1>(rt, p, grid, st)
-                   : launch_tile_ow<T, true, false, 2>(rt, p, grid, st);
-    else
-      shuffled     ? launch_tile_ow<T, false, true, 1>(rt, p, grid, st)
-      : w_fmt == 1 ? launch_tile_ow<T, false, false, 1>(rt, p, grid, st)
-                   : launch_tile_ow<T, false, false, 2>(rt, p, grid, st);
+    if (w_fmt == 3) {
+      if constexpr (!kOutOnly) launch_tile_ow<T, false, false, 3>(rt, p, grid, st);
+    } else if constexpr (!kF16) {
+      if (gw)
+        w_fmt == 1 ? launch_tile_ow<T, false, false, 1, true>(rt, p, grid, st)
+                   : launch_tile_ow<T, false, false, 2, true>(rt, p, grid, st);
+      else if (mx)
+        shuffled     ? launch_tile_ow<T, true, true, 1>(rt, p, grid, st)
+        : w_fmt == 1 ? launch_tile_ow<T, true, false, 1>(rt, p, grid, st)
+                     : launch_tile_ow<T, true, false, 2>(rt, p, grid, st);
+      else
+        shuffled     ? launch_tile_ow<T, false, true, 1>(rt, p, grid, st)
+        : w_fmt == 1 ? launch_tile_ow<T, false, false, 1>(rt, p, grid, st)
+                     : launch_tile_ow<T, false, false, 2>(rt, p, grid, st);
+    }
   };
   K % kTileK != 0 ? tile(std::true_type{}) : tile(std::false_type{});
 }
@@ -3767,6 +3846,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(finalize, w4a16_moe_sm80_finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(row_quant, w4a16_moe_sm80_row_quant);
 #ifdef RECORDS_OW
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_fp4, w4a16_moe_sm80_gemm_fp4);
+#endif
+#ifdef RECORDS_F8
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(prep_f8, w4a16_moe_sm80_prep_f8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_f8, w4a16_moe_sm80_gemm_f8);
 #endif

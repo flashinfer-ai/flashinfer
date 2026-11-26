@@ -522,8 +522,11 @@ def w8a16_fp8_gemm_workspace_bytes(
     ``tile_a x tile_w`` fp32 block per tail slice plus the tail tiles' arrival
     counters, :func:`_sm90_workspace_layout`).  A pure function of the shape and
     the device's SM count; ``algo`` as :func:`launch_w8a16_fp8_gemm`."""
+    major = get_compute_capability(device)[0]
+    if major == 8:  # SM8x has no FP8 MMA: the records GEMM, no workspace
+        return 0
     num_sms = get_device_sm_count(device)
-    if get_compute_capability(device)[0] == 9:
+    if major == 9:
         plan = _sm90_plan(algo, m, n, k, num_sms)
         tile_w, tile_a = _SM90_TILES[plan.tile_algo].rows
         if plan.tail_tiles == 0:
@@ -547,7 +550,7 @@ def launch_w8a16_fp8_gemm(
     """Launch the W8A16 GEMM (``out = act @ dequant(weight).T + bias``) on
     validated 2-D tensors: ``act`` [M, K] fp16 / bf16, ``weight`` [N, K] e4m3,
     ``weight_scale`` one fp32, ``bias`` [N] or None, ``out`` [M, N], all
-    contiguous and on one Hopper or Blackwell device; ``act``, ``weight``,
+    contiguous and on one SM8x, Hopper or Blackwell device; ``act``, ``weight``,
     ``bias``, ``out`` and ``workspace`` 16-byte aligned, ``weight_scale`` only
     4-byte aligned (a one-element view at any fp32 offset is fine; the public
     :func:`flashinfer.gemm.w8a16_fp8_gemm` checks all of that).  ``algo``: a code of the
@@ -557,7 +560,13 @@ def launch_w8a16_fp8_gemm(
     # The DSL resolves its compile target from the current CUDA device: run the
     # call under act's device, which need not be the current one.
     with torch.cuda.device(act.device):
-        if _target(act.device)[0] == 9:
+        major = _target(act.device)[0]
+        # SM8x has no FP8 MMA: the records GEMM restores the weights exactly.
+        if major == 8:
+            from .sm8x_fp8_dense import sm8x_mm_16bit_fp8
+
+            sm8x_mm_16bit_fp8(act, weight, weight_scale, bias, out)
+        elif major == 9:
             _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo, workspace)
         else:
             _w8a16_fp8_gemm_sm100(act, weight, weight_scale, bias, out, algo, workspace)

@@ -14,9 +14,11 @@ FP32 scales of ``A``'s 1- or 128-row groups and ``B``'s 128-row groups per 128-e
 the SM100 DeepGEMM takes of their scales, as MXFP8 scales, the rows routed by ``m_indices`` or
 ``masked_m``; ``group_gemm_mxfp8_mxfp4_nt_groupwise`` the MXFP4 weights on the dense
 ``mm_fp4`` GEMM (``gemm_fp4``) with ``A`` restored to BF16 in its routed row order, as
-``masked_scaled_bmm`` and ``ragged_scaled_bmm`` their FP4 weights (MXFP8: ``gemm_f8``). Every
-backend name keeps its SM100+ requirements and runs here; on SM89 the native per-tensor cuBLAS
-and cuDNN backends keep their own runners.
+``masked_scaled_bmm`` and ``ragged_scaled_bmm`` their FP4 weights (MXFP8: ``gemm_f8``).
+``mm_bf16_fp8`` and ``mm_fp16_fp8`` run ``gemm_f8`` on the 16-bit activation with the E4M3
+weight restored exactly in its type, the bias added to the FP32 sum before the one rounding.
+Every backend name keeps its SM100+ requirements and runs here; on SM89 the native per-tensor
+cuBLAS and cuDNN backends keep their own runners.
 """
 
 import functools
@@ -233,7 +235,7 @@ def _run_fp8(
         alpha, beta, gsa, gsb = _ones(a.device), None, scale_a, scale_b
     gemm.gemm_f8(
         w, alpha, beta, act, meta, rowmap, target, r, n, k, max_blocks, groups, rs, ks, bs,
-        _FMT[b.dtype], shuffled, sf, asf, a8x4, sf_bstride, gsa, gsb, max(gm, 1),
+        _FMT[b.dtype], shuffled, sf, asf, a8x4, sf_bstride, gsa, gsb, max(gm, 1), None,
     )  # fmt: skip
     if not direct:
         out.copy_(target[:, :n].view(batches, m, n))
@@ -1119,3 +1121,80 @@ def sm8x_ragged_scaled_bmm(
              device=a.device), c],
         )  # fmt: skip
     return c
+
+
+def _run_16(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    r: int,
+) -> None:
+    """``out = alpha * (a @ b.T) + bias``: ``a`` ``(M, K)`` BF16 or FP16, ``b`` ``(N, K)`` E4M3,
+    ``bias`` ``(N,)`` of ``a``'s type or None, ``out`` ``(M, N)``, contiguous."""
+    m, k = (int(x) for x in a.shape)
+    n, kp = int(b.shape[0]), _pad(k, 32)
+    rows = _I32_MAX // kp  # the GEMM's activation offsets are 32-bit
+    if m > rows:
+        for r0 in range(0, m, rows):
+            _run_16(a[r0 : r0 + rows], b, alpha, bias, out[r0 : r0 + rows], r)
+        return
+    max_blocks = -(-m // r)
+    ints = (1 + 2 * max_blocks, max_blocks * r)
+    meta, rowmap = torch.empty(sum(ints), dtype=torch.int32, device=a.device).split(
+        ints
+    )
+    act = torch.empty((m, kp), dtype=a.dtype, device=a.device)
+    module = _w4a16_moe_sm80_module(None, False, None, a.dtype == torch.float16)
+    module.prep_f8(a.reshape(-1), act, meta, rowmap, 1, k, r, max_blocks, 0)
+    module.gemm_f8(
+        b.view(torch.uint8).reshape(-1), alpha.reshape(1), None, act, meta, rowmap, out, r, n,
+        k, max_blocks, 1, k, 128, 0, 3, False, None, None, False, 0, None, None, 1, bias,
+    )  # fmt: skip
+
+
+class Sm8x16BitFp8Runner(TunableRunner):
+    """``_run_16`` as an autotuner candidate on ``[a, b, alpha, out]`` (plus ``bias`` when
+    given); tactic: the row tile."""
+
+    def get_cache_key_extras(self, inputs) -> tuple:
+        return (inputs[0].dtype, len(inputs))
+
+    def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
+        return [8, 16, 32, 64]
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        a, b, alpha, out = inputs[:4]
+        bias = inputs[4] if len(inputs) > 4 else None
+        _run_16(a, b, alpha, bias, out, 64 if tactic in (None, -1) else tactic)
+        return out
+
+
+def sm8x_mm_16bit_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> None:
+    """``mm_bf16_fp8`` / ``mm_fp16_fp8`` on SM8x: ``launch_w8a16_fp8_gemm``'s validated 2-D
+    operands (``b`` ``(N, K)`` E4M3, ``alpha`` one FP32)."""
+    from ..fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket_uncapped,
+    )
+
+    tuning = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                (0,), (0,), get_hybrid_num_tokens_buckets, map_to_hybrid_bucket_uncapped
+            ),
+        ),
+        constraint_specs=(ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),),
+    )
+    inputs = [a, b, alpha, out] + ([] if bias is None else [bias])
+    chosen, tactic = AutoTuner.get().choose_one(
+        "mm_16bit_fp8_sm8x", [Sm8x16BitFp8Runner()], tuning, inputs
+    )
+    chosen(inputs=inputs, tactic=tactic)
