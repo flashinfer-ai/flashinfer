@@ -25,6 +25,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -34,7 +35,7 @@ from flashinfer.attention.prims_ts._compile_cache import (
     _kernel_source_files,
     build_and_load_attention_kernel,
 )
-from flashinfer.attention.prims_ts import _hardware
+from flashinfer.attention.prims_ts import _compile_cache, _hardware
 
 pytestmark = pytest.mark.arch_blackwell
 
@@ -100,19 +101,35 @@ def test_unknown_compile_values_bypass_persistence(monkeypatch):
     )
 
 
-def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch):
+def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch, tmp_path):
     from flashinfer.jit import cute_dsl_core
 
     names = []
     capability = [(10, 0)]
+    source = tmp_path / "kernel.py"
+    source.write_text("pass")
+    monkeypatch.setattr(_compile_cache, "_kernel_source_files", lambda: (str(source),))
+    hash_sources = Mock(wraps=cute_dsl_core._hash_source_files)
+    monkeypatch.setattr(cute_dsl_core, "_hash_source_files", hash_sources)
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", raising=False)
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100f")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability[0])
     monkeypatch.setattr(
         cute_dsl_core,
         "build_and_load_cute_dsl_kernel",
-        lambda module, name, *a, **kw: names.append((module, name)),
+        lambda module, name, fn, *, source_sha256: names.append(
+            (module, name, source_sha256)
+        ),
     )
+
+    def probe():
+        return _compile_cache.is_attention_kernel_cached(
+            "context", "main", _Spec(), "", lambda: None
+        )
+
+    assert not probe()
     build_and_load_attention_kernel("context", "main", _Spec(), "", lambda: None)
     build_and_load_attention_kernel(
         "context", "main", _Spec(device_index=1), "", lambda: None
@@ -121,6 +138,10 @@ def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch):
     build_and_load_attention_kernel("context", "main", _Spec(), "", lambda: None)
     assert names[0] == names[1]
     assert names[0] != names[2]
+    hash_sources.assert_called_once_with((str(source),))
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
+    assert not probe()
+    assert hash_sources.call_count == 2
 
 
 def test_source_dependencies_include_shared_attention_code():
@@ -159,6 +180,7 @@ def test_disabled_cache_compiles_directly(monkeypatch):
 
 def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypatch):
     utils = pytest.importorskip("cutlass.utils")
+    driver = pytest.importorskip("cuda.bindings.driver")
     device = [0]
     calls = []
     fail = [False]
@@ -176,23 +198,35 @@ def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypa
     )
     monkeypatch.setattr(torch, "empty", lambda *a, **kw: None)
     monkeypatch.setattr(
-        utils, "HardwareInfo", lambda *_: SimpleNamespace(get_max_active_clusters=query)
+        utils,
+        "HardwareInfo",
+        lambda *_: SimpleNamespace(kernel=None, get_max_active_clusters=query),
+    )
+    monkeypatch.setattr(
+        driver,
+        "cuOccupancyMaxPotentialClusterSize",
+        lambda *_: (driver.CUresult.CUDA_SUCCESS, (16, 8)[device[0]]),
     )
     _hardware._query_max_active_clusters.cache_clear()
+    _hardware._cluster_limits.cache_clear()
     try:
         assert _hardware.get_max_active_clusters(1) == 148
         assert _hardware.get_max_active_clusters(1) == 148
         assert _hardware.get_max_active_clusters(2) == 74
+        assert _hardware.get_max_active_clusters(16) == 9
+        assert _hardware.get_max_active_clusters(17) == 0
         device[0] = 1
         assert _hardware.get_max_active_clusters(1) == 147
+        assert _hardware.get_max_active_clusters(16) == 0
         fail[0] = True
         with pytest.raises(RuntimeError, match="probe failed"):
             _hardware.get_max_active_clusters(2)
         fail[0] = False
         assert _hardware.get_max_active_clusters(2) == 73
-        assert calls == [(0, 1), (0, 2), (1, 1), (1, 2), (1, 2)]
+        assert calls == [(0, 1), (0, 2), (0, 16), (1, 1), (1, 2), (1, 2)]
     finally:
         _hardware._query_max_active_clusters.cache_clear()
+        _hardware._cluster_limits.cache_clear()
 
 
 @pytest.mark.skipif(
@@ -407,3 +441,47 @@ def test_kv_tile_needs_right_mask(
     assert (
         kv_tile_needs_right_mask(tile_offset_k, tile_size_kv, visible_end) is expected
     )
+
+
+def test_unmasked_kv_tile_range_matches_per_tile_visibility() -> None:
+    """The cached tile range, plain or packed, selects exactly the fully visible tiles.
+
+    The packed word is read back as a signed 32-bit register, as on the GPU.
+    Bounds past its 16-bit fields may only shrink the range.
+    """
+    pytest.importorskip("cutlass", minversion="4.7.0")
+    from flashinfer.attention.prims_ts.kernels.mask import (
+        kv_tile_in_range,
+        kv_tile_is_fully_visible,
+        pack_kv_tile_range,
+        packed_kv_tile_in_range,
+        unmasked_kv_tile_range,
+    )
+
+    def as_int32(word: int) -> int:
+        word &= 0xFFFFFFFF
+        return word - (1 << 32) if word >= 1 << 31 else word
+
+    for tile_size_kv in (1, 3, 128):
+        for visible_begin in range(-130, 400, 7):
+            for visible_end in range(-130, 400, 11):
+                begin, end = unmasked_kv_tile_range(
+                    visible_begin, visible_end, tile_size_kv
+                )
+                packed = as_int32(pack_kv_tile_range(begin, end))
+                for tile_idx in range(400 // tile_size_kv + 2):
+                    visible = kv_tile_is_fully_visible(
+                        tile_idx * tile_size_kv,
+                        tile_size_kv,
+                        visible_begin,
+                        visible_end,
+                    )
+                    assert kv_tile_in_range(tile_idx, begin, end) is visible
+                    assert packed_kv_tile_in_range(tile_idx, packed) is visible
+
+    for begin, end in ((5, 0x8000), (5, 0x3FFFFFFF // 128), (0x10000, 0x10001)):
+        packed = as_int32(pack_kv_tile_range(begin, end))
+        for tile_idx in (0, 5, 0x7FFF, 0xFFFE, 0xFFFF, 0x10000):
+            if packed_kv_tile_in_range(tile_idx, packed):
+                assert kv_tile_in_range(tile_idx, begin, end)
+        assert packed_kv_tile_in_range(0x7FFF, packed) is (end > 0x7FFF > begin)

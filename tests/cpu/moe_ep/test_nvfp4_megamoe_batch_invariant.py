@@ -40,8 +40,10 @@ def _public(provider="legacy", **kwargs):
             )
     else:
         cls = BlackwellConfig
-        if provider != "legacy":
-            kwargs = dict(kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **kwargs)
+        selector = "sm100_nvfp4_nvfp4_bf16_cutedsl"
+        if provider == "legacy":
+            selector += "_legacy"
+        kwargs = dict(kernel_name=selector, **kwargs)
         if provider == "genphase":
             kwargs = dict(kernel_variant="genphase", **kwargs)
     return cls(intermediate_size=256, top_k=2, batch_invariant=True, **kwargs)
@@ -170,7 +172,7 @@ def test_only_validated_default_flag_batches_are_admitted(provider, knobs):
 
 
 def test_legacy_full_fc1_width_must_describe_specified_intermediate():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.nvfp4 import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.nvfp4 import (
         MegaMoENvfp4Config,
     )
 
@@ -227,7 +229,7 @@ def test_auto_selector_requires_same_nvfp4_numerical_class():
 def test_legacy_cache_isolates_arithmetic_and_rejects_corrupted_plan(
     tmp_path, monkeypatch
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     path = tmp_path / "knobs.json"
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
@@ -262,11 +264,11 @@ def test_legacy_cache_isolates_arithmetic_and_rejects_corrupted_plan(
 
 def _native_config(arch):
     if arch == "sm_107":
-        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             Sm107BlockScaledMoeConfig as Config,
         )
     else:
-        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             Sm100BlockScaledMoeConfig as Config,
         )
     return Config(
@@ -292,7 +294,7 @@ def test_native_requires_real_expert_scalar_inputs(arch):
 
 
 def test_blackwell_next_cache_contains_policy_and_receipt(tmp_path, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         knob_cache,
         tuning,
     )
@@ -339,7 +341,7 @@ def test_blackwell_next_cache_contains_policy_and_receipt(tmp_path, monkeypatch)
 
 
 def test_rubin_cache_isolates_receipt_and_rejects_bad_cached_geometry():
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
     knobs = nvfp4_batch_invariant_default_knobs("standard", arch="sm_107")
     key = dict(
@@ -373,7 +375,7 @@ def test_rubin_bi_staging_uses_logical_sf_view_of_padded_native_workspace(monkey
     from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
         staging,
     )
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as shim
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as shim
 
     class CudaMetadataTensor(torch.Tensor):
         @property

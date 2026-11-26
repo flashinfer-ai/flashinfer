@@ -50,9 +50,11 @@ See ``README.md`` in this package (section "Concurrency").
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import functools
 import os
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -2243,6 +2245,32 @@ def _bind(
     )
 
 
+def _capturing(index: int) -> bool:
+    """Whether the current stream of ``cuda:index`` is capturing a CUDA Graph."""
+    if _CURRENT_DEVICE() == index:
+        return _CAPTURING()
+    with torch.cuda.device(index):
+        return _CAPTURING()
+
+
+def _stream_sms(stream: int) -> int:
+    """SMs the context of ``stream`` offers: a green context's partition, else the whole device.  Without
+    the driver bindings' resource query, a large count, which leaves the check to the driver."""
+    try:
+        from cuda.bindings import driver
+
+        status, ctx = driver.cuStreamGetCtx(driver.CUstream(stream))
+        if status == driver.CUresult.CUDA_SUCCESS:
+            status, resource = driver.cuCtxGetDevResource(
+                ctx, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            )
+            if status == driver.CUresult.CUDA_SUCCESS:
+                return int(resource.sm.smCount)
+    except (ImportError, AttributeError):
+        pass
+    return sys.maxsize
+
+
 # ``cudaGetErrorString(cudaErrorCooperativeLaunchTooLarge)``, which the bindings report when a cooperative grid
 # does not fit the SMs the launch stream offers (a smaller green context, for one).
 _COOPERATIVE_TOO_LARGE = "too many blocks in cooperative launch"
@@ -2253,6 +2281,13 @@ def _clear_cuda_last_error() -> None:
     keeps it as the calling thread's last error, which the next PyTorch launch check would raise once.  The
     bindings share the process's ``libcudart`` with PyTorch (cuda-python's runtime module may load another
     copy), so this calls ``cudaGetLastError`` in every ``libcudart`` the process has loaded."""
+    if sys.platform == "win32":
+        # No /proc and no RTLD_NOLOAD: loading the DLL by name returns the copy the process already holds.
+        with contextlib.suppress(OSError):
+            ctypes.CDLL(
+                f"cudart64_{(torch.version.cuda or '').split('.')[0]}.dll"
+            ).cudaGetLastError()
+        return
     paths = set()
     try:
         with open("/proc/self/maps") as maps:
@@ -2338,6 +2373,14 @@ class _Launch:
 
     def __call__(self, stream: int) -> None:
         """Launch on ``stream``, the current stream of the launch's device (set as the FFI stream)."""
+        if (
+            self.cooperative_ctas
+            and _capturing(self.device_index)
+            and _stream_sms(stream) < self.min_sms()
+        ):
+            # The driver refuses an eager launch that does not fit.  Under capture, older drivers (CUDA 13.0)
+            # record it instead, so check the SMs of the capture stream here.
+            self._refused()
         try:
             if self.ws_numel:
                 self.entry(*self.ws_head, self.partial_ws(stream), *self.ws_tail)
@@ -2352,12 +2395,7 @@ class _Launch:
         """The partial workspace of a launch on ``stream``: the stream's workspace when eager, a block of the
         graph's memory pool under capture (written before it is read inside the launch, so never initialised)."""
         index = self.device_index
-        if _CURRENT_DEVICE() == index:
-            capturing = _CAPTURING()
-        else:
-            with torch.cuda.device(index):
-                capturing = _CAPTURING()
-        if capturing:
+        if _capturing(index):
             return torch.empty(
                 self.ws_numel, dtype=torch.float32, device=torch.device("cuda", index)
             )

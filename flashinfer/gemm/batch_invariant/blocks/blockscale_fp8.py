@@ -58,11 +58,6 @@ from cutlass.tensor_utils import LayoutEnum
 from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-# FlashInfer's copy of the DSL's persistent tile scheduler (the DSL's own module is deprecated and warns per use)
-from flashinfer.cute_dsl.attention.fmha.helpers import (
-    static_persistent_tile_scheduler as tile_scheduler,
-)
-
 from ....batch_invariant.fp_interface.cute import CuteF32
 from ..generator import Knobs, MainloopBlock
 from ..spec import BLOCK_K, SCALE_BLOCK_N, EpilogueChain
@@ -76,8 +71,8 @@ from .operands import (
     OUT_DT,
     StaticPlan,
     TmaSetup,
-    build_grid,
 )
+from .scheduler import SchedParams, TileScheduler, build_grid
 
 IN_FMT = "e4m3_bs"
 TMEM_COLS = 512  # the accumulator ring's budget: the dense body's 512 TMEM columns
@@ -791,7 +786,9 @@ class BlockScaleFp8Gemm:
         sfa: cute.Tensor,
         sfb: cute.Tensor,
         c: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
+        swizzle: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         assert a.element_type is IN_DT[IN_FMT] and b.element_type is IN_DT[IN_FMT], (
@@ -811,7 +808,6 @@ class BlockScaleFp8Gemm:
             LayoutEnum.from_tensor(a).mma_major_mode(),
             LayoutEnum.from_tensor(b).mma_major_mode(),
             LayoutEnum.from_tensor(c),
-            chunks=1,
             in_fmt=IN_FMT,
             acc_stages=acc_stages_for(self.knobs),
             reserve_smem_bytes=scale_ring_bytes(self.knobs),
@@ -825,7 +821,7 @@ class BlockScaleFp8Gemm:
         )  # one stage = one scale block
         tma = TmaSetup(st, a, b, c)
         self.num_tma_load_bytes = tma.tx_bytes
-        params, grid = build_grid(st, c, max_active_clusters)
+        params, grid = build_grid(st, c, max_active_clusters, swizzle, raster_m)
         self.kernel(
             st.tiled_mma,
             tma.atom_a,
@@ -866,7 +862,7 @@ class BlockScaleFp8Gemm:
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_staged,
         epi_tile: cute.Tile,
-        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+        tile_sched_params: SchedParams,
     ):
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1043,14 +1039,15 @@ class BlockScaleFp8Gemm:
         tCtAcc_fake = tiled_mma.make_fragment_C(
             cute.append(acc_shape, st.num_acc_stage)
         )
+        # the scheduler (its first tile decoded here) before the barrier init completes: the decode overlaps the wait
+        tile_sched = TileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         # --- roles
         if warp_idx == TMA_WARP_BS:
             cute.arch.setmaxregister_decrease(UNIFORM_REGS)
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             blockscale_producer_loop(
                 atom_thr_size,
                 k_tile_cnt,
@@ -1077,9 +1074,6 @@ class BlockScaleFp8Gemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             blockscale_mma_loop(
                 self.lowering,
                 st.num_acc_stage,
@@ -1105,9 +1099,6 @@ class BlockScaleFp8Gemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             blockscale_epilogue_loop(
                 st,
                 self.chain,

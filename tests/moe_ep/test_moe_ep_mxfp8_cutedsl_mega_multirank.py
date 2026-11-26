@@ -1,29 +1,12 @@
-"""Multi-rank MXFP8 checks and Blackwell standard/GenPhase layer regressions.
+"""MXFP8 layer, weight-layout and cross-rank correctness checks on Blackwell.
 
-Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
+Run distributed cases with torchrun and four GPUs. The layer bootstraps its
+Torch and NVSHMEM runtime. Canonical BF16 and prequantized weights use the
+sources-backed adapter's kernel layout.
 
-Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
-(``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
-
-Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
-:class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
-
-Weights: the CuTeDSL kernel consumes MXFP8 expert weights in kernel-ready
-(swizzled E8M0 scale-factor) layout. These tests pass canonical bf16
-:class:`~flashinfer.moe_ep.MoEWeightPack`; the layer quantizes them at init via
-``preprocess_weights=True``. To supply pre-quantized MXFP8 weights instead, pass
-kernel-layout ``w13``/``w2`` plus ``w13_scale``/``w2_scale``.
-
-Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
-self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
-ownership, cross-rank combine), because both sides run the same CUDA kernel.
-``test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle`` closes that gap with
-the sm90_fp8_fp8_bf16_pull_cutedsl twin's methodology: every rank all-gathers the actual staged
-MXFP8 payloads, routing, and plain weight legs, runs the multi-rank-native
-``compute_megamoe_reference_mxfp8`` on the global problem, and checks its own
-rank's slice against the real-EP kernel output.
+The distributed oracle gathers actual staged activations, routes and separately
+quantized plain weights. It evaluates every expert contribution with Torch and
+checks each rank's output, including in-kernel top-k reduction.
 """
 
 from __future__ import annotations
@@ -35,9 +18,9 @@ import pytest
 from flashinfer.moe_ep import FinalizeMode
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources")
 
 
 def _require_cuda():
@@ -85,7 +68,7 @@ def test_blackwell_layer_graph_and_weight_formats(
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     _require_cuda()
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
@@ -131,7 +114,7 @@ def test_blackwell_layer_graph_and_weight_formats(
             return Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=intermediate,
                 top_k=topk,
-                kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+                kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
                 apply_routing_weights_before_fc2=early,
             )
         kwargs = (
@@ -141,7 +124,7 @@ def test_blackwell_layer_graph_and_weight_formats(
                 cluster_shape_mn=(cluster_m, 1),
             )
             if variant == "genphase"
-            else dict(kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next")
+            else dict(kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl")
         )
         return Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, kind=kind, **kwargs
@@ -209,7 +192,10 @@ def test_blackwell_layer_graph_and_weight_formats(
                     if count and world > 1 and rank == world - 1:
                         current.topk_ids.fill_(-1)
                         current.topk_weights.fill_(float("nan"))
-                    ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
+                    if variant != "genphase":
+                        ws._pre_reduced_activation.view(torch.bfloat16).fill_(
+                            float("nan")
+                        )
                     y = layer.forward(current, return_workspace_view=True)
                     check(ws, layer._transformed, y, count)
 
@@ -230,13 +216,18 @@ def test_blackwell_layer_graph_and_weight_formats(
                     # Grow eagerly before replaying the smaller graph, which
                     # must conservatively re-mask its entire capacity tail.
                     layer.forward(dense)
-                    ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
+                    if variant != "genphase":
+                        ws._pre_reduced_activation.view(torch.bfloat16).fill_(
+                            float("nan")
+                        )
                     graph.replay()
                     torch.cuda.synchronize()
                     check(ws, layer._transformed, captured, current.num_tokens)
+                first = captured.clone()
                 for _ in range(64):
                     graph.replay()
                 torch.cuda.synchronize()
+                assert torch.equal(captured, first)
                 check(ws, layer._transformed, captured, current.num_tokens)
     finally:
         for layer in reversed(layers):
@@ -300,12 +291,16 @@ def _make_bf16_weights(
 
 
 def _mega_problem(
-    rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
+    rank: int,
+    world_size: int,
+    *,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    hidden: int = 2048,
+    intermediate: int = 1024,
+    num_experts: int = 8,
+    topk: int = 4,
 ):
-    hidden = 2048
-    intermediate = 1024
-    num_experts = 8
-    topk = 4
     gate_up_clamp = 10.0
     fast_math = True
     kind = "mxfp8_e4m3"
@@ -346,134 +341,125 @@ def _mega_problem(
     )
 
 
-def _reference_mxfp8_mega_moe_staged(
-    problem: dict, *, destroy_buffer: bool = True, knobs: dict | None = None
-):
-    """Reference with bf16 activations staged inside the symm buffer."""
-    import torch
+def _make_mxfp8_workspace(problem, *, knobs=None, in_kernel_fc2_reduce=False):
+    """Build a direct source-kernel control with the layer's resolved geometry."""
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-        get_symm_buffer_for_mxfp8_mega_moe,
-        mxfp8_mega_moe,
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
+
+    backend = create_mega_kernel(
+        _megakernel_config(
+            problem, knobs=knobs, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+        )
     )
-    from flashinfer.moe_ep import MoEWeightPack
+    backend._ensure_ep_bootstrap(
+        BootstrapConfig(rank=dist.get_rank(), world_size=dist.get_world_size())
+    )
+    config = backend._workspace_config(
+        FleetParams(
+            num_experts=problem["num_experts"],
+            max_tokens_per_rank=problem["max_tokens"],
+            token_hidden_size=problem["hidden"],
+        )
+    )
+    return pkg.Sm100BlockScaledSymmBuffer(config)
+
+
+def _stage_mxfp8_problem(problem, workspace):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
-        preprocess_mega_weights,
-    )
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    symm_buffer = get_symm_buffer_for_mxfp8_mega_moe(
-        problem["num_experts"],
-        problem["max_tokens"],
-        problem["topk"],
-        problem["hidden"],
-        problem["intermediate"],
-        rank,
-        world_size,
-        kind=problem["kind"],
-        gate_up_clamp=problem["gate_up_clamp"],
-        knobs=knobs,
-    )
-    num_tokens = problem["num_tokens"]
+    sf_cols = ((problem["hidden"] // 32 + 3) // 4) * 4
     stage_mega_moe_inputs(
         problem["hidden_states"],
         problem["topk_weights"],
         problem["topk_ids"],
-        symm_buffer.x,
-        symm_buffer.x_sf,
-        symm_buffer.topk_idx,
-        symm_buffer.topk_weights,
+        workspace.x,
+        workspace.x_sf[:, :sf_cols],
+        workspace.topk_idx,
+        workspace.topk_weights,
         kind=problem["kind"],
     )
+    workspace.note_staged_tokens(problem["num_tokens"])
 
-    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
-    transformed_l1, transformed_l2 = preprocess_mega_weights(
-        pack,
-        intermediate_size=problem["intermediate"],
-        hidden_size=problem["hidden"],
-        kind=problem["kind"],
-        gate_up_clamp=problem["gate_up_clamp"],
-    )
 
-    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
-    mxfp8_mega_moe(
-        y,
-        transformed_l1,
-        transformed_l2,
-        symm_buffer,
-        num_tokens=num_tokens,
-        gate_up_clamp=problem["gate_up_clamp"],
-        fast_math=problem["fast_math"],
+def _reference_mxfp8_mega_moe_staged(
+    problem: dict, *, destroy_buffer: bool = True, knobs: dict | None = None
+):
+    """Launch directly after fused BF16 staging, without the layer wrapper."""
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
     )
-    torch.cuda.synchronize()
-    if destroy_buffer:
-        symm_buffer.destroy()
-    return y
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
+
+    workspace = _make_mxfp8_workspace(problem, knobs=knobs)
+    try:
+        _stage_mxfp8_problem(problem, workspace)
+        weights = preprocess_mega_weights(
+            MoEWeightPack(problem["w13"], problem["w2"]),
+            intermediate_size=problem["intermediate"],
+            hidden_size=problem["hidden"],
+            kind=problem["kind"],
+        )
+        y = torch.empty(
+            problem["num_tokens"],
+            problem["hidden"],
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        pkg.sm100_block_scaled_mega_moe(
+            y, *weights, workspace, fast_math=problem["fast_math"]
+        )
+        torch.cuda.synchronize()
+        return y
+    finally:
+        if destroy_buffer:
+            workspace.destroy()
 
 
 def _reference_mxfp8_mega_moe_prestaged(
     problem: dict, x_fp8, x_sf, *, destroy_buffer: bool = True
 ):
-    """Reference with caller-supplied MXFP8 activations + E8M0 block scales."""
+    """Launch directly with caller-supplied MXFP8 activations and scales."""
     import torch
-    import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-        get_symm_buffer_for_mxfp8_mega_moe,
-        mxfp8_mega_moe,
-    )
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    symm_buffer = get_symm_buffer_for_mxfp8_mega_moe(
-        problem["num_experts"],
-        problem["max_tokens"],
-        problem["topk"],
-        problem["hidden"],
-        problem["intermediate"],
-        rank,
-        world_size,
-        kind=problem["kind"],
-        gate_up_clamp=problem["gate_up_clamp"],
-    )
-    num_tokens = problem["num_tokens"]
-    symm_buffer.x[:num_tokens].view(torch.uint8).copy_(x_fp8.view(torch.uint8))
-    symm_buffer.x_sf[:num_tokens].view(torch.uint8).copy_(x_sf.view(torch.uint8))
-    symm_buffer.topk_idx[:num_tokens].copy_(problem["topk_ids"])
-    symm_buffer.topk_weights[:num_tokens].copy_(problem["topk_weights"])
-
-    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
-    transformed_l1, transformed_l2 = preprocess_mega_weights(
-        pack,
-        intermediate_size=problem["intermediate"],
-        hidden_size=problem["hidden"],
-        kind=problem["kind"],
-        gate_up_clamp=problem["gate_up_clamp"],
-    )
-
-    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
-    mxfp8_mega_moe(
-        y,
-        transformed_l1,
-        transformed_l2,
-        symm_buffer,
-        num_tokens=num_tokens,
-        gate_up_clamp=problem["gate_up_clamp"],
-        fast_math=problem["fast_math"],
-    )
-    torch.cuda.synchronize()
-    if destroy_buffer:
-        symm_buffer.destroy()
-    return y
+    workspace = _make_mxfp8_workspace(problem)
+    try:
+        n = problem["num_tokens"]
+        workspace.x[:n].view(torch.uint8).copy_(x_fp8.view(torch.uint8))
+        workspace.x_sf[:n, : x_sf.shape[1]].view(torch.uint8).copy_(
+            x_sf.view(torch.uint8)
+        )
+        workspace.topk_idx[:n].copy_(problem["topk_ids"])
+        workspace.topk_weights[:n].copy_(problem["topk_weights"])
+        workspace.note_staged_tokens(n)
+        weights = preprocess_mega_weights(
+            MoEWeightPack(problem["w13"], problem["w2"]),
+            intermediate_size=problem["intermediate"],
+            hidden_size=problem["hidden"],
+            kind=problem["kind"],
+        )
+        y = torch.empty(n, problem["hidden"], dtype=torch.bfloat16, device="cuda")
+        pkg.sm100_block_scaled_mega_moe(
+            y, *weights, workspace, fast_math=problem["fast_math"]
+        )
+        torch.cuda.synchronize()
+        return y
+    finally:
+        if destroy_buffer:
+            workspace.destroy()
 
 
 def _assert_ikr_close(y, y_ref, *, topk):
@@ -544,9 +530,6 @@ def _run_mega_layer(
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
-        stage_mega_moe_inputs,
-    )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
@@ -570,35 +553,15 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-                get_symm_buffer_for_mxfp8_mega_moe,
-            )
-
-            staging_buffer = get_symm_buffer_for_mxfp8_mega_moe(
-                problem["num_experts"],
-                problem["max_tokens"],
-                problem["topk"],
-                problem["hidden"],
-                problem["intermediate"],
-                rank,
-                world_size,
-                kind=problem["kind"],
-                gate_up_clamp=problem["gate_up_clamp"],
-            )
-            num_tokens = problem["num_tokens"]
-            stage_mega_moe_inputs(
-                problem["hidden_states"],
-                problem["topk_weights"],
-                problem["topk_ids"],
-                staging_buffer.x,
-                staging_buffer.x_sf,
-                staging_buffer.topk_idx,
-                staging_buffer.topk_weights,
-                kind=problem["kind"],
-            )
-            t_hidden = staging_buffer.x[:num_tokens].clone()
-            t_scales = staging_buffer.x_sf[:num_tokens].clone()
-            staging_buffer.destroy()
+            staging_buffer = _make_mxfp8_workspace(problem, knobs=knobs)
+            try:
+                _stage_mxfp8_problem(problem, staging_buffer)
+                n = problem["num_tokens"]
+                t_hidden = staging_buffer.x[:n].clone()
+                sf_cols = ((problem["hidden"] // 32 + 3) // 4) * 4
+                t_scales = staging_buffer.x_sf[:n, :sf_cols].clone()
+            finally:
+                staging_buffer.destroy()
 
         mega = MoEEpLayer(
             bootstrap=BootstrapConfig(
@@ -730,64 +693,12 @@ def _run_mega_layer_zero_token_ikr_regression(
     *,
     num_iters: int = 60,
 ):
-    """Interleave num_tokens=0 and real forward() calls, in_kernel_fc2_reduce=True,
-    no barrier between iterations, at an independent per-rank schedule.
+    """Interleave empty and nonempty EP launches without per-iteration barriers.
 
-    Regression guard for mxfp8_mega_moe()'s num_tokens==0 shortcut, which used to
-    return WITHOUT ever calling frontend.run() (i.e. without launching the kernel
-    at all) when in_kernel_fc2_reduce was enabled:
-
-        if n == 0 and symm_buffer._frontend.config.in_kernel_fc2_reduce:
-            return symm_buffer.output_activation[:0] if y is None else None
-
-    Sm100MegaMoEMxfp8Kernel is a persistent megakernel -- its CTA grid
-    (MoEFusedFc12SchedulerParams.get_grid_shape -> (cluster_mn[0], cluster_mn[1],
-    max_active_clusters)) is sized from hardware occupancy, never from
-    num_tokens, so even a genuinely zero-token launch still runs every CTA and
-    the warp-specialized dispatch / token-back / tail-cleanup logic that keeps
-    a rank's cross-rank REDG atomic-add combine session in lockstep with its EP
-    peers. A rank that takes the old shortcut instead silently skips that
-    round's kernel launch, desynchronizing its session state from its peers'
-    -- their subsequent launches then wait on a signal that rank never posts.
-
-    This only manifests when DP/EP ranks call forward() independently (no
-    cross-rank barrier between rounds, exactly how SGLang's per-rank scheduler
-    loop drives it) AND some rank legitimately hits num_tokens==0 (SGLang's own
-    idle-batch mechanism for keeping DP ranks in lockstep) while its peers have
-    real work -- light/symmetric/all-nonzero testing never exercises it. See
-    kernel_src/sm100/cutedsl_megamoe/shim/mxfp8.py::mxfp8_mega_moe.
-
-    Shapes/scale intentionally match the real repro (hidden=2048,
-    intermediate=768, num_experts=128, top_k=8, max_tokens_per_rank=16384 --
-    the Qwen3-30B-A3B MXFP8 SGLang config that originally hit this), not this
-    file's usual small test defaults: the same test at
-    hidden=2048/intermediate=1024/num_experts=8/topk=4/max_tokens=64 (this
-    file's ``_mega_problem`` default) plus a deterministic modulo-based
-    zero/nonzero schedule passes vacuously even without the fix -- neither the
-    smaller buffer/expert-count nor a merely-deterministic (as opposed to
-    randomly-timed) schedule reproduces the desync on its own; both the scale
-    and genuinely independent per-rank timing (via per-rank-seeded
-    ``random.Random``, not a fixed formula) were needed to reproduce it.
-
-    CAVEAT: a regression here manifests as a LIVELOCK (100% GPU utilization,
-    zero forward progress, no exception, no crash), not a clean test failure --
-    a same-process watchdog can't interrupt a rank frozen inside
-    torch.cuda.synchronize() on a raw CUDA kernel wait (this isn't an NCCL
-    collective op, so dist.init_process_group(timeout=...) doesn't cover it
-    either). Rely on the CI job's own wall-clock timeout to catch a real
-    regression.
-
-    This exact scenario (matched shapes, matched random schedule, even a
-    deliberate timing nudge on real rounds, NUM_ITERS=2000 -- the script
-    defaults to 60) was confirmed to
-    reliably livelock pre-fix when run as a plain torchrun-launched script
-    (tests/moe_ep/../repro_ikr_zero_token_idle.py -- the authoritative
-    regression artifact for this bug) but passes vacuously pre-fix when run
-    under `torchrun -m pytest` specifically (root cause not fully isolated;
-    pytest's execution environment appears to dampen the wall-clock
-    divergence between ranks this race depends on). This test is kept as a
-    documented, passing correctness check of the exact scenario under the
-    project's normal test harness -- not as a guaranteed regression trap.
+    Empty ranks must still participate in communication and tail cleanup while
+    peers have work. Keep the serving-scale capacity and independently seeded
+    rank timing from the original idle-batch reproduction. A protocol failure
+    can stall in a device wait, so the allocation timeout remains necessary.
     """
     import random
     import time
@@ -983,26 +894,7 @@ def _all_gather_stack(t):
 
 
 def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = False):
-    """Real-EP kernel launch vs the drop's torch GLOBAL reference.
-
-    Parity alone cannot catch a kernel that is wrong but self-consistent at
-    ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
-    cross-rank combine), because both sides run the same CUDA kernel; this
-    closes that gap (sm90_fp8_fp8_bf16_pull_cutedsl twin methodology).
-
-    Every rank stages its own bf16 shard, runs the fused kernel with real
-    cross-rank NVSHMEM traffic, then all-gathers the ACTUAL staged MXFP8
-    activations + routing + plain (pre-swizzle) weight legs (no reliance on
-    cross-rank RNG determinism) and feeds the global problem to
-    ``compute_megamoe_reference_mxfp8`` — which is multi-rank native: it takes
-    ``(num_ranks, tokens_per_rank, ...)`` operands and computes
-    ``expert(topk_idx[r, t, k])`` across rank boundaries.  Each rank asserts
-    its own output slice within the single-GPU oracle's tolerances.
-
-    ``in_kernel_fc2_reduce`` runs the REDG in-flight combine variant (torch
-    reference unchanged; the compare widens by the bf16 K-term accumulation
-    band, see ``_assert_ikr_close``).
-    """
+    """Check real EP traffic against every route's independently computed term."""
     import torch
     import torch.distributed as dist
 
@@ -1013,17 +905,13 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
-        stage_mega_moe_inputs,
-    )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-        compute_megamoe_reference_mxfp8,
-        get_symm_buffer_for_mxfp8_mega_moe,
-        mxfp8_mega_moe,
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.kernel_helpers import (
+        compute_megamoe_reference_block_scaled,
     )
 
     from .test_mxfp8_cutedsl_preprocess_vs_reference import (
@@ -1035,98 +923,75 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
     num_local = problem["num_experts"] // world_size
-    # Guarantee cross-rank traffic by construction: token 0 routes one expert
-    # per EP rank (contiguous block ownership: rank r owns [r*L, (r+1)*L)).
     forced = (
         torch.arange(min(problem["topk"], world_size), device="cuda", dtype=torch.int64)
         * num_local
     )
     problem["topk_ids"][0, : forced.numel()] = forced
-
     kernel = create_mega_kernel(
         _megakernel_config(problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
     )
     runtime = bootstrap_moe_ep_runtime(
-        bootstrap,
-        kernel.runtime_requirements(bootstrap),
+        bootstrap, kernel.runtime_requirements(bootstrap)
     )
     try:
         n = problem["num_tokens"]
-
-        symm_buffer = get_symm_buffer_for_mxfp8_mega_moe(
-            problem["num_experts"],
-            problem["max_tokens"],
-            problem["topk"],
-            problem["hidden"],
-            problem["intermediate"],
-            rank,
-            world_size,
-            kind=problem["kind"],
-            gate_up_clamp=problem["gate_up_clamp"],
-            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        workspace = _make_mxfp8_workspace(
+            problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce
         )
         try:
-            stage_mega_moe_inputs(
-                problem["hidden_states"],
-                problem["topk_weights"],
-                problem["topk_ids"],
-                symm_buffer.x,
-                symm_buffer.x_sf,
-                symm_buffer.topk_idx,
-                symm_buffer.topk_weights,
-                kind=problem["kind"],
-            )
-            # Snapshot exactly what the kernel consumes (this rank's shard).
-            x_local = symm_buffer.x[:n].clone()
-            x_sf_local = symm_buffer.x_sf[:n].clone()
-            idx_local = symm_buffer.topk_idx[:n].clone()
-            w_local = symm_buffer.topk_weights[:n].clone()
-
-            transformed_l1, transformed_l2 = preprocess_mega_weights(
-                MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+            _stage_mxfp8_problem(problem, workspace)
+            x_local = workspace.x[:n].clone()
+            x_sf_local = workspace.x_sf[:n].clone()
+            idx_local = workspace.topk_idx[:n].clone()
+            w_local = workspace.topk_weights[:n].clone()
+            weights = preprocess_mega_weights(
+                MoEWeightPack(problem["w13"], problem["w2"]),
                 intermediate_size=problem["intermediate"],
                 hidden_size=problem["hidden"],
                 kind=problem["kind"],
-                gate_up_clamp=problem["gate_up_clamp"],
             )
-
             y_kernel = torch.empty(
                 n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
             )
-            mxfp8_mega_moe(
-                y_kernel,
-                transformed_l1,
-                transformed_l2,
-                symm_buffer,
-                num_tokens=n,
-                gate_up_clamp=problem["gate_up_clamp"],
-                fast_math=problem["fast_math"],
-            )
+            pkg.sm100_block_scaled_mega_moe(y_kernel, *weights, workspace)
             torch.cuda.synchronize()
             dist.barrier()
 
-            # Reassemble the global problem from the operands each rank staged;
-            # the reference consumes (num_ranks, ...) stacks directly.
-            fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_mxfp8_from_bf16(problem)
-            combine_ref = compute_megamoe_reference_mxfp8(
-                input_activation=_all_gather_stack(x_local),
-                input_activation_sf=_all_gather_stack(x_sf_local),
-                input_topk_idx=_all_gather_stack(idx_local),
-                input_topk_weights=_all_gather_stack(w_local),
-                fc1_weight=_all_gather_stack(fc1_plain),
-                fc1_weight_sf=_all_gather_stack(fc1_sf),
-                fc2_weight=_all_gather_stack(fc2_plain),
-                fc2_weight_sf=_all_gather_stack(fc2_sf),
-                ab_dtype=torch.float8_e4m3fn,
-                gate_up_clamp=problem["gate_up_clamp"],
-                apply_routing_weights_before_fc2=True,
-            )
-            # The topk weight is already folded before the fc1-out round-trip, so
-            # the per-topk terms reduce with a plain sum; compare this rank's slice.
-            y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
-
+            # Gather actual staged bytes and separately quantized plain weights.
+            # A kernel-to-kernel comparison cannot detect wrong expert ownership.
+            x, sf, ids, scores = [
+                _all_gather_stack(value).flatten(0, 1)
+                for value in (x_local, x_sf_local, idx_local, w_local)
+            ]
+            plain1, scale1, plain2, scale2 = [
+                _all_gather_stack(value).flatten(0, 1)
+                for value in _plain_mxfp8_from_bf16(problem)
+            ]
+            terms = [
+                compute_megamoe_reference_block_scaled(
+                    x,
+                    sf,
+                    ids[:, k : k + 1],
+                    scores[:, k : k + 1],
+                    plain1.permute(0, 2, 1),
+                    scale1,
+                    plain2.permute(0, 2, 1),
+                    scale2,
+                    quant_kind=problem["kind"],
+                    local_expert_offset=0,
+                    gate_up_clamp=problem["gate_up_clamp"],
+                    apply_routing_weights_before_fc2=True,
+                    return_fp32=True,
+                )
+                for k in range(problem["topk"])
+            ]
+            combine_ref = torch.stack(terms, dim=1).reshape(
+                world_size, n, problem["topk"], problem["hidden"]
+            )[rank]
+            y_ref = combine_ref.sum(dim=1)
             assert torch.isfinite(y_kernel).all()
-            yk = y_kernel.to(torch.float32)
+            yk = y_kernel.float()
             rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
             print(
                 f"[mxfp8 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce}] "
@@ -1134,22 +999,13 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 f"max|d|={(yk - y_ref).abs().max().item():.4g} "
                 f"amax(ref)={y_ref.abs().max().item():.4g}"
             )
-            # Per-cell bf16 term-magnitude band (see
-            # _assert_mega_oracle_term_band_close): the old flat atol=8.0 was
-            # "1 bf16 ULP at |term|~2048" calibrated on GB200's rounding and
-            # tripped by one cell on B200; the band derives the bound from the
-            # oracle's own per-topk terms instead. The ikr coefficient absorbs
-            # the REDG nondeterministic reduce order (same bound as
-            # _assert_ikr_close).
             _assert_mega_oracle_term_band_close(
-                yk, combine_ref[rank], ikr=in_kernel_fc2_reduce, label=f"rank{rank}"
+                yk, combine_ref, ikr=in_kernel_fc2_reduce, label=f"rank{rank}"
             )
             assert rel_l2.item() < (0.03 if in_kernel_fc2_reduce else 0.02)
             return rank
         finally:
-            # A failing rank must still free its symmetric-heap slice;
-            # leaking it turns a clean failure into a multi-rank hang.
-            symm_buffer.destroy()
+            workspace.destroy()
     finally:
         finalize_moe_ep_runtime(runtime)
 
@@ -1247,6 +1103,7 @@ def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
     import torch
     import torch.distributed as dist
 
+    from flashinfer import autotune_v2
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -1256,7 +1113,7 @@ def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
         MoEWeightPack,
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     _require_cuda()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
@@ -1318,8 +1175,7 @@ def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
             layers.append(layer)
             return layer
 
-        with pytest.warns(UserWarning, match="COLLECTIVE"):
-            layer = create("auto")
+        layer = create("auto")
         if rank == 0:
             path.unlink(missing_ok=True)
         if world > 1:
@@ -1329,20 +1185,21 @@ def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
             getattr(ws, n).data_ptr()
             for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
         ]
-        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            autotune,
             knob_cache,
         )
         import time
 
-        record_knobs = knob_cache.record_knobs
-        tune = pkg.autotune_sm100_genphase_mega_moe
+        write_record = knob_cache.write_record
+        tune = autotune.autotune_sm100_block_scaled_mega_moe
 
         def delayed_record(*args, **kwargs):
             """Delay rank zero's cache write to expose premature peer returns."""
             # Expose peers returning before a slow shared-cache write completes.
             if world > 1:
                 time.sleep(0.25)
-            return record_knobs(*args, **kwargs)
+            return write_record(*args, **kwargs)
 
         def tune_and_check_publication(*args, **kwargs):
             """Require all ranks to observe the cached winner when tuning returns."""
@@ -1364,11 +1221,12 @@ def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
             )
             return winner
 
-        monkeypatch.setattr(knob_cache, "record_knobs", delayed_record)
+        monkeypatch.setattr(knob_cache, "write_record", delayed_record)
         monkeypatch.setattr(
-            pkg, "autotune_sm100_genphase_mega_moe", tune_and_check_publication
+            autotune, "autotune_sm100_block_scaled_mega_moe", tune_and_check_publication
         )
-        layer.warmup(inputs)
+        with autotune_v2(cache_root=str(path.with_suffix(".managed"))):
+            layer.warmup(inputs)
         winner = {
             k: getattr(ws.config, k)
             for k in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")

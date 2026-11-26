@@ -7,8 +7,9 @@ quantizes, interleaves (groups of 8), and swizzles them. Pass pre-quantized
 MXFP8 weights via ``w13``/``w2`` plus ``w13_scale``/``w2_scale`` to skip
 re-quantization.
 
-Requires sm_120/sm_121 (Blackwell-consumer); the kernel tree is
-process-exclusive with the sm_100 and sm_90 trees.
+Requires sm_120/sm_121 (Blackwell-consumer). The swap-AB sources load
+unqualified packages, so they require a separate process from other
+implementations that load different versions of those packages.
 """
 
 from __future__ import annotations
@@ -135,7 +136,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
             get_symm_buffer_for_sm120_mxfp8_mega_moe,
         )
 
@@ -210,7 +211,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         else:
             # Backend talks only to the swapab_cutedsl_megakernel shim
             # (never src/ directly).
-            from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+            from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
                 Mxfp8BlockSize,
                 ceil_div,
                 round_up,
@@ -248,7 +249,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
             sm120_mxfp8_mega_moe,
         )
 

@@ -21,12 +21,13 @@ import torch
 
 def write_if_different(path: pathlib.Path, content: str) -> None:
     if path.exists():
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             if f.read() == content:
                 return
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    # UTF-8, not the locale encoding (cp1252 on Windows): generated sources can hold non-ASCII text.
+    with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
 

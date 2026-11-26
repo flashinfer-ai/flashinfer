@@ -207,6 +207,7 @@ def test_lse_reduce(process_group, dtype, lse_mode):
             cp_rank=cp_rank,
             cp_size=cp_size,
             lse_mode=lse_mode,
+            layout="dst_major",
         )
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
 
@@ -225,6 +226,7 @@ def test_lse_reduce(process_group, dtype, lse_mode):
             cp_rank=cp_rank,
             cp_size=cp_size,
             lse_mode=lse_mode,
+            layout="dst_major",
         )
 
     # CUDA graph capture uses a distinct stream, so it needs a separately
@@ -249,6 +251,7 @@ def test_lse_reduce(process_group, dtype, lse_mode):
             cp_rank=cp_rank,
             cp_size=cp_size,
             lse_mode=lse_mode,
+            layout="dst_major",
         )
     dist.barrier(group=group)
     for _ in range(4):
@@ -285,7 +288,15 @@ def _workspace(max_tokens, local_heads, head_dim, dtype):
     )
 
 
-def _reduce(partial_o, partial_lse, workspace, lse_mode="base2", *, mask=None):
+def _reduce(
+    partial_o,
+    partial_lse,
+    workspace,
+    lse_mode="base2",
+    *,
+    mask=None,
+    layout="dst_major",
+):
     return decode_cp_a2a_lse_reduce(
         partial_o,
         partial_lse,
@@ -294,6 +305,7 @@ def _reduce(partial_o, partial_lse, workspace, lse_mode="base2", *, mask=None):
         cp_size=dist.get_world_size(),
         lse_mode=lse_mode,
         mask=mask,
+        layout=layout,
     )
 
 
@@ -525,3 +537,58 @@ def test_lse_reduce_layout_validation(process_group, invalid):
     ws = _workspace(4, 2, 64, torch.bfloat16)
     with pytest.raises(RuntimeError, match="16-byte|contiguous|cp_size|dimensions"):
         _reduce(partial_o, partial_lse, ws)
+
+
+@pytest.mark.parametrize("layout", [None, "bogus"])
+def test_layout_needs_to_be_resolvable(layout):
+    """heads == cp_size cannot be inferred; an unknown layout is rejected."""
+    cp_size, dim = 8, 64
+    with pytest.raises(ValueError, match="layout"):
+        decode_cp_a2a_lse_reduce(
+            torch.empty(4, cp_size, cp_size, dim, dtype=torch.bfloat16),
+            torch.empty(4, cp_size, cp_size, dtype=torch.float32),
+            torch.empty(0, dtype=torch.uint8),
+            cp_rank=0,
+            cp_size=cp_size,
+            layout=layout,
+        )
+
+
+@pytest.mark.parametrize("heads", ["two", "cp_size"])
+@pytest.mark.parametrize("lse_mode", ["base2", "basee"])
+def test_head_major_layout_matches_destination_major(process_group, heads, lse_mode):
+    """Deprecated head-major input gives the destination-major result.
+
+    With ``heads == cp_size`` both orders have the same shape, so each call
+    names its layout; with two heads the layout is inferred.
+    """
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    n = dist.get_world_size()
+    local_heads = n if heads == "cp_size" else 2
+    explicit = local_heads == n and n > 1
+    head_dim, dtype = 512, torch.bfloat16
+    ws = _workspace(4, local_heads, head_dim, dtype)
+    partial_o, partial_lse, source = _attention_output_case(
+        4, local_heads, head_dim, dtype, seed=800
+    )
+    expected = _distributed_reference(*source, lse_mode)
+
+    actual = _reduce(
+        partial_o,
+        partial_lse,
+        ws,
+        lse_mode,
+        layout="dst_major" if explicit else None,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-3)
+
+    with pytest.warns(DeprecationWarning, match="head-major"):
+        actual = _reduce(
+            partial_o.transpose(1, 2).contiguous(),
+            partial_lse.transpose(1, 2).contiguous(),
+            ws,
+            lse_mode,
+            layout="head_major" if explicit else None,
+        )
+    assert actual.shape == (4, local_heads, head_dim)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-3)

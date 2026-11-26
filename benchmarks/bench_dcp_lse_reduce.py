@@ -129,6 +129,7 @@ def _benchmark_case(
             workspace,
             cp_rank=rank,
             cp_size=world_size,
+            layout="dst_major",
         )
 
     nccl_send_o = torch.empty_like(partial_o.permute(1, 0, 2, 3).contiguous())
@@ -176,6 +177,7 @@ def _benchmark_case(
             graph_workspace,
             cp_rank=rank,
             cp_size=world_size,
+            layout="dst_major",
         )
     graph_us = _measure(
         graph.replay,
@@ -204,6 +206,7 @@ def _benchmark_case(
                 graph_multi_workspace,
                 cp_rank=rank,
                 cp_size=world_size,
+                layout="dst_major",
             )
     graph_multi_us = [
         value / graph_launches_per_replay

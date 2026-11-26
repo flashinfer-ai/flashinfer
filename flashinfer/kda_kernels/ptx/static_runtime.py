@@ -164,7 +164,7 @@ def _shim_source(program: dict) -> str:
 @cache
 def _load(name: str):
     """Compile and cache one shared FFI shim with its validated PTX or cubin image."""
-    from tvm_ffi import cpp
+    from ...jit.inline_cubin import load_inline_with_cubin
     from ...jit.core import MissingJITCacheError
 
     if os.environ.get("FLASHINFER_DISABLE_JIT"):
@@ -173,7 +173,7 @@ def _load(name: str):
         )
     table = _program_table()
     program = table["programs"][name]
-    module = cpp.load_inline(
+    module = load_inline_with_cubin(
         f"flashinfer_ptx_{program['module_ident']}",
         cpp_sources=_shim_source(program),
         embed_cubin={program["module_ident"]: _kernel_image(name)},

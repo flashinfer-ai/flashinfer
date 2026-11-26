@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import subprocess
 import sys
 import threading
@@ -119,12 +120,20 @@ class _Probes:
         return self.outcomes.pop(0)
 
 
-def _fake_device(monkeypatch, probe):
+def _fake_device(monkeypatch, probe, clocks=(4752, 4752)):
     # Capture detection is stubbed at the module level: the real one selects the
     # (fake) device first when more than one GPU is visible.
     monkeypatch.setattr(cl, "_is_locality_arch", lambda index: True)
     monkeypatch.setattr(cl, "_stream_capturing", lambda device_index: False)
     monkeypatch.setattr(cl, "_probe", lambda device_index: probe(device_index))
+    reads = []
+
+    def memory_clocks(device_index):
+        reads.append(device_index)
+        return clocks
+
+    monkeypatch.setattr(cl, "_memory_clocks", memory_clocks)
+    return reads
 
 
 @pytest.mark.parametrize("cached", [False, True])
@@ -175,6 +184,199 @@ def test_sm_table_one_probe_per_device(monkeypatch):
         assert results == [table] * 4
     finally:
         cl._forget()
+
+
+@pytest.mark.parametrize(
+    "clocks, routes",
+    [
+        ((4752, 4752), True),
+        ((4515, 4752), True),  # 0.95 x 4752 = 4514.4
+        ((4514, 4752), False),
+        ((3996, 4752), False),
+        ((3186, 4752), False),
+        ((0, 0), False),
+        (None, False),  # NVML could not read the clocks
+    ],
+)
+def test_memory_at_full_clock(monkeypatch, clocks, routes):
+    """memory_at_full_clock is False for a device whose memory runs below
+    MEMORY_CLOCK_FRACTION of its maximum clock, or whose clock NVML cannot read;
+    the clock is read once and the outcome is cached either way. The SM table
+    neither reads the clock nor depends on it."""
+    table = cl.SmTable(device_index=5, counts=(106, 106), entries=None)
+    probe = _Probes((table, True))
+    reads = _fake_device(monkeypatch, probe, clocks)
+    try:
+        assert cl.sm_table(5) is table
+        assert reads == [] and 5 not in cl._MEMORY_CLOCKS
+        assert cl.memory_at_full_clock(5) is routes
+        assert cl._MEMORY_CLOCKS[5] == clocks
+        assert cl.memory_at_full_clock(5) is routes
+        assert cl.memory_at_full_clock(5) is routes
+        assert cl.sm_table(5) is table and cl._TABLES[5] is table
+        assert probe.calls == 1 and reads == [5]
+    finally:
+        cl._forget()
+    assert not cl._MEMORY_CLOCKS
+
+
+@pytest.mark.parametrize("outcome", [(None, True), (None, False)])
+def test_memory_clock_not_read_without_a_table(monkeypatch, outcome):
+    """The probe reads no memory clock, whatever its outcome."""
+    probe = _Probes(outcome, outcome)
+    reads = _fake_device(monkeypatch, probe, (3186, 4752))
+    try:
+        assert cl.sm_table(5) is None
+        assert reads == [] and 5 not in cl._MEMORY_CLOCKS
+    finally:
+        cl._forget()
+
+
+class _FakeNvml:
+    """A stand-in ``pynvml`` module: ``fail`` names the call that raises."""
+
+    NVML_CLOCK_MEM = 2
+
+    class NVMLError(Exception):
+        pass
+
+    def __init__(self, current=3186, peak=4752, fail=None):
+        self.current, self.peak, self.fail = current, peak, fail
+        self.calls: list[Any] = []
+
+    def _call(self, name, *args):
+        self.calls.append((name, *args))
+        if name == self.fail:
+            raise self.NVMLError(name)
+
+    def nvmlInit(self):
+        self._call("init")
+
+    def nvmlShutdown(self):
+        self._call("shutdown")
+
+    def nvmlDeviceGetHandleByUUID(self, uuid):
+        self._call("handle", uuid)
+        return ("handle", uuid)
+
+    def nvmlDeviceGetClockInfo(self, handle, clock):
+        self._call("clock", handle, clock)
+        return self.current
+
+    def nvmlDeviceGetMaxClockInfo(self, handle, clock):
+        self._call("max_clock", handle, clock)
+        return self.peak
+
+
+def test_memory_clocks_from_nvml(monkeypatch):
+    """The device is found by its UUID; NVML is shut down after the reads."""
+    nvml = _FakeNvml(current=3186, peak=4752)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setattr(cl, "_nvml_uuid", lambda index: f"GPU-uuid-{index}")
+    assert cl._memory_clocks(3) == (3186, 4752)
+    handle = ("handle", "GPU-uuid-3")
+    assert nvml.calls == [
+        ("init",),
+        ("handle", "GPU-uuid-3"),
+        ("clock", handle, nvml.NVML_CLOCK_MEM),
+        ("max_clock", handle, nvml.NVML_CLOCK_MEM),
+        ("shutdown",),
+    ]
+
+
+@pytest.mark.parametrize("fail", ["init", "handle", "clock", "max_clock", "uuid"])
+def test_memory_clocks_nvml_error(monkeypatch, fail):
+    """Any NVML failure reads as no clocks (batch DeepGEMM FP8 then routes no
+    twin); NVML is shut down when it was initialized."""
+    nvml = _FakeNvml(fail=fail)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+
+    def uuid(index):
+        if fail == "uuid":
+            raise RuntimeError("no device properties")
+        return "GPU-uuid"
+
+    monkeypatch.setattr(cl, "_nvml_uuid", uuid)
+    assert cl._memory_clocks(0) is None
+    names = [call[0] for call in nvml.calls]
+    initialized = fail not in ("init", "uuid")
+    assert ("shutdown" in names) == initialized
+
+
+def test_memory_clocks_without_pynvml(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", None)  # import raises ImportError
+    assert cl._memory_clocks(0) is None
+
+
+@pytest.mark.parametrize("fail", [None, "clock"])
+def test_unreadable_memory_clock_logged_once_per_device(monkeypatch, caplog, fail):
+    """A missing pynvml (``fail`` None) or an NVML failure logs one warning per
+    device and process, however often the clock is read; a readable clock logs
+    nothing."""
+    if fail is None:
+        monkeypatch.setitem(sys.modules, "pynvml", None)
+    else:
+        monkeypatch.setitem(sys.modules, "pynvml", _FakeNvml(fail=fail))
+    monkeypatch.setattr(cl, "_nvml_uuid", lambda index: "GPU-uuid")
+    monkeypatch.setattr(cl, "_CLOCK_WARNED", set())
+    with caplog.at_level(logging.WARNING, logger=cl.__name__):
+        for device in (0, 0, 1, 0, 1):
+            assert cl._memory_clocks(device) is None
+    warnings = [r for r in caplog.records if r.name == cl.__name__]
+    assert [r.args[0] for r in warnings] == [0, 1]
+    reason = "pynvml is not installed" if fail is None else "NVML could not read it"
+    assert all(reason in r.getMessage() for r in warnings)
+    caplog.clear()
+    monkeypatch.setitem(sys.modules, "pynvml", _FakeNvml())
+    with caplog.at_level(logging.WARNING, logger=cl.__name__):
+        assert cl._memory_clocks(2) == (3186, 4752)
+    assert not [r for r in caplog.records if r.name == cl.__name__]
+
+
+def test_memory_at_full_clock_through_nvml(monkeypatch):
+    """End to end over a stand-in NVML: below the full clock
+    memory_at_full_clock is False and cached, the table stays; NVML is read
+    once."""
+    table = cl.SmTable(device_index=5, counts=(106, 106), entries=None)
+    probe = _Probes((table, True))
+    # The stubs of _fake_device without its stand-in clock reader.
+    monkeypatch.setattr(cl, "_is_locality_arch", lambda index: True)
+    monkeypatch.setattr(cl, "_stream_capturing", lambda device_index: False)
+    monkeypatch.setattr(cl, "_probe", lambda device_index: probe(device_index))
+    nvml = _FakeNvml(current=3186, peak=4752)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setattr(cl, "_nvml_uuid", lambda index: "GPU-uuid")
+    try:
+        assert cl.sm_table(5) is table
+        assert cl.memory_at_full_clock(5) is False
+        assert cl.memory_at_full_clock(5) is False
+        assert cl.sm_table(5) is table
+        assert probe.calls == 1
+        assert [call[0] for call in nvml.calls].count("clock") == 1
+        assert cl._MEMORY_CLOCKS[5] == (3186, 4752)
+    finally:
+        cl._forget()
+
+
+@pytest.mark.parametrize(
+    "uuid, expected",
+    [
+        (
+            "1c2d3e4f-0000-1111-2222-333344445555",
+            "GPU-1c2d3e4f-0000-1111-2222-333344445555",
+        ),
+        ("GPU-1c2d3e4f", "GPU-1c2d3e4f"),
+        ("MIG-1c2d3e4f", "MIG-1c2d3e4f"),
+    ],
+)
+def test_nvml_uuid(monkeypatch, uuid, expected):
+    class Properties:
+        pass
+
+    properties = Properties()
+    properties.uuid = uuid
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: properties)
+    assert cl._nvml_uuid(0) == expected
 
 
 def test_probe_module_failure_is_not_cached(monkeypatch):
@@ -312,6 +514,28 @@ def test_sm_table_probe():
     assert sum(word != 0 for word in words) == sm_count
     assert cl.sm_table(device) is table  # cached
     assert cl.sm_table(torch.device("cuda", device)) is table
+
+
+def test_memory_at_full_clock_on_the_device():
+    """On the device: NVML reads the memory clock, memory_at_full_clock is True
+    exactly when that clock is at least MEMORY_CLOCK_FRACTION of the maximum, and
+    the SM table exists either way."""
+    device = _require_locality()
+    cl._forget()
+    try:
+        table = cl.sm_table(device)
+        assert table is not None
+        full = cl.memory_at_full_clock(device)
+        clocks = cl._MEMORY_CLOCKS.get(device)
+        print(f"MEMORY_CLOCKS device={device} clocks={clocks} full={full}")
+        if clocks is None:
+            pytest.skip("NVML could not read the memory clock")
+        current, peak = clocks
+        assert peak > 0
+        assert full == (current >= cl.MEMORY_CLOCK_FRACTION * peak)
+        assert cl.sm_table(device) is table
+    finally:
+        cl._forget()
 
 
 def test_sm_table_not_probed_under_graph_capture():
@@ -567,6 +791,51 @@ def test_split_empty_freed_in_its_own_context(case):
     assert _free_bytes(driver) >= free_before - _FREE_SLACK
 
 
+# Work queued in a context for far longer than a split free takes: copies of
+# _BUSY_BYTES, _BUSY_COPIES times (tens of milliseconds).
+_BUSY_BYTES = 256 * 1024**2
+_BUSY_COPIES = 1000
+
+
+def test_split_free_waits_for_the_freeing_context():
+    """A split allocation freed while another context of its device is current
+    is freed only after the work queued in that context is done (that work may
+    read the memory), not only the work of the context that made it."""
+    device = _require_locality()
+    driver = _driver()
+    unit = cl.granularity(device)
+    tensor = cl.split_empty((2 * unit,), torch.uint8, unit, device)
+    base = tensor.data_ptr()
+    torch.cuda.synchronize(device)
+    primary = _current_context(driver)
+    other = _create_context(driver, device)
+    buffers = []
+    stream = None
+    try:
+        assert _current_context(driver) == int(other) != primary
+        buffers = [_ok(driver.cuMemAlloc(_BUSY_BYTES)) for _ in range(2)]
+        stream = _ok(driver.cuStreamCreate(0))
+        for _ in range(_BUSY_COPIES):
+            _ok(driver.cuMemcpyDtoDAsync(buffers[1], buffers[0], _BUSY_BYTES, stream))
+        busy = driver.cuStreamQuery(stream)[0]
+        del tensor  # the last reference: freed now, under `other`
+        done = driver.cuStreamQuery(stream)[0]
+        assert cl.homing(base) is None
+        assert _current_context(driver) == int(other)
+        assert busy == driver.CUresult.CUDA_ERROR_NOT_READY, busy
+        assert done == driver.CUresult.CUDA_SUCCESS, done
+    finally:
+        if _current_context(driver) == int(other):
+            if stream is not None:
+                _ok(driver.cuStreamSynchronize(stream))
+                _ok(driver.cuStreamDestroy(stream))
+            for buffer in buffers:
+                _ok(driver.cuMemFree(buffer))
+            _ok(driver.cuCtxPopCurrent())
+        _ok(driver.cuCtxDestroy(other))
+    assert _current_context(driver) == primary
+
+
 def test_split_calls_on_another_device_keep_the_callers_context():
     """Allocating, querying and freeing split memory of another device leaves the
     caller's context current, also when it is not a primary context."""
@@ -752,6 +1021,156 @@ def test_split_calls_in_a_thread_without_a_context_keep_its_state(process):
         assert not seen["primary_active_after_tensor"], seen
 
 
+def _peer_device(device: int) -> int:
+    """Another sm_107a device than ``device``; skips the test without one."""
+    peer = next(
+        (
+            index
+            for index in range(torch.cuda.device_count())
+            if index != device and torch.cuda.get_device_capability(index) == (10, 7)
+        ),
+        None,
+    )
+    if peer is None:
+        pytest.skip("needs a second sm_107a device")
+    return peer
+
+
+def _raw_base(raw: Any) -> int:
+    """The device address of a tensor the locality module returned, read without
+    PyTorch (which may select a device)."""
+    if isinstance(raw, torch.Tensor):
+        return int(raw.data_ptr())
+    import ctypes
+
+    capsule = raw._to_dlpack()
+    get_pointer = ctypes.PYFUNCTYPE(ctypes.c_void_p, ctypes.py_object, ctypes.c_char_p)(
+        ("PyCapsule_GetPointer", ctypes.pythonapi)
+    )
+    # A DLManagedTensor starts with its DLTensor, which starts with the data
+    # pointer.
+    return int(ctypes.c_void_p.from_address(get_pointer(capsule, b"dltensor")).value)
+
+
+def _memory_device(driver, pointer: int) -> int:
+    return int(
+        _ok(
+            driver.cuPointerGetAttribute(
+                driver.CUpointer_attribute.CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, pointer
+            )
+        )
+    )
+
+
+def test_split_calls_under_a_pushed_context_of_another_device_keep_its_state():
+    """A thread that pushes its own context of one device, allocates, queries and
+    frees split memory of another device through the locality module, and pops
+    its context is left as it was: no current context, and the same device
+    reported by the CUDA runtime and by ``torch.cuda.current_device()``. A tensor
+    the thread then allocates on the other device is in that device's memory."""
+    device = _require_locality()
+    driver = _driver()
+    peer = _peer_device(device)
+    module = cl._module()
+    unit = cl.granularity(peer)
+    warm = cl.split_empty((2 * unit,), torch.uint8, unit, peer)  # streams, module
+    del warm
+    gc.collect()
+    runtimes = _runtime_libraries()
+    # The thread's tensor then needs a new device allocation (no cached block).
+    torch.cuda.empty_cache()
+    seen: dict[str, Any] = {}
+    tensors = []
+
+    def run() -> None:
+        try:
+            seen["before"] = _thread_state(driver, runtimes)
+            context = _create_context(driver, device)
+            try:
+                seen["pushed"] = int(context) == _current_context(driver)
+                seen["granularity"] = int(module.cake_locality_granularity(peer))
+                raw = module.cake_locality_split_empty(2 * unit, unit, peer)
+                base = _raw_base(raw)
+                seen["domains"] = [
+                    int(module.cake_locality_pointer_domain(base + offset, peer))
+                    for offset in (0, unit)
+                ]
+                seen["registered"] = cl.homing(base) is not None
+                del raw  # the last reference: freed now, under the pushed context
+                seen["freed"] = cl.homing(base) is None
+                seen["kept"] = int(context) == _current_context(driver)
+            finally:
+                _ok(driver.cuCtxPopCurrent())
+                _ok(driver.cuCtxDestroy(context))
+            seen["after"] = _thread_state(driver, runtimes)
+            tensors.append(torch.empty(4, device=f"cuda:{peer}"))
+            seen["tensor_device"] = tensors[0].device.index
+        except BaseException as exc:  # reported below
+            seen["error"] = repr(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    assert "error" not in seen, seen
+    assert seen["before"]["context"] == 0, seen
+    assert seen["pushed"] and seen["kept"], seen
+    assert seen["granularity"] == unit and seen["domains"] == [0, 1], seen
+    assert seen["registered"] and seen["freed"], seen
+    assert seen["after"] == seen["before"], seen
+    assert seen["tensor_device"] == peer, seen
+    assert _memory_device(driver, tensors[0].data_ptr()) == peer, seen
+
+
+def test_split_allocation_in_a_thread_without_a_context_keeps_its_state():
+    """A split allocation of the last device made through the locality module in
+    a thread with no current context leaves that thread as it was (no current
+    context, the same runtime and PyTorch device), and its memory is on that
+    device, each part on its die."""
+    device = _require_locality()
+    driver = _driver()
+    last = torch.cuda.device_count() - 1
+    if last < 1 or torch.cuda.get_device_capability(last) != (10, 7):
+        pytest.skip("needs a second sm_107a device")
+    torch.cuda.synchronize(device)  # this thread's context reads the pointers below
+    module = cl._module()
+    unit = cl.granularity(last)
+    runtimes = _runtime_libraries()
+    seen: dict[str, Any] = {}
+    held = []
+
+    def run() -> None:
+        try:
+            seen["before"] = _thread_state(driver, runtimes)
+            held.append(module.cake_locality_split_empty(2 * unit, unit, last))
+            seen["after_alloc"] = _thread_state(driver, runtimes)
+            base = _raw_base(held[0])
+            seen["domains"] = [
+                int(module.cake_locality_pointer_domain(base + offset, last))
+                for offset in (0, unit)
+            ]
+            seen["after"] = _thread_state(driver, runtimes)
+            seen["base"] = base
+        except BaseException as exc:  # reported below
+            seen["error"] = repr(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    assert "error" not in seen, seen
+    assert seen["before"]["context"] == 0, seen
+    assert seen["after_alloc"] == seen["before"], seen
+    assert seen["after"] == seen["before"], seen
+    assert seen["domains"] == [0, 1], seen
+    base = seen["base"]
+    record = cl.homing(base)
+    assert record is not None and record.device_index == last, record
+    assert _memory_device(driver, base) == last
+    assert _memory_device(driver, base + unit) == last
+    held.clear()
+    gc.collect()
+    assert cl.homing(base) is None
+
+
 def test_split_empty_cuda_graph_replay():
     device = _require_locality()
     unit = cl.granularity(device)
@@ -902,41 +1321,46 @@ def test_launch_counters_default_stream_pairs_are_per_thread(
 
 # The message ``_domain_pools`` raises when the pools' first allocation fails: the
 # allocator's error follows the colon, and the cause is a torch.OutOfMemoryError
-# whatever the driver error was.
+# whatever the driver error was. Without the colon part, PyTorch refused the
+# request before the allocator ran (for example at its per-process memory limit).
+_SMOKE_FAILURE_NO_DETAIL = "locality-domain 0 allocation smoke test failed"
 _SMOKE_FAILURE = (
-    "locality-domain 0 allocation smoke test failed: localized VMM allocation in "
-    "domain 0 failed: {}"
+    _SMOKE_FAILURE_NO_DETAIL + ": localized VMM allocation in domain 0 failed: {}"
 )
 
 
-@pytest.mark.parametrize("case", ["direct", "wrapped", "wrapped_refusal"])
+@pytest.mark.parametrize(
+    "case", ["direct", "wrapped", "wrapped_no_diagnostic", "wrapped_refusal"]
+)
 def test_launch_counters_out_of_memory_pair_not_cached(
     fresh_counters, monkeypatch, case
 ):
     """A pair made unhomed because a locality-domain pool was out of memory serves
     its call and is not cached; the next call tries the pools again. The same
     holds when the pools' first allocation wraps a CUDA out-of-memory error in a
-    LocalityDomainError (as ``_domain_pools`` does). A wrapped driver refusal
+    LocalityDomainError (as ``_domain_pools`` does), also one with no allocator
+    error (PyTorch refused the request). A wrapped driver refusal
     (CUDA_ERROR_NOT_SUPPORTED), like any other refusal, is remembered."""
     from flashinfer import locality_domain
 
     device = _require_cuda()
     calls = []
-    error = {
-        "wrapped": "CUDA_ERROR_OUT_OF_MEMORY (2): out of memory",
-        "wrapped_refusal": "CUDA_ERROR_NOT_SUPPORTED (801): operation not supported",
+    message = {
+        "wrapped": _SMOKE_FAILURE.format("CUDA_ERROR_OUT_OF_MEMORY (2): out of memory"),
+        "wrapped_no_diagnostic": _SMOKE_FAILURE_NO_DETAIL,
+        "wrapped_refusal": _SMOKE_FAILURE.format(
+            "CUDA_ERROR_NOT_SUPPORTED (801): operation not supported"
+        ),
     }.get(case)
 
     def exhausted(_index):
         calls.append(_index)
-        if error is None:
+        if message is None:
             raise torch.OutOfMemoryError("pool exhausted")
         try:
             raise torch.OutOfMemoryError("pool exhausted")
         except torch.OutOfMemoryError as exc:
-            raise locality_domain.LocalityDomainError(
-                _SMOKE_FAILURE.format(error)
-            ) from exc
+            raise locality_domain.LocalityDomainError(message) from exc
 
     monkeypatch.setattr(locality_domain, "_domain_pools", exhausted)
     stream = torch.cuda.Stream(device=device)
