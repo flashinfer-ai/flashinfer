@@ -1004,6 +1004,8 @@ def top_k(
     """
     batch_size = input.size(0)
     device = input.device
+    if not 0 < k <= input.size(1):
+        raise ValueError(f"k must be in [1, {input.size(1)}], got {k}")
 
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     clusters_eligible = can_use_clusters_topk(
@@ -1226,6 +1228,8 @@ def top_k_page_table_transform(
     """
     device = input.device
     num_rows = input.size(0)
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
 
     if page_size != 1:
         if page_size <= 0 or page_size > 1 << 30 or page_size & (page_size - 1):
@@ -1436,6 +1440,8 @@ def top_k_ragged_transform(
     """
     device = input.device
     num_rows = input.size(0)
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
 
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     clusters_eligible = (
