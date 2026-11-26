@@ -58,6 +58,27 @@ from .swap import SwappedGroupedGemm, is_swapped_record, swapped_knobs  # noqa: 
 
 MODULE = "batch_invariant_moe"
 GRID_PLACEHOLDER = 1  # the compile-time value of the grid argument: a dynamic Int32 of the kernel, never compiled in
+RASTER_PLACEHOLDER = 1  # the grouped body's raster-order argument at compile time: a dynamic Int32 as well
+RASTERS = ("m", "n")
+
+
+@functools.lru_cache(maxsize=None)
+def object_record(cfg: Knobs) -> Knobs:
+    """The record a compiled grouped object stands for: the knobs with the launch arguments (the raster order, the grid)
+    at their defaults, so records differing only in them share one object."""
+    return dataclasses.replace(cfg, raster_along="m", grid_clusters=0)
+
+
+def raster_arg(cfg: Knobs) -> int:
+    """The grouped body's raster-order launch argument of a record (1: m-blocks fastest inside a group); a value outside the
+    record space is a host error (the argument reaches the kernel unchecked)."""
+    if cfg.raster_along not in RASTERS:
+        raise ValueError(
+            f"batch-invariant MoE: raster {cfg.raster_along!r} outside {RASTERS}"
+        )
+    return 1 if cfg.raster_along == "m" else 0
+
+
 #: The output dtypes by format: the dense GEMM's, plus the e4m3 output stored as bytes (the chain's paired conversion fills
 #: byte registers), the block-scaled requantisations' e4m3 codes (``mxfp8`` / ``e4m3bs``: the block scales are their
 #: second output) and the static NVFP4 class's packed codes; the output alignment of every format is the dense GEMM's (16-byte rows), the
@@ -122,13 +143,12 @@ def kernel_name(
     cfg: Knobs, chain: ChainLike, out_fmt: str = "bf16", packing: str = "dense"
 ) -> str:
     """The object's name: the operand format (the instruction class), the block-scaled bodies' packing of the A rows, the
-    chain (activation, output format, parameters) and the record without its ``grid_clusters`` (the grid is a launch
-    argument: records differing only in it share one object)."""
+    chain (activation, output format, parameters) and the record's compile-time identity (``Knobs.describe_object``: the
+    raster order and the grid are launch arguments, so records differing only in them share one object)."""
     chain = as_chain(chain, out_fmt)
-    knobs = dataclasses.replace(cfg, grid_clusters=0)
     mode = "_densea" if _is_block_scaled(chain) and packing == "dense" else ""
     return jit.sanitize_symbol_name(
-        f"grouped_{fmt_tag(chain.in_fmt)}{mode}_{chain.describe()}_{knobs.describe()}"
+        f"grouped_{fmt_tag(chain.in_fmt)}{mode}_{chain.describe()}_{object_record(cfg).describe_object()}"
     )
 
 
@@ -411,10 +431,11 @@ def compile_grouped_fn(
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one grouped specialisation."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         f = _fakes(chain, packing)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
+        # dynamic arguments of the kernel: the launch passes the device's grid and the record's raster order
+        grid, raster = GRID_PLACEHOLDER, RASTER_PLACEHOLDER
         body = GroupedBlockGemm(cfg, chain, packing=packing)
         if _is_block_scaled(chain) or _is_promoted(chain):
             if isinstance(chain, (MxChain, Mxfp4Chain)) or _is_promoted(chain):
@@ -432,8 +453,10 @@ def compile_grouped_fn(
                         f["counts"],
                         Int32(GROUP_ALIGN),
                         grid,
+                        raster,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 return cute.compile(
                     body.block_scaled_plain,
@@ -445,8 +468,10 @@ def compile_grouped_fn(
                     f["counts"],
                     Int32(GROUP_ALIGN),
                     grid,
+                    raster,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             if chain.needs_aux:
                 return cute.compile(
@@ -462,8 +487,10 @@ def compile_grouped_fn(
                     f["pts"],
                     f["aux"],
                     grid,
+                    raster,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             return cute.compile(
                 body.block_scaled,
@@ -476,8 +503,10 @@ def compile_grouped_fn(
                 f["alpha"],
                 f["pts"],
                 grid,
+                raster,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         entry = body.with_scales if chain.scale_operands else body
         return cute.compile(
@@ -488,21 +517,22 @@ def compile_grouped_fn(
             f["counts"],
             *f["scales"],
             grid,
+            raster,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return compile_fn
 
 
-@functools.cache
 def get_compiled_grouped(
     cfg: Knobs,
     chain: ChainLike = "plain",
     out_fmt: str = "bf16",
     packing: str = "dense",
 ) -> Any:
-    """``kernel(a3, b3, out2, counts, grid)``, or ``kernel(a3, b3, out2, counts, alpha, sa, si, grid)`` for a chain with
+    """``kernel(a3, b3, out2, counts, grid, raster)``, or ``kernel(a3, b3, out2, counts, alpha, sa, si, grid, raster)`` for a chain with
     scale operands: A ``(Tk, K, 1)`` K-major, B ``(N, K, E)`` K-major (the chain's operand format), out ``(Tk, Nout)``
     row-major (``Nout = N``, or ``N / 2`` for the gated chains; uint8 bytes for the e4m3 output), counts ``(E,)`` int32,
     ``alpha (E,)`` the per-expert weight scales, ``sa (1,)`` the A operand's scale, ``si (1,)`` the intermediate multiplier,
@@ -522,6 +552,12 @@ def get_compiled_grouped(
         chain,
     )
     assert not isinstance(chain, Fp8BsChain) or packing == "dense", chain
+    # one loaded kernel per object record: the raster twins share it (``raster`` is a launch argument)
+    return _compiled_grouped(object_record(cfg), chain, packing)
+
+
+@functools.cache
+def _compiled_grouped(cfg: Knobs, chain: GroupedEpilogueBlock, packing: str) -> Any:
     return jit.build_and_load(
         MODULE,
         kernel_name(cfg, chain, packing=packing),
@@ -631,7 +667,7 @@ def compile_swapped_fn(
     chains ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, grid)`` with the stage ``k_block`` elements of K wide when
     given."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         f = _fakes(chain)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
@@ -665,6 +701,7 @@ def compile_swapped_fn(
                         grid,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 if chain.quant:
                     return cute.compile(
@@ -681,6 +718,7 @@ def compile_swapped_fn(
                         grid,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 return cute.compile(
                     body.block_scaled_plain_gathered,
@@ -695,6 +733,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             if chain.needs_aux:
                 return cute.compile(
@@ -714,6 +753,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             return cute.compile(
                 body.block_scaled_gathered,
@@ -730,6 +770,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if _is_promoted(chain) and gather:
             # the block-scale fp8 gather form: the unpermuted rows and scales through the plan's map (the bf16 / f32 chains)
@@ -746,6 +787,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if _is_block_scaled(chain) or _is_promoted(chain):
             if isinstance(chain, (MxChain, Mxfp4Chain)) or _is_promoted(chain):
@@ -763,6 +805,7 @@ def compile_swapped_fn(
                         grid,
                         stream_fake,
                         options="--enable-tvm-ffi",
+                        **compile_options,
                     )
                 return cute.compile(
                     body.block_scaled_plain,
@@ -775,6 +818,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             if chain.needs_aux:
                 return cute.compile(
@@ -792,6 +836,7 @@ def compile_swapped_fn(
                     grid,
                     stream_fake,
                     options="--enable-tvm-ffi",
+                    **compile_options,
                 )
             return cute.compile(
                 body.block_scaled,
@@ -806,6 +851,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if gather:
             return cute.compile(
@@ -819,6 +865,7 @@ def compile_swapped_fn(
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         entry = body.with_scales if chain.scale_operands else body
         return cute.compile(
@@ -831,6 +878,7 @@ def compile_swapped_fn(
             grid,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return compile_fn

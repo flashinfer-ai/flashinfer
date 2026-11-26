@@ -18,15 +18,32 @@ rows, the quantized weight view with its scales, the W8A8 chains, the fused fp8 
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 
 from ...batch_invariant.support import unsupported
 from ..api import QuantFormat
+from ...batch_invariant.support import LazyNames
 from .runner import MOE_BF16_ARCHS, BatchInvariantMoeRunnerBase
 
 CLASS = "moe.e4m3"
+
+
+def _load_names() -> Dict[str, Any]:
+    from .api_fp8 import MoEWeightsE4M3, _fused_moe_fp8_run
+    from .blocks.epilogue import GEMM2_CHAIN
+    from .schedule_fp8 import gemm1_chain
+
+    return dict(
+        MoEWeightsE4M3=MoEWeightsE4M3,
+        fused_moe_fp8_run=_fused_moe_fp8_run,
+        GEMM2_CHAIN=GEMM2_CHAIN,
+        gemm1_chain=gemm1_chain,
+    )
+
+
+_names = LazyNames(_load_names)
 #: The compute capabilities the classes are stated for (the dense fp8 GEMM class's parts).
 MOE_FP8_ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
 #: Positions of the packed inputs: the e4m3 activations, the expert ids, the routing weights, the two quantized weights,
@@ -81,44 +98,28 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunnerBase):
 
     # ---- the weight view -------------------------------------------------------------------------------------------
     def _weights_from_view(self, view):
-        from .api_fp8 import MoEWeightsE4M3
-
-        return MoEWeightsE4M3.from_view(view)
+        return _names.MoEWeightsE4M3.from_view(view)
 
     def _weight_tensors(self, w) -> List[torch.Tensor]:
         return [w.w1q, w.w2q, w.s_w1, w.s_w2, w.s_x, w.s_inter, w.m_inter]
 
     def _weights_from_tensors(self, a, tensors: List[torch.Tensor]):
-        from .api_fp8 import MoEWeightsE4M3
-
         w1q, w2q, s_w1, s_w2, s_x, s_inter, m_inter = tensors
-        return MoEWeightsE4M3(
+        return _names.MoEWeightsE4M3(
             w1q, w2q, s_w1, s_w2, s_x, s_inter, m_inter, a.gated, a.act, a.params
         )
 
     def _chain1(self, a):
-        from .schedule_fp8 import gemm1_chain
-
-        return gemm1_chain(a.act, a.params, a.gated)
+        return _names.gemm1_chain(a.act, a.params, a.gated)
 
     def _chain2(self):
-        from .blocks.epilogue import GEMM2_CHAIN
-
-        return GEMM2_CHAIN
+        return _names.GEMM2_CHAIN
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
-        from .api_fp8 import fused_moe_fp8
-
-        fused_moe_fp8(
-            x,
-            ids,
-            wts,
-            w,
-            out=out,
-            config1=c1,
-            config2=c2,
-            plan=plan,
-            w_round=getattr(inputs, "w_round", False),
-        )
+        T, H = x.shape
+        _names.fused_moe_fp8_run(
+            x, ids, wts, w, out, c1, c2, T, H, ids.shape[1], w.num_experts, w.intermediate_size,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
+        )  # fmt: skip
         return out

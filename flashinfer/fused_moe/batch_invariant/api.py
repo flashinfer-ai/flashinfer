@@ -15,12 +15,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 
-from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
+from ...batch_invariant.support import LazyNames
+from ...gemm.batch_invariant.api import (
+    _CO_RESIDENT,
+    _device_key,
+    persistent_clusters,
+    sm_count_of,
+)
 from ...gemm.batch_invariant.generator import Knobs
+from ...gemm.batch_invariant.heuristic import on_rank_cache_clear
 from . import spec as S
 from .blocks.epilogue import GroupedChain, GroupedEpilogueBlock
 from .blocks.scheduler import MAX_E
@@ -306,34 +313,165 @@ def _grouped_out(
     return out
 
 
-_FUSED_KERNELS: Dict[str, tuple] = {}
+def _load_kernels() -> Dict[str, Any]:
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .combine import get_compiled_combine, warps_per_token
+    from .permute import (
+        PLAN_BLOCK,
+        get_compiled_gather,
+        get_compiled_plan,
+        get_compiled_plan_multi,
+        warps_per_row,
+    )
+    from .route import get_compiled_route
+    from .route_plan import ROUTE_PLAN_MAX_SLOTS, get_compiled_route_plan
+    from .schedule import default_configs, launch_tile_bound
+
+    return dict(
+        get_compiled_grouped=get_compiled_grouped,
+        get_compiled_swapped=get_compiled_swapped,
+        get_compiled_combine=get_compiled_combine,
+        warps_per_token=warps_per_token,
+        PLAN_BLOCK=PLAN_BLOCK,
+        get_compiled_gather=get_compiled_gather,
+        get_compiled_plan=get_compiled_plan,
+        get_compiled_plan_multi=get_compiled_plan_multi,
+        warps_per_row=warps_per_row,
+        get_compiled_route=get_compiled_route,
+        ROUTE_PLAN_MAX_SLOTS=ROUTE_PLAN_MAX_SLOTS,
+        get_compiled_route_plan=get_compiled_route_plan,
+        default_configs=default_configs,
+        launch_tile_bound=launch_tile_bound,
+    )
 
 
-def _fused_kernels() -> tuple:
-    """The fused flow's kernel entries (the gather and combine getters with their warp rules, the launch's tile bound),
-    imported on first use (the package keeps its imports light: the CuTe-DSL modules load when a kernel is first needed)
-    and kept: an import statement on the launch path costs the host at every call."""
-    k = _FUSED_KERNELS.get("k")
-    if k is None:
-        from .combine import get_compiled_combine, warps_per_token
-        from .permute import get_compiled_gather, warps_per_row
-        from .schedule import launch_tile_bound
+#: The fused flow's kernel getters, warp rules and the launch's tile bound, imported on first use (the package keeps its
+#: imports light: the CuTe-DSL modules load when a kernel is first needed).
+_k = LazyNames(_load_kernels)
 
-        k = _FUSED_KERNELS["k"] = (
-            get_compiled_gather,
-            warps_per_row,
-            get_compiled_combine,
-            warps_per_token,
-            launch_tile_bound,
+
+class LaunchHandle(NamedTuple):
+    """What a grouped launch needs besides its tensors: the compiled kernel, the device's co-resident cluster count for
+    the record (the persistent grid is their minimum with the launch's tile bound, a function of the shape alone) and the
+    record's raster-order argument (the grouped body's; the swapped bodies' constant is in their object)."""
+
+    kernel: Any
+    clusters: int
+    raster: int
+
+
+# the launch handles by (device index, record, what else selects the compiled object)
+_HANDLES: Dict[tuple, LaunchHandle] = {}
+
+
+def clear_kernel_cache() -> None:
+    """Forget every cached launch handle of the MoE classes: the one supported way to drop them (tests; a device
+    re-registration, which also forgets the rankings)."""
+    _HANDLES.clear()
+
+
+on_rank_cache_clear(clear_kernel_cache)
+
+
+def launch_handle(
+    device: torch.device,
+    config: Knobs,
+    key: tuple,
+    build: Callable[..., Any],
+    *args: Any,
+) -> LaunchHandle:
+    """The launch handle of ``config`` on ``device`` for ``key`` (what else selects the compiled object): the kernel from
+    ``build(*args)`` with the device's co-resident cluster count for the record, kept per (device index, record, key) once
+    the count is the device's answer (a device whose occupancy query is still being retried is asked again on the next call,
+    as ``persistent_clusters`` does)."""
+    index = _device_key(device)
+    k = (index, config, *key)
+    h = _HANDLES.get(k)
+    if h is None:
+        from .blocks.compile import raster_arg
+
+        h = LaunchHandle(
+            build(*args), persistent_clusters(device, config), raster_arg(config)
         )
-    return k
+        if (
+            config.grid_clusters
+            or (index, config.cluster_m * config.cluster_n) in _CO_RESIDENT
+        ):
+            _HANDLES[k] = h
+    return h
 
 
 def launch_grid(device: torch.device, config: Knobs, Tk: int, E: int, N: int) -> int:
     """The persistent grid of a grouped launch: the device's co-resident cluster capacity for the record's cluster size,
     clipped to the launch's tile bound (a placement: which CTA computes a tile, never the bits)."""
-    launch_tile_bound = _fused_kernels()[4]
-    return min(persistent_clusters(device, config), launch_tile_bound(config, Tk, E, N))
+    return min(
+        persistent_clusters(device, config), _k.launch_tile_bound(config, Tk, E, N)
+    )
+
+
+def _body_kernel(config: Knobs, chain: GroupedEpilogueBlock) -> Any:
+    """The compiled body of a bf16-class record: the swapped body for a swapped record, the grouped body otherwise."""
+    if config.swap_ab:
+        return _k.get_compiled_swapped(config, chain)
+    return _k.get_compiled_grouped(config, chain)
+
+
+def _gather_kernel(config: Knobs, chain: GroupedEpilogueBlock) -> Any:
+    return _k.get_compiled_swapped(config, chain, gather=True)
+
+
+def _grouped_launch(
+    a: torch.Tensor,
+    w3: torch.Tensor,
+    out: torch.Tensor,
+    counts: torch.Tensor,
+    config: Knobs,
+    chain: GroupedEpilogueBlock,
+    Tk: int,
+    E: int,
+    N: int,
+    grid: Optional[int] = None,
+) -> None:
+    """The body of ``config`` on prepared operands: ``a [R >= Tk, K]`` (the grouped body reads the output's rows, the
+    swapped body's R is free), ``w3 (N, K, E)`` the weight's kernel view, ``out [Tk, Nout]``; the persistent grid is the
+    handle's cluster count clipped to the launch's tile bound, or ``grid`` as given. The callers validated the operands."""
+    if Tk == 0:
+        return
+    h = launch_handle(a.device, config, ("body", chain), _body_kernel, config, chain)
+    if not config.swap_ab and Tk != a.shape[0]:
+        a = a[:Tk]
+    if grid is None:
+        grid = min(h.clusters, _k.launch_tile_bound(config, Tk, E, N))
+    if config.swap_ab:
+        h.kernel(a.unsqueeze(-1), w3, out, counts, grid)
+    else:
+        h.kernel(a.unsqueeze(-1), w3, out, counts, grid, h.raster)
+
+
+def _gather_launch(
+    x: torch.Tensor,
+    src: torch.Tensor,
+    k_div: int,
+    w3: torch.Tensor,
+    out: torch.Tensor,
+    counts: torch.Tensor,
+    config: Knobs,
+    chain: GroupedEpilogueBlock,
+    Tk: int,
+    E: int,
+    N: int,
+    grid: Optional[int] = None,
+) -> None:
+    """The swapped body's gather form on prepared operands (:func:`grouped_gemm_gather`'s launch): the kernel reads the
+    token rows of ``x [T, K]`` through ``src``. The callers validated the operands."""
+    if Tk == 0:
+        return
+    h = launch_handle(
+        x.device, config, ("gather", chain), _gather_kernel, config, chain
+    )
+    if grid is None:
+        grid = min(h.clusters, _k.launch_tile_bound(config, Tk, E, N))
+    h.kernel(x, src, int(k_div), w3, out, counts, grid)
 
 
 def grouped_gemm(
@@ -357,8 +495,6 @@ def grouped_gemm(
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
     launch argument: the device's co-resident cluster capacity for the record's cluster size, clipped to the launch's static
     tile bound (`schedule.launch_tile_bound`), or ``grid`` as given."""
-    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
-
     R, K, E, N, Tk = _check_grouped_operands(
         "grouped_gemm", a, w, counts, Tk, out, torch.bfloat16, 8, "bf16"
     )
@@ -371,26 +507,10 @@ def grouped_gemm(
     out = _grouped_out(
         "grouped_gemm", out, Tk, n_out, _DTYPE_OF[chain.out_fmt], a.device
     )
-    kernel = (
-        get_compiled_swapped(config, chain)
-        if config.swap_ab
-        else get_compiled_grouped(config, chain)
-    )
-    if Tk == 0:
-        return out
-    if not config.swap_ab and Tk != R:
-        a = a[
-            :Tk
-        ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
-    if grid is None:
-        grid = launch_grid(a.device, config, Tk, E, N)
-    kernel(
-        a.unsqueeze(-1),
-        w.permute(1, 2, 0),
-        out,
-        counts,
-        grid,
-    )
+    _body_kernel(
+        config, chain
+    )  # the compiled object before the empty launch returns (the public entry's contract)
+    _grouped_launch(a, w.permute(1, 2, 0), out, counts, config, chain, Tk, E, N, grid)
     return out
 
 
@@ -412,8 +532,6 @@ def grouped_gemm_gather(
     permuted activation tensor, no gather launch; ``src [>= Tk]`` int32 the plan's slot of every expanded row. The same bits
     as :func:`grouped_gemm` on the materialised permutation (the stage holds the same bytes, the fold is the same). The
     gather form belongs to the swapped records (a dense record raises)."""
-    from .blocks.compile import get_compiled_swapped
-
     if (
         x.dtype != torch.bfloat16
         or w.dtype != torch.bfloat16
@@ -478,19 +596,9 @@ def grouped_gemm_gather(
         raise ValueError(
             "grouped_gemm_gather: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
         )
-    kernel = get_compiled_swapped(config, chain, gather=True)
-    if Tk == 0:
-        return out
-    if grid is None:
-        grid = launch_grid(x.device, config, Tk, E, N)
-    kernel(
-        x,
-        src,
-        int(k_div),
-        w.permute(1, 2, 0),
-        out,
-        counts,
-        grid,
+    _gather_kernel(config, chain)  # the compiled object before the empty launch returns
+    _gather_launch(
+        x, src, k_div, w.permute(1, 2, 0), out, counts, config, chain, Tk, E, N, grid
     )
     return out
 
@@ -572,8 +680,6 @@ def route(
     non-NaN score, each remaining slot takes the lowest expert index the row has not taken, with a NaN weight (the row's
     output is NaN; every id stays in ``[0, E)``). A Python ``scaling_factor`` other than ``1`` costs a fill per call; a
     one-element tensor is read as given."""
-    from .route import get_compiled_route
-
     method, T, E, b, s = _routing_args(
         "route", logits, top_k, method, bias, scaling_factor
     )
@@ -587,7 +693,7 @@ def route(
     if not experts.is_contiguous() or not weights.is_contiguous():
         raise ValueError("route: experts and weights must be contiguous")
     if T:
-        get_compiled_route(expert_bucket(E), top_k, method, _IN[logits.dtype])(
+        _k.get_compiled_route(expert_bucket(E), top_k, method, _IN[logits.dtype])(
             logits, b, s, experts, weights, T, E
         )
     return experts, weights
@@ -614,15 +720,13 @@ def route_plan(
     padded bound's rows with ``-1`` in every padding slot, as the padded two-launch plan gives them. ``dual`` (with ``align = 1``):
     ``(..., dest_pad [T, k] int32, pos_pad [T k] int32)`` follow -- the positions with the groups padded to ``pad_align`` rows and
     the padded position of every dense row, ``permute_plan_dual``'s integers (the block-scaled classes' dense packing)."""
-    from .route_plan import ROUTE_PLAN_MAX_SLOTS, get_compiled_route_plan
-
     method, T, E, b, s = _routing_args(
         "route_plan", logits, top_k, method, bias, scaling_factor
     )
     dev = logits.device
-    if T * top_k > ROUTE_PLAN_MAX_SLOTS:
+    if T * top_k > _k.ROUTE_PLAN_MAX_SLOTS:
         raise ValueError(
-            f"route_plan: {T * top_k} expanded rows; the fused plan holds at most {ROUTE_PLAN_MAX_SLOTS}"
+            f"route_plan: {T * top_k} expanded rows; the fused plan holds at most {_k.ROUTE_PLAN_MAX_SLOTS}"
         )
     if align < 1 or align & (align - 1):
         raise ValueError(f"route_plan: align {align} must be a power of two")
@@ -645,7 +749,7 @@ def route_plan(
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
     pos_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
     if T:
-        get_compiled_route_plan(
+        _k.get_compiled_route_plan(
             expert_bucket(E), top_k, method, _IN[logits.dtype], align, dual, pad_align
         )(
             logits,
@@ -747,11 +851,10 @@ def gather_rows(
     x_buf = torch.empty(Tk + pad, H, dtype=x.dtype, device=x.device)
     x_perm = x_buf[:Tk]
     if Tk:
-        get_compiled_gather, warps_per_row = _fused_kernels()[:2]
         al = 16 // x.element_size()
-        get_compiled_gather(k, fmt, warps_per_row(Tk, H // al, sm_count_of(x.device)))(
-            x, src, x_perm, Tk, H
-        )
+        _k.get_compiled_gather(
+            k, fmt, _k.warps_per_row(Tk, H // al, sm_count_of(x.device))
+        )(x, src, x_perm, Tk, H)
     return x_buf, x_perm
 
 
@@ -767,9 +870,8 @@ def combine_rows(
     through the shared combine kernel (``w_round``: the f32 weights enter as their bf16 rounding)."""
     T, H = out.shape
     if T:
-        get_compiled_combine, warps_per_token = _fused_kernels()[2:4]
-        get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(y.device)), w_round
+        _k.get_compiled_combine(
+            k, "bf16", "bf16", _k.warps_per_token(T, H, sm_count_of(y.device)), w_round
         )(y, dest, scales, out, T, H)
 
 
@@ -809,8 +911,6 @@ def permute_plan(
     ``(..., dest_pad [T, k] int32, pos_pad [Tk] int32)`` follow -- the positions with the groups padded to ``pad_align``
     rows and the padded position of every dense row (the block-scaled classes' dense packing: the rows dense, the scale
     factors at the padded positions). The same integers as ``route_plan``'s forms."""
-    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
-
     if not 1 <= E <= MAX_E:
         raise ValueError(
             f"permute_plan: E {E} must lie in [1, {MAX_E}] (the plan kernel's expert tables)"
@@ -829,8 +929,16 @@ def permute_plan(
     flat = experts.reshape(-1)
     if not flat.is_contiguous() or flat.dtype != torch.int32:
         raise TypeError("permute_plan: experts must be a contiguous int32 [T, k]")
+    return _permute_plan_run(flat, T, k, E, align, dual, pad_align)
+
+
+def _permute_plan_run(
+    flat: torch.Tensor, T: int, k: int, E: int, align: int, dual: bool, pad_align: int
+) -> Tuple[torch.Tensor, ...]:
+    """:func:`permute_plan` on validated arguments (``flat`` the contiguous int32 ids, ``E`` and ``k`` within the kernels'
+    bounds, the form's arguments admissible)."""
     n = T * k
-    dev = experts.device
+    dev = flat.device
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     if align > 1:
         src = torch.full(
@@ -844,13 +952,13 @@ def permute_plan(
     if n == 0:
         counts.zero_()
     elif n >= PLAN_MULTI_MIN_N:
-        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
+        nb = (n + _k.PLAN_BLOCK - 1) // _k.PLAN_BLOCK
         hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(align, dual, pad_align)(
+        _k.get_compiled_plan_multi(align, dual, pad_align)(
             flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(align, dual, pad_align)(
+        _k.get_compiled_plan(align, dual, pad_align)(
             flat, counts, dest, src, dest_pad, pos_pad, n, E
         )
     if dual:
@@ -863,6 +971,8 @@ def permute_plan(
 # wide token tile exposes that slower stream; the narrow tiles of the decode regime hide it behind the launch they save
 # (declared empirical: the in-op A/B of the two forms per token tile).
 GATHER_TOKEN_TILE_MAX = 16
+#: GEMM2's chain of the bf16 classes (the ``plain`` legacy name at the bf16 output): one object, built once.
+GEMM2_CHAIN_BF16 = GroupedChain.legacy("plain", "bf16")
 
 
 def fused_moe(
@@ -894,8 +1004,6 @@ def fused_moe(
     the launch's tile bound (the default), or the device's capacity (a placement either way). ``w_round``: the f32 ``weights`` enter the fold as their bf16
     rounding, done by the combine kernel (the pre-routed packed-word convention: the bits of rounding them on the host first,
     without the host's passes over the slots)."""
-    from .schedule import default_configs
-
     if not isinstance(w, MoEWeights):
         w = MoEWeights.prepare(*w)
     T, H, k, experts, scales, out = _check_fused_inputs(
@@ -915,31 +1023,67 @@ def fused_moe(
             f"fused_moe: {E} experts; the plan and the grouped GEMMs hold at most {MAX_E}"
         )
     if config1 is None or config2 is None:
-        c1, c2 = default_configs(T, k, H, I, E, *_part(x.device), gated=w.gated)
+        c1, c2 = _k.default_configs(T, k, H, I, E, *_part(x.device), gated=w.gated)
         config1, config2 = config1 or c1, config2 or c2
+    if gather and not config1.swap_ab:
+        raise ValueError("fused_moe: the gather form belongs to the swapped records")
+    return _fused_moe_run(
+        x, experts, scales, w, out, config1, config2, T, H, k, E, I,
+        plan=plan, finalize=finalize, return_intermediates=return_intermediates,
+        gather=gather, grid_clip=grid_clip, w_round=w_round,
+    )  # fmt: skip
+
+
+def _fused_moe_run(
+    x: torch.Tensor,
+    experts: torch.Tensor,
+    scales: torch.Tensor,
+    w: MoEWeights,
+    out: torch.Tensor,
+    config1: Knobs,
+    config2: Knobs,
+    T: int,
+    H: int,
+    k: int,
+    E: int,
+    I: int,
+    *,
+    plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    finalize: bool = True,
+    return_intermediates: bool = False,
+    gather: Optional[bool] = None,
+    grid_clip: bool = True,
+    w_round: bool = False,
+):
+    """:func:`fused_moe` on validated operands with the records chosen: the runner's launch (its pack proved every rule the
+    public entry checks, so nothing is checked twice per call) and the public entry's body."""
     counts, dest, src = (
-        plan if plan is not None else permute_plan(experts, E)
-    )  # ``plan``: ``route_plan``'s outputs, the same integers
+        plan if plan is not None else _permute_plan_run(experts.reshape(-1), T, k, E, 1, False, 128)
+    )  # fmt: skip  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
     pad1, pad2 = swapped_pads(config1, config2)
-    a_buf = torch.empty(Tk + pad2, I, dtype=torch.bfloat16, device=x.device)
-    g1 = None if grid_clip else persistent_clusters(x.device, config1)
-    g2 = None if grid_clip else persistent_clusters(x.device, config2)
+    dev = x.device
+    a_buf = torch.empty(Tk + pad2, I, dtype=torch.bfloat16, device=dev)
+    g1 = None if grid_clip else persistent_clusters(dev, config1)
+    g2 = None if grid_clip else persistent_clusters(dev, config2)
     if gather is None:
         gather = bool(config1.swap_ab) and config1.tile_n <= GATHER_TOKEN_TILE_MAX
+    a = a_buf[:Tk]
+    n1 = w.w1i.shape[1]
     if gather:
         # the swapped GEMM1 gathers the tokens' rows itself through the plan's slots: no gather launch, no permuted tensor
         x_perm = None
-        a = grouped_gemm_gather(
-            x, src, k, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
-        )  # [Tk, I] bf16
+        _gather_launch(
+            x, src, k, w.w1i.permute(1, 2, 0), a, counts, config1, w.chain1, Tk, E, n1, g1
+        )  # fmt: skip  # [Tk, I] bf16
     else:
         x_buf, x_perm = gather_rows(x, src, k, Tk, pad1, "bf16")
-        a = grouped_gemm(
-            x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
+        _grouped_launch(
+            x_buf, w.w1i.permute(1, 2, 0), a, counts, config1, w.chain1, Tk, E, n1, g1
         )  # [Tk, I] bf16
-    y = grouped_gemm(
-        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk, grid=g2
+    y = torch.empty(Tk, H, dtype=torch.bfloat16, device=dev)
+    _grouped_launch(
+        a_buf, w.w2.permute(1, 2, 0), y, counts, config2, GEMM2_CHAIN_BF16, Tk, E, H, g2
     )  # [Tk, H] bf16
     if finalize:
         combine_rows(y, dest, scales, out, k, w_round)

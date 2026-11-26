@@ -373,7 +373,7 @@ def get_compiled_fp8bs_quant(
     dtype = get_cutlass_dtype(dtype_str)
     name = quant_kernel_name(dtype_str, wpr, enable_pdl, block)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_m, sym_k, sym_kb = (
             cute.sym_int(32),
             cute.sym_int(32, divisibility=block),
@@ -405,6 +405,7 @@ def get_compiled_fp8bs_quant(
             enable_pdl,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)
@@ -424,7 +425,7 @@ def get_compiled_plan_quant(dtype_str: str, wpr: int, block: int = BLOCK):
     s (M, KB) f32 with free strides, n, E, M, K)``: the dense permutation plan and the quantizer in one launch."""
     dtype = get_cutlass_dtype(dtype_str)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_n, sym_e = cute.sym_int(32), cute.sym_int(32)
         sym_m, sym_k, sym_kb = (
             cute.sym_int(32),
@@ -466,6 +467,7 @@ def get_compiled_plan_quant(dtype_str: str, wpr: int, block: int = BLOCK):
             Int32(block),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(
@@ -478,7 +480,7 @@ def get_compiled_gather_rows_scales(k: int, wpr: int = 1):
     """``kernel(x_bytes [T, B] u8, src [>= Tk] i32, x_perm [>= Tk, B] u8, sf (KB, T) f32 any strides, sf_perm (KB, >= Tk) f32,
     Tk, B, KB)``: the fused row + scale gather (one launch); ``wpr`` warps per row (``permute.warps_per_row``)."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_t, sym_n, sym_p = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
         sym_b = cute.sym_int(32, divisibility=16)
         sym_kb, sym_t2 = cute.sym_int(32), cute.sym_int(32)
@@ -517,6 +519,7 @@ def get_compiled_gather_rows_scales(k: int, wpr: int = 1):
             Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, gather_rows_scales_name(k, wpr), compile_fn)

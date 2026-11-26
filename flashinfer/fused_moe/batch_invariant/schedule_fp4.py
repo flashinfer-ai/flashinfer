@@ -23,6 +23,7 @@ from ...gemm.batch_invariant.generator import (
     knob_product,
 )
 from .blocks.epilogue import GroupedEpilogueBlock, Mxfp4Chain
+from ...gemm.batch_invariant.heuristic import on_rank_cache_clear
 from .blocks.swap import swapped_knobs
 from .schedule import (  # noqa: F401  (re-exported)
     TOP_K,
@@ -394,6 +395,11 @@ def _rank_grouped_fp4(
     if pair is not None and pair not in seen and k > 1:
         out = out[: k - 1] + [pair] if len(out) >= k else out + [pair]
     return tuple(out[:k])
+
+
+on_rank_cache_clear(
+    _rank_grouped_fp4.cache_clear
+)  # the memo follows the dispatcher's rankings (a device's registered numbers)
 
 
 def default_configs_fp4(

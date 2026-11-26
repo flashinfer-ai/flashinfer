@@ -28,16 +28,19 @@ the fused op.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from ...autotuner import TuningConfig
 from ...batch_invariant.support import (
     BatchInvariantUnsupportedError,
+    LazyNames,
     check_device,
     unsupported,
 )
+from ...gemm.batch_invariant.generator import Knobs
+from ...gemm.batch_invariant.heuristic import on_rank_cache_clear
 from ..api import (
     GELU,
     GeGLU,
@@ -65,6 +68,48 @@ MOE_BF16_ARCHS: Tuple[Tuple[int, int], ...] = ((10, 0), (10, 3), (10, 7))
 _X, _IDS, _W, _W1, _W2, _OUT = range(6)
 
 
+def _load_api() -> Dict[str, Any]:
+    from .api import MoEWeights, _fused_moe_run, route, route_plan
+    from .blocks.epilogue import GroupedChain
+    from .blocks.scheduler import MAX_E
+    from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
+    from .schedule import TOP_K, active_experts, rank_grouped, rows_per_expert
+
+    return dict(
+        MoEWeights=MoEWeights,
+        fused_moe_run=_fused_moe_run,
+        route=route,
+        route_plan=route_plan,
+        GroupedChain=GroupedChain,
+        MAX_E=MAX_E,
+        ROUTE_PLAN_MAX_SLOTS=ROUTE_PLAN_MAX_SLOTS,
+        ROUTE_PLAN_MAX_TOKENS=ROUTE_PLAN_MAX_TOKENS,
+        TOP_K=TOP_K,
+        active_experts=active_experts,
+        rank_grouped=rank_grouped,
+        rows_per_expert=rows_per_expert,
+    )
+
+
+_api = LazyNames(_load_api)
+
+# the runners' memoised picks follow the dispatcher's rankings: a clear of the rank cache (a device's registered numbers)
+# bumps the generation and every runner drops its memo at its next pick
+_PICK_GENERATION = [0]
+
+
+def _bump_pick_generation() -> None:
+    _PICK_GENERATION[0] += 1
+
+
+on_rank_cache_clear(_bump_pick_generation)
+
+
+def pick_generation() -> int:
+    """The generation of the memoised picks (bumped whenever the rankings are cleared)."""
+    return _PICK_GENERATION[0]
+
+
 def _tactic(c1, c2) -> tuple:
     """A pair of records as a flat tuple of scalars (JSON round-trip safe for the autotuner's cache): the tile, the cluster,
     the CTA group, the raster and the swapped flag (the record's body: the grouped or the swapped one) per record."""
@@ -87,8 +132,6 @@ _TACTIC_FIELDS = 7
 
 
 def _configs_from_tactic(t: tuple):
-    from ...gemm.batch_invariant.generator import Knobs
-
     def one(v):
         return Knobs(
             (int(v[0]), int(v[1])),
@@ -221,13 +264,21 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         self._method: Optional[Any] = None
         self._grouped_other: bool = False
         self._logits_refusal: Optional[Tuple[Any, ...]] = None
+        # the activation's chain, a function of the configuration: derived once, at the support check
+        self._act: Optional[Any] = None
+        # the dispatcher's picks per shape key, taken at the pick generation `_picks_gen` (see `pick_generation`)
+        self._picks: Dict[tuple, tuple] = {}
+        self._picks_gen: int = -1
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
         """The chain of the layer's activation (``spec.ActSpec``: gating, chain name, binary32 parameters)."""
-        from .spec import activation_of
+        a = self._act
+        if a is None:
+            from .spec import activation_of
 
-        return activation_of(self.config.activation)
+            a = self._act = activation_of(self.config.activation)
+        return a
 
     def _local_experts(self) -> Tuple[int, int]:
         """``(offset, count)`` of this shard's experts (every expert without expert parallelism)."""
@@ -347,25 +398,19 @@ class BatchInvariantMoeRunnerBase(MoERunner):
     # ---- the weight view (format hooks) -------------------------------------------------------------------------------
     def _weights_from_view(self, view):
         """The weight view as the kernels consume it (``MoEWeights`` / ``MoEWeightsE4M3``)."""
-        from .api import MoEWeights
-
-        return MoEWeights.from_view(view)
+        return _api.MoEWeights.from_view(view)
 
     def _weight_tensors(self, w) -> List[torch.Tensor]:
         """The view's tensors in the pack, in the order ``_weights_from_tensors`` rebuilds them."""
         return [w.w1i, w.w2]
 
     def _weights_from_tensors(self, a, tensors: List[torch.Tensor]):
-        from .api import MoEWeights
-
         w1i, w2 = tensors
-        return MoEWeights(w1i, w2, a.gated, a.act, a.params)
+        return _api.MoEWeights(w1i, w2, a.gated, a.act, a.params)
 
     def _chain1(self, a):
         """GEMM1's epilogue chain of the layer's activation ``a`` (``spec.ActSpec``), for the dispatcher."""
-        from .blocks.epilogue import GroupedChain
-
-        return GroupedChain("glu" if a.gated else "act", a.act, "bf16", a.params)
+        return _api.GroupedChain("glu" if a.gated else "act", a.act, "bf16", a.params)
 
     def _chain2(self):
         """GEMM2's epilogue chain, for the dispatcher."""
@@ -406,8 +451,6 @@ class BatchInvariantMoeRunnerBase(MoERunner):
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        from .api import route, route_plan
-
         cfg = self.config
         cls = self.CLASS
         plan: List[torch.Tensor] = []
@@ -474,19 +517,16 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                     "a bias exactly for the methods that select on sigmoid(l) + bias",
                 )
             scale = self._scale_tensor() if self._method.scaled else None
-            from .blocks.scheduler import MAX_E
-            from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
-
             if (
-                0 < T <= ROUTE_PLAN_MAX_TOKENS
-                and T * k <= ROUTE_PLAN_MAX_SLOTS
-                and cfg.routing.num_experts <= MAX_E
+                0 < T <= _api.ROUTE_PLAN_MAX_TOKENS
+                and T * k <= _api.ROUTE_PLAN_MAX_SLOTS
+                and cfg.routing.num_experts <= _api.MAX_E
                 and not self._plan_in_kernel(T, x.shape[1])
             ):
                 # routing and the permutation plan in one launch (a placement: the same bits and integers), in the form the
                 # class's packing takes at this token count; a shard plans its local experts by their local ids. A class
                 # whose first GEMM builds the plan itself at this token count launches the routing alone.
-                ids, wts, *plan = route_plan(
+                ids, wts, *plan = _api.route_plan(
                     act.routing_logits,
                     k,
                     self._method,
@@ -498,7 +538,7 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 if e_off:
                     ids = ids - e_off
             else:
-                ids, wts = route(act.routing_logits, k, self._method, bias, scale)
+                ids, wts = _api.route(act.routing_logits, k, self._method, bias, scale)
                 if e_off:
                     ids = ids - e_off
         else:
@@ -535,8 +575,6 @@ class BatchInvariantMoeRunnerBase(MoERunner):
     def _ranked(self, T: int) -> Tuple[list, list]:
         """The dispatcher's ranked records of the two GEMMs at ``T`` tokens (``rank_grouped`` memoises its arguments, all
         scalars of the configuration and the part: a forward without a tactic pays the ranking once per token count)."""
-        from .schedule import TOP_K, active_experts, rank_grouped, rows_per_expert
-
         cfg = self.config
         E, k, I = (
             cfg.routing.num_experts,
@@ -546,12 +584,12 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         E_local = self._local_experts()[1]
         H = self._hidden
         # the rows per expert follow the global routing; the groups are the shard's experts
-        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E_local)
+        rows, n_act = _api.rows_per_expert(T, k, E), _api.active_experts(T, k, E_local)
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         n1 = 2 * I if a.gated else I
         return (
-            rank_grouped(
+            _api.rank_grouped(
                 rows,
                 n1,
                 H,
@@ -559,10 +597,10 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 self._chain1(a),
                 sm_count,
                 family,
-                TOP_K,
+                _api.TOP_K,
                 n_active=n_act,
             ),
-            rank_grouped(
+            _api.rank_grouped(
                 rows,
                 H,
                 I,
@@ -570,7 +608,7 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 self._chain2(),
                 sm_count,
                 family,
-                TOP_K,
+                _api.TOP_K,
                 n_active=n_act,
             ),
         )
@@ -581,10 +619,24 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         r1, r2 = self._ranked(int(inputs[_X].shape[0]))
         return [_tactic(c1, c2) for c1 in r1 for c2 in r2]
 
+    def _memo(self) -> Dict[tuple, tuple]:
+        """The runner's memoised picks, emptied when the rankings were cleared since they were taken."""
+        gen = pick_generation()
+        if self._picks_gen != gen:
+            self._picks.clear()
+            self._picks_gen = gen
+        return self._picks
+
     def _pick(self, T: int) -> Tuple[Any, Any]:
-        """The dispatcher's records of the two GEMMs at ``T`` tokens (a forward without a tactic)."""
-        r1, r2 = self._ranked(T)
-        return r1[0], r2[0]
+        """The dispatcher's records of the two GEMMs at ``T`` tokens (a forward without a tactic), memoised per (token
+        count, hidden size): a forward ranks nothing after the first at its shape."""
+        memo = self._memo()
+        key = (T, self._hidden)
+        p = memo.get(key)
+        if p is None:
+            r1, r2 = self._ranked(T)
+            p = memo[key] = (r1[0], r2[0])
+        return p
 
     def _configs_of_tactic(self, tactic: Any) -> Tuple[Any, Any]:
         """The two records of an autotuner tactic (a class whose tactic carries more than the records overrides this)."""
@@ -596,40 +648,25 @@ class BatchInvariantMoeRunnerBase(MoERunner):
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
         """The fused op on the packed inputs with the records ``c1`` / ``c2``; the layer's output (or its unfinalized
-        triple)."""
-        from .api import fused_moe
-
+        triple). The pack validated every operand, so the op's launch runs on them directly (one validation per call)."""
+        T, H = x.shape
+        k, E, I = ids.shape[1], w.num_experts, w.intermediate_size
         if not self.config.finalize.do_finalize:
             # the layer's unfinalized triple: GEMM2's per-slot rows grouped by expert in expert order and, inside a group,
             # in token-slot order (rows past the valid ones -- a dropped slot's share -- are not written), the weights as the
             # combine would fold them (exactly widened to fp32 by the fold: the mode's dtype carries the same values) and the
             # row of every (token, slot) in the flat layout, -1 for a dropped slot; the class's slot-order fold over the
             # triple is the finalized output bit for bit (TRTLLM-Gen's rows are atomically placed and not reproducible)
-            _, im = fused_moe(
-                x,
-                ids,
-                wts,
-                w,
-                out=out,
-                config1=c1,
-                config2=c2,
-                plan=plan,
-                return_intermediates=True,
-                finalize=False,
-            )
+            _, im = _api.fused_moe_run(
+                x, ids, wts, w, out, c1, c2, T, H, k, E, I,
+                plan=plan, return_intermediates=True, finalize=False,
+            )  # fmt: skip
             weights_dtype = getattr(inputs, "weights_dtype", torch.float32)
             return [im["y"], wts.to(weights_dtype), im["dest"].reshape(-1)]
-        fused_moe(
-            x,
-            ids,
-            wts,
-            w,
-            out=out,
-            config1=c1,
-            config2=c2,
-            plan=plan,
-            w_round=getattr(inputs, "w_round", False),
-        )
+        _api.fused_moe_run(
+            x, ids, wts, w, out, c1, c2, T, H, k, E, I,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
+        )  # fmt: skip
         return out
 
     def forward(

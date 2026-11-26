@@ -371,7 +371,7 @@ def get_compiled_scatter_fp4(
     ``unit_pts``: the per-token scales are one (``pts`` unread, a 1-element placeholder); ``no_pts``: no per-token scale at all
     (``pts`` / ``pts_perm`` unread, 1-element placeholders); ``block``: the elements per scale of the linear layout."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_t, sym_n, sym_p, sym_b = (
             cute.sym_int(32),
             cute.sym_int(32),
@@ -432,6 +432,7 @@ def get_compiled_scatter_fp4(
             Int32(4),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(
@@ -455,7 +456,7 @@ def get_compiled_scatter_sf(k: int, no_pts: bool = False, spl: int = 1) -> Any:
     ``no_pts``: the per-token scales are neither read nor stored (1-element placeholders); ``spl``: a lane's groups per row
     (:func:`scatter_sf_lanes`)."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_s, sym_t, sym_n, sym_sp, sym_p = (
             cute.sym_int(32, divisibility=512),
             cute.sym_int(32),
@@ -486,6 +487,7 @@ def get_compiled_scatter_sf(k: int, no_pts: bool = False, spl: int = 1) -> Any:
             Int32(4),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(

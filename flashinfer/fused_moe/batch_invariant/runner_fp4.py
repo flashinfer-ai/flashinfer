@@ -32,6 +32,7 @@ import torch
 from ...autotuner import TuningConfig
 from ...batch_invariant.support import (
     BatchInvariantUnsupportedError,
+    LazyNames,
     check_device,
     unsupported,
 )
@@ -53,10 +54,64 @@ from ..api import (
     SwiGLU,
     SwiGLUStep,
 )
+from ...gemm.batch_invariant.generator import Knobs
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
 from . import spec as S
 from .api_fp4 import MXFP4, MXFP4W8A, NVFP4, Fp4Pair
-from .runner import MOE_BF16_ARCHS, _PackedInputs, routing_term
+from .runner import MOE_BF16_ARCHS, _PackedInputs, pick_generation, routing_term
+
+
+def _load_names() -> Dict[str, Any]:
+    from .api import route, route_plan
+    from .api_fp4 import (
+        GROUP_ALIGN,
+        TE_GS_INV,
+        MoEWeightsFp4,
+        _fused_moe_fp4_run,
+        _gs_inv,
+        gather_form_ok,
+        gather_sf_layout,
+    )
+    from .api_mxfp8 import _fused_moe_mxfp8_run, check_activation_pack
+    from .blocks.scheduler import MAX_E
+    from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
+    from .schedule import TOP_K
+    from .schedule_fp4 import (
+        TOP_K_FP4,
+        active_experts,
+        gather_form_rule,
+        rank_grouped_fp4,
+        rows_per_expert,
+    )
+    from .schedule_mxfp4w8a import packing_for, ranked_mx
+
+    return dict(
+        route=route,
+        route_plan=route_plan,
+        GROUP_ALIGN=GROUP_ALIGN,
+        MoEWeightsFp4=MoEWeightsFp4,
+        TE_GS_INV=TE_GS_INV,
+        fused_moe_fp4_run=_fused_moe_fp4_run,
+        gs_inv=_gs_inv,
+        gather_form_ok=gather_form_ok,
+        gather_sf_layout=gather_sf_layout,
+        check_activation_pack=check_activation_pack,
+        fused_moe_mxfp8_run=_fused_moe_mxfp8_run,
+        MAX_E=MAX_E,
+        ROUTE_PLAN_MAX_SLOTS=ROUTE_PLAN_MAX_SLOTS,
+        ROUTE_PLAN_MAX_TOKENS=ROUTE_PLAN_MAX_TOKENS,
+        TOP_K=TOP_K,
+        TOP_K_FP4=TOP_K_FP4,
+        active_experts=active_experts,
+        gather_form_rule=gather_form_rule,
+        rank_grouped_fp4=rank_grouped_fp4,
+        rows_per_expert=rows_per_expert,
+        packing_for=packing_for,
+        ranked_mx=ranked_mx,
+    )
+
+
+_names = LazyNames(_load_names)
 
 #: The backend's key: the name of its weight view and of its autotuner records.
 BACKEND_KEY = "batch_invariant_fp4"
@@ -153,8 +208,6 @@ def _tactic_fp4(c1, c2) -> tuple:
 def _configs_from_tactic_fp4(t: tuple):
     """The two records of a tactic tuple; a tuple of another length (a tactic persisted under another tag) is refused by
     name, never split at the wrong field."""
-    from ...gemm.batch_invariant.generator import Knobs
-
     if len(t) != 2 * TACTIC_FIELDS:
         raise ValueError(
             f"the fp4 MoE backend's tactic is {2 * TACTIC_FIELDS} scalars ({TACTIC_FIELDS} per record), got {len(t)}"
@@ -219,6 +272,11 @@ class BatchInvariantFp4Runner(MoERunner):
         # the intermediate's class (`per_token` / `static`): the bound backend config's field
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
+        # the activation's chain, a function of the configuration: derived once, at the support check
+        self._act: Optional[Any] = None
+        # the ranked records per shape key, taken at the pick generation `_picks_gen` (`runner.pick_generation`)
+        self._picks: Dict[tuple, tuple] = {}
+        self._picks_gen: int = -1
 
     @property
     def pair(self) -> Fp4Pair:
@@ -229,9 +287,20 @@ class BatchInvariantFp4Runner(MoERunner):
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
-        from .spec import activation_of
+        a = self._act
+        if a is None:
+            from .spec import activation_of
 
-        return activation_of(self.config.activation)
+            a = self._act = activation_of(self.config.activation)
+        return a
+
+    def _memo(self) -> Dict[tuple, tuple]:
+        """The runner's memoised rankings, emptied when the rankings were cleared since they were taken."""
+        gen = pick_generation()
+        if self._picks_gen != gen:
+            self._picks.clear()
+            self._picks_gen = gen
+        return self._picks
 
     def _check_experts(self) -> None:
         """The class's rule on the expert range: the EP form is not part of this backend, so a shard is refused in the
@@ -402,8 +471,7 @@ class BatchInvariantFp4Runner(MoERunner):
         returns it or flattened; ``False``: the linear layout); unset, the shape names it where it can, and a 2-D
         ``[T, H/block]`` tensor at a row count that is a multiple of 128 (the quantizer's buffer has that shape too) is
         refused (:func:`~.api_fp4.gather_sf_layout`)."""
-        from .api_fp4 import gather_sf_layout
-
+        gather_sf_layout = _names.gather_sf_layout
         pair, cls = self.pair, self.pair.cls
         sf = act.hidden_states_scale
         if sf is None:
@@ -474,8 +542,7 @@ class BatchInvariantFp4Runner(MoERunner):
         rows and their token-major UE8M0 scales in the linear ``[T, H / 32]`` shape, taken as given (uint8, ``float8_e8m0fnu``
         or the e4m3-typed carrier ``TrtllmFp4Config.prepare_activations`` gives this pair), both 16-byte aligned; no per-token
         scale (the placeholder stands in the pack)."""
-        from .api_mxfp8 import check_activation_pack
-
+        check_activation_pack = _names.check_activation_pack
         cls = self.pair.cls
         if act.per_token_scale is not None:
             raise unsupported(
@@ -495,8 +562,7 @@ class BatchInvariantFp4Runner(MoERunner):
         """The fused route + plan launch's form: the dual plan (the dense rows with the padded scale positions) for the fp4
         pairs' dense packing, and for the mixed pair the form of the packing the ranked records run on at this token count
         (the dual plan, or the padded plan of whole 128-row atoms per group)."""
-        from .api_fp4 import GROUP_ALIGN
-
+        GROUP_ALIGN = _names.GROUP_ALIGN
         if self.pair.mixed and self._packing(T, H) == "padded":
             return dict(align=GROUP_ALIGN)
         return dict(dual=True, pad_align=GROUP_ALIGN)
@@ -506,9 +572,11 @@ class BatchInvariantFp4Runner(MoERunner):
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        from .api import route, route_plan
-        from .api_fp4 import MoEWeightsFp4
-
+        route, route_plan, MoEWeightsFp4 = (
+            _names.route,
+            _names.route_plan,
+            _names.MoEWeightsFp4,
+        )
         cfg, pair, cls = self.config, self.pair, self.pair.cls
         plan: List[torch.Tensor] = []
         w_round = False  # bound to the pack (the bf16 runner's rule): a later pack never changes an earlier one's rounding
@@ -618,13 +686,10 @@ class BatchInvariantFp4Runner(MoERunner):
                     "a bias exactly for the methods that select on sigmoid(l) + bias",
                 )
             scale = self._scale_tensor() if self._method.scaled else None
-            from .blocks.scheduler import MAX_E
-            from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
-
             if (
-                0 < T <= ROUTE_PLAN_MAX_TOKENS
-                and T * k <= ROUTE_PLAN_MAX_SLOTS
-                and E <= MAX_E
+                0 < T <= _names.ROUTE_PLAN_MAX_TOKENS
+                and T * k <= _names.ROUTE_PLAN_MAX_SLOTS
+                and E <= _names.MAX_E
             ):
                 # routing and the permutation plan in one launch (a placement: the same bits and integers), in the form of
                 # the packing the pair runs on at this token count; the plan tensors follow the ids and weights as the
@@ -683,12 +748,10 @@ class BatchInvariantFp4Runner(MoERunner):
         4-byte groups: :func:`~.api_fp4.gather_form_ok`; the 128x4 buffer always). The records handed to the op are then the
         pack's own, so the op never has to fall back from a record the runner chose. The mixed pair's bodies read the token
         box: no gather form."""
-        from .api_fp4 import gather_form_ok
-
         if self.pair.mixed or not self._scatter_launch(x):
             return False
         linear = x.dtype != torch.bfloat16 and sf.ndim == 2
-        return gather_form_ok(
+        return _names.gather_form_ok(
             self._hidden_of(x), "linear" if linear else "128x4", self.pair.block
         )
 
@@ -696,9 +759,13 @@ class BatchInvariantFp4Runner(MoERunner):
         """The ranked records of both GEMMs (the tactic space's head); with ``gather_form`` GEMM1's list carries the
         gather-form twin the structural rule places (:func:`~.schedule_fp4.gather_form_rule`). The mixed pair's lists are
         its dispatcher's over both record spaces (:func:`~.schedule_mxfp4w8a.ranked_mx`), trimmed to the packing the first
-        picks run on (on the padded packing the swapped records cannot run, so they leave the lists)."""
-        from .api_fp4 import MoEWeightsFp4
-
+        picks run on (on the padded packing the swapped records cannot run, so they leave the lists). Memoised per (token
+        count, hidden size, gather form): a forward ranks nothing after the first at its shape."""
+        memo = self._memo()
+        key = (T, H, gather_form)
+        r = memo.get(key)
+        if r is not None:
+            return r
         cfg, pair = self.config, self.pair
         E, k, I = (
             cfg.routing.num_experts,
@@ -708,7 +775,7 @@ class BatchInvariantFp4Runner(MoERunner):
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         # the chains of the class (the weights' terms without the tensors)
-        w = MoEWeightsFp4(
+        w = _names.MoEWeightsFp4(
             pair,
             None,
             None,
@@ -722,48 +789,39 @@ class BatchInvariantFp4Runner(MoERunner):
             intermediate=self._intermediate,
         )  # type: ignore[arg-type]
         if pair.mixed:
-            from .schedule import TOP_K
-            from .schedule_mxfp4w8a import packing_for, ranked_mx
-
             in_fmt = self._in_fmt or pair.fmts[0]
             # both record spaces are ranked for the fused-requantization spelling GEMM1 runs
-            r1, r2 = ranked_mx(
-                T, k, H, I, E, w.chain1_quant, in_fmt, sm_count, family, TOP_K
+            r1, r2 = _names.ranked_mx(
+                T, k, H, I, E, w.chain1_quant, in_fmt, sm_count, family, _names.TOP_K
             )
-            if packing_for(r1[0], r2[0]) == "padded":
+            if _names.packing_for(r1[0], r2[0]) == "padded":
                 r1 = [c for c in r1 if not c.swap_ab]
                 r2 = [c for c in r2 if not c.swap_ab]
+            memo[key] = (r1, r2)
             return r1, r2
-        from .schedule_fp4 import (
-            TOP_K_FP4,
-            active_experts,
-            gather_form_rule,
-            rank_grouped_fp4,
-            rows_per_expert,
-        )
-
-        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
+        rows, n_act = _names.rows_per_expert(T, k, E), _names.active_experts(T, k, E)
         in1, in2 = pair.classes(H, I, family, a.gated)
         chain1, chain2 = w.chain1, w.chain2
         n1 = 2 * I if a.gated else I
         r1 = list(
-            rank_grouped_fp4(
-                rows, n1, H, E, chain1, in1, sm_count, family, TOP_K_FP4, n_active=n_act
+            _names.rank_grouped_fp4(
+                rows, n1, H, E, chain1, in1, sm_count, family, _names.TOP_K_FP4, n_active=n_act
             )
-        )
-        twins = [gather_form_rule(c, gather_form) for c in r1]
+        )  # fmt: skip
+        twins = [_names.gather_form_rule(c, gather_form) for c in r1]
         r1 += [t for t in twins if t.gather_a and t not in r1]
-        r2 = rank_grouped_fp4(
-            rows, H, I, E, chain2, in2, sm_count, family, TOP_K_FP4, n_active=n_act
-        )
-        return r1, list(r2)
+        r2 = list(
+            _names.rank_grouped_fp4(
+                rows, H, I, E, chain2, in2, sm_count, family, _names.TOP_K_FP4, n_active=n_act
+            )
+        )  # fmt: skip
+        memo[key] = (r1, r2)
+        return r1, r2
 
     def _packing(self, T: int, H: int) -> str:
         """The mixed pair's packing of the expanded rows at ``T`` tokens: the first picks' (`schedule_mxfp4w8a.packing_for`)."""
-        from .schedule_mxfp4w8a import packing_for
-
         r1, r2 = self._ranked(T, H)
-        return packing_for(r1[0], r2[0])
+        return _names.packing_for(r1[0], r2[0])
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         self._require_built()
@@ -792,8 +850,7 @@ class BatchInvariantFp4Runner(MoERunner):
         **kwargs,
     ) -> torch.Tensor:
         self._require_built()
-        from .api_fp4 import MoEWeightsFp4, fused_moe_fp4
-
+        MoEWeightsFp4 = _names.MoEWeightsFp4
         pair = self.pair
         x, sf, pts, ids, wts, w1, w1sf, w1a, w2, w2sf, w2a, out, gs2, inv2 = inputs[:14]
         plan = (
@@ -802,9 +859,7 @@ class BatchInvariantFp4Runner(MoERunner):
         H = self._hidden_of(x)
         a = self._activation()
         if pair.mixed:
-            from .api_mxfp4w8a import fused_moe_mxfp4w8a
-            from .schedule_mxfp4w8a import packing_for
-
+            packing_for = _names.packing_for
             T = int(x.shape[0])
             if tactic == -1 or tactic is None:
                 r1, r2 = self._ranked(T, H)
@@ -824,26 +879,25 @@ class BatchInvariantFp4Runner(MoERunner):
                     path = "dense"
                 elif path == "dense":
                     plan = None
-            fused_moe_mxfp4w8a(
-                (x, sf),
-                ids,
-                wts,
-                w,
-                out=out,
-                config1=c1,
-                config2=c2,
-                in_fmt=self._in_fmt,
-                plan=plan,
-                path=path,
-                w_round=getattr(inputs, "w_round", False),
-            )
+            if T == 0:
+                return (
+                    out  # no tokens: nothing to route, the (0, H) output as it stands
+                )
+            if c1.gather_a:
+                c1 = dataclasses.replace(
+                    c1, gather_a=False
+                )  # the mixed classes read the token box: no gather form
+            # the op's launch on the validated pack (the pack proved every rule the public entry checks)
+            _names.fused_moe_mxfp8_run(
+                x, sf, ids, wts, w, out, c1, c2, self._in_fmt or pair.fmts[0], path, "fused", False,
+                T, H, ids.shape[1], w.num_experts, self.config.experts.intermediate_size,
+                plan=plan, w_round=getattr(inputs, "w_round", False),
+            )  # fmt: skip
             return out
         if tactic == -1 or tactic is None:
-            from .schedule_fp4 import gather_form_rule
-
             gather_form = self._gather_form(x, sf)
             r1, r2 = self._ranked(int(x.shape[0]), H, gather_form)
-            c1, c2 = gather_form_rule(r1[0], gather_form), r2[0]
+            c1, c2 = _names.gather_form_rule(r1[0], gather_form), r2[0]
         else:
             c1, c2 = _configs_from_tactic_fp4(tuple(tactic))
             if c1.gather_a and not self._gather_form(x, sf):
@@ -856,27 +910,40 @@ class BatchInvariantFp4Runner(MoERunner):
             w1a if pair.scaled else None, w2a if pair.scaled else None,
             self._intermediate, gs2 if static else None, inv2 if static else None,
         )  # fmt: skip
-        # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack); the scale tensor's
-        # rank names its layout (flat: the 128x4 buffer, 2-D: the linear rows, as pack_inputs shaped it); both are the op's
-        # own placements (no fill, no re-tiling launch)
+        # the op's launch on the validated pack (the pack proved every rule the public entry checks): the bf16 rows as
+        # given (the NVFP4 pair quantizes them into the grouped layout inside the op, the MX pair here, as the public entry
+        # does), or the pre-quantized pack -- the empty per-token placeholder means unit scales (the per-tensor pack); the
+        # scale tensor's rank names its layout (flat: the 128x4 buffer, 2-D: the linear rows, as pack_inputs shaped it);
+        # both are the op's own placements (no fill, no re-tiling launch)
+        T, dev = int(x.shape[0]), x.device
+        gsi = _names.gs_inv(_names.TE_GS_INV, dev)
         if x.dtype == torch.bfloat16:
-            xin: Any = x
-        elif pair.scaled:
-            xin = (x, sf, pts if pts.numel() == x.shape[0] else None)
+            x_rows, x4, x_sf, x_pts, sf_src, unit_pts = (
+                x,
+                None,
+                None,
+                None,
+                "128x4",
+                False,
+            )
+            if not pair.scaled:
+                x4, x_sf, x_pts = pair.quantize(x_rows, gsi)
         else:
-            xin = (x, sf)
-        fused_moe_fp4(
-            xin,
-            ids,
-            wts,
-            w,
-            out=out,
-            config1=c1,
-            config2=c2,
-            plan=plan,
-            round_scales=getattr(inputs, "w_round", False),
-            sf_layout=None
-            if x.dtype == torch.bfloat16
-            else ("linear" if sf.ndim == 2 else "128x4"),
-        )
+            sf_src = "linear" if sf.ndim == 2 else "128x4"
+            unit_pts = not (pair.scaled and pts.numel() == T)
+            x_rows, x4, x_sf = None, x, sf.reshape(-1)
+            if not pair.scaled:
+                x_pts = None
+            elif unit_pts:
+                x_pts = _names.gs_inv(
+                    1.0, dev
+                )  # a placeholder the unit-scale scatter never reads
+            else:
+                x_pts = pts
+        in1, in2 = w.classes(self._part[1] if self._part is not None else None)
+        _names.fused_moe_fp4_run(
+            w, x_rows, x4, x_sf, x_pts, sf_src, unit_pts, ids, wts, out, c1, c2, in1, in2,
+            T, H, ids.shape[1], w.num_experts, self.config.experts.intermediate_size, gsi,
+            plan=plan, round_scales=getattr(inputs, "w_round", False),
+        )  # fmt: skip
         return out

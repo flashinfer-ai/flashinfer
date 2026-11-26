@@ -3923,3 +3923,52 @@ def test_tuned_tactic_captured_in_a_graph_replays_while_the_other_packing_runs_e
         assert torch.equal(bits(out), ref)
         assert torch.equal(bits(layer(other, W)), ref_other)
     assert torch.equal(bits(layer(act, W)), ref)
+
+
+@needs_device
+def test_forward_memoises_the_ranking_and_the_launch_handles(monkeypatch):
+    """A forward after the first at a shape ranks nothing (the ranked lists the pick, the plan form and the decode rule all
+    read are memoised per token count and hidden size) and fetches no compiled object (the cached launch handles of the MX
+    bodies), at a decode count and a prefill count; the public op on the same records gives the runner's bits."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import runner_mxfp8 as RM
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import (
+        MoEWeightsMXFP8,
+        fused_moe_mxfp8,
+    )
+
+    k, H, I, E = 4, 256, 128, 16
+    layer = _layer(k, E, I)
+    runner = layer.runners[0]
+    W = None
+    calls = []
+    real = RM._names.ranked_mx  # the dispatcher's ranking the runner's memo guards
+
+    def counted(*args, **kw):
+        calls.append(1)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(RM._names, "ranked_mx", counted)
+    for T, seed in ((5, 77), (300, 78)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
+        if W is None:
+            W = _weights(w1, w2)
+        xq, xsf = _quant(x)
+        pack = _logits_pack((xq, xsf), logits)
+        ref = bits(layer(pack, W))
+        api.clear_kernel_cache()
+        runner._picks.clear()
+        del calls[:]
+        assert torch.equal(bits(layer(pack, W)), ref)
+        handles = dict(api._HANDLES)
+        n = len(calls)
+        assert n >= 1 and len(handles) >= 2
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == n and handles == api._HANDLES
+        ids, wts = api.route(logits, k, runner._method)
+        c1, c2 = runner._pick(T)
+        w = MoEWeightsMXFP8.from_view(W.get_view(runner.backend_key))
+        out = fused_moe_mxfp8(
+            (xq, xsf), ids, wts, w, config1=c1, config2=c2, in_fmt=runner._in_fmt
+        )
+        assert torch.equal(bits(out), ref)

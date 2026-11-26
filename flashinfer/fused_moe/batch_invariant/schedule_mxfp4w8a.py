@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple
 
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.heuristic import decode_sane
+from ...gemm.batch_invariant.heuristic import on_rank_cache_clear
 from .blocks.epilogue import GroupedChain, GroupedEpilogueBlock
 from .blocks.epilogue_mx import OUT_FMT, MxChain
 from .blocks.operands import EPI_WARPGROUPS_BLOCKSCALED
@@ -258,6 +259,11 @@ def _rank_grouped_mx(
             out.append(rec)
             seen.add(rec)
     return tuple(out[:k])
+
+
+on_rank_cache_clear(
+    _rank_grouped_mx.cache_clear
+)  # the memo follows the dispatcher's rankings (a device's registered numbers)
 
 
 def ranked_mx(

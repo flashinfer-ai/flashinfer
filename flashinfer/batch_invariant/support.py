@@ -6,9 +6,22 @@ Light imports only: the operators import this module on every call with ``batch_
 from __future__ import annotations
 
 import functools
-from typing import Dict, Iterable, Tuple
+from typing import Any, Callable, Dict, Iterable, Tuple
 
 import torch
+
+
+class LazyNames:
+    """Names a launch path imports, resolved on first use and kept as attributes: the CuTe-DSL modules stay out of the
+    package's import, and an import statement on the hot path would cost the host at every call."""
+
+    def __init__(self, load: Callable[[], Dict[str, Any]]) -> None:
+        self._load = load
+
+    def __getattr__(self, name: str) -> Any:
+        for k, v in self._load().items():
+            setattr(self, k, v)
+        return object.__getattribute__(self, name)
 
 
 class BatchInvariantUnsupportedError(ValueError):

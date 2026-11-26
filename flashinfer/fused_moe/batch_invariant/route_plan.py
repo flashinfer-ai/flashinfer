@@ -292,7 +292,7 @@ def get_compiled_route_plan(
     expert-parallel shard) runtime."""
     in_dt = get_cutlass_dtype(in_fmt)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_t, sym_e, sym_n, sym_p, sym_c = (
             cute.sym_int(32),
             cute.sym_int(32),
@@ -335,6 +335,7 @@ def get_compiled_route_plan(
             Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(

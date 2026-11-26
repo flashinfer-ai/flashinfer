@@ -4603,6 +4603,7 @@ def test_gather_static_class_refuses_an_undersized_out_sf_before_any_launch(
     bound, and a caller's larger ``rows_sf`` without the larger buffer are refused before the kernel is fetched or
     launched; the exactly sized buffer runs and holds the fused op's scale bytes and codes, as does the fused op's own
     count with its buffer."""
+    from flashinfer.fused_moe.batch_invariant import api as bi_api
     from flashinfer.fused_moe.batch_invariant import api_fp4 as A
     from flashinfer.fused_moe.batch_invariant.blocks import compile as C
     from flashinfer.fused_moe.batch_invariant.schedule_fp4 import (
@@ -4635,12 +4636,13 @@ def test_gather_static_class_refuses_an_undersized_out_sf_before_any_launch(
     assert im["Tk_pad"] == bound and need % C.SF_BUFFER_DIVISIBILITY == 0
     a4 = torch.zeros(Tk + A.DENSE_TAIL, I // 2, dtype=torch.uint8, device="cuda")
     fetched = []
-    real = C.get_compiled_swapped
+    real = A._k.get_compiled_swapped  # the op's resolved getter (the launch handles are cleared: the kernel is fetched again)
     monkeypatch.setattr(
-        C,
+        A._k,
         "get_compiled_swapped",
         lambda *a, **kw: fetched.append(a) or real(*a, **kw),
     )
+    bi_api.clear_kernel_cache()
 
     def run(out_sf, **kw):
         return A.grouped_gemm_fp4(
@@ -5492,3 +5494,39 @@ def test_tuned_tactic_captured_in_a_graph_replays_while_another_form_runs_eagerl
         assert torch.equal(bits(out), ref)
         assert torch.equal(bits(layer(other, W)), ref_other)
     assert torch.equal(bits(layer(act, W)), ref)
+
+
+@needs_device
+@pytest.mark.parametrize("quant", [_NVFP4, _MIXED], ids=["nvfp4", "mxfp4w8a"])
+def test_forward_memoises_the_ranking_and_the_launch_handles(quant, monkeypatch):
+    """A forward after the first at a shape ranks nothing (the ranked lists are memoised per token count, hidden size and
+    gather form) and fetches no compiled object (the cached launch handles of the fp4 bodies); the activation term is
+    derived once; the bits are the same throughout."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import runner_fp4 as RF
+
+    T, k, H, I, E = 5, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
+    layer = _layer(k, E, I, quant=quant)
+    W = _weights(w1, w2, quant=quant)
+    runner = layer.runners[0]
+    pack = _lp(PAIRS[quant.pair], x, logits)
+    ref = bits(layer(pack, W))
+    assert runner._act is not None and runner._activation() is runner._act
+    api.clear_kernel_cache()
+    runner._picks.clear()
+    calls = []
+    name = "ranked_mx" if PAIRS[quant.pair].mixed else "rank_grouped_fp4"
+    real = getattr(RF._names, name)  # the dispatcher's ranking the runner's memo guards
+
+    def counted(*args, **kw):
+        calls.append(1)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(RF._names, name, counted)
+    assert torch.equal(bits(layer(pack, W)), ref)
+    handles = dict(api._HANDLES)
+    n = len(calls)
+    assert n >= 1 and len(handles) >= 2
+    assert torch.equal(bits(layer(pack, W)), ref)
+    assert len(calls) == n and handles == api._HANDLES

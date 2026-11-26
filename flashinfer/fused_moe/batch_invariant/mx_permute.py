@@ -217,7 +217,7 @@ def get_compiled_scatter_mx(k: int, wpr: int = 1, cpl: int = 1, spl: int = 1) ->
     nb, pcols)``; ``wpr`` warps per row (``permute.warps_per_row(T k, B / 16, sms)``), ``cpl`` / ``spl`` the lane's static
     bounds (:func:`scatter_mx_lanes`)."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_t, sym_n, sym_p, sym_b = (
             cute.sym_int(32),
             cute.sym_int(32),
@@ -262,6 +262,7 @@ def get_compiled_scatter_mx(k: int, wpr: int = 1, cpl: int = 1, spl: int = 1) ->
             Int32(4),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(

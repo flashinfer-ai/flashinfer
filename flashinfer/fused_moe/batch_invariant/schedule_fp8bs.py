@@ -21,6 +21,7 @@ import functools
 from typing import List, Optional, Sequence, Tuple
 
 from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
+from ...gemm.batch_invariant.heuristic import on_rank_cache_clear
 from .blocks.epilogue_fp8bs import (
     GEMM2_CHAIN,
     OUT_FMT_QUANT,
@@ -329,6 +330,11 @@ def _rank_grouped_fp8bs(
             out.append(rec)
             seen.add(rec)
     return tuple(out[:k])
+
+
+on_rank_cache_clear(
+    _rank_grouped_fp8bs.cache_clear
+)  # the memo follows the dispatcher's rankings (a device's registered numbers)
 
 
 def fused_quant_default(

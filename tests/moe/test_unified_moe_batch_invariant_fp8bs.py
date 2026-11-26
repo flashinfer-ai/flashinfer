@@ -3876,3 +3876,49 @@ def test_nan_activations_stay_in_their_rows(act):
     out_b = layer(_routed_pack(xn, None, ids, wts), W)
     assert torch.equal(torch.isnan(out_b), nan_out)
     assert torch.equal(bits(out_b[others]), bits(clean[others]))
+
+
+@needs_device
+def test_forward_memoises_the_pick_and_the_launch_handles():
+    """A forward after the first at a shape ranks nothing (the pick with its requantization spelling is memoised per token
+    count, hidden size and block) and fetches no compiled object (the cached launch handles of the block-scale bodies); the
+    public op on the same records and spelling gives the runner's bits."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.api_fp8bs import (
+        MoEWeightsE4M3BS,
+        fused_moe_fp8bs,
+    )
+
+    T, k, H, I, E = 5, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    runner = layer.runners[0]
+    xq, sx = _xq(x)
+    pack = _logits_pack(xq, sx, logits)
+    ref = bits(layer(pack, W))
+    api.clear_kernel_cache()
+    runner._picks.clear()
+    calls = []
+    orig = runner._ranked
+
+    def counted(*args, **kw):
+        calls.append(1)
+        return orig(*args, **kw)
+
+    runner._ranked = counted  # type: ignore[method-assign]
+    try:
+        assert torch.equal(bits(layer(pack, W)), ref)
+        handles = dict(api._HANDLES)
+        assert len(calls) == 1 and len(handles) >= 2
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 1 and handles == api._HANDLES
+    finally:
+        del runner._ranked
+    ids, wts = api.route(logits, k, runner._method)
+    c1, c2 = runner._pick(T)
+    w = MoEWeightsE4M3BS.from_view(W.get_view(runner.backend_key))
+    out = fused_moe_fp8bs(
+        xq, sx, ids, wts, w, config1=c1, config2=c2, fuse_quant=runner._fused
+    )
+    assert torch.equal(bits(out), ref)

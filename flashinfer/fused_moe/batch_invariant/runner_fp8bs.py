@@ -19,17 +19,53 @@ unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvaria
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from ...batch_invariant.support import unsupported
 from ..api import MoEActivationPack, MoEWeightPack
 from .api_fp8bs import MOE_FP8BS_ARCHS, VIEW_PAIR
+from ...batch_invariant.support import LazyNames
 from .runner import _TACTIC_FIELDS, _configs_from_tactic, _tactic
 from .runner_fp8_block import PAIR_DEEPSEEK_FP8, BatchInvariantFp8BlockRunner
 from .spec_fp8bs import BLOCK as QBLOCK
 from .spec_fp8bs import CLASS, CLASS_OF
+
+
+def _load_names() -> Dict[str, Any]:
+    from .api_fp8bs import (
+        MoEWeightsE4M3BS,
+        _fused_moe_fp8bs_run,
+        _gather_form,
+        _quantize_rows,
+        check_aligned,
+        check_shape_fp8bs,
+        scale_mn_view,
+    )
+    from .blocks.epilogue_fp8bs import GEMM2_CHAIN
+    from .schedule import TOP_K, active_experts, rows_per_expert
+    from .schedule_fp8bs import fused_quant_default, gemm1_chain, rank_grouped_fp8bs
+
+    return dict(
+        MoEWeightsE4M3BS=MoEWeightsE4M3BS,
+        check_aligned=check_aligned,
+        check_shape_fp8bs=check_shape_fp8bs,
+        fused_moe_fp8bs_run=_fused_moe_fp8bs_run,
+        gather_form=_gather_form,
+        quantize_rows=_quantize_rows,
+        scale_mn_view=scale_mn_view,
+        GEMM2_CHAIN=GEMM2_CHAIN,
+        TOP_K=TOP_K,
+        active_experts=active_experts,
+        rows_per_expert=rows_per_expert,
+        fused_quant_default=fused_quant_default,
+        gemm1_chain=gemm1_chain,
+        rank_grouped_fp8bs=rank_grouped_fp8bs,
+    )
+
+
+_names = LazyNames(_load_names)
 
 #: Positions of the packed inputs: the e4m3 activations, their block scales, the expert ids, the routing weights, the two
 #: quantized weights with their block scales and the output.
@@ -133,8 +169,11 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         aligned, and the class's shape rule on the configuration at this hidden size; or the raw bf16 rows with no scale
         (the class quantizes them in one launch with its permutation plan: the pack contract's raw-bf16 encoding of a
         DeepSeek fp8 backend that quantizes internally), packed with an empty scale."""
-        from .api_fp8bs import check_aligned, check_shape_fp8bs, scale_mn_view
-
+        check_aligned, check_shape_fp8bs, scale_mn_view = (
+            _names.check_aligned,
+            _names.check_shape_fp8bs,
+            _names.scale_mn_view,
+        )
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype not in (self.X_DTYPE, torch.bfloat16):
             raise unsupported(
@@ -181,19 +220,15 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
     # ---- the weight view -------------------------------------------------------------------------------------------
     def _weights_from_view(self, view):
-        from .api_fp8bs import MoEWeightsE4M3BS
-
-        return MoEWeightsE4M3BS.from_view(view)
+        return _names.MoEWeightsE4M3BS.from_view(view)
 
     def _weight_tensors(self, w) -> List[torch.Tensor]:
         return [w.w1, w.w1_sf, w.w2, w.w2_sf]
 
     def _weights_from_tensors(self, a, tensors: List[torch.Tensor]):
-        from .api_fp8bs import MoEWeightsE4M3BS
-
         w1, w1_sf, w2, w2_sf = tensors
-        self._block = MoEWeightsE4M3BS.block_of(w1, w1_sf)
-        return MoEWeightsE4M3BS(
+        self._block = _names.MoEWeightsE4M3BS.block_of(w1, w1_sf)
+        return _names.MoEWeightsE4M3BS(
             w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params, self._block
         )
 
@@ -201,10 +236,6 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     def _ranked(self, T: int, fused: Optional[bool] = None) -> Tuple[list, list]:
         """The ranked records of both GEMMs over both record spaces at ``T`` tokens for the requantization spelling ``fused``
         (the default spelling's at this token count when None), memoised (`schedule_fp8bs.rank_grouped_fp8bs`)."""
-        from .blocks.epilogue_fp8bs import GEMM2_CHAIN
-        from .schedule import TOP_K, active_experts, rows_per_expert
-        from .schedule_fp8bs import gemm1_chain, rank_grouped_fp8bs
-
         cfg = self.config
         E, k, I = (
             cfg.routing.num_experts,
@@ -214,42 +245,40 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         H = self._hidden
         if fused is None:
             fused = self._fused_default(T)
-        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
+        rows, n_act = _names.rows_per_expert(T, k, E), _names.active_experts(T, k, E)
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         n1 = 2 * I if a.gated else I
         return (
-            rank_grouped_fp8bs(
+            _names.rank_grouped_fp8bs(
                 rows,
                 n1,
                 H,
                 E,
-                gemm1_chain(a.act, a.params, a.gated, fused),
+                _names.gemm1_chain(a.act, a.params, a.gated, fused),
                 sm_count,
                 family,
-                TOP_K,
+                _names.TOP_K,
                 n_active=n_act,
                 block=self._block,
             ),
-            rank_grouped_fp8bs(
+            _names.rank_grouped_fp8bs(
                 rows,
                 H,
                 I,
                 E,
-                GEMM2_CHAIN,
+                _names.GEMM2_CHAIN,
                 sm_count,
                 family,
-                TOP_K,
+                _names.TOP_K,
                 n_active=n_act,
                 block=self._block,
             ),
         )
 
     def _fused_default(self, T: int) -> bool:
-        from .schedule_fp8bs import fused_quant_default
-
         cfg = self.config
-        return fused_quant_default(
+        return _names.fused_quant_default(
             T,
             cfg.routing.top_k,
             cfg.routing.num_experts,
@@ -258,10 +287,16 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         )
 
     def _default(self, T: int):
-        """``(c1, c2, fused)``: the dispatcher's records and spelling at ``T`` tokens."""
-        fused = self._fused_default(T)
-        r1, r2 = self._ranked(T, fused)
-        return r1[0], r2[0], fused
+        """``(c1, c2, fused)``: the dispatcher's records and spelling at ``T`` tokens, memoised per (token count, hidden
+        size, block) with the runner's picks."""
+        memo = self._memo()
+        key = (T, self._hidden, self._block)
+        p = memo.get(key)
+        if p is None:
+            fused = self._fused_default(T)
+            r1, r2 = self._ranked(T, fused)
+            p = memo[key] = (r1[0], r2[0], fused)
+        return p
 
     def _pick(self, T: int) -> Tuple[Any, Any]:
         c1, c2, self._fused = self._default(T)
@@ -274,11 +309,9 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         """The ranked record pairs of both requantization spellings, the dispatcher's spelling first (every tactic computes
         the class)."""
-        from .api_fp8bs import MoEWeightsE4M3BS
-
         self._require_built()
         self._hidden = int(inputs[_X].shape[1])
-        self._block = MoEWeightsE4M3BS.block_of(inputs[_W1], inputs[_W1SF])
+        self._block = _names.MoEWeightsE4M3BS.block_of(inputs[_W1], inputs[_W1SF])
         T = int(inputs[_X].shape[0])
         default_fused = self._fused_default(T)
         out: List[Any] = []
@@ -296,24 +329,20 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
-        from .api_fp8bs import fused_moe_fp8bs
-
+        """The op on the validated pack: the bf16 rows quantized by the class first (with the plan in one launch when the
+        plan is the op's), then the launch with the records and the requantization spelling of the pick or the tactic."""
         xq, sx = x
+        T, H = xq.shape
+        if T == 0:
+            return out  # the empty output: no plan, no quantizer, no record
         if xq.dtype == torch.bfloat16:
-            sx = None  # the bf16 rows: quantized by the op (with the plan in one launch when the plan is the op's)
-        fused_moe_fp8bs(
-            xq,
-            sx,
-            ids,
-            wts,
-            w,
-            out=out,
-            config1=c1,
-            config2=c2,
-            fuse_quant=self._fused,
-            plan=plan,
-            w_round=getattr(inputs, "w_round", False),
-        )
+            xq, sx, plan = _names.quantize_rows(xq, ids, w, plan)
+        fused = self._fused
+        _names.fused_moe_fp8bs_run(
+            xq, sx, ids, wts, w, out, c1, c2, fused, _names.gather_form(c1, fused),
+            T, H, ids.shape[1], w.num_experts, w.intermediate_size,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
+        )  # fmt: skip
         return out
 
 

@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
-from ...batch_invariant.support import unsupported
+from ...batch_invariant.support import LazyNames, unsupported
 from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
 from .api import (
@@ -31,11 +31,11 @@ from .api import (
     _check_grouped_chain,
     _check_grouped_operands,
     _grouped_out,
+    _permute_plan_run,
     combine_rows,
     gather_rows,
     interleave_fc1,
-    launch_grid,
-    permute_plan,
+    launch_handle,
     swapped_pads,
 )
 from .blocks.epilogue import GEMM2_CHAIN, Fp8Chain
@@ -46,6 +46,22 @@ from .spec_fp8 import E4M3_MAX
 CLASS = "moe.e4m3"
 ALIGN_E4M3 = 16  # e4m3 elements per 16-byte row: the TMA alignment of every operand
 _OUT_DTYPE = {"bf16": torch.bfloat16, "f32": torch.float32, "e4m3": torch.float8_e4m3fn}
+
+
+def _load_kernels() -> Dict[str, Any]:
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .schedule import launch_tile_bound
+    from .schedule_fp8 import default_configs_fp8
+
+    return dict(
+        get_compiled_grouped=get_compiled_grouped,
+        get_compiled_swapped=get_compiled_swapped,
+        launch_tile_bound=launch_tile_bound,
+        default_configs_fp8=default_configs_fp8,
+    )
+
+
+_k = LazyNames(_load_kernels)
 
 
 def weight_multipliers(w: torch.Tensor) -> torch.Tensor:
@@ -271,8 +287,6 @@ def grouped_gemm_fp8(
     side, :mod:`.blocks.swap`) the swapped body on the same dense rows -- a placement, the same bits. ``Tk`` (default:
     the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the swapped body's last token box then
     stays inside the buffer instead of being zero-filled past it). The persistent grid is a launch argument."""
-    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
-
     R, K, E, N, Tk = _check_grouped_operands(
         "grouped_gemm_fp8",
         a,
@@ -303,28 +317,55 @@ def grouped_gemm_fp8(
     out_k = out.view(torch.uint8) if chain.out_fmt == "e4m3" else out
     if Tk == 0:
         return out
-    kernel = (
-        get_compiled_swapped(config, chain)
-        if config.swap_ab
-        else get_compiled_grouped(config, chain)
-    )
-    if not config.swap_ab and Tk != R:
-        a = a[
-            :Tk
-        ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
-    kernel(
-        a.unsqueeze(-1),
-        w.permute(1, 2, 0),
-        out_k,
-        counts,
-        s_w.reshape(-1)
-        .to(torch.float32)
-        .contiguous(),  # the kernel reads a unit-stride vector
-        s_a.reshape(1).to(torch.float32).contiguous(),
-        inv.reshape(1).to(torch.float32).contiguous(),
-        launch_grid(a.device, config, Tk, E, N),
+    _grouped_fp8_launch(
+        a, w.permute(1, 2, 0), out_k, counts, s_w, s_a, inv, config, chain, Tk, E, N
     )
     return out
+
+
+def _body_kernel(config: Knobs, chain: Fp8Chain) -> Any:
+    """The compiled body of an fp8-class record: the swapped body for a swapped record, the grouped body otherwise."""
+    if config.swap_ab:
+        return _k.get_compiled_swapped(config, chain)
+    return _k.get_compiled_grouped(config, chain)
+
+
+def _scale_vector(s: torch.Tensor) -> torch.Tensor:
+    """The unit-stride fp32 vector the kernel reads (the prepared weights' scales already are one)."""
+    if s.dtype == torch.float32 and s.dim() == 1 and s.is_contiguous():
+        return s
+    return s.reshape(-1).to(torch.float32).contiguous()
+
+
+def _grouped_fp8_launch(
+    a: torch.Tensor,
+    w3: torch.Tensor,
+    out_k: torch.Tensor,
+    counts: torch.Tensor,
+    s_w: torch.Tensor,
+    s_a: torch.Tensor,
+    inv: torch.Tensor,
+    config: Knobs,
+    chain: Fp8Chain,
+    Tk: int,
+    E: int,
+    N: int,
+) -> None:
+    """The body of ``config`` on prepared operands (:func:`grouped_gemm_fp8`'s launch): ``a [R >= Tk, K]`` (the grouped body
+    reads the output's rows, the swapped body's R is free), ``w3 (N, K, E)`` the weight's kernel view, ``out_k`` the output as
+    the kernel stores it; the persistent grid is the handle's cluster count clipped to the launch's tile bound. The callers
+    validated the operands."""
+    if Tk == 0:
+        return
+    h = launch_handle(a.device, config, ("body", chain), _body_kernel, config, chain)
+    if not config.swap_ab and Tk != a.shape[0]:
+        a = a[:Tk]
+    grid = min(h.clusters, _k.launch_tile_bound(config, Tk, E, N))
+    scales = (_scale_vector(s_w), _scale_vector(s_a), _scale_vector(inv))
+    if config.swap_ab:
+        h.kernel(a.unsqueeze(-1), w3, out_k, counts, *scales, grid)
+    else:
+        h.kernel(a.unsqueeze(-1), w3, out_k, counts, *scales, grid, h.raster)
 
 
 def fused_moe_fp8(
@@ -345,8 +386,6 @@ def fused_moe_fp8(
     ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by default).
     ``w_round``: the f32 weights enter the fold as their bf16 rounding (the pre-routed packed-word convention), by the combine
     kernel. An id outside ``[0, E)`` is a dropped slot (the term ``+0``), as in the bf16 op."""
-    from .schedule_fp8 import default_configs_fp8
-
     T, H, k, experts, scales, out = _check_fused_inputs(
         "fused_moe_fp8",
         xq,
@@ -360,37 +399,67 @@ def fused_moe_fp8(
     )
     E, I = w.num_experts, w.intermediate_size
     check_shape_e4m3(H, I, E)
-    dev = xq.device
     if config1 is None or config2 is None:
         from ...gemm.batch_invariant.api import part_of
 
-        sm_count, family = part_of(dev)
-        c1, c2 = default_configs_fp8(
+        sm_count, family = part_of(xq.device)
+        c1, c2 = _k.default_configs_fp8(
             T, k, H, I, E, sm_count, family, gated=w.gated, chain1=w.chain1
         )
         config1, config2 = config1 or c1, config2 or c2
+    for cfg, N, K, chain in (
+        (config1, w.w1q.shape[1], H, w.chain1),
+        (config2, H, I, GEMM2_CHAIN),
+    ):
+        if not _accepted(cfg, N, K, E, chain):
+            raise ValueError(
+                f"fused_moe_fp8: the record {cfg.describe()} does not implement (N={N}, K={K}, E={E}, "
+                f"{chain.describe()}); the shape's records are `all_valid_configs_fp8` / `all_valid_configs_swapped_fp8`"
+            )
+    return _fused_moe_fp8_run(
+        xq, experts, scales, w, out, config1, config2, T, H, k, E, I,
+        plan=plan, return_intermediates=return_intermediates, w_round=w_round,
+    )  # fmt: skip
+
+
+def _fused_moe_fp8_run(
+    xq: torch.Tensor,
+    experts: torch.Tensor,
+    scales: torch.Tensor,
+    w: MoEWeightsE4M3,
+    out: torch.Tensor,
+    config1: Knobs,
+    config2: Knobs,
+    T: int,
+    H: int,
+    k: int,
+    E: int,
+    I: int,
+    *,
+    plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    return_intermediates: bool = False,
+    w_round: bool = False,
+):
+    """:func:`fused_moe_fp8` on validated operands with the records chosen: the runner's launch (its pack proved every rule
+    the public entry checks, so nothing is checked twice per call) and the public entry's body."""
     counts, dest, src = (
-        plan if plan is not None else permute_plan(experts, E)
-    )  # ``plan``: ``route_plan``'s outputs, the same integers
+        plan if plan is not None else _permute_plan_run(experts.reshape(-1), T, k, E, 1, False, 128)
+    )  # fmt: skip  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
     pad1, pad2 = swapped_pads(config1, config2)
+    dev = xq.device
     x_buf, x_perm = gather_rows(xq, src, k, Tk, pad1, "e4m3")
     a_buf = torch.empty(Tk + pad2, I, dtype=torch.float8_e4m3fn, device=dev)
-    a = grouped_gemm_fp8(
-        x_buf,
-        w.w1q,
-        w.s_w1,
-        w.s_x,
-        w.m_inter,
-        counts,
-        config1,
-        w.chain1,
-        out=a_buf[:Tk],
-        Tk=Tk,
-    )  # [Tk, I] e4m3
-    y = grouped_gemm_fp8(
-        a_buf, w.w2q, w.s_w2, w.s_inter, w.m_inter, counts, config2, GEMM2_CHAIN, Tk=Tk
-    )  # [Tk, H] bf16
+    a = a_buf[:Tk]
+    _grouped_fp8_launch(
+        x_buf, w.w1q.permute(1, 2, 0), a.view(torch.uint8), counts, w.s_w1, w.s_x, w.m_inter,
+        config1, w.chain1, Tk, E, w.w1q.shape[1],
+    )  # fmt: skip  # [Tk, I] e4m3
+    y = torch.empty(Tk, H, dtype=torch.bfloat16, device=dev)
+    _grouped_fp8_launch(
+        a_buf, w.w2q.permute(1, 2, 0), y, counts, w.s_w2, w.s_inter, w.m_inter,
+        config2, GEMM2_CHAIN, Tk, E, H,
+    )  # fmt: skip  # [Tk, H] bf16
     combine_rows(y, dest, scales, out, k, w_round)
     if return_intermediates:
         return out, dict(

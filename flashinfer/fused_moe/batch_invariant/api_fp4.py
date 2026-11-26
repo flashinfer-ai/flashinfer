@@ -23,19 +23,30 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 
 from ...batch_invariant.quantization.layout import padded_sf_cols, sf_numel
 from ...batch_invariant.quantization.mx_spec import MXFP4 as MXFP4_FORMAT
-from ...batch_invariant.support import BatchInvariantUnsupportedError, unsupported
-from ...gemm.batch_invariant.api import part_of, persistent_clusters, sm_count_of
+from ...batch_invariant.support import (
+    BatchInvariantUnsupportedError,
+    LazyNames,
+    unsupported,
+)
+from ...gemm.batch_invariant.api import part_of, sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.schedule import chunks_for, fp4_class_for
 from ...gemm.batch_invariant.spec import MX_MIXED_FMTS, MXFP4_FMTS, NVFP4_FMTS
 from . import spec as S
-from .api import interleave_fc1, padded_rows_bound, permute_plan, route
+from .api import (
+    _permute_plan_run,
+    interleave_fc1,
+    launch_handle,
+    padded_rows_bound,
+    permute_plan,
+    route,
+)
 from .blocks.epilogue import (
     MXFP4_GEMM2_CHAIN,
     GroupedEpilogueBlock,
@@ -684,6 +695,148 @@ def _operands(
     return rows_sf
 
 
+def _load_kernels() -> Dict[str, Any]:
+    from .blocks.compile import (
+        can_implement_grouped_blockscaled,
+        can_implement_swapped_blockscaled,
+        get_compiled_grouped,
+        get_compiled_swapped,
+    )
+    from .combine import get_compiled_combine, warps_per_token
+    from .permute import warps_per_row
+    from .permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+        scatter_lanes,
+        scatter_sf_lanes,
+    )
+
+    return dict(
+        can_implement_grouped_blockscaled=can_implement_grouped_blockscaled,
+        can_implement_swapped_blockscaled=can_implement_swapped_blockscaled,
+        get_compiled_grouped=get_compiled_grouped,
+        get_compiled_swapped=get_compiled_swapped,
+        get_compiled_combine=get_compiled_combine,
+        warps_per_token=warps_per_token,
+        warps_per_row=warps_per_row,
+        get_compiled_scatter_fp4=get_compiled_scatter_fp4,
+        get_compiled_scatter_sf=get_compiled_scatter_sf,
+        scatter_lanes=scatter_lanes,
+        scatter_sf_lanes=scatter_sf_lanes,
+    )
+
+
+_k = LazyNames(_load_kernels)
+
+
+def _fp4_kernel(
+    config: Knobs, chain: Fp4Chain, kind: str, packing: str, sf_src: str
+) -> Any:
+    """The compiled fp4 body of a record: the gather record at its scale source, the swapped body, or the grouped body at
+    ``packing``."""
+    if kind == "gather":
+        return _k.get_compiled_swapped(config, chain, sf_src=sf_src)
+    if kind == "swapped":
+        return _k.get_compiled_swapped(config, chain)
+    return _k.get_compiled_grouped(config, chain, packing=packing)
+
+
+def _fp4_handle(
+    device: torch.device,
+    config: Knobs,
+    chain: Fp4Chain,
+    kind: str,
+    packing: str = "dense",
+    sf_src: str = "128x4",
+):
+    """The launch handle of an fp4 body (the compiled kernel with the device's co-resident cluster count for the record)."""
+    return launch_handle(
+        device,
+        config,
+        (kind, chain, packing, sf_src),
+        _fp4_kernel,
+        config,
+        chain,
+        kind,
+        packing,
+        sf_src,
+    )
+
+
+def _vec(t: torch.Tensor) -> torch.Tensor:
+    """A scale operand as the kernel reads it: a contiguous vector (the prepared weights' alphas and the pack's row scales
+    already are one)."""
+    return t if (t.dim() == 1 and t.is_contiguous()) else t.reshape(-1).contiguous()
+
+
+def _fp4_launch(
+    pair: Fp4Pair,
+    a4: torch.Tensor,
+    a_sf: torch.Tensor,
+    w4: torch.Tensor,
+    w_sf: torch.Tensor,
+    out: torch.Tensor,
+    counts: torch.Tensor,
+    config: Knobs,
+    chain: Fp4Chain,
+    in_fmt: str,
+    rows: int,
+    E: int,
+    N: int,
+    *,
+    pts: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
+    out_sf: Optional[torch.Tensor] = None,
+    aux: Optional[torch.Tensor] = None,
+    dense_a: bool = True,
+    rows_sf: int = 0,
+    src: Optional[torch.Tensor] = None,
+    k_div: int = 1,
+    sf_src: str = "128x4",
+) -> None:
+    """One fp4 body launch on prepared operands (the launch of :func:`grouped_gemm_fp4` and of the gather record): the
+    gather record (``src`` given: the token rows through the plan's map, their scales at ``sf_src``), the swapped body or
+    the grouped body at the packing; the NVFP4 chains take ``alpha [E]`` and ``pts``, the static class ``out_sf`` / ``aux``;
+    the persistent grid is the handle's cluster count clipped to the launch's tile bound. The callers validated the
+    operands."""
+    static = chain.needs_aux
+    kind = "gather" if src is not None else ("swapped" if config.swap_ab else "grouped")
+    h = _fp4_handle(
+        a4.device,
+        config,
+        chain.at(in_fmt),
+        kind,
+        "dense" if dense_a else "padded",
+        sf_src,
+    )
+    grid = min(h.clusters, launch_tile_bound(config, rows, E, N))
+    a3, sfa, w3, wsf = a4.unsqueeze(-1), a_sf.reshape(-1), w4.permute(1, 2, 0), w_sf.reshape(-1)  # fmt: skip
+    head: Tuple[Any, ...]
+    if kind == "gather":
+        head = (a3, sfa, src, k_div, w3, wsf, out)
+    elif kind == "swapped":
+        head = (a3, sfa, w3, wsf, out)
+    else:
+        head = (a3, w3, sfa, wsf, out)
+    # the grouped body's raster order is a launch argument; the swapped body's is in its object
+    tail = (grid, h.raster) if kind == "grouped" else (grid,)
+    if not pair.scaled:
+        if kind == "grouped":
+            h.kernel(*head, counts, rows_sf, *tail)
+        else:
+            h.kernel(*head, counts, *tail)
+    elif static:
+        if out_sf is None:
+            out_sf = _dummy_sf(
+                a4.device
+            )  # GEMM2 of the static class: the scale-byte operand is unread
+        h.kernel(
+            *head, out_sf.reshape(-1), counts, _vec(alpha), _vec(pts), _vec(aux), *tail
+        )
+    else:
+        h.kernel(*head, counts, _vec(alpha), _vec(pts), *tail)
+
+
 def grouped_gemm_fp4(
     a4: torch.Tensor,
     a_sf: torch.Tensor,
@@ -720,12 +873,6 @@ def grouped_gemm_fp4(
     token), ``out`` given (it sizes the dense rows); no permuted tensor, the same bits. ``sf_layout`` names the gather record's
     scale layout where the shape does not (:func:`gather_sf_layout`)."""
     from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
-    from .blocks.compile import (
-        can_implement_grouped_blockscaled,
-        can_implement_swapped_blockscaled,
-        get_compiled_grouped,
-        get_compiled_swapped,
-    )
 
     pair = pair_of(chain)
     name = f"grouped_gemm_{pair.name}"
@@ -769,11 +916,11 @@ def grouped_gemm_fp4(
             raise ValueError(
                 f"{name}: the swapped decode body reads the dense packing (dense_a=True)"
             )
-        if not can_implement_swapped_blockscaled(config, N, K, E, chain, in_fmt):
+        if not _k.can_implement_swapped_blockscaled(config, N, K, E, chain, in_fmt):
             raise ValueError(
                 f"{name}: swapped record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
             )
-    elif not can_implement_grouped_blockscaled(config, N, K, E, chain, in_fmt):
+    elif not _k.can_implement_grouped_blockscaled(config, N, K, E, chain, in_fmt):
         raise ValueError(
             f"{name}: record {config.describe()} does not implement ({N}, {K}, {E}, {chain}, {in_fmt})"
         )
@@ -807,40 +954,10 @@ def grouped_gemm_fp4(
     if rows == 0:
         return out
     # the persistent grid clipped to the launch's tile bound (a placement: which cluster computes a tile, never the bits)
-    grid = min(
-        persistent_clusters(a4.device, config), launch_tile_bound(config, rows, E, N)
-    )
-    w3, wsf = w4.permute(1, 2, 0), w_sf.reshape(-1)
-    if config.swap_ab:
-        kernel = get_compiled_swapped(config, chain.at(in_fmt))
-        if not pair.scaled:
-            kernel(a4.unsqueeze(-1), a_sf.reshape(-1), w3, wsf, out, counts, grid)
-        elif static:
-            kernel(
-                a4.unsqueeze(-1), a_sf.reshape(-1), w3, wsf, out, out_sf.reshape(-1), counts,
-                alpha.reshape(-1).contiguous(), pts.reshape(-1).contiguous(), aux.reshape(-1).contiguous(), grid,
-            )  # fmt: skip
-        else:
-            kernel(
-                a4.unsqueeze(-1), a_sf.reshape(-1), w3, wsf, out, counts,
-                alpha.reshape(-1).contiguous(), pts.reshape(-1).contiguous(), grid,
-            )  # fmt: skip
-        return out
-    kernel = get_compiled_grouped(
-        config, chain.at(in_fmt), packing="dense" if dense_a else "padded"
-    )
-    if not pair.scaled:
-        kernel(a4.unsqueeze(-1), w3, a_sf.reshape(-1), wsf, out, counts, rows_sf, grid)
-    elif static:
-        kernel(
-            a4.unsqueeze(-1), w3, a_sf.reshape(-1), wsf, out, out_sf.reshape(-1), counts,
-            alpha.reshape(-1).contiguous(), pts.reshape(-1).contiguous(), aux.reshape(-1).contiguous(), grid,
-        )  # fmt: skip
-    else:
-        kernel(
-            a4.unsqueeze(-1), w3, a_sf.reshape(-1), wsf, out, counts,
-            alpha.reshape(-1).contiguous(), pts.reshape(-1).contiguous(), grid,
-        )  # fmt: skip
+    _fp4_launch(
+        pair, a4, a_sf, w4, w_sf, out, counts, config, chain, in_fmt, rows, E, N,
+        pts=pts, alpha=alpha, out_sf=out_sf, aux=aux, dense_a=dense_a, rows_sf=rows_sf,
+    )  # fmt: skip
     return out
 
 
@@ -909,7 +1026,6 @@ def _grouped_gemm_fp4_gather(
     row count, a multiple of 128) or the plan's host bound :func:`padded_rows_bound` of ``T x k_div`` slots, which the
     caller's count may not undercut."""
     from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
-    from .blocks.compile import can_implement_swapped_blockscaled, get_compiled_swapped
 
     name = f"grouped_gemm_{pair.name}"
     T, Kh, E, N, _ = _check_grouped_operands(
@@ -971,7 +1087,7 @@ def _grouped_gemm_fp4_gather(
         raise ValueError(
             f"{name}: the grouped class takes unsplit expert weight shapes"
         )
-    if not config.swap_ab or not can_implement_swapped_blockscaled(
+    if not config.swap_ab or not _k.can_implement_swapped_blockscaled(
         config, N, K, E, chain, in_fmt
     ):
         raise ValueError(
@@ -1013,20 +1129,10 @@ def _grouped_gemm_fp4_gather(
     out = _grouped_out(name, out, rows, n_out, out_dtype, a4.device)
     if rows == 0 or T == 0:
         return out
-    grid = min(
-        persistent_clusters(a4.device, config), launch_tile_bound(config, rows, E, N)
-    )
-    kernel = get_compiled_swapped(config, chain.at(in_fmt), sf_src=sf_src)
-    head = (a4.unsqueeze(-1), a_sf.reshape(-1), src, k_div, w4.permute(1, 2, 0), w_sf.reshape(-1), out)  # fmt: skip
-    if not pair.scaled:
-        kernel(*head, counts, grid)
-    elif static:
-        kernel(
-            *head, out_sf.reshape(-1), counts, alpha.reshape(-1).contiguous(),
-            pts.reshape(-1).contiguous(), aux.reshape(-1).contiguous(), grid,
-        )  # fmt: skip
-    else:
-        kernel(*head, counts, alpha.reshape(-1).contiguous(), pts.reshape(-1).contiguous(), grid)  # fmt: skip
+    _fp4_launch(
+        pair, a4, a_sf, w4, w_sf, out, counts, config, chain, in_fmt, rows, E, N,
+        pts=pts, alpha=alpha, out_sf=out_sf, aux=aux, src=src, k_div=k_div, sf_src=sf_src,
+    )  # fmt: skip
     return out
 
 
@@ -1383,12 +1489,7 @@ def fused_moe_fp4(
         )
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
-    from .permute_nvfp4 import (
-        get_compiled_scatter_fp4,
-        get_compiled_scatter_sf,
-        scatter_lanes,
-        scatter_sf_lanes,
-    )
+    from .permute_nvfp4 import get_compiled_scatter_fp4, scatter_lanes
     from .schedule_fp4 import default_configs_fp4, gather_form_rule
 
     pair = w.pair
@@ -1486,13 +1587,41 @@ def fused_moe_fp4(
         raise ValueError(
             f"{op}: the precomputed plan is the dense packing's (path='dense')"
         )
+    if path == "dense":
+        # the records' acceptance (the grouped entry's rule, for a caller's records)
+        for cfg, N, K, chain, fmt in (
+            (config1, w.w1.shape[1], H, chain1, in1),
+            (config2, H, I, chain2, in2),
+        ):
+            if fmt not in pair.fmts or chunks_for(N, K, fmt) != 1:
+                raise ValueError(
+                    f"{op}: the grouped class takes unsplit expert weight shapes"
+                )
+            if cfg.gather_a:
+                ok = cfg.swap_ab and _k.can_implement_swapped_blockscaled(
+                    cfg, N, K, E, chain, fmt
+                )
+                kind = "gather record"
+            elif cfg.swap_ab:
+                ok = _k.can_implement_swapped_blockscaled(cfg, N, K, E, chain, fmt)
+                kind = "swapped record"
+            else:
+                ok = _k.can_implement_grouped_blockscaled(cfg, N, K, E, chain, fmt)
+                kind = "record"
+            if not ok:
+                raise ValueError(
+                    f"{op}: {kind} {cfg.describe()} does not implement ({N}, {K}, {E}, {chain}, {fmt})"
+                )
+        return _fused_moe_fp4_run(
+            w, x_rows, x4, x_sf, x_pts, sf_src, unit_pts, experts, scales, out, config1, config2, in1, in2,
+            T, H, k, E, I, gsi, plan=plan, round_scales=round_scales, return_intermediates=return_intermediates,
+        )  # fmt: skip
     Tk = T * k
     Tk_pad = padded_rows_bound(T, k, E)
-    pcols_h, pcols_i = pair.sf_cols(H), pair.sf_cols(I)
+    pcols_h = pair.sf_cols(H)
     unit = _placeholder(dev)
     wpr = warps_per_row(Tk, H // 32, sm_count)
     # the scale operands of the GEMMs: the NVFP4 pair's (pts rows, alphas), none for the MX pair
-    pts1 = (lambda t: t) if scaled else (lambda t: None)
     alpha1, alpha2 = (w.w1_alpha, w.w2_alpha) if scaled else (None, None)
     combine = get_compiled_combine(
         k, "bf16", "bf16", warps_per_token(T, H, sm_count), round_scales
@@ -1543,117 +1672,6 @@ def fused_moe_fp4(
                 pcols_h,
             )
 
-    if path == "dense":
-        counts, dest, src, dest_pad, pos_pad = (
-            plan if plan is not None else permute_plan_dual(experts, E)
-        )  # ``plan``: ``route_plan_dual``'s outputs, the same integers
-        # the fp4 rows back to back (a tail past Tk for the last tiles' TMA boxes); the scale factors and the row scales at
-        # the padded positions (one 128x4 atom per (expert, 128-row tile); a tail past Tk_pad likewise)
-        Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
-        x_perm4 = x_perm_sf = x_perm_pts = None
-        if gather1:
-            # the gather form: GEMM1 reads the token rows through the plan's map; a bf16 input is quantized over its T rows
-            if x4 is None:
-                x4, x_sf, x_pts = pair.quantize(x_rows, gsi)
-            g_a, g_pts = x4, x_pts
-            g_sf = x_sf.view(T, H // pair.block) if sf_src == "linear" else x_sf
-        else:
-            x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
-            x_perm_sf = torch.empty(
-                pair.sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev
-            )
-            x_perm_pts = (
-                torch.empty(Tk_sf, dtype=torch.float32, device=dev) if scaled else None
-            )
-            if Tk and x4 is None:
-                quantize_scatter_rows(
-                    x_rows,
-                    gsi,
-                    dest.reshape(-1),
-                    dest_pad.reshape(-1),
-                    k,
-                    (x_perm4, x_perm_sf, x_perm_pts),
-                )
-            elif Tk:
-                scatter(
-                    x4,
-                    x_sf,
-                    x_pts,
-                    dest.reshape(-1),
-                    dest_pad.reshape(-1),
-                    x_perm4,
-                    x_perm_sf,
-                    x_perm_pts,
-                )
-            g_a, g_sf, g_pts = x_perm4, x_perm_sf, x_perm_pts
-        g_src = src if gather1 else None
-        a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
-        # zero-filled: the writers (the static epilogue, the quantizers' re-tiling) store a row's real scale columns only, and
-        # GEMM2's scale boxes read the padded columns of a row's last 4-byte group against the zero-filled tail of its k-tile
-        a_sf_pad = torch.zeros(pair.sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
-        a = a_sf = a_pts = a_pts_pad = None
-        if static:
-            # the static class: GEMM1's epilogue writes the intermediate's codes (dense rows) and scale bytes (the padded
-            # positions) itself -- no bf16 intermediate, no quantizer launch; GEMM2's scale is mul(alpha2[e], inv2[e])
-            grouped_gemm_fp4(
-                g_a, g_sf, w.w1, w.w1_sf, counts, config1, chain1, in1,
-                pts=g_pts, alpha=alpha1, out=a4, dense_a=True, rows_sf=Tk_sf, out_sf=a_sf_pad, aux=w.gs2,
-                src=g_src, k_div=k, sf_layout=sf_src,
-            )  # fmt: skip
-            a_pts_pad = (
-                x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
-                if x_perm_pts is not None
-                else torch.empty(Tk_sf, dtype=torch.float32, device=dev)
-            )
-        else:
-            a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
-            grouped_gemm_fp4(
-                g_a, g_sf, w.w1, w.w1_sf, counts, config1, chain1, in1,
-                pts=g_pts, alpha=alpha1, out=a, dense_a=True, rows_sf=Tk_sf, src=g_src, k_div=k, sf_layout=sf_src,
-            )  # fmt: skip
-            # the class's second pass over the live rows: the codes stay dense; the scale factors (and the row scales) are
-            # re-tiled to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
-            if scaled:
-                a_pts_pad = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
-                if Tk and INTERMEDIATE_RETILE == "mapped":
-                    quantize_rows_mapped(
-                        a[:Tk], gsi, pos_pad, (a4[:Tk], a_sf_pad, a_pts_pad)
-                    )
-                elif Tk:
-                    a_sf = torch.empty(
-                        pair.sf_numel(Tk, I), dtype=torch.uint8, device=dev
-                    )
-                    _, _, a_pts = quantize_activations(a[:Tk], gsi, out=(a4[:Tk], a_sf))
-                    get_compiled_scatter_sf(1, spl=scatter_sf_lanes(pcols_i))(
-                        a_sf, a_pts, pos_pad, a_sf_pad, a_pts_pad, Tk, pcols_i
-                    )
-            else:
-                a_sf = torch.empty(pair.sf_numel(Tk, I), dtype=torch.uint8, device=dev)
-                if Tk:
-                    quantize_rows_mx(a[:Tk], out=(a4[:Tk], a_sf))
-                    get_compiled_scatter_sf(1, True, spl=scatter_sf_lanes(pcols_i))(
-                        a_sf, unit, pos_pad, a_sf_pad, unit, Tk, pcols_i
-                    )
-        y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
-        grouped_gemm_fp4(
-            a4, a_sf_pad, w.w2, w.w2_sf, counts, config2, chain2, in2,
-            pts=pts1(a_pts_pad), alpha=alpha2, out=y, dense_a=True, rows_sf=Tk_sf, aux=w.inv2 if static else None,
-        )  # fmt: skip
-        if T:
-            combine(y, dest, scales, out, T, H)
-        if return_intermediates:
-            return out, dict(
-                counts=counts, dest=dest, src=src, dest_pad=dest_pad, pos_pad=pos_pad,
-                x4=x4, x_sf=x_sf, x_pts=x_pts,
-                x_perm4=None if x_perm4 is None else x_perm4[:Tk],
-                x_perm_sf=None if x_perm_sf is None else x_perm_sf[: pair.sf_numel(Tk_pad, H)],
-                x_perm_pts=None if x_perm_pts is None else x_perm_pts[:Tk_pad],
-                a=None if a is None else a[:Tk], a4=a4[:Tk], a_sf=a_sf, a_pts=a_pts,
-                a_sf_pad=a_sf_pad[: pair.sf_numel(Tk_pad, I)],
-                a_pts_pad=None if a_pts_pad is None else a_pts_pad[:Tk_pad],
-                y=y[:Tk], config1=config1, config2=config2, in_fmts=(in1, in2), Tk_pad=Tk_pad, path=path,
-            )  # fmt: skip
-        return out
     # the padded packing: every group's rows start at a 128-row atom; the padding rows are zero (computed, never stored)
     from .api import PLAN_MULTI_MIN_N
     from .permute import (
@@ -1719,6 +1737,213 @@ def fused_moe_fp4(
             x_perm4=x_perm4, x_perm_sf=x_perm_sf, x_perm_pts=x_perm_pts,
             a=a, a4=a4, a_sf=a_sf, a_pts=a_pts, y=y,
             config1=config1, config2=config2, in_fmts=(in1, in2), Tk_pad=Tk_pad, path=path,
+        )  # fmt: skip
+    return out
+
+
+def _fused_moe_fp4_run(
+    w: MoEWeightsFp4,
+    x_rows: Optional[torch.Tensor],
+    x4: Optional[torch.Tensor],
+    x_sf: Optional[torch.Tensor],
+    x_pts: Optional[torch.Tensor],
+    sf_src: str,
+    unit_pts: bool,
+    experts: torch.Tensor,
+    scales: torch.Tensor,
+    out: torch.Tensor,
+    config1: Knobs,
+    config2: Knobs,
+    in1: str,
+    in2: str,
+    T: int,
+    H: int,
+    k: int,
+    E: int,
+    I: int,
+    gsi: torch.Tensor,
+    *,
+    plan: Optional[Tuple[torch.Tensor, ...]] = None,
+    round_scales: bool = False,
+    return_intermediates: bool = False,
+):
+    """:func:`fused_moe_fp4` on the dense packing with validated operands and the records chosen (``config1``'s gather form
+    admitted by the pack's scale layout): the runner's launch (its pack proved every rule the public entry checks, so
+    nothing is checked twice per call) and the public entry's body. ``x_rows`` the bf16 rows (quantized here), or the pack
+    ``x4`` / ``x_sf`` (the flat 128x4 bytes or the linear rows: ``sf_src``) / ``x_pts`` (the unit placeholder when
+    ``unit_pts``)."""
+    pair, dev = w.pair, out.device
+    sm_count = sm_count_of(dev)
+    chain1, chain2 = w.chain1, w.chain2
+    static = w.static
+    scaled = pair.scaled
+    gather1 = config1.gather_a
+    Tk = T * k
+    Tk_pad = padded_rows_bound(T, k, E)
+    pcols_h, pcols_i = pair.sf_cols(H), pair.sf_cols(I)
+    unit = _placeholder(dev)
+    wpr = _k.warps_per_row(Tk, H // 32, sm_count)
+    # the scale operands of the GEMMs: the NVFP4 pair's (pts rows, alphas), none for the MX pair
+    alpha1, alpha2 = (w.w1_alpha, w.w2_alpha) if scaled else (None, None)
+    combine = _k.get_compiled_combine(
+        k, "bf16", "bf16", _k.warps_per_token(T, H, sm_count), round_scales
+    )
+
+    def scatter(
+        x4_, x_sf_, x_pts_, dest_, dest_pad_, x_perm4_, x_perm_sf_, x_perm_pts_
+    ):
+        """The fp4 scatter of a quantized input to the grouped layout (its scale rows re-tiled into the atoms)."""
+        if scaled:
+            kern = _k.get_compiled_scatter_fp4(
+                k, wpr, sf_src, unit_pts, **_k.scatter_lanes(H // 2, pcols_h, wpr)
+            )
+            kern(
+                x4_,
+                x_sf_,
+                x_pts_,
+                dest_,
+                dest_pad_,
+                x_perm4_,
+                x_perm_sf_,
+                x_perm_pts_,
+                Tk,
+                H // 2,
+                pcols_h,
+            )
+        else:
+            kern = _k.get_compiled_scatter_fp4(
+                k,
+                wpr,
+                sf_src,
+                False,
+                True,
+                MX_BLOCK,
+                **_k.scatter_lanes(H // 2, pcols_h, wpr),
+            )
+            kern(
+                x4_,
+                x_sf_,
+                unit,
+                dest_,
+                dest_pad_,
+                x_perm4_,
+                x_perm_sf_,
+                unit,
+                Tk,
+                H // 2,
+                pcols_h,
+            )
+
+    counts, dest, src, dest_pad, pos_pad = (
+        plan if plan is not None else _permute_plan_run(experts.reshape(-1), T, k, E, 1, True, GROUP_ALIGN)
+    )  # fmt: skip  # ``plan``: ``route_plan_dual``'s outputs, the same integers
+    # the fp4 rows back to back (a tail past Tk for the last tiles' TMA boxes); the scale factors and the row scales at
+    # the padded positions (one 128x4 atom per (expert, 128-row tile); a tail past Tk_pad likewise)
+    Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
+    x_perm4 = x_perm_sf = x_perm_pts = None
+    n1 = w.w1.shape[1]
+    if gather1:
+        # the gather form: GEMM1 reads the token rows through the plan's map; a bf16 input is quantized over its T rows
+        if x4 is None:
+            x4, x_sf, x_pts = pair.quantize(x_rows, gsi)
+        g_a, g_pts = x4, x_pts
+        g_sf = x_sf.view(T, H // pair.block) if sf_src == "linear" else x_sf
+    else:
+        x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
+        x_perm_sf = torch.empty(pair.sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
+        x_perm_pts = (
+            torch.empty(Tk_sf, dtype=torch.float32, device=dev) if scaled else None
+        )
+        if Tk and x4 is None:
+            quantize_scatter_rows(
+                x_rows,
+                gsi,
+                dest.reshape(-1),
+                dest_pad.reshape(-1),
+                k,
+                (x_perm4, x_perm_sf, x_perm_pts),
+            )
+        elif Tk:
+            scatter(
+                x4,
+                x_sf,
+                x_pts,
+                dest.reshape(-1),
+                dest_pad.reshape(-1),
+                x_perm4,
+                x_perm_sf,
+                x_perm_pts,
+            )
+        g_a, g_sf, g_pts = x_perm4, x_perm_sf, x_perm_pts
+    g_src = src if gather1 else None
+    a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
+    # zero-filled: the writers (the static epilogue, the quantizers' re-tiling) store a row's real scale columns only, and
+    # GEMM2's scale boxes read the padded columns of a row's last 4-byte group against the zero-filled tail of its k-tile
+    a_sf_pad = torch.zeros(pair.sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
+    a = a_sf = a_pts = a_pts_pad = None
+    run1 = Tk_a > 0 and (
+        not gather1 or T > 0
+    )  # the gather record's launch needs token rows
+    if static:
+        # the static class: GEMM1's epilogue writes the intermediate's codes (dense rows) and scale bytes (the padded
+        # positions) itself -- no bf16 intermediate, no quantizer launch; GEMM2's scale is mul(alpha2[e], inv2[e])
+        if run1:
+            _fp4_launch(
+                pair, g_a, g_sf, w.w1, w.w1_sf, a4, counts, config1, chain1, in1, Tk_a, E, n1,
+                pts=g_pts, alpha=alpha1, out_sf=a_sf_pad, aux=w.gs2, rows_sf=Tk_sf, src=g_src, k_div=k, sf_src=sf_src,
+            )  # fmt: skip
+        a_pts_pad = (
+            x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
+            if x_perm_pts is not None
+            else torch.empty(Tk_sf, dtype=torch.float32, device=dev)
+        )
+    else:
+        a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
+        if run1:
+            _fp4_launch(
+                pair, g_a, g_sf, w.w1, w.w1_sf, a, counts, config1, chain1, in1, Tk_a, E, n1,
+                pts=g_pts, alpha=alpha1, rows_sf=Tk_sf, src=g_src, k_div=k, sf_src=sf_src,
+            )  # fmt: skip
+        # the class's second pass over the live rows: the codes stay dense; the scale factors (and the row scales) are
+        # re-tiled to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
+        if scaled:
+            a_pts_pad = torch.empty(Tk_sf, dtype=torch.float32, device=dev)
+            if Tk and INTERMEDIATE_RETILE == "mapped":
+                quantize_rows_mapped(
+                    a[:Tk], gsi, pos_pad, (a4[:Tk], a_sf_pad, a_pts_pad)
+                )
+            elif Tk:
+                a_sf = torch.empty(pair.sf_numel(Tk, I), dtype=torch.uint8, device=dev)
+                _, _, a_pts = quantize_activations(a[:Tk], gsi, out=(a4[:Tk], a_sf))
+                _k.get_compiled_scatter_sf(1, spl=_k.scatter_sf_lanes(pcols_i))(
+                    a_sf, a_pts, pos_pad, a_sf_pad, a_pts_pad, Tk, pcols_i
+                )
+        else:
+            a_sf = torch.empty(pair.sf_numel(Tk, I), dtype=torch.uint8, device=dev)
+            if Tk:
+                quantize_rows_mx(a[:Tk], out=(a4[:Tk], a_sf))
+                _k.get_compiled_scatter_sf(1, True, spl=_k.scatter_sf_lanes(pcols_i))(
+                    a_sf, unit, pos_pad, a_sf_pad, unit, Tk, pcols_i
+                )
+    y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
+    if Tk_a:
+        _fp4_launch(
+            pair, a4, a_sf_pad, w.w2, w.w2_sf, y, counts, config2, chain2, in2, Tk_a, E, H,
+            pts=a_pts_pad if scaled else None, alpha=alpha2, aux=w.inv2 if static else None, rows_sf=Tk_sf,
+        )  # fmt: skip
+    if T:
+        combine(y, dest, scales, out, T, H)
+    if return_intermediates:
+        return out, dict(
+            counts=counts, dest=dest, src=src, dest_pad=dest_pad, pos_pad=pos_pad,
+            x4=x4, x_sf=x_sf, x_pts=x_pts,
+            x_perm4=None if x_perm4 is None else x_perm4[:Tk],
+            x_perm_sf=None if x_perm_sf is None else x_perm_sf[: pair.sf_numel(Tk_pad, H)],
+            x_perm_pts=None if x_perm_pts is None else x_perm_pts[:Tk_pad],
+            a=None if a is None else a[:Tk], a4=a4[:Tk], a_sf=a_sf, a_pts=a_pts,
+            a_sf_pad=a_sf_pad[: pair.sf_numel(Tk_pad, I)],
+            a_pts_pad=None if a_pts_pad is None else a_pts_pad[:Tk_pad],
+            y=y[:Tk], config1=config1, config2=config2, in_fmts=(in1, in2), Tk_pad=Tk_pad, path="dense",
         )  # fmt: skip
     return out
 

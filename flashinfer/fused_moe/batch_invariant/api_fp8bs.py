@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
-from ...batch_invariant.support import check_device, unsupported
+from ...batch_invariant.support import LazyNames, check_device, unsupported
 from ...gemm.batch_invariant.api import sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.spec import BLOCK_K
@@ -38,9 +38,10 @@ from .api import (
     _check_grouped_chain,
     _check_grouped_operands,
     _grouped_out,
+    _permute_plan_run,
     combine_rows,
     interleave_fc1,
-    launch_grid,
+    launch_handle,
     permute_plan,
 )
 from .blocks.epilogue_fp8bs import GEMM2_CHAIN, OUT_FMT_QUANT, Fp8BsChain, gemm1_chain
@@ -71,6 +72,34 @@ SCALE_LAYOUTS = ("MN", "K")
 ROW_WARPS_PER_SM_SMALL = 16
 #: The route kernel's top-k bound; the class's bound on the slots.
 K_MAX = 16
+
+
+def _load_kernels() -> Dict[str, Any]:
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .blocks.fp8bs_small import get_compiled_gather_rows_scales
+    from .permute import warps_per_row
+    from .schedule import launch_tile_bound
+    from .schedule_fp8bs import (
+        can_implement_grouped_fp8bs,
+        can_implement_swapped_fp8bs,
+        default_configs_fp8bs,
+        fused_quant_default,
+    )
+
+    return dict(
+        get_compiled_grouped=get_compiled_grouped,
+        get_compiled_swapped=get_compiled_swapped,
+        get_compiled_gather_rows_scales=get_compiled_gather_rows_scales,
+        warps_per_row=warps_per_row,
+        launch_tile_bound=launch_tile_bound,
+        can_implement_grouped_fp8bs=can_implement_grouped_fp8bs,
+        can_implement_swapped_fp8bs=can_implement_swapped_fp8bs,
+        default_configs_fp8bs=default_configs_fp8bs,
+        fused_quant_default=fused_quant_default,
+    )
+
+
+_k = LazyNames(_load_kernels)
 
 
 # ----------------------------------------------------------------------------- the quantizer
@@ -589,12 +618,6 @@ def grouped_gemm_fp8bs(
     row ``p`` reads token ``src[p] // k_div`` (the plan's slot map, ``k_div`` the slots per token), ``rows_out`` the dense rows of
     ``out`` (``Tk`` plus the tail). The persistent grid is a launch argument, the device's capacity clipped to the launch's tile
     bound (`schedule.launch_tile_bound`: which CTA computes a tile, never the bits)."""
-    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
-    from .schedule_fp8bs import (
-        can_implement_grouped_fp8bs,
-        can_implement_swapped_fp8bs,
-    )
-
     gather = src is not None
     if gather and (
         not config.swap_ab
@@ -639,9 +662,9 @@ def grouped_gemm_fp8bs(
             f"grouped_gemm_fp8bs: w_sf must be a contiguous, 16-byte-aligned fp32 {(E, NB, KB)}, got {tuple(w_sf.shape)}"
         )
     accepted = (
-        can_implement_swapped_fp8bs(config, N, K, E, chain, interleaved, block)
+        _k.can_implement_swapped_fp8bs(config, N, K, E, chain, interleaved, block)
         if config.swap_ab
-        else can_implement_grouped_fp8bs(config, N, K, E, chain, interleaved, block)
+        else _k.can_implement_grouped_fp8bs(config, N, K, E, chain, interleaved, block)
     )
     if not accepted:
         raise ValueError(
@@ -674,44 +697,66 @@ def grouped_gemm_fp8bs(
             w_sf[0, :1, :1].reshape(1, 1),
         )  # the scale output is unread: any fp32 (1, 1) tensor
     # the unified bodies on the promoted operand block: the chain carries the class's block and the weight interleave
-    body_chain = chain.at(block, interleaved)
-    if Tk and gather:
-        # the swapped body's gather form: the unpermuted rows and their scales through the plan's map, the same bits
-        get_compiled_swapped(config, body_chain, gather=True)(
-            a,
-            sfa_v,
-            src,
-            k_div,
-            w.permute(1, 2, 0),
-            w_sf,
-            out_k,
-            counts,
-            launch_grid(a.device, config, Tk, E, N),
-        )
-    elif Tk and config.swap_ab:
-        # the swapped body: the same operands, the same bits (no fused requantization output)
-        get_compiled_swapped(config, body_chain)(
-            a.unsqueeze(-1),
-            sfa_v,
-            w.permute(1, 2, 0),
-            w_sf,
-            out_k,
-            counts,
-            launch_grid(a.device, config, Tk, E, N),
-        )
-    elif Tk:
-        get_compiled_grouped(config, body_chain)(
-            a.unsqueeze(-1),
-            w.permute(1, 2, 0),
-            sfa_v,
-            w_sf,
-            out_k,
-            *((sfo_k,) if quant else ()),
-            counts,
-            Tk,
-            launch_grid(a.device, config, Tk, E, N),
-        )
+    _grouped_fp8bs_launch(
+        a, sfa_v, w.permute(1, 2, 0), w_sf, out_k, sfo_k, counts, config, chain.at(block, interleaved),
+        quant, Tk, E, N, src=src, k_div=k_div,
+    )  # fmt: skip
     return (out, sfo) if quant else out
+
+
+def _body_kernel(config: Knobs, chain: Fp8BsChain) -> Any:
+    """The compiled body of a block-scale fp8 record: the swapped body for a swapped record, the grouped body otherwise."""
+    if config.swap_ab:
+        return _k.get_compiled_swapped(config, chain)
+    return _k.get_compiled_grouped(config, chain)
+
+
+def _gather_kernel(config: Knobs, chain: Fp8BsChain) -> Any:
+    return _k.get_compiled_swapped(config, chain, gather=True)
+
+
+def _grouped_fp8bs_launch(
+    a: torch.Tensor,
+    sfa_v: torch.Tensor,
+    w3: torch.Tensor,
+    w_sf: torch.Tensor,
+    out_k: torch.Tensor,
+    sfo_k: torch.Tensor,
+    counts: torch.Tensor,
+    config: Knobs,
+    body_chain: Fp8BsChain,
+    quant: bool,
+    Tk: int,
+    E: int,
+    N: int,
+    src: Optional[torch.Tensor] = None,
+    k_div: int = 1,
+) -> None:
+    """The body of ``config`` on prepared operands (:func:`grouped_gemm_fp8bs`'s launch): the gather form (``src`` given: the
+    unpermuted rows and their scales through the plan's map), the swapped body or the grouped body (with the fused
+    requantization's scale output ``sfo_k`` when ``quant``); ``w3 (N, K, E)`` the weight's kernel view, ``sfa_v`` the row
+    scales as the kernel's ``(rows, KB)`` view; the persistent grid is the handle's cluster count clipped to the launch's tile
+    bound. The callers validated the operands."""
+    if Tk == 0:
+        return
+    dev = a.device
+    if src is not None:
+        h = launch_handle(
+            dev, config, ("gather", body_chain), _gather_kernel, config, body_chain
+        )
+        grid = min(h.clusters, _k.launch_tile_bound(config, Tk, E, N))
+        h.kernel(a, sfa_v, src, k_div, w3, w_sf, out_k, counts, grid)
+        return
+    h = launch_handle(
+        dev, config, ("body", body_chain), _body_kernel, config, body_chain
+    )
+    grid = min(h.clusters, _k.launch_tile_bound(config, Tk, E, N))
+    if config.swap_ab:
+        h.kernel(a.unsqueeze(-1), sfa_v, w3, w_sf, out_k, counts, grid)
+    elif quant:
+        h.kernel(a.unsqueeze(-1), w3, sfa_v, w_sf, out_k, sfo_k, counts, Tk, grid, h.raster)  # fmt: skip
+    else:
+        h.kernel(a.unsqueeze(-1), w3, sfa_v, w_sf, out_k, counts, Tk, grid, h.raster)
 
 
 def check_aligned(block: int, x: torch.Tensor, sx: Optional[torch.Tensor]) -> None:
@@ -756,10 +801,6 @@ def fused_moe_fp8bs(
     box form's one launch is the cheaper placement at the wider tiles). ``plan``: ``route_plan``'s ``(counts, dest, src)``.
     ``w_round``: the f32 weights enter the fold as their bf16 rounding, by the combine kernel (the pre-routed packed-word
     convention), as in the bf16 op."""
-    from .blocks.fp8bs_small import get_compiled_gather_rows_scales
-    from .permute import warps_per_row
-    from .schedule_fp8bs import default_configs_fp8bs, fused_quant_default
-
     if xq.dtype in _DTYPE_STR:
         # bf16 activations: the class quantizes them itself -- with the dense plan in one launch when the plan is this
         # call's (the pre-routed form), by the standalone quantizer when the plan is given (the routed form's route + plan)
@@ -781,13 +822,7 @@ def fused_moe_fp8bs(
         check_aligned(w.block, xq, None)
         if T0 == 0:
             return out  # the empty output: no plan, no quantizer, no record
-        if plan is None:
-            xq, sx, counts_q, dest_q, src_q = fp8_block_quantize_plan(
-                xq, token_selected_experts.contiguous(), w.num_experts, block=w.block
-            )
-            plan = (counts_q, dest_q, src_q)
-        else:
-            xq, sx = fp8_block_quantize(xq, "MN", block=w.block)
+        xq, sx, plan = _quantize_rows(xq, token_selected_experts.contiguous(), w, plan)
     # the shared fused-entry rules (the rows' alignment, the ids and weights, the output)
     T, H, k, experts, scales, out = _check_fused_inputs(
         "fused_moe_fp8bs",
@@ -812,7 +847,7 @@ def fused_moe_fp8bs(
         return out  # the empty output: no record is consulted
     if fuse_quant is None:
         fuse_quant = (
-            fused_quant_default(T, k, E, gated=w.gated) and block == QBLOCK
+            _k.fused_quant_default(T, k, E, gated=w.gated) and block == QBLOCK
             if config1 is None
             else False
         )  # the 32-wide class requantizes by the standalone pass
@@ -822,12 +857,11 @@ def fused_moe_fp8bs(
             "the fused requantization",
             "the standalone requantization pass (the fused spelling is the 128-wide class's)",
         )
-    chain1 = w.chain1(fuse_quant)
     if config1 is None or config2 is None:
         from ...gemm.batch_invariant.api import part_of
 
         sm_count, family = part_of(dev)
-        c1, c2 = default_configs_fp8bs(
+        c1, c2 = _k.default_configs_fp8bs(
             T,
             k,
             H,
@@ -842,32 +876,99 @@ def fused_moe_fp8bs(
             block=block,
         )
         config1, config2 = config1 or c1, config2 or c2
-    counts, dest, src = (
-        plan if plan is not None else permute_plan(experts, E)
-    )  # ``plan``: ``route_plan``'s outputs
-    Tk = T * k
-    # the packed row buffers (and their scale columns) carry TAIL_ROWS past Tk so every tile's TMA box stays in bounds (an
-    # out-of-bounds box is served far more slowly than the rows it zero-fills); the tail rows are never stored or read back
-    Tk_a = Tk + TAIL_ROWS if Tk else 0
     # GEMM1's gather form: a narrow swapped record reads the token rows and their scales through the plan's map itself (the
     # routed gather launch is not run); the box form (a grouped record, a wide token tile, or ``gather=False``) reads the
     # permuted copies -- the bf16 op's rule
     if gather is None:
-        gather = (
-            bool(config1.swap_ab)
-            and not fuse_quant
-            and config1.tile_n <= GATHER_TOKEN_TILE_MAX
-        )
+        gather = _gather_form(config1, fuse_quant)
     if gather and (not config1.swap_ab or fuse_quant):
         raise ValueError(
             "fused_moe_fp8bs: the gather form belongs to GEMM1's swapped records without the fused requantization"
         )
+    # the records' acceptance (the grouped entry's rule, for a caller's records)
+    for cfg, N, K, chain in (
+        (config1, w.w1.shape[1], H, w.chain1(fuse_quant)),
+        (config2, H, I, GEMM2_CHAIN),
+    ):
+        accepted = (
+            _k.can_implement_swapped_fp8bs(cfg, N, K, E, chain, None, block)
+            if cfg.swap_ab
+            else _k.can_implement_grouped_fp8bs(cfg, N, K, E, chain, None, block)
+        )
+        if not accepted:
+            raise ValueError(
+                f"fused_moe_fp8bs: {cfg.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, block={block})"
+            )
+    return _fused_moe_fp8bs_run(
+        xq, sx_kt, experts, scales, w, out, config1, config2, fuse_quant, gather, T, H, k, E, I,
+        plan=plan, return_intermediates=return_intermediates, w_round=w_round,
+    )  # fmt: skip
+
+
+def _quantize_rows(
+    x: torch.Tensor, experts: torch.Tensor, w: MoEWeightsE4M3BS, plan
+) -> Tuple[torch.Tensor, torch.Tensor, Any]:
+    """The bf16 rows quantized by the class: with the dense plan in one launch when the plan is this call's, by the standalone
+    quantizer when the plan is given (the routed form's route + plan). Returns ``(xq, sx, plan)``."""
+    if plan is None:
+        xq, sx, counts_q, dest_q, src_q = fp8_block_quantize_plan(
+            x, experts, w.num_experts, block=w.block
+        )
+        return xq, sx, (counts_q, dest_q, src_q)
+    xq, sx = fp8_block_quantize(x, "MN", block=w.block)
+    return xq, sx, plan
+
+
+def _gather_form(config1: Knobs, fuse_quant: bool) -> bool:
+    """GEMM1's gather form (the bf16 op's rule): a swapped record of a narrow token tile without the fused requantization."""
+    return (
+        bool(config1.swap_ab)
+        and not fuse_quant
+        and config1.tile_n <= GATHER_TOKEN_TILE_MAX
+    )
+
+
+def _fused_moe_fp8bs_run(
+    xq: torch.Tensor,
+    sx_kt: torch.Tensor,
+    experts: torch.Tensor,
+    scales: torch.Tensor,
+    w: MoEWeightsE4M3BS,
+    out: torch.Tensor,
+    config1: Knobs,
+    config2: Knobs,
+    fuse_quant: bool,
+    gather: bool,
+    T: int,
+    H: int,
+    k: int,
+    E: int,
+    I: int,
+    *,
+    plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    return_intermediates: bool = False,
+    w_round: bool = False,
+):
+    """:func:`fused_moe_fp8bs` on validated operands (``xq`` e4m3 ``[T, H]``, ``sx_kt`` its ``[H / block, T]`` scales as given)
+    with the records and the spelling chosen: the runner's launch (its pack proved every rule the public entry checks, so
+    nothing is checked twice per call) and the public entry's body."""
+    block = w.block
+    dev = xq.device
+    KB = H // block
+    chain1 = w.chain1(fuse_quant)
+    counts, dest, src = (
+        plan if plan is not None else _permute_plan_run(experts.reshape(-1), T, k, E, 1, False, 128)
+    )  # fmt: skip  # ``plan``: ``route_plan``'s outputs
+    Tk = T * k
+    # the packed row buffers (and their scale columns) carry TAIL_ROWS past Tk so every tile's TMA box stays in bounds (an
+    # out-of-bounds box is served far more slowly than the rows it zero-fills); the tail rows are never stored or read back
+    Tk_a = Tk + TAIL_ROWS if Tk else 0
     x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
     sx_perm = torch.empty(KB, Tk_a, dtype=torch.float32, device=dev)
     if Tk and (not gather or return_intermediates):
         # the e4m3 rows and their scale columns to the expanded rows in one launch (a copy)
-        get_compiled_gather_rows_scales(
-            k, warps_per_row(Tk, H // 16, sm_count_of(dev))
+        _k.get_compiled_gather_rows_scales(
+            k, _k.warps_per_row(Tk, H // 16, sm_count_of(dev))
         )(
             xq.view(torch.uint8),
             src.reshape(-1),
@@ -878,41 +979,44 @@ def fused_moe_fp8bs(
             H,
             KB,
         )
+    w1_3, w2_3 = w.w1.permute(1, 2, 0), w.w2.permute(1, 2, 0)
+    n1 = w.w1.shape[1]
+    body1 = chain1.at(block, None)
     a = None
     if fuse_quant:
-        aq, sa = grouped_gemm_fp8bs(
-            x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
-        )  # [Tk_a, I] e4m3 + [I / 128, Tk_a]
+        # [Tk_a, I] e4m3 + [I / 128, Tk_a]: the fused requantization's codes and scales
+        aq = torch.empty(Tk_a, I, dtype=torch.float8_e4m3fn, device=dev)
+        sa = torch.empty(I // QBLOCK, Tk_a, dtype=torch.float32, device=dev)
+        _grouped_fp8bs_launch(
+            x_perm, sx_perm.t(), w1_3, w.w1_sf, aq.view(torch.uint8), sa, counts, config1, body1,
+            True, Tk_a, E, n1,
+        )  # fmt: skip
     else:
+        a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
+        unread = w.w1_sf[0, :1, :1].reshape(
+            1, 1
+        )  # the scale output is unread: any fp32 (1, 1) tensor
         if gather:
-            a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
-            if Tk:
-                grouped_gemm_fp8bs(
-                    xq,
-                    sx_kt,
-                    w.w1,
-                    w.w1_sf,
-                    counts,
-                    config1,
-                    chain1,
-                    out=a,
-                    src=src.reshape(-1),
-                    k_div=k,
-                    rows_out=Tk_a,
-                )  # [Tk_a, I] bf16: the unpermuted rows through the plan's map
+            # [Tk_a, I] bf16: the unpermuted rows through the plan's map
+            _grouped_fp8bs_launch(
+                xq, sx_kt.t(), w1_3, w.w1_sf, a, unread, counts, config1, body1, False, Tk_a, E, n1,
+                src=src.reshape(-1), k_div=k,
+            )  # fmt: skip
         else:
-            a = grouped_gemm_fp8bs(
-                x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
-            )  # [Tk_a, I] bf16
+            _grouped_fp8bs_launch(
+                x_perm, sx_perm.t(), w1_3, w.w1_sf, a, unread, counts, config1, body1, False, Tk_a, E, n1,
+            )  # fmt: skip  # [Tk_a, I] bf16
         aq = torch.empty(Tk_a, I, dtype=torch.float8_e4m3fn, device=dev)
         sa = torch.empty(I // block, Tk_a, dtype=torch.float32, device=dev)
         if Tk:
             fp8_block_quantize(
                 a[:Tk], "MN", out=(aq[:Tk], sa[:, :Tk]), block=block
             )  # the live rows only
-    y = grouped_gemm_fp8bs(
-        aq, sa, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN
-    )  # [Tk_a, H] bf16
+    y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
+    _grouped_fp8bs_launch(
+        aq, sa.t(), w2_3, w.w2_sf, y, w.w2_sf[0, :1, :1].reshape(1, 1), counts, config2,
+        GEMM2_CHAIN.at(block, None), False, Tk_a, E, H,
+    )  # fmt: skip  # [Tk_a, H] bf16
     combine_rows(y[:Tk], dest, scales, out, k, w_round)
     if return_intermediates:
         # the live rows under the common keys; the tail-carrying buffers the kernels consume under ``*_buf`` (a kernel timed

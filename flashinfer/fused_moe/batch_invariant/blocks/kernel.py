@@ -122,11 +122,12 @@ class GroupedBlockGemm:
         out: cute.Tensor,
         counts: cute.Tensor,
         max_active_clusters: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """The entry of the chains without scale operands (the bf16 classes)."""
         assert not self.chain.operands and not self.operands.block_scaled, self.chain
-        self._launch(a, b, out, counts, max_active_clusters, stream)
+        self._launch(a, b, out, counts, max_active_clusters, raster_m, stream)
 
     @cute.jit
     def with_scales(
@@ -139,13 +140,23 @@ class GroupedBlockGemm:
         sa: cute.Tensor,
         si: cute.Tensor,
         max_active_clusters: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """The entry of the chains with scale operands (the fp8 per-tensor classes): ``alpha (E,)`` the per-expert weight
         scales, ``sa (1,)`` the A operand's scale, ``si (1,)`` the intermediate multiplier."""
         assert self.chain.scale_operands, self.chain
         self._launch(
-            a, b, out, counts, max_active_clusters, stream, alpha=alpha, sa=sa, si=si
+            a,
+            b,
+            out,
+            counts,
+            max_active_clusters,
+            raster_m,
+            stream,
+            alpha=alpha,
+            sa=sa,
+            si=si,
         )
 
     @cute.jit
@@ -160,6 +171,7 @@ class GroupedBlockGemm:
         alpha: cute.Tensor,
         pts: cute.Tensor,
         max_active_clusters: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """The entry of the block-scaled chains with the W4A4 row scale: ``sfa`` / ``sfb`` the flat 128x4 scale-factor buffers,
@@ -171,6 +183,7 @@ class GroupedBlockGemm:
             out,
             counts,
             max_active_clusters,
+            raster_m,
             stream,
             sfa=sfa,
             sfb=sfb,
@@ -190,6 +203,7 @@ class GroupedBlockGemm:
         counts: cute.Tensor,
         rows_sf: Int32,
         max_active_clusters: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """The entry of the block-scaled chains without further operands (the MX classes, MXFP8 and MXFP4: the e8m0 scales of both operands
@@ -206,6 +220,7 @@ class GroupedBlockGemm:
             out,
             counts,
             max_active_clusters,
+            raster_m,
             stream,
             sfa=sfa,
             sfb=sfb,
@@ -224,6 +239,7 @@ class GroupedBlockGemm:
         counts: cute.Tensor,
         rows_sf: Int32,
         max_active_clusters: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """The entry of the block-scaled chains without further operands whose epilogue quantizes (``chain.quant``: the MXFP8
@@ -239,6 +255,7 @@ class GroupedBlockGemm:
             out,
             counts,
             max_active_clusters,
+            raster_m,
             stream,
             sfa=sfa,
             sfb=sfb,
@@ -260,6 +277,7 @@ class GroupedBlockGemm:
         pts: cute.Tensor,
         aux: cute.Tensor,
         max_active_clusters: cutlass.Int32,
+        raster_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """The static class's chains: GEMM1 (``out_fmt == "nvfp4"``: ``out`` the packed codes uint8 ``[rows, I/2]``, ``out_sf`` the
@@ -272,6 +290,7 @@ class GroupedBlockGemm:
             out,
             counts,
             max_active_clusters,
+            raster_m,
             stream,
             sfa=sfa,
             sfb=sfb,
@@ -290,6 +309,7 @@ class GroupedBlockGemm:
         out,
         counts,
         max_active_clusters,
+        raster_m,
         stream,
         *,
         sfa=None,
@@ -381,6 +401,7 @@ class GroupedBlockGemm:
                 st.b_smem_layout_staged,
                 st.epi_tile,
                 self.c_smem_layout_staged,
+                raster_m,
                 alpha,
                 sa,
                 si,
@@ -418,6 +439,7 @@ class GroupedBlockGemm:
                 st.b_smem_layout_staged,
                 st.epi_tile,
                 self.c_smem_layout_staged,
+                raster_m,
                 alpha,
                 sa,
                 si,
@@ -448,6 +470,7 @@ class GroupedBlockGemm:
         b_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
         c_smem_layout_staged,
+        raster_m: cutlass.Int32,
         mAlpha: cute.Tensor = None,
         mSa: cute.Tensor = None,
         mSi: cute.Tensor = None,
@@ -766,7 +789,7 @@ class GroupedBlockGemm:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         cute.arch.barrier()  # the group tables are complete
 
-        raster_m = self.knobs.raster_along == "m"
+        # the raster order is the launch argument (one object serves both orders; the swapped body keeps its constant)
         tn, cn = st.mma_tiler[1], self.cluster_shape_mn[1]
         # --- roles
         if warp_idx == tma_warp:

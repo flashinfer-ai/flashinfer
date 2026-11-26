@@ -22,15 +22,47 @@ other packing recomputes the plan). An unsupported configuration raises
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from ...batch_invariant.support import unsupported
 from ..api import MoEActivationPack, MoEWeightPack
 from .api_mxfp8 import MOE_MXFP8_ARCHS, VIEW_PAIR
+from ...batch_invariant.support import LazyNames
 from .runner_fp8_block import PAIR_MXFP8, BatchInvariantFp8BlockRunner
 from .spec_mxfp8 import BLOCK, CLASS
+
+
+def _load_names() -> Dict[str, Any]:
+    from .api_mxfp8 import (
+        GROUP_ALIGN,
+        MoEWeightsMXFP8,
+        _fused_moe_mxfp8_run,
+        _mx_forms,
+        check_shape_mxfp8,
+        decode_form_default,
+    )
+    from .blocks.epilogue_mx import MxChain
+    from .schedule import TOP_K
+    from .schedule_mxfp8 import GEMM2_CHAIN, packing_for, ranked_mx
+
+    return dict(
+        GROUP_ALIGN=GROUP_ALIGN,
+        MoEWeightsMXFP8=MoEWeightsMXFP8,
+        check_shape_mxfp8=check_shape_mxfp8,
+        decode_form_default=decode_form_default,
+        fused_moe_mxfp8_run=_fused_moe_mxfp8_run,
+        mx_forms=_mx_forms,
+        MxChain=MxChain,
+        TOP_K=TOP_K,
+        GEMM2_CHAIN=GEMM2_CHAIN,
+        packing_for=packing_for,
+        ranked_mx=ranked_mx,
+    )
+
+
+_names = LazyNames(_load_names)
 
 
 class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
@@ -94,8 +126,6 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         the linear ``[T, H / 32]`` shape, taken as given (a flattened or swizzled buffer is refused, never reshaped into
         rows; the empty pack takes any empty scale tensor), both 16-byte aligned; and the class's shape rule on the
         configuration at this hidden size."""
-        from .api_mxfp8 import check_shape_mxfp8
-
         x = act.hidden_states_q
         if x.dtype != self.X_DTYPE or x.ndim != 2:
             raise unsupported(
@@ -133,7 +163,7 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
                 "16-byte aligned rows and scale bytes (the kernels' vector loads and TMA boxes)",
             )
         cfg = self.config
-        check_shape_mxfp8(
+        _names.check_shape_mxfp8(
             H, cfg.experts.intermediate_size, cfg.routing.num_experts, cfg.routing.top_k
         )
         return [x, sf]
@@ -142,14 +172,12 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         """The decode form's rule at this token count (`api_mxfp8.decode_form_default` at the first picks): GEMM1's gather
         record then builds the plan from the ids and stores the counts and the row map for GEMM2 and the combine (a tactic of
         another kind of record falls back to the plan computed by the op: the same integers)."""
-        from .api_mxfp8 import decode_form_default
-
         k, E_local = self.config.routing.top_k, self._local_experts()[1]
         r1, r2 = self._ranked(T, H)
         return bool(
             r1
             and r2
-            and decode_form_default(
+            and _names.decode_form_default(
                 T, k, E_local, H, r1[0], r2[0], path=self._packing(T, H)
             )
         )
@@ -157,34 +185,26 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
     def _plan_form(self, T: int, H: int) -> dict:
         """The fused route + plan launch in the form of the packing the ranked records run on at this token count: the
         dual plan (the dense rows with the padded scale positions) or the padded plan (whole 128-row atoms per group)."""
-        from .api_mxfp8 import GROUP_ALIGN
-
         if self._packing(T, H) == "dense":
-            return dict(dual=True, pad_align=GROUP_ALIGN)
-        return dict(align=GROUP_ALIGN)
+            return dict(dual=True, pad_align=_names.GROUP_ALIGN)
+        return dict(align=_names.GROUP_ALIGN)
 
     # ---- the weight view -------------------------------------------------------------------------------------------
     def _weights_from_view(self, view):
         """The view as the kernels consume it; a view without this pair's tag is refused by name (``from_view``)."""
-        from .api_mxfp8 import MoEWeightsMXFP8
-
-        return MoEWeightsMXFP8.from_view(view)
+        return _names.MoEWeightsMXFP8.from_view(view)
 
     def _weight_tensors(self, w) -> List[torch.Tensor]:
         return [w.w1, w.w1_sf, w.w2, w.w2_sf]
 
     def _weights_from_tensors(self, a, tensors: List[torch.Tensor]):
-        from .api_mxfp8 import MoEWeightsMXFP8
-
         w1, w1_sf, w2, w2_sf = tensors
-        return MoEWeightsMXFP8(w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params)
+        return _names.MoEWeightsMXFP8(w1, w1_sf, w2, w2_sf, a.gated, a.act, a.params)
 
     def _chain1(self, a):
         """GEMM1's chain for the dispatcher: the bf16-output chain of the layer's activation at the part's instruction
         class (the fused requantization's extra term is the same for every record)."""
-        from .blocks.epilogue_mx import MxChain
-
-        return MxChain(
+        return _names.MxChain(
             "glu" if a.gated else "act",
             a.act,
             "bf16",
@@ -193,73 +213,68 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         )
 
     def _chain2(self):
-        from .schedule_mxfp8 import GEMM2_CHAIN
-
-        return GEMM2_CHAIN.with_class(self._in_fmt or "mxfp8")
+        return _names.GEMM2_CHAIN.with_class(self._in_fmt or "mxfp8")
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int, H: Optional[int] = None) -> Tuple[list, list]:
-        """The ranked records of both GEMMs over both record spaces at ``T`` tokens (`schedule_mxfp8.ranked_mx`, memoised),
-        trimmed to the packing the first picks run on: on the padded packing the swapped records cannot run, so they leave
-        the lists."""
-        from .schedule import TOP_K
-        from .schedule_mxfp8 import packing_for, ranked_mx
-
+        """The ranked records of both GEMMs over both record spaces at ``T`` tokens (`schedule_mxfp8.ranked_mx`), trimmed
+        to the packing the first picks run on: on the padded packing the swapped records cannot run, so they leave the
+        lists. Memoised per (token count, hidden size) with the runner's picks (the plan form, the decode rule and the
+        pick all read it at every call)."""
+        H = H if H is not None else self._hidden
+        memo = self._memo()
+        key = ("ranked", T, H)
+        r = memo.get(key)
+        if r is not None:
+            return r
         cfg = self.config
         E, k, I = (
             cfg.routing.num_experts,
             cfg.routing.top_k,
             cfg.experts.intermediate_size,
         )
-        H = H if H is not None else self._hidden
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
         in_fmt = self._in_fmt or "mxfp8"
-        r1, r2 = ranked_mx(
-            T, k, H, I, E, self._chain1(a), in_fmt, sm_count, family, TOP_K
+        r1, r2 = _names.ranked_mx(
+            T, k, H, I, E, self._chain1(a), in_fmt, sm_count, family, _names.TOP_K
         )
-        if packing_for(r1[0], r2[0]) == "padded":
+        if _names.packing_for(r1[0], r2[0]) == "padded":
             r1 = [c for c in r1 if not c.swap_ab]
             r2 = [c for c in r2 if not c.swap_ab]
+        memo[key] = (r1, r2)
         return r1, r2
 
     def _packing(self, T: int, H: int) -> str:
         """The packing of the expanded rows at ``T`` tokens: the first picks' (`schedule_mxfp8.packing_for`)."""
-        from .schedule_mxfp8 import packing_for
-
         r1, r2 = self._ranked(T, H)
-        return packing_for(r1[0], r2[0])
+        return _names.packing_for(r1[0], r2[0])
 
     def _cache_key_extras(self) -> tuple:
         return super()._cache_key_extras() + (self._in_fmt or "",)
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def _launch(self, x, ids, wts, w, out, c1, c2, plan, inputs):
-        from .api_mxfp8 import fused_moe_mxfp8
-        from .schedule_mxfp8 import packing_for
-
+        """The op on the validated pack with the records of the pick or the tactic: the packing is the records' own (a
+        swapped record reads the dense packing, the padded body reads either); the layer keys a tuned winner by its token
+        bucket, so a tactic may replay at a token count whose first picks pack the other way -- the plan packed in the
+        first picks' form is kept where the records read it (the dual plan feeds both bodies) and dropped otherwise (the op
+        computes its own: the same integers, the same bits); GEMM1's form (the gather record, the in-kernel plan) follows
+        the op's rules at these records."""
         xq, xsf = x
-        # the packing is the records' own (a swapped record reads the dense packing, the padded body reads either): the
-        # layer keys a tuned winner by its token bucket, so a tactic may replay at a token count whose first picks pack
-        # the other way; the plan packed in the first picks' form is kept where the records read it (the dual plan feeds
-        # both bodies) and dropped otherwise (the op computes its own: the same integers, the same bits)
-        path = packing_for(c1, c2)
+        T, H = xq.shape
+        if T == 0:
+            return out  # no tokens: nothing to route, the (0, H) output as it stands
+        k, E, I = ids.shape[1], w.num_experts, w.intermediate_size
+        path = _names.packing_for(c1, c2)
         if plan is not None:
             if len(plan) == 5:
                 path = "dense"
             elif path == "dense":
                 plan = None
-        fused_moe_mxfp8(
-            (xq, xsf),
-            ids,
-            wts,
-            w,
-            out=out,
-            config1=c1,
-            config2=c2,
-            in_fmt=self._in_fmt,
-            plan=plan,
-            path=path,
-            w_round=getattr(inputs, "w_round", False),
-        )
+        c1, in_kernel = _names.mx_forms(c1, c2, T, k, E, H, path, plan is not None)
+        _names.fused_moe_mxfp8_run(
+            xq, xsf, ids, wts, w, out, c1, c2, self._in_fmt or "mxfp8", path, "fused", in_kernel, T, H, k, E, I,
+            plan=plan, w_round=getattr(inputs, "w_round", False),
+        )  # fmt: skip
         return out

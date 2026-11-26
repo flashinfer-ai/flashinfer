@@ -3298,3 +3298,188 @@ def test_f32_prerouted_weights_round_in_the_combine_kernel():
     a = fused_moe(x, ids.cuda(), weights.cuda(), Wm, w_round=True)
     b = fused_moe(x, ids.cuda(), w16.float().cuda(), Wm)
     assert torch.equal(bits(a), bits(b))
+
+
+def test_pick_memos_and_launch_handles_follow_the_rankings():
+    """The runners' memoised picks, every MoE ranking memo and the launch-handle cache follow the dispatcher's rank cache:
+    a clear of the rankings (a device's registered numbers, ``rank.cache_clear()``) bumps the pick generation, empties the
+    ranking memos of every class dispatcher and forgets the handles; ``clear_kernel_cache`` is the handles' own clear."""
+    import importlib
+
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import runner as R
+    from flashinfer.fused_moe.batch_invariant import schedule as S_
+    from flashinfer.gemm.batch_invariant import heuristic as H
+
+    g = R.pick_generation()
+    S_.rank_grouped(7, 1536, 2048, 128, "swiglu", 212, "sm_107", 3, n_active=56)
+    assert S_._rank_grouped.cache_info().currsize >= 1
+    api._HANDLES[("probe",)] = None
+    api.clear_kernel_cache()
+    assert not api._HANDLES
+    api._HANDLES[("probe",)] = None
+    H.rank.cache_clear()
+    assert R.pick_generation() == g + 1
+    assert S_._rank_grouped.cache_info().currsize == 0
+    assert not api._HANDLES
+    for mod, fn in (
+        ("schedule_fp4", "_rank_grouped_fp4"),
+        ("schedule_fp8bs", "_rank_grouped_fp8bs"),
+        ("schedule_mxfp8", "_rank_grouped_mx"),
+        ("schedule_mxfp4w8a", "_rank_grouped_mx"),
+    ):
+        m = importlib.import_module(f"flashinfer.fused_moe.batch_invariant.{mod}")
+        assert getattr(m, fn).cache_clear in H._RANK_DEPENDENT_CACHES, mod
+
+
+def test_lazy_names_resolve_once_and_keep_the_light_import():
+    """``LazyNames`` binds every name of its loader at the first access and serves attributes afterwards; the loaders of
+    the runners name the kernel modules, which the package's import leaves unloaded until a kernel is first needed."""
+    from flashinfer.batch_invariant.support import LazyNames
+
+    loads = []
+
+    def load():
+        loads.append(1)
+        return dict(a=1, b=2)
+
+    names = LazyNames(load)
+    assert names.b == 2 and names.a == 1 and loads == [1]
+    assert "a" in vars(names) and "b" in vars(names)
+    assert not hasattr(names, "c")
+
+
+@needs_device
+def test_forward_memoises_the_pick_and_the_launch_handles():
+    """A forward after the first at a shape ranks nothing and fetches no compiled object: the runner's pick is memoised per
+    (token count, hidden size), the activation term is derived once, the two GEMM launches take cached handles keyed by
+    the indexed device, the record and the chain, and the memos empty with the rankings; the bits are the same throughout."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.runner import pick_generation
+    from flashinfer.gemm.batch_invariant.heuristic import rank
+
+    T, k, H, I, E = 5, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    runner = layer.runners[0]
+    assert isinstance(runner, BatchInvariantMoeRunner)
+    pack = _logits_pack(x, logits)
+    ref = bits(layer(pack, W))
+    assert runner._act is not None and runner._activation() is runner._act
+    api.clear_kernel_cache()
+    runner._picks.clear()
+    calls = []
+    orig = runner._ranked
+
+    def counted(*args, **kw):
+        calls.append(1)
+        return orig(*args, **kw)
+
+    runner._ranked = counted  # type: ignore[method-assign]
+    try:
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 1 and (T, H) in runner._picks
+        handles = dict(api._HANDLES)
+        assert len(handles) >= 2
+        dev = torch.cuda.current_device()
+        assert all(key[0] == dev for key in handles)
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 1 and handles == api._HANDLES
+        rank.cache_clear()  # the rankings' clear takes the handles with it and retires the picks (dropped at the next pick)
+        assert not api._HANDLES and runner._picks_gen != pick_generation()
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 2 and api._HANDLES.keys() == handles.keys()
+    finally:
+        del runner._ranked
+    # the public op on the same records gives the same bits as the runner's launch on the validated pack
+    ids, wts = api.route(logits.cuda(), k, runner._method)
+    c1, c2 = runner._pick(T)
+    out = api.fused_moe(
+        x.cuda(),
+        ids,
+        wts,
+        api.MoEWeights.from_view(W.get_view(runner.backend_key)),
+        config1=c1,
+        config2=c2,
+    )
+    assert torch.equal(bits(out), ref)
+
+
+def test_grouped_raster_argument_is_validated_and_names_one_object():
+    """The grouped body's raster order is a launch argument: the two raster placements of a record name one compiled object
+    (``kernel_name`` without the raster and grid tokens: ``Knobs.describe_object`` of the object record), ``object_record``
+    keeps every other knob, and a raster value outside the record space is a host error before any launch; the swapped
+    records keep the raster in their object name (one raster, no twin)."""
+    import dataclasses
+    import re
+
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    rm = Knobs((128, 128), (1, 2), False, True, "m", 1)
+    rn = dataclasses.replace(rm, raster_along="n")
+    assert C.object_record(rm) == C.object_record(rn) == rm
+    assert C.object_record(dataclasses.replace(rn, grid_clusters=7)) == rm
+    for chain in ("swiglu", "plain", "relu2"):
+        a, b = C.kernel_name(rm, chain), C.kernel_name(rn, chain)
+        assert a == b and re.search(r"_r[mn](_|$)|_g\d", a) is None, a
+        assert a.startswith("grouped_bf16_") and "_mma128x128_cl1x2_1cta_tma" in a
+    other = dataclasses.replace(rm, mma_tiler_mn=(128, 256))
+    assert C.kernel_name(other, "plain") != C.kernel_name(rm, "plain")
+    assert C.raster_arg(rm) == 1 and C.raster_arg(rn) == 0
+    with pytest.raises(ValueError, match="raster"):
+        C.raster_arg(dataclasses.replace(rm, raster_along="k"))
+    sw = Knobs((128, 16), (1, 1), False, True, "m", 1, swap_ab=True)
+    assert "_rm_" in C.swapped_kernel_name(sw, "plain")
+
+
+@needs_device
+def test_raster_placements_share_one_compiled_object_and_the_bits():
+    """The two raster placements of a grouped record launch ONE compiled object (one ``jit.build_and_load`` name without the
+    raster token) with bit-identical outputs, through the grouped GEMM entry and through the fused op with the twins as
+    GEMM1's and GEMM2's records; a swapped record's object is its own."""
+    import dataclasses
+    import re
+
+    import flashinfer.batch_invariant.jit as J
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.blocks import compile as C
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    names = []
+    orig = J.build_and_load
+
+    def recording(module, kernel, compile_fn):
+        names.append(kernel)
+        return orig(module, kernel, compile_fn)
+
+    J.build_and_load = recording
+    try:
+        C._compiled_grouped.cache_clear()
+        api.clear_kernel_cache()
+        T, k, H, I, E = 300, 4, 256, 128, 16
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=91, adversarial=True)
+        w = api.MoEWeights.prepare(w1, w2)
+        ids, wts = api.route(logits, k)
+        base = Knobs((128, 128), (1, 2), False, True, "m", 1)
+        twin = dataclasses.replace(base, raster_along="n")
+        assert C.get_compiled_grouped(base, w.chain1) is C.get_compiled_grouped(
+            twin, w.chain1
+        )
+        ref = bits(api.fused_moe(x, ids, wts, w, config1=base, config2=base))
+        for c1, c2 in ((twin, base), (base, twin), (twin, twin)):
+            assert torch.equal(
+                bits(api.fused_moe(x, ids, wts, w, config1=c1, config2=c2)), ref
+            ), (c1.describe(), c2.describe())
+        counts, dest, src = api.permute_plan(ids, E)
+        x_perm = api.gather_rows(x, src, k, T * k, 0, "bf16")[1]
+        a_m = api.grouped_gemm(x_perm, w.w1i, counts, base, w.chain1)
+        a_n = api.grouped_gemm(x_perm, w.w1i, counts, twin, w.chain1)
+        assert torch.equal(bits(a_m), bits(a_n))
+        grouped = [n for n in names if n.startswith("grouped_bf16_")]
+        assert len(set(grouped)) == 2 and all(
+            re.search(r"_r[mn](_|$)", n) is None for n in grouped
+        ), names
+    finally:
+        J.build_and_load = orig

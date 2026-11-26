@@ -27,6 +27,7 @@ import math
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
+from ...gemm.batch_invariant.heuristic import on_rank_cache_clear
 
 if TYPE_CHECKING:
     from .blocks.epilogue import GroupedEpilogueBlock
@@ -578,6 +579,11 @@ def _rank_grouped(
             out.append(rec)
             seen.add(rec)
     return tuple(out[:k])
+
+
+on_rank_cache_clear(
+    _rank_grouped.cache_clear
+)  # the memo follows the dispatcher's rankings (a device's registered numbers)
 
 
 def default_configs(

@@ -711,7 +711,7 @@ def plan_threads(n: int) -> int:
 def get_compiled_histogram() -> Any:
     """``kernel(experts [T k] i32, counts [E] i32 (zeroed by the caller, accumulated), n, E)``."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_n, sym_e = cute.sym_int(32), cute.sym_int(32)
         e_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
@@ -724,6 +724,7 @@ def get_compiled_histogram() -> Any:
             Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, "moe_histogram", compile_fn)
@@ -733,7 +734,7 @@ def get_compiled_histogram() -> Any:
 def get_compiled_positions(align: int = 1) -> Any:
     """``kernel(experts [T k] i32, counts [E] i32, dest [T k] i32, src [rows] i32, n, E)``."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_n, sym_e, sym_p = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
         e_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
@@ -750,6 +751,7 @@ def get_compiled_positions(align: int = 1) -> Any:
             Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(
@@ -764,7 +766,7 @@ def get_compiled_plan(
     """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k], src [Tk(_pad)], dest_pad [T k], pos_pad [T k], n, E)``;
     without ``dual`` pass any two int32 tensors for the last two."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_n, sym_e, sym_p = cute.sym_int(32), cute.sym_int(32), cute.sym_int(32)
         e_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
@@ -785,6 +787,7 @@ def get_compiled_plan(
             Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(
@@ -800,7 +803,7 @@ def get_compiled_plan_multi(
     hist_blk [nb E] i32 (scratch), n, E, nb)`` with ``nb = ceil(n / PLAN_BLOCK)``: the two-launch plan of large batches
     (same outputs as ``get_compiled_plan``)."""
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_n, sym_e, sym_p, sym_h = (
             cute.sym_int(32),
             cute.sym_int(32),
@@ -829,6 +832,7 @@ def get_compiled_plan_multi(
             Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(
@@ -843,7 +847,7 @@ def get_compiled_gather(k: int, in_fmt: str = "bf16", wpr: int = 1) -> Any:
     dt = get_cutlass_dtype(in_fmt)
     vec = 128 // dt.width
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_t, sym_tk, sym_h = (
             cute.sym_int(32),
             cute.sym_int(32),
@@ -866,6 +870,7 @@ def get_compiled_gather(k: int, in_fmt: str = "bf16", wpr: int = 1) -> Any:
             Int32(vec),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(

@@ -354,7 +354,7 @@ def get_compiled_route(
     in_dt = get_cutlass_dtype(in_fmt)
     name = route_kernel_name(Ep, k, method.name, in_fmt)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_t, sym_e = cute.sym_int(32), cute.sym_int(32)
         l_fake = cute.runtime.make_fake_tensor(
             in_dt, (sym_t, sym_e), (cute.sym_int64(), 1), assumed_align=4
@@ -379,6 +379,7 @@ def get_compiled_route(
             Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load("batch_invariant_moe", name, compile_fn)

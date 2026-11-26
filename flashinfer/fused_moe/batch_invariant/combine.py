@@ -188,7 +188,7 @@ def get_compiled_combine(
     ``w_round``: the weights enter as their bf16 rounding (the pre-routed packed-word convention)."""
     y_dt, o_dt = get_cutlass_dtype(y_fmt), get_cutlass_dtype(out_fmt)
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_t, sym_tk, sym_h = (
             cute.sym_int(32),
             cute.sym_int(32),
@@ -217,6 +217,7 @@ def get_compiled_combine(
             Int32(8),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(

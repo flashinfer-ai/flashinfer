@@ -249,22 +249,26 @@ class GroupScheduler:
         )
 
     # -- loop-carried protocol: the smem tables and static knobs come from the enclosing scope
+    def _carried(self):
+        """The loop-carried values: the counts, the raster order too when it is a launch argument (the grouped bodies)."""
+        vals = [self.E, self.n_tiles, self.total, self.stride, self.linear]
+        if not isinstance(self.raster_m, bool):
+            vals.append(self.raster_m)
+        return vals
+
     def __extract_mlir_values__(self):
         vals = []
-        for v in (self.E, self.n_tiles, self.total, self.stride, self.linear):
+        for v in self._carried():
             vals.extend(extract_mlir_values(v))
         return vals
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 5, len(values)
-        E, n_tiles, total, stride, linear = [
-            new_from_mlir_values(a, [v])
-            for a, v in zip(
-                (self.E, self.n_tiles, self.total, self.stride, self.linear),
-                values,
-                strict=True,
-            )
+        carried = self._carried()
+        assert len(values) == len(carried), (len(values), len(carried))
+        E, n_tiles, total, stride, linear, *rest = [
+            new_from_mlir_values(a, [v]) for a, v in zip(carried, values, strict=True)
         ]
+        raster_m = rest[0] if rest else self.raster_m
         return GroupScheduler(
             self.s_off,
             self.s_pre,
@@ -278,9 +282,34 @@ class GroupScheduler:
             self.cn,
             self.cta_m_in_cluster,
             self.cta_n_in_cluster,
-            self.raster_m,
+            raster_m,
             self.branchless,
         )
+
+    @cute.jit
+    def _blocks(self, local, mb):
+        """``(m_block, n_block)`` of a group-local tile index: m-blocks fastest when rastering along m (``local`` split by
+        the group's row blocks ``mb``), n-tiles fastest otherwise. A constant raster order (the swapped bodies) is a
+        trace-time branch; a launch-argument order (the grouped bodies) is one divmod by the selected count and two
+        selects (the same integers)."""
+        m_block = Int32(0)
+        n_block = Int32(0)
+        if cutlass.const_expr(isinstance(self.raster_m, bool)):
+            if cutlass.const_expr(self.raster_m):
+                m_block = local % mb
+                n_block = local // mb
+            else:
+                n_block = local % self.n_tiles
+                m_block = local // self.n_tiles
+        else:
+            rm = self.raster_m
+            nm = Int32(1) - rm
+            div = rm * mb + nm * self.n_tiles
+            q = local // div
+            r = local % div
+            m_block = rm * r + nm * q
+            n_block = rm * q + nm * r
+        return m_block, n_block
 
     @staticmethod
     @cute.jit
@@ -293,14 +322,15 @@ class GroupScheduler:
         cluster_rows: cutlass.Constexpr,
         tn: cutlass.Constexpr,
         cn: cutlass.Constexpr,
-        raster_m: cutlass.Constexpr,
+        raster_m,
         cta_m_in_cluster,
         cta_n_in_cluster,
         branchless: cutlass.Constexpr = False,
     ):
         """After ``build_group_tables`` and a CTA barrier. The linear index starts at the cluster's index in the grid and
         advances by the number of clusters. ``counts`` (global) gives the group's real end for the store mask (``s_off``
-        may be padded). ``branchless``: the promoted bodies' decode placement (the same integers)."""
+        may be padded). ``raster_m``: a Python bool (the swapped bodies' constant) or an ``Int32`` launch argument (the
+        grouped bodies: 1 rasters along m). ``branchless``: the promoted bodies' decode placement (the same integers)."""
         n_tiles = (N + Int32(tn * cn - 1)) // Int32(tn * cn)
         total = s_pre[MAX_E] * n_tiles
         cid = cute.arch.cluster_idx()
@@ -346,14 +376,7 @@ class GroupScheduler:
             e = lo
             local = L - self.s_pre[e] * self.n_tiles
             mb = cutlass.max(self.s_pre[e + Int32(1)] - self.s_pre[e], Int32(1))
-            m_block = Int32(0)
-            n_block = Int32(0)
-            if cutlass.const_expr(self.raster_m):
-                m_block = local % mb
-                n_block = local // mb
-            else:
-                n_block = local % self.n_tiles
-                m_block = local // self.n_tiles
+            m_block, n_block = self._blocks(local, mb)
             row0 = self.s_off[e] + m_block * Int32(self.cluster_rows)
             row_end = self.s_off[e] + self.counts[e]
             n_tile = n_block * Int32(self.cn) + self.cta_n_in_cluster
@@ -379,14 +402,7 @@ class GroupScheduler:
                 e = lo
                 local = L - self.s_pre[e] * self.n_tiles
                 mb = self.s_pre[e + Int32(1)] - self.s_pre[e]
-                m_block = Int32(0)
-                n_block = Int32(0)
-                if cutlass.const_expr(self.raster_m):
-                    m_block = local % mb
-                    n_block = local // mb
-                else:
-                    n_block = local % self.n_tiles
-                    m_block = local // self.n_tiles
+                m_block, n_block = self._blocks(local, mb)
                 row0 = self.s_off[e] + m_block * Int32(self.cluster_rows)
                 row_end = (
                     self.s_off[e] + self.counts[e]

@@ -377,7 +377,7 @@ def _compile_bucket(dtype_str: str, Kbp: int, cfg: QuantConfig, enable_pdl: bool
         f"moe_quant_pertoken_rowmap_{dtype_str}_kbp{Kbp}_{cfg.describe()}_pdl{int(enable_pdl)}"
     )
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_m, sym_k, sym_k2, sym_n, sym_m2, sym_r = (
             cute.sym_int(64),
             cute.sym_int(32),
@@ -413,6 +413,7 @@ def _compile_bucket(dtype_str: str, Kbp: int, cfg: QuantConfig, enable_pdl: bool
             enable_pdl,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)
@@ -437,7 +438,7 @@ def _compile_scatter_bucket(
         f"moe_quant_pertoken_scatter_{dtype_str}_kbp{Kbp}_k{k}_{cfg.describe()}_pdl{int(enable_pdl)}"
     )
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_m, sym_k, sym_k2, sym_n, sym_m2, sym_r, sym_p = (
             cute.sym_int(64),
             cute.sym_int(32),
@@ -479,6 +480,7 @@ def _compile_scatter_bucket(
             enable_pdl,
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)

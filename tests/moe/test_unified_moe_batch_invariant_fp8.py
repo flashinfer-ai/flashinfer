@@ -559,7 +559,10 @@ def test_one_body_per_form_serves_both_formats():
     with pytest.raises(AssertionError):
         SwappedGroupedGemm(swapped_knobs("e4m3")[0], fp8, gather=True)
     # the object names carry the format; one JIT module, no format-specific body in its closure
-    assert C.kernel_name(dense, bf16) == "grouped_bf16_swiglu_bf16_" + dense.describe()
+    assert (
+        C.kernel_name(dense, bf16)
+        == "grouped_bf16_swiglu_bf16_" + dense.describe_object()
+    )
     assert C.kernel_name(dense, fp8).startswith("grouped_e4m3_glu_silu_w8a8_e4m3_")
     assert C.swapped_kernel_name(swapped_knobs("e4m3")[0], GEMM2_CHAIN).startswith(
         "swapped_e4m3_plain_silu_w8a8_bf16_"
@@ -2249,3 +2252,47 @@ def test_plausible_against_flashinfers_fp8_torch_reference(act):
     )
     with pytest.raises(Exception, match="Mismatch percentage"):
         check_accuracy(out, wrong, atol=0.05, rtol=0.3, percent=0.99)
+
+
+@needs_device
+def test_forward_memoises_the_pick_and_the_launch_handles():
+    """A forward after the first at a shape ranks nothing and fetches no compiled object (the runner's memoised pick, the
+    cached launch handles of the two fp8 GEMMs), and the public op on the same records gives the runner's bits."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import (
+        MoEWeightsE4M3,
+        fused_moe_fp8,
+    )
+
+    T, k, H, I, E = 5, 4, 256, 128, 16
+    x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=77)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2, m_x)
+    runner = layer.runners[0]
+    xq = _xq(x, m_x)
+    pack = _logits_pack(xq, logits)
+    ref = bits(layer(pack, W))
+    api.clear_kernel_cache()
+    runner._picks.clear()
+    calls = []
+    orig = runner._ranked
+
+    def counted(*args, **kw):
+        calls.append(1)
+        return orig(*args, **kw)
+
+    runner._ranked = counted  # type: ignore[method-assign]
+    try:
+        assert torch.equal(bits(layer(pack, W)), ref)
+        handles = dict(api._HANDLES)
+        assert len(calls) == 1 and len(handles) >= 2
+        assert torch.equal(bits(layer(pack, W)), ref)
+        assert len(calls) == 1 and handles == api._HANDLES
+    finally:
+        del runner._ranked
+    ids, wts = api.route(logits, k, runner._method)
+    c1, c2 = runner._pick(T)
+    w = MoEWeightsE4M3.from_view(W.get_view(runner.backend_key))
+    assert torch.equal(
+        bits(fused_moe_fp8(xq, ids, wts, w, config1=c1, config2=c2)), ref
+    )
