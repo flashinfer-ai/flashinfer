@@ -330,6 +330,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             "quant_kind": str,
             "combine_format": CombineFormat,
             "gate_up_clamp": Optional[float],
+            # SiTU's betas (None: SwiGLU), which the epilogue compiles in.
+            "situ_beta": OptionalRequirement(Optional[float]),
+            "situ_linear_beta": OptionalRequirement(Optional[float]),
             "world_size": int,
             "topk": int,
             "topk_index_dtype": type,
@@ -437,6 +440,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.acc_dtype = tcgen05_block_scaled_acc_dtype
         self.combine_format = problem_desc["combine_format"]
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
+        self.situ_beta = problem_desc.get("situ_beta")
+        self.situ_linear_beta = problem_desc.get("situ_linear_beta")
         self.world_size = problem_desc["world_size"]
         self.topk = problem_desc["topk"]
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
@@ -1513,6 +1518,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
             f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}x{self.refine_output_stages}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
+            f"{'' if self.situ_beta is None else f'situ{float(self.situ_beta)}x{float(self.situ_linear_beta)}_'}"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_reduce' if self.reduce_topk_in_kernel else 'separate_reduce'}_"
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}_"

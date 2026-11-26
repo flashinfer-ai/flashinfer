@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional
 
 KERNEL_NAME = "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided"
 
@@ -15,8 +15,8 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
 
     Runs on SM100 (B200) and SM103 (B300) devices.
 
-    One compiled call launches the EP dispatch, the fused FC1 / SwiGLU / MXFP8
-    requantization / FC2 kernel with its combine pushes, and the top-k reduce,
+    One compiled call launches the EP dispatch, the fused FC1 / gated activation /
+    MXFP8 requantization / FC2 kernel with its combine pushes, and the top-k reduce,
     over PyTorch symmetric memory on the EP process group. Activations and
     weights carry UE8M0 scales per 32 values. The dispatch is a Sentinel
     (data-as-flag) protocol up to 128 tokens per rank and a counter protocol
@@ -29,13 +29,23 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     so ``top_k`` must be at most 32. The engine's tiling and shared-memory
     limits are checked when the layer is constructed.
 
-    ``intermediate_size`` is the width after SwiGLU; FC1 produces
+    ``intermediate_size`` is the width after the gated activation; FC1 produces
     ``2 * intermediate_size`` columns (gate rows first, then up rows, in the
     canonical ``w13`` layout).
 
+    ``activation`` is the routed experts' gated activation, in FP32 on the FC1
+    accumulator: ``"swiglu"``, ``gate * sigmoid(gate) * up``, or ``"situ"``
+    (Kimi-K3), ``beta * tanh(gate / beta) * sigmoid(gate) * linear_beta *
+    tanh(up / linear_beta)`` with ``beta = situ_beta`` and ``linear_beta =
+    situ_linear_beta`` (Kimi-K3: 4 and 25). SiTU requires both betas, positive
+    and finite, and SwiGLU takes neither. The betas are compiled into the
+    kernel, so layers that differ in activation or betas build separate
+    engines and workspaces.
+
     ``gate_up_clamp`` clamps the gate from above and the up projection on both
     sides before SwiGLU; ``activation_clamp`` is the same clamp under its
-    DeepGEMM name. Setting both requires equal values.
+    DeepGEMM name. Setting both requires equal values. SiTU takes no clamp (its
+    tanh bounds both factors), so it rejects both fields.
 
     ``knobs`` overrides the engine geometry, schedule and protocols that
     ``nvlink_one_sided_tiling`` derives from the capacity, EP size and routing shape.
@@ -82,14 +92,17 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     the counter dispatch's window before the first routed tile, the engine takes
     that dispatch over the pull (``nvlink_one_sided_tiling``; knobs may pin either).
     ``shared_gate_up_clamp`` is its own SwiGLU clamp (``None``: none; the
-    routed ``gate_up_clamp`` never applies to it). ``shared_bf16_rounding``
+    routed ``gate_up_clamp`` never applies to it). The shared expert runs
+    SwiGLU only, so ``activation="situ"`` rejects ``shared_expert`` and with it
+    ``shared_gate_up_clamp``; Kimi-K3's shared expert runs on the full hidden
+    state, outside its routed experts' latent MoE. ``shared_bf16_rounding``
     rounds its gate, up and SwiGLU product to BF16 and the routes' FP32 sum to
     BF16 before its output joins it, the order of a BF16 shared expert added to
     a BF16 routed output; it changes the output and is opt-in, and the in-kernel
     top-k reduce, which adds in arrival order, cannot round that way.
 
     ``routing_weights_after_fc2`` applies each route's routing weight to its FC2
-    output in FP32 instead of to its SwiGLU output before the MXFP8
+    output in FP32 instead of to its activation output before the MXFP8
     requantization: the top-k reduce multiplies each route's BF16 partial by its
     weight as it sums them (the order of a reference that weights the BF16 FC2
     rows in the sum), and under ``reduce_topk_in_kernel`` the FC2 epilogue
@@ -103,6 +116,9 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     kernel_name: str = KERNEL_NAME
     gate_up_clamp: Optional[float] = None
     activation_clamp: Optional[float] = None
+    activation: Literal["swiglu", "situ"] = field(default="swiglu", kw_only=True)
+    situ_beta: Optional[float] = field(default=None, kw_only=True)
+    situ_linear_beta: Optional[float] = field(default=None, kw_only=True)
     knobs: Optional[dict[str, Any]] = None
     die_local_weights: Optional[bool] = None
     reduce_topk_in_kernel: bool = False
@@ -130,6 +146,37 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
                 "gate_up_clamp and activation_clamp name the same clamp; "
                 f"got {self.gate_up_clamp} and {self.activation_clamp}"
             )
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'situ', got {self.activation!r}"
+            )
+        betas = ("situ_beta", "situ_linear_beta")
+        if self.activation == "situ":
+            for name in betas:
+                value = getattr(self, name)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value <= 0
+                ):
+                    raise ValueError(
+                        f"activation='situ' needs {name} positive and finite, got {value!r}"
+                    )
+                # The engine's descriptors take the betas as floats.
+                setattr(self, name, float(value))
+            if self.resolved_gate_up_clamp is not None:
+                raise ValueError(
+                    "activation='situ' takes no clamp; gate_up_clamp and "
+                    "activation_clamp apply to SwiGLU only"
+                )
+            if self.shared_expert is not None:
+                raise ValueError(
+                    "the fused shared expert runs SwiGLU only; activation='situ' "
+                    "rejects shared_expert (run the shared expert outside the layer)"
+                )
+        elif any(getattr(self, name) is not None for name in betas):
+            raise ValueError("situ_beta and situ_linear_beta need activation='situ'")
         if self.die_local_weights is not None and not isinstance(
             self.die_local_weights, bool
         ):

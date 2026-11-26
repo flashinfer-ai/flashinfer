@@ -3,9 +3,10 @@
 ``sm103_mxfp8_mxfp4_bf16_nvlink_one_sided`` without a GPU and without
 importing the CuTe DSL: registration and exports, config and knob validation,
 the shapes and devices ``validate_init`` rejects, the CUDA graph capture guard,
-the shared expert's config and weights, and the host mirror of the main
-kernel's token tile choice. The engine path each capacity resolves to is
-asserted by the layer-vs-oracle cases in
+the activation (SwiGLU or SiTU) and its engine configs, the shared expert's
+config and weights, and the host mirror of the main kernel's token tile
+choice. The engine path each capacity resolves to is asserted by the
+layer-vs-oracle cases in
 ``tests/moe_ep/test_moe_ep_nvlink_one_sided_megamoe_multirank.py``.
 """
 
@@ -51,6 +52,8 @@ NO_JIT = {"just_in_time_claims": False}
 NO_HEAD = {"shared_expert_entry": False}
 DIE_LOCAL = {"die_local_weights": True}
 IN_KERNEL = {"reduce_topk_in_kernel": True}
+# Kimi-K3's SiTU betas.
+SITU = {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0}
 
 
 def _config(**fields):
@@ -113,6 +116,24 @@ def test_registration_and_exports():
             {**SHARED, "shared_bf16_rounding": True, "reduce_topk_in_kernel": True},
             "reduce_topk_in_kernel",
         ),
+        # SiTU takes both betas, positive and finite real numbers, and no clamp;
+        # SwiGLU takes neither beta; the shared expert runs SwiGLU only.
+        ({"activation": "gelu"}, "activation must be 'swiglu' or 'situ'"),
+        ({"activation": "situ"}, "needs situ_beta positive"),
+        ({**SITU, "situ_linear_beta": None}, "needs situ_linear_beta positive"),
+        ({**SITU, "situ_beta": 0.0}, "needs situ_beta positive"),
+        ({**SITU, "situ_linear_beta": -25.0}, "needs situ_linear_beta positive"),
+        ({**SITU, "situ_beta": float("inf")}, "needs situ_beta positive"),
+        ({**SITU, "situ_beta": float("nan")}, "needs situ_beta positive"),
+        ({**SITU, "situ_beta": True}, "needs situ_beta positive"),
+        ({**SITU, "situ_linear_beta": "25"}, "needs situ_linear_beta positive"),
+        ({"situ_beta": 4.0, "situ_linear_beta": 25.0}, "need activation='situ'"),
+        ({"situ_linear_beta": 25.0}, "need activation='situ'"),
+        ({**SITU, "gate_up_clamp": CLAMP}, "takes no clamp"),
+        ({**SITU, "activation_clamp": CLAMP}, "takes no clamp"),
+        ({**SITU, **SHARED}, "shared expert runs SwiGLU only"),
+        ({**SITU, **SHARED, "shared_gate_up_clamp": CLAMP}, "SwiGLU only"),
+        ({**SITU, "shared_gate_up_clamp": CLAMP}, "need shared_expert"),
     ],
 )
 def test_config_validation(fields, message):
@@ -254,6 +275,86 @@ def test_capture_requires_compiled_workspace():
     backend.validate_capture_ready(
         SimpleNamespace(_destroyed=False, _compiled=object()), None
     )
+
+
+def test_situ_config(dist_not_initialized):
+    """SiTU reaches the engine config as its own configuration, one per pair of betas.
+
+    The activation and its betas change no other engine field, so the tiling,
+    protocols and workspace layout follow the capacity as under SwiGLU, while
+    the engine configs, which key the built engines and the workspace pool,
+    differ from SwiGLU's and from each other's.
+    """
+    config = Config(
+        intermediate_size=INTERMEDIATE,
+        top_k=TOPK,
+        activation="situ",
+        situ_beta=4,
+        situ_linear_beta=25,
+    )
+    assert (config.situ_beta, config.situ_linear_beta) == (4.0, 25.0)
+    assert all(
+        type(value) is float for value in (config.situ_beta, config.situ_linear_beta)
+    )
+    assert config.resolved_gate_up_clamp is None
+    swiglu = _config()
+    assert (swiglu.activation, swiglu.situ_beta, swiglu.situ_linear_beta) == (
+        "swiglu",
+        None,
+        None,
+    )
+    # SiTU combines with the options that do not touch the activation.
+    for fields in (IN_KERNEL, {"routing_weights_after_fc2": True}, DIE_LOCAL):
+        _config(**SITU, **fields)
+    other = {**SITU, "situ_beta": 2.0, "situ_linear_beta": 8.0}
+    for capacity in (16, 128, 256, 1024, 4096):
+        for world in (2, 8):
+            # _kernel sets the SwiGLU clamp, which SiTU rejects.
+            plain = create_mega_kernel(_config())
+            situ = create_mega_kernel(_config(**SITU))
+            situ_other = create_mega_kernel(_config(**other))
+            configs = []
+            for kernel in (plain, situ, situ_other):
+                kernel.bind_ep_bootstrap(
+                    BootstrapConfig(world_size=world, rank=0, auto_bootstrap=False)
+                )
+                configs.append(kernel._engine_config(_fleet(capacity)))
+            plain_config, situ_config, other_config = configs
+            assert plain_config.activation == "swiglu"
+            assert plain_config.situ_beta is plain_config.situ_linear_beta is None
+            assert situ_config == dataclasses.replace(plain_config, **SITU)
+            assert other_config == dataclasses.replace(plain_config, **other)
+            assert len({plain_config, situ_config, other_config}) == 3
+
+
+def test_situ_engine_config_validation():
+    """The engine config takes SiTU with its betas, without a clamp or a shared expert."""
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+        Sm100GenphaseMoeConfig,
+    )
+
+    common = dict(
+        num_total_experts=EXPERTS,
+        max_tokens_per_rank=256,
+        num_topk=TOPK,
+        hidden=HIDDEN,
+        intermediate=INTERMEDIATE,
+        rank=0,
+        world_size=8,
+        quant_kind="mxfp4_mxfp8",
+        cluster_shape_mn=(2, 1),
+        mma_tiler_mnk=(256, 128, 128),
+        **COUNTER_DISPATCH,
+    )
+    Sm100GenphaseMoeConfig(**SITU, **common)
+    for fields, message in (
+        ({**SITU, "gate_up_clamp": CLAMP}, "SiTU does not support gate_up_clamp"),
+        ({**SITU, "situ_linear_beta": None}, "positive, finite situ_linear_beta"),
+        ({"situ_beta": 4.0}, "require activation='situ'"),
+        ({**SITU, **SHARED}, "excludes shared_expert"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            Sm100GenphaseMoeConfig(**{**common, **fields})
 
 
 def test_routing_weights_after_fc2_config(dist_not_initialized):

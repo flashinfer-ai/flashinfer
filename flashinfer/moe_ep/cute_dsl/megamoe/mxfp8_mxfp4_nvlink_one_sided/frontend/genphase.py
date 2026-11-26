@@ -39,6 +39,8 @@ from .kernel_helpers import (
 class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
     """MXFP8 E4M3 or MXFP4-weight x MXFP8, BF16 combine, grouped GenPhase on SM100/103.
 
+    Runs SwiGLU or SiTU (``activation``); the fused shared expert runs SwiGLU.
+
     Defaults to N128/CGA4; N64 and N128 at CGA2 and N64/CGA4 are explicit
     alternatives, and ``nvlink_one_sided_tiling`` picks among them by expected expert load.
     """
@@ -71,10 +73,9 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
                 ((256, 240, 128), (2, 1)),
             )
             or self.schedule_policy[0] != "grouped"
-            or self.activation != "swiglu"
         ):
             raise ValueError(
-                "Blackwell GenPhase requires MXFP8 E4M3 or MXFP4 x MXFP8, SwiGLU, tile "
+                "Blackwell GenPhase requires MXFP8 E4M3 or MXFP4 x MXFP8, tile "
                 "(256, 64 or 128, 128) at cluster (2, 1) or (4, 1) and grouped "
                 "scheduling."
             )

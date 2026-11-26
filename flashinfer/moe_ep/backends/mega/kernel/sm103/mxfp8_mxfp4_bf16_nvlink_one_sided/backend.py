@@ -209,6 +209,9 @@ class Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend(MegaKernelBackend):
                 world_size=self.ep_world_size,
                 quant_kind="mxfp4_mxfp8",
                 gate_up_clamp=k.resolved_gate_up_clamp,
+                activation=k.activation,
+                situ_beta=k.situ_beta,
+                situ_linear_beta=k.situ_linear_beta,
                 die_local_weights=k.die_local_weights,
                 # The counter combine's tail barrier publishes the in-kernel adds;
                 # the Sentinel combine keeps its slots and the separate reduce.

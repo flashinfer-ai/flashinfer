@@ -10,7 +10,7 @@ B200)::
 (``run_tests.sh mega_sm103_nvlink_one_sided`` runs it at EP2 and EP4, and at EP8 when
 eight such GPUs are visible. The dispatch-round cases need at most 32 local
 experts, so they run at EP8 only and skip at smaller EP sizes, as do the
-Kimi-K3 cases.)
+Kimi-K3 cases, SiTU's included.)
 
 Problem: DeepSeek-V4-Flash routed experts (hidden 4096, intermediate 2048, 256
 experts, top-6, SwiGLU with clamp 10), MXFP4 weights and MXFP8 activations
@@ -88,6 +88,18 @@ bound allows, since 16 routes per token among 112 local experts would otherwise
 outgrow SMEM. Each output is checked against both oracles, and reruns on both
 landing sets and a CUDA graph replay reproduce it bit for bit.
 
+SiTU (``activation="situ"``: ``beta * tanh(gate / beta) * sigmoid(gate) *
+linear_beta * tanh(up / linear_beta)`` without a clamp, at Kimi-K3's betas 4 and
+25) runs in a separate test with the same checks, against oracles that apply it:
+on DeepSeek-V4.1-Flash's routed experts (hidden 5120, intermediate 2304, 384
+experts, top-6) at every EP size under the Sentinel protocols, the pull dispatch
+and the default at 4096 tokens per rank, and on Kimi-K3's at EP8 under the
+Sentinel protocols, the pull dispatch and the counter protocols, on token tiles
+from N64 to N240 (``SITU_CASES``). Each output must also miss the SwiGLU oracle.
+At 128 tokens per rank a SwiGLU layer and a SiTU layer with other betas run in
+the same process, on their own workspaces and kernels, interleaved with the
+first.
+
 Every case asserts the engine path it resolves to at EP2, EP4 and EP8 (see
 ``PATHS``), so a change to the capacity defaults that moves a case off its path
 fails instead of leaving that path untested. Host-only registration and config
@@ -126,6 +138,12 @@ V4_FLASH = _Problem(HIDDEN, INTERMEDIATE, EXPERTS, TOPK)
 # Kimi-K3's routed experts: a hidden size of seven 512-byte runs, top-16 of 896
 # experts (112 local experts at EP8, about 2.26 routes per reached rank).
 KIMI_K3 = _Problem(hidden=3584, intermediate=3072, experts=896, topk=16)
+# DeepSeek-V4.1-Flash's routed experts: top-6 of 384 experts.
+V41_FLASH = _Problem(hidden=5120, intermediate=2304, experts=384, topk=6)
+# Kimi-K3's SiTU betas (situ_beta, situ_linear_beta), and another pair that a
+# second SiTU layer of the same problem compiles in.
+KIMI_K3_SITU = (4.0, 25.0)
+OTHER_SITU = (2.0, 8.0)
 # Relative L2 bounds over each rank's valid rows.
 REQUANTIZED_TOLERANCE = 1e-2
 EXACT_TOLERANCE = 6e-2
@@ -487,11 +505,16 @@ def _reference(
     shared=None,
     weight_after_fc2=False,
     problem: _Problem = V4_FLASH,
+    situ=None,
 ):
     """(requantized-numerics, exact) FP32 outputs of this rank's rows (collective).
 
+    The routed experts run SwiGLU with the clamp ``CLAMP``, or with ``situ``
+    (``(beta, linear_beta)``) SiTU without a clamp:
+    ``beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta)``.
+
     With ``weight_after_fc2`` the requantized oracle applies each route's
-    routing weight to its BF16-rounded FC2 partial instead of to its SwiGLU
+    routing weight to its BF16-rounded FC2 partial instead of to its activation
     output before the requantization.
 
     With ``shared`` (a ``_SharedExpert``) every row adds the shared expert's
@@ -535,9 +558,18 @@ def _reference(
         w2 = weights.w2_dequant[expert].float()
         fc1 = x[token] @ w1.T
         scale = routing[token, slot].unsqueeze(1)
-        gate = fc1[:, :intermediate].clamp(max=CLAMP)
-        up = fc1[:, intermediate:].clamp(-CLAMP, CLAMP)
-        act = gate * torch.sigmoid(gate) * up
+        gate, up = fc1[:, :intermediate], fc1[:, intermediate:]
+        if situ is None:
+            gate, up = gate.clamp(max=CLAMP), up.clamp(-CLAMP, CLAMP)
+            act = gate * torch.sigmoid(gate) * up
+        else:
+            beta, linear_beta = situ
+            act = (
+                beta
+                * torch.tanh(gate / beta)
+                * torch.sigmoid(gate)
+                * (linear_beta * torch.tanh(up / linear_beta))
+            )
         if weight_after_fc2:
             requantized = _dequantize_mxfp8(*_quantize_mxfp8(act)) @ w2.T
             partial[0, token, slot] = requantized.bfloat16().float() * scale
@@ -603,6 +635,7 @@ def _oracle_errors(
     shared=None,
     weight_after_fc2=False,
     problem: _Problem = V4_FLASH,
+    situ=None,
 ):
     """(nonfinite, relL2 vs requantized, relL2 vs exact) over every rank's valid rows.
 
@@ -612,7 +645,7 @@ def _oracle_errors(
     import torch.distributed as dist
 
     requantized, exact = _reference(
-        batch, weights, capacity, group, shared, weight_after_fc2, problem
+        batch, weights, capacity, group, shared, weight_after_fc2, problem, situ
     )
     rows = slice(skip_rows, batch.count)
     error = torch.zeros(3, device="cuda")
@@ -652,6 +685,7 @@ def _check(
     shared=None,
     weight_after_fc2=False,
     problem: _Problem = V4_FLASH,
+    situ=None,
 ):
     """Collectively assert both oracle bounds on every rank's valid rows."""
     nonfinite, requantized_error, exact_error = _oracle_errors(
@@ -665,6 +699,7 @@ def _check(
         shared=shared,
         weight_after_fc2=weight_after_fc2,
         problem=problem,
+        situ=situ,
     )
     assert nonfinite == 0, f"{label}: nonfinite output"
     assert requantized_error < REQUANTIZED_TOLERANCE, (
@@ -718,8 +753,11 @@ def _layer(
     reduce_topk_in_kernel=False,
     fc1_token_pool_capacity=None,
     problem: _Problem = V4_FLASH,
+    situ=None,
     **shared_fields,
 ):
+    """The layer under test: SwiGLU with ``CLAMP``, or with ``situ``
+    (``(situ_beta, situ_linear_beta)``) SiTU without a clamp."""
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -740,7 +778,13 @@ def _layer(
             megakernel=Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig(
                 intermediate_size=problem.intermediate,
                 top_k=problem.topk,
-                activation_clamp=CLAMP,
+                **(
+                    dict(activation_clamp=CLAMP)
+                    if situ is None
+                    else dict(
+                        activation="situ", situ_beta=situ[0], situ_linear_beta=situ[1]
+                    )
+                ),
                 knobs=knobs,
                 die_local_weights=die_local_weights,
                 reduce_topk_in_kernel=reduce_topk_in_kernel,
@@ -844,6 +888,40 @@ KIMI_K3_PATHS = {
     4096: (None, None, "counter/counter N240|N128 rounds1 grouped256+pipelined jit"),
 }
 KIMI_K3_ROUTINGS = ("perfect", "random")
+# SiTU cases: (problem, tokens per rank, knobs, routing). V4.1-Flash runs at every
+# EP size: the Sentinel protocols at 128 tokens per rank, the pull dispatch pinned
+# at 1024, and the default at 4096, the counter protocols at EP2 and the pull
+# dispatch into the token pool from EP4, on the N192 token tile. Kimi-K3 runs at
+# EP8: the Sentinel protocols at 16 tokens per rank, the pull dispatch pinned at
+# 1024 and the counter protocols at 4096 on the N240 token tile.
+SITU_CASES = {
+    "v41_t128": (V41_FLASH, SENTINEL_CAPACITY, None, "random"),
+    "v41_t1024_pull": (V41_FLASH, GROUPED_CAPACITY, PULL_KNOBS, "random"),
+    "v41_t4096": (V41_FLASH, 4096, None, "perfect"),
+    "k3_t16": (KIMI_K3, 16, None, "perfect"),
+    "k3_t1024_pull": (KIMI_K3, GROUPED_CAPACITY, PULL_KNOBS, "random"),
+    "k3_t4096": (KIMI_K3, 4096, None, "perfect"),
+}
+SITU_PATHS = {
+    "v41_t128": SENTINEL_PATH,
+    "v41_t1024_pull": (
+        "pull/counter N64 rounds1 grouped256+pipelined jit walkers",
+        "pull/counter N128 rounds1 grouped256+pipelined jit walkers",
+        "pull/counter N192|N128 rounds1 grouped128+pipelined jit walkers",
+    ),
+    "v41_t4096": (
+        "counter/counter N192|N128 rounds1 grouped256+pipelined jit",
+        "pull/counter N192|N128 rounds1 grouped128+pipelined jit walkers pool",
+        "pull/counter N192|N128 rounds1 grouped128+pipelined jit walkers pool",
+    ),
+    "k3_t16": KIMI_K3_PATHS[16],
+    "k3_t1024_pull": (
+        None,
+        None,
+        "pull/counter N192|N128 rounds1 grouped256+pipelined jit walkers",
+    ),
+    "k3_t4096": KIMI_K3_PATHS[4096],
+}
 
 PATHS: dict[str, dict[str, tuple[Optional[str], ...]]] = {
     "test_layer_vs_oracle": {
@@ -917,6 +995,7 @@ PATHS: dict[str, dict[str, tuple[Optional[str], ...]]] = {
         for capacity, path in KIMI_K3_PATHS.items()
         for routing in KIMI_K3_ROUTINGS
     },
+    "test_situ": SITU_PATHS,
 }
 
 
@@ -952,6 +1031,70 @@ def _assert_path(request, config, world: int) -> None:
     assert _path(config) == expected, (
         f"{test}[{case}] at EP{world} resolves to {_path(config)!r}, not {expected!r}"
     )
+
+
+def _check_and_reproduce(
+    layer, weights, capacity, group, *, problem, seed, routing, situ=None
+):
+    """Check a full batch, then counts that differ by rank (rank 0 empty), against
+    both oracles under ``routing`` ("perfect" or "random"); then rerun the full
+    batch on both landing sets and from a CUDA graph, each of which must give the
+    first output's bits (collective). Returns the full batch and its output.
+    """
+    import torch
+    import torch.distributed as dist
+
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
+    perfect = (rank, world) if routing == "perfect" else None
+
+    def check(y, batch, label):
+        assert y.shape == (batch.count, problem.hidden)
+        _check(
+            y,
+            batch,
+            weights,
+            capacity,
+            group,
+            label=label,
+            problem=problem,
+            situ=situ,
+        )
+
+    batch = _make_batch(capacity, seed, problem=problem, perfect=perfect)
+    y = layer.forward(_tensors(batch, quantize_input=False))
+    check(y, batch, f"{routing} routing, full batch")
+    partial = _make_batch(
+        capacity * rank // world, seed + 1, problem=problem, perfect=perfect
+    )
+    check(
+        layer.forward(_tensors(partial, quantize_input=False)),
+        partial,
+        f"{routing} routing, counts by rank",
+    )
+    reruns = [layer.forward(_tensors(batch, quantize_input=False)) for _ in range(2)]
+
+    static = _tensors(batch, quantize_input=False)
+    static.output = torch.empty_like(y)
+    layer.warmup(static)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=stream):
+        layer.forward(static)
+    torch.cuda.current_stream().wait_stream(stream)
+    static.output.zero_()
+    graph.replay()
+    reruns.append(static.output.clone())
+    del graph
+    _assert_all_ranks(
+        all(
+            torch.equal(again.view(torch.int16), y.view(torch.int16))
+            for again in reruns
+        ),
+        group,
+        "a rerun of the full batch differs from its first output",
+    )
+    return batch, y
 
 
 # ----------------------------------------------------------------------------
@@ -2219,7 +2362,6 @@ def test_kimi_k3(request, capacity, routing):
         problem.experts // world, seed=1171 * rank + capacity, problem=problem
     )
     seed = 7877 * (rank + 1) + capacity
-    perfect = (rank, world) if routing == "perfect" else None
     layer = _layer(
         capacity,
         _prequantized_pack(weights),
@@ -2230,48 +2372,137 @@ def test_kimi_k3(request, capacity, routing):
     )
     try:
         _assert_path(request, layer._ensure_workspace().config, world)
-
-        def check(y, batch, label):
-            assert y.shape == (batch.count, problem.hidden)
-            _check(y, batch, weights, capacity, group, label=label, problem=problem)
-
-        batch = _make_batch(capacity, seed, problem=problem, perfect=perfect)
-        y = layer.forward(_tensors(batch, quantize_input=False))
-        check(y, batch, f"{routing} routing, full batch")
-        partial = _make_batch(
-            capacity * rank // world, seed + 1, problem=problem, perfect=perfect
-        )
-        check(
-            layer.forward(_tensors(partial, quantize_input=False)),
-            partial,
-            f"{routing} routing, counts by rank",
-        )
-        reruns = [
-            layer.forward(_tensors(batch, quantize_input=False)) for _ in range(2)
-        ]
-
-        static = _tensors(batch, quantize_input=False)
-        static.output = torch.empty_like(y)
-        layer.warmup(static)
-        graph = torch.cuda.CUDAGraph()
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.graph(graph, stream=stream):
-            layer.forward(static)
-        torch.cuda.current_stream().wait_stream(stream)
-        static.output.zero_()
-        graph.replay()
-        reruns.append(static.output.clone())
-        del graph
-        _assert_all_ranks(
-            all(
-                torch.equal(again.view(torch.int16), y.view(torch.int16))
-                for again in reruns
-            ),
+        _check_and_reproduce(
+            layer,
+            weights,
+            capacity,
             group,
-            "a rerun of the full batch differs from its first output",
+            problem=problem,
+            seed=seed,
+            routing=routing,
         )
     finally:
         torch.cuda.synchronize()
         layer.destroy()
+        dist.barrier()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("case", list(SITU_CASES))
+def test_situ(request, case):
+    """SiTU matches both oracles in its own numerics, misses SwiGLU's, and reproduces its output bit for bit.
+
+    Each case runs its engine path (``SITU_CASES``) through ``test_kimi_k3``'s
+    checks with Kimi-K3's betas, and its full batch misses the SwiGLU oracle by
+    more than the bound. The 128-token case then launches, in the same process
+    and interleaved, a SwiGLU layer and a SiTU layer with other betas on the
+    same problem and capacity: each builds its own workspace and kernel and
+    matches its own oracle, and the first layer still reproduces its output.
+    """
+    import torch
+    import torch.distributed as dist
+
+    problem, capacity, knobs, routing = SITU_CASES[case]
+    rank, world = _init_distributed()
+    if problem is KIMI_K3 and world != 8:
+        pytest.skip("Kimi-K3 runs at EP8")
+    group = dist.group.WORLD
+    weights = _make_weights(
+        problem.experts // world, seed=1231 * rank + capacity, problem=problem
+    )
+    seed = 7919 * (rank + 1) + capacity
+    layers = [
+        _layer(
+            capacity,
+            _prequantized_pack(weights),
+            rank=rank,
+            world=world,
+            quantize_input=False,
+            knobs=knobs,
+            problem=problem,
+            situ=KIMI_K3_SITU,
+        )
+    ]
+    try:
+        layer = layers[0]
+        workspace = layer._ensure_workspace()
+        _assert_path(request, workspace.config, world)
+        config = workspace.config
+        assert (config.activation, config.situ_beta, config.situ_linear_beta) == (
+            "situ",
+            *KIMI_K3_SITU,
+        )
+        assert config.gate_up_clamp is None
+        assert "_situ4.0x25.0_" in workspace.kernel.name()
+        batch, y = _check_and_reproduce(
+            layer,
+            weights,
+            capacity,
+            group,
+            problem=problem,
+            seed=seed,
+            routing=routing,
+            situ=KIMI_K3_SITU,
+        )
+        _, swiglu_error, _ = _oracle_errors(
+            y,
+            batch,
+            weights,
+            capacity,
+            group,
+            label="full batch vs the SwiGLU oracle",
+            problem=problem,
+        )
+        assert swiglu_error > REQUANTIZED_TOLERANCE, (
+            f"relL2 {swiglu_error:.3e} vs the SwiGLU oracle: the output is not SiTU's"
+        )
+        if capacity != SENTINEL_CAPACITY:
+            return
+
+        variants = ((None, "SwiGLU"), (OTHER_SITU, "SiTU, other betas"))
+        for situ, _ in variants:
+            layers.append(
+                _layer(
+                    capacity,
+                    _prequantized_pack(weights),
+                    rank=rank,
+                    world=world,
+                    quantize_input=False,
+                    knobs=knobs,
+                    problem=problem,
+                    situ=situ,
+                )
+            )
+        workspaces = [other._ensure_workspace() for other in layers]
+        names = [space.kernel.name() for space in workspaces]
+        assert len({id(space) for space in workspaces}) == len(set(names)) == 3
+        assert "situ" not in names[1] and "_situ2.0x8.0_" in names[2]
+        for i in range(2):
+            fresh = _make_batch(capacity, seed + 10 + i, problem=problem)
+            for other, (situ, label) in zip(
+                (*layers[1:], layer),
+                (*variants, (KIMI_K3_SITU, "SiTU")),
+                strict=True,
+            ):
+                _check(
+                    other.forward(_tensors(fresh, quantize_input=False)),
+                    fresh,
+                    weights,
+                    capacity,
+                    group,
+                    label=f"{label} layer, batch {i}",
+                    problem=problem,
+                    situ=situ,
+                )
+        again = layer.forward(_tensors(batch, quantize_input=False))
+        _assert_all_ranks(
+            torch.equal(again.view(torch.int16), y.view(torch.int16)),
+            group,
+            "the SiTU layer's output changed after the other layers launched",
+        )
+    finally:
+        torch.cuda.synchronize()
+        for other in reversed(layers):
+            other.destroy()
         dist.barrier()

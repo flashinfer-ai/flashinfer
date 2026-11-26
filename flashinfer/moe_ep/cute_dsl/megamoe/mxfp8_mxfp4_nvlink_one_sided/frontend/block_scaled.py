@@ -444,6 +444,10 @@ class BlockScaledMoeConfig:
     # reduce).
     apply_routing_weights_before_fc2: bool = True
     max_sm_count: Optional[int] = None
+    # The routed experts' gated activation on the FP32 FC1 accumulator: SwiGLU,
+    # clamped by gate_up_clamp, or SiTU, beta * tanh(gate / beta) * sigmoid(gate)
+    # * linear_beta * tanh(up / linear_beta), which takes no clamp. The betas are
+    # compiled into the epilogue.
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
@@ -1050,6 +1054,10 @@ class BlockScaledMoeConfig:
             ):
                 raise ValueError(
                     "shared_expert needs GenPhase with MXFP4 x MXFP8 weights, tile M 256 and cluster (2, 1)."
+                )
+            if self.activation != "swiglu":
+                raise ValueError(
+                    "The shared expert runs SwiGLU; activation='situ' excludes shared_expert."
                 )
             if self.shared_gate_up_clamp is not None and (
                 not math.isfinite(self.shared_gate_up_clamp)
