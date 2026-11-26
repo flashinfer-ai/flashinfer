@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
-// The PLAN CHOOSER of the Cake GDP Blackwell prefill (flashinfer/cake_gdp_backend/cake_jit.py) in native code: the
-// launch of one batch and the int32 words of its item table, for the eager call's host time.  It is a line-by-line
-// port of the Python chooser, which stays the reference (``prefill_v6_plan_reference``): the same integer model, the
-// same candidates in the same order, the same placement (the bulk LPT of ``lpt_rounds`` / ``lpt_counts``), the same
-// robustness rule and tie breaks, so both give the same plan bit for bit (tests/cpu/gdp checks it on random batches).
-// Every constant comes from the caller (the Python constants of the split rules and of the chooser), so the rules
-// keep one text.  No device code, no CUDA call: a pure host function of its arguments.
+// The PLAN CHOOSER of the Cake GDP Blackwell prefill (flashinfer/cake_gdp_backend/cake_jit.py) in
+// native code: the launch of one batch and the int32 words of its item table, for the eager call's
+// host time.  It is a line-by-line port of the Python chooser, which stays the reference
+// (``prefill_v6_plan_reference``): the same integer model, the same candidates in the same order,
+// the same placement (the bulk LPT of ``lpt_rounds`` / ``lpt_counts``), the same robustness rule
+// and tie breaks, so both give the same plan bit for bit (tests/cpu/gdp checks it on random
+// batches). Every constant comes from the caller (the Python constants of the split rules and of
+// the chooser), so the rules keep one text.  No device code, no CUDA call: a pure host function of
+// its arguments.
 
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/function.h>
@@ -40,8 +42,9 @@
 
 namespace {
 
-// A per-call bump arena (thread local): every container of the chooser allocates from it and nothing is freed until
-// the next call resets it, which keeps one block (the last, largest) unless the call grew it past 4 MiB.
+// A per-call bump arena (thread local): every container of the chooser allocates from it and
+// nothing is freed until the next call resets it, which keeps one block (the last, largest) unless
+// the call grew it past 4 MiB.
 class Arena {
  public:
   void* Get(size_t n, size_t align) {
@@ -94,15 +97,18 @@ struct ArenaAlloc {
   T* allocate(size_t n) { return static_cast<T*>(tls_arena.Get(n * sizeof(T), alignof(T))); }
   void deallocate(T*, size_t) {}
   template <class U>
-  bool operator==(const ArenaAlloc<U>&) const { return true; }
+  bool operator==(const ArenaAlloc<U>&) const {
+    return true;
+  }
   template <class U>
-  bool operator!=(const ArenaAlloc<U>&) const { return false; }
+  bool operator!=(const ArenaAlloc<U>&) const {
+    return false;
+  }
 };
 template <class T>
 using Vec = std::vector<T, ArenaAlloc<T>>;
 template <class K, class V, class C = std::less<K>>
 using Map = std::map<K, V, C, ArenaAlloc<std::pair<const K, V>>>;
-
 
 using i64 = int64_t;
 using Row = std::array<i64, 4>;  // (seq, head, cut, span)
@@ -161,8 +167,8 @@ struct Batch {
   i64 H, n, sm, total, arch_slots;
   Vec<i64> lens, chunks;
   Map<i64, Vec<i64>> by_len;  // length -> sequences, ascending
-  Map<i64, i64> chunk_of;             // length -> chunks
-  Vec<i64> distinct;               // the distinct chunk counts, ascending
+  Map<i64, i64> chunk_of;     // length -> chunks
+  Vec<i64> distinct;          // the distinct chunk counts, ascending
   bool empty = false;
 };
 
@@ -183,8 +189,8 @@ Vec<ScanEntry> CountScan(const Params& P, i64 chunks, i64 H, i64 n, i64 sm, i64 
     i64 span = p == 1 ? chunks : SplitSpan(chunks, p, n);
     if (p > 1 && span < span_min) break;
     i64 p_eff = CeilDiv(chunks, span);
-    out.push_back({span, p_eff,
-                   CeilDiv(H * p_eff, sm) * ((span + 1) * P[kCostChunk] + P[kCostItem])});
+    out.push_back(
+        {span, p_eff, CeilDiv(H * p_eff, sm) * ((span + 1) * P[kCostChunk] + P[kCostItem])});
   }
   return out;
 }
@@ -232,8 +238,8 @@ Vec<Decision> Decisions(const Params& P, const Batch& bt, i64 chunks) {
   return out;
 }
 
-// ``_v6_cut_shape``: the rows of a sequence (index 0) cut by ``d``, per row its chunk count and kind (0: cut 0,
-// 1: cut > 0, -1: a pad row).
+// ``_v6_cut_shape``: the rows of a sequence (index 0) cut by ``d``, per row its chunk count and
+// kind (0: cut 0, 1: cut > 0, -1: a pad row).
 struct CutShape {
   Vec<Row> rows;
   Vec<i64> ks, kinds;
@@ -256,7 +262,8 @@ CutShape MakeCutShape(const Params& P, i64 chunks, Decision d, i64 H, i64 n) {
       while (lo < hi) {
         i64 head = lo / padded, cut = lo % padded;
         i64 end = std::min(hi, (head + 1) * padded);
-        if (cut < chunks) pieces.push_back({Row{0, head, cut, -slot}, std::min(end - head * padded, chunks) - cut});
+        if (cut < chunks)
+          pieces.push_back({Row{0, head, cut, -slot}, std::min(end - head * padded, chunks) - cut});
         lo = end;
       }
       std::pair<Row, i64> pad{Row{0, std::min(k * slot / padded, H - 1), chunks, -slot}, 0};
@@ -319,7 +326,8 @@ struct Model {
     }
     i64 sum = 0, top = 0;
     for (i64 j = 0; j < d.p; ++j) {
-      i64 e = std::max<i64>(std::min(d.span, chunks - j * d.span), 0) * P[kChunk] + P[kItem] + (j ? P[kWarmup] : 0);
+      i64 e = std::max<i64>(std::min(d.span, chunks - j * d.span), 0) * P[kChunk] + P[kItem] +
+              (j ? P[kWarmup] : 0);
       sum += e;
       top = j ? std::max(top, e) : e;
     }
@@ -442,8 +450,9 @@ void LptCounts(const Vec<i64>& loads, i64 cost, i64 k, Vec<i64>& counts, Vec<i64
   }
 }
 
-// A CTA's rows in the table: its long cut-0 rows, its long later-cut rows, its short rows (``inference_lists``), each
-// in placement order.  Rows are collected as (3 * CTA + part, row) and laid out by a stable counting sort.
+// A CTA's rows in the table: its long cut-0 rows, its long later-cut rows, its short rows
+// (``inference_lists``), each in placement order.  Rows are collected as (3 * CTA + part, row) and
+// laid out by a stable counting sort.
 using Placed = Vec<std::pair<i64, Row>>;
 
 void LptPlace(Vec<i64>& loads, i64 cost, const Vec<Row>& rows, Placed& placed) {
@@ -651,7 +660,8 @@ struct Chooser {
       i64 chunks = bt.chunks[q];
       count += static_cast<i64>(model.Shape(chunks, c.dec.at(chunks)).rows.size());
     }
-    // ``inference_lists``: the long rows dealt round-robin, each CTA's cut-0 rows first when a CTA holds several
+    // ``inference_lists``: the long rows dealt round-robin, each CTA's cut-0 rows first when a CTA
+    // holds several
     Placed& placed = placed_;
     placed.clear();
     Vec<i64>& loads = loads_;
@@ -747,7 +757,8 @@ struct Chooser {
     Vec<std::pair<i64, i64>> big;
     for (const auto& rc : c.runs)
       if (rc.second > least) big.push_back(rc);
-    std::stable_sort(big.begin(), big.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::stable_sort(big.begin(), big.end(),
+                     [](const auto& a, const auto& b) { return a.second > b.second; });
     c.assign.clear();
     for (const auto& [rows, cost] : big)
       for (i64 i = 0; i < rows; ++i) {
@@ -779,13 +790,14 @@ struct Chooser {
     }
     if (c.assign.empty()) Cost(c);
     Vec<i64> cost_of(rows.size());
-    for (size_t i = 0; i < rows.size(); ++i) cost_of[i] = BlockRowCost(P, bt.lens[rows[i][0]], bt.n);
+    for (size_t i = 0; i < rows.size(); ++i)
+      cost_of[i] = BlockRowCost(P, bt.lens[rows[i][0]], bt.n);
     Vec<i64> big;
     for (size_t i = 0; i < rows.size(); ++i)
       if (cost_of[i] > c.least) big.push_back(i);
     std::stable_sort(big.begin(), big.end(), [&](i64 a, i64 b) { return cost_of[a] > cost_of[b]; });
-    // per CTA: its big rows in assignment order, then the next cheapest rows up to its capacity; the table takes
-    // the CTAs' r-th rows for r = 0, 1, ...
+    // per CTA: its big rows in assignment order, then the next cheapest rows up to its capacity;
+    // the table takes the CTAs' r-th rows for r = 0, 1, ...
     Vec<i64> start(G + 1, 0), fill(G, 0);
     for (i64 b = 0; b < G; ++b) start[b + 1] = start[b] + c.cap[b];
     Vec<Row> flat(start[G]);
@@ -809,9 +821,9 @@ struct Chooser {
     return plan;
   }
 
-  // ``_v6_scenario_time`` over a plan prepared once: per row of a cut (sequence, head) its cut, the next cut of
-  // that (sequence, head) (else the chunk count) and the range of its ascending cuts in ``cuts``; any other row
-  // its fixed cost.
+  // ``_v6_scenario_time`` over a plan prepared once: per row of a cut (sequence, head) its cut, the
+  // next cut of that (sequence, head) (else the chunk count) and the range of its ascending cuts in
+  // ``cuts``; any other row its fixed cost.
   struct RowInfo {
     i64 fixed, cut, next, chunks;
     i64 lo, hi;  // its (sequence, head)'s cuts: cuts[lo, hi); lo < 0: the fixed cost
@@ -839,16 +851,18 @@ struct Chooser {
     size_t R = plan.rows.size();
     out->rows.assign(R, RowInfo{0, 0, 0, 0, -1, -1});
     out->cuts.clear();
-    // the rows of every (sequence, head) that are neither a state copy nor a pad, ordered by (sequence, head, cut)
+    // the rows of every (sequence, head) that are neither a state copy nor a pad, ordered by
+    // (sequence, head, cut)
     Vec<std::array<i64, 3>>& keyed = keyed_;
     keyed.clear();
     keyed.reserve(R);
     for (size_t i = 0; i < R; ++i) {
       const Row& r = plan.rows[i];
-      if (r[3] != 0 && r[2] < bt.chunks[r[0]]) keyed.push_back({r[0] * bt.H + r[1], r[2], static_cast<i64>(i)});
+      if (r[3] != 0 && r[2] < bt.chunks[r[0]])
+        keyed.push_back({r[0] * bt.H + r[1], r[2], static_cast<i64>(i)});
     }
-    // ordered by (sequence * H + head, cut, row): a counting sort by (sequence, head) then an insertion sort of
-    // each group by (cut, row) when the groups are few, else one sort
+    // ordered by (sequence * H + head, cut, row): a counting sort by (sequence, head) then an
+    // insertion sort of each group by (cut, row) when the groups are few, else one sort
     i64 groups = static_cast<i64>(bt.lens.size()) * bt.H;
     if (groups <= 4 * static_cast<i64>(keyed.size()) + 1024) {
       Vec<i64>& start = packed_;
@@ -861,8 +875,9 @@ struct Chooser {
       for (size_t a = 0, b; a < sorted.size(); a = b) {
         for (b = a + 1; b < sorted.size() && sorted[b][0] == sorted[a][0];) ++b;
         for (size_t k = a + 1; k < b; ++k)
-          for (size_t j = k; j > a && (sorted[j][1] < sorted[j - 1][1] ||
-                                       (sorted[j][1] == sorted[j - 1][1] && sorted[j][2] < sorted[j - 1][2]));
+          for (size_t j = k;
+               j > a && (sorted[j][1] < sorted[j - 1][1] ||
+                         (sorted[j][1] == sorted[j - 1][1] && sorted[j][2] < sorted[j - 1][2]));
                --j)
             std::swap(sorted[j], sorted[j - 1]);
       }
@@ -880,7 +895,8 @@ struct Chooser {
       }
       i64 chunks = bt.chunks[plan.rows[keyed[a][2]][0]];
       for (size_t k = a; k < b; ++k)
-        out->rows[keyed[k][2]] = RowInfo{0, keyed[k][1], k + 1 < b ? keyed[k + 1][1] : chunks, chunks, lo, hi};
+        out->rows[keyed[k][2]] =
+            RowInfo{0, keyed[k][1], k + 1 < b ? keyed[k + 1][1] : chunks, chunks, lo, hi};
     }
     for (size_t i = 0; i < R; ++i)
       if (out->rows[i].lo < 0) {
@@ -924,7 +940,8 @@ struct Chooser {
     return P[kFixed] + top;
   }
 
-  // ``ref`` prepared once (with its cuts in ``ref_needs``); its scenario times memoized by W in ``ref_times``
+  // ``ref`` prepared once (with its cuts in ``ref_needs``); its scenario times memoized by W in
+  // ``ref_times``
   bool Robust(const Plan& cand, const Prepared& ref, const Vec<i64>& ref_needs,
               Vec<std::pair<i64, i64>>* ref_times) {
     Vec<i64> needs(ref_needs);
@@ -1012,9 +1029,7 @@ Choice Choose(const Params& P, const Batch& bt) {
                                : (cands[i].kind == 1 && blocks[cands[i].at].name == kBlock);
     if (is_ref) ref_at = i;
   }
-  auto bound = [&](const Cand& c) {
-    return c.kind == 0 ? splits[c.at].bound : blocks[c.at].bound;
-  };
+  auto bound = [&](const Cand& c) { return c.kind == 0 ? splits[c.at].bound : blocks[c.at].bound; };
   auto cost = [&](const Cand& c) {
     return c.kind == 0 ? ch.Cost(splits[c.at]) : ch.Cost(blocks[c.at]);
   };
@@ -1050,7 +1065,8 @@ Choice Choose(const Params& P, const Batch& bt) {
 
 Vec<i64> ReadInts(const tvm::ffi::Bytes& b, int64_t width, const char* what) {
   TVM_FFI_ICHECK(width == 4 || width == 8) << what << ": element width 4 or 8, got " << width;
-  TVM_FFI_ICHECK(b.size() % width == 0) << what << ": " << b.size() << " bytes is not a multiple of " << width;
+  TVM_FFI_ICHECK(b.size() % width == 0)
+      << what << ": " << b.size() << " bytes is not a multiple of " << width;
   Vec<i64> out(b.size() / width);
   for (size_t i = 0; i < out.size(); ++i) {
     if (width == 8) {
@@ -1064,15 +1080,18 @@ Vec<i64> ReadInts(const tvm::ffi::Bytes& b, int64_t width, const char* what) {
   return out;
 }
 
-// The launch of one batch: ``offsets`` the ``N + 1`` host offsets (``width``-byte integers), ``params`` the int64
-// parameter words, ``flags`` bit 0/1: the split build reads CTA offsets / the planned offsets (csr / plan_guard), bit
-// 2/3 the same for the block build.  Returns int32 words: ``(candidate, split, grid, rows, words)``, then the
+// The launch of one batch: ``offsets`` the ``N + 1`` host offsets (``width``-byte integers),
+// ``params`` the int64 parameter words, ``flags`` bit 0/1: the split build reads CTA offsets / the
+// planned offsets (csr / plan_guard), bit 2/3 the same for the block build.  Returns int32 words:
+// ``(candidate, split, grid, rows, words)``, then the
 // ``words`` int32 words of the program's ``items`` formal (``v6_item_words``).
-tvm::ffi::Bytes V6Launch(tvm::ffi::Bytes offsets, int64_t width, int64_t num_heads, int64_t num_householder,
-                         int64_t sm_count, int64_t total_tokens, tvm::ffi::Bytes params, int64_t flags) {
+tvm::ffi::Bytes V6Launch(tvm::ffi::Bytes offsets, int64_t width, int64_t num_heads,
+                         int64_t num_householder, int64_t sm_count, int64_t total_tokens,
+                         tvm::ffi::Bytes params, int64_t flags) {
   tls_arena.Reset();
   Params P{ReadInts(params, 8, "params")};
-  TVM_FFI_ICHECK(static_cast<i64>(P.w.size()) >= kSpecs && P.w.size() == static_cast<size_t>(kSpecs + 2 * P[kNumSpecs]))
+  TVM_FFI_ICHECK(static_cast<i64>(P.w.size()) >= kSpecs &&
+                 P.w.size() == static_cast<size_t>(kSpecs + 2 * P[kNumSpecs]))
       << "cake_gdp_v6_plan: " << P.w.size() << " parameter words do not match the layout";
   Vec<i64> cu = ReadInts(offsets, width, "offsets");
   TVM_FFI_ICHECK(cu.size() >= 2) << "cake_gdp_v6_plan: at least two offsets";
@@ -1115,7 +1134,8 @@ tvm::ffi::Bytes V6Launch(tvm::ffi::Bytes offsets, int64_t width, int64_t num_hea
   for (const Row& r : plan.rows)
     for (i64 v : r) words.push_back(static_cast<int32_t>(v));
   if (csr) {
-    TVM_FFI_ICHECK(!plan.offsets.empty()) << "cake_gdp_v6_plan: the csr build runs a plan with row offsets";
+    TVM_FFI_ICHECK(!plan.offsets.empty())
+        << "cake_gdp_v6_plan: the csr build runs a plan with row offsets";
     for (i64 o : plan.offsets) words.push_back(static_cast<int32_t>(o));
   }
   if (guard) {
@@ -1127,7 +1147,8 @@ tvm::ffi::Bytes V6Launch(tvm::ffi::Bytes offsets, int64_t width, int64_t num_hea
   words[2] = static_cast<int32_t>(plan.grid);
   words[3] = static_cast<int32_t>(plan.rows.size());
   words[4] = static_cast<int32_t>(words.size() - 5);
-  return tvm::ffi::Bytes(reinterpret_cast<const char*>(words.data()), words.size() * sizeof(int32_t));
+  return tvm::ffi::Bytes(reinterpret_cast<const char*>(words.data()),
+                         words.size() * sizeof(int32_t));
 }
 
 }  // namespace
