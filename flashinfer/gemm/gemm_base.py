@@ -7779,11 +7779,12 @@ def _get_sm100_block_scaled_tactics(
 # SM100 CuTe-DSL kernel has the per-row alpha epilogue, and SM103 runs that
 # same kernel. The SM103 3xFP4 and SM107 kernels have no such epilogue, and the
 # SM100 kernel has not been validated with it on SM107, so SM107 is not
-# claimed. _cute_dsl_gemm_fp4_requirement is the single place that enforces
+# claimed. SM8x runs every backend on one dense GEMM (sm8x_fp4_dense), which
+# has the per-row alpha. _cute_dsl_gemm_fp4_requirement is the single place that enforces
 # this; the other FP4 backends never see a per-token alpha because
 # _heuristic_func_mm_fp4 drops them and _check_mm_fp4_problem_size rejects them
 # when requested explicitly.
-_CUTE_DSL_PER_TOKEN_ALPHA_CCS = (100, 103)
+_CUTE_DSL_PER_TOKEN_ALPHA_CCS = (80, 86, 87, 89, 100, 103)
 
 
 def _is_per_token_alpha(alpha_tensor) -> bool:
@@ -9659,7 +9660,7 @@ def _check_mm_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9730,7 +9731,7 @@ def _trtllm_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -9759,7 +9760,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9815,11 +9816,12 @@ def _cute_dsl_gemm_fp4_requirement(
                 f"only, got SM{major}{minor}."
             )
     _check_cute_dsl_availability()
-    _check_cute_dsl_arch(a.device)
+    if get_compute_capability(a.device)[0] != 8:  # SM8x generates no CuTe-DSL code
+        _check_cute_dsl_arch(a.device)
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _cutedsl_low_latency_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9857,7 +9859,7 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([80, 86, 87, 89, 120, 121])
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -11660,7 +11662,17 @@ def mm_fp4(
             use_8x4_sf_layout, enable_pdl
         ),
     }
-    runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
+    if major == 8:  # every backend runs the SM8x dense GEMM
+        from .sm8x_fp4_dense import sm8x_mm_fp4_runner
+
+        runners = [
+            sm8x_mm_fp4_runner(
+                a, b, a_descale, b_descale, alpha, out_dtype, out,
+                use_8x4_sf_layout, use_nvfp4,
+            )
+        ]  # fmt: skip
+    else:
+        runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
 
     inputs = [
         a,

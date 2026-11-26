@@ -11,6 +11,10 @@ module whose GEMM2 writes FP16 (``RECORDS_OUT_F16``), rounded once from FP32.
 ``[N, ceil(size / N)]`` whose first ``size`` bytes are the records, ``b_descale`` an empty
 float8_e4m3fn tensor, ``alpha`` unchanged. ``mm_bf16_fp4`` also takes each backend's SM100+
 format (``cute-dsl-native``'s canonical weight among them) and builds its records per call.
+
+``mm_fp4`` (NVFP4 activations) runs on SM8x for every backend as the prep's exact BF16
+restore of ``a`` and the dense GEMM ``gemm_fp4``, which reads the ``[N, K/2]`` weight and its
+128x4-swizzled scales as given, with a scalar or per-token ``alpha``.
 """
 
 import functools
@@ -464,3 +468,114 @@ def sm8x_mm_bf16_fp4(
     if not direct:
         out.copy_(target[:, :n])
     return out
+
+
+# ---------------------------------------------------------------------------------------------
+# mm_fp4 (NVFP4 x NVFP4)
+# ---------------------------------------------------------------------------------------------
+
+
+def _run_fp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out: torch.Tensor,
+    r: int,
+) -> None:
+    """``out = (a @ b) * alpha`` for ``mm_fp4``'s NVFP4 operands: the prep restores ``a`` to
+    BF16 exactly, then the dense GEMM (``gemm_fp4``) reads ``b`` and its 128x4-swizzled scales
+    as given."""
+    m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
+    if m == 0:
+        return
+    if not a.is_contiguous() or a.data_ptr() % 16:
+        a = a.clone(memory_format=torch.contiguous_format)
+    w = b.t()
+    if not w.is_contiguous() or w.data_ptr() % 16:
+        w = w.clone(memory_format=torch.contiguous_format)
+    sf = _flat_bytes(b_descale)
+    if sf.data_ptr() % 16:
+        sf = sf.clone()
+    if alpha is None:
+        alpha = _ones(a.device)
+    max_blocks = -(-m // r)
+    ints = (1 + 2 * max_blocks, max_blocks * r, -(-m // 2048) + 1)
+    meta, rowmap, workspace = torch.empty(
+        sum(ints), dtype=torch.int32, device=a.device
+    ).split(ints)
+    topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=a.device)
+    act = torch.empty((m, k), dtype=torch.bfloat16, device=a.device)
+    module = _w4a16_moe_sm80_module(None, False, None, False)
+    module.prep(
+        topk_ids, meta, rowmap, workspace, 1, r, max_blocks, a, _flat_bytes(a_descale), act,
+        True, None, None, 0, None, None, None, None, None,
+    )  # fmt: skip
+    direct = n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
+    target = (
+        out
+        if direct
+        else torch.empty((m, _pad(n, 8)), dtype=out.dtype, device=a.device)
+    )
+    gemm = _out_f16_module() if out.dtype == torch.float16 else module
+    gemm.gemm_fp4(
+        w, sf, alpha, act, meta, rowmap, target, r, n, k, max_blocks, alpha.numel() > 1
+    )
+    if not direct:
+        out.copy_(target[:, :n])
+
+
+class Sm8xMmFp4Runner(TunableRunner):
+    """``_run_fp4`` behind ``mm_fp4`` as an autotuner candidate on ``mm_fp4``'s inputs; tactic:
+    the row tile."""
+
+    def get_cache_key_extras(self, inputs) -> tuple:
+        return (inputs[5], inputs[4] is not None and inputs[4].numel() > 1)
+
+    def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
+        return [8, 16, 32, 64]
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        a, b, a_descale, b_descale, alpha, _, out = inputs[:7]
+        _run_fp4(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out,
+            64 if tactic in (None, -1) else tactic,
+        )
+        return out
+
+
+def sm8x_mm_fp4_runner(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: torch.Tensor,
+    use_8x4_sf_layout: bool,
+    use_nvfp4: bool,
+) -> Sm8xMmFp4Runner:
+    """The ``mm_fp4`` runner of every backend on SM8x (after the backend's requirement
+    check)."""
+    if use_8x4_sf_layout or not use_nvfp4:
+        raise NotImplementedError(
+            "mm_fp4 on SM8x currently serves NVFP4 with 128x4 scale factors"
+        )
+    m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
+    if k % 32:
+        raise ValueError(f"mm_fp4 on SM8x requires K % 32 == 0, got K={k}")
+    if tuple(out.shape) != (m, n):
+        raise ValueError(f"out shape {tuple(out.shape)} != expected {(m, n)}")
+    if out.dtype != out_dtype:
+        raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
+    if any(t.device != a.device for t in (b, a_descale, b_descale, out)):
+        raise ValueError("a, b, a_descale, b_descale and out must be on one device")
+    if alpha is None:
+        _ones(a.device)  # outside a tuner's graph capture
+    return Sm8xMmFp4Runner()
