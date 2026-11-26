@@ -26,6 +26,7 @@ def GTerm.sexpr : GTerm → String
   | .bias n => s!"(bias {n.id})"
   | .sfaBlk a kb => s!"(sfa_blk {a.id} {kb})"
   | .sfbBlk b kb => s!"(sfb_blk {b.id / 128} {kb})"    -- the weight scale block of the column: `spec.block_scale_term` writes n // SCALE_BLOCK_N
+  | .sfbBlk32 b kb => s!"(sfb_blk {b.id / 32} {kb})"    -- the 32-wide block-scale MoE class's weight scale block (`spec_fp8bs.reduction_kblock` at 32)
 end GEMM
 
 end BIK

@@ -3491,19 +3491,30 @@ class BatchInvariantBf16Config:
 # the GEMM's CTAs taking the routing's ids and building the group tables themselves) follows the Frost low-latency MoE's launch
 # structure; the PDL wait / trigger placement and the launch's tile bound on the persistent grid follow Prims-TS and
 # TRTLLM-Gen; the scatter's placement and the swapped epilogue's warpgroup split are the fp4 backend's; the routing,
-# permutation, combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same
-# bits, placed as those kernels place theirs.
+# permutation, combine and the ranking contract are the bf16 backend's. The DeepSeek pair's kernels took: the swapped-AB
+# decode records with the 64-row weight tile from Prims-TS (its DeepSeek body runs 64 weight rows) and TRTLLM-Gen's block-fp8
+# decode tactics; the fused activation and block requantization in GEMM1's epilogue from Prims-TS's fused activation and
+# TRTLLM-Gen's block-fp8 contract, whose surface the pair mirrors; the routed gather of the rows with their scale columns in
+# one launch from TRTLLM-Gen's routed-token layouts; the swapped body's gather form from the bf16 backend's TMA gather4 of the
+# token rows through the plan's map. Each is a placement of the class's dataflow: the same bits, placed as those kernels place
+# theirs.
 @dataclass(frozen=True)
 class BatchInvariantFp8BlockConfig:
     """The batch-invariant fp8-block MoE backend: the fp8 formats with block scales under one backend
     (``backend_key = "batch_invariant_fp8_block"``), grouped as :class:`TrtllmFp8BlockConfig` groups them, on SM100 / SM103 /
     SM107. The quantization pair of ``QuantConfig`` selects the class family, each pair keeping its own kernels, classes,
-    fingerprints and pack conventions: ``QuantConfig(weight=MXFP8, activation=MXFP8)`` runs the classes ``moe.mxfp8.<act>``
-    of the mode documented in ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set,
-    as the bf16 backend), the pair served. Another pair is not admitted by the layer (``supported_quant_variants``) and
-    is refused by :meth:`prepare_weights` / :meth:`prepare_activations` with
-    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` naming the pair served; the weight view names its
-    pair (``quant``) and a view without it is declined by the layer's candidate filter.
+    fingerprints and pack conventions: ``QuantConfig(weight=MXFP8, activation=MXFP8)`` runs the classes ``moe.mxfp8.<act>``,
+    ``QuantConfig(weight=DeepSeekFp8, activation=DeepSeekFp8)`` the DeepSeek-style block-scale classes ``moe.e4m3bs.<act>``
+    / ``moe.e4m3bs32.<act>`` of the mode documented in ``flashinfer/batch_invariant/README.md`` (one class per typed
+    activation and parameter set each, as the bf16 backend), the pairs served. Another pair is not admitted by the layer
+    (``supported_quant_variants``) and is refused by :meth:`prepare_weights` / :meth:`prepare_activations` with
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` naming the pairs served; the weight view names its
+    pair (``quant``) and a view without it is declined by the layer's candidate filter. For both pairs every output bit is
+    a function of the token's own quantized row and scales, its ``top_k`` experts and routing weights and the quantized
+    expert weights and scales alone. ``MoEFinalizeConfig.do_finalize`` must stay ``True`` and ``use_fused_finalize`` is
+    ignored; fused shared experts and expert-parallel shards are refused by name; all three routing input modes are taken;
+    unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
+    back and is not a default candidate.
 
     MXFP8 x MXFP8: the expert weights and the activations are MXFP8 (e4m3 values, one UE8M0 scale per 32 elements), both by
     the batch-invariant quantizer class (``mxfp8_quantize(..., batch_invariant=True)``: the experts per expert at
@@ -3513,23 +3524,44 @@ class BatchInvariantFp8BlockConfig:
     architecture is a dimension of the class, as for ``mm_mxfp8``), the activation chain is the bf16 classes' on the
     dequantised fp32 accumulators, the intermediate is quantized by the same quantizer class on the materialised bf16 row,
     the combine is the slot-order fp32 fold. The arithmetic is exact (every step of the chain correctly rounded, no SFU
-    table enters the bits; the instruction class of the part is the one architecture dimension). Every output bit is a
-    function of the token's own quantized row, its ``top_k`` experts and routing weights and the quantized expert
-    weights alone. ``MoEFinalizeConfig.do_finalize`` must stay ``True`` and ``use_fused_finalize`` is ignored; fused
-    shared experts and expert-parallel shards are refused by name; all three routing input modes are taken; unsupported
-    inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls back and is
-    not a default candidate.
+    table enters the bits; the instruction class of the part is the one architecture dimension). Weights:
+    ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or ``w1 [E, I, H]`` for the ungated
+    activations, and ``w2 [E, H, I]`` -- bf16 or a wider floating dtype, CPU-resident or on the device -- and quantizes
+    the experts one at a time into the pack on ``device`` (the weights' by default; a CUDA device), each expert's slice
+    moved and cast right before its quantization; ``num_local_experts`` / ``hidden_size`` / ``intermediate_size``, when
+    given, must be the weights' own; ``hidden_size`` and ``intermediate_size`` are multiples of 32. Activations: the
+    canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with the token-major UE8M0 scales ``[num_tokens, H / 32]`` (the pack
+    ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` prepare) in that linear layout alone, taken as given: a swizzled
+    or flattened scale buffer, ``QuantConfig(swizzled_scale_factors=True)`` and a ``per_token_scale`` are refused, rows
+    and scale bytes are 16-byte aligned, and ``num_tokens = 0`` gives the empty output. The 128x4 scale buffers the
+    kernels read carry zero pad columns.
 
-    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or ``w1 [E, I, H]`` for the
-    ungated activations, and ``w2 [E, H, I]`` -- bf16 or a wider floating dtype, CPU-resident or on the device -- and
-    quantizes the experts one at a time into the pack on ``device`` (the weights' by default; a CUDA device), each
-    expert's slice moved and cast right before its quantization; ``num_local_experts`` / ``hidden_size`` /
-    ``intermediate_size``, when given, must be the weights' own; ``hidden_size`` and ``intermediate_size`` are multiples
-    of 32. Activations: the canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with the token-major UE8M0 scales
-    ``[num_tokens, H / 32]`` (the pack ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` prepare) in that linear layout
-    alone, taken as given: a swizzled or flattened scale buffer, ``QuantConfig(swizzled_scale_factors=True)`` and a
-    ``per_token_scale`` are refused, rows and scale bytes are 16-byte aligned, and ``num_tokens = 0`` gives the empty
-    output. The 128x4 scale buffers the kernels read carry zero pad columns.
+    DeepSeekFp8 x DeepSeekFp8: :class:`TrtllmFp8BlockConfig`'s DeepSeek surface: ``prepare_weights`` from the canonical
+    experts (e4m3 payloads with one fp32 scale per 128x128 block, quantized here by the class's own chain one expert at a
+    time into the pack on ``device`` -- the weights' by default, a CUDA device, each expert's slice moved and cast right
+    before its quantization, so the peak memory beyond the inputs is the pack plus one expert's temporaries; a weight
+    whose block scale is not finite is refused naming the expert; FlashInfer's DeepSeek weight view is taken as given
+    through :meth:`from_trtllm_view`, its scales copied and refused unless finite, positive and normal), the view naming
+    its pair (``quant``) and its block; ``prepare_activations`` quantizing the bf16 activations per 1x128 block into the
+    DeepSeek pair (an e4m3 ``[num_tokens, H]`` and fp32 scales ``[H / 128, num_tokens]``: the one layout the layer takes,
+    as given and never transposed, rows and scales 16-byte aligned; ``num_tokens = 0`` gives the empty output; the raw bf16
+    rows with no scale are taken too and quantized by the class in one launch with its permutation plan;
+    ``QuantConfig(swizzled_scale_factors=True)`` is refused at construction). ``deepseek_fp8_block_size`` (128 by default,
+    or 32: prims-TS's vocabulary for the re-blocked TP shards)
+    selects the block of both quantizations and with it the class: ``prepare_weights(..., deepseek_fp8_block_size=32)``
+    writes 32x32 weight blocks (fp32 scales ``[E, N / 32, K / 32]``) into the view, ``prepare_activations(...,
+    deepseek_fp8_block_size=32)`` the 1x32 activation blocks (fp32 scales ``[H / 32, num_tokens]``: prims-TS's layout), and
+    the runner reads the block off the prepared weights' scale shape at every call and checks the activation scales
+    against it -- the classes ``moe.e4m3bs32.<act>`` on the GEMM core ``gemm.e4m3.kblock32`` (one fp8 instruction step per
+    block, promoted per step: four times the 128-wide class's promotion work per K, the recipe's cost), their own
+    fingerprints (``fingerprint("fused_moe_fp8bs", ..., deepseek_fp8_block_size=32)``), the same chains, routing and
+    combine; H and I stay multiples of 128. The class declares every rounding: both quantizations are the ``fp8bs.quant``
+    chain (the block amax, ``s = fmax(amax / 448, 1e-12)``, the correctly rounded reciprocal, one saturating RNE conversion
+    per element), the two grouped GEMMs are placements of the dense block-scale class ``gemm.e4m3.kblock128`` (the fp8
+    instruction's fold per 128-element K block promoted in block order with the row's and the weight block's scales),
+    GEMM1's activation runs on the promoted accumulators and rounds to bf16 once, the intermediate is requantized by the
+    same chain (in GEMM1's epilogue or by a standalone pass: one term, two placements), GEMM2 converts to bf16 once, the
+    combine is the slot-order fp32 fold. ``H`` and ``I`` are multiples of 128 (whole scale blocks of every operand).
     """
 
     @classmethod
@@ -3547,37 +3579,58 @@ class BatchInvariantFp8BlockConfig:
         intermediate_size: Optional[int] = None,
         activation: Optional["ActivationConfig"] = None,
         device: Optional[torch.device] = None,
+        deepseek_fp8_block_size: int = 128,
     ) -> Dict[str, Any]:
-        """The weight view of the pair ``quant`` selects. MXFP8 x MXFP8: the experts quantized one at a time by the
-        batch-invariant MXFP8 quantizer into the pack on ``device`` (the gate / up rows interleaved first for a gated
-        activation), the swizzled scale buffers, the pair tag and the activation's chain (``activation`` defaults to
-        ``SwiGLU()``). A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own
-        (the mode's error names the dimension before any view is built)."""
+        """The weight view of the pair ``quant`` selects: the experts quantized one at a time into the pack on ``device``
+        (the weights' by default; a CUDA device), the gate / up rows interleaved for a gated activation, the pair tag and
+        the activation's chain (``activation`` defaults to ``SwiGLU()``). MXFP8 x MXFP8: the batch-invariant MXFP8 quantizer,
+        the swizzled scale buffers. DeepSeekFp8 x DeepSeekFp8: the class's chain per ``deepseek_fp8_block_size`` x
+        ``deepseek_fp8_block_size`` block (128, or 32: the ``moe.e4m3bs32`` classes; the block scales stay the canonical
+        rows'), the block written into the view and read back at every call. A supplied ``num_local_experts`` /
+        ``hidden_size`` / ``intermediate_size`` must be the weights' own (the mode's error names the dimension before any
+        view is built)."""
         from ..batch_invariant.support import unsupported
-        from .batch_invariant.runner_fp8_block import PAIR_MXFP8, unsupported_pair
+        from .batch_invariant.runner_fp8_block import (
+            PAIR_DEEPSEEK_FP8,
+            PAIR_MXFP8,
+            unsupported_pair,
+        )
+        from .batch_invariant.spec import activation_of
 
+        if quant.pair not in (PAIR_MXFP8, PAIR_DEEPSEEK_FP8):
+            raise unsupported_pair(quant)
+        chain = activation_of(activation if activation is not None else SwiGLU())
         if quant.pair == PAIR_MXFP8:
-            from .batch_invariant.api_mxfp8 import CLASS, MoEWeightsMXFP8
-            from .batch_invariant.spec import activation_of
+            from .batch_invariant.api_mxfp8 import CLASS as cls_name
 
-            chain = activation_of(activation if activation is not None else SwiGLU())
-            if w1.dim() != 3 or w2.dim() != 3:
-                raise TypeError(
-                    "the MXFP8 MoE classes take expert weights w1 [E, N1, H], w2 [E, H, I]"
+            if deepseek_fp8_block_size != 128:
+                raise ValueError(
+                    "deepseek_fp8_block_size is a dimension of the DeepSeekFp8 pair only"
                 )
-            E, n1, H = w1.shape
-            I = n1 // 2 if chain.gated else n1
-            for name, given, own in (
-                ("num_local_experts", num_local_experts, E),
-                ("hidden_size", hidden_size, H),
-                ("intermediate_size", intermediate_size, I),
-            ):
-                if given is not None and given != own:
-                    raise unsupported(
-                        CLASS,
-                        f"{name} {given} with weights of {own} (w1 {tuple(w1.shape)}, {'gated' if chain.gated else 'ungated'})",
-                        "the weights' own geometry (or no dimension arguments)",
-                    )
+        else:
+            from .batch_invariant.api_fp8bs import CLASS, CLASS_OF
+
+            cls_name = CLASS_OF.get(int(deepseek_fp8_block_size), CLASS)
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise TypeError(
+                f"the {cls_name} classes take expert weights w1 [E, N1, H], w2 [E, H, I]"
+            )
+        E, n1, H = w1.shape
+        I = n1 // 2 if chain.gated else n1
+        for name, given, own in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, I),
+        ):
+            if given is not None and given != own:
+                raise unsupported(
+                    cls_name,
+                    f"{name} {given} with weights of {own} (w1 {tuple(w1.shape)}, {'gated' if chain.gated else 'ungated'})",
+                    "the weights' own geometry (or no dimension arguments)",
+                )
+        if quant.pair == PAIR_MXFP8:
+            from .batch_invariant.api_mxfp8 import MoEWeightsMXFP8
+
             return MoEWeightsMXFP8.prepare(
                 w1,
                 w2,
@@ -3586,21 +3639,100 @@ class BatchInvariantFp8BlockConfig:
                 params=chain.params,
                 device=device,
             ).view()
-        raise unsupported_pair(quant)
+        from .batch_invariant.api_fp8bs import MoEWeightsE4M3BS
+
+        return MoEWeightsE4M3BS.prepare(
+            w1,
+            w2,
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+            block=int(deepseek_fp8_block_size),
+            device=device,
+        ).view()
+
+    @staticmethod
+    def from_trtllm_view(
+        view: Dict[str, Any],
+        *,
+        quant: "QuantConfig",
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The DeepSeekFp8 x DeepSeekFp8 weight view from FlashInfer's DeepSeek block-fp8 weight view
+        (``TrtllmFp8BlockConfig.prepare_weights`` under ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: ``gemm1_weights`` /
+        ``gemm1_weights_scale`` / ``gemm2_weights`` / ``gemm2_weights_scale`` of the canonical rows): the caller's block
+        quantization taken as given into the pack on ``device`` (the view's by default; a CUDA device) one expert at a
+        time, the gated weight's quantized rows interleaved here, the scales copied and refused unless finite, positive
+        and normal; the block (128, or 32) is read off the scales' shape. The MXFP8 pair has no such view (TRTLLM-Gen's
+        MXFP8 view is shuffled): it is prepared from the experts by :meth:`prepare_weights`."""
+        from .batch_invariant.api_fp8bs import MoEWeightsE4M3BS
+        from .batch_invariant.runner_fp8_block import (
+            PAIR_DEEPSEEK_FP8,
+            unsupported_pair,
+        )
+        from .batch_invariant.spec import activation_of
+
+        if quant.pair != PAIR_DEEPSEEK_FP8:
+            raise unsupported_pair(
+                quant,
+                served=(PAIR_DEEPSEEK_FP8,),
+                of="`from_trtllm_view` of the fp8-block MoE backend",
+            )
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        return MoEWeightsE4M3BS.prepare(
+            view["gemm1_weights"],
+            view["gemm2_weights"],
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+            quantized=(
+                view["gemm1_weights"],
+                view["gemm1_weights_scale"],
+                view["gemm2_weights"],
+                view["gemm2_weights_scale"],
+            ),
+            block=MoEWeightsE4M3BS.block_of(
+                view["gemm1_weights"], view["gemm1_weights_scale"]
+            ),
+            device=device,
+        ).view()
 
     @staticmethod
     def prepare_activations(
-        hidden_states: torch.Tensor, *, quant: "QuantConfig"
+        hidden_states: torch.Tensor,
+        *,
+        quant: "QuantConfig",
+        deepseek_fp8_block_size: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The activation pack of the pair ``quant`` selects. MXFP8 x MXFP8: the canonical MXFP8 pack by the
-        batch-invariant quantizer, e4m3 ``[T, H]`` and the token-major UE8M0 scales ``[T, H / 32]`` (uint8)."""
-        from .batch_invariant.runner_fp8_block import PAIR_MXFP8, unsupported_pair
+        """The activation pack of the pair ``quant`` selects, from bf16 ``[T, H]``. MXFP8 x MXFP8: the canonical MXFP8 pack
+        by the batch-invariant quantizer, e4m3 ``[T, H]`` and the token-major UE8M0 scales ``[T, H / 32]`` (uint8). DeepSeekFp8
+        x DeepSeekFp8: the class's quantization per 1x``deepseek_fp8_block_size`` block (the ``fp8bs.quant`` kernel:
+        graph-capturable, no host sync), e4m3 ``[T, H]`` and fp32 scales ``[H / block, T]`` (the DeepSeek pair; the block must
+        be the prepared weights')."""
+        from .batch_invariant.runner_fp8_block import (
+            PAIR_DEEPSEEK_FP8,
+            PAIR_MXFP8,
+            unsupported_pair,
+        )
 
         if quant.pair == PAIR_MXFP8:
             from .batch_invariant.api_mxfp8 import quantize_activations_mxfp8
 
+            if deepseek_fp8_block_size != 128:
+                raise ValueError(
+                    "deepseek_fp8_block_size is a dimension of the DeepSeekFp8 pair only"
+                )
             return quantize_activations_mxfp8(
                 hidden_states.to(torch.bfloat16).contiguous()
+            )
+        if quant.pair == PAIR_DEEPSEEK_FP8:
+            from .batch_invariant.api_fp8bs import fp8_block_quantize
+
+            return fp8_block_quantize(
+                hidden_states.to(torch.bfloat16).contiguous(),
+                "MN",
+                block=int(deepseek_fp8_block_size),
             )
         raise unsupported_pair(quant)
 

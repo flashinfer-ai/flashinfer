@@ -71,12 +71,13 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
     ),
-    # the MoE kernels of the bf16, the fp8 per-tensor, the NVFP4 and the MXFP8 classes: the grouped and the swapped GEMM
-    # bodies (one source for every operand format, composing the dense and the block-scaled GEMM blocks: they are in its
-    # closure), the routing, permutation, combine, fp4 scatter and MX scatter kernels; the MoE API, dispatchers and runners
-    # stay outside
+    # the MoE kernels of the bf16, the fp8 per-tensor, the NVFP4, the MXFP8 and the block-scale fp8 classes: the grouped and
+    # the swapped GEMM bodies (one source for every operand format, composing the dense, the block-scaled and the block-scale
+    # fp8 GEMM blocks: they are in its closure), the routing, permutation, combine, fp4 scatter and MX scatter kernels, the
+    # block-scale fp8 quantizer and scale gathers; the MoE API, dispatchers and runners stay outside
     "batch_invariant_moe": (
         "fused_moe/batch_invariant/blocks/compile.py",
+        "fused_moe/batch_invariant/blocks/fp8bs_small.py",
         "fused_moe/batch_invariant/route.py",
         "fused_moe/batch_invariant/route_plan.py",
         "fused_moe/batch_invariant/permute.py",

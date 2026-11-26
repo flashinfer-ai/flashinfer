@@ -581,6 +581,15 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         r1, r2 = self._ranked(int(inputs[_X].shape[0]))
         return [_tactic(c1, c2) for c1 in r1 for c2 in r2]
 
+    def _pick(self, T: int) -> Tuple[Any, Any]:
+        """The dispatcher's records of the two GEMMs at ``T`` tokens (a forward without a tactic)."""
+        r1, r2 = self._ranked(T)
+        return r1[0], r2[0]
+
+    def _configs_of_tactic(self, tactic: Any) -> Tuple[Any, Any]:
+        """The two records of an autotuner tactic (a class whose tactic carries more than the records overrides this)."""
+        return _configs_from_tactic(tuple(tactic))
+
     def _cache_key_extras(self) -> tuple:
         return MoERunner._cache_key_extras(self) + (self.TACTIC_TAG,)
 
@@ -640,10 +649,9 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         )  # the plan's tensors, in the form the class packed them
         self._hidden = int(xs[0].shape[1])
         if tactic == -1 or tactic is None:
-            r1, r2 = self._ranked(int(xs[0].shape[0]))
-            c1, c2 = r1[0], r2[0]
+            c1, c2 = self._pick(int(xs[0].shape[0]))
         else:
-            c1, c2 = _configs_from_tactic(tuple(tactic))
+            c1, c2 = self._configs_of_tactic(tactic)
         w = self._weights_from_tensors(self._activation(), tensors)
         x = xs[0] if na == 1 else tuple(xs)
         return self._launch(x, ids, wts, w, out, c1, c2, plan, inputs)

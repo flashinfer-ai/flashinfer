@@ -225,6 +225,18 @@ class GroupedEpilogueBlock:
         """Whether the chain reads the per-expert auxiliary scales (the static NVFP4 class's chains)."""
         return False
 
+    def record_ok(self, knobs) -> bool:
+        """The chain's own rule on a grouped record beyond the format's (the block-scale fp8 chains' promotion tiles)."""
+        return True
+
+    def swapped_record_ok(self, knobs) -> bool:
+        """The chain's own rule on a swapped record beyond the format's."""
+        return True
+
+    def shape_ok(self, N: int, K: int, E: int) -> bool:
+        """The chain's own operand rule beyond the format's alignment (whole scale blocks of a block-scale weight)."""
+        return True
+
     def tile_scale(self, fp, mAlpha, mSa, mAux, e):
         return None
 
@@ -248,6 +260,10 @@ class GroupedEpilogueBlock:
     def smem_layout(self, epi_warpgroups: int, token_tile: Optional[int] = None):
         """The chain's own shared storage in the grouped body (``token_tile`` None) or the swapped one, as a layout of fp32
         words; None for a chain without one."""
+        return None
+
+    def stage_layout(self):
+        """The chain's own staging rows for its stores in the grouped body, as a layout of bytes; None for a chain without."""
         return None
 
     def grouped_loop(self):

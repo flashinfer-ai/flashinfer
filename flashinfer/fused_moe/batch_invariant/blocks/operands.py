@@ -6,6 +6,11 @@ time, so one grouped body (:mod:`.kernel`) and one swapped body (:mod:`.swap`) s
 * :class:`DenseOperands` -- the dense formats (``bf16`` / ``e4m3``): the format's dtype and alignment, the K-steps per smem
   stage of each body, the mainloop block whose lowering ``mma_loop`` executes and the static plan; the TMA ring is the dense
   GEMM's (one A and one B box per stage).
+* :class:`PromotedOperands` -- the block-scale fp8 format (``e4m3_bs``: the DeepSeek-style classes, 128- or 32-wide blocks
+  with fp32 scales): the dense fp8 fold reset per scale block, the block partials promoted into fp32 register sums by two
+  promotion warpgroups from a ``cp.async`` fp32 scale ring (the dense block-scale body's recipe); the plan is the dense
+  one with the accumulator ring and the scale ring's reserve, the loops are :mod:`.epilogue_fp8bs`'s, the register budgets
+  are reconfigured per role (whole warpgroups: the last warps idle).
 * :class:`BlockScaledOperands` -- the block-scaled formats (the 4-bit ``nvfp4`` / ``mxfp4`` and the 8-bit ``mxfp8`` element
   formats, and the mixed ``mxfp4w8a`` pair of an e4m3 token operand against an e2m1 weight operand, each with the sm_100 /
   sm_103 and the sm_107 instruction class), parametrised by the plan of the instruction class
@@ -22,7 +27,7 @@ time, so one grouped body (:mod:`.kernel`) and one swapped body (:mod:`.swap`) s
   the scale factors and the per-row scales at the padded positions through a second table of group offsets) and ``padded``
   (every group's rows start at an atom; the padding rows, zero-filled by the caller, are computed and never stored).
 
-The interface a body consumes (stable; additions only): ``block_scaled``, ``mixed``, ``in_fmt``, ``packing`` / ``dense_a``,
+The interface a body consumes (stable; additions only): ``block_scaled``, ``mixed``, ``promoted``, ``in_fmt``, ``packing`` / ``dense_a``,
 ``dtype``, ``align``, ``epi_warpgroups``, ``table_bytes``, ``k_blocks(body)``, ``mainloop(body)``, ``plan(...)``,
 ``plan_cls_for(body)``, ``view_tokens(t)`` / ``view_weights(t)``, ``smem_dtypes(st)``, ``tmem_alloc_kwargs(st)``; for the
 block-scaled block also ``sf_dtype``, ``sf_vec``, ``elem_bits``, ``group_align``, ``view_elems(t)``, ``sf_view_rows(...)``,
@@ -52,6 +57,12 @@ from cutlass.pipeline import (
 from cutlass.pipeline.helpers import MbarrierArray
 from cutlass.tensor_utils import LayoutEnum
 
+from ....gemm.batch_invariant.blocks.blockscale_fp8 import (
+    NUM_PROMO_GROUPS,
+    PROMO_REGS,
+    UNIFORM_REGS,
+    acc_stages_for,
+)
 from ....gemm.batch_invariant.blocks.blockscaled import (
     A_RING_MAX_BYTES,
     PLANS,
@@ -82,6 +93,25 @@ from ....gemm.batch_invariant.spec import (
     MX_MIXED_FMTS,
     SF_ATOM_KBLOCKS,
     SF_ATOM_ROWS,
+)
+from ..spec_fp8bs import BLOCK as QBLOCK
+from ..spec_fp8bs import check_block
+from .epilogue_fp8bs import (
+    IN_FMT_BS,
+    NUM_SCALE_STAGES_OF,
+    blocks_per_stage,
+    grouped_blockscale_epilogue_loop,
+    grouped_blockscale_mma_loop,
+    grouped_blockscale_producer_loop,
+    grouped_scale_ring_bytes,
+    n_scale_slots,
+    swap_bs_epilogue_loop,
+    swap_bs_gather_producer_loop,
+    swap_bs_mma_loop,
+    swap_bs_producer_loop,
+    swap_scale_ring_bytes,
+    code_stage_bytes,
+    xch_floats,
 )
 from .scheduler import EPI_WARPGROUPS_DENSE, MAX_E
 
@@ -115,6 +145,7 @@ class DenseOperands:
 
     in_fmt: str = "bf16"
     block_scaled = False
+    promoted = False
     mixed = False  # one element format for both operands
     packing: str = "dense"
 
@@ -373,6 +404,7 @@ class BlockScaledOperands:
     in_fmt: str = "nvfp4"
     packing: str = "dense"
     block_scaled = True
+    promoted = False
 
     def __post_init__(self):
         assert self.in_fmt in BLOCK_SCALED and (
@@ -518,11 +550,173 @@ class BlockScaledOperands:
         )
 
 
-def operands_for(in_fmt: str, packing: str = "dense"):
-    """The operand block of a chain's format: the dense block for ``bf16`` / ``e4m3``, the block-scaled one otherwise."""
+@dataclass(frozen=True)
+class PromotedOperands:
+    """The operand block of the block-scale fp8 format (``e4m3_bs``), parametrised by the class's scale block (128 / 32) and
+    the weight's gate / up row interleave (read off the chain: :class:`.epilogue_fp8bs.Fp8BsChain`). The operand ring is the
+    dense fp8 plan's with the accumulator ring the promotion drains (``acc_stages_for``) and the fp32 scale ring's reserve;
+    the bodies' promoted branches run the loops of :mod:`.epilogue_fp8bs` (the scale-ring producer beside the TMA, the
+    per-block MMA commits, the promotion epilogue) with the register budgets of the dense block-scale body."""
+
+    block: int = QBLOCK
+    interleaved: bool = True
+    in_fmt = IN_FMT_BS
+    block_scaled = False
+    promoted = True
+    mixed = False  # one element format for both operands
+    packing = "dense"
+
+    def __post_init__(self):
+        check_block(self.block)
+
+    @property
+    def dense_a(self) -> bool:
+        return True
+
+    @property
+    def dtype(self):
+        return IN_DT[self.in_fmt]
+
+    def view_tokens(self, t: cute.Tensor) -> cute.Tensor:
+        """The token operand as the TMA reads it (the dense e4m3 rows: as given)."""
+        return t
+
+    def view_weights(self, t: cute.Tensor) -> cute.Tensor:
+        """The weight operand as the TMA reads it (as given)."""
+        return t
+
+    @staticmethod
+    def smem_dtypes(st):
+        """The element types of the A and B smem rings: the operands' own (the dense plan has no container)."""
+        return st.a_dtype, st.b_dtype
+
+    @property
+    def align(self) -> int:
+        return ALIGN[self.in_fmt]
+
+    @property
+    def epi_warpgroups(self) -> int:
+        """The two promotion warpgroups (each a contiguous column half of the tile)."""
+        return NUM_PROMO_GROUPS
+
+    @property
+    def table_bytes(self) -> int:
+        return 2 * (MAX_E + 1) * 4
+
+    @property
+    def spb(self) -> int:
+        """Scale blocks per 128-element smem stage (1 for the 128-wide class, 4 for the 32-wide one)."""
+        return blocks_per_stage(self.block)
+
+    @property
+    def n_scale_stages(self) -> int:
+        return NUM_SCALE_STAGES_OF[self.block]
+
+    @property
+    def regs(self):
+        """``(promotion warps, every other warp)`` register budgets per thread (``setmaxnreg``)."""
+        return PROMO_REGS, UNIFORM_REGS
+
+    def k_blocks(self, body: str) -> Optional[int]:
+        return None
+
+    def mainloop(self, body: str) -> MainloopBlock:
+        return MainloopBlock(self.in_fmt)
+
+    @property
+    def xch_reserve_bytes(self) -> int:
+        """The fused requantization's half-block amax exchange and its code staging rows (the 128-wide class's), held back from
+        the grouped ring for every chain of the class: the quantising and the plain spellings of a record share one plan (one
+        ring depth per record)."""
+        return 4 * xch_floats() + (code_stage_bytes() if self.block == QBLOCK else 0)
+
+    def scale_ring_bytes(self, knobs: Knobs, body: str) -> int:
+        """Smem of the fp32 scale ring: per stage the tile's row (token) scales and its weight slot scales, ``spb`` blocks each."""
+        if body == "grouped":
+            return grouped_scale_ring_bytes(knobs, self.block, self.interleaved)
+        return swap_scale_ring_bytes(knobs, self.block, self.interleaved)
+
+    def plan(self, knobs: Knobs, a, b, extra_smem_bytes: int, body: str) -> StaticPlan:
+        """The dense fp8 plan with the promotion's accumulator ring and the scale ring's reserve (the swapped body passes its
+        record's dense twin: the tiles are the same). The plan's knob rule is the format's for the grouped records; the
+        swapped records are the MoE class's own (a 64-row weight tile, 8- to 64-token tiles: the dense block-scale class's rule
+        does not admit them), so their dense twins are checked under the dense bf16 rule, as the class's swapped body did (the
+        rule names the admissible tiles; the instruction and the stage follow the operand dtypes)."""
+        assert a.element_type is self.dtype and b.element_type is self.dtype, (
+            a.element_type,
+            b.element_type,
+            self.in_fmt,
+        )
+        return StaticPlan(
+            knobs,
+            a.element_type,
+            b.element_type,
+            ACC_DTYPE,
+            LayoutEnum.from_tensor(a).mma_major_mode(),
+            LayoutEnum.from_tensor(b).mma_major_mode(),
+            LayoutEnum.ROW_MAJOR,
+            c_in_smem=False,
+            extra_smem_bytes=extra_smem_bytes,
+            in_fmt=self.in_fmt if body == "grouped" else "bf16",
+            acc_stages=acc_stages_for(knobs),
+            reserve_smem_bytes=self.scale_ring_bytes(knobs, body)
+            + (self.xch_reserve_bytes if body == "grouped" else 0),
+        )
+
+    def tmem_alloc_kwargs(self, st) -> dict:
+        return {}
+
+    def scale_rings(self, smem, st, body: str):
+        """The fp32 scale ring in shared memory (built inside the kernel): ``(rows, spb, stages)`` for the tile's row scales
+        (the CTA tile's rows in the grouped body, the token tile in the swapped one) and ``(slots, spb, stages)`` for the weight
+        tile's slot scales (:func:`.epilogue_fp8bs.n_scale_slots`), a row's or a slot's ``spb`` scales contiguous."""
+        rows, cols = st.cta_tile_shape_mnk[0], st.cta_tile_shape_mnk[1]
+        if body != "grouped":
+            rows, cols = (
+                cols,
+                rows,
+            )  # the swapped body: the tokens on N, the weight rows on M
+        slots = n_scale_slots(cols, self.block, self.interleaved)
+        spb, n = self.spb, self.n_scale_stages
+        sfa = smem.allocate_tensor(
+            element_type=ACC_DTYPE,
+            layout=cute.make_layout((rows, spb, n), stride=(spb, 1, rows * spb)),
+            byte_alignment=16,
+        )
+        sfb = smem.allocate_tensor(
+            element_type=ACC_DTYPE,
+            layout=cute.make_layout((slots, spb, n), stride=(spb, 1, slots * spb)),
+            byte_alignment=16,
+        )
+        return sfa, sfb
+
+    def producer_loop(self, body: str):
+        if body == "grouped":
+            return grouped_blockscale_producer_loop
+        if body == "gather":
+            return swap_bs_gather_producer_loop
+        return swap_bs_producer_loop
+
+    def mma_loop_fn(self, body: str):
+        return grouped_blockscale_mma_loop if body == "grouped" else swap_bs_mma_loop
+
+    def epilogue_loop(self, body: str):
+        return (
+            grouped_blockscale_epilogue_loop
+            if body == "grouped"
+            else swap_bs_epilogue_loop
+        )
+
+
+def operands_for(in_fmt: str, packing: str = "dense", chain=None):
+    """The operand block of a chain's format: the dense block for ``bf16`` / ``e4m3``, the promoted block for the block-scale
+    fp8 format (its block and weight interleave read off the chain), the block-scaled one otherwise."""
     if in_fmt in K_BLOCKS_OF["grouped"]:
         assert packing == "dense", (in_fmt, packing)
         return DenseOperands(in_fmt)
+    if in_fmt == IN_FMT_BS:
+        assert packing == "dense" and chain is not None, (in_fmt, packing, chain)
+        return PromotedOperands(chain.block, chain.il)
     return BlockScaledOperands(in_fmt, packing)
 
 

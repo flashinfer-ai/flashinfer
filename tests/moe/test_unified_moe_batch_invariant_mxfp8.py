@@ -217,7 +217,7 @@ def _routed_pack(x, ids, weights, packed=False) -> MoEActivationPack:
 def test_backend_is_registered_and_never_a_default_candidate():
     """The config is a known backend of the layer, mapped to the fp8-block runner, absent from the default candidates; the
     runner declares the three routing modes, every activation class of the layer and the pairs it serves (MXFP8 x MXFP8
-    here, run by the pair's runner); a pair it does not serve is not admitted."""
+    among them, run by this pair's runner); a pair it does not serve is not admitted."""
     assert BatchInvariantFp8BlockConfig in ALL_BACKEND_CONFIGS
     assert (
         _BACKEND_RUNNERS[BatchInvariantFp8BlockConfig] is BatchInvariantFp8BlockRunner
@@ -235,11 +235,11 @@ def test_backend_is_registered_and_never_a_default_candidate():
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     }
-    assert (
-        BatchInvariantFp8BlockRunner.supported_quant_variants
-        == BatchInvariantMxfp8Runner.supported_quant_variants
-        == ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    assert BatchInvariantMxfp8Runner.supported_quant_variants == (
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
     )
+    assert _QUANT.pair in BatchInvariantFp8BlockRunner.supported_quant_variants
+    assert BatchInvariantFp8BlockRunner.supports_quant(_QUANT)
     assert issubclass(BatchInvariantMxfp8Runner, BatchInvariantFp8BlockRunner)
     assert (
         BatchInvariantFp8BlockRunner.implementation(_QUANT.pair)
@@ -260,11 +260,8 @@ def test_backend_is_registered_and_never_a_default_candidate():
     }
     assert KEY == "batch_invariant_fp8_block"
     assert repr(BatchInvariantFp8BlockConfig()) == "BatchInvariantFp8BlockConfig()"
-    deepseek = QuantConfig(
-        weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
-    )
-    assert not BatchInvariantFp8BlockRunner.supports_quant(deepseek)
-    assert BatchInvariantFp8BlockRunner.implementation(deepseek.pair) is None
+    assert not BatchInvariantFp8BlockRunner.supports_quant(QuantConfig())
+    assert BatchInvariantFp8BlockRunner.implementation(QuantConfig().pair) is None
 
 
 def test_fingerprint_dimensions_and_classes():
@@ -784,7 +781,7 @@ def test_unsupported_device_and_quant_raise_before_any_kernel():
     assert "moe.mxfp8" in str(excinfo.value) and "cpu" in str(excinfo.value)
     for quant in (
         QuantConfig(),
-        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     ):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),

@@ -87,6 +87,7 @@ inductive GTerm where
   | bias (n : ColData)
   | sfaBlk (a : RowData) (kb : Nat)
   | sfbBlk (b : ColData) (kb : Nat)
+  | sfbBlk32 (b : ColData) (kb : Nat)
   deriving DecidableEq, Repr
 
 /-- Fold the K-steps `t0, t0+1, ..., t0+n-1` in ascending order onto `acc`. -/
@@ -446,6 +447,7 @@ structure Prims (α : Type) where
   bias : ColData → α
   sfaBlk : RowData → Nat → α
   sfbBlk : ColData → Nat → α
+  sfbBlk32 : ColData → Nat → α
 
 variable {α : Type}
 
@@ -469,6 +471,7 @@ def eval (P : Prims α) : GTerm → α
   | .bias n => P.bias n
   | .sfaBlk a kb => P.sfaBlk a kb
   | .sfbBlk b kb => P.sfbBlk b kb
+  | .sfbBlk32 b kb => P.sfbBlk32 b kb
 
 /-- **R1 determinism** at the semantic level: evaluation is a function; two executions of the same term under the
 same interpretation agree. -/

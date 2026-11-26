@@ -891,6 +891,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `batch_invariant_fp4` | `BatchInvariantFp4Config` | `MXFP4×MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp4` | `BatchInvariantFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp4` | `BatchInvariantFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `batch_invariant_fp8_block` | `BatchInvariantFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp8_block` | `BatchInvariantFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp8_per_tensor` | `BatchInvariantFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
@@ -980,6 +981,14 @@ quantizer's chain, so no SFU table enters the bits; the one architecture dimensi
 class of the part (the SM107 step folds 64 elements, the SM100 / SM103 step 32; the SM100 / SM103 mixed step reads the
 e2m1 weight in 128-element runs, so `H` and `I` are multiples of 128 there), carried by `fingerprint("fused_moe_mxfp8",
 ..., arch=)` / `fingerprint("fused_moe_mxfp4w8a", ..., arch=)`.
+
+The fp8-block backend's DeepSeekFp8×DeepSeekFp8 pair (the block-scale classes `moe.e4m3bs.<act>` at 128-wide blocks and
+`moe.e4m3bs32.<act>` at 32-wide ones) is exact as well: the fp32 block scales are multiplied into the promotion of the fp8
+instruction's fold per block (`fma.rn(mul.rn(s_a, s_b), P_kb, acc)` in block order), GEMM1's chain is the bf16 backend's
+declared sequence and the intermediate's requantization is the `fp8bs.quant` chain (the block amax, `fmax(amax / 448, 1e-12)`,
+one correctly rounded reciprocal, the saturating conversion), so no SFU table enters the bits; the fp8 instruction folds the
+same 32 elements on every part, so these classes have no architecture dimension (`fingerprint("fused_moe_fp8bs", ...)` takes
+none).
 
 For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
 [usage, qualification and extension guide](../frost_low_latency_moe.md).

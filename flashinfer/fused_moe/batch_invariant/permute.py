@@ -232,9 +232,27 @@ class PlanKernel:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         e, _, _ = cute.arch.block_idx()
+        cute.arch.griddepcontrol_wait()  # no trigger: the dependent is a one-wave grid whose waiting CTAs would crowd this one out
+        self.cta(mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, n, E, e, tidx)
+
+    @cute.jit
+    def cta(
+        self,
+        mExp: cute.Tensor,
+        mCounts: cute.Tensor,
+        mDest: cute.Tensor,
+        mSrc: cute.Tensor,
+        mDestPad: cute.Tensor,
+        mPosPad: cute.Tensor,
+        n: Int32,
+        E: Int32,
+        e: Int32,
+        tidx: Int32,
+    ):
+        """The plan CTA of expert ``e`` (``self.threads`` threads): the body of :meth:`kernel`, also run by the block-scale
+        classes' plan + quantizer launch (:class:`.blocks.fp8bs_small.PlanQuantKernel`) in its first ``E`` CTAs."""
         warp = tidx // LANES
         lane = cute.arch.lane_idx()
-        cute.arch.griddepcontrol_wait()  # no trigger: the dependent is a one-wave grid whose waiting CTAs would crowd this one out
         smem = cutlass.utils.SmemAllocator()
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E,)), byte_alignment=16

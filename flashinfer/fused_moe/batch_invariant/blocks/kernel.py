@@ -4,13 +4,15 @@
 group scheduler, with per-tile TMA coordinates (A offset by the group's rows through ``cute.domain_offset``, B indexed by
 the expert as the batch coordinate) and the group-masked epilogue.
 
-One body for the bf16, the fp8 per-tensor, the NVFP4 and the MXFP8 classes: the operand block (:class:`.operands.DenseOperands`, keyed
+One body for the bf16, the fp8 per-tensor, the NVFP4, the MXFP8 and the block-scale fp8 classes: the operand block (:class:`.operands.DenseOperands`, keyed
 by the chain's operand format: the format's dtype, alignment, K-steps per stage, mainloop block and static plan; or
 :class:`.operands.BlockScaledOperands`: the block-scaled plan of the instruction class, a scale-factor ring beside each
 operand ring, the scale factors staged to TMEM per k-tile, the group tables at the 128-row scale atom with the dense packing's
 second table) and the epilogue block (the chain, :class:`.epilogue.GroupedEpilogueBlock`: the bf16 chains, the W8A8 chains
 with their scale operands, the W4A4 chains with the per-row scale and the static class's fused quantization, the MX chains
-with the fused requantization's own loop and exchange buffer) are resolved at
+with the fused requantization's own loop and exchange buffer; the block-scale fp8 chains on
+:class:`.operands.PromotedOperands`: the dense fp8 fold reset per scale block, the partials promoted by the epilogue
+warpgroups from an fp32 scale ring, the chain and the store from registers) are resolved at
 trace time, so every format-dependent choice is a ``const_expr`` branch and each format compiles to its own kernel.
 
 Operands: A ``(Tk, K, 1)`` K-major (the permuted activations; for the 4-bit formats the byte-packed ``(rows, K / 2, 1)``
@@ -102,12 +104,15 @@ class GroupedBlockGemm:
         assert isinstance(chain, GroupedEpilogueBlock), chain
         self.knobs, self.chain, self.out_fmt = knobs, chain, chain.out_fmt
         self.in_fmt = chain.in_fmt
-        self.operands = operands_for(self.in_fmt, packing)
+        self.operands = operands_for(self.in_fmt, packing, chain=chain)
         self.cluster_shape_mn = knobs.cluster_shape_mn
         self.epi_warpgroups = self.operands.epi_warpgroups
         self.epilogue_warps, self.mma_warp, self.tma_warp, self.threads = warp_roles(
             self.epi_warpgroups
         )
+        if self.operands.promoted:
+            # whole warpgroups (the register reconfiguration is a warpgroup instruction): the last warps idle
+            self.threads = 32 * (-(-(self.tma_warp + 1) // 4) * 4)
 
     @cute.jit
     def __call__(
@@ -189,8 +194,11 @@ class GroupedBlockGemm:
     ):
         """The entry of the block-scaled chains without further operands (the MX classes, MXFP8 and MXFP4: the e8m0 scales of both operands
         are applied inside the instruction, no global or per-row scale): ``rows_sf`` the rows of the A operand's scale-factor
-        buffer (the padded row count of the dense packing)."""
-        assert self.operands.block_scaled and not self.chain.operands, self.chain
+        buffer (the padded row count of the dense packing); the block-scale fp8 chains (``sfa`` / ``sfb`` their fp32 block
+        scales, ``rows_sf`` unread)."""
+        assert (
+            self.operands.block_scaled or self.operands.promoted
+        ) and not self.chain.operands, self.chain
         assert not self.chain.quant, self.chain
         self._launch(
             a,
@@ -218,10 +226,12 @@ class GroupedBlockGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """The entry of the block-scaled chains without further operands whose epilogue quantizes (the MXFP8 classes' fused
-        requantization, ``chain.quant``): ``out`` the codes (uint8), ``out_sf`` the flat 128x4 scale bytes at the (padded)
-        row positions of ``rows_sf`` rows."""
-        assert self.operands.block_scaled and not self.chain.operands, self.chain
+        """The entry of the block-scaled chains without further operands whose epilogue quantizes (``chain.quant``: the MXFP8
+        classes' fused requantization -- ``out`` the codes (uint8), ``out_sf`` the flat 128x4 scale bytes at the (padded) row
+        positions of ``rows_sf`` rows; the block-scale fp8 classes' -- ``out_sf`` the fp32 block scales ``(Nout / 128, Tk)``)."""
+        assert (
+            self.operands.block_scaled or self.operands.promoted
+        ) and not self.chain.operands, self.chain
         assert self.chain.quant, self.chain
         self._launch(
             a,
@@ -329,10 +339,15 @@ class GroupedBlockGemm:
                 "the grouped body takes the dense records"
             )
         else:
-            assert self.xch_layout is None, self.chain
+            assert self.xch_layout is None or ops.promoted, self.chain
+            # the promoted plan holds the exchange buffer's bytes back for every chain (:meth:`.operands.PromotedOperands.plan`):
+            # one ring depth per record, whichever spelling of the chain runs
+            xch = 0 if ops.promoted else xch_smem_bytes(self.xch_layout)
 
             def plan(extra: int):
-                return ops.plan(self.knobs, a, b, TABLE_SMEM_BYTES + extra, "grouped")
+                return ops.plan(
+                    self.knobs, a, b, TABLE_SMEM_BYTES + xch + extra, "grouped"
+                )
 
             st = plan(0)
             if self.staged:
@@ -406,6 +421,9 @@ class GroupedBlockGemm:
                 alpha,
                 sa,
                 si,
+                mSFA_mkl=sfa,
+                mSFB_nkl=sfb,
+                mOutSf=out_sf,
             ).launch(
                 grid=grid,
                 block=[self.threads, 1, 1],
@@ -448,6 +466,9 @@ class GroupedBlockGemm:
         st = self.st
         ops = self.operands
         bs = ops.block_scaled
+        pr = (
+            ops.promoted
+        )  # the block-scale fp8 format: the fp32 scale ring and the promotion epilogue
         epilogue_warps, mma_warp, tma_warp = (
             self.epilogue_warps,
             self.mma_warp,
@@ -482,17 +503,42 @@ class GroupedBlockGemm:
         Tk = mA_mkl.shape[0]
 
         # --- scaffolding: barriers, pipelines, TMEM allocator, the group tables
-        @cute.struct
-        class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_ab_stage * 2]
-            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, st.num_acc_stage * 2]
-            tmem_dealloc_mbar: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-            group_off: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
-            group_pre: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
-
         smem = cutlass.memory.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
+        if cutlass.const_expr(pr):
+
+            @cute.struct
+            class SharedStoragePromoted:
+                ab_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, st.num_ab_stage * 2
+                ]
+                acc_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, st.num_acc_stage * 2
+                ]
+                scale_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, ops.n_scale_stages * 2
+                ]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                group_off: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
+                group_pre: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
+
+            storage = smem.allocate(SharedStoragePromoted)
+        else:
+
+            @cute.struct
+            class SharedStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, st.num_ab_stage * 2
+                ]
+                acc_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, st.num_acc_stage * 2
+                ]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                group_off: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
+                group_pre: cute.struct.MemRange[cutlass.Int32, MAX_E + 1]
+
+            storage = smem.allocate(SharedStorage)
         ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=st.num_ab_stage,
@@ -514,6 +560,18 @@ class GroupedBlockGemm:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
+        scale_pipeline = None
+        if cutlass.const_expr(pr):
+            # the fp32 scale ring: the TMA warp's lanes produce by cp.async, the promotion warpgroups consume
+            scale_pipeline = pipeline.PipelineCpAsync.create(
+                barrier_storage=storage.scale_mbar_ptr.data_ptr(),
+                num_stages=ops.n_scale_stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, 32 * len(epilogue_warps)
+                ),
+                defer_sync=True,
+            )
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(epilogue_warps) + 1)
         )
@@ -586,6 +644,9 @@ class GroupedBlockGemm:
                 layout=sfb_smem_layout_staged,
                 byte_alignment=128,
             )
+        sSFA32 = sSFB32 = None
+        if cutlass.const_expr(pr):
+            sSFA32, sSFB32 = ops.scale_rings(smem, st, "grouped")
         sX = None
         if cutlass.const_expr(self.xch_layout is not None):
             # a quantising chain's exchange buffer (the fused requantization's half-block amax between the warpgroups of a pair);
@@ -594,6 +655,14 @@ class GroupedBlockGemm:
                 element_type=cutlass.Float32,
                 layout=self.chain.smem_layout(self.epi_warpgroups),
                 byte_alignment=16,
+            )
+        sQ = None
+        if cutlass.const_expr(self.chain.stage_layout() is not None):
+            # a quantising chain's staging rows (the fused requantization's code stores, one round of rows per promotion warp)
+            sQ = smem.allocate_tensor(
+                element_type=cutlass.Uint8,
+                layout=self.chain.stage_layout(),
+                byte_alignment=128,
             )
         sC = None
         if cutlass.const_expr(self.staged):  # one output subtile per epilogue warpgroup
@@ -690,6 +759,10 @@ class GroupedBlockGemm:
             )
         mma_m_in_cluster = block_in_cluster_coord_vmnk[1]
         cta_n_in_cluster = block_in_cluster_coord_vmnk[2]
+        # this CTA's first row inside the cluster tile: the M coordinate's block of the MMA tile's rows, then the pair member's half
+        cta_row_rel = mma_m_in_cluster * Int32(
+            st.mma_tiler[0]
+        ) + mma_tile_coord_v * Int32(st.cta_tile_shape_mnk[0])
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         cute.arch.barrier()  # the group tables are complete
 
@@ -697,6 +770,8 @@ class GroupedBlockGemm:
         tn, cn = st.mma_tiler[1], self.cluster_shape_mn[1]
         # --- roles
         if warp_idx == tma_warp:
+            if cutlass.const_expr(pr):
+                cute.arch.setmaxregister_decrease(ops.regs[1])
             tile_sched = GroupScheduler.create(
                 s_off,
                 s_pre,
@@ -709,6 +784,7 @@ class GroupedBlockGemm:
                 raster_m,
                 mma_m_in_cluster,
                 cta_n_in_cluster,
+                branchless=ops.promoted,
             )
             if cutlass.const_expr(bs):
                 grouped_blockscaled_producer_loop(
@@ -738,6 +814,34 @@ class GroupedBlockGemm:
                     s_off,
                     s_off_pad,
                 )
+            elif cutlass.const_expr(pr):
+                ops.producer_loop("grouped")(
+                    st,
+                    k_tile_cnt,
+                    tile_sched,
+                    ab_producer,
+                    tma_atom_a,
+                    tma_atom_b,
+                    mA_mkl,
+                    tBgB,
+                    sA,
+                    tBsB,
+                    thr_mma,
+                    block_in_cluster_coord_vmnk[2],
+                    a_cta_layout,
+                    mma_m_in_cluster,
+                    a_full_mcast_mask,
+                    b_full_mcast_mask,
+                    scale_pipeline,
+                    mSFA_mkl,
+                    mSFB_nkl,
+                    sSFA32,
+                    sSFB32,
+                    cta_row_rel,
+                    Tk,
+                    ops.interleaved,
+                    ops.block,
+                )
             else:
                 grouped_tma_producer_loop(
                     st,
@@ -758,6 +862,8 @@ class GroupedBlockGemm:
                     b_full_mcast_mask,
                 )
         if warp_idx == mma_warp:
+            if cutlass.const_expr(pr):
+                cute.arch.setmaxregister_decrease(ops.regs[1])
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -773,8 +879,24 @@ class GroupedBlockGemm:
                 raster_m,
                 mma_m_in_cluster,
                 cta_n_in_cluster,
+                branchless=ops.promoted,
             )
-            if cutlass.const_expr(bs):
+            if cutlass.const_expr(pr):
+                ops.mma_loop_fn("grouped")(
+                    self.lowering,
+                    ops.spb,
+                    st.num_acc_stage,
+                    k_tile_cnt,
+                    is_leader_cta,
+                    tile_sched,
+                    tiled_mma,
+                    ab_consumer,
+                    acc_pipeline,
+                    tCrA,
+                    tCrB,
+                    tCtAcc_base,
+                )
+            elif cutlass.const_expr(bs):
                 tCtSFA = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + st.num_acc_tmem_cols, dtype=st.sf_dtype),
                     tCtSFA_layout,
@@ -819,6 +941,8 @@ class GroupedBlockGemm:
                     tCtAcc_base,
                 )
         if warp_idx < mma_warp:
+            if cutlass.const_expr(pr):
+                cute.arch.setmaxregister_increase(ops.regs[0])
             tmem.allocate(st.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
@@ -835,9 +959,39 @@ class GroupedBlockGemm:
                 raster_m,
                 mma_m_in_cluster,
                 cta_n_in_cluster,
+                branchless=ops.promoted,
             )
             quant_loop = self.chain.grouped_loop()
-            if cutlass.const_expr(quant_loop is not None):
+            if cutlass.const_expr(pr):
+                # the promotion epilogue: the block partials folded with the fp32 scale products into register sums, then the
+                # chain and the store (the staged bf16 store, the direct f32 store or the fused requantization)
+                ops.epilogue_loop("grouped")(
+                    st,
+                    self.chain,
+                    ops.interleaved,
+                    tidx,
+                    warp_idx,
+                    tile_sched,
+                    tCtAcc_base,
+                    thr_mma,
+                    mOut,
+                    mOutSf,
+                    Tk,
+                    N,
+                    epi_tile,
+                    acc_pipeline,
+                    scale_pipeline,
+                    sSFA32,
+                    sSFB32,
+                    k_tile_cnt,
+                    mma_m_in_cluster,
+                    cta_row_rel,
+                    sC,
+                    sX,
+                    ops.block,
+                    sQ=sQ,
+                )
+            elif cutlass.const_expr(quant_loop is not None):
                 # a quantising chain's own epilogue (the MXFP8 classes' fused requantization: the codes and the 128x4 block
                 # scales of the bf16-rounded chain, the scale bytes at the padded positions)
                 quant_loop(
@@ -891,6 +1045,11 @@ class GroupedBlockGemm:
             # staged store's barriers join one group only)
             epi_join.arrive_and_wait()
             tmem.free(tmem_ptr)
+        if cutlass.const_expr(pr):
+            if warp_idx > tma_warp:
+                cute.arch.setmaxregister_decrease(
+                    ops.regs[1]
+                )  # the warps padding the last warpgroup: no role
 
 
 @cute.jit

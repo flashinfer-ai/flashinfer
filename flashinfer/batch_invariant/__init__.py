@@ -428,6 +428,56 @@ def _moe_nvfp4_fingerprint(
     )
 
 
+def _moe_fp8bs_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    deepseek_fp8_block_size: int = 128,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The block-scale fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
+    ``QuantConfig(DeepSeekFp8, DeepSeekFp8)``: the dimensions of :func:`_moe_class_terms` (the routing method with
+    ``DeepSeekV3``'s groups, the activation with its scalars and gating) under the class's complete shape rule (the
+    layer's: a shape the runner refuses has no receipt) and the scale block size (``deepseek_fp8_block_size``: 128 for
+    ``moe.e4m3bs.<act>``, 32 for ``moe.e4m3bs32.<act>``, a dimension of the class); the block scales, like the operands,
+    are inputs, and the fp8 instruction folds the same 32 elements on every part, so there is no architecture dimension."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8bs import check_shape_fp8bs
+    from flashinfer.fused_moe.batch_invariant.spec_fp8bs import (
+        BLOCK,
+        check_block,
+        spec_fingerprint_fp8bs,
+    )
+
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % BLOCK:
+            raise ValueError(
+                f"fingerprint('fused_moe_fp8bs'): {dim} {value} must be a positive multiple of {BLOCK} "
+                "(whole scale blocks of every operand)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_fp8bs",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    block = check_block(int(deepseek_fp8_block_size))
+    check_shape_fp8bs(H, I, num_experts, top_k, block)
+    return spec_fingerprint_fp8bs(
+        H, I, top_k, num_experts, rm, name, params, gated, block=block
+    )
+
+
 def _moe_mxfp4_fingerprint(
     H: int,
     I: int,
@@ -914,6 +964,23 @@ CLASSES: Dict[str, ClassInfo] = {
             "gated",
             "arch",
             "intermediate",
+            "n_group",
+            "topk_group",
+        ),
+    ),
+    # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(DeepSeekFp8, DeepSeekFp8)`: the same
+    # dimensions as `fused_moe` for the DeepSeek-style block-scale classes `moe.e4m3bs.<act>` (the block scales are inputs of
+    # the class: their values never enter the identifier), the scale block size a dimension
+    "fused_moe_fp8bs": ClassInfo(
+        "moe.e4m3bs",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_fp8bs_fingerprint,
+        (
+            "method",
+            "act",
+            "params",
+            "gated",
+            "deepseek_fp8_block_size",
             "n_group",
             "topk_group",
         ),

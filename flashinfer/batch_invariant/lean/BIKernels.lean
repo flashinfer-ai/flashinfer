@@ -26,6 +26,9 @@ import BIKernels.MoEMxfp4
 import BIKernels.MoEMxfp4Cases
 import BIKernels.MegaMoE
 import BIKernels.MegaMoECases
+import BIKernels.FP8BlockQuant
+import BIKernels.MoEFp8Bs
+import BIKernels.MoEFp8BsCases
 import BIKernels.MoEMxfp8
 import BIKernels.MoEMxfp8Cases
 import BIKernels.MoEMxfp4w8a

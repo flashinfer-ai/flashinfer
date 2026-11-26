@@ -212,7 +212,9 @@ def build_group_tables_dual(
 class GroupScheduler:
     """Persistent walk over the cluster tiles of all groups. ``cluster_rows`` = CTA tile rows x cluster M (the rows one
     cluster tile covers), ``cn`` = cluster N, ``raster_m``: m-blocks fastest inside a group (consecutive clusters share
-    the expert's B tile) or n-tiles fastest."""
+    the expert's B tile) or n-tiles fastest; ``branchless``: the tile decode runs unconditionally with its index and
+    block count clamped (the promoted bodies' placement, whose register-tight epilogues would spill around a branch), else
+    inside a branch on the tile count (the other bodies' code, unchanged)."""
 
     def __init__(
         self,
@@ -229,8 +231,10 @@ class GroupScheduler:
         cta_m_in_cluster,
         cta_n_in_cluster,
         raster_m,
+        branchless=False,
     ):
         self.s_off, self.s_pre, self.counts = s_off, s_pre, counts
+        self.branchless = branchless
         self.E, self.n_tiles, self.total, self.stride, self.linear = (
             Int32(E),
             Int32(n_tiles),
@@ -275,6 +279,7 @@ class GroupScheduler:
             self.cta_m_in_cluster,
             self.cta_n_in_cluster,
             self.raster_m,
+            self.branchless,
         )
 
     @staticmethod
@@ -291,10 +296,11 @@ class GroupScheduler:
         raster_m: cutlass.Constexpr,
         cta_m_in_cluster,
         cta_n_in_cluster,
+        branchless: cutlass.Constexpr = False,
     ):
         """After ``build_group_tables`` and a CTA barrier. The linear index starts at the cluster's index in the grid and
         advances by the number of clusters. ``counts`` (global) gives the group's real end for the store mask (``s_off``
-        may be padded)."""
+        may be padded). ``branchless``: the promoted bodies' decode placement (the same integers)."""
         n_tiles = (N + Int32(tn * cn - 1)) // Int32(tn * cn)
         total = s_pre[MAX_E] * n_tiles
         cid = cute.arch.cluster_idx()
@@ -315,21 +321,20 @@ class GroupScheduler:
             cta_m_in_cluster,
             cta_n_in_cluster,
             raster_m,
+            branchless,
         )
 
     @cute.jit
     def get_current_work(self) -> GroupWorkTile:
         valid = self.linear < self.total
-        e = Int32(0)
-        row0 = Int32(0)
-        row_end = Int32(0)
-        n_tile = Int32(0)
-        # no cluster tile at all (every count zero: every slot dropped, or an expert-parallel rank without a local hit):
-        # the tile is invalid before the decode, whose last group would have no row blocks to divide by
-        if self.total > Int32(0):
+        if cutlass.const_expr(self.branchless):
+            # the promoted bodies' placement: the decode runs unconditionally (a branch around it would hold its outputs
+            # live across the consumer's whole tile, a spill for the register-tight promotion epilogues); with no cluster
+            # tile at all the clamped index decodes the last group, whose block count is clamped to one so nothing divides
+            # by zero; the tile is invalid and nothing reads its fields
             L = cutlass.min(self.linear, self.total - Int32(1))
+            L = cutlass.max(L, Int32(0))
             blk = L // self.n_tiles
-            # largest e with s_pre[e] <= blk, e in [0, E)
             lo = Int32(0)
             hi = self.E - Int32(1)
             while lo < hi:
@@ -340,7 +345,7 @@ class GroupScheduler:
                     hi = mid - Int32(1)
             e = lo
             local = L - self.s_pre[e] * self.n_tiles
-            mb = self.s_pre[e + Int32(1)] - self.s_pre[e]
+            mb = cutlass.max(self.s_pre[e + Int32(1)] - self.s_pre[e], Int32(1))
             m_block = Int32(0)
             n_block = Int32(0)
             if cutlass.const_expr(self.raster_m):
@@ -350,10 +355,43 @@ class GroupScheduler:
                 n_block = local % self.n_tiles
                 m_block = local // self.n_tiles
             row0 = self.s_off[e] + m_block * Int32(self.cluster_rows)
-            row_end = (
-                self.s_off[e] + self.counts[e]
-            )  # the real end: rows past it belong to the padding or to other groups
+            row_end = self.s_off[e] + self.counts[e]
             n_tile = n_block * Int32(self.cn) + self.cta_n_in_cluster
+        else:
+            e = Int32(0)
+            row0 = Int32(0)
+            row_end = Int32(0)
+            n_tile = Int32(0)
+            # no cluster tile at all (every count zero: every slot dropped, or an expert-parallel rank without a local
+            # hit): the tile is invalid before the decode, whose last group would have no row blocks to divide by
+            if self.total > Int32(0):
+                L = cutlass.min(self.linear, self.total - Int32(1))
+                blk = L // self.n_tiles
+                # largest e with s_pre[e] <= blk, e in [0, E)
+                lo = Int32(0)
+                hi = self.E - Int32(1)
+                while lo < hi:
+                    mid = (lo + hi + Int32(1)) // Int32(2)
+                    if self.s_pre[mid] <= blk:
+                        lo = mid
+                    else:
+                        hi = mid - Int32(1)
+                e = lo
+                local = L - self.s_pre[e] * self.n_tiles
+                mb = self.s_pre[e + Int32(1)] - self.s_pre[e]
+                m_block = Int32(0)
+                n_block = Int32(0)
+                if cutlass.const_expr(self.raster_m):
+                    m_block = local % mb
+                    n_block = local // mb
+                else:
+                    n_block = local % self.n_tiles
+                    m_block = local // self.n_tiles
+                row0 = self.s_off[e] + m_block * Int32(self.cluster_rows)
+                row_end = (
+                    self.s_off[e] + self.counts[e]
+                )  # the real end: rows past it belong to the padding or to other groups
+                n_tile = n_block * Int32(self.cn) + self.cta_n_in_cluster
         return GroupWorkTile(valid, e, row0, row_end, n_tile)
 
     @cute.jit
