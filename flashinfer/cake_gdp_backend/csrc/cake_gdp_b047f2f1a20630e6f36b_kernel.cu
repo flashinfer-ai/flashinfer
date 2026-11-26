@@ -7954,15 +7954,15 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             if (disable_state_update == 0) {
                 if (use_ssm_state_indices == 0) {
 #if __CUDA_ARCH__ == 900
-                    uint32_t _read_special_reg_1272;
-                    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(_read_special_reg_1272));
-                    int tid_r = (int)_read_special_reg_1272;
+                    uint32_t tid_u;
+                    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid_u));
+                    long long noise_at = read_slot_head + (long long)(tid_u / 8 * 4) * state_stride_p2 + (long long)((tid_u - tid_u / 8 * 8) * 4);
 #else
                     uint32_t _read_special_reg_248;
                     asm volatile("mov.u32 %0, %%tid.x;" : "=r"(_read_special_reg_248));
                     int tid_r = (int)_read_special_reg_248;
-#endif
                     long long noise_at = read_slot_head + (long long)(tid_r / 8 * 4) * state_stride_p2 + (long long)((tid_r - tid_r / 8 * 8) * 4);
+#endif
                     if (philox_rounds != 0) {
                         unsigned int key0_1 = seed_lo;
                         unsigned int key1_1 = seed_hi;
@@ -8307,17 +8307,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                             key1_1 = key1_1 + 3144134277u;
                         }
 #if __CUDA_ARCH__ == 900
-                        float _abs_1273;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1273) : "f"(S[0]));
-                        unsigned int s_63 = __as_u32(mul_f32_rz_noftz(_abs_1273, __uint_as_float(125829120)));
-                        unsigned int _min_1274 = ((s_63) < (260046848) ? (s_63) : (260046848));
-                        unsigned int h_64 = _min_1274 + (h_noise[0] & 8191) >> 13;
+                        float _abs_1272;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1272) : "f"(S[0]));
+                        unsigned int s_63 = __as_u32(mul_f32_rz_noftz(_abs_1272, __uint_as_float(125829120)));
+                        unsigned int _min_1273 = ((s_63) < (260046848) ? (s_63) : (260046848));
+                        unsigned int h_64 = _min_1273 + (h_noise[0] & 8191) >> 13;
                         unsigned int mag_63 = ((s_63 <= 2139095040) ? h_64 : 32256);
-                        float _abs_1275;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1275) : "f"(S[1]));
-                        unsigned int s_63_1 = __as_u32(mul_f32_rz_noftz(_abs_1275, __uint_as_float(125829120)));
-                        unsigned int _min_1276 = ((s_63_1) < (260046848) ? (s_63_1) : (260046848));
-                        unsigned int h_65 = _min_1276 + ((h_noise[0] & 536805376) >> 16) >> 13;
+                        float _abs_1274;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1274) : "f"(S[1]));
+                        unsigned int s_63_1 = __as_u32(mul_f32_rz_noftz(_abs_1274, __uint_as_float(125829120)));
+                        unsigned int _min_1275 = ((s_63_1) < (260046848) ? (s_63_1) : (260046848));
+                        unsigned int h_65 = _min_1275 + ((h_noise[0] & 536805376) >> 16) >> 13;
                         unsigned int mag_63_1 = ((s_63_1 <= 2139095040) ? h_65 : 32256);
                         uint32_t mags_31;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_31) : "r"(mag_63), "r"(mag_63_1));
@@ -8325,17 +8325,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_31) : "r"(__as_u32(S[0])), "r"(__as_u32(S[1])));
                         unsigned int word_31 = signs_31 & 2147516416u | mags_31;
                         h_words[0] = word_31;
-                        float _abs_1277;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1277) : "f"(S[2]));
-                        unsigned int s_64 = __as_u32(mul_f32_rz_noftz(_abs_1277, __uint_as_float(125829120)));
-                        unsigned int _min_1278 = ((s_64) < (260046848) ? (s_64) : (260046848));
-                        unsigned int h_66 = _min_1278 + (h_noise[1] & 8191) >> 13;
+                        float _abs_1276;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1276) : "f"(S[2]));
+                        unsigned int s_64 = __as_u32(mul_f32_rz_noftz(_abs_1276, __uint_as_float(125829120)));
+                        unsigned int _min_1277 = ((s_64) < (260046848) ? (s_64) : (260046848));
+                        unsigned int h_66 = _min_1277 + (h_noise[1] & 8191) >> 13;
                         unsigned int mag_64 = ((s_64 <= 2139095040) ? h_66 : 32256);
-                        float _abs_1279;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1279) : "f"(S[3]));
-                        unsigned int s_65 = __as_u32(mul_f32_rz_noftz(_abs_1279, __uint_as_float(125829120)));
-                        unsigned int _min_1280 = ((s_65) < (260046848) ? (s_65) : (260046848));
-                        unsigned int h_67 = _min_1280 + ((h_noise[1] & 536805376) >> 16) >> 13;
+                        float _abs_1278;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1278) : "f"(S[3]));
+                        unsigned int s_65 = __as_u32(mul_f32_rz_noftz(_abs_1278, __uint_as_float(125829120)));
+                        unsigned int _min_1279 = ((s_65) < (260046848) ? (s_65) : (260046848));
+                        unsigned int h_67 = _min_1279 + ((h_noise[1] & 536805376) >> 16) >> 13;
                         unsigned int mag_65 = ((s_65 <= 2139095040) ? h_67 : 32256);
                         uint32_t mags_31_1;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_31_1) : "r"(mag_64), "r"(mag_65));
@@ -8353,17 +8353,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1281;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1281) : "f"(S[8]));
-                        unsigned int s_66 = __as_u32(mul_f32_rz_noftz(_abs_1281, __uint_as_float(125829120)));
-                        unsigned int _min_1282 = ((s_66) < (260046848) ? (s_66) : (260046848));
-                        unsigned int h_68 = _min_1282 + (h_noise[2] & 8191) >> 13;
+                        float _abs_1280;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1280) : "f"(S[8]));
+                        unsigned int s_66 = __as_u32(mul_f32_rz_noftz(_abs_1280, __uint_as_float(125829120)));
+                        unsigned int _min_1281 = ((s_66) < (260046848) ? (s_66) : (260046848));
+                        unsigned int h_68 = _min_1281 + (h_noise[2] & 8191) >> 13;
                         unsigned int mag_66 = ((s_66 <= 2139095040) ? h_68 : 32256);
-                        float _abs_1283;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1283) : "f"(S[9]));
-                        unsigned int s_67 = __as_u32(mul_f32_rz_noftz(_abs_1283, __uint_as_float(125829120)));
-                        unsigned int _min_1284 = ((s_67) < (260046848) ? (s_67) : (260046848));
-                        unsigned int h_69 = _min_1284 + ((h_noise[2] & 536805376) >> 16) >> 13;
+                        float _abs_1282;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1282) : "f"(S[9]));
+                        unsigned int s_67 = __as_u32(mul_f32_rz_noftz(_abs_1282, __uint_as_float(125829120)));
+                        unsigned int _min_1283 = ((s_67) < (260046848) ? (s_67) : (260046848));
+                        unsigned int h_69 = _min_1283 + ((h_noise[2] & 536805376) >> 16) >> 13;
                         unsigned int mag_67 = ((s_67 <= 2139095040) ? h_69 : 32256);
                         uint32_t mags_32;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_32) : "r"(mag_66), "r"(mag_67));
@@ -8371,17 +8371,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_32) : "r"(__as_u32(S[8])), "r"(__as_u32(S[9])));
                         unsigned int word_32 = signs_32 & 2147516416u | mags_32;
                         h_words[0] = word_32;
-                        float _abs_1285;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1285) : "f"(S[10]));
-                        unsigned int s_68 = __as_u32(mul_f32_rz_noftz(_abs_1285, __uint_as_float(125829120)));
-                        unsigned int _min_1286 = ((s_68) < (260046848) ? (s_68) : (260046848));
-                        unsigned int h_70 = _min_1286 + (h_noise[3] & 8191) >> 13;
+                        float _abs_1284;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1284) : "f"(S[10]));
+                        unsigned int s_68 = __as_u32(mul_f32_rz_noftz(_abs_1284, __uint_as_float(125829120)));
+                        unsigned int _min_1285 = ((s_68) < (260046848) ? (s_68) : (260046848));
+                        unsigned int h_70 = _min_1285 + (h_noise[3] & 8191) >> 13;
                         unsigned int mag_68 = ((s_68 <= 2139095040) ? h_70 : 32256);
-                        float _abs_1287;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1287) : "f"(S[11]));
-                        unsigned int s_69 = __as_u32(mul_f32_rz_noftz(_abs_1287, __uint_as_float(125829120)));
-                        unsigned int _min_1288 = ((s_69) < (260046848) ? (s_69) : (260046848));
-                        unsigned int h_71 = _min_1288 + ((h_noise[3] & 536805376) >> 16) >> 13;
+                        float _abs_1286;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1286) : "f"(S[11]));
+                        unsigned int s_69 = __as_u32(mul_f32_rz_noftz(_abs_1286, __uint_as_float(125829120)));
+                        unsigned int _min_1287 = ((s_69) < (260046848) ? (s_69) : (260046848));
+                        unsigned int h_71 = _min_1287 + ((h_noise[3] & 536805376) >> 16) >> 13;
                         unsigned int mag_69 = ((s_69 <= 2139095040) ? h_71 : 32256);
                         uint32_t mags_33;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_33) : "r"(mag_68), "r"(mag_69));
@@ -8399,17 +8399,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1289;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1289) : "f"(S[4]));
-                        unsigned int s_70 = __as_u32(mul_f32_rz_noftz(_abs_1289, __uint_as_float(125829120)));
-                        unsigned int _min_1290 = ((s_70) < (260046848) ? (s_70) : (260046848));
-                        unsigned int h_72 = _min_1290 + (h_noise[4] & 8191) >> 13;
+                        float _abs_1288;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1288) : "f"(S[4]));
+                        unsigned int s_70 = __as_u32(mul_f32_rz_noftz(_abs_1288, __uint_as_float(125829120)));
+                        unsigned int _min_1289 = ((s_70) < (260046848) ? (s_70) : (260046848));
+                        unsigned int h_72 = _min_1289 + (h_noise[4] & 8191) >> 13;
                         unsigned int mag_70 = ((s_70 <= 2139095040) ? h_72 : 32256);
-                        float _abs_1291;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1291) : "f"(S[5]));
-                        unsigned int s_71 = __as_u32(mul_f32_rz_noftz(_abs_1291, __uint_as_float(125829120)));
-                        unsigned int _min_1292 = ((s_71) < (260046848) ? (s_71) : (260046848));
-                        unsigned int h_73 = _min_1292 + ((h_noise[4] & 536805376) >> 16) >> 13;
+                        float _abs_1290;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1290) : "f"(S[5]));
+                        unsigned int s_71 = __as_u32(mul_f32_rz_noftz(_abs_1290, __uint_as_float(125829120)));
+                        unsigned int _min_1291 = ((s_71) < (260046848) ? (s_71) : (260046848));
+                        unsigned int h_73 = _min_1291 + ((h_noise[4] & 536805376) >> 16) >> 13;
                         unsigned int mag_71 = ((s_71 <= 2139095040) ? h_73 : 32256);
                         uint32_t mags_34;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_34) : "r"(mag_70), "r"(mag_71));
@@ -8417,17 +8417,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_34) : "r"(__as_u32(S[4])), "r"(__as_u32(S[5])));
                         unsigned int word_34 = signs_34 & 2147516416u | mags_34;
                         h_words[0] = word_34;
-                        float _abs_1293;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1293) : "f"(S[6]));
-                        unsigned int s_72 = __as_u32(mul_f32_rz_noftz(_abs_1293, __uint_as_float(125829120)));
-                        unsigned int _min_1294 = ((s_72) < (260046848) ? (s_72) : (260046848));
-                        unsigned int h_74 = _min_1294 + (h_noise[5] & 8191) >> 13;
+                        float _abs_1292;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1292) : "f"(S[6]));
+                        unsigned int s_72 = __as_u32(mul_f32_rz_noftz(_abs_1292, __uint_as_float(125829120)));
+                        unsigned int _min_1293 = ((s_72) < (260046848) ? (s_72) : (260046848));
+                        unsigned int h_74 = _min_1293 + (h_noise[5] & 8191) >> 13;
                         unsigned int mag_72 = ((s_72 <= 2139095040) ? h_74 : 32256);
-                        float _abs_1295;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1295) : "f"(S[7]));
-                        unsigned int s_73 = __as_u32(mul_f32_rz_noftz(_abs_1295, __uint_as_float(125829120)));
-                        unsigned int _min_1296 = ((s_73) < (260046848) ? (s_73) : (260046848));
-                        unsigned int h_75 = _min_1296 + ((h_noise[5] & 536805376) >> 16) >> 13;
+                        float _abs_1294;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1294) : "f"(S[7]));
+                        unsigned int s_73 = __as_u32(mul_f32_rz_noftz(_abs_1294, __uint_as_float(125829120)));
+                        unsigned int _min_1295 = ((s_73) < (260046848) ? (s_73) : (260046848));
+                        unsigned int h_75 = _min_1295 + ((h_noise[5] & 536805376) >> 16) >> 13;
                         unsigned int mag_73 = ((s_73 <= 2139095040) ? h_75 : 32256);
                         uint32_t mags_35;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_35) : "r"(mag_72), "r"(mag_73));
@@ -8445,17 +8445,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1297;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1297) : "f"(S[12]));
-                        unsigned int s_74 = __as_u32(mul_f32_rz_noftz(_abs_1297, __uint_as_float(125829120)));
-                        unsigned int _min_1298 = ((s_74) < (260046848) ? (s_74) : (260046848));
-                        unsigned int h_76 = _min_1298 + (h_noise[6] & 8191) >> 13;
+                        float _abs_1296;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1296) : "f"(S[12]));
+                        unsigned int s_74 = __as_u32(mul_f32_rz_noftz(_abs_1296, __uint_as_float(125829120)));
+                        unsigned int _min_1297 = ((s_74) < (260046848) ? (s_74) : (260046848));
+                        unsigned int h_76 = _min_1297 + (h_noise[6] & 8191) >> 13;
                         unsigned int mag_74 = ((s_74 <= 2139095040) ? h_76 : 32256);
-                        float _abs_1299;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1299) : "f"(S[13]));
-                        unsigned int s_75 = __as_u32(mul_f32_rz_noftz(_abs_1299, __uint_as_float(125829120)));
-                        unsigned int _min_1300 = ((s_75) < (260046848) ? (s_75) : (260046848));
-                        unsigned int h_77 = _min_1300 + ((h_noise[6] & 536805376) >> 16) >> 13;
+                        float _abs_1298;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1298) : "f"(S[13]));
+                        unsigned int s_75 = __as_u32(mul_f32_rz_noftz(_abs_1298, __uint_as_float(125829120)));
+                        unsigned int _min_1299 = ((s_75) < (260046848) ? (s_75) : (260046848));
+                        unsigned int h_77 = _min_1299 + ((h_noise[6] & 536805376) >> 16) >> 13;
                         unsigned int mag_75 = ((s_75 <= 2139095040) ? h_77 : 32256);
                         uint32_t mags_36;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_36) : "r"(mag_74), "r"(mag_75));
@@ -8463,17 +8463,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_36) : "r"(__as_u32(S[12])), "r"(__as_u32(S[13])));
                         unsigned int word_36 = signs_36 & 2147516416u | mags_36;
                         h_words[0] = word_36;
-                        float _abs_1301;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1301) : "f"(S[14]));
-                        unsigned int s_76 = __as_u32(mul_f32_rz_noftz(_abs_1301, __uint_as_float(125829120)));
-                        unsigned int _min_1302 = ((s_76) < (260046848) ? (s_76) : (260046848));
-                        unsigned int h_78 = _min_1302 + (h_noise[7] & 8191) >> 13;
+                        float _abs_1300;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1300) : "f"(S[14]));
+                        unsigned int s_76 = __as_u32(mul_f32_rz_noftz(_abs_1300, __uint_as_float(125829120)));
+                        unsigned int _min_1301 = ((s_76) < (260046848) ? (s_76) : (260046848));
+                        unsigned int h_78 = _min_1301 + (h_noise[7] & 8191) >> 13;
                         unsigned int mag_76 = ((s_76 <= 2139095040) ? h_78 : 32256);
-                        float _abs_1303;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1303) : "f"(S[15]));
-                        unsigned int s_77 = __as_u32(mul_f32_rz_noftz(_abs_1303, __uint_as_float(125829120)));
-                        unsigned int _min_1304 = ((s_77) < (260046848) ? (s_77) : (260046848));
-                        unsigned int h_79 = _min_1304 + ((h_noise[7] & 536805376) >> 16) >> 13;
+                        float _abs_1302;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1302) : "f"(S[15]));
+                        unsigned int s_77 = __as_u32(mul_f32_rz_noftz(_abs_1302, __uint_as_float(125829120)));
+                        unsigned int _min_1303 = ((s_77) < (260046848) ? (s_77) : (260046848));
+                        unsigned int h_79 = _min_1303 + ((h_noise[7] & 536805376) >> 16) >> 13;
                         unsigned int mag_77 = ((s_77 <= 2139095040) ? h_79 : 32256);
                         uint32_t mags_37;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_37) : "r"(mag_76), "r"(mag_77));
@@ -8491,17 +8491,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 96ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1305;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1305) : "f"(S[16]));
-                        unsigned int s_78 = __as_u32(mul_f32_rz_noftz(_abs_1305, __uint_as_float(125829120)));
-                        unsigned int _min_1306 = ((s_78) < (260046848) ? (s_78) : (260046848));
-                        unsigned int h_80 = _min_1306 + (h_noise[8] & 8191) >> 13;
+                        float _abs_1304;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1304) : "f"(S[16]));
+                        unsigned int s_78 = __as_u32(mul_f32_rz_noftz(_abs_1304, __uint_as_float(125829120)));
+                        unsigned int _min_1305 = ((s_78) < (260046848) ? (s_78) : (260046848));
+                        unsigned int h_80 = _min_1305 + (h_noise[8] & 8191) >> 13;
                         unsigned int mag_78 = ((s_78 <= 2139095040) ? h_80 : 32256);
-                        float _abs_1307;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1307) : "f"(S[17]));
-                        unsigned int s_79 = __as_u32(mul_f32_rz_noftz(_abs_1307, __uint_as_float(125829120)));
-                        unsigned int _min_1308 = ((s_79) < (260046848) ? (s_79) : (260046848));
-                        unsigned int h_81 = _min_1308 + ((h_noise[8] & 536805376) >> 16) >> 13;
+                        float _abs_1306;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1306) : "f"(S[17]));
+                        unsigned int s_79 = __as_u32(mul_f32_rz_noftz(_abs_1306, __uint_as_float(125829120)));
+                        unsigned int _min_1307 = ((s_79) < (260046848) ? (s_79) : (260046848));
+                        unsigned int h_81 = _min_1307 + ((h_noise[8] & 536805376) >> 16) >> 13;
                         unsigned int mag_79 = ((s_79 <= 2139095040) ? h_81 : 32256);
                         uint32_t mags_38;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_38) : "r"(mag_78), "r"(mag_79));
@@ -8509,17 +8509,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_38) : "r"(__as_u32(S[16])), "r"(__as_u32(S[17])));
                         unsigned int word_38 = signs_38 & 2147516416u | mags_38;
                         h_words[0] = word_38;
-                        float _abs_1309;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1309) : "f"(S[18]));
-                        unsigned int s_80 = __as_u32(mul_f32_rz_noftz(_abs_1309, __uint_as_float(125829120)));
-                        unsigned int _min_1310 = ((s_80) < (260046848) ? (s_80) : (260046848));
-                        unsigned int h_82 = _min_1310 + (h_noise[9] & 8191) >> 13;
+                        float _abs_1308;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1308) : "f"(S[18]));
+                        unsigned int s_80 = __as_u32(mul_f32_rz_noftz(_abs_1308, __uint_as_float(125829120)));
+                        unsigned int _min_1309 = ((s_80) < (260046848) ? (s_80) : (260046848));
+                        unsigned int h_82 = _min_1309 + (h_noise[9] & 8191) >> 13;
                         unsigned int mag_80 = ((s_80 <= 2139095040) ? h_82 : 32256);
-                        float _abs_1311;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1311) : "f"(S[19]));
-                        unsigned int s_81 = __as_u32(mul_f32_rz_noftz(_abs_1311, __uint_as_float(125829120)));
-                        unsigned int _min_1312 = ((s_81) < (260046848) ? (s_81) : (260046848));
-                        unsigned int h_83 = _min_1312 + ((h_noise[9] & 536805376) >> 16) >> 13;
+                        float _abs_1310;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1310) : "f"(S[19]));
+                        unsigned int s_81 = __as_u32(mul_f32_rz_noftz(_abs_1310, __uint_as_float(125829120)));
+                        unsigned int _min_1311 = ((s_81) < (260046848) ? (s_81) : (260046848));
+                        unsigned int h_83 = _min_1311 + ((h_noise[9] & 536805376) >> 16) >> 13;
                         unsigned int mag_81 = ((s_81 <= 2139095040) ? h_83 : 32256);
                         uint32_t mags_39;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_39) : "r"(mag_80), "r"(mag_81));
@@ -8537,17 +8537,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + state_stride_p2))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1313;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1313) : "f"(S[24]));
-                        unsigned int s_82 = __as_u32(mul_f32_rz_noftz(_abs_1313, __uint_as_float(125829120)));
-                        unsigned int _min_1314 = ((s_82) < (260046848) ? (s_82) : (260046848));
-                        unsigned int h_84 = _min_1314 + (h_noise[10] & 8191) >> 13;
+                        float _abs_1312;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1312) : "f"(S[24]));
+                        unsigned int s_82 = __as_u32(mul_f32_rz_noftz(_abs_1312, __uint_as_float(125829120)));
+                        unsigned int _min_1313 = ((s_82) < (260046848) ? (s_82) : (260046848));
+                        unsigned int h_84 = _min_1313 + (h_noise[10] & 8191) >> 13;
                         unsigned int mag_82 = ((s_82 <= 2139095040) ? h_84 : 32256);
-                        float _abs_1315;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1315) : "f"(S[25]));
-                        unsigned int s_83 = __as_u32(mul_f32_rz_noftz(_abs_1315, __uint_as_float(125829120)));
-                        unsigned int _min_1316 = ((s_83) < (260046848) ? (s_83) : (260046848));
-                        unsigned int h_85 = _min_1316 + ((h_noise[10] & 536805376) >> 16) >> 13;
+                        float _abs_1314;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1314) : "f"(S[25]));
+                        unsigned int s_83 = __as_u32(mul_f32_rz_noftz(_abs_1314, __uint_as_float(125829120)));
+                        unsigned int _min_1315 = ((s_83) < (260046848) ? (s_83) : (260046848));
+                        unsigned int h_85 = _min_1315 + ((h_noise[10] & 536805376) >> 16) >> 13;
                         unsigned int mag_83 = ((s_83 <= 2139095040) ? h_85 : 32256);
                         uint32_t mags_40;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_40) : "r"(mag_82), "r"(mag_83));
@@ -8555,17 +8555,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_40) : "r"(__as_u32(S[24])), "r"(__as_u32(S[25])));
                         unsigned int word_40 = signs_40 & 2147516416u | mags_40;
                         h_words[0] = word_40;
-                        float _abs_1317;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1317) : "f"(S[26]));
-                        unsigned int s_84 = __as_u32(mul_f32_rz_noftz(_abs_1317, __uint_as_float(125829120)));
-                        unsigned int _min_1318 = ((s_84) < (260046848) ? (s_84) : (260046848));
-                        unsigned int h_86 = _min_1318 + (h_noise[11] & 8191) >> 13;
+                        float _abs_1316;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1316) : "f"(S[26]));
+                        unsigned int s_84 = __as_u32(mul_f32_rz_noftz(_abs_1316, __uint_as_float(125829120)));
+                        unsigned int _min_1317 = ((s_84) < (260046848) ? (s_84) : (260046848));
+                        unsigned int h_86 = _min_1317 + (h_noise[11] & 8191) >> 13;
                         unsigned int mag_84 = ((s_84 <= 2139095040) ? h_86 : 32256);
-                        float _abs_1319;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1319) : "f"(S[27]));
-                        unsigned int s_85 = __as_u32(mul_f32_rz_noftz(_abs_1319, __uint_as_float(125829120)));
-                        unsigned int _min_1320 = ((s_85) < (260046848) ? (s_85) : (260046848));
-                        unsigned int h_87 = _min_1320 + ((h_noise[11] & 536805376) >> 16) >> 13;
+                        float _abs_1318;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1318) : "f"(S[27]));
+                        unsigned int s_85 = __as_u32(mul_f32_rz_noftz(_abs_1318, __uint_as_float(125829120)));
+                        unsigned int _min_1319 = ((s_85) < (260046848) ? (s_85) : (260046848));
+                        unsigned int h_87 = _min_1319 + ((h_noise[11] & 536805376) >> 16) >> 13;
                         unsigned int mag_85 = ((s_85 <= 2139095040) ? h_87 : 32256);
                         uint32_t mags_41;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_41) : "r"(mag_84), "r"(mag_85));
@@ -8583,17 +8583,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + state_stride_p2 + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1321;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1321) : "f"(S[20]));
-                        unsigned int s_86 = __as_u32(mul_f32_rz_noftz(_abs_1321, __uint_as_float(125829120)));
-                        unsigned int _min_1322 = ((s_86) < (260046848) ? (s_86) : (260046848));
-                        unsigned int h_88 = _min_1322 + (h_noise[12] & 8191) >> 13;
+                        float _abs_1320;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1320) : "f"(S[20]));
+                        unsigned int s_86 = __as_u32(mul_f32_rz_noftz(_abs_1320, __uint_as_float(125829120)));
+                        unsigned int _min_1321 = ((s_86) < (260046848) ? (s_86) : (260046848));
+                        unsigned int h_88 = _min_1321 + (h_noise[12] & 8191) >> 13;
                         unsigned int mag_86 = ((s_86 <= 2139095040) ? h_88 : 32256);
-                        float _abs_1323;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1323) : "f"(S[21]));
-                        unsigned int s_87 = __as_u32(mul_f32_rz_noftz(_abs_1323, __uint_as_float(125829120)));
-                        unsigned int _min_1324 = ((s_87) < (260046848) ? (s_87) : (260046848));
-                        unsigned int h_89 = _min_1324 + ((h_noise[12] & 536805376) >> 16) >> 13;
+                        float _abs_1322;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1322) : "f"(S[21]));
+                        unsigned int s_87 = __as_u32(mul_f32_rz_noftz(_abs_1322, __uint_as_float(125829120)));
+                        unsigned int _min_1323 = ((s_87) < (260046848) ? (s_87) : (260046848));
+                        unsigned int h_89 = _min_1323 + ((h_noise[12] & 536805376) >> 16) >> 13;
                         unsigned int mag_87 = ((s_87 <= 2139095040) ? h_89 : 32256);
                         uint32_t mags_42;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_42) : "r"(mag_86), "r"(mag_87));
@@ -8601,17 +8601,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_42) : "r"(__as_u32(S[20])), "r"(__as_u32(S[21])));
                         unsigned int word_42 = signs_42 & 2147516416u | mags_42;
                         h_words[0] = word_42;
-                        float _abs_1325;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1325) : "f"(S[22]));
-                        unsigned int s_88 = __as_u32(mul_f32_rz_noftz(_abs_1325, __uint_as_float(125829120)));
-                        unsigned int _min_1326 = ((s_88) < (260046848) ? (s_88) : (260046848));
-                        unsigned int h_90 = _min_1326 + (h_noise[13] & 8191) >> 13;
+                        float _abs_1324;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1324) : "f"(S[22]));
+                        unsigned int s_88 = __as_u32(mul_f32_rz_noftz(_abs_1324, __uint_as_float(125829120)));
+                        unsigned int _min_1325 = ((s_88) < (260046848) ? (s_88) : (260046848));
+                        unsigned int h_90 = _min_1325 + (h_noise[13] & 8191) >> 13;
                         unsigned int mag_88 = ((s_88 <= 2139095040) ? h_90 : 32256);
-                        float _abs_1327;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1327) : "f"(S[23]));
-                        unsigned int s_89 = __as_u32(mul_f32_rz_noftz(_abs_1327, __uint_as_float(125829120)));
-                        unsigned int _min_1328 = ((s_89) < (260046848) ? (s_89) : (260046848));
-                        unsigned int h_91 = _min_1328 + ((h_noise[13] & 536805376) >> 16) >> 13;
+                        float _abs_1326;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1326) : "f"(S[23]));
+                        unsigned int s_89 = __as_u32(mul_f32_rz_noftz(_abs_1326, __uint_as_float(125829120)));
+                        unsigned int _min_1327 = ((s_89) < (260046848) ? (s_89) : (260046848));
+                        unsigned int h_91 = _min_1327 + ((h_noise[13] & 536805376) >> 16) >> 13;
                         unsigned int mag_89 = ((s_89 <= 2139095040) ? h_91 : 32256);
                         uint32_t mags_43;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_43) : "r"(mag_88), "r"(mag_89));
@@ -8629,17 +8629,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + state_stride_p2 + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1329;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1329) : "f"(S[28]));
-                        unsigned int s_90 = __as_u32(mul_f32_rz_noftz(_abs_1329, __uint_as_float(125829120)));
-                        unsigned int _min_1330 = ((s_90) < (260046848) ? (s_90) : (260046848));
-                        unsigned int h_92 = _min_1330 + (h_noise[14] & 8191) >> 13;
+                        float _abs_1328;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1328) : "f"(S[28]));
+                        unsigned int s_90 = __as_u32(mul_f32_rz_noftz(_abs_1328, __uint_as_float(125829120)));
+                        unsigned int _min_1329 = ((s_90) < (260046848) ? (s_90) : (260046848));
+                        unsigned int h_92 = _min_1329 + (h_noise[14] & 8191) >> 13;
                         unsigned int mag_90 = ((s_90 <= 2139095040) ? h_92 : 32256);
-                        float _abs_1331;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1331) : "f"(S[29]));
-                        unsigned int s_91 = __as_u32(mul_f32_rz_noftz(_abs_1331, __uint_as_float(125829120)));
-                        unsigned int _min_1332 = ((s_91) < (260046848) ? (s_91) : (260046848));
-                        unsigned int h_93 = _min_1332 + ((h_noise[14] & 536805376) >> 16) >> 13;
+                        float _abs_1330;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1330) : "f"(S[29]));
+                        unsigned int s_91 = __as_u32(mul_f32_rz_noftz(_abs_1330, __uint_as_float(125829120)));
+                        unsigned int _min_1331 = ((s_91) < (260046848) ? (s_91) : (260046848));
+                        unsigned int h_93 = _min_1331 + ((h_noise[14] & 536805376) >> 16) >> 13;
                         unsigned int mag_91 = ((s_91 <= 2139095040) ? h_93 : 32256);
                         uint32_t mags_44;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_44) : "r"(mag_90), "r"(mag_91));
@@ -8647,17 +8647,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_44) : "r"(__as_u32(S[28])), "r"(__as_u32(S[29])));
                         unsigned int word_44 = signs_44 & 2147516416u | mags_44;
                         h_words[0] = word_44;
-                        float _abs_1333;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1333) : "f"(S[30]));
-                        unsigned int s_92 = __as_u32(mul_f32_rz_noftz(_abs_1333, __uint_as_float(125829120)));
-                        unsigned int _min_1334 = ((s_92) < (260046848) ? (s_92) : (260046848));
-                        unsigned int h_94 = _min_1334 + (h_noise[15] & 8191) >> 13;
+                        float _abs_1332;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1332) : "f"(S[30]));
+                        unsigned int s_92 = __as_u32(mul_f32_rz_noftz(_abs_1332, __uint_as_float(125829120)));
+                        unsigned int _min_1333 = ((s_92) < (260046848) ? (s_92) : (260046848));
+                        unsigned int h_94 = _min_1333 + (h_noise[15] & 8191) >> 13;
                         unsigned int mag_92 = ((s_92 <= 2139095040) ? h_94 : 32256);
-                        float _abs_1335;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1335) : "f"(S[31]));
-                        unsigned int s_93 = __as_u32(mul_f32_rz_noftz(_abs_1335, __uint_as_float(125829120)));
-                        unsigned int _min_1336 = ((s_93) < (260046848) ? (s_93) : (260046848));
-                        unsigned int h_95 = _min_1336 + ((h_noise[15] & 536805376) >> 16) >> 13;
+                        float _abs_1334;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1334) : "f"(S[31]));
+                        unsigned int s_93 = __as_u32(mul_f32_rz_noftz(_abs_1334, __uint_as_float(125829120)));
+                        unsigned int _min_1335 = ((s_93) < (260046848) ? (s_93) : (260046848));
+                        unsigned int h_95 = _min_1335 + ((h_noise[15] & 536805376) >> 16) >> 13;
                         unsigned int mag_93 = ((s_93 <= 2139095040) ? h_95 : 32256);
                         uint32_t mags_45;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_45) : "r"(mag_92), "r"(mag_93));
@@ -8832,17 +8832,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                             key0_1_1 = key0_1_1 + 2654435769u;
                             key1_1_1 = key1_1_1 + 3144134277u;
                         }
-                        float _abs_1337;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1337) : "f"(S[32]));
-                        unsigned int s_94 = __as_u32(mul_f32_rz_noftz(_abs_1337, __uint_as_float(125829120)));
-                        unsigned int _min_1338 = ((s_94) < (260046848) ? (s_94) : (260046848));
-                        unsigned int h_96 = _min_1338 + (h_noise[0] & 8191) >> 13;
+                        float _abs_1336;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1336) : "f"(S[32]));
+                        unsigned int s_94 = __as_u32(mul_f32_rz_noftz(_abs_1336, __uint_as_float(125829120)));
+                        unsigned int _min_1337 = ((s_94) < (260046848) ? (s_94) : (260046848));
+                        unsigned int h_96 = _min_1337 + (h_noise[0] & 8191) >> 13;
                         unsigned int mag_94 = ((s_94 <= 2139095040) ? h_96 : 32256);
-                        float _abs_1339;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1339) : "f"(S[33]));
-                        unsigned int s_95 = __as_u32(mul_f32_rz_noftz(_abs_1339, __uint_as_float(125829120)));
-                        unsigned int _min_1340 = ((s_95) < (260046848) ? (s_95) : (260046848));
-                        unsigned int h_97 = _min_1340 + ((h_noise[0] & 536805376) >> 16) >> 13;
+                        float _abs_1338;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1338) : "f"(S[33]));
+                        unsigned int s_95 = __as_u32(mul_f32_rz_noftz(_abs_1338, __uint_as_float(125829120)));
+                        unsigned int _min_1339 = ((s_95) < (260046848) ? (s_95) : (260046848));
+                        unsigned int h_97 = _min_1339 + ((h_noise[0] & 536805376) >> 16) >> 13;
                         unsigned int mag_95 = ((s_95 <= 2139095040) ? h_97 : 32256);
                         uint32_t mags_46;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_46) : "r"(mag_94), "r"(mag_95));
@@ -8850,17 +8850,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_46) : "r"(__as_u32(S[32])), "r"(__as_u32(S[33])));
                         unsigned int word_46 = signs_46 & 2147516416u | mags_46;
                         h_words[0] = word_46;
-                        float _abs_1341;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1341) : "f"(S[34]));
-                        unsigned int s_96 = __as_u32(mul_f32_rz_noftz(_abs_1341, __uint_as_float(125829120)));
-                        unsigned int _min_1342 = ((s_96) < (260046848) ? (s_96) : (260046848));
-                        unsigned int h_98 = _min_1342 + (h_noise[1] & 8191) >> 13;
+                        float _abs_1340;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1340) : "f"(S[34]));
+                        unsigned int s_96 = __as_u32(mul_f32_rz_noftz(_abs_1340, __uint_as_float(125829120)));
+                        unsigned int _min_1341 = ((s_96) < (260046848) ? (s_96) : (260046848));
+                        unsigned int h_98 = _min_1341 + (h_noise[1] & 8191) >> 13;
                         unsigned int mag_96 = ((s_96 <= 2139095040) ? h_98 : 32256);
-                        float _abs_1343;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1343) : "f"(S[35]));
-                        unsigned int s_97 = __as_u32(mul_f32_rz_noftz(_abs_1343, __uint_as_float(125829120)));
-                        unsigned int _min_1344 = ((s_97) < (260046848) ? (s_97) : (260046848));
-                        unsigned int h_99 = _min_1344 + ((h_noise[1] & 536805376) >> 16) >> 13;
+                        float _abs_1342;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1342) : "f"(S[35]));
+                        unsigned int s_97 = __as_u32(mul_f32_rz_noftz(_abs_1342, __uint_as_float(125829120)));
+                        unsigned int _min_1343 = ((s_97) < (260046848) ? (s_97) : (260046848));
+                        unsigned int h_99 = _min_1343 + ((h_noise[1] & 536805376) >> 16) >> 13;
                         unsigned int mag_97 = ((s_97 <= 2139095040) ? h_99 : 32256);
                         uint32_t mags_47;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_47) : "r"(mag_96), "r"(mag_97));
@@ -8878,17 +8878,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1345;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1345) : "f"(S[40]));
-                        unsigned int s_98 = __as_u32(mul_f32_rz_noftz(_abs_1345, __uint_as_float(125829120)));
-                        unsigned int _min_1346 = ((s_98) < (260046848) ? (s_98) : (260046848));
-                        unsigned int h_100 = _min_1346 + (h_noise[2] & 8191) >> 13;
+                        float _abs_1344;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1344) : "f"(S[40]));
+                        unsigned int s_98 = __as_u32(mul_f32_rz_noftz(_abs_1344, __uint_as_float(125829120)));
+                        unsigned int _min_1345 = ((s_98) < (260046848) ? (s_98) : (260046848));
+                        unsigned int h_100 = _min_1345 + (h_noise[2] & 8191) >> 13;
                         unsigned int mag_98 = ((s_98 <= 2139095040) ? h_100 : 32256);
-                        float _abs_1347;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1347) : "f"(S[41]));
-                        unsigned int s_99 = __as_u32(mul_f32_rz_noftz(_abs_1347, __uint_as_float(125829120)));
-                        unsigned int _min_1348 = ((s_99) < (260046848) ? (s_99) : (260046848));
-                        unsigned int h_101 = _min_1348 + ((h_noise[2] & 536805376) >> 16) >> 13;
+                        float _abs_1346;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1346) : "f"(S[41]));
+                        unsigned int s_99 = __as_u32(mul_f32_rz_noftz(_abs_1346, __uint_as_float(125829120)));
+                        unsigned int _min_1347 = ((s_99) < (260046848) ? (s_99) : (260046848));
+                        unsigned int h_101 = _min_1347 + ((h_noise[2] & 536805376) >> 16) >> 13;
                         unsigned int mag_99 = ((s_99 <= 2139095040) ? h_101 : 32256);
                         uint32_t mags_48;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_48) : "r"(mag_98), "r"(mag_99));
@@ -8896,17 +8896,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_48) : "r"(__as_u32(S[40])), "r"(__as_u32(S[41])));
                         unsigned int word_48 = signs_48 & 2147516416u | mags_48;
                         h_words[0] = word_48;
-                        float _abs_1349;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1349) : "f"(S[42]));
-                        unsigned int s_100 = __as_u32(mul_f32_rz_noftz(_abs_1349, __uint_as_float(125829120)));
-                        unsigned int _min_1350 = ((s_100) < (260046848) ? (s_100) : (260046848));
-                        unsigned int h_102 = _min_1350 + (h_noise[3] & 8191) >> 13;
+                        float _abs_1348;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1348) : "f"(S[42]));
+                        unsigned int s_100 = __as_u32(mul_f32_rz_noftz(_abs_1348, __uint_as_float(125829120)));
+                        unsigned int _min_1349 = ((s_100) < (260046848) ? (s_100) : (260046848));
+                        unsigned int h_102 = _min_1349 + (h_noise[3] & 8191) >> 13;
                         unsigned int mag_100 = ((s_100 <= 2139095040) ? h_102 : 32256);
-                        float _abs_1351;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1351) : "f"(S[43]));
-                        unsigned int s_101 = __as_u32(mul_f32_rz_noftz(_abs_1351, __uint_as_float(125829120)));
-                        unsigned int _min_1352 = ((s_101) < (260046848) ? (s_101) : (260046848));
-                        unsigned int h_103 = _min_1352 + ((h_noise[3] & 536805376) >> 16) >> 13;
+                        float _abs_1350;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1350) : "f"(S[43]));
+                        unsigned int s_101 = __as_u32(mul_f32_rz_noftz(_abs_1350, __uint_as_float(125829120)));
+                        unsigned int _min_1351 = ((s_101) < (260046848) ? (s_101) : (260046848));
+                        unsigned int h_103 = _min_1351 + ((h_noise[3] & 536805376) >> 16) >> 13;
                         unsigned int mag_101 = ((s_101 <= 2139095040) ? h_103 : 32256);
                         uint32_t mags_49;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_49) : "r"(mag_100), "r"(mag_101));
@@ -8924,17 +8924,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2 + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1353;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1353) : "f"(S[36]));
-                        unsigned int s_102 = __as_u32(mul_f32_rz_noftz(_abs_1353, __uint_as_float(125829120)));
-                        unsigned int _min_1354 = ((s_102) < (260046848) ? (s_102) : (260046848));
-                        unsigned int h_104 = _min_1354 + (h_noise[4] & 8191) >> 13;
+                        float _abs_1352;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1352) : "f"(S[36]));
+                        unsigned int s_102 = __as_u32(mul_f32_rz_noftz(_abs_1352, __uint_as_float(125829120)));
+                        unsigned int _min_1353 = ((s_102) < (260046848) ? (s_102) : (260046848));
+                        unsigned int h_104 = _min_1353 + (h_noise[4] & 8191) >> 13;
                         unsigned int mag_102 = ((s_102 <= 2139095040) ? h_104 : 32256);
-                        float _abs_1355;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1355) : "f"(S[37]));
-                        unsigned int s_103 = __as_u32(mul_f32_rz_noftz(_abs_1355, __uint_as_float(125829120)));
-                        unsigned int _min_1356 = ((s_103) < (260046848) ? (s_103) : (260046848));
-                        unsigned int h_105 = _min_1356 + ((h_noise[4] & 536805376) >> 16) >> 13;
+                        float _abs_1354;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1354) : "f"(S[37]));
+                        unsigned int s_103 = __as_u32(mul_f32_rz_noftz(_abs_1354, __uint_as_float(125829120)));
+                        unsigned int _min_1355 = ((s_103) < (260046848) ? (s_103) : (260046848));
+                        unsigned int h_105 = _min_1355 + ((h_noise[4] & 536805376) >> 16) >> 13;
                         unsigned int mag_103 = ((s_103 <= 2139095040) ? h_105 : 32256);
                         uint32_t mags_50;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_50) : "r"(mag_102), "r"(mag_103));
@@ -8942,17 +8942,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_50) : "r"(__as_u32(S[36])), "r"(__as_u32(S[37])));
                         unsigned int word_50 = signs_50 & 2147516416u | mags_50;
                         h_words[0] = word_50;
-                        float _abs_1357;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1357) : "f"(S[38]));
-                        unsigned int s_104 = __as_u32(mul_f32_rz_noftz(_abs_1357, __uint_as_float(125829120)));
-                        unsigned int _min_1358 = ((s_104) < (260046848) ? (s_104) : (260046848));
-                        unsigned int h_106 = _min_1358 + (h_noise[5] & 8191) >> 13;
+                        float _abs_1356;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1356) : "f"(S[38]));
+                        unsigned int s_104 = __as_u32(mul_f32_rz_noftz(_abs_1356, __uint_as_float(125829120)));
+                        unsigned int _min_1357 = ((s_104) < (260046848) ? (s_104) : (260046848));
+                        unsigned int h_106 = _min_1357 + (h_noise[5] & 8191) >> 13;
                         unsigned int mag_104 = ((s_104 <= 2139095040) ? h_106 : 32256);
-                        float _abs_1359;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1359) : "f"(S[39]));
-                        unsigned int s_105 = __as_u32(mul_f32_rz_noftz(_abs_1359, __uint_as_float(125829120)));
-                        unsigned int _min_1360 = ((s_105) < (260046848) ? (s_105) : (260046848));
-                        unsigned int h_107 = _min_1360 + ((h_noise[5] & 536805376) >> 16) >> 13;
+                        float _abs_1358;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1358) : "f"(S[39]));
+                        unsigned int s_105 = __as_u32(mul_f32_rz_noftz(_abs_1358, __uint_as_float(125829120)));
+                        unsigned int _min_1359 = ((s_105) < (260046848) ? (s_105) : (260046848));
+                        unsigned int h_107 = _min_1359 + ((h_noise[5] & 536805376) >> 16) >> 13;
                         unsigned int mag_105 = ((s_105 <= 2139095040) ? h_107 : 32256);
                         uint32_t mags_51;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_51) : "r"(mag_104), "r"(mag_105));
@@ -8970,17 +8970,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2 + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1361;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1361) : "f"(S[44]));
-                        unsigned int s_106 = __as_u32(mul_f32_rz_noftz(_abs_1361, __uint_as_float(125829120)));
-                        unsigned int _min_1362 = ((s_106) < (260046848) ? (s_106) : (260046848));
-                        unsigned int h_108 = _min_1362 + (h_noise[6] & 8191) >> 13;
+                        float _abs_1360;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1360) : "f"(S[44]));
+                        unsigned int s_106 = __as_u32(mul_f32_rz_noftz(_abs_1360, __uint_as_float(125829120)));
+                        unsigned int _min_1361 = ((s_106) < (260046848) ? (s_106) : (260046848));
+                        unsigned int h_108 = _min_1361 + (h_noise[6] & 8191) >> 13;
                         unsigned int mag_106 = ((s_106 <= 2139095040) ? h_108 : 32256);
-                        float _abs_1363;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1363) : "f"(S[45]));
-                        unsigned int s_107 = __as_u32(mul_f32_rz_noftz(_abs_1363, __uint_as_float(125829120)));
-                        unsigned int _min_1364 = ((s_107) < (260046848) ? (s_107) : (260046848));
-                        unsigned int h_109 = _min_1364 + ((h_noise[6] & 536805376) >> 16) >> 13;
+                        float _abs_1362;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1362) : "f"(S[45]));
+                        unsigned int s_107 = __as_u32(mul_f32_rz_noftz(_abs_1362, __uint_as_float(125829120)));
+                        unsigned int _min_1363 = ((s_107) < (260046848) ? (s_107) : (260046848));
+                        unsigned int h_109 = _min_1363 + ((h_noise[6] & 536805376) >> 16) >> 13;
                         unsigned int mag_107 = ((s_107 <= 2139095040) ? h_109 : 32256);
                         uint32_t mags_52;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_52) : "r"(mag_106), "r"(mag_107));
@@ -8988,17 +8988,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_52) : "r"(__as_u32(S[44])), "r"(__as_u32(S[45])));
                         unsigned int word_52 = signs_52 & 2147516416u | mags_52;
                         h_words[0] = word_52;
-                        float _abs_1365;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1365) : "f"(S[46]));
-                        unsigned int s_108 = __as_u32(mul_f32_rz_noftz(_abs_1365, __uint_as_float(125829120)));
-                        unsigned int _min_1366 = ((s_108) < (260046848) ? (s_108) : (260046848));
-                        unsigned int h_110 = _min_1366 + (h_noise[7] & 8191) >> 13;
+                        float _abs_1364;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1364) : "f"(S[46]));
+                        unsigned int s_108 = __as_u32(mul_f32_rz_noftz(_abs_1364, __uint_as_float(125829120)));
+                        unsigned int _min_1365 = ((s_108) < (260046848) ? (s_108) : (260046848));
+                        unsigned int h_110 = _min_1365 + (h_noise[7] & 8191) >> 13;
                         unsigned int mag_108 = ((s_108 <= 2139095040) ? h_110 : 32256);
-                        float _abs_1367;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1367) : "f"(S[47]));
-                        unsigned int s_109 = __as_u32(mul_f32_rz_noftz(_abs_1367, __uint_as_float(125829120)));
-                        unsigned int _min_1368 = ((s_109) < (260046848) ? (s_109) : (260046848));
-                        unsigned int h_111 = _min_1368 + ((h_noise[7] & 536805376) >> 16) >> 13;
+                        float _abs_1366;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1366) : "f"(S[47]));
+                        unsigned int s_109 = __as_u32(mul_f32_rz_noftz(_abs_1366, __uint_as_float(125829120)));
+                        unsigned int _min_1367 = ((s_109) < (260046848) ? (s_109) : (260046848));
+                        unsigned int h_111 = _min_1367 + ((h_noise[7] & 536805376) >> 16) >> 13;
                         unsigned int mag_109 = ((s_109 <= 2139095040) ? h_111 : 32256);
                         uint32_t mags_53;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_53) : "r"(mag_108), "r"(mag_109));
@@ -9016,17 +9016,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2 + 96ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1369;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1369) : "f"(S[48]));
-                        unsigned int s_110 = __as_u32(mul_f32_rz_noftz(_abs_1369, __uint_as_float(125829120)));
-                        unsigned int _min_1370 = ((s_110) < (260046848) ? (s_110) : (260046848));
-                        unsigned int h_112 = _min_1370 + (h_noise[8] & 8191) >> 13;
+                        float _abs_1368;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1368) : "f"(S[48]));
+                        unsigned int s_110 = __as_u32(mul_f32_rz_noftz(_abs_1368, __uint_as_float(125829120)));
+                        unsigned int _min_1369 = ((s_110) < (260046848) ? (s_110) : (260046848));
+                        unsigned int h_112 = _min_1369 + (h_noise[8] & 8191) >> 13;
                         unsigned int mag_110 = ((s_110 <= 2139095040) ? h_112 : 32256);
-                        float _abs_1371;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1371) : "f"(S[49]));
-                        unsigned int s_111 = __as_u32(mul_f32_rz_noftz(_abs_1371, __uint_as_float(125829120)));
-                        unsigned int _min_1372 = ((s_111) < (260046848) ? (s_111) : (260046848));
-                        unsigned int h_113 = _min_1372 + ((h_noise[8] & 536805376) >> 16) >> 13;
+                        float _abs_1370;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1370) : "f"(S[49]));
+                        unsigned int s_111 = __as_u32(mul_f32_rz_noftz(_abs_1370, __uint_as_float(125829120)));
+                        unsigned int _min_1371 = ((s_111) < (260046848) ? (s_111) : (260046848));
+                        unsigned int h_113 = _min_1371 + ((h_noise[8] & 536805376) >> 16) >> 13;
                         unsigned int mag_111 = ((s_111 <= 2139095040) ? h_113 : 32256);
                         uint32_t mags_54;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_54) : "r"(mag_110), "r"(mag_111));
@@ -9034,17 +9034,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_54) : "r"(__as_u32(S[48])), "r"(__as_u32(S[49])));
                         unsigned int word_54 = signs_54 & 2147516416u | mags_54;
                         h_words[0] = word_54;
-                        float _abs_1373;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1373) : "f"(S[50]));
-                        unsigned int s_112 = __as_u32(mul_f32_rz_noftz(_abs_1373, __uint_as_float(125829120)));
-                        unsigned int _min_1374 = ((s_112) < (260046848) ? (s_112) : (260046848));
-                        unsigned int h_114 = _min_1374 + (h_noise[9] & 8191) >> 13;
+                        float _abs_1372;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1372) : "f"(S[50]));
+                        unsigned int s_112 = __as_u32(mul_f32_rz_noftz(_abs_1372, __uint_as_float(125829120)));
+                        unsigned int _min_1373 = ((s_112) < (260046848) ? (s_112) : (260046848));
+                        unsigned int h_114 = _min_1373 + (h_noise[9] & 8191) >> 13;
                         unsigned int mag_112 = ((s_112 <= 2139095040) ? h_114 : 32256);
-                        float _abs_1375;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1375) : "f"(S[51]));
-                        unsigned int s_113 = __as_u32(mul_f32_rz_noftz(_abs_1375, __uint_as_float(125829120)));
-                        unsigned int _min_1376 = ((s_113) < (260046848) ? (s_113) : (260046848));
-                        unsigned int h_115 = _min_1376 + ((h_noise[9] & 536805376) >> 16) >> 13;
+                        float _abs_1374;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1374) : "f"(S[51]));
+                        unsigned int s_113 = __as_u32(mul_f32_rz_noftz(_abs_1374, __uint_as_float(125829120)));
+                        unsigned int _min_1375 = ((s_113) < (260046848) ? (s_113) : (260046848));
+                        unsigned int h_115 = _min_1375 + ((h_noise[9] & 536805376) >> 16) >> 13;
                         unsigned int mag_113 = ((s_113 <= 2139095040) ? h_115 : 32256);
                         uint32_t mags_55;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_55) : "r"(mag_112), "r"(mag_113));
@@ -9062,17 +9062,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 3ll * state_stride_p2))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1377;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1377) : "f"(S[56]));
-                        unsigned int s_114 = __as_u32(mul_f32_rz_noftz(_abs_1377, __uint_as_float(125829120)));
-                        unsigned int _min_1378 = ((s_114) < (260046848) ? (s_114) : (260046848));
-                        unsigned int h_116 = _min_1378 + (h_noise[10] & 8191) >> 13;
+                        float _abs_1376;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1376) : "f"(S[56]));
+                        unsigned int s_114 = __as_u32(mul_f32_rz_noftz(_abs_1376, __uint_as_float(125829120)));
+                        unsigned int _min_1377 = ((s_114) < (260046848) ? (s_114) : (260046848));
+                        unsigned int h_116 = _min_1377 + (h_noise[10] & 8191) >> 13;
                         unsigned int mag_114 = ((s_114 <= 2139095040) ? h_116 : 32256);
-                        float _abs_1379;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1379) : "f"(S[57]));
-                        unsigned int s_115 = __as_u32(mul_f32_rz_noftz(_abs_1379, __uint_as_float(125829120)));
-                        unsigned int _min_1380 = ((s_115) < (260046848) ? (s_115) : (260046848));
-                        unsigned int h_117 = _min_1380 + ((h_noise[10] & 536805376) >> 16) >> 13;
+                        float _abs_1378;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1378) : "f"(S[57]));
+                        unsigned int s_115 = __as_u32(mul_f32_rz_noftz(_abs_1378, __uint_as_float(125829120)));
+                        unsigned int _min_1379 = ((s_115) < (260046848) ? (s_115) : (260046848));
+                        unsigned int h_117 = _min_1379 + ((h_noise[10] & 536805376) >> 16) >> 13;
                         unsigned int mag_115 = ((s_115 <= 2139095040) ? h_117 : 32256);
                         uint32_t mags_56;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_56) : "r"(mag_114), "r"(mag_115));
@@ -9080,17 +9080,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_56) : "r"(__as_u32(S[56])), "r"(__as_u32(S[57])));
                         unsigned int word_56 = signs_56 & 2147516416u | mags_56;
                         h_words[0] = word_56;
-                        float _abs_1381;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1381) : "f"(S[58]));
-                        unsigned int s_116 = __as_u32(mul_f32_rz_noftz(_abs_1381, __uint_as_float(125829120)));
-                        unsigned int _min_1382 = ((s_116) < (260046848) ? (s_116) : (260046848));
-                        unsigned int h_118 = _min_1382 + (h_noise[11] & 8191) >> 13;
+                        float _abs_1380;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1380) : "f"(S[58]));
+                        unsigned int s_116 = __as_u32(mul_f32_rz_noftz(_abs_1380, __uint_as_float(125829120)));
+                        unsigned int _min_1381 = ((s_116) < (260046848) ? (s_116) : (260046848));
+                        unsigned int h_118 = _min_1381 + (h_noise[11] & 8191) >> 13;
                         unsigned int mag_116 = ((s_116 <= 2139095040) ? h_118 : 32256);
-                        float _abs_1383;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1383) : "f"(S[59]));
-                        unsigned int s_117 = __as_u32(mul_f32_rz_noftz(_abs_1383, __uint_as_float(125829120)));
-                        unsigned int _min_1384 = ((s_117) < (260046848) ? (s_117) : (260046848));
-                        unsigned int h_119 = _min_1384 + ((h_noise[11] & 536805376) >> 16) >> 13;
+                        float _abs_1382;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1382) : "f"(S[59]));
+                        unsigned int s_117 = __as_u32(mul_f32_rz_noftz(_abs_1382, __uint_as_float(125829120)));
+                        unsigned int _min_1383 = ((s_117) < (260046848) ? (s_117) : (260046848));
+                        unsigned int h_119 = _min_1383 + ((h_noise[11] & 536805376) >> 16) >> 13;
                         unsigned int mag_117 = ((s_117 <= 2139095040) ? h_119 : 32256);
                         uint32_t mags_57;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_57) : "r"(mag_116), "r"(mag_117));
@@ -9108,17 +9108,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 3ll * state_stride_p2 + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1385;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1385) : "f"(S[52]));
-                        unsigned int s_118 = __as_u32(mul_f32_rz_noftz(_abs_1385, __uint_as_float(125829120)));
-                        unsigned int _min_1386 = ((s_118) < (260046848) ? (s_118) : (260046848));
-                        unsigned int h_120 = _min_1386 + (h_noise[12] & 8191) >> 13;
+                        float _abs_1384;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1384) : "f"(S[52]));
+                        unsigned int s_118 = __as_u32(mul_f32_rz_noftz(_abs_1384, __uint_as_float(125829120)));
+                        unsigned int _min_1385 = ((s_118) < (260046848) ? (s_118) : (260046848));
+                        unsigned int h_120 = _min_1385 + (h_noise[12] & 8191) >> 13;
                         unsigned int mag_118 = ((s_118 <= 2139095040) ? h_120 : 32256);
-                        float _abs_1387;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1387) : "f"(S[53]));
-                        unsigned int s_119 = __as_u32(mul_f32_rz_noftz(_abs_1387, __uint_as_float(125829120)));
-                        unsigned int _min_1388 = ((s_119) < (260046848) ? (s_119) : (260046848));
-                        unsigned int h_121 = _min_1388 + ((h_noise[12] & 536805376) >> 16) >> 13;
+                        float _abs_1386;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1386) : "f"(S[53]));
+                        unsigned int s_119 = __as_u32(mul_f32_rz_noftz(_abs_1386, __uint_as_float(125829120)));
+                        unsigned int _min_1387 = ((s_119) < (260046848) ? (s_119) : (260046848));
+                        unsigned int h_121 = _min_1387 + ((h_noise[12] & 536805376) >> 16) >> 13;
                         unsigned int mag_119 = ((s_119 <= 2139095040) ? h_121 : 32256);
                         uint32_t mags_58;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_58) : "r"(mag_118), "r"(mag_119));
@@ -9126,17 +9126,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_58) : "r"(__as_u32(S[52])), "r"(__as_u32(S[53])));
                         unsigned int word_58 = signs_58 & 2147516416u | mags_58;
                         h_words[0] = word_58;
-                        float _abs_1389;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1389) : "f"(S[54]));
-                        unsigned int s_120 = __as_u32(mul_f32_rz_noftz(_abs_1389, __uint_as_float(125829120)));
-                        unsigned int _min_1390 = ((s_120) < (260046848) ? (s_120) : (260046848));
-                        unsigned int h_122 = _min_1390 + (h_noise[13] & 8191) >> 13;
+                        float _abs_1388;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1388) : "f"(S[54]));
+                        unsigned int s_120 = __as_u32(mul_f32_rz_noftz(_abs_1388, __uint_as_float(125829120)));
+                        unsigned int _min_1389 = ((s_120) < (260046848) ? (s_120) : (260046848));
+                        unsigned int h_122 = _min_1389 + (h_noise[13] & 8191) >> 13;
                         unsigned int mag_120 = ((s_120 <= 2139095040) ? h_122 : 32256);
-                        float _abs_1391;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1391) : "f"(S[55]));
-                        unsigned int s_121 = __as_u32(mul_f32_rz_noftz(_abs_1391, __uint_as_float(125829120)));
-                        unsigned int _min_1392 = ((s_121) < (260046848) ? (s_121) : (260046848));
-                        unsigned int h_123 = _min_1392 + ((h_noise[13] & 536805376) >> 16) >> 13;
+                        float _abs_1390;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1390) : "f"(S[55]));
+                        unsigned int s_121 = __as_u32(mul_f32_rz_noftz(_abs_1390, __uint_as_float(125829120)));
+                        unsigned int _min_1391 = ((s_121) < (260046848) ? (s_121) : (260046848));
+                        unsigned int h_123 = _min_1391 + ((h_noise[13] & 536805376) >> 16) >> 13;
                         unsigned int mag_121 = ((s_121 <= 2139095040) ? h_123 : 32256);
                         uint32_t mags_59;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_59) : "r"(mag_120), "r"(mag_121));
@@ -9154,17 +9154,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 3ll * state_stride_p2 + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
-                        float _abs_1393;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1393) : "f"(S[60]));
-                        unsigned int s_122 = __as_u32(mul_f32_rz_noftz(_abs_1393, __uint_as_float(125829120)));
-                        unsigned int _min_1394 = ((s_122) < (260046848) ? (s_122) : (260046848));
-                        unsigned int h_124 = _min_1394 + (h_noise[14] & 8191) >> 13;
+                        float _abs_1392;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1392) : "f"(S[60]));
+                        unsigned int s_122 = __as_u32(mul_f32_rz_noftz(_abs_1392, __uint_as_float(125829120)));
+                        unsigned int _min_1393 = ((s_122) < (260046848) ? (s_122) : (260046848));
+                        unsigned int h_124 = _min_1393 + (h_noise[14] & 8191) >> 13;
                         unsigned int mag_122 = ((s_122 <= 2139095040) ? h_124 : 32256);
-                        float _abs_1395;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1395) : "f"(S[61]));
-                        unsigned int s_123 = __as_u32(mul_f32_rz_noftz(_abs_1395, __uint_as_float(125829120)));
-                        unsigned int _min_1396 = ((s_123) < (260046848) ? (s_123) : (260046848));
-                        unsigned int h_125 = _min_1396 + ((h_noise[14] & 536805376) >> 16) >> 13;
+                        float _abs_1394;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1394) : "f"(S[61]));
+                        unsigned int s_123 = __as_u32(mul_f32_rz_noftz(_abs_1394, __uint_as_float(125829120)));
+                        unsigned int _min_1395 = ((s_123) < (260046848) ? (s_123) : (260046848));
+                        unsigned int h_125 = _min_1395 + ((h_noise[14] & 536805376) >> 16) >> 13;
                         unsigned int mag_123 = ((s_123 <= 2139095040) ? h_125 : 32256);
                         uint32_t mags_60;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_60) : "r"(mag_122), "r"(mag_123));
@@ -9172,17 +9172,17 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                         asm("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(signs_60) : "r"(__as_u32(S[60])), "r"(__as_u32(S[61])));
                         unsigned int word_60 = signs_60 & 2147516416u | mags_60;
                         h_words[0] = word_60;
-                        float _abs_1397;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1397) : "f"(S[62]));
-                        unsigned int s_124 = __as_u32(mul_f32_rz_noftz(_abs_1397, __uint_as_float(125829120)));
-                        unsigned int _min_1398 = ((s_124) < (260046848) ? (s_124) : (260046848));
-                        unsigned int h_126 = _min_1398 + (h_noise[15] & 8191) >> 13;
+                        float _abs_1396;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1396) : "f"(S[62]));
+                        unsigned int s_124 = __as_u32(mul_f32_rz_noftz(_abs_1396, __uint_as_float(125829120)));
+                        unsigned int _min_1397 = ((s_124) < (260046848) ? (s_124) : (260046848));
+                        unsigned int h_126 = _min_1397 + (h_noise[15] & 8191) >> 13;
                         unsigned int mag_124 = ((s_124 <= 2139095040) ? h_126 : 32256);
-                        float _abs_1399;
-                        asm("abs.f32 %0, %1;" : "=f"(_abs_1399) : "f"(S[63]));
-                        unsigned int s_125 = __as_u32(mul_f32_rz_noftz(_abs_1399, __uint_as_float(125829120)));
-                        unsigned int _min_1400 = ((s_125) < (260046848) ? (s_125) : (260046848));
-                        unsigned int h_127 = _min_1400 + ((h_noise[15] & 536805376) >> 16) >> 13;
+                        float _abs_1398;
+                        asm("abs.f32 %0, %1;" : "=f"(_abs_1398) : "f"(S[63]));
+                        unsigned int s_125 = __as_u32(mul_f32_rz_noftz(_abs_1398, __uint_as_float(125829120)));
+                        unsigned int _min_1399 = ((s_125) < (260046848) ? (s_125) : (260046848));
+                        unsigned int h_127 = _min_1399 + ((h_noise[15] & 536805376) >> 16) >> 13;
                         unsigned int mag_125 = ((s_125 <= 2139095040) ? h_127 : 32256);
                         uint32_t mags_61;
                         asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(mags_61) : "r"(mag_124), "r"(mag_125));
@@ -9202,12 +9202,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
                     }
                     if (philox_rounds == 0) {
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1400;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1400) : "f"(S[1]), "f"(S[0]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1400;
                         uint32_t _cvt_rn_f16x2_f32_1401;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1401) : "f"(S[1]), "f"(S[0]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1401;
-                        uint32_t _cvt_rn_f16x2_f32_1402;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1402) : "f"(S[3]), "f"(S[2]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1402;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1401) : "f"(S[3]), "f"(S[2]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1401;
 #else
                         uint32_t _cvt_rn_f16x2_f32_281;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_281) : "f"(S2[0].y), "f"(S2[0].x));
@@ -9218,12 +9218,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1402;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1402) : "f"(S[5]), "f"(S[4]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1402;
                         uint32_t _cvt_rn_f16x2_f32_1403;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1403) : "f"(S[5]), "f"(S[4]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1403;
-                        uint32_t _cvt_rn_f16x2_f32_1404;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1404) : "f"(S[7]), "f"(S[6]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1404;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1403) : "f"(S[7]), "f"(S[6]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1403;
 #else
                         uint32_t _cvt_rn_f16x2_f32_283;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_283) : "f"(S2[2].y), "f"(S2[2].x));
@@ -9234,12 +9234,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1404;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1404) : "f"(S[9]), "f"(S[8]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1404;
                         uint32_t _cvt_rn_f16x2_f32_1405;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1405) : "f"(S[9]), "f"(S[8]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1405;
-                        uint32_t _cvt_rn_f16x2_f32_1406;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1406) : "f"(S[11]), "f"(S[10]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1406;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1405) : "f"(S[11]), "f"(S[10]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1405;
 #else
                         uint32_t _cvt_rn_f16x2_f32_285;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_285) : "f"(S2[4].y), "f"(S2[4].x));
@@ -9250,12 +9250,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1406;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1406) : "f"(S[13]), "f"(S[12]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1406;
                         uint32_t _cvt_rn_f16x2_f32_1407;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1407) : "f"(S[13]), "f"(S[12]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1407;
-                        uint32_t _cvt_rn_f16x2_f32_1408;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1408) : "f"(S[15]), "f"(S[14]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1408;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1407) : "f"(S[15]), "f"(S[14]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1407;
 #else
                         uint32_t _cvt_rn_f16x2_f32_287;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_287) : "f"(S2[6].y), "f"(S2[6].x));
@@ -9266,12 +9266,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 96ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1408;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1408) : "f"(S[17]), "f"(S[16]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1408;
                         uint32_t _cvt_rn_f16x2_f32_1409;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1409) : "f"(S[17]), "f"(S[16]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1409;
-                        uint32_t _cvt_rn_f16x2_f32_1410;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1410) : "f"(S[19]), "f"(S[18]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1410;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1409) : "f"(S[19]), "f"(S[18]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1409;
 #else
                         uint32_t _cvt_rn_f16x2_f32_289;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_289) : "f"(S2[8].y), "f"(S2[8].x));
@@ -9282,12 +9282,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + state_stride_p2))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1410;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1410) : "f"(S[21]), "f"(S[20]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1410;
                         uint32_t _cvt_rn_f16x2_f32_1411;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1411) : "f"(S[21]), "f"(S[20]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1411;
-                        uint32_t _cvt_rn_f16x2_f32_1412;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1412) : "f"(S[23]), "f"(S[22]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1412;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1411) : "f"(S[23]), "f"(S[22]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1411;
 #else
                         uint32_t _cvt_rn_f16x2_f32_291;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_291) : "f"(S2[10].y), "f"(S2[10].x));
@@ -9298,12 +9298,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + state_stride_p2 + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1412;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1412) : "f"(S[25]), "f"(S[24]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1412;
                         uint32_t _cvt_rn_f16x2_f32_1413;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1413) : "f"(S[25]), "f"(S[24]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1413;
-                        uint32_t _cvt_rn_f16x2_f32_1414;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1414) : "f"(S[27]), "f"(S[26]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1414;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1413) : "f"(S[27]), "f"(S[26]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1413;
 #else
                         uint32_t _cvt_rn_f16x2_f32_293;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_293) : "f"(S2[12].y), "f"(S2[12].x));
@@ -9314,12 +9314,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + state_stride_p2 + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1414;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1414) : "f"(S[29]), "f"(S[28]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1414;
                         uint32_t _cvt_rn_f16x2_f32_1415;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1415) : "f"(S[29]), "f"(S[28]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1415;
-                        uint32_t _cvt_rn_f16x2_f32_1416;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1416) : "f"(S[31]), "f"(S[30]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1416;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1415) : "f"(S[31]), "f"(S[30]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1415;
 #else
                         uint32_t _cvt_rn_f16x2_f32_295;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_295) : "f"(S2[14].y), "f"(S2[14].x));
@@ -9330,12 +9330,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + state_stride_p2 + 96ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1416;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1416) : "f"(S[33]), "f"(S[32]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1416;
                         uint32_t _cvt_rn_f16x2_f32_1417;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1417) : "f"(S[33]), "f"(S[32]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1417;
-                        uint32_t _cvt_rn_f16x2_f32_1418;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1418) : "f"(S[35]), "f"(S[34]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1418;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1417) : "f"(S[35]), "f"(S[34]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1417;
 #else
                         uint32_t _cvt_rn_f16x2_f32_297;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_297) : "f"(S2[16].y), "f"(S2[16].x));
@@ -9346,12 +9346,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1418;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1418) : "f"(S[37]), "f"(S[36]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1418;
                         uint32_t _cvt_rn_f16x2_f32_1419;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1419) : "f"(S[37]), "f"(S[36]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1419;
-                        uint32_t _cvt_rn_f16x2_f32_1420;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1420) : "f"(S[39]), "f"(S[38]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1420;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1419) : "f"(S[39]), "f"(S[38]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1419;
 #else
                         uint32_t _cvt_rn_f16x2_f32_299;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_299) : "f"(S2[18].y), "f"(S2[18].x));
@@ -9362,12 +9362,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2 + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1420;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1420) : "f"(S[41]), "f"(S[40]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1420;
                         uint32_t _cvt_rn_f16x2_f32_1421;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1421) : "f"(S[41]), "f"(S[40]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1421;
-                        uint32_t _cvt_rn_f16x2_f32_1422;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1422) : "f"(S[43]), "f"(S[42]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1422;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1421) : "f"(S[43]), "f"(S[42]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1421;
 #else
                         uint32_t _cvt_rn_f16x2_f32_301;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_301) : "f"(S2[20].y), "f"(S2[20].x));
@@ -9378,12 +9378,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2 + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1422;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1422) : "f"(S[45]), "f"(S[44]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1422;
                         uint32_t _cvt_rn_f16x2_f32_1423;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1423) : "f"(S[45]), "f"(S[44]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1423;
-                        uint32_t _cvt_rn_f16x2_f32_1424;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1424) : "f"(S[47]), "f"(S[46]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1424;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1423) : "f"(S[47]), "f"(S[46]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1423;
 #else
                         uint32_t _cvt_rn_f16x2_f32_303;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_303) : "f"(S2[22].y), "f"(S2[22].x));
@@ -9394,12 +9394,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 2ll * state_stride_p2 + 96ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1424;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1424) : "f"(S[49]), "f"(S[48]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1424;
                         uint32_t _cvt_rn_f16x2_f32_1425;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1425) : "f"(S[49]), "f"(S[48]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1425;
-                        uint32_t _cvt_rn_f16x2_f32_1426;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1426) : "f"(S[51]), "f"(S[50]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1426;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1425) : "f"(S[51]), "f"(S[50]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1425;
 #else
                         uint32_t _cvt_rn_f16x2_f32_305;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_305) : "f"(S2[24].y), "f"(S2[24].x));
@@ -9410,12 +9410,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 3ll * state_stride_p2))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1426;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1426) : "f"(S[53]), "f"(S[52]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1426;
                         uint32_t _cvt_rn_f16x2_f32_1427;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1427) : "f"(S[53]), "f"(S[52]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1427;
-                        uint32_t _cvt_rn_f16x2_f32_1428;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1428) : "f"(S[55]), "f"(S[54]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1428;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1427) : "f"(S[55]), "f"(S[54]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1427;
 #else
                         uint32_t _cvt_rn_f16x2_f32_307;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_307) : "f"(S2[26].y), "f"(S2[26].x));
@@ -9426,12 +9426,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 3ll * state_stride_p2 + 32ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1428;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1428) : "f"(S[57]), "f"(S[56]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1428;
                         uint32_t _cvt_rn_f16x2_f32_1429;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1429) : "f"(S[57]), "f"(S[56]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1429;
-                        uint32_t _cvt_rn_f16x2_f32_1430;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1430) : "f"(S[59]), "f"(S[58]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1430;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1429) : "f"(S[59]), "f"(S[58]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1429;
 #else
                         uint32_t _cvt_rn_f16x2_f32_309;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_309) : "f"(S2[28].y), "f"(S2[28].x));
@@ -9442,12 +9442,12 @@ kernel_cake_gdp_b047f2f1a20630e6f36b(__nv_bfloat16* __restrict__ q, __nv_bfloat1
 #endif
                         reinterpret_cast<int2*>(state + (write_rows_base + 3ll * state_stride_p2 + 64ll))[0] = reinterpret_cast<int2*>(h_words)[0];
 #if __CUDA_ARCH__ == 900
+                        uint32_t _cvt_rn_f16x2_f32_1430;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1430) : "f"(S[61]), "f"(S[60]));
+                        h_words[0] = _cvt_rn_f16x2_f32_1430;
                         uint32_t _cvt_rn_f16x2_f32_1431;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1431) : "f"(S[61]), "f"(S[60]));
-                        h_words[0] = _cvt_rn_f16x2_f32_1431;
-                        uint32_t _cvt_rn_f16x2_f32_1432;
-                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1432) : "f"(S[63]), "f"(S[62]));
-                        h_words[1] = _cvt_rn_f16x2_f32_1432;
+                        asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_1431) : "f"(S[63]), "f"(S[62]));
+                        h_words[1] = _cvt_rn_f16x2_f32_1431;
 #else
                         uint32_t _cvt_rn_f16x2_f32_311;
                         asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(_cvt_rn_f16x2_f32_311) : "f"(S2[30].y), "f"(S2[30].x));
