@@ -371,7 +371,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param num_tokens_per_page: Tokens per physical K/V page.
         :param balanced_scheduler: Use the causal load-balanced grid mapping
             and visit Q tiles in reverse order. Compilation must guarantee
-            that causal masking is enabled when this option is true.
+            that causal masking is enabled when this option is true, and
+            callers must keep ``ceil_div(max_seqlen_q, q_tile_tokens) <= 65535``
+            because Q tiles are mapped onto ``grid.y``.
         :param gqa_pack_size: Q heads sharing one K/V head packed into each Q
             tile (row ``r`` is token ``r // gqa_pack_size``). Must divide ``q_tile``.
         """
@@ -2924,6 +2926,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         # A dynamic threshold can be produced or updated by an earlier kernel.
         # Keep its load after the PDL dependency wait so a dependent launch
         # never observes the predecessor's stale value.
+        if cutlass.const_expr(self.split_d and skip_softmax_threshold is not None):
+            raise NotImplementedError(
+                "skip_softmax_threshold is not supported for head_dim=512"
+            )
         skip_softmax_threshold_log2 = None
         if cutlass.const_expr(skip_softmax_threshold is not None):
             skip_softmax_threshold_log2 = cute.math.log2(
@@ -3968,6 +3974,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         Direct callers must satisfy the same shape contract enforced by
         :meth:`can_implement_paged`.
         """
+        if cutlass.const_expr(self.split_d and skip_softmax_threshold is not None):
+            raise NotImplementedError(
+                "skip_softmax_threshold is not supported for head_dim=512"
+            )
         head_dim = q.shape[2]
         output_head_dim = o.shape[2]
         num_heads_q = q.shape[1]

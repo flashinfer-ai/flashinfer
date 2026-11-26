@@ -228,14 +228,27 @@ def test_validate_hnd_paged_pool_page_size_1():
     with pytest.raises(ValueError, match="16-byte aligned page stride"):
         _validate_hnd_paged_pool("k_pool", misaligned)
 
+    # Misaligned base address (1-byte storage offset) must be rejected even with aligned strides
+    raw_base = torch.empty(8 * 4 * 1 * 512 + 16, dtype=torch.float8_e4m3fn)
+    misaligned_base = raw_base[1 : 1 + 8 * 4 * 1 * 512].view(8, 4, 1, 512)
+    with pytest.raises(ValueError, match="base address must be 16-byte aligned"):
+        _validate_hnd_paged_pool("k_pool", misaligned_base)
+
 
 def test_plan_paged_accepts_page_size_1_and_nhd_layout_only_for_page_size_1(
     monkeypatch,
 ):
+    pytest.importorskip("cutlass.experimental")
     from flashinfer.attention.cute_dsl.sm120_fmha import (
         SM120PrimsBatchPrefillBackend,
+        _check_cutlass_dsl_version,
         _validate_sm120_prims_plan_options,
     )
+
+    try:
+        _check_cutlass_dsl_version()
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(str(exc))
     from flashinfer.cute_dsl.attention.fmha import sm120 as sm120_mod
 
     monkeypatch.setattr(
