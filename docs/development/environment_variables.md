@@ -256,6 +256,7 @@ users should normally leave the batch-size policy at its defaults.
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
 | Disable SM107 fused routing tail masking (enabled by default; use a separate fill) | `export FLASHINFER_SM107_FUSED_TAIL_MASK=0` |
 | Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
+| Bound the PCIe IPC all-reduce wait for peers (seconds; a missing peer then traps instead of hanging; unset or `0` keeps the unbounded wait) | `export FLASHINFER_PCIE_IPC_TIMEOUT_S=60` |
 | Plan cake_fmha small-M decode splits on the device's SM count without reading the launch stream (on by default: splits follow the stream's SM partition; turn it off only when no small-M launch runs on a green context; `flashinfer.green_ctx` helpers turn it back on) | `export FLASHINFER_CAKE_FMHA_SM_PARTITIONS=0` |
 | Set SM100-family MXFP8 CuTe-DSL compile workers (default 4; 0/1 means on-demand) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS=4` |
 | Set MXFP8 precompile timeout per worker chunk (seconds; default 600; 0 disables) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT=600` |
