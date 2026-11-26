@@ -174,6 +174,9 @@ exclude = [
 "flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
 "flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
+# Token-count allowlists of the specialized MoE backend's kernels (one subpackage each),
+# loaded at runtime via importlib.resources.
+"flashinfer.fused_moe.backends.specialized" = ["kernels/*/*.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
 "flashinfer.fused_moe.backends.cudnn_frost" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.

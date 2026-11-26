@@ -641,6 +641,13 @@ class MoERunner(TunableRunner):
     # Set to True only by runners that thread QuantConfig.nvfp4_4over6 into
     # their activation quantizer instead of letting it read the environment.
     supports_nvfp4_4over6: ClassVar[bool] = False
+    # Set to True only by a backend whose ``accepts`` admits exactly the calls
+    # where it was measured faster than every other backend, such as a backend
+    # of kernels specialized for one served configuration. Outside
+    # ``flashinfer.autotune(True)``, ``MoELayer`` then takes it, when it
+    # accepts a call, without timing it against the other eligible backends;
+    # under autotune it is timed like any candidate.
+    prefer_when_accepted: ClassVar[bool] = False
 
     config: MoEConfig
 

@@ -48,9 +48,10 @@ def test_aot_registers_cutlass_fused_moe_for_supported_targets(
     # Exercise registration without generating sources or probing CUDA.
     for name in dir(aot):
         if name.startswith("gen_") and name != "gen_all_modules":
-            monkeypatch.setattr(
-                aot, name, Mock(return_value=SimpleNamespace(name=name))
-            )
+            spec = SimpleNamespace(name=name)
+            # Plural generators return a list of specs.
+            result = [spec] if name.endswith("_modules") else spec
+            monkeypatch.setattr(aot, name, Mock(return_value=result))
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
     fused_moe = aot.gen_cutlass_fused_moe_sm100_module
     fused_moe.return_value = SimpleNamespace(name="fused_moe_100")

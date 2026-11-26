@@ -744,6 +744,7 @@ Key mechanisms (and where they live):
 - **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. This comparison captures `pack_inputs` plus `forward`, including per-call GPU conversions and routing-ID packing. One-time preparation runs before capture; Python overhead is excluded from graph replay timing. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
+- **Untimed selections.** A backend whose runner sets `prefer_when_accepted` (meant for a backend whose acceptance envelope is exactly where it measured faster than the other backends, such as one of kernels specialized for a single served configuration; no stock backend sets it) wins every bucket it accepts without cross-backend timing, outside `flashinfer.autotune(True)`. Under `autotune(True)` all eligible backends are timed, and a bucket whose winner was taken untimed is selected again. Nothing is timed, tuned or precompiled inside a CUDA-graph capture, also under `autotune(True)`, since each synchronizes the device: a cached winner is replayed, and a first call of a bucket takes the first eligible candidate in configured order (leaving out runners that set `capture_requires_eager_selection`), with the tactic the autotuner already has for it (else the fallback tactic), and caches it as untimed, so the next call of the bucket outside a capture selects again. A capture-time selection of one candidate is also selected again on its next eager call, which tunes it and precompiles its bucket. Capture is checked on the layer's device, not only on the current one.
 - **Fail-fast scope:** each runner declares MMA ``(weight, activation)`` pairs
   plus ``supported_output_formats``; ``QuantConfig`` only checks that each axis
   is a ``QuantFormat``. Unsupported combinations are filtered before build, the
@@ -987,6 +988,68 @@ same: it reuses the SwiGLU alpha/beta channels, whose null default is
 b12x runners keep their flat-proven activation subsets. Weight preparation
 derives GEMM1 rows from `activation.is_gated` across backends (`2I` gated, `I`
 non-gated) and forwards the gated mode into TRTLLM row permutations.
+
+### Specialized backend (`specialized`)
+
+`SpecializedMoEConfig()` is the one backend for MoE kernels generated for a
+single served configuration: a model's expert geometry, routing, quantization and
+token counts on one GPU architecture (for example by a kernel-generation workflow
+from serving logs). Such a kernel is a fused fast path for that configuration
+only, so it does not get a backend of its own; it registers as a kernel of this
+backend.
+
+- **Registration.** Each kernel is a self-contained subpackage of
+  `flashinfer/fused_moe/backends/specialized/kernels/` that exports `KERNEL`, a
+  `SpecializedMoEKernel` subclass (`backends/specialized/kernel.py`) named after
+  the subpackage. The subpackage holds the kernel's configuration guard, per-call
+  guard, token-count allowlist (package data), lazy per-device build, launch and
+  diagnostics; its CUDA or CuTe DSL sources stay in the usual places (`csrc/`,
+  `flashinfer/jit/`, `flashinfer/fused_moe/cute_dsl/`).
+  `backends/specialized/registry.py` finds the subpackages, so adding a kernel
+  edits no shared file. `registered_kernels()` lists them, `stats()` returns
+  their diagnostics, and kernels with AOT modules hand them to `flashinfer.aot`
+  through the registry.
+- **Selection.** `SpecializedMoEConfig.supported(arch)` is true when a registered
+  kernel runs on that architecture. At `MoELayer` construction the runner
+  (`SpecializedMoERunner`) binds every kernel whose declarations (quantization
+  pair, output format, activation class, routing modes, expert parallelism,
+  fused shared experts) and configuration guard admit the layer's configuration;
+  with none bound, the layer skips the backend. The runner's class declarations
+  are the union of the registered kernels', so the backend is left out of the
+  generated activation matrix above, which lists backends whose capabilities are
+  fixed in code.
+- **Weights and numerics.** A kernel reads the weight view of the backend whose
+  data path it computes (for example `trtllm_bf16_routed` or
+  `trtllm_fp8_block`), so a default `MoELayer` needs no extra preparation, and it
+  keeps that backend's roundings and fp32 accumulation.
+- **Per call.** `accepts()` asks the bound kernels in name order and the first
+  that admits the call runs it. A call no kernel admits (token count outside its
+  allowlist, tensor layout, device) runs on the other candidates. A kernel's
+  allowlist holds only the calls where it was measured faster than the other
+  backends, so the backend is first in the default list and prefers itself
+  (`prefer_when_accepted`): outside `flashinfer.autotune(True)`, `MoELayer`
+  runs an admitted call on it without timing the other candidates; under
+  `autotune(True)` it is timed against them like any candidate.
+- **Build and CUDA graphs.** A kernel is built for a device by the first eager
+  call it admits, never at import or construction. Under CUDA-graph capture a
+  call is admitted only when the kernel is built and the layer already admitted
+  that token count eagerly, so its winner was selected outside capture; otherwise,
+  including the first call of a token count under capture, the call is captured
+  on another candidate, untimed. That needs another configured backend that
+  accepts the call with its weight view prepared (in the default list, the backend
+  whose view the kernel reads); with the specialized backend alone such a call
+  raises `NotImplementedError`, so make an eager call of every token count before
+  capturing it. `MoELayer.reset_winner()` forgets those admissions with
+  the winners, and a winner-cache miss under capture leaves the backend out of
+  the selection and caches it for the remaining candidates only, so a later eager
+  call of that bucket still selects among all of them. Nothing is built or timed
+  inside a capture.
+- **Kill switch.** `FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`, read at call time,
+  keeps every call on the other candidates (the runner rejects the call before
+  asking any kernel). A selection stored outside `MoELayer.__call__`
+  (`_prepare_tactic` / `_run_tactic`) is re-checked against `accepts()`
+  (`stored_selection_requires_accepts`), so it falls back to an ordinary
+  selection too.
 
 ### Today's MVP Cut
 
