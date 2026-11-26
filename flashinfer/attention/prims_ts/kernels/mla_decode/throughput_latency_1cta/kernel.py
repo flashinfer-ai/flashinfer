@@ -2812,6 +2812,34 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 use_pdl=True,
             )
 
+    def waits_after_prologue(
+        self,
+        cfg,
+        acc_o,
+        tile_sched_params,
+        softmax_scale_operand,
+        output_scale,
+        sparse_inputs,
+    ) -> bool:
+        """Return whether a traced launch waits for its PDL predecessor after the prologue.
+
+        A persistent grid binds its sparse sources without reading them, has
+        no per-CTA activity guard, and takes launch-scalar scales, so nothing
+        before its task graph reads memory the preceding grid may write. KV
+        producers may read their bound sources while binding them.
+        """
+        return bool(
+            cfg.use_pdl
+            and cfg.pdl_wait_after_prologue
+            and acc_o is None
+            and tile_sched_params is not None
+            and cfg.use_persistent_scheduler == 1
+            and self.kv_producer is None
+            and not isinstance(softmax_scale_operand, cute.Tensor)
+            and not isinstance(output_scale, cute.Tensor)
+            and not (cfg.sparse_direct and isinstance(sparse_inputs[5], cute.Tensor))
+        )
+
     @cute.kernel
     def dense_kernel(
         self,
@@ -2846,19 +2874,15 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
-        # A persistent grid binds its sparse sources without reading them, has
-        # no per-CTA activity guard, and takes launch-scalar scales, so nothing
-        # before its task graph reads memory the preceding grid may write.
         wait_after_prologue = cutlass.const_expr(
-            cfg.use_pdl
-            and cfg.pdl_wait_after_prologue
-            and acc_o is None
-            and tile_sched_params is not None
-            and cfg.use_persistent_scheduler == 1
-            and self.kv_producer is None
-            and not isinstance(softmax_scale_operand, cute.Tensor)
-            and not isinstance(output_scale, cute.Tensor)
-            and not (cfg.sparse_direct and isinstance(sparse_inputs[5], cute.Tensor))
+            self.waits_after_prologue(
+                cfg,
+                acc_o,
+                tile_sched_params,
+                softmax_scale_operand,
+                output_scale,
+                sparse_inputs,
+            )
         )
         if cutlass.const_expr(
             (cfg.use_pdl or acc_o is not None) and not wait_after_prologue
