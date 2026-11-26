@@ -9,7 +9,7 @@ import torch.distributed as dist
 import flashinfer.comm as comm
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import TorchDistBackend
+from flashinfer.comm.mnnvl import TorchDistBackend, is_multicast_supported
 from flashinfer.fp4_quantization import _compute_swizzled_layout_sf_size
 from flashinfer.utils import get_compute_capability
 
@@ -1128,3 +1128,76 @@ def test_mnnvl_allreduce_rmsnorm_large_magnitude(
         inject_large_magnitude=True,
         strategy=strategy,
     )
+
+
+@torch.inference_mode()
+def test_mnnvl_allreduce_rmsnorm_normalizes_before_gamma():
+    gpus_per_node = torch.cuda.device_count()
+    if gpus_per_node == 0:
+        pytest.skip("MNNVL allreduce test requires CUDA")
+    _, world_size, _ = _get_rank_info_from_env()
+    if world_size < 2:
+        pytest.skip("MNNVL allreduce test requires at least 2 ranks")
+
+    _set_device_from_launcher_local_rank()
+    device_idx = torch.cuda.current_device()
+    device = torch.device("cuda", device_idx)
+    init_torch_distributed_from_mpi(device_id=device)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    support = [False] * world_size
+    dist.all_gather_object(support, is_multicast_supported(device_idx))
+    if not all(support):
+        pytest.skip("MNNVL allreduce test requires NVLink multicast on all ranks")
+
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        gpus_per_node=gpus_per_node,
+        tp_size=world_size,
+    )
+    dtype = torch.bfloat16
+    hidden_size = 2048
+    eps = 1e-6
+    # gamma * x overflows FP32 only in the first row; sum(x**2) and the
+    # normalized result are finite for both. Nonzero residual supplies x/4.
+    x = torch.tensor([2.0**12, 2.0**-5], dtype=torch.float64).view(2, 1)
+    weight = 2.0**120
+    rank_fraction = {0: 0.25, 1: 0.5}.get(rank, 0.0)
+    local_input = (x * rank_fraction).to(device=device, dtype=dtype)
+    local_input = local_input.expand(-1, hidden_size).contiguous()
+    residual = (x * 0.25).to(device=device, dtype=dtype)
+    residual = residual.expand_as(local_input).contiguous()
+    gamma = torch.full((hidden_size,), weight, device=device, dtype=dtype)
+    expected_residual = x.to(device=device, dtype=dtype).expand_as(local_input)
+    expected_norm = (x * (x.square() + eps).rsqrt() * weight).to(
+        device=device, dtype=dtype
+    )
+    expected_norm = expected_norm.expand_as(local_input)
+
+    workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
+        mapping,
+        max_num_tokens=local_input.shape[0],
+        hidden_dim=hidden_size,
+        dtype=dtype,
+        comm_backend=TorchDistBackend(),
+    )
+    strategy = trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy
+    try:
+        # One-shot controls for the allreduce and norm at the same large gamma.
+        results = []
+        for mode in (strategy.ONESHOT, strategy.TWOSHOT):
+            results.append(
+                trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_add_rmsnorm(
+                    local_input, residual, gamma, workspace, epsilon=eps, strategy=mode
+                )
+            )
+        torch.cuda.synchronize(device)
+        dist.barrier()
+    finally:
+        workspace.destroy()
+
+    # All ranks finish both collectives before any rank can fail an assertion.
+    for norm, residual_out in results:
+        torch.testing.assert_close(residual_out, expected_residual, rtol=0, atol=0)
+        torch.testing.assert_close(norm, expected_norm, rtol=0, atol=0)

@@ -1698,8 +1698,16 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       PackedVec<PackedType, T> out;
 #pragma unroll
       for (int j = 0; j < kELTS_PER_LOAD; j++) {
-        float normVal = (params.weightBias + toFloat<T>(gamma.elements[j])) *
-                        rInput[i * kELTS_PER_LOAD + j] * rcpRms;
+        float normVal;
+        if constexpr (QType == QuantType::kNone) {
+          // Normalize before applying gamma, as in one-shot. Multiplying the
+          // unnormalized activation by gamma can overflow with a finite result.
+          float const normalized = __fmul_rn(rInput[i * kELTS_PER_LOAD + j], rcpRms);
+          normVal = normalized * (params.weightBias + toFloat<T>(gamma.elements[j]));
+        } else {
+          normVal = (params.weightBias + toFloat<T>(gamma.elements[j])) *
+                    rInput[i * kELTS_PER_LOAD + j] * rcpRms;
+        }
         threadMax = fmaxf(threadMax, fabsf(normVal));
         out.elements[j] = fromFloat<T>(normVal);
         if constexpr (QType == QuantType::kPerTokenGroupFP8Packed) {
