@@ -1098,14 +1098,18 @@ def mm_bf16_fp4_trace_dispatch(**kwargs):
     canonical weight with linear 2-D scales. The explicit cute-dsl-native
     backend consumes the contiguous canonical 128x4 scale buffer directly. Pass as
     ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
+    SM8x prepares W4A16 records with empty scales; they have no template yet, so
+    they resolve to None (tracing records nothing).
     """
+    b_descale = kwargs.get("b_descale")
+    if b_descale is not None and b_descale.numel() == 0:
+        return None
     if kwargs.get("backend") == "cute-dsl-native":
         sf = kwargs.get("b_descale")
         return _mm_bf16_fp4_native_trace(sf.ndim if sf is not None else 1)
     b = kwargs.get("b")
     if b is not None and b.dtype == torch.int32:
         return mm_bf16_fp4_cute_dsl_trace
-    b_descale = kwargs.get("b_descale")
     if b_descale is not None and b_descale.dim() == 6:
         return mm_bf16_fp4_cute_dsl_sm100_trace
     return mm_bf16_fp4_cudnn_trace

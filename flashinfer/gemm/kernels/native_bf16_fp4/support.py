@@ -36,7 +36,7 @@ def check_weights(b, b_descale, alpha, block_size=16):
     return n, k
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([80, 86, 87, 89, 120, 121])
 def check_native_bf16_fp4(
     a,
     b,
@@ -53,7 +53,10 @@ def check_native_bf16_fp4(
     # explicit until the caller can describe which representation it owns.
     if backend == "auto":
         return False
-    n, k = check_weights(b, b_descale, alpha, block_size)
+    from ...sm8x_fp4_dense import sm8x_records_nk
+
+    nk = sm8x_records_nk(a, b, b_descale, alpha, block_size)
+    n, k = nk if nk is not None else check_weights(b, b_descale, alpha, block_size)
     if (
         a.ndim != 2
         or a.dtype != torch.bfloat16

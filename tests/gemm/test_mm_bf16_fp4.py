@@ -12,7 +12,7 @@ from flashinfer.gemm.gemm_bf16_fp4 import (
     _CUDNN_BF16_FP4_MIN_BACKEND_VERSION,
     _unswizzle_sf_128x4,
 )
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import device_support_pdl, get_compute_capability
 from tests.utils.test_helpers.pdl import late_store
 from tests.moe_ep.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
@@ -173,8 +173,9 @@ def _uses_exact_w4a16_reference(backend, device):
         if capability in ((10, 0), (10, 3), (10, 7)):
             # Every SM100-family tactic reduces the full K in one accumulator.
             return True
-        elif capability in ((11, 0), (12, 0), (12, 1)):
-            # These kernels can select split-K/GEMV and have separate layouts.
+        elif capability in ((11, 0), (12, 0), (12, 1)) or capability[0] == 8:
+            # These kernels can select split-K/GEMV and have separate layouts; SM8x
+            # runs the W4A16 records GEMM (torch reference, tolerance compare).
             return False
         else:
             raise ValueError(f"Unsupported cute-dsl compute capability {capability}")
@@ -307,6 +308,10 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     SM100-family full-K tactics use zero tolerance; SM12x retains its
     existing split-K/GEMV accuracy checks. Shapes include K and M tails."""
     _skip_if_backend_unavailable("cute-dsl")
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip(
+            "tactic runners of the SM100 / SM12x CuTe DSL kernels (not run on SM8x)"
+        )
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
         _SM100_BF16_FP4_TACTICS,
         _bf16_fp4_cute_dsl_tactic_configs,
@@ -663,6 +668,10 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
         assert b_p.shape == b_fp4.shape
         assert sf_p.data_ptr() == b_sf.data_ptr()
         assert sf_p.dim() == 6
+    elif major == 8:  # SM8x: the W4A16 records
+        assert b_p.dtype == torch.uint8
+        assert b_p.shape[0] == n and b_p.shape[1] > k // 2
+        assert sf_p.numel() == 0
     else:
         assert b_p.dtype == torch.int32
         assert sf_p.shape == (k // 16, n)
@@ -714,6 +723,8 @@ def test_alpha_dtype_must_be_float32():
 def test_mm_bf16_fp4_pdl_waits_for_alpha(backend):
     _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
+    if not device_support_pdl(device):
+        pytest.skip("PDL needs SM90+")
     m, n, k = SMOKE_MNK
     torch.manual_seed(0)
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
