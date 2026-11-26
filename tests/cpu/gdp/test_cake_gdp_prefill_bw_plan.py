@@ -814,6 +814,46 @@ def test_the_plan_cache_keeps_the_least_recently_used_plans(arch):
     assert cache.total == len(big.rows)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", sorted(SMS))
+def test_a_cache_hit_reads_the_offsets_the_tensor_holds_now(arch):
+    """A cache hit keys a CPU tensor by the offsets it holds at the call (read through a view of its memory): the
+    same plan for the same offsets in another tensor, of either width, contiguous or not; the new plan after the
+    tensor's offsets change in place; the arguments as given (integer-valued NumPy / float scalars) hit the entry
+    of their integer values; the views kept stay bounded."""
+    import numpy as np
+
+    loader.clear_plan_caches()
+    cu_a, cu_b = _cu([1] * 4 + [3000]), _cu([1] * 4 + [2000])
+    want_a = loader.prefill_v6_plan(cu_a, **_kw(20, arch))
+    want_b = loader.prefill_v6_plan(cu_b, **_kw(20, arch))
+    assert want_a != want_b
+    for dtype in (torch.int32, torch.int64):
+        t = torch.tensor(cu_a, dtype=dtype)
+        assert loader.prefill_v6_plan(t, **_kw(20, arch)) == want_a
+        assert loader.prefill_v6_plan(t, **_kw(20, arch)) == want_a  # a hit
+        launch = loader.prefill_v6_launch(t, total_tokens=cu_a[-1], **_kw(20, arch))
+        assert (launch.split, launch.grid) == (want_a.split, want_a.grid)
+        t.copy_(torch.tensor(cu_b, dtype=dtype))  # the same memory, other offsets
+        assert loader.prefill_v6_plan(t, **_kw(20, arch)) == want_b
+        launch = loader.prefill_v6_launch(t, total_tokens=cu_b[-1], **_kw(20, arch))
+        assert (launch.split, launch.grid) == (want_b.split, want_b.grid)
+        wide = torch.tensor([x for c in cu_a for x in (c, -1)], dtype=dtype)[::2]
+        assert not wide.is_contiguous()
+        assert loader.prefill_v6_plan(wide, **_kw(20, arch)) == want_a
+    plan = loader.prefill_v6_plan(torch.tensor(cu_a), **_kw(20, arch))
+    kw = _kw(20, arch)
+    kw.update(
+        num_heads=np.int64(20), sm_count=float(kw["sm_count"]), total_tokens=cu_a[-1]
+    )
+    assert loader.prefill_v6_plan(torch.tensor(cu_a), **kw) is plan
+    for extra in range(loader._V6_HOST_VIEWS_MAX + 8):
+        loader.prefill_v6_plan(
+            torch.tensor(_cu([1] * (extra % 5) + [100 + extra])), **_kw(4, arch)
+        )
+    assert len(loader._V6_HOST_VIEWS) <= loader._V6_HOST_VIEWS_MAX
+
+
 @functools.cache
 def _native():
     native = loader._v6_native_module()

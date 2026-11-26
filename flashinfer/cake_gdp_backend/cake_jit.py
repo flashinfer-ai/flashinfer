@@ -17905,19 +17905,25 @@ def prefill_v6_plan(
     ``total_tokens`` defaults to the last) on a device of ``sm_count`` SMs: the candidate the PLAN CHOOSER picks
     (the native chooser when it builds, else the Python reference; cached, see NATIVE PLAN CHOOSER)."""
 
-    # the key: a tensor's offsets as bytes, a sequence's as a tuple (width 0)
+    # the key: a tensor's offsets as bytes, a sequence's as a tuple (width 0); a hit with the arguments as given
     data: bytes | tuple[int, ...]
     if isinstance(cu_seqlens, torch.Tensor):
         data, width = _v6_offset_bytes(cu_seqlens)
-        if total_tokens is None:
-            total_tokens = int.from_bytes(data[-width:], "little", signed=True)
     else:
         data, width = (
             (cu_seqlens if type(cu_seqlens) is tuple else tuple(cu_seqlens)),
             0,
         )
+    key = (data, width, num_heads, num_householder, sm_count, arch, total_tokens)
+    plan = _V6_PLANS.get(key)
+    if plan is not None:
+        _V6_PLANS.move_to_end(key)
+        return plan
+    if width:
         if total_tokens is None:
-            total_tokens = data[-1]
+            total_tokens = int.from_bytes(data[-width:], "little", signed=True)
+    elif total_tokens is None:
+        total_tokens = data[-1]
     key = (
         data,
         width,
@@ -18063,7 +18069,9 @@ def prefill_v6_candidate_plan(
 # count and the item words, cached by the call's host offsets (their bytes), H, n, the SM count, the arch, the token
 # count and the state form; the cache keeps V6_PLAN_CACHE_SIZE launches and at most V6_LAUNCH_CACHE_BYTES of words
 # (least recently used out), the ``prefill_v6_plan`` cache at most V6_PLAN_CACHE_ROWS rows.  ``clear_plan_caches``
-# empties every planner cache (a batch the process has not planned before).
+# empties every planner cache (a batch the process has not planned before).  A cached call is one dictionary lookup
+# of the arguments as given (equal integer values find the same entry) and of the offsets a CPU tensor holds at the
+# call, read through a kept view of its memory (``_v6_offset_bytes``); a miss converts the arguments and looks again.
 V6_NATIVE_SOURCE = "cake_gdp_v6_plan.cpp"
 V6_NATIVE_HEAD = (
     5  # header words of the native result: candidate, split, grid, rows, item words
@@ -18265,15 +18273,31 @@ def v6_launch_of_plan(
     )
 
 
+# ctypes views of host memory by (address, bytes): ``_v6_offset_bytes`` reads a CPU tensor's offsets through the view
+# of its memory (``raw``), without a foreign-function call or a NumPy array; at most _V6_HOST_VIEWS_MAX views are kept
+# (a view holds no memory, only the address).
+_V6_HOST_VIEWS: dict[tuple[int, int], Any] = {}
+_V6_HOST_VIEWS_MAX = 64
+
+
+def _v6_host_view(at: tuple[int, int]):
+    # the oldest view out (pop: another thread may have taken it)
+    if len(_V6_HOST_VIEWS) >= _V6_HOST_VIEWS_MAX:
+        _V6_HOST_VIEWS.pop(next(iter(_V6_HOST_VIEWS), None), None)
+    view = _V6_HOST_VIEWS[at] = (ctypes.c_char * at[1]).from_address(at[0])
+    return view
+
+
 def _v6_offset_bytes(cu_seqlens) -> tuple[bytes, int]:
     """The host offsets as (bytes, element width): a CPU int32 / int64 tensor as is, else int64."""
     if isinstance(cu_seqlens, torch.Tensor):
-        width = cu_seqlens.element_size()
         if cu_seqlens.is_cpu and cu_seqlens.is_contiguous():
-            return ctypes.string_at(
-                cu_seqlens.data_ptr(), cu_seqlens.numel() * width
-            ), width
-        return cu_seqlens.numpy().tobytes(), width
+            at = (cu_seqlens.data_ptr(), cu_seqlens.nbytes)
+            view = _V6_HOST_VIEWS.get(at)
+            if view is None:
+                view = _v6_host_view(at)
+            return view.raw, cu_seqlens.itemsize
+        return cu_seqlens.numpy().tobytes(), cu_seqlens.itemsize
     return array.array("q", cu_seqlens).tobytes(), 8
 
 
@@ -18292,6 +18316,21 @@ def prefill_v6_launch(
     or a sequence of integers, the state form as in ``selected_v6_module``."""
 
     data, width = _v6_offset_bytes(cu_seqlens)
+    key = (
+        data,
+        width,
+        num_heads,
+        num_householder,
+        sm_count,
+        arch,
+        total_tokens,
+        state_dtype,
+        pool,
+    )
+    launch = _V6_LAUNCHES.get(key)  # a hit with the arguments as given
+    if launch is not None:
+        _V6_LAUNCHES.move_to_end(key)
+        return launch
     if total_tokens is None:
         total_tokens = int.from_bytes(data[-width:], "little", signed=True)
     H, n, sm, total = (
