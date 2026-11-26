@@ -387,9 +387,11 @@ def test_firefly_per_tensor_equals_unit_row_scales(
 
 
 @pytest.mark.parametrize("per_token", PER_TOKEN)
-def test_firefly_skipped_routes_and_expert_parallelism(per_token):
+@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
+def test_firefly_skipped_routes_and_expert_parallelism(fused, per_token):
     """Ids outside this rank's experts (negative, other ranks', >= E) add
-    nothing; BF16 route weights are read as given; the unpacked mode works."""
+    nothing; BF16 route weights are read as given; the unpacked mode works;
+    the direct, short and long batches, fused and unfused."""
     num_experts, top_k, hidden, inter, act = 32, 4, 1024, 512, SwiGLU()
     offset, local = 8, 16
     g, pack, w1, w2 = _setup(local, top_k, hidden, inter, act)
@@ -398,12 +400,13 @@ def test_firefly_skipped_routes_and_expert_parallelism(per_token):
         top_k,
         inter,
         act,
-        256,
+        2048,
+        fused=fused,
         per_token=per_token,
         local_expert_offset=offset,
         local_num_experts=local,
     )
-    for m in (3, 256):
+    for m in (3, 256, 2048):
         x_deq, q, sf, gs, ids, wts = _inputs(
             g,
             m,
@@ -435,7 +438,7 @@ def test_firefly_skipped_routes_and_expert_parallelism(per_token):
             _mid_per_token(layer, m, hidden, torch.bfloat16),
             offset=offset,
         )
-        assert _rel_rmse(out, ref) < 0.005
+        assert _rel_rmse(out, ref) < (0.0065 if fused else 0.005), f"M={m}"
 
 
 @pytest.mark.parametrize("per_token", PER_TOKEN)
@@ -909,3 +912,89 @@ def test_firefly_prepare_weights_on_device_other_than_current():
     for name, t in view.items():
         if isinstance(t, torch.Tensor):
             assert t.device == dev, name
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
+def test_firefly_top_k_32(fused):
+    """top_k = 32, the largest supported, on the direct, short and long batches.
+    The fused finalize adds each route into the BF16 output, one BF16 rounding
+    per add, so its error grows with top_k as expected: relative RMSE about
+    0.004 at top_k 8, 0.006 at 22 and 0.007 at 32 (FlashInfer's cute_dsl fused
+    finalize gives the same numbers); hence its own bound here. The unfused
+    finalize sums in FP32 and rounds once at any top_k."""
+    num_experts, top_k, hidden, inter, act = 64, 32, 1024, 512, SwiGLU()
+    g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 1024, fused=fused)
+    for m in (2, 64, 1024):
+        x_deq, q, sf, gs, ids, wts = _inputs(g, m, hidden, num_experts, top_k)
+        out = layer(_act_pack(q, sf, gs, ids, wts), pack)
+        ref = _reference(
+            x_deq, ids, wts, w1, w2, act, inter, _mid_per_token(layer, m, hidden)
+        )
+        assert _rel_rmse(out, ref) < (0.008 if fused else 0.005), f"M={m}"
+
+
+def test_firefly_plan_built_inside_capture():
+    """A batch size first seen inside a CUDA graph capture: building its plan
+    writes nothing to the device, so a call before any replay is correct (the
+    long batches' fused gate/up reads M from memory to zero the output rows)."""
+    num_experts, top_k, hidden, inter, act = 8, 8, 1024, 512, SwiGLU()
+    g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 1100, fused=True)
+    _, q, sf, gs, ids, wts = _inputs(g, 64, hidden, num_experts, top_k)
+    layer(
+        _act_pack(q, sf, gs, ids, wts), pack
+    )  # constructs the CuteMoE outside the capture
+    moe = layer.runners[0]._moes[hidden]
+    view = pack.get_view("firefly_nvfp4")
+    m = 1100  # the long batches
+    x_deq, q, sf, gs, ids, wts = _inputs(g, m, hidden, num_experts, top_k)
+    out = torch.randn((m, hidden), device="cuda").bfloat16()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream(q.device)):
+        moe(q, sf, gs, view, topk_ids=ids, topk_weights=wts, out=out)
+    out = torch.randn(
+        (m, hidden), device="cuda"
+    ).bfloat16()  # not zeroed: the kernels zero it
+    moe(q, sf, gs, view, topk_ids=ids, topk_weights=wts, out=out)
+    ref = _reference(
+        x_deq, ids, wts, w1, w2, act, inter, _mid_per_token(layer, m, hidden)
+    )
+    assert _rel_rmse(out, ref) < 0.0065
+
+
+def test_firefly_construction_inside_capture_raises():
+    """The CuteMoE's construction (the layer's first call: its workspace is
+    allocated and zeroed) inside a CUDA graph capture raises instead of
+    recording fills that would run only at a replay."""
+    from flashinfer.experimental.firefly.moe import CuteMoE
+
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError),
+        torch.cuda.graph(graph, stream=torch.cuda.Stream("cuda")),
+    ):
+        CuteMoE(8, 8, 1024, 512, max_tokens=64)
+
+
+def test_firefly_rejects_misaligned_weight_view():
+    """FP4 weights at an address 16- but not 32-byte aligned (a view into a
+    larger buffer) are rejected by the weight check: the grouped GEMMs read
+    them 32-byte aligned."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
+    g, pack, _, _ = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 8)
+    _, q, sf, gs, ids, wts = _inputs(g, 8, hidden, num_experts, top_k)
+    layer(_act_pack(q, sf, gs, ids, wts), pack)
+    moe = layer.runners[0]._moes[hidden]
+    view = dict(pack.get_view("firefly_nvfp4"))
+    w1 = view["w1"]
+    n = w1.numel() * w1.element_size()
+    raw = torch.empty(n + 64, dtype=torch.uint8, device=w1.device)
+    off = (16 - raw.data_ptr()) % 32
+    moved = raw[off : off + n].view(w1.dtype).view(w1.shape)
+    moved.copy_(w1)
+    assert moved.data_ptr() % 32 == 16
+    view["w1"] = moved
+    with pytest.raises(ValueError):
+        moe(q, sf, gs, view, topk_ids=ids, topk_weights=wts)

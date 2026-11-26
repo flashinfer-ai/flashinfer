@@ -24,7 +24,7 @@ batch size (from 1 token to `tune_max_num_tokens`).
 | Activation pack | `uint8 [M, H/2]` E2M1 values (even element in the low nibble), linear `float8_e4m3fn [M, H/16]` block scales; per-token: `float32 [M]` per-token scales, x ~ e2m1 * block scale * per-token scale; per-tensor: a unit global scale, x ~ e2m1 * block scale (a calibrated activation scale is folded into the view's per-expert `w1_gs`, as other backends fold it into `w1_alpha`) |
 | Routing | pre-routed (`PackedPrecomputed` or `UnpackedPrecomputed`): `int32 [M, top_k]` ids, `float32` / `bfloat16` / `float16 [M, top_k]` weights used as given; ids outside this rank's experts (negative ones included) are skipped; each token's ids must name distinct experts, as a top-k selection does (not checked, which would take a device-to-host sync per call: repeated ids cause no out-of-bounds access, but their result is unspecified) |
 | Activations | `SwiGLU(alpha, beta, limit)`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU` (no `clamp_limit`), `ReLU2` |
-| Finalize | `do_finalize=True`; `use_fused_finalize=False` sums the top_k rows in a fixed FP32 order (deterministic), `True` adds them into the output from the down GEMM (BF16 atomics / bulk reductions, not deterministic) |
+| Finalize | `do_finalize=True`; `use_fused_finalize=False` sums the top_k rows in a fixed FP32 order (deterministic), `True` adds them into the output from the down GEMM (BF16 atomics / bulk reductions, not deterministic; one BF16 rounding per add, so the error grows with top_k: relative RMSE about 0.004 at top_k 8 and 0.007 at 32, as FlashInfer's `cute_dsl` fused finalize, against about 0.0025 unfused) |
 | Expert parallelism | `local_expert_offset` / `local_num_experts` (the output is this rank's partial sum) |
 | PDL | `ExecutionConfig(enable_pdl=)` (default on) |
 | Shapes | H % 256 == 0, I % 128 == 0, 1 <= top_k <= min(E, 32), E <= 1024 |
@@ -84,7 +84,9 @@ a CUDA graph, call (or let `MoELayer` prepare) each batch size with each
 routing-weight dtype the capture uses (FP32, BF16 or FP16 weights take
 separate kernels); for M <= 4 (the direct GEMMs) use the same weight tensors as
 the capture, since their TMA descriptors are built per weight tensor on first
-use, which a capture cannot do.
+use, which a capture cannot do (a missing one raises `RuntimeError`). The
+layer's first call (which allocates and zeroes its workspace) must also come
+before any capture, or it raises `RuntimeError`.
 
 ## Package layout
 

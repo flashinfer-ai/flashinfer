@@ -35,7 +35,9 @@ On the direct path and the short batches with BF16 atomic adds (``DirectGemm(fus
 long batches the down GEMM is token-major and adds each tile row with one bulk reduce (``GroupedGemm(token_major,
 fused_out)``, as CTA pairs of 256 tokens x 256 weight rows where ``down_pairs``; the output zeroed by the gate/up's
 load warp, ``GroupedGemm(zero_rows)``). The sum is then rounded to BF16 after every add, in a varying
-order: the output is not deterministic and its error is larger (relative RMSE ~0.004 instead of ~0.0025).
+order: the output is not deterministic and its error is larger, and grows with topk as expected of one more BF16
+rounding per add (relative RMSE ~0.004 at topk 8, ~0.006 at 22, ~0.007 at 32, against ~0.0025 unfused at any topk;
+FlashInfer's cute_dsl fused finalize gives the same numbers).
 
 ``CuteMoE(E, topk, H, I, max_tokens)`` allocates one workspace for every batch size up to ``max_tokens``; a call
 with the quantized input ``q`` [m, H / 2] uint8, ``sf`` [m, H / 16] (E4M3 as uint8 or float8_e4m3fn), ``gs`` [m]
@@ -843,6 +845,12 @@ class CuteMoE:
             if dev.index is None
             else dev
         )
+        if torch.cuda.is_current_stream_capturing():
+            # the workspace and the constants below are filled by kernels, which a capture only records: they would hold
+            # nothing until a replay (a plan built inside a capture writes nothing to the device, _tokens_arg)
+            raise RuntimeError(
+                "CuteMoE: construct it before a CUDA graph capture (through FlashInfer: call the layer once first)"
+            )
         props = torch.cuda.get_device_properties(self.dev)
         if not supported(props.major * 10 + props.minor):
             raise ValueError(
@@ -876,7 +884,9 @@ class CuteMoE:
             _SIZES[key] = sizes
         self.ws = _Workspace(_SIZES[key], self.dev)
         self._dummy = torch.zeros(4, dtype=torch.int32, device=self.dev)
-        self._tokens = {}  # M -> Int32 [1] (_tokens_arg)
+        self._mtab = torch.arange(
+            max_tokens + 1, dtype=torch.int32, device=self.dev
+        )  # M at index M (_tokens_arg)
         # per-tensor input: unit row scales for the gate/up without Scatter (_queue_gate_up)
         self._ones = (
             None
@@ -1474,10 +1484,10 @@ class CuteMoE:
             )
 
     def _tokens_arg(self, m):
-        """An Int32 [1] holding M, for the long batches' gate/up that zeroes the output's M rows (zero_rows)."""
-        if m not in self._tokens:
-            self._tokens[m] = torch.full((1,), m, dtype=torch.int32, device=self.dev)
-        return self._tokens[m]
+        """An Int32 [1] holding M, for the long batches' gate/up that zeroes the output's M rows (zero_rows): a slice of
+        the table filled at construction, so that building a plan writes nothing to the device (inside a CUDA graph
+        capture such a write would only happen at a replay, and a call before it would read 0)."""
+        return self._mtab[m : m + 1]
 
     def _queue_gate_up(self, pl, b, c, v):
         """The gate/up GEMM."""

@@ -2079,6 +2079,11 @@ class GroupedGemm:
                 xb = mb
             pol = Int64(EVICT_NORMAL)
             if cutlass.const_expr(self.evict_weights):
+                # two_cta (not pair_table): mb is this CTA's 128-row block while nrb counts the pair tiles, so rank 0
+                # keeps its weights in the first half of the pairs and both ranks evict in the second half. Following
+                # the pairs instead (evict unless the next pair has the same expert) measured up to 1.9% slower and no
+                # EVICT_FIRST up to 1.5% slower, where this GEMM gets evict_weights (M <= 1024, few experts,
+                # 4096 <= H < 6144); kept as is.
                 pol = self._weight_policy(mb, nrb, experts)
             for kt in cutlass.range(KT, unroll=1):
                 bar = stage_ready + slot

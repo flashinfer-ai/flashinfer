@@ -210,8 +210,9 @@ def check_weights(
     device=None,
 ) -> None:
     """Raise ValueError unless ``w`` holds the weights of ``num_experts`` experts of (H, I) in the kernels' layout:
-    the shapes, one-byte FP4 / E4M3 elements and FP32 global scales, contiguous at 16-byte aligned addresses (the
-    kernels read them through the TMA and with 16-byte loads), on ``device`` if given. Checked, never copied: the
+    the shapes, one-byte FP4 / E4M3 elements and FP32 global scales, contiguous at 16-byte aligned addresses, 32-byte
+    for the FP4 weights w1 / w2 (the kernels read them through the TMA and with 16-byte loads; the grouped GEMMs declare
+    w1 / w2 32-byte aligned), on ``device`` if given. Checked, never copied: the
     weights are prepared once (``prepare_view``) and a call only passes their addresses."""
     E, H, I = num_experts, hidden_size, intermediate_size
     n1 = 2 * I if gated else I
@@ -225,6 +226,7 @@ def check_weights(
     )
     for name, t in zip(KernelWeights._fields, w, strict=True):
         shape, size = want[name]
+        align = 32 if name in ("w1", "w2") else 16
         if isinstance(shape, tuple):
             bad = (
                 tuple(t.shape) != shape and f"shape {tuple(t.shape)}, expected {shape}"
@@ -243,7 +245,7 @@ def check_weights(
                 and f"dtype {t.dtype}, expected torch.float32"
             )
             or (not t.is_contiguous() and "not contiguous")
-            or (t.data_ptr() % 16 and "not 16-byte aligned")
+            or (t.data_ptr() % align and f"not {align}-byte aligned")
             or (
                 device is not None
                 and t.device != torch.device(device)
