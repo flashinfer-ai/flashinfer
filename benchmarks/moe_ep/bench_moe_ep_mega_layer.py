@@ -27,6 +27,7 @@ times fall back to the CUDA events, and ``benchmark_metadata.warning`` says why.
 Neither times an output copy: the output is a workspace view where the backend
 offers one. Other options:
 
+- ``--list_kernels``: print the kernel names it runs and exit.
 - ``--kernel_breakdown``: also every kernel's time inside the window.
 - ``--backend_config``: further fields of the selected backend's kernel
   config, as a JSON object.
@@ -268,8 +269,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--kernel_name",
-        required=True,
-        help="Registered MegaMoE kernel, e.g. sm100_fp8_fp4_bf16_deepgemm.",
+        help="Registered MegaMoE kernel, e.g. sm100_fp8_fp4_bf16_deepgemm "
+        "(--list_kernels prints them all).",
+    )
+    parser.add_argument(
+        "--list_kernels",
+        action="store_true",
+        help="Print every kernel name this benchmark runs, with its config "
+        "class, and exit; needs no GPU or torchrun.",
     )
     add_profile_args(parser)
     add_layer_args(parser)
@@ -291,11 +298,18 @@ def parse_args() -> argparse.Namespace:
         default="mega",
         help="mega: the compute call, staging excluded; forward: the whole forward.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.list_kernels and not args.kernel_name:
+        parser.error("--kernel_name is required (--list_kernels prints the names)")
+    return args
 
 
 def main() -> None:
     args = parse_args()
+    if args.list_kernels:
+        for name, config_type in sorted(_kernel_config_types().items()):
+            print(f"{name}  ({config_type.__name__})")
+        return
 
     cupti_ctx, cupti_error = start_cupti()
 
