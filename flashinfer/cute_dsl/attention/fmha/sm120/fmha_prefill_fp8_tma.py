@@ -409,9 +409,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 raise ValueError(
                     f"num_tokens_per_page must be one of {self.SUPPORTED_PAGE_SIZES}"
                 )
-            if self.kv_tile % num_tokens_per_page != 0:
+            if (
+                self.kv_tile % num_tokens_per_page != 0
+                and num_tokens_per_page % self.kv_tile != 0
+            ):
                 raise ValueError(
-                    "paged KV requires num_tokens_per_page to divide kv_tile"
+                    "paged KV requires num_tokens_per_page to divide kv_tile "
+                    "or kv_tile to divide num_tokens_per_page"
                 )
             self.num_tokens_per_page = num_tokens_per_page
         else:
@@ -485,10 +489,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
         self.tma_copy_head_per_iter = self.head_tile // self.tma_copy_iters
         self.tma_copy_elems_per_iter = self.kv_tile_elems // self.tma_copy_iters
+        self.tma_page_rows = min(self.num_tokens_per_page, self.kv_tile)
         self.tma_copy_elems_per_page_iter = (
-            self.num_tokens_per_page * self.tma_copy_head_per_iter
+            self.tma_page_rows * self.tma_copy_head_per_iter
         )
-        self.kv_page_chunks = self.kv_tile // self.num_tokens_per_page
+        self.kv_page_chunks = max(1, self.kv_tile // self.num_tokens_per_page)
 
         # Cooperative 16-byte cp.async tiling for token-granular (page_size=1)
         # paged KV. Every supported head_tile in {32, 64, 128, 256} divides 32
@@ -630,7 +635,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         # the base API's fail-fast False result rather than raising TypeError.
         if kv_tile not in cls.SEQ_KV_TILES:
             return False
-        if kv_tile % num_tokens_per_page != 0:
+        if kv_tile % num_tokens_per_page != 0 and num_tokens_per_page % kv_tile != 0:
             return False
         return cls._can_implement(
             in_dtype,
@@ -693,7 +698,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         """Resolve shared K/V physical pages for one logical K/V tile."""
         page_ids = cutlass.Array(cutlass.Int32, self.kv_page_chunks, alignment=16)
         block_tables_ptr = block_tables.iterator.raw_ptr()
-        block_table_offset = batch_idx * cutlass.Int32(block_tables.shape[1])
+        block_table_offset = cutlass.Int64(batch_idx) * cutlass.Int64(
+            block_tables.shape[1]
+        )
         base_logical_page = seq_coord // self.num_tokens_per_page
         safe_page_count = cute.math.max(
             (seqlen_kv + self.num_tokens_per_page - 1) // self.num_tokens_per_page,
@@ -720,7 +727,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 )
             else:
                 page_ids[seq_chunk] = cutlass.Int32(
-                    block_tables_ptr[block_table_offset + logical_page]
+                    block_tables_ptr[block_table_offset + cutlass.Int64(logical_page)]
                 )
 
         return page_ids
@@ -733,6 +740,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         mbar_arrived: cutlass.Array,
         page_ids: cutlass.Array,
         kv_head_idx: cutlass.Int32,
+        kv_seq_idx: cutlass.Int32,
         l2_cache_hint: cutlass.Int64 | None,
     ) -> None:
         """Launch TMA loads for one logical K/V tile from pre-resolved pages.
@@ -748,6 +756,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
 
         token_in_page = cutlass.Int32(0)
+        if cutlass.const_expr(self.num_tokens_per_page > self.kv_tile):
+            token_in_page = kv_seq_idx % cutlass.Int32(self.num_tokens_per_page)
         for issue_chunk in cutlass.range_constexpr(self.kv_page_chunks):
             # Preserve the tuned reverse TMA issue order, while deriving page_dst
             # from the logical chunk so MMA still sees left-to-right sequence rows.
@@ -875,8 +885,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         q_src = (
                             basic_params.q_ptr
                             + basic_params.q_head_base
-                            + cur_q_seq_idx * basic_params.q_seq_stride
-                            + q_head_col
+                            + cutlass.Int64(cur_q_seq_idx) * basic_params.q_seq_stride
+                            + cutlass.Int64(q_head_col)
                         )
                         q_packed = prims.load_ext(
                             q_src,
@@ -888,8 +898,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         q_vec = (
                             basic_params.q_ptr
                             + basic_params.q_head_base
-                            + cur_q_seq_idx * basic_params.q_seq_stride
-                            + q_head_col
+                            + cutlass.Int64(cur_q_seq_idx) * basic_params.q_seq_stride
+                            + cutlass.Int64(q_head_col)
                         ).load(count=4, alignment=4)
                         q_regs_per_frag[row_quad] = q_vec.bitcast(cutlass.Int32)[0]
             return q_regs_per_frag
@@ -2423,16 +2433,19 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             q_heads_per_kv_head = num_heads_q // num_heads_kv
             kv_head_idx = q_head_idx // q_heads_per_kv_head
 
-        q_seq_stride = num_heads_q * head_dim
-        q_head_base = q_token_base * q_seq_stride + q_head_idx * head_dim
+        q_seq_stride = cutlass.Int64(num_heads_q) * cutlass.Int64(head_dim)
+        q_head_base = cutlass.Int64(q_token_base) * q_seq_stride + cutlass.Int64(
+            q_head_idx
+        ) * cutlass.Int64(head_dim)
         o_head_base = q_head_base
         o_seq_stride = q_seq_stride
         if cutlass.const_expr(kv_tile_ranges is not None):
             # Chunk c of token p writes O/LSE row p * num_kv_chunks + c.
-            o_seq_stride = q_seq_stride * num_kv_chunks
+            o_seq_stride = q_seq_stride * cutlass.Int64(num_kv_chunks)
             o_head_base = (
-                q_token_base * num_kv_chunks + kv_chunk
-            ) * q_seq_stride + q_head_idx * head_dim
+                cutlass.Int64(q_token_base) * cutlass.Int64(num_kv_chunks)
+                + cutlass.Int64(kv_chunk)
+            ) * q_seq_stride + cutlass.Int64(q_head_idx) * cutlass.Int64(head_dim)
 
         num_kv_tiles = ceil_div(seqlen_k, self.kv_tile)
         if cutlass.const_expr(self.is_causal):
@@ -2524,7 +2537,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             if cutlass.const_expr(self.use_cp_async_paged_kv):
                 k_page_stride = cutlass.Int64(k.stride[0])
                 v_page_stride = cutlass.Int64(v.stride[0])
-                kv_head_offset = cutlass.Int64(kv_head_idx * self.head_tile)
+                kv_head_offset = cutlass.Int64(kv_head_idx) * cutlass.Int64(
+                    self.head_tile
+                )
                 k_head_ptr = k.iterator.raw_ptr() + kv_head_offset
                 v_head_ptr = v.iterator.raw_ptr() + kv_head_offset
                 block_table_row_ptr = block_tables.iterator.raw_ptr() + cutlass.Int64(
@@ -2588,6 +2603,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                                 arrived,
                                 page_ids,
                                 kv_head_idx,
+                                kv_seq_idx,
                                 kv_l2_cache_hint,
                             )
                         else:
@@ -2597,6 +2613,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                                 arrived,
                                 page_ids,
                                 kv_head_idx,
+                                kv_seq_idx,
                                 kv_l2_cache_hint,
                             )
                     else:
@@ -2673,6 +2690,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         k_arrived,
                         page_ids,
                         kv_head_idx,
+                        kv_seq_idx,
                         fixed_kv_l2_cache_hint,
                     )
                     self.load_one_paged_kv_tile(
@@ -2681,6 +2699,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         v_arrived,
                         page_ids,
                         kv_head_idx,
+                        kv_seq_idx,
                         fixed_kv_l2_cache_hint,
                     )
                 else:
@@ -2734,6 +2753,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             k_arrived,
                             page_ids,
                             kv_head_idx,
+                            kv_seq_idx,
                             fixed_kv_l2_cache_hint,
                         )
                     else:
@@ -2765,6 +2785,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             v_arrived,
                             page_ids,
                             kv_head_idx,
+                            kv_seq_idx,
                             fixed_kv_l2_cache_hint,
                         )
                     else:
@@ -3144,9 +3165,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 gO_ptr = (
                     o_ptr
                     + o_head_base
-                    + store_q_seq_idx * o_seq_stride
-                    + store_head_col
-                    + store_col_in_cta
+                    + cutlass.Int64(store_q_seq_idx) * o_seq_stride
+                    + cutlass.Int64(store_head_col)
+                    + cutlass.Int64(store_col_in_cta)
                 )
                 if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim:
                     gO_ptr.store(o_vec, alignment=16)
@@ -3177,9 +3198,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     (
                         o_ptr
                         + o_head_base
-                        + zero_q_seq_idx * o_seq_stride
-                        + self.q_row_head_offset(zero_row_in_cta, head_dim)
-                        + zero_head_col
+                        + cutlass.Int64(zero_q_seq_idx) * o_seq_stride
+                        + cutlass.Int64(
+                            self.q_row_head_offset(zero_row_in_cta, head_dim)
+                        )
+                        + cutlass.Int64(zero_head_col)
                     ).store(zero_vector, alignment=16)
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -3276,7 +3299,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     box_dims=(
                         1,
                         1,
-                        self.num_tokens_per_page,
+                        self.tma_page_rows,
                         self.tma_copy_head_per_iter,
                     ),
                     stride_order=(3, 2, 1, 0),
@@ -3287,7 +3310,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     box_dims=(
                         1,
                         1,
-                        self.num_tokens_per_page,
+                        self.tma_page_rows,
                         self.tma_copy_head_per_iter,
                     ),
                     stride_order=(3, 2, 1, 0),
