@@ -97,6 +97,7 @@ class CombineKernel:
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_one_wave()
         g_raw = (
             bidx * WARPS + tidx // LANES
         )  # the global warp index: token t_raw, part w of its row
@@ -148,7 +149,6 @@ class CombineKernel:
                 )
             if valid & (j < n_vec):
                 cute.copy(atom_out, out, cute.local_tile(row_out, (VEC,), (jc,)))
-        pdl.trigger_one_wave()
 
 
 WARPS_PER_SM_TARGET = 32  # the combine's warp count target per SM: one warp's serial slabs of a row are latency-bound

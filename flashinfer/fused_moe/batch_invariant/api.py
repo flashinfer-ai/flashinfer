@@ -201,13 +201,16 @@ def _check_grouped_operands(
     dtype: torch.dtype,
     align: int,
     kind: str,
+    n_align: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int]:
     """The grouped GEMM entries' shared operand rules (``(R, K, E, N, Tk)``): ``a [R, K]`` and ``w [E, N, K]`` of the
-    class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements; N and K multiples of it), one K, at
-    most ``MAX_E`` experts,
-    ``Tk`` in ``[0, R]`` (the rows of ``out`` by default, else of ``a``), ``counts`` a contiguous int32 ``[E]``."""
+    class's operand ``dtype``, K-contiguous and 16-byte-aligned (``align`` elements of ``a``'s storage; K a multiple of it,
+    N of ``n_align``, ``align`` by default: the block-scaled formats' byte-packed rows take their own N rule), one K, at
+    most ``MAX_E`` experts, ``Tk`` in ``[0, R]`` (the rows of ``out`` by default, else of ``a``), ``counts`` a contiguous
+    int32 ``[E]``."""
     if a.dtype != dtype or w.dtype != dtype or a.dim() != 2 or w.dim() != 3:
         raise TypeError(f"{name} takes {kind} a [Tk, K] and w [E, N, K]")
+    n_align = align if n_align is None else n_align
     R, K = a.shape
     E, N, K2 = w.shape
     if E > MAX_E:
@@ -224,10 +227,15 @@ def _check_grouped_operands(
         or a.stride(0) % align
         or w.stride(0) % align
         or K % align
-        or N % align
+        or N % n_align
     ):
+        rule = (
+            f"N and K multiples of {align}"
+            if n_align == align
+            else f"K a multiple of {align}, N of {n_align}"
+        )
         raise ValueError(
-            f"{name}: K-contiguous, 16-byte-aligned operands of one K (N and K multiples of {align}) "
+            f"{name}: K-contiguous, 16-byte-aligned operands of one K ({rule}) "
             f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
         )
     if (

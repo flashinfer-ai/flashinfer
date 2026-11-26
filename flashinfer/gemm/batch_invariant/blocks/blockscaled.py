@@ -118,6 +118,9 @@ class BlockScaledPlan:
     SF_VEC = SF_VEC["mxfp8"]  # elements per block scale
     INST_K = 32  # the instruction's K
     TMEM_COLS = TMEM_COLS  # the TMEM budget planned against
+    #: the sm_100 instructions' shared-memory descriptors address the first 256 KB of the CTA's shared memory: every operand
+    #: ring a UMMA reads ends below it (the grouped bodies' plan rule; the sm_107 plan lifts it)
+    UMMA_SMEM_ADDR_MAX: Optional[int] = 1 << 18
     TMEM_ALLOC_ARCH = TMEM_ARCH  # the allocator's architecture: "sm_100" allows powers of two to 512, "sm_107" also the whole 576
     S2T_BROADCAST = False  # the smem -> TMEM scale-factor copy's source partition (see s2t_copy_and_partition)
     #: The smem container of each operand (None: the operand's own dtype, packed). The sm_100 / sm_103 ``kind::mxf8f6f4``
@@ -377,6 +380,9 @@ class BlockScaledPlanSM107(BlockScaledPlan):
 
     IN_FMT = "mxfp8_k64"
     INST_K = 64
+    UMMA_SMEM_ADDR_MAX = (
+        None  # the sm_107 instructions address the part's whole shared memory
+    )
     TMEM_COLS = TMEM_COLS_SM107
     TMEM_ALLOC_ARCH = (
         "sm_107"  # the allocator accepts the non-power-of-two 576 on sm_107 only

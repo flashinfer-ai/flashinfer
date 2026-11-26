@@ -40,7 +40,7 @@ runtime-token-count program of the route (``T`` up to its ``max_t_steps``).
 Batch size and head count are runtime scalars, so a changed problem size never
 recompiles anything.  Two kernel bodies ship: the lane-owns-rows body
 (``variant`` ``l8r4`` / ``l8r4p`` / ``l8r4w5`` / ``l8r2`` / ``l4r2``, one
-CTA per batch row and head)
+CTA per batch row and head, and SM90's FP16 ``l8r2h``, two)
 and, for ``T = 1`` with ``B x HV <= 160``, the row-partition body
 (``splitv8_tile8``, eight CTAs per state head); each record names its body
 (``body``: ``lanerow`` for the lane-owns-rows body, ``splitv`` for the row
@@ -55,34 +55,53 @@ for.
 
 A decode record reads and writes a state pool of one dtype, its build's
 ``state_dtype``: ``"f16"`` for an FP16 pool, absent for an FP32 pool (the
-default).  Every FP16 record is the twin of the FP32 record of the same route,
-body, variant and token count, with the same band, and is delivered on SM100 /
-SM103 / SM107 only: its stores round the FP32 state with the hardware
-``cvt.rs`` instruction.  Its kernel takes two more arguments, the int64 ``rand_seed``
+default).  Every FP16 record but the row-split programs below is the twin of
+the FP32 record of the same route, body, variant and token count, with the same
+band less the cells of those programs, and is delivered on the architectures of
+that record (SM90 has the FP16 twins of its own ``l4r2`` program at ``T = 4``
+and of its own build of the row-partition program, and its own FP16 build of
+the ``l8r4`` program of 6 tokens).  Its
+stores round the FP32 state with the hardware ``cvt.rs`` instruction on SM100 /
+SM103 / SM107 and with the same rounding in integer arithmetic on SM90, which
+has no ``cvt.rs``.  Its kernel takes two more arguments, the int64 ``rand_seed``
 tensor it reads on the device and the Philox round count ``philox_rounds``
 (``0`` rounds to nearest even and reads no seed).  The dispatch functions
 take the pool's dtype as ``state_dtype`` (``torch.float32`` by default) and
 consider the records of that dtype only, so an FP16 pool runs the twin of the
-program an FP32 pool would run.
+program an FP32 pool would run, or a row-split program.
 
 An FP16 call also has a launch class: its round count (``philox_rounds``, 0
 without a seed) and whether it stores per-token snapshots
 (``ssm_state_indices`` given).  A selection cell of an FP16 record may bound
 the round count (``rounds_at_least`` / ``rounds_at_most``, inclusive) and name
-the snapshot use (``snapshot``); an absent key admits every value.  Two FP16
-programs have a sibling built with ``snapshot_noise``: the ``l8r4`` program of
-16 tokens and the runtime program of three Householder updates.  The sibling
+the snapshot use (``snapshot``); an absent key admits every value.  The
+``l8r4`` program of 16 tokens and the runtime program of three Householder
+updates have a sibling built with ``snapshot_noise``, and on SM90 so does the
+``l8r4`` program of 6 tokens.  The sibling
 draws a launch's random bits once into shared memory instead of at each store,
 which pays only when the launch stores snapshots; it keeps its program's body,
 variant and band and stores the same bits.  Its cells admit the stochastic
 calls with snapshots of the measured cell, and its plain program's cells admit
 every other call of the band, so every call still selects exactly one program
 and an FP16 pool still runs the body and variant an FP32 pool would run.
-The FP16 row-partition program has a sibling built with ``draw_share``: each
+The FP16 row-partition program of SM100 / SM103 / SM107 has a sibling built
+with ``draw_share`` (SM90 ships none): each
 Philox draw of its store is computed once and shared by a lane shuffle, so it
 stores the same bits.  Its cell admits the stochastic calls of the band
 (``rounds_at_least``), and its plain program keeps the calls that round to
 nearest even (``rounds_at_most``).
+
+SM90 also ships FP16-only row-split programs (``variant`` ``l8r2h``: the
+``l8r2`` lane layout with each state head cut over two CTAs of 128 threads,
+grid rule ``ctas_per_state`` 2), one for each static token count of 2 to 8
+and 16 and one runtime program for each ``n``; no route ships their FP32
+build.  Their
+cells admit the small-grid calls on which they were measured faster, with
+wave bounds that are multiples of 1/2 (``k x SM`` state heads run on
+``2 k`` CTAs per SM).  Such a call runs the row-split program of its token
+count (static or runtime) instead of the program or sibling it would run
+otherwise, whose cells admit every other call of the band, so every call
+still selects exactly one program.
 
 Prefill: the ``prefill`` route holds the single-pass programs of two kernel
 bodies: the V6 fork-order body (``body`` ``prefill_sm90_v6``: the plain, the
@@ -132,13 +151,16 @@ record's ``build`` spells those keywords: ``variant`` (the body's geometry:
 ``l8r4`` = eight lanes per state row, four rows per lane; ``l8r4p`` and
 ``l8r4w5`` = that geometry with the producer preload, for one wave of four
 CTAs per SM and for the many-wave rows (``B x HV > 64 x SM
-count``); ``l8r2``;
+count``); ``l8r2``; ``l8r2h`` = ``l8r2`` with a head cut over two CTAs;
 ``l4r2``; ``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of
 eight rows
 per head), ``num_householder`` (``n``),
 ``t_steps`` (a fixed token count compiled in; ``None`` for a runtime token
 count up to ``max_t_steps``), ``use_qk_l2norm``, on an FP16-pool record
-``state_dtype`` and on a sibling ``snapshot_noise`` or ``draw_share``.  Prefill: the six flags
+``state_dtype``, on a sibling ``snapshot_noise`` or ``draw_share``, and
+``arch`` on an SM90 build whose program differs from that of the other
+architectures (the row-partition programs and the FP16 ``l8r4`` program of 6
+tokens).  Prefill: the six flags
 ``use_initial_state``, ``use_state_indices``, ``store_final_state``,
 ``unit_gates``, ``unit_beta`` and ``segment_pass`` beside the defaults of the
 kernel's build signature (the I/O dtype ``bf16``, the WY solve arm, the O
@@ -294,6 +316,162 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "output_state_indices": "output_state_indices",
             "q": "q",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": 160,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_8f8062d89b8b871f1e2f": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "splitv",
+        "build": {
+            "arch": "sm_90a",
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 1,
+            "use_qk_l2norm": True,
+            "variant": "splitv8_tile8",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 8,
+            "kind": "state_heads",
+            "tile_v": 8,
+        },
+        "kernel": "cake_gdp_8f8062d89b8b871f1e2f",
+        "kernel_symbol": "kernel_cake_gdp_8f8062d89b8b871f1e2f",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 2304,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_8f8062d89b8b871f1e2f",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
             "scale": "scale",
             "ssm_state_indices": "ssm_state_indices",
             "state": "state",
@@ -769,6 +947,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_16d24c9e19fa73fe57ee": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -920,6 +1099,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": [
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "ctas_per_sm_above": 2,
                 "kind": "state_heads_between",
@@ -927,9 +1107,27 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "ctas_per_sm_above": 2,
                 "kind": "state_heads_between",
+                "snapshot": False,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
                 "snapshot": False,
             },
         ],
@@ -2944,6 +3142,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_5bc4ef21b6e7aefed05f": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3092,14 +3291,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_6bb51453cd15a43da9c2": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3248,14 +3458,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_717ce3c684b41c37e673": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3404,10 +3625,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": None,
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_72b6872c98ed9abf0bdf": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3556,12 +3792,31 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_78fc9caafee16e2af047": {
         "arches": [
@@ -3707,6 +3962,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_7e4385817ba59915bc61": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3855,15 +4111,35 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_8e26e2c2d0cb0a7fbee9": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -4012,12 +4288,23 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_8f4ad44e524af3f3cbb9": {
         "arches": [
@@ -4178,6 +4465,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_9bfd49d6bbbb3d849f30": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -4326,12 +4614,31 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_a226c899893599e679a3": {
         "arches": [
@@ -4480,8 +4787,334 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "state_heads_between",
         },
     },
+    "cake_gdp_11085a9519b214993653": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "arch": "sm_90a",
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 6,
+            "use_qk_l2norm": True,
+            "variant": "l8r4",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_11085a9519b214993653",
+        "kernel_symbol": "kernel_cake_gdp_11085a9519b214993653",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 17152,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_11085a9519b214993653",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": False,
+            },
+        ],
+    },
+    "cake_gdp_8aabe827188edf904960": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "snapshot_noise": True,
+            "state_dtype": "f16",
+            "t_steps": 6,
+            "use_qk_l2norm": True,
+            "variant": "l8r4",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_8aabe827188edf904960",
+        "kernel_symbol": "kernel_cake_gdp_8aabe827188edf904960",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33536,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_8aabe827188edf904960",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_above": 2,
+            "kind": "state_heads_between",
+            "rounds_at_least": 5,
+            "snapshot": True,
+        },
+    },
     "cake_gdp_b047f2f1a20630e6f36b": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -4631,14 +5264,26 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-            "rounds_at_least": 5,
-            "snapshot": True,
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": True,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": True,
+            },
+        ],
     },
     "cake_gdp_b81854850bf4b769295c": {
         "arches": [
@@ -4830,6 +5475,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_aa7f7810c60fe76c14a6": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -4978,7 +5624,21 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": None,
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_baca2c2d21cf59fc2d3c": {
         "arches": [
@@ -5124,8 +5784,166 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "state_heads_between",
         },
     },
+    "cake_gdp_b245506c43aed8c3e6b4": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 4,
+            "use_qk_l2norm": True,
+            "variant": "l4r2",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_b245506c43aed8c3e6b4",
+        "kernel_symbol": "kernel_cake_gdp_b245506c43aed8c3e6b4",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 11392,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_b245506c43aed8c3e6b4",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_above": 0.5,
+            "ctas_per_sm_at_most": 1,
+            "kind": "state_heads_between",
+            "rounds_at_most": 4,
+        },
+    },
     "cake_gdp_bb55d7d5e4db0d95acce": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -5274,15 +6092,26 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_bc76e12e0c247b44a27d": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -5431,15 +6260,26 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_c3cf32174475946d9c35": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -5588,11 +6428,21 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_c51f69d9ac126bbaab36": {
         "arches": [
@@ -5946,6 +6796,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_cbb122ec06d8e7bfbdab": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -6094,12 +6945,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_dbd09ba202e904a29148": {
         "arches": [
@@ -6261,6 +7122,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_e1047159db983943d97b": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -6409,13 +7271,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 160,
-            "at_most": None,
-            "ctas_per_sm_above": 4,
-            "ctas_per_sm_at_most": 64,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 160,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 4,
+                "ctas_per_sm_at_most": 64,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 160,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_e156ee45668b2455e46d": {
         "arches": [
@@ -6711,6 +7582,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_ee0cdd5d391a7f594356": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -6859,15 +7731,43 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_efdf403e0df822bfc83f": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -7020,6 +7920,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": [
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "ctas_per_sm_at_most": 3,
                 "kind": "state_heads_between",
@@ -7072,6 +7973,16 @@ MODULES: dict[str, dict[str, Any]] = {
                 "ctas_per_sm_above": 124,
                 "kind": "state_heads_between",
                 "rounds_at_least": 11,
+                "snapshot": True,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 3,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
                 "snapshot": True,
             },
         ],
@@ -7558,6 +8469,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_f3f05058d0b4a43f6589": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -7706,10 +8618,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": None,
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_f5d305e6f05978caca3c": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -7861,12 +8788,14 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": [
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "kind": "state_heads_between",
                 "rounds_at_most": 9,
             },
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "kind": "state_heads_between",
                 "snapshot": False,
@@ -7896,6 +8825,32 @@ MODULES: dict[str, dict[str, Any]] = {
                 "ctas_per_sm_above": 124,
                 "kind": "state_heads_between",
                 "rounds_at_most": 10,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 3,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 3,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": False,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 3,
+                "kind": "state_heads_between",
             },
         ],
     },
@@ -9422,6 +10377,1936 @@ MODULES: dict[str, dict[str, Any]] = {
             "at_most": 160,
             "kind": "state_heads_between",
             "rounds_at_least": 5,
+        },
+    },
+    "cake_gdp_4c574be45e595fe98665": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 2,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_4c574be45e595fe98665",
+        "kernel_symbol": "kernel_cake_gdp_4c574be45e595fe98665",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 13952,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_4c574be45e595fe98665",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_db30017cc306551537d8": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 3,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_db30017cc306551537d8",
+        "kernel_symbol": "kernel_cake_gdp_db30017cc306551537d8",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16768,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_db30017cc306551537d8",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2.5,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_03fc4d822d2896c11df9": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 4,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_03fc4d822d2896c11df9",
+        "kernel_symbol": "kernel_cake_gdp_03fc4d822d2896c11df9",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 19584,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_03fc4d822d2896c11df9",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_2bbb0a6eea719d10ec5c": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 5,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_2bbb0a6eea719d10ec5c",
+        "kernel_symbol": "kernel_cake_gdp_2bbb0a6eea719d10ec5c",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 22528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_2bbb0a6eea719d10ec5c",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_c26823b0a9a42e400ad0": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 6,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_c26823b0a9a42e400ad0",
+        "kernel_symbol": "kernel_cake_gdp_c26823b0a9a42e400ad0",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 25344,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_c26823b0a9a42e400ad0",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_e506863593932b5cf7d2": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 7,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_e506863593932b5cf7d2",
+        "kernel_symbol": "kernel_cake_gdp_e506863593932b5cf7d2",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 28160,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_e506863593932b5cf7d2",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_a5f2411d386e80d6c500": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 8,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_a5f2411d386e80d6c500",
+        "kernel_symbol": "kernel_cake_gdp_a5f2411d386e80d6c500",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 30976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_a5f2411d386e80d6c500",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_0e9af5fb535caec5f960": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 16,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_0e9af5fb535caec5f960",
+        "kernel_symbol": "kernel_cake_gdp_0e9af5fb535caec5f960",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 53632,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_0e9af5fb535caec5f960",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_527260b8ec384f213efd": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 1,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_527260b8ec384f213efd",
+        "kernel_symbol": "kernel_cake_gdp_527260b8ec384f213efd",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 28928,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_527260b8ec384f213efd",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2.5,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_09db3ffab8d0378caa18": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 2,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_09db3ffab8d0378caa18",
+        "kernel_symbol": "kernel_cake_gdp_09db3ffab8d0378caa18",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 41344,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_09db3ffab8d0378caa18",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2.5,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_ce8bf154da25575debfc": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_ce8bf154da25575debfc",
+        "kernel_symbol": "kernel_cake_gdp_ce8bf154da25575debfc",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 53632,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_ce8bf154da25575debfc",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_1654ec2bd9e2b4374ad9": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 4,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_1654ec2bd9e2b4374ad9",
+        "kernel_symbol": "kernel_cake_gdp_1654ec2bd9e2b4374ad9",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66048,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_1654ec2bd9e2b4374ad9",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 1.5,
+            "kind": "state_heads_between",
         },
     },
     "cake_gdp_157b3ebf33cf7c928af5": {
@@ -11205,9 +14090,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_90a": {
         "decode_nh1": [
             "cake_gdp_78fc9caafee16e2af047",
+            "cake_gdp_f3f05058d0b4a43f6589",
+            "cake_gdp_527260b8ec384f213efd",
         ],
         "decode_nh2": [
             "cake_gdp_3342c82179fa758b0570",
+            "cake_gdp_aa7f7810c60fe76c14a6",
+            "cake_gdp_09db3ffab8d0378caa18",
         ],
         "decode_nh3": [
             "cake_gdp_068a895d0c8fa77ed2f9",
@@ -11227,9 +14116,40 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_450bb0db3b79acafa419",
             "cake_gdp_c51f69d9ac126bbaab36",
             "cake_gdp_585a5ea4cbdd07f1b2a8",
+            "cake_gdp_8f8062d89b8b871f1e2f",
+            "cake_gdp_6bb51453cd15a43da9c2",
+            "cake_gdp_bc76e12e0c247b44a27d",
+            "cake_gdp_5bc4ef21b6e7aefed05f",
+            "cake_gdp_ee0cdd5d391a7f594356",
+            "cake_gdp_7e4385817ba59915bc61",
+            "cake_gdp_8e26e2c2d0cb0a7fbee9",
+            "cake_gdp_cbb122ec06d8e7bfbdab",
+            "cake_gdp_f5d305e6f05978caca3c",
+            "cake_gdp_efdf403e0df822bfc83f",
+            "cake_gdp_bb55d7d5e4db0d95acce",
+            "cake_gdp_11085a9519b214993653",
+            "cake_gdp_8aabe827188edf904960",
+            "cake_gdp_b245506c43aed8c3e6b4",
+            "cake_gdp_16d24c9e19fa73fe57ee",
+            "cake_gdp_b047f2f1a20630e6f36b",
+            "cake_gdp_c3cf32174475946d9c35",
+            "cake_gdp_9bfd49d6bbbb3d849f30",
+            "cake_gdp_72b6872c98ed9abf0bdf",
+            "cake_gdp_e1047159db983943d97b",
+            "cake_gdp_4c574be45e595fe98665",
+            "cake_gdp_db30017cc306551537d8",
+            "cake_gdp_03fc4d822d2896c11df9",
+            "cake_gdp_2bbb0a6eea719d10ec5c",
+            "cake_gdp_c26823b0a9a42e400ad0",
+            "cake_gdp_e506863593932b5cf7d2",
+            "cake_gdp_a5f2411d386e80d6c500",
+            "cake_gdp_0e9af5fb535caec5f960",
+            "cake_gdp_ce8bf154da25575debfc",
         ],
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",
+            "cake_gdp_717ce3c684b41c37e673",
+            "cake_gdp_1654ec2bd9e2b4374ad9",
         ],
         "prefill": [
             "cake_gdp_0de8fd0ee57885709a1c",
@@ -11612,6 +14532,18 @@ def route_modules(
     return tuple(names)
 
 
+def _waves_x2(waves: Any) -> int:
+    """Twice a wave bound of a select cell, an int: the bounds are multiples of 1/2 (a program of two CTAs per head
+    runs k x SM heads on 2 k CTAs per SM), so a half-wave edge compares exactly."""
+
+    doubled = 2 * waves
+    if isinstance(waves, bool) or doubled != int(doubled) or doubled <= 0:
+        raise ValueError(
+            f"a Cake GDP decode wave bound must be a positive multiple of 1/2, got {waves!r}"
+        )
+    return int(doubled)
+
+
 def _selects(
     rule: Any,
     state_heads: int,
@@ -11630,7 +14562,8 @@ def _selects(
     ``philox_rounds`` is 0 for a call that rounds to nearest even) and ``snapshot`` equal to the cell's when it
     names one (``True`` for a call that stores per-token snapshots).  A cell naming ``arches`` applies on those
     architectures only (a band that differs per architecture); a list of such cells is a band of several intervals
-    and admits when any cell does.  ``None`` (a runtime program without cells) admits everything."""
+    and admits when any cell does.  ``None`` (a runtime program without cells) admits everything.  Each wave bound
+    is a positive multiple of 1/2 and compares exactly."""
 
     if rule is None:
         return True
@@ -11675,13 +14608,17 @@ def _selects(
         rule.get("ctas_per_sm_at_least"),
         rule.get("ctas_per_sm_below"),
     )
-    if waves_at_most is not None and state_heads > int(waves_at_most) * sm_count:
+    state_heads2 = 2 * state_heads
+    if waves_at_most is not None and state_heads2 > _waves_x2(waves_at_most) * sm_count:
         return False
-    if waves_above is not None and state_heads <= int(waves_above) * sm_count:
+    if waves_above is not None and state_heads2 <= _waves_x2(waves_above) * sm_count:
         return False
-    if waves_at_least is not None and state_heads < int(waves_at_least) * sm_count:
+    if (
+        waves_at_least is not None
+        and state_heads2 < _waves_x2(waves_at_least) * sm_count
+    ):
         return False
-    if waves_below is not None and state_heads >= int(waves_below) * sm_count:
+    if waves_below is not None and state_heads2 >= _waves_x2(waves_below) * sm_count:
         return False
     return True
 
@@ -11706,13 +14643,14 @@ def selected_module(
 
     This is the band rule of the kernel (its ``band_variant``), spelled once as the records' ``select_rule``
     leaves: a route carries static-token-count programs (``build["t_steps"]`` = the call's ``T``), each owning a
-    band of state-head counts (``above < state_heads <= at_most`` within optional wave bounds, multiples of the SM
-    count; a band of several intervals is a list of such cells, and a cell may name the ``arches`` it applies to),
+    band of state-head counts (``above < state_heads <= at_most`` within optional wave bounds, multiples of half the
+    SM count; a band of several intervals is a list of such cells, and a cell may name the ``arches`` it applies to),
     and runtime-token-count programs (``build["t_steps"]`` ``None``, ``T`` up to ``build["max_t_steps"]``) for
     every other call.  Exactly one static program may admit a call; else the admitting runtime program with the
     fewest ``max_t_steps`` runs (two such programs are an error).  Only the records of the pool's dtype take part
-    (``build["state_dtype"]``, ``"f32"`` when absent): an FP16 record has the band of its FP32 twin, so both pools
-    select the same program body and variant.  The cells of an FP16 record may also bound the launch class
+    (``build["state_dtype"]``, ``"f32"`` when absent): an FP16 record has the band of its FP32 twin less the cells
+    of the row-split programs (SM90's FP16-only ``l8r2h`` programs, which take a call of their cells instead), so
+    outside those cells both pools select the same program body and variant.  The cells of an FP16 record may also bound the launch class
     (:func:`_selects`): a ``snapshot_noise`` sibling admits the stochastic calls with snapshots of its cell and its
     plain program every other call, so they split the band of one FP32 program between them.  An FP32 record has
     no class keys, so its choice does not depend on the launch class.
@@ -12960,7 +15898,7 @@ def launch_grid(
 ) -> tuple[int, int, int]:
     """Launch grid of one module under its recorded grid rule.  ``state_heads`` (decode): ``ceil(B x HV /
     heads_per_cta) x ctas_per_state`` CTAs (``heads_per_cta`` defaults to one: one CTA per batch row and head for the
-    lane-owns-rows body, eight per state head for ``splitv8_tile8``); ``batch`` and ``heads`` must be positive.
+    lane-owns-rows body, two for SM90's row-split programs, eight per state head for ``splitv8_tile8``); ``batch`` and ``heads`` must be positive.
     ``tiles`` (prefill): ``min(sm_count, tiles)`` persistent CTAs over the host's ``N x H`` tile count, both
     positive.  The public API refuses an empty call before reaching here."""
 
