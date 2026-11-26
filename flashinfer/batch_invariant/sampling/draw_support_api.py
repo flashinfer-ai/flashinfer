@@ -30,6 +30,9 @@ import functools
 
 import torch
 
+from ..const_tensor import _CACHE as _CONST_CACHE
+from ..const_tensor import _CACHE_MAX as _CONST_CACHE_MAX
+from ..const_tensor import const_fill
 from ..support import check_no_overlap, out_buffer, scratch, unsupported
 from .api import (
     _DTYPE_STR,
@@ -59,43 +62,15 @@ def _check_input(x: torch.Tensor, name: str) -> int:
 
 
 #: (device, dtype, value, rows) -> [the tensor, the event of its fill (None once that fill is known complete)]
-_CONST_ROWS: Dict[tuple, list] = {}
-_CONST_ROWS_MAX = 256
+_CONST_ROWS = _CONST_CACHE  # the shared cache (const_tensor): kept under the names the first version used
+_CONST_ROWS_MAX = _CONST_CACHE_MAX
 
 
 def _const_rows(device, dtype: torch.dtype, v, M: int) -> torch.Tensor:
     """The per-row tensor of a Python-scalar filter value, cached per (device, dtype, value, rows): the kernel only reads
-    it, so one fill serves every call with that scalar (a fill kernel and an allocation per scalar filter per call before
-    2026-11-18). The fill runs on the creating call's stream and the entry carries its event: a call on another stream
-    waits on that event, device side, until the fill is known complete, after which the entry is used as it stands (the
-    review of #9695 read the tensor from a second stream before its fill had run). Inside a CUDA-graph capture on the
-    tensor's device the cache is not consulted: the call fills its own tensor into the graph, as every call did before (an
-    event recorded outside a capture cannot be waited on inside it). The cache is bounded (past the bound a call fills a
-    fresh tensor)."""
-    dev = torch.device(device)
-    if dev.index is not None and dev.index != torch.cuda.current_device():
-        with torch.cuda.device(dev):
-            capturing = torch.cuda.is_current_stream_capturing()
-    else:
-        capturing = torch.cuda.is_current_stream_capturing()
-    if capturing:
-        return torch.full((M,), v, dtype=dtype, device=device)
-    key = (device, dtype, v, M)
-    entry = _CONST_ROWS.get(key)
-    if entry is None:
-        t = torch.full((M,), v, dtype=dtype, device=device)
-        if len(_CONST_ROWS) < _CONST_ROWS_MAX:
-            fill_done = torch.cuda.Event()
-            fill_done.record(torch.cuda.current_stream(dev))
-            _CONST_ROWS[key] = [t, fill_done]
-        return t
-    t, fill_done = entry
-    if fill_done is not None:
-        if fill_done.query():
-            entry[1] = None  # the fill is complete: no ordering needed from here on
-        else:
-            torch.cuda.current_stream(dev).wait_event(fill_done)
-    return t
+    it, so one fill serves every call with that scalar (:mod:`flashinfer.batch_invariant.const_tensor`: the fill's event
+    orders a reader on another stream, a CUDA-graph capture bypasses the cache, the cache is bounded)."""
+    return const_fill((M,), v, dtype, device, kind="sampler_rows")
 
 
 @functools.lru_cache(maxsize=None)
