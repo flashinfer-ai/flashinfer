@@ -173,7 +173,7 @@ class ImpactTests(unittest.TestCase):
         self.assertEqual([], result.paths)
         self.assertEqual("gpu_required", result.gpu_impact["classification"])
 
-    def test_cpu_and_docs_impacts_require_complete_diff(self):
+    def test_cpu_and_docs_impacts_allow_missing_patch_with_note(self):
         for kind in ["cpu_only", "docs_only"]:
             self.setUp()
             self.assertEqual(
@@ -182,7 +182,7 @@ class ImpactTests(unittest.TestCase):
         self.setUp()
         self.fixture.github.get_pr_files.return_value[0]["patch"] = None
         self.assertEqual(
-            "unknown", self.select(analysis("cpu_only")).gpu_impact["classification"]
+            "cpu_only", self.select(analysis("cpu_only")).gpu_impact["classification"]
         )
 
     def test_impact_rejects_invented_evidence_and_missing_schema(self):
@@ -288,7 +288,10 @@ class TransportTests(unittest.TestCase):
     def test_analysis_timeout_restores_publication_budget(self):
         from unittest.mock import patch
 
-        self.client.deadline = 12345
+        import time
+
+        deadline = time.monotonic() + 540
+        self.client.deadline = deadline
         self.client.get_pr_files.return_value = [{"filename": "kernel.cu"}]
 
         def timeout(*args, **kwargs):
@@ -296,10 +299,11 @@ class TransportTests(unittest.TestCase):
             raise gate.TargetSelectionError("Inference deadline exceeded")
 
         selector = Mock()
+        selector.timeout = 240
         selector.select.side_effect = timeout
         with patch.object(gate, "PytestTargetSelector", return_value=selector):
             result = gate.run_pr(self.client, 42)
-        self.assertEqual(12345, self.client.deadline)
+        self.assertEqual(deadline, self.client.deadline)
         self.assertEqual("failure", result.conclusion)
         self.client.publish.assert_called_once()
 
@@ -404,6 +408,165 @@ class TransportTests(unittest.TestCase):
         self.assertIn("pull-requests: read", source)
         self.assertNotIn("pull-requests: write", source)
         self.assertNotIn("github.event.pull_request.head", source)
+
+
+class RetryAnalysisTests(unittest.TestCase):
+    def setUp(self):
+        import time
+
+        self.fixture = fixtures.PytestTargetSelectorTests()
+        self.fixture.setUp()
+        self.fixture.github.deadline = time.monotonic() + 540
+
+    def run_outputs(self, outputs):
+        class Model(fixtures.FakeInference):
+            reasoning_effort = None
+
+            def __init__(self):
+                super().__init__(outputs)
+                self.efforts = []
+
+            def complete(self, context, task):
+                self.efforts.append(self.reasoning_effort)
+                value = super().complete(context, task)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+
+        model = Model()
+        f = self.fixture
+        result = gate.analyze_gpu_impact(f.github, fixtures.PR, f.read_ci, model)
+        return result, model
+
+    def selection(self, kind):
+        return {
+            "outcome": "needs_maintainer",
+            "targets": [],
+            "reason": "Scope advice",
+            "gpu_impact": analysis(kind),
+        }
+
+    def test_known_cpu_or_gpu_does_not_retry(self):
+        for kind in ("cpu_only", "gpu_required"):
+            impact, model = self.run_outputs([{"read_paths": []}, self.selection(kind)])
+            self.assertEqual(kind, impact["classification"])
+            self.assertEqual([None, None], model.efforts)
+
+    def test_failed_final_request_retries_minimal_with_same_evidence(self):
+        impact, model = self.run_outputs(
+            [
+                {"read_paths": []},
+                gate.TargetSelectionError("Incomplete JSON"),
+                self.selection("gpu_required"),
+            ]
+        )
+        self.assertEqual("gpu_required", impact["classification"])
+        self.assertEqual([None, None, "minimal"], model.efforts)
+        self.assertEqual(model.calls[1][0], model.calls[2][0])
+        self.assertEqual("Incomplete JSON", impact["analysis_attempts"][0]["error"])
+
+    def test_invalid_evidence_is_rerequested_before_minimal_final(self):
+        impact, model = self.run_outputs(
+            [
+                {"read_paths": ["invented.py"]},
+                {"read_paths": []},
+                self.selection("cpu_only"),
+            ]
+        )
+        self.assertEqual("cpu_only", impact["classification"])
+        self.assertEqual([None, "minimal", "minimal"], model.efforts)
+
+    def test_unknown_retries_once_and_requires_bot(self):
+        impact, model = self.run_outputs(
+            [{"read_paths": []}, self.selection("unknown"), self.selection("unknown")]
+        )
+        self.assertEqual("unknown", impact["classification"])
+        self.assertEqual(2, len(impact["analysis_attempts"]))
+        result = gate.evaluate([], lambda: impact)
+        self.assertEqual("failure", result.conclusion)
+        self.assertIn("/bot run", result.summary)
+        self.assertNotIn("Rerun this check", result.summary)
+
+    def test_missing_patches_are_informational_for_any_filename(self):
+        from gpu_impact import validate_impact
+
+        context = {
+            "source_files": {"utils.py": "host code"},
+            "changed_files": [{"filename": "utils.py"}],
+            "ci_files": {},
+            "unavailable_evidence": {},
+            "omitted_evidence": {"changed_files": 0},
+        }
+        impact = validate_impact(
+            {**analysis("cpu_only"), "evidence_paths": ["utils.py"]}, context
+        )
+        self.assertEqual("cpu_only", impact["classification"])
+        self.assertEqual(["utils.py"], impact["missing_patch_paths"])
+        self.assertIn(
+            "Patch content unavailable", gate.evaluate([], lambda: impact).summary
+        )
+        context["omitted_evidence"]["changed_files"] = 1
+        self.assertEqual(
+            "unknown",
+            validate_impact(
+                {**analysis("cpu_only"), "evidence_paths": ["utils.py"]}, context
+            )["classification"],
+        )
+
+    def test_budget_omitted_file_can_supply_filename_evidence(self):
+        from gpu_impact import validate_impact
+
+        context = {
+            "source_files": {},
+            "changed_files": [{"filename": "docs/large.md", "patch_omitted": True}],
+            "ci_files": {},
+            "unavailable_evidence": {},
+            "omitted_evidence": {"changed_files": 0},
+        }
+        impact = validate_impact(
+            {**analysis("cpu_only"), "evidence_paths": ["docs/large.md"]}, context
+        )
+        self.assertEqual("cpu_only", impact["classification"])
+        self.assertEqual(["docs/large.md"], impact["filename_only_evidence"])
+
+    def test_missing_patch_note_is_bounded_for_large_changes(self):
+        from gpu_impact import validate_impact
+
+        context = {
+            "source_files": {"utils.py": "host code"},
+            "changed_files": [
+                {"filename": f"utils_{index}.py"} for index in range(100)
+            ],
+            "ci_files": {},
+            "unavailable_evidence": {},
+            "omitted_evidence": {"changed_files": 0},
+        }
+        impact = validate_impact(
+            {**analysis("cpu_only"), "evidence_paths": ["utils.py"]}, context
+        )
+        self.assertEqual(30, len(impact["missing_patch_paths"]))
+        self.assertEqual(100, impact["missing_patch_count"])
+        self.assertIn("first 30 of 100", gate.evaluate([], lambda: impact).summary)
+
+    def test_evidence_cache_is_not_reused_for_changed_context(self):
+        model = fixtures.FakeInference(
+            [
+                {"read_paths": ["first.py"]},
+                self.selection("gpu_required"),
+                {"read_paths": ["second.py"]},
+            ]
+        )
+        wrapped = gate.RetryingImpactInference(model)
+        from ai_test_scope import EVIDENCE_PROMPT
+
+        wrapped.complete({"head": "first"}, EVIDENCE_PROMPT)
+        wrapped.complete({"head": "first"}, "selection")
+        wrapped.retry = True
+        self.assertEqual(
+            {"read_paths": ["second.py"]},
+            wrapped.complete({"head": "second"}, EVIDENCE_PROMPT),
+        )
+        self.assertEqual(3, len(model.calls))
 
 
 if __name__ == "__main__":

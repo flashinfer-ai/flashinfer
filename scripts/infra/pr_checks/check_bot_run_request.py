@@ -2,6 +2,7 @@
 """Publish a response-only internal /bot run gate without posting PR comments."""
 
 import argparse
+import copy
 from dataclasses import dataclass
 import html
 import json
@@ -12,7 +13,9 @@ import subprocess
 import sys
 
 from ai_test_scope import (
+    EVIDENCE_PROMPT,
     GitHub,
+    InferenceHub,
     PytestTargetSelector,
     TargetSelectionError,
     _public_prose,
@@ -23,6 +26,77 @@ CHECK_NAME = "Bot Run Request Check"
 BOT_ID = 236526959  # Stable GitHub account ID; never rely on copied display text.
 PUBLIC_NOTE = "<!-- flashinfer-bot:ci-bot-commands-note -->"
 VERSION = "bot-run-request-v1"
+
+
+class RetryingImpactInference:
+    """Reuse validated file requests only while their pinned context is identical."""
+
+    def __init__(self, model):
+        self.model = model
+        self.api_key = model.api_key
+        self.deadline = None
+        self.retry = False
+        self.evidence = None
+        self.evidence_context = None
+        self.confirmed = False
+
+    def complete(self, context, task):
+        if task == EVIDENCE_PROMPT:
+            key = json.dumps(context, sort_keys=True)
+            if self.retry and self.confirmed and key == self.evidence_context:
+                return copy.deepcopy(self.evidence)
+            self.confirmed = False
+        else:
+            # Selection is reached only after the selector validates read_paths.
+            self.confirmed = True
+        self.model.deadline = self.deadline
+        result = self.model.complete(context, task)
+        if task == EVIDENCE_PROMPT:
+            self.evidence = copy.deepcopy(result)
+            self.evidence_context = key
+        return result
+
+
+def analyze_gpu_impact(client, pr, read_ci_file, inference=None):
+    model = inference or InferenceHub()
+    wrapped = RetryingImpactInference(model)
+    deadline = client.deadline
+    attempts = []
+    secrets = (model.api_key, os.getenv("GH_TOKEN"), os.getenv("GITHUB_TOKEN"))
+    for index, effort in enumerate((None, "minimal")):
+        model.reasoning_effort = effort
+        wrapped.retry = index > 0
+        try:
+            # Share the outer budget between attempts and leave publication time.
+            available = _remaining(deadline, 540) - 60
+            if available <= 0:
+                raise TargetSelectionError("Insufficient time for analysis retry")
+            selector = PytestTargetSelector(client, read_ci_file, inference=wrapped)
+            selector.timeout = min(selector.timeout, available / (2 - index))
+            selection = selector.select(pr, include_gpu_impact=True)
+            impact = {**selection.gpu_impact, "targets": selection.paths}
+            if impact["classification"] == "unknown":
+                raise TargetSelectionError(impact["reason"])
+        except (TargetSelectionError, ValueError) as error:
+            attempts.append(
+                {
+                    "effort": effort or "default",
+                    "error": _public_prose(str(error), secrets),
+                }
+            )
+        else:
+            attempts.append({"effort": effort or "default", "success": True})
+            return {**impact, "analysis_attempts": attempts}
+        finally:
+            client.deadline = deadline
+    return {
+        "classification": "unknown",
+        "reason": attempts[-1]["error"],
+        "evidence_paths": [],
+        "targets": [],
+        "case_gap": "",
+        "analysis_attempts": attempts,
+    }
 
 
 def is_run_command(body):
@@ -123,15 +197,27 @@ def evaluate(comments, analyze):
         details += "\n\nSuggested tests: " + ", ".join(
             html.escape(path) for path in impact["targets"]
         )
+    if impact.get("missing_patch_paths"):
+        details += "\n\nPatch content unavailable (informational): " + ", ".join(
+            html.escape(path) for path in impact["missing_patch_paths"]
+        )
+        count = impact["missing_patch_count"]
+        if count > len(impact["missing_patch_paths"]):
+            details += f" (showing the first 30 of {count} files)"
     if impact.get("case_gap"):
         details += "\n\nTest selection gap: " + _public_prose(
             impact["case_gap"], limit=1000
+        )
+    if len(impact.get("analysis_attempts", [])) > 1:
+        details += "\n\nAnalysis attempts:\n" + "\n".join(
+            "- " + item["effort"] + ": " + item.get("error", "succeeded")
+            for item in impact["analysis_attempts"]
         )
     if kind in {"cpu_only", "docs_only"}:
         return Result("success", kind, "Bot run not required", details, impact)
     if kind == "unknown":
         title, reason = "Unable to determine GPU impact", "unknown"
-        details += "\n\nNo CPU-only exemption could be established. Rerun this check, or comment `/bot run` and wait for the bot response."
+        details += "\n\nNo CPU-only exemption could be established. Comment `/bot run` and wait for the internal bot response."
     elif command:
         title, reason = "Waiting for flashinfer-bot", "waiting_for_bot"
     else:
@@ -325,17 +411,9 @@ def run_pr(client, number):
                     "targets": [],
                 }
             root = Path(__file__).resolve().parents[3]
-            selector = PytestTargetSelector(
-                client, lambda path: (root / path).read_text()
+            return analyze_gpu_impact(
+                client, pr, lambda path: (root / path).read_text()
             )
-            # Inference has its own shorter deadline. Reserve the outer budget
-            # so even a timed-out analysis can publish a useful failing Check.
-            deadline = client.deadline
-            try:
-                selection = selector.select(pr, include_gpu_impact=True)
-            finally:
-                client.deadline = deadline
-            return {**selection.gpu_impact, "targets": selection.paths}
 
         result = evaluate(comments, analyze)
     except TargetSelectionError as error:

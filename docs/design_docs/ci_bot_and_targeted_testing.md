@@ -235,8 +235,21 @@ graphs, synchronization and communication generally need GPU validation. New
 PR tests are included even if they are not among the recommended targets.
 GPU impact with no corresponding selected case still requires a bot response;
 the missing/uncertain test coverage is reported rather than treated as exempt.
-An incomplete diff, evidence failure or uncertain model answer is not an
-exemption. A verified response remains sufficient even when analysis is unavailable.
+The GPU-impact response uses compact JSON with default reasoning. If analysis
+fails validation or returns `unknown`, the gate retries once with
+`reasoning_effort=minimal`. A validated evidence-file request is reused only
+when its context is unchanged; invalid file requests are retried too. If the
+second analysis is still uncertain or invalid, the check fails and requires
+`/bot run` and an internal bot response. A known GPU-related result requires a
+reply immediately, without a model retry.
+
+For content omitted by the context budget, GPU classification may use the
+file's name/path; the check records filename-only evidence. Missing patch text
+is informational and does not automatically override a documentation/CPU-only
+model conclusion. The model should return `unknown` when the available evidence
+cannot support a conclusion. Missing changed-file records, invalid evidence
+paths and invalid test targets still prevent an exemption. A verified bot
+response remains sufficient even when analysis is unavailable.
 
 | State without a qualifying bot response | Check result |
 | --- | --- |

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts/infra/pr_checks"))
 import ai_test_scope as scope
+import test_ai_test_scope as fixtures
 
 
 def completion(content='{"read_paths": []}', finish="stop"):
@@ -28,6 +29,20 @@ def response(data):
 
 
 class InferenceTransportTests(unittest.TestCase):
+    def test_reasoning_effort_is_only_sent_when_explicitly_requested(self):
+        for effort in (None, "minimal"):
+            with patch.object(
+                scope.urllib.request, "urlopen", return_value=response(completion())
+            ) as call:
+                scope.InferenceHub("secret", reasoning_effort=effort).complete(
+                    {}, "JSON"
+                )
+            payload = json.loads(call.call_args.args[0].data)
+            if effort is None:
+                self.assertNotIn("reasoning_effort", payload)
+            else:
+                self.assertEqual("minimal", payload["reasoning_effort"])
+
     def test_transient_http_and_network_errors_retry_then_succeed(self):
         for error in (
             urllib.error.HTTPError("https://hub.example", 429, "busy", {}, None),
@@ -221,3 +236,39 @@ class MergeReadTransportTests(unittest.TestCase):
         ) as api:
             self.assertEqual("current", github.get_current_base_sha(pr))
         api.assert_called_once_with("repos/owner/repo/git/ref/heads/release%2Fnext")
+
+
+class EvidenceInventoryTests(unittest.TestCase):
+    def setUp(self):
+        fixture = fixtures.PytestTargetSelectorTests()
+        fixture.setUp()
+        self.github = fixture.github
+        self.inference = fixture.inference
+        self.selector = fixture.selector
+
+    def test_regular_file_outside_trimmed_inventory_can_be_read(self):
+        path = "include/flashinfer/nested/private_kernel.cuh"
+        self.github.get_repository_tree.return_value["tree"].append(
+            {"path": path, "sha": "kernel", "mode": "100644", "type": "blob", "size": 7}
+        )
+        original = self.github.get_repository_blob.side_effect
+        self.github.get_repository_blob.side_effect = (
+            lambda repo, sha, limit: "// CUDA"
+            if sha == "kernel"
+            else original(repo, sha, limit)
+        )
+        self.inference.outputs[0]["read_paths"].append(path)
+        self.selector.select(fixtures.PR)
+        self.assertNotIn(path, self.inference.calls[0][0]["inventory_at_merged_tree"])
+        self.assertIn(path, self.inference.calls[1][0]["source_files"])
+
+    def test_symlinks_and_submodules_are_not_readable_evidence(self):
+        for mode, kind in (("120000", "blob"), ("160000", "commit")):
+            self.setUp()
+            path = "flashinfer/unsafe.py"
+            self.github.get_repository_tree.return_value["tree"].append(
+                {"path": path, "sha": "unsafe", "mode": mode, "type": kind}
+            )
+            self.inference.outputs[0] = {"read_paths": [path]}
+            with self.assertRaises(scope.TargetSelectionError):
+                self.selector.select(fixtures.PR)

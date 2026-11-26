@@ -271,7 +271,7 @@ class GitHub:
 class InferenceHub:
     """Same bearer-authenticated chat-completions integration as cuDNN triage."""
 
-    def __init__(self, api_key=None, base_url=None, model=None):
+    def __init__(self, api_key=None, base_url=None, model=None, reasoning_effort=None):
         self.api_key = (
             api_key if api_key is not None else os.getenv("INFERENCE_API_KEY", "")
         )
@@ -280,6 +280,7 @@ class InferenceHub:
         ).rstrip("/")
         self.model = model or os.getenv("CI_BOT_TARGET_MODEL") or DEFAULT_MODEL
         self.deadline = None
+        self.reasoning_effort = reasoning_effort
         parsed = urlsplit(self.base_url)
         if (
             parsed.scheme != "https"
@@ -304,6 +305,8 @@ class InferenceHub:
                 {"role": "user", "content": json.dumps(context)},
             ],
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         for attempt in range(3):
             request = urllib.request.Request(
                 self.base_url + "/chat/completions",
@@ -547,11 +550,6 @@ class PytestTargetSelector:
             raise TargetSelectionError(str(error)) from error
         context = budget.context
         files = context["source_files"]
-        visible_paths = set(
-            context["inventory_at_merged_tree"]
-            + context["candidate_test_files"]
-            + context["configuration_files"]
-        )
 
         secrets = (
             os.getenv("GH_TOKEN"),
@@ -621,7 +619,7 @@ class PytestTargetSelector:
             key=lambda path: not isinstance(path, str) or path not in candidate_set,
         ):
             if not isinstance(path, str) or (
-                path not in visible_paths and path not in ci_files
+                path not in blobs and path not in ci_files
             ):
                 raise TargetSelectionError(
                     "AI requested a file outside the supplied repository inventory"
