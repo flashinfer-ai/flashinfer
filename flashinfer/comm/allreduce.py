@@ -878,6 +878,11 @@ def allreduce_fusion(
         ``workspace.is_buffer_size_sufficient(tp_size, num_tokens, hidden_dim, dtype)``
         returns ``True``.
 
+        With an MNNVL workspace and ``kARResidualRMSNorm``, ``input``,
+        ``residual_in``, ``rms_gamma``, and any supplied ``norm_out`` or
+        ``residual_out`` must be contiguous. Padded rows and other strided
+        views are not supported by this kernel.
+
     Parameters
     ----------
     input : torch.Tensor
