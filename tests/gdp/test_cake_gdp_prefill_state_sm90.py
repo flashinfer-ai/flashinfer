@@ -846,3 +846,19 @@ def test_the_seed_contract():
             output_final_state=True,
             rand_seed=seed,
         )
+
+
+def test_a_sequence_longer_than_4096_blocks_is_refused():
+    """The SM90 programs run a sequence of at most 4096 64-token blocks (262144 tokens): a longer one, with an FP32
+    or a BF16 state, is refused before any launch."""
+    inputs = _inputs([1, 4096 * 64 + 1], 1, seed=28)
+    with pytest.raises(ValueError, match="at most 262144 tokens"):
+        _call(inputs, output_final_state=True)
+    initial = _pool(2, 1, torch.bfloat16, seed=29)
+    with pytest.raises(ValueError, match="at most 262144 tokens"):
+        _call(
+            inputs,
+            initial_state=initial,
+            output_state=torch.empty_like(initial),
+            output_final_state=True,
+        )

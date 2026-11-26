@@ -562,6 +562,9 @@ _GATE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 _TENSORMAP_BYTES_PER_CTA = 512
 # One (sequence, head) state record: V x K elements.
 _STATE_ELEMENTS = HEAD_SIZE_V * HEAD_SIZE_K
+# The longest sequence the SM90 programs run: they divide a chunk index by ``num_householder`` with a 32-bit product
+# that wraps past 4096 64-token blocks (a longer sequence hangs or faults), so a longer one is refused.
+_SM90_MAX_SEQ_LEN = 4096 * 64
 # The prefill state dtypes: FP32 everywhere; BF16 and FP16 on the architectures whose registry ships their programs
 # (the state is read widened exactly and its final value rounded once: with the hardware ``cvt.rs`` on SM100 / SM103,
 # with a software form of it on SM90).
@@ -1265,7 +1268,8 @@ def cake_chunk_gated_delta_product(
     graph-captured caller passes the host copy.  A device without an exported prefill route, and a flag set no
     exported program spells (``g=None`` together with ``beta=None``; on SM90 a unit-gate or unit-beta call with a
     float32 ``initial_state`` or a float32 ``state_indices`` pool without ``output_state_indices``), is refused with
-    ``ValueError`` rather than approximated.
+    ``ValueError`` rather than approximated.  On SM90 a sequence longer than 262144 tokens is refused with
+    ``ValueError``.
     """
 
     if not isinstance(q, torch.Tensor) or q.ndim != 3:
@@ -1539,6 +1543,15 @@ def cake_chunk_gated_delta_product(
             f"cu_seqlens_cpu must hold the {N + 1} entries of cu_seqlens, got {cu_seqlens_cpu.numel()}"
         )
     cu_cpu: tuple[int, ...] = tuple(int(x) for x in cu_seqlens_cpu.tolist())
+    if not blackwell:
+        longest = max(
+            (b - a for a, b in zip(cu_cpu, cu_cpu[1:], strict=False)), default=0
+        )
+        if longest > _SM90_MAX_SEQ_LEN:
+            raise ValueError(
+                f"the Cake GDP prefill on {arch} runs sequences of at most {_SM90_MAX_SEQ_LEN} tokens, got one of "
+                f"{longest}"
+            )
     device_index = _device_index(device)
     sm_count = _loader.sm_count(device_index)
     if blackwell:
