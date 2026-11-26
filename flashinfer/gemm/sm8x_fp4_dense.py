@@ -16,6 +16,8 @@ format (``cute-dsl-native``'s canonical weight among them) and builds its record
 restore of ``a`` and the dense GEMM ``gemm_fp4``, which reads the ``[N, K/2]`` weight and its
 128x4-swizzled scales as given, with a scalar or per-token ``alpha``. For MXFP4 the restore
 leaves out ``a``'s E8M0 scales, which ``gemm_fp4`` applies with ``b``'s per 32-value block.
+The ``trtllm`` backend's ``b`` and ``b_descale`` (``nvfp4_quantize(do_shuffle=True)``) are read
+in their row shuffle, and an 8x4-swizzled ``a_descale`` is restored as such.
 """
 
 import functools
@@ -485,10 +487,13 @@ def _run_fp4(
     out: torch.Tensor,
     r: int,
     mx: bool = False,
+    shuffled: bool = False,
+    sf_8x4: bool = False,
 ) -> None:
     """``out = (a @ b) * alpha`` for ``mm_fp4``'s NVFP4 (MXFP4: ``mx``) operands: the prep
-    restores ``a`` to BF16 exactly (MXFP4: without its scales), then the dense GEMM
-    (``gemm_fp4``) reads ``b`` and its 128x4-swizzled scales as given (MXFP4: and ``a``'s)."""
+    restores ``a`` to BF16 exactly (MXFP4: without its scales; ``sf_8x4``: its scales 8x4
+    swizzled), then the dense GEMM (``gemm_fp4``) reads ``b`` and its 128x4-swizzled scales as
+    given (MXFP4: and ``a``'s; ``shuffled``: both in the trtllm row shuffle)."""
     m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
     if m == 0:
         return
@@ -516,7 +521,7 @@ def _run_fp4(
     module = _w4a16_moe_sm80_module(None, False, None, False)
     module.prep(
         topk_ids, meta, rowmap, workspace, 1, r, max_blocks, a, asf, act,
-        True, None, None, 5 if mx else 0, None, None, None, None, None,
+        True, None, None, 5 if mx else 6 if sf_8x4 else 0, None, None, None, None, None,
     )  # fmt: skip
     direct = n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
     target = (
@@ -527,7 +532,7 @@ def _run_fp4(
     gemm = _out_f16_module() if out.dtype == torch.float16 else module
     gemm.gemm_fp4(
         w, sf, alpha, act, meta, rowmap, target, r, n, k, max_blocks, alpha.numel() > 1,
-        asf if mx else None,
+        asf if mx else None, shuffled,
     )  # fmt: skip
     if not direct:
         out.copy_(target[:, :n])
@@ -537,8 +542,13 @@ class Sm8xMmFp4Runner(TunableRunner):
     """``_run_fp4`` behind ``mm_fp4`` as an autotuner candidate on ``mm_fp4``'s inputs; tactic:
     the row tile."""
 
+    def __init__(self, shuffled: bool, sf_8x4: bool):
+        self.shuffled = shuffled
+        self.sf_8x4 = sf_8x4
+
     def get_cache_key_extras(self, inputs) -> tuple:
-        return (inputs[5], inputs[4] is not None and inputs[4].numel() > 1, inputs[8])
+        alpha_rows = inputs[4] is not None and inputs[4].numel() > 1
+        return (inputs[5], alpha_rows, inputs[8], self.shuffled, self.sf_8x4)
 
     def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
         return [8, 16, 32, 64]
@@ -554,6 +564,8 @@ class Sm8xMmFp4Runner(TunableRunner):
             out,
             64 if tactic in (None, -1) else tactic,
             not inputs[8],
+            self.shuffled,
+            self.sf_8x4,
         )
         return out
 
@@ -567,11 +579,10 @@ def sm8x_mm_fp4_runner(
     out_dtype: torch.dtype,
     out: torch.Tensor,
     use_8x4_sf_layout: bool,
+    shuffled: bool = False,
 ) -> Sm8xMmFp4Runner:
     """The ``mm_fp4`` runner of every backend on SM8x (after the backend's requirement
-    check)."""
-    if use_8x4_sf_layout:
-        raise NotImplementedError("mm_fp4 on SM8x currently serves 128x4 scale factors")
+    check); ``shuffled``: ``b`` and its scales in the trtllm backend's row shuffle."""
     m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
     if k % 32:
         raise ValueError(f"mm_fp4 on SM8x requires K % 32 == 0, got K={k}")
@@ -588,4 +599,4 @@ def sm8x_mm_fp4_runner(
         )
     if alpha is None:
         _ones(a.device)  # outside a tuner's graph capture
-    return Sm8xMmFp4Runner()
+    return Sm8xMmFp4Runner(shuffled, use_8x4_sf_layout)

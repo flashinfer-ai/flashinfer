@@ -9703,7 +9703,7 @@ def _cudnn_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _trtllm_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -11667,7 +11667,8 @@ def mm_fp4(
 
         runners = [
             sm8x_mm_fp4_runner(
-                a, b, a_descale, b_descale, alpha, out_dtype, out, use_8x4_sf_layout
+                a, b, a_descale, b_descale, alpha, out_dtype, out, use_8x4_sf_layout,
+                list(backends) == ["trtllm"],
             )
         ]  # fmt: skip
     else:

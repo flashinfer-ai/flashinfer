@@ -679,6 +679,11 @@ __device__ __forceinline__ uint32_t movm_trans(uint32_t x) {
   return y;
 }
 
+// Stored row of row n of a 32-row block in TRT-LLM's epilogue-tile-128 shuffle.
+__device__ __forceinline__ int shuffled_row(int n) {
+  return (n & ~31) | (n & 3) << 3 | (n >> 2 & 7);
+}
+
 // ACT: 0 none (GEMM2), 1 silu(gate) * up (GEMM1, gated), 2 relu(x)^2 (GEMM1,
 // not gated) KT: K % 128 != 0 (a tail k-step per chunk). G1E, Q12F: the R 96
 // 2-stage paths of kX96 and kQ12. VS: the scale load of kG2W64v. FQ (GEMM1): the
@@ -687,13 +692,15 @@ __device__ __forceinline__ uint32_t movm_trans(uint32_t x) {
 // GEMM2 by its row scale p.ws[b R + r], both on the FP32 sum as the reference's epilogue. OW
 // (gemm_ow, the dense mm_fp4): the weights in their own layout (GemmParamsOw) read with
 // ldmatrix, the BF16 activation as the k permutation of their nibbles, the sum times 2^7 then
-// alpha.
+// alpha. SH (OW, NVFP4): the weights and their scales in TRT-LLM's epilogue-tile-128 row shuffle
+// (shuffle_matrix_a, shuffle_matrix_sf_a), each row read from where it is stored.
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
           bool Q12F = false, bool VS = false, bool FQ = false, bool PT = false, bool OW = false,
-          bool MX = false>
+          bool MX = false, bool SH = false>
 __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX> const& p) {
   static_assert(!FQ || ACT != 0 || R == 8, "FQ: a GEMM1 epilogue or the R 8 GEMM2 sum");
   static_assert(!MX || OW, "MX: OW");
+  static_assert(!SH || (OW && !MX), "SH: OW, NVFP4");
   using C = Cfg<R, NC>;
   constexpr int NT = NW * 32;
   constexpr int SC = 8 * NC / WC, WT = NW / WC, TW = R / WT, G = TW / 8;
@@ -786,10 +793,12 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX> const& p) {
       valid_record[rec] = NC == 1 || c < record_chunks;
       if constexpr (OW) {
         ow_rows = p.N - (c * kTileN + (tid >> 2));
-        gws[rec] = p.w + (e * p.N + c * kTileN + (tid >> 2)) * (K / 2) + iks * (kTileK / 2) +
-                   (tid & 3) * 16;
+        gws[rec] = p.w +
+                   (e * p.N + c * kTileN + (SH ? shuffled_row(tid >> 2) : tid >> 2)) * (K / 2) +
+                   iks * (kTileK / 2) + (tid & 3) * 16;
         gsf = MX ? p.sf + (static_cast<long>(c) * p.nka + iks) * 512 + (tid & 31) * 16
-                 : p.sf + (static_cast<long>(c) * p.nka + 2 * iks) * 512 + tid * 16;
+                 : p.sf + (static_cast<long>(c) * p.nka + 2 * iks) * 512 +
+                       (SH ? shuffled_row(tid) : tid) * 16;
       } else if constexpr (KT) {
         gws[rec] = p.w + (e * record_chunks + c) * cbytes + tid * 16;
       } else {
@@ -1610,9 +1619,9 @@ __global__ void __launch_bounds__(NW * 32) gemm_pt(GemmParamsT<FQ> p) {
 #if !defined(RECORDS_F16) && !defined(RECORDS_ACT) && !defined(RECORDS_EXACT) && \
     !defined(RECORDS_E4M3_MAX)
 #define RECORDS_OW
-template <int R, int WC, int NW, int STAGES, bool KT, bool MX = false>
+template <int R, int WC, int NW, int STAGES, bool KT, bool MX = false, bool SH = false>
 __global__ void __launch_bounds__(NW * 32) gemm_ow(GemmParamsT<false, true, MX> p) {
-  gemm_body<R, WC, NW, 0, STAGES, KT, 1, false, false, false, false, false, true, MX>(p);
+  gemm_body<R, WC, NW, 0, STAGES, KT, 1, false, false, false, false, false, true, MX, SH>(p);
 }
 #endif
 
@@ -1816,8 +1825,11 @@ __device__ __forceinline__ void prep_alphas(AlArgs const& a, int E) {
   }
 }
 
-// Scale g of token t: [tokens][sf_pitch], or 128x4 swizzled (sf_pitch tiles of 128 rows x 4).
+// Scale g of token t: [tokens][sf_pitch], or 128x4 swizzled (sf_pitch tiles of 128 rows x 4),
+// or (S8) 8x4 swizzled (sf_pitch tiles of 8 rows x 4).
+template <bool S8 = false>
 __device__ __forceinline__ long sf_index(DqArgs const& d, int t, int g) {
+  if constexpr (S8) return (static_cast<long>(t / 8) * d.sf_pitch + g / 4) * 32 + t % 8 * 4 + g % 4;
   return d.swizzled ? (static_cast<long>(t / 128) * d.sf_pitch + g / 4) * 512 + t % 32 * 16 +
                           t % 128 / 32 * 4 + g % 4
                     : static_cast<long>(t) * d.sf_pitch + g;
@@ -1828,8 +1840,8 @@ __device__ __forceinline__ long sf_index(DqArgs const& d, int t, int g) {
 // a thread. More blocks would make the second thread's scale issue cost more than the chain saves.
 constexpr int kPairBlocks = 192;
 
-// BF: the input is BF16, quantized first under d.gs (PE: per entry, DQ 4).
-template <bool BF, bool PAIR = false, bool PE = false>
+// BF: the input is BF16, quantized first under d.gs (PE: per entry, DQ 4). S8: NVFP4 scales 8x4.
+template <bool BF, bool PAIR = false, bool PE = false, bool S8 = false>
 __device__ __forceinline__ void dequant_input(DqArgs const& d) {
   const int stride = (gridDim.x - d.cta0) * blockDim.x;
   [[maybe_unused]] float gs = BF && !PE ? __ldg(d.gs) : 0.f;
@@ -1872,7 +1884,7 @@ __device__ __forceinline__ void dequant_input(DqArgs const& d) {
       c = make_uint2(static_cast<uint32_t>(codes), static_cast<uint32_t>(codes >> 32));
     } else {
       c = __ldg(reinterpret_cast<const uint2*>(d.x) + i);
-      s = d.sf[sf_index(d, t, j)];
+      s = d.sf[sf_index<S8>(d, t, j)];
     }
     uint4 o[2];
     restore_nvfp4x8(c.x, s, reinterpret_cast<uint32_t*>(o));
@@ -1974,7 +1986,7 @@ __device__ __forceinline__ void dequant_pt(DqArgs const& d) {
 // One-CTA prep: warp w < W counts entries [w Q, (w + 1) Q) per expert in its own table row.
 // DQ: CTAs past the first restore the NVFP4 input instead (2: quantize the BF16 input first; 3:
 // per token, dequant_pt; 4: per entry under its expert's scale; 5 to 7: dequant_mx; 8: per token
-// FP8, dequant_pt<true>).
+// FP8, dequant_pt<true>; 9: MXFP4 without its scales; 10: scales 8x4 swizzled).
 // ONE (one token, M <= 32): a one-row block per entry in entry order, its experts being distinct;
 // a BF16 input may take the PAIR restore.
 // An expert id outside [0, E) has no slot (as a negative one): -1.
@@ -1993,14 +2005,14 @@ __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
       dequant_pt<DQ == 8>(dq);
       return;
     }
-  } else if constexpr (DQ > 4) {
+  } else if constexpr (DQ > 4 && DQ < 10) {
     if (blockIdx.x >= dq.cta0) {
       dequant_mx<DQ == 9 ? 3 : DQ - 4, DQ == 9>(dq);
       return;
     }
   } else if constexpr (DQ) {
     if (blockIdx.x >= dq.cta0) {
-      dequant_input<DQ != 1, ONE && DQ == 2, DQ == 4>(dq);
+      dequant_input<DQ != 1 && DQ != 10, ONE && DQ == 2, DQ == 4, DQ == 10>(dq);
       return;
     }
   }
@@ -2121,14 +2133,14 @@ __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
       dequant_pt<DQ == 8>(dq);
       return;
     }
-  } else if constexpr (DQ > 4) {
+  } else if constexpr (DQ > 4 && DQ < 10) {
     if (blockIdx.x >= dq.cta0) {
       dequant_mx<DQ == 9 ? 3 : DQ - 4, DQ == 9>(dq);
       return;
     }
   } else if constexpr (DQ) {
     if (blockIdx.x >= dq.cta0) {
-      dequant_input<DQ != 1, false, DQ == 4>(dq);
+      dequant_input<DQ != 1 && DQ != 10, false, DQ == 4, DQ == 10>(dq);
       return;
     }
   }
@@ -2375,34 +2387,34 @@ void launch_tile(int R, GemmParamsT<FQ> const& p, int grid, cudaStream_t st) {
 }
 
 #ifdef RECORDS_OW
-template <int R, int WC, int NW, int STAGES, bool KT, bool MX>
+template <int R, int WC, int NW, int STAGES, bool KT, bool MX, bool SH>
 void launch_gemm_ow(GemmParamsT<false, true, MX> const& p, int grid, cudaStream_t st) {
   const int smem = STAGES * Cfg<R, 1>::kStageBytes;
   TVM_FFI_ICHECK(smem <= max_smem_optin()) << "W4A16 MoE GEMM: tile exceeds device shared memory";
-  cudaFuncSetAttribute(gemm_ow<R, WC, NW, STAGES, KT, MX>,
+  cudaFuncSetAttribute(gemm_ow<R, WC, NW, STAGES, KT, MX, SH>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  gemm_ow<R, WC, NW, STAGES, KT, MX><<<grid, NW * 32, smem, st>>>(p);
+  gemm_ow<R, WC, NW, STAGES, KT, MX, SH><<<grid, NW * 32, smem, st>>>(p);
 }
 
 // OW: launch_tile's kBase tiles
-template <bool KT, bool MX>
+template <bool KT, bool MX, bool SH>
 void launch_tile_ow(int R, GemmParamsT<false, true, MX> const& p, int grid, cudaStream_t st) {
   if (R == 8) {  // as launch_tile_pt
     constexpr int s = Cfg<8, 1>::kStageBytes;
-    if (ctas_per_sm<gemm_ow<8, 8, 8, 3, KT, MX>, 3 * s>() >
-        ctas_per_sm<gemm_ow<8, 8, 8, 4, KT, MX>, 4 * s>())
-      launch_gemm_ow<8, 8, 8, 3, KT, MX>(p, grid, st);
+    if (ctas_per_sm<gemm_ow<8, 8, 8, 3, KT, MX, SH>, 3 * s>() >
+        ctas_per_sm<gemm_ow<8, 8, 8, 4, KT, MX, SH>, 4 * s>())
+      launch_gemm_ow<8, 8, 8, 3, KT, MX, SH>(p, grid, st);
     else
-      launch_gemm_ow<8, 8, 8, 4, KT, MX>(p, grid, st);
+      launch_gemm_ow<8, 8, 8, 4, KT, MX, SH>(p, grid, st);
   } else if (R == 16)
-    launch_gemm_ow<16, 8, 8, 2, KT, MX>(p, grid, st);
+    launch_gemm_ow<16, 8, 8, 2, KT, MX, SH>(p, grid, st);
   else if (R == 32) {
     if (max_smem_per_sm() <= 100 * 1024)
-      launch_gemm_ow<32, 8, 8, 2, KT, MX>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 2, KT, MX, SH>(p, grid, st);
     else
-      launch_gemm_ow<32, 8, 8, 4, KT, MX>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 4, KT, MX, SH>(p, grid, st);
   } else
-    launch_gemm_ow<64, 4, 4, 3, KT, MX>(p, grid, st);
+    launch_gemm_ow<64, 4, 4, 3, KT, MX, SH>(p, grid, st);
 }
 #endif
 
@@ -2450,8 +2462,9 @@ using namespace flashinfer::w4a16_moe_sm80;
 // x_sf [tokens][>= K / 32] (or 128x4 swizzled), or FP8 E4M3 [tokens][K] (x_sf unread); x_fmt 4
 // (BF16 or FP16): x quantized per token to FP8 E4M3 as SM90's Humming path, x_ts receiving 1 / q
 // (x_sf unread). x_fmt 5 (RECORDS_OW modules, gemm_fp4's input): x is MXFP4 restored without its
-// scales (times 2^119). With alphas (FP32 [2 num_experts]) the first CTA writes the GEMM alphas
-// num1 / den1, then num2 / den2 (FP32 [num_experts] over [1]).
+// scales (times 2^119); x_fmt 6 (RECORDS_OW, sf_swizzled): NVFP4 under 8x4 swizzled scales. With
+// alphas (FP32 [2 num_experts]) the first CTA writes the GEMM alphas num1 / den1, then num2 / den2
+// (FP32 [num_experts] over [1]).
 void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap,
                          TensorView workspace, int64_t num_experts, int64_t row_tile,
                          int64_t max_blocks, tvm::ffi::Optional<TensorView> x,
@@ -2494,8 +2507,9 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
                  (!x_fmt || (dq && !(kF16 && x_fmt == 3) && x_ts.has_value() == (x_fmt == 4))))
       << "x_fmt: 0, 1 to 3 (FP16 x_out: 1, 2) with no x_ts, or 4 with x_ts";
 #elif defined(RECORDS_OW)
-  TVM_FFI_ICHECK(x_fmt == 0 || (x_fmt == 5 && dq && !slot_experts.has_value() && !x_ts.has_value()))
-      << "x_fmt: 0, or 5 (MXFP4 for gemm_fp4) with x";
+  TVM_FFI_ICHECK(x_fmt == 0 || ((x_fmt == 5 || (x_fmt == 6 && sf_swizzled)) && dq &&
+                                !slot_experts.has_value() && !x_ts.has_value()))
+      << "x_fmt: 0, or with x 5 (MXFP4 for gemm_fp4) or 6 (NVFP4, 8x4 swizzled x_sf)";
 #else
   TVM_FFI_ICHECK(x_fmt == 0) << "MX inputs (x_fmt) take a RECORDS_ACT module";
 #endif
@@ -2529,7 +2543,7 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
         d.top_k = static_cast<int>(M / xv.size(0));
         d.num_experts = e;
       }
-    } else if (x_fmt) {  // MX
+    } else if (x_fmt && x_fmt != 6) {  // MX
       const int64_t t32 = (K / 32 + 3) / 4;
       TVM_FFI_ICHECK(
           K % 32 == 0 && xv.size(0) == tokens &&
@@ -2543,11 +2557,12 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
       d.sf_pitch = static_cast<int>(sf_swizzled ? t32 : x_fmt == 2 ? 0 : sv.size(1));
     } else {
       TVM_FFI_ICHECK(sv.dtype().bits == 8) << "x_sf must hold one byte per scale";
+      const int64_t band = x_fmt == 6 ? 8 : 128;  // rows of a swizzled tile
       TVM_FFI_ICHECK(K % 16 == 0 && xv.size(0) == tokens && xv.size(1) == K / 2 &&
-                     (sf_swizzled ? sv.numel() >= (tokens + 127) / 128 * 128 * tiles * 4
+                     (sf_swizzled ? sv.numel() >= (tokens + band - 1) / band * band * tiles * 4
                                   : sv.size(0) == tokens && sv.size(1) >= K / 16))
-          << "NVFP4 input: x [tokens, K / 2], x_sf [tokens, >= K / 16] (or 128x4 swizzled), "
-             "x_out [tokens, K]";
+          << "NVFP4 input: x [tokens, K / 2], x_sf [tokens, >= K / 16] (or 128x4 / 8x4 "
+             "swizzled), x_out [tokens, K]";
       d.sf = static_cast<const uint8_t*>(sv.data_ptr());
       d.sf_pitch = static_cast<int>(sf_swizzled ? tiles : sv.size(1));
     }
@@ -2641,7 +2656,7 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
         }
 #elif defined(RECORDS_OW)
         if (x_fmt) {
-          run(prep<RT, 9, false, O>);
+          x_fmt == 5 ? run(prep<RT, 9, false, O>) : run(prep<RT, 10, false, O>);
           return;
         }
 #endif
@@ -2691,9 +2706,11 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
   };
   if (x_fmt) mx(false);
 #elif defined(RECORDS_OW)
-  auto mx = [&](bool launch) {  // x_fmt 5
-    constexpr auto kern = prepx_count<9>;
-    launch ? kern<<<nC + dq_ctas, 1024, sm_q, st>>>(ids, M, e, ch, pc, d, al) : big(kern, sm_q);
+  auto mx = [&](bool launch) {  // x_fmt 5 and 6
+    auto go = [&](auto kern) {
+      launch ? kern<<<nC + dq_ctas, 1024, sm_q, st>>>(ids, M, e, ch, pc, d, al) : big(kern, sm_q);
+    };
+    x_fmt == 5 ? go(prepx_count<9>) : go(prepx_count<10>);
   };
   if (x_fmt) mx(false);
 #else
@@ -2979,13 +2996,15 @@ void w4a16_moe_sm80_gemm(
 // The dense mm_fp4 (OW): out [rows][Nout] = alpha x act w^T, act [rows][K] BF16 (prep's restored
 // NVFP4 activation, one expert: meta and rowmap of prep), w the NVFP4 weights [N][K / 2] as they
 // are, sf their E4M3 block scales 128x4-swizzled [pad(N, 128)][pad(K / 16, 4)]; alpha [1], or
-// [rows] per row with alpha_rows. Columns N .. Nout - 1 are 0.
+// [rows] per row with alpha_rows. Columns N .. Nout - 1 are 0. With shuffled (NVFP4, N % 32 == 0)
+// w and sf hold their rows in TRT-LLM's epilogue-tile-128 shuffle (nvfp4_quantize do_shuffle).
 void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, TensorView act,
                              TensorView meta, TensorView rowmap, TensorView out, int64_t row_tile,
                              int64_t N, int64_t K, int64_t max_blocks, bool alpha_rows,
-                             tvm::ffi::Optional<TensorView> act_sf) {
+                             tvm::ffi::Optional<TensorView> act_sf, bool shuffled) {
   // act_sf: MXFP4 (E8M0 scales of both operands, the activation's 128x4 [pad(M, 128)][4 nka])
   const bool mx = act_sf.has_value();
+  TVM_FFI_ICHECK(!shuffled || (!mx && N % 32 == 0)) << "shuffled weights: NVFP4, N % 32 == 0";
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(sf, dl_uint8);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
@@ -3033,11 +3052,13 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   p.asf = mx ? static_cast<const uint8_t*>(act_sf.value().data_ptr()) : nullptr;
   const int grid = static_cast<int>(max_blocks * (n_pad / kTileN));
   const int rt = static_cast<int>(row_tile);
-  if (K % kTileK != 0)
-    mx ? launch_tile_ow<true, true>(rt, p, grid, st) : launch_tile_ow<true, false>(rt, p, grid, st);
-  else
-    mx ? launch_tile_ow<false, true>(rt, p, grid, st)
-       : launch_tile_ow<false, false>(rt, p, grid, st);
+  auto tile = [&](auto kt) {
+    constexpr bool T = decltype(kt)::value;
+    mx         ? launch_tile_ow<T, true, false>(rt, p, grid, st)
+    : shuffled ? launch_tile_ow<T, false, true>(rt, p, grid, st)
+               : launch_tile_ow<T, false, false>(rt, p, grid, st);
+  };
+  K % kTileK != 0 ? tile(std::true_type{}) : tile(std::false_type{});
 }
 #endif
 
