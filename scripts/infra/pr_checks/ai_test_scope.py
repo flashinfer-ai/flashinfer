@@ -530,6 +530,14 @@ class PytestTargetSelector:
             if not text:
                 raise TargetSelectionError("CI routing evidence is unavailable")
             ci_files[path] = text
+        # Historical replay reads routing at its selected CI revision. Older
+        # monolithic workflows need no dispatcher; split workflows must supply it.
+        if "# CI_BOT_PR_TEST_DISPATCH_V1:" in ci_files[".github/workflows/pr-test.yml"]:
+            path = ".github/workflows/pr-test-dispatch.yml"
+            text = self.read_ci_file(path)
+            if not text:
+                raise TargetSelectionError("CI routing evidence is unavailable")
+            ci_files[path] = text
         candidates = [path for path in inventory if _TEST_FILE.fullmatch(path)]
         candidate_set = set(candidates)
         try:

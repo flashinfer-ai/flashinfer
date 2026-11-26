@@ -239,6 +239,7 @@ class SwapsPlan:
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
         self.D, self.g, self.page, self.n_pad = D, g, page, n_pad
+        self.sinks = False  # set by the kernel compiled for attention sinks
         self.ragged = (
             ragged  # the packed-token KV view (blocks/operands.StaticPlan.ragged)
         )
