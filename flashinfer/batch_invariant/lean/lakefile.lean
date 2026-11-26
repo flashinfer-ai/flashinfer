@@ -2,8 +2,10 @@ import Lake
 open Lake DSL
 
 -- The kernel decides the generated conformance theorems by evaluating `String` equalities of several KB (a list of
--- characters: the recursion is as deep as the string); the default 8 MB thread stack overflows near 6.4 KB, so the
--- build runs `lean` with a 64 MB thread stack (an argument outside the trace: it changes no build result).
+-- characters: the recursion is as deep as the string); the default 8 MB thread stack overflows near 6.4 KB, and the
+-- build runs `lean` with a 64 MB thread stack (an argument outside the trace: it changes no build result). The generated
+-- cases keep every decided string under a few KB (the NVFP4 4over6 error chains are pinned term by term: their whole strings
+-- reach 260 KB, which no thread stack the kernel's recursion could use would hold).
 package bikernels where
   weakLeanArgs := #["--tstack=65536"]
 

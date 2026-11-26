@@ -21,7 +21,8 @@ def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 def decidedAxiom : Name := ``Lean.ofReduceBool
 /-- The named `native_decide` theorems: the exhaustive checks over the generators' configuration spaces and the GEMM
 dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time), the attention spec cases
-(terms of tens of kilobytes) and the attention class-separation theorems. -/
+(terms of tens of kilobytes), the attention class-separation theorems and the NVFP4 4over6 error-term lists (16 strings of up
+to 7 KB per theorem: the kernel took more than an hour on them). -/
 def decidedTheorems : List Name :=
   [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
    ``BIK.gemm_fp8_space_ok, ``BIK.gemm_fp8_space_c4_ok, ``BIK.gemm_fp8_space_c4_cta_twins, ``BIK.gemm_fp8_dispatch_in_space,
@@ -42,7 +43,13 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mxw48_space_decode_ok, ``BIK.gemm_mxw48_space_c2_ok,
    ``BIK.gemm_mxw48k64_space_ok, ``BIK.gemm_mxw48k64_space_c4_ok, ``BIK.gemm_mxw48k64_space_c4_cta_twins, ``BIK.gemm_mxw48k64_dispatch_in_space,
    ``BIK.gemm_mxw48k64_space_decode_ok, ``BIK.gemm_mxw48k64_space_c2_ok,
-   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_mode]
+   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_mode,
+   ``BIK.q46_16_nvfp4_quant_4over6_mae_t4, ``BIK.q46_16_nvfp4_quant_4over6_mae_t6, ``BIK.q46_16_nvfp4_quant_4over6_mse_t4, ``BIK.q46_16_nvfp4_quant_4over6_mse_t6,
+   ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mae_e448_t4, ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mae_e448_t6, ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mae_e256_t4, ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mae_e256_t6,
+   ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mse_e448_t4, ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mse_e448_t6, ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mse_e256_t4, ``BIK.q46_16_nvfp4_quant_pertoken_4over6_mse_e256_t6,
+   ``BIK.q46_48_nvfp4_quant_4over6_mae_t4, ``BIK.q46_48_nvfp4_quant_4over6_mae_t6, ``BIK.q46_48_nvfp4_quant_4over6_mse_t4, ``BIK.q46_48_nvfp4_quant_4over6_mse_t6,
+   ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mae_e448_t4, ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mae_e448_t6, ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mae_e256_t4, ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mae_e256_t6,
+   ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mse_e448_t4, ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mse_e448_t6, ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mse_e256_t4, ``BIK.q46_48_nvfp4_quant_pertoken_4over6_mse_e256_t6]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?

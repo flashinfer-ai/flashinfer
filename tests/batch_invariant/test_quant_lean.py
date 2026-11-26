@@ -11,6 +11,7 @@ and ``lake exe quantconformance`` prints the Lean model's terms, compared here w
 """
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -33,10 +34,22 @@ def test_generated_cases_are_current():
     assert len(lean_cases.quant_cases()) >= 6
     assert len(lean_cases.quant_out_cases()) == 6
     assert len(lean_cases.quant_block_cases()) >= 4
+    assert len(lean_cases.quant_4over6_cases()) == 12
     assert len(lean_cases.mxquant_cases()) == 3
     assert len(lean_cases.mxquant_out_cases()) == 12
     assert len(lean_cases.mxquant_block_cases()) >= 8
-    assert "sorry" not in committed and "native_decide" not in committed
+    assert "sorry" not in committed
+    # the compiled evaluator only on the 24 NVFP4 4over6 error-term lists (16 strings of up to 7 KB each: the kernel's `decide`
+    # took more than an hour on them), every one named in the axiom policy (`Axioms.lean`, enforced by `lake exe axioms`)
+    decided = [l for l in committed.splitlines() if "native_decide" in l]
+    assert len(decided) == 24 and all(
+        re.match(r"theorem q46_\d+_nvfp4_quant\S*_(t4|t6) :", l) for l in decided
+    ), decided[:3]
+    with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
+        axioms = f.read()
+    for l in decided:
+        name = l.split()[1]
+        assert f"``BIK.{name}" in axioms, name
 
 
 def _lake(*args, timeout):
@@ -75,6 +88,9 @@ def test_lean_model_matches_python_engine_and_specs():
         elif tag == "quantblock":
             _, b, name, sx = line.split(" ", 3)
             lean[("quantblock", int(b), name)] = sx
+        elif tag == "quant46":
+            _, K, vname, which, sx = line.split(" ", 4)
+            lean[("quant46", int(K), vname, which)] = sx
         elif tag == "mxq":
             _, name, kind, sx = line.split(" ", 3)
             lean[("mxq", name, kind)] = sx
@@ -108,6 +124,14 @@ def test_lean_model_matches_python_engine_and_specs():
     for b, name, sx in lean_cases.quant_block_cases():
         assert lean[("quantblock", b, name)] == sx, (b, name)
         checked += 1
+    for c in lean_cases.quant_4over6_cases():
+        for which in lean_cases.QUANT46_WHICH:
+            assert lean[("quant46", c["K"], c["variant"], which)] == c[which], (
+                c["K"],
+                c["variant"],
+                which,
+            )
+            checked += 1
     for c in lean_cases.mxquant_cases():
         assert lean[("mxq", c["name"], "spec")] == c["spec"]
         assert lean[("mxq", c["name"], "kernel")] == c["kernel"], c["name"]

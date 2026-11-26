@@ -17,10 +17,13 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer import SfLayout
 from flashinfer import batch_invariant as bi
 from flashinfer.batch_invariant.quantization import layout as L
 from flashinfer.batch_invariant.quantization import nvfp4_reference as R
 from flashinfer.batch_invariant.quantization import nvfp4_schedule as C
+from flashinfer.batch_invariant.quantization import nvfp4_spec as S
+from flashinfer.batch_invariant.fp_interface import exact as fp32
 from flashinfer.batch_invariant.quantization.nvfp4_api import (
     NVFP4_QUANT_ARCHS,
     nvfp4_quantize_batch_invariant,
@@ -210,7 +213,9 @@ def test_determinism_graph_replay_and_pdl(per_token):
             )
     for _ in range(2):
         for o in outs:
-            o.zero_()
+            o.view(torch.uint8).fill_(
+                0xA5
+            )  # a nonzero pattern: a skipped store cannot pass as a zero
         g.replay()
         torch.cuda.synchronize()
         assert same_bits(tuple(o.cpu() for o in outs), ref)
@@ -474,7 +479,9 @@ def test_global_scale_forms_and_the_float_scale_cache():
             outs = flashinfer.nvfp4_quantize(x, w, batch_invariant=True)
     for _ in range(2):
         for o in outs:
-            o.zero_()
+            o.view(torch.uint8).fill_(
+                0xA5
+            )  # a nonzero pattern: a skipped store cannot pass as a zero
         g.replay()
         torch.cuda.synchronize()
         assert same_bits(tuple(o.cpu() for o in outs), ref_w)
@@ -616,13 +623,451 @@ def test_fp4_quantize_entry_point_runs_the_class():
         flashinfer.fp4_quantize(
             x.to(torch.float8_e4m3fn), gs_t, 16, batch_invariant=True
         )
-    with pytest.raises(E, match="4over6"):
-        flashinfer.fp4_quantize(
+    # the 4over6 recipe runs its class through this entry point too: the same bits as the nvfp4_quantize entry
+    cfg46 = NVFP44Over6Config(e4m3_max=448, err_mode="MAE", err_use_fast_math=False)
+    c46, s46 = flashinfer.fp4_quantize(
+        x, gs_t, 16, nvfp4_4over6=cfg46, batch_invariant=True
+    )
+    r46 = flashinfer.nvfp4_quantize(x, gs_t, nvfp4_4over6=cfg46, batch_invariant=True)
+    assert torch.equal(
+        c46.view(torch.uint8).reshape(-1), r46[0].view(torch.uint8).reshape(-1)
+    )
+    assert torch.equal(
+        s46.view(torch.uint8).reshape(-1), r46[1].view(torch.uint8).reshape(-1)
+    )
+
+
+# ------------------------------------------------------------------------------------------------- the 4over6 classes
+RECIPES = [
+    S.Recipe("mae"),
+    S.Recipe("mse"),
+    S.Recipe("mae", 256),
+]  # the error modes; e4m3_max 256 (a per-token class of its own)
+KS_4OVER6 = [48, 1024, 4096, 16384]
+KS_SPACE_4OVER6 = [48, 1024, 8192]  # 8192: the 512-lane per-token placements (Kbp 512)
+
+
+def _rid(r):
+    return f"{r.err_mode}{r.e4m3_max}"
+
+
+def _gs_4over6(x, per_token, recipe):
+    """The global scale the recipe implies: per token ``1 / (6 * e4m3_max)``; per tensor ``e4m3_max * 6 / amax``
+    (``make_nvfp4_global_scale(..., nvfp4_4over6_config=)``)."""
+    if per_token:
+        return 1.0 / (6.0 * recipe.e4m3_max)
+    amax = float(x.float().abs().nan_to_num(posinf=0.0, neginf=0.0).max())
+    return recipe.e4m3_max * 6.0 / amax if amax > 0 else 1.0
+
+
+def _fi_cfg(recipe):
+    from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
+
+    return NVFP44Over6Config(
+        e4m3_max=recipe.e4m3_max,
+        err_mode=recipe.err_mode.upper(),
+        err_use_fast_math=False,
+    )
+
+
+def test_4over6_classes_are_registered_and_pinned():
+    """Six classes: per-tensor mae / mse (e4m3_max is not in their term) and per-token mae / mse x e4m3_max 448 / 256
+    (K a dimension, as for the plain per-token class). Pinned at the first build; separate from the plain classes'."""
+    assert (
+        bi.fingerprint("nvfp4_quantize_4over6", err_mode="mae")
+        == "nvfp4quant-bfed5b4dae7e5206"
+    )
+    assert (
+        bi.fingerprint("nvfp4_quantize_4over6", err_mode="mse")
+        == "nvfp4quant-f38cb68367096e58"
+    )
+    assert bi.fingerprint("nvfp4_quantize_4over6", err_mode="MAE") == bi.fingerprint(
+        "nvfp4_quantize_4over6", err_mode="mae"
+    )
+    assert (
+        bi.fingerprint(
+            "nvfp4_quantize_4over6_per_token", err_mode="mae", e4m3_max=448, K=1024
+        )
+        == "nvfp4quant-105eb3ee0518df01"
+    )
+    assert (
+        bi.fingerprint(
+            "nvfp4_quantize_4over6_per_token", err_mode="mae", e4m3_max=256, K=1024
+        )
+        == "nvfp4quant-8d67eef4671b3d18"
+    )
+    assert (
+        bi.fingerprint(
+            "nvfp4_quantize_4over6_per_token", err_mode="mse", e4m3_max=448, K=1024
+        )
+        == "nvfp4quant-c849aab355e0912e"
+    )
+    assert (
+        bi.fingerprint(
+            "nvfp4_quantize_4over6_per_token", err_mode="mse", e4m3_max=256, K=1024
+        )
+        == "nvfp4quant-8d87a788889e046d"
+    )
+    assert bi.class_name("nvfp4_quantize_4over6") == "nvfp4.quant.4over6"
+    assert (
+        bi.class_name("nvfp4_quantize_4over6_per_token")
+        == "nvfp4.quant.4over6.pertoken"
+    )
+    plain = {
+        bi.fingerprint("nvfp4_quantize"),
+        bi.fingerprint("nvfp4_quantize_per_token", K=1024),
+    }
+    new = {
+        bi.fingerprint("nvfp4_quantize_4over6", err_mode=m) for m in ("mae", "mse")
+    } | {
+        bi.fingerprint(
+            "nvfp4_quantize_4over6_per_token", err_mode=m, e4m3_max=e, K=1024
+        )
+        for m in ("mae", "mse")
+        for e in (448, 256)
+    }
+    assert len(new) == 6 and not (new & plain)
+    assert S.Variant(False, S.Recipe("mae", 256)).recipe == S.Recipe("mae", 448)
+    with pytest.raises(TypeError):
+        bi.fingerprint("nvfp4_quantize_4over6")
+    assert all(c.elems_per_thread == 16 for c in C.valid_configs_4over6(4096, 2, False))
+    for K in (48, 1024, 4096, 16384):
+        for eb in (2, 4):
+            for pt in (False, True):
+                space = C.valid_configs_4over6(K, eb, pt)
+                for M in (1, 64, 4096, 32768):
+                    for sm in (148, 152, 204, 224):
+                        for layout in ("128x4", "8x4", "linear"):
+                            pick = C.default_config(
+                                K, M, eb, pt, sm, layout, recipe=S.Recipe("mae")
+                            )
+                            assert pick in space, (
+                                K,
+                                eb,
+                                pt,
+                                M,
+                                sm,
+                                layout,
+                                pick.describe(),
+                            )
+                            assert pick == C.default_config(
+                                K, M, eb, pt, sm, layout, recipe=S.Recipe("mse", 256)
+                            )
+                            # one block per lane (as many lanes as blocks, 512 at most); the one-block tile only at
+                            # M x K >= TILE46_MIN_ELEMS for the per-tensor class in the 128x4 layout
+                            if pick.mode == "tile":
+                                assert (
+                                    not pt
+                                    and layout == "128x4"
+                                    and M * K >= C.TILE46_MIN_ELEMS
+                                    and pick.tile_bpt == 1
+                                )
+                            else:
+                                assert pick.blocks_per_thread(K) == max(
+                                    1, C.padded_blocks(K) // C.ROW_LANES_MAX
+                                )
+                            if (
+                                sm > 148
+                            ):  # monotone in the SM count: the tile is never admitted only at the larger count
+                                prev = C.default_config(
+                                    K, M, eb, pt, 148, layout, recipe=S.Recipe("mae")
+                                )
+                                assert pick == prev or (
+                                    pick.mode != "tile" and prev.mode == "tile"
+                                )
+
+
+@needs_device
+@pytest.mark.parametrize("recipe", RECIPES, ids=_rid)
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("K", KS_4OVER6)
+@pytest.mark.parametrize("dtype", DT)
+def test_4over6_matches_exact_reference(dtype, K, per_token, recipe):
+    """GPU == the vectorised model of the recipe (both candidates, the two error chains in element order, the selection,
+    the zero rule) for every row, and == the symbolic spec evaluated exactly on two rows at the small sizes."""
+    for M in (1, 37, 130):
+        x = adversarial_inputs(M, K, dtype, seed=M + K)
+        gs = _gs_4over6(x, per_token, recipe)
+        outs = _quantize(x, gs, "128x4", per_token, nvfp4_4over6=_fi_cfg(recipe))
+        ref = R.quantize_reference(x, gs, per_token, recipe=recipe)
+        assert torch.equal(outs[0], ref[0].reshape(M, K // 2)), (
+            f"codes != model ({M}, {K}, {dtype}, {_rid(recipe)})"
+        )
+        assert torch.equal(outs[1].reshape(-1), ref[1].reshape(-1)), (
+            f"scales != model ({M}, {K}, {dtype}, {_rid(recipe)})"
+        )
+        if per_token:
+            assert torch.equal(outs[2].view(torch.int32), ref[2].view(torch.int32)), (
+                "pts != model"
+            )
+        if K <= 1024:
+            rows = list(range(min(M, 2)))
+            ep, esf, epts = R.exact_rows(x, gs, rows, per_token, recipe=recipe)
+            assert torch.equal(outs[0][rows], ep), "codes != exact spec"
+            assert torch.equal(
+                R.unswizzle_sf_128x4(outs[1].reshape(-1), M, K)[rows], esf
+            ), "scales != exact spec"
+            if per_token:
+                assert torch.equal(
+                    outs[2][rows].view(torch.int32), epts.view(torch.int32)
+                ), "pts != exact spec"
+
+
+@needs_device
+@pytest.mark.parametrize("recipe", RECIPES[:2], ids=_rid)
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("K", KS_SPACE_4OVER6)
+def test_4over6_config_agreement_whole_space(K, per_token, recipe):
+    """Every placement of the 4over6 space (the one-thread-per-block subset, incl. the tile placements) gives the same bits."""
+    x = adversarial_inputs(130, K, torch.bfloat16, seed=K)
+    gs = _gs_4over6(x, per_token, recipe)
+    ref = _quantize(x, gs, "128x4", per_token, nvfp4_4over6=_fi_cfg(recipe))
+    space = C.valid_configs_4over6(K, 2, per_token)
+    assert space
+    for cfg in space:
+        outs = nvfp4_quantize_rows(
+            x,
+            torch.tensor([gs], dtype=torch.float32, device="cuda"),
+            "128x4",
+            per_token=per_token,
+            config=cfg,
+            recipe=recipe,
+        )
+        got = (outs[0].reshape(130, K // 2).cpu(), outs[1].reshape(-1).cpu()) + (
+            (outs[2].cpu(),) if per_token else ()
+        )
+        assert same_bits(got, (ref[0], ref[1].reshape(-1)) + tuple(ref[2:])), (
+            cfg.describe(),
+            K,
+            per_token,
+            _rid(recipe),
+        )
+
+
+@needs_device
+@pytest.mark.parametrize("recipe", RECIPES[:2], ids=_rid)
+@pytest.mark.parametrize("per_token", [False, True])
+def test_4over6_determinism_graph_replay_and_batch_invariance(per_token, recipe):
+    """R1 / R2 for the recipe: repeated calls, CUDA-graph replay and PDL give the same bits; a row's outputs do not depend on
+    the rows around it (permutation, sub-batch)."""
+    K = 1024
+    x = adversarial_inputs(37, K, torch.bfloat16, seed=3)
+    gs = _gs_4over6(x, per_token, recipe)
+    cfg = _fi_cfg(recipe)
+    ref = _quantize(x, gs, "128x4", per_token, nvfp4_4over6=cfg)
+    for pdl in (None, True, False):
+        assert same_bits(
+            _quantize(x, gs, "128x4", per_token, nvfp4_4over6=cfg, enable_pdl=pdl), ref
+        )
+    gs_t = torch.full((1,), gs, dtype=torch.float32, device="cuda")
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        outs = flashinfer.nvfp4_quantize(
             x,
             gs_t,
-            16,
-            nvfp4_4over6=NVFP44Over6Config(
-                e4m3_max=448, err_mode="MAE", err_use_fast_math=False
-            ),
+            per_token_activation=per_token,
+            nvfp4_4over6=cfg,
             batch_invariant=True,
         )
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            outs = flashinfer.nvfp4_quantize(
+                x,
+                gs_t,
+                per_token_activation=per_token,
+                nvfp4_4over6=cfg,
+                batch_invariant=True,
+            )
+    for _ in range(2):
+        for o in outs:
+            o.view(torch.uint8).fill_(
+                0xA5
+            )  # a nonzero pattern: a skipped store cannot pass as a zero
+        g.replay()
+        torch.cuda.synchronize()
+        got = (outs[0].reshape(37, K // 2).cpu(), outs[1].reshape(-1).cpu()) + (
+            (outs[2].cpu(),) if per_token else ()
+        )
+        assert same_bits(got, (ref[0], ref[1].reshape(-1)) + tuple(ref[2:]))
+    perm = torch.randperm(37, generator=torch.Generator().manual_seed(1))
+    permuted = _quantize(x[perm.cuda()], gs, "128x4", per_token, nvfp4_4over6=cfg)
+    assert torch.equal(permuted[0], ref[0][perm])
+    assert torch.equal(
+        R.unswizzle_sf_128x4(permuted[1].reshape(-1), 37, K),
+        R.unswizzle_sf_128x4(ref[1].reshape(-1), 37, K)[perm],
+    )
+    sub = _quantize(x[5:12], gs, "128x4", per_token, nvfp4_4over6=cfg)
+    assert torch.equal(sub[0], ref[0][5:12])
+    assert torch.equal(
+        R.unswizzle_sf_128x4(sub[1].reshape(-1), 7, K),
+        R.unswizzle_sf_128x4(ref[1].reshape(-1), 37, K)[5:12],
+    )
+    if per_token:
+        assert torch.equal(
+            permuted[2].view(torch.int32), ref[2][perm].view(torch.int32)
+        )
+        assert torch.equal(sub[2].view(torch.int32), ref[2][5:12].view(torch.int32))
+
+
+@needs_device
+def test_4over6_zero_rule_and_unsupported_forms():
+    """A block of amax 0 (zeros, -0) gives the scale byte 0 and +0 codes; a zero row per token gives the per-token scale 0
+    (the plain classes keep the -0 codes and give 1); ``err_use_fast_math=True`` raises BatchInvariantUnsupportedError
+    (approximate arithmetic), as does a 4over6 recipe on the MXFP4 class of ``fp4_quantize``."""
+    from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
+
+    x = adversarial_inputs(8, 256, torch.bfloat16, seed=9)
+    x[1] = 0
+    x[2, :16] = -0.0
+    x[3, 16:32] = 0
+    for per_token in (False, True):
+        r = S.Recipe("mae")
+        gs = _gs_4over6(x, per_token, r)
+        outs = _quantize(x, gs, "128x4", per_token, nvfp4_4over6=_fi_cfg(r))
+        sf = R.unswizzle_sf_128x4(outs[1].reshape(-1), 8, 256)
+        assert int(outs[0][1].abs().sum()) == 0 and int(sf[1].abs().sum()) == 0
+        assert int(outs[0][2, :8].abs().sum()) == 0 and int(sf[2, 0]) == 0
+        assert int(outs[0][3, 8:16].abs().sum()) == 0 and int(sf[3, 1]) == 0
+        if per_token:
+            assert outs[2][1].item() == 0.0 and outs[2][0].item() != 0.0
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="fast_math"):
+        flashinfer.nvfp4_quantize(
+            x,
+            1.0,
+            nvfp4_4over6=NVFP44Over6Config(err_use_fast_math=True),
+            batch_invariant=True,
+        )
+    with pytest.raises((bi.BatchInvariantUnsupportedError, ValueError), match="4over6"):
+        flashinfer.fp4_quantize(
+            x, None, 32, True, nvfp4_4over6=NVFP44Over6Config(), batch_invariant=True
+        )
+    # a per-token host scale that contradicts the recipe's e4m3_max (the operator's wrapper refuses it the same way)
+    for e4m3_max, wrong in ((448, 1.0 / (6 * 256)), (256, 1.0 / (6 * 448))):
+        with pytest.raises(ValueError, match="does not match"):
+            flashinfer.nvfp4_quantize(
+                x,
+                wrong,
+                per_token_activation=True,
+                nvfp4_4over6=NVFP44Over6Config(
+                    e4m3_max=e4m3_max, err_use_fast_math=False
+                ),
+                batch_invariant=True,
+            )
+        with pytest.raises(ValueError, match="does not match"):
+            flashinfer.nvfp4_quantize(
+                x,
+                torch.tensor([wrong], dtype=torch.float32),
+                per_token_activation=True,
+                nvfp4_4over6=NVFP44Over6Config(
+                    e4m3_max=e4m3_max, err_use_fast_math=False
+                ),
+                batch_invariant=True,
+            )
+    # a malformed scale keeps the typed refusal on the 4over6 path (the pairing check runs after the form checks)
+    for bad in (None, [1.0], "abc", 1.0 + 2.0j):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            flashinfer.nvfp4_quantize(
+                x,
+                bad,
+                per_token_activation=True,
+                nvfp4_4over6=NVFP44Over6Config(err_use_fast_math=False),
+                batch_invariant=True,
+            )
+    # a forced placement outside the 4over6 space (two lanes per block) is refused before any kernel is requested
+    with pytest.raises(ValueError, match="4over6 placement"):
+        nvfp4_quantize_rows(
+            x,
+            torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+            "128x4",
+            config=C.QuantConfig(32, 4, 8),
+            recipe=S.Recipe("mae"),
+        )
+
+
+@needs_device
+@pytest.mark.parametrize("recipe", RECIPES, ids=_rid)
+@pytest.mark.parametrize("per_token", [False, True])
+def test_4over6_flashinfer_cuda_kernel_exact_path_is_bitwise_identical(
+    monkeypatch, per_token, recipe
+):
+    """FlashInfer's own CUDA kernel with the explicit recipe (``err_use_fast_math=False``) under
+    ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1`` computes the class: codes, scale bytes and per-token scales equal
+    (that build flushes subnormal inputs, which are zeroed here as in the plain class's comparison)."""
+    monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "1")
+    cfg = _fi_cfg(recipe)
+    for M, K in [(37, 256), (130, 1024), (3, 4096), (8, 48), (200, 5120)]:
+        x = adversarial_inputs(M, K, torch.bfloat16, seed=M, special=False)
+        tiny = (x.float().abs() < 2.0**-126) & (x != 0)
+        x = torch.where(tiny, torch.zeros_like(x), x)
+        gs = _gs_4over6(x, per_token, recipe)
+        ours = _quantize(x, gs, "128x4", per_token, nvfp4_4over6=cfg)
+        gs_t = torch.tensor([gs], dtype=torch.float32, device="cuda")
+        outs = flashinfer.nvfp4_quantize(
+            x,
+            gs_t,
+            sfLayout=SfLayout.layout_128x4,
+            backend="cuda",
+            per_token_activation=per_token,
+            nvfp4_4over6=cfg,
+        )
+        theirs = (
+            outs[0].view(torch.uint8).reshape(M, K // 2).cpu(),
+            outs[1].view(torch.uint8).reshape(-1).cpu(),
+        ) + ((outs[2].cpu(),) if per_token else ())
+        assert torch.equal(ours[0], theirs[0]), (
+            f"codes differ from FlashInfer's exact 4over6 kernel (M={M}, K={K}, {_rid(recipe)})"
+        )
+        assert torch.equal(ours[1].reshape(-1), theirs[1]), (
+            f"scales differ from FlashInfer's exact 4over6 kernel (M={M}, K={K}, {_rid(recipe)})"
+        )
+        if per_token:
+            assert torch.equal(
+                ours[2].view(torch.int32), theirs[2].view(torch.int32)
+            ), "per-token scales differ"
+
+
+def test_4over6_table_reconstruction_identity():
+    """The per-token kernel reads the reconstruction ``div(mul(mul(q, sfd), ramax), 6 e4m3_max)`` from a table of the eight
+    e2m1 magnitudes and negates the entry under the code's sign bit (``nvfp4_kernel._quantize_block_4over6``): RN
+    multiplication and division are odd in their first operand, so ``recon(-m) == neg(recon(m))`` bit for bit on the exact
+    backend for every e2m1 magnitude, e4m3 scale value, row amax across the binary32 range (0, subnormal, inf) and both
+    ``e4m3_max`` values; a NaN reconstruction (an infinite row amax at the zero magnitude) is NaN on both sides (the error
+    terms and the selection do not read its sign)."""
+    E = R.ExactF32
+    sfds = sorted(
+        {
+            fp32.to_fp8(v, "e4m3")
+            for v in (0.0, 2.0**-9, 2.0**-6, 0.3, 0.5, 1.0, 1.5, 7.0, 100.0, 448.0, 1e6)
+        }
+    )
+    ramaxes = [
+        0.0,
+        2.0**-149,
+        2.0**-126,
+        1e-3,
+        1.0,
+        3.0,
+        448.0,
+        65504.0,
+        3.3e38,
+        float("inf"),
+    ]
+    checked = 0
+    for e4m3_max in (448, 256):
+        for sfd in sfds:
+            for ramax in ramaxes:
+                for m in fp32.E2M1_MAGNITUDES:
+                    pos = S.recon(E, E.const(m), sfd, E.const(1.0), ramax, e4m3_max)
+                    negq = S.recon(E, E.const(-m), sfd, E.const(1.0), ramax, e4m3_max)
+                    if pos != pos:
+                        assert negq != negq, (e4m3_max, sfd, ramax, m)
+                    else:
+                        assert fp32.f32_bits(negq) == fp32.f32_bits(E.neg(pos)), (
+                            e4m3_max,
+                            sfd,
+                            ramax,
+                            m,
+                        )
+                    checked += 1
+    assert checked == 2 * len(sfds) * len(ramaxes) * 8

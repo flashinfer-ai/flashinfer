@@ -74,6 +74,15 @@ class TermAlgebra(_Base):
         """``a`` if ``a != 0`` else ``b`` (an exact comparison-and-select, ``setp.ne`` + ``selp``)."""
         return self._mk("nzor", a, b)
 
+    def neg(self, a: Term) -> Term:
+        """``neg.f32``: exact (the sign bit is flipped); the 4over6 classes' subtraction is ``add(d, neg(x))``."""
+        return self._mk("neg", a)
+
+    def op(self, name: str, *args) -> Term:
+        """An opaque, non-commutative primitive named ``name`` (the 4over6 classes' exact select ``zsel``); printed
+        ``(op:name a b)``, evaluated through ``syms["op:name"]``."""
+        return self._mk("op:" + name, *args)
+
 
 def evaluate(
     t: Term,
@@ -125,6 +134,13 @@ def evaluate(
             v = fp32.fabs(memo[A[0].uid])
         elif op == "nzor":
             v = fp32.nzor(memo[A[0].uid], memo[A[1].uid])
+        elif op == "neg":
+            v = fp32.neg(memo[A[0].uid])
+        elif op.startswith("op:"):
+            fn = syms.get(op)
+            if fn is None:
+                raise NotImplementedError(f"no CPU model for opaque primitive {op!r}")
+            v = fn(*[memo[a.uid] if isinstance(a, Term) else a for a in A])
         elif op == "cvt_out":
             kind = A[1]
             if kind in ("e4m3", "e5m2"):
@@ -199,7 +215,7 @@ def sexpr(t: Term) -> str:
         elif op == "fmaxc":
             a, b = sorted(A[:2])
             out = f"(fmax {a} {b})"
-        elif op in ("exp2i", "fabs"):
+        elif op in ("exp2i", "fabs", "neg"):
             out = f"({op} {A[0]})"
         elif op in ("div", "fmin", "fmax", "nzor"):
             out = f"({op} {A[0]} {A[1]})"

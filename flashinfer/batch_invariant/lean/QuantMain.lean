@@ -25,6 +25,15 @@ def main : IO Unit := do
     IO.println s!"quantout {K} {vname} pts {if v.perToken then osexpr (Quant.specPts nb kb qrow) else "absent"}"
   for (b, name) in quantBlockCases do
     IO.println s!"quantblock {b} {name} {osexpr (Quant.blockAmax qrow b)}"
+  for (K, kb, vname, pt, r) in quant4over6Cases do
+    let nb := K / 16
+    IO.println s!"quant46 {K} {vname} sf4 {osexpr (Quant.spec4over6Sf pt nb kb qrow 0 true)}"
+    IO.println s!"quant46 {K} {vname} sf6 {osexpr (Quant.spec4over6Sf pt nb kb qrow 0 false)}"
+    IO.println s!"quant46 {K} {vname} code4_0 {osexpr (Quant.spec4over6Code pt nb kb qrow 0 true)}"
+    IO.println s!"quant46 {K} {vname} code6_L {osexpr (Quant.spec4over6Code pt nb kb qrow 15 false)}"
+    IO.println s!"quant46 {K} {vname} e4 {osexpr (Quant.spec4over6Err r pt nb kb qrow 0 true)}"
+    IO.println s!"quant46 {K} {vname} e6 {osexpr (Quant.spec4over6Err r pt nb kb qrow 0 false)}"
+    IO.println s!"quant46 {K} {vname} pts {if pt then osexpr (Quant.spec4over6Pts nb kb qrow) else "absent"}"
   -- the MX classes (MXQuant.lean): the block placements' kernel terms, the chains per format and rule, the block amaxes
   for (name, ps) in mxqCases do
     IO.println s!"mxq {name} spec {osexpr (MXQuant.blockAmax qrow 0)}"

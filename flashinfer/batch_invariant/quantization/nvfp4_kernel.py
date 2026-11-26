@@ -29,7 +29,7 @@ import functools
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import arith, llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import canon, jit
@@ -47,11 +47,16 @@ from .nvfp4_schedule import BLOCK, LANES, SF_COL_TILE, SF_ROW_TILE, QuantConfig
 from .nvfp4_spec import (
     PER_TENSOR,
     Variant,
+    block_error,
+    err_term,
     inv_scale,
     leaf_value,
     quant_pre,
+    recon,
     row_reduction,
     row_scale_chain,
+    row_scale_chain_4over6,
+    sf_candidate_values,
     sf_value,
 )
 
@@ -108,6 +113,65 @@ def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None):
         Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
         Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
     )
+
+
+@dsl_user_op
+def e2m1x8_to_f32x8(word: Uint32, *, loc=None, ip=None):
+    """The eight e2m1 values of one packed word (``cvt_f32x8_to_e2m1x8``'s layout: element ``2j`` in the low nibble of
+    byte ``j``) as f32: ``cvt.rn.f16x2.e2m1x2`` (every e2m1 value is an f16 value, so the conversion is exact) then
+    ``cvt.f32.f16`` (exact). The 4over6 classes' reconstruction reads the candidates' codes back as values; the spec has
+    the values directly (``cvt_out(.., "e2m1")`` is a value), so this is plumbing, pinned by the IR test."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8),
+        [Uint32(word).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b8 b0, b1, b2, b3;
+            .reg .b32 h0, h1, h2, h3;
+            .reg .b16 l0, u0, l1, u1, l2, u2, l3, u3;
+            mov.b32 {b0, b1, b2, b3}, $8;
+            cvt.rn.f16x2.e2m1x2 h0, b0;
+            cvt.rn.f16x2.e2m1x2 h1, b1;
+            cvt.rn.f16x2.e2m1x2 h2, b2;
+            cvt.rn.f16x2.e2m1x2 h3, b3;
+            mov.b32 {l0, u0}, h0;
+            mov.b32 {l1, u1}, h1;
+            mov.b32 {l2, u2}, h2;
+            mov.b32 {l3, u3}, h3;
+            cvt.f32.f16 $0, l0;
+            cvt.f32.f16 $1, u0;
+            cvt.f32.f16 $2, l1;
+            cvt.f32.f16 $3, u1;
+            cvt.f32.f16 $4, l2;
+            cvt.f32.f16 $5, u2;
+            cvt.f32.f16 $6, l3;
+            cvt.f32.f16 $7, u3;
+        }
+        """,
+        "=f,=f,=f,=f,=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return [
+        Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(8)
+    ]
+
+
+def _select(cond, a, b):
+    """``cond ? a : b`` on two values of one numeric type (``selp``; no arithmetic)."""
+    ty = type(a)
+    return ty(arith.select(cond.ir_value(), ty(a).ir_value(), ty(b).ir_value()))
+
+
+class _QuantFP(CuteF32):
+    """The kernel's fp backend: ``CuteF32`` plus the 4over6 classes' exact select ``ZSEL(e, p) = +0 if e == 0 else p``
+    (``setp.eq.f32`` + ``selp.f32``: a comparison and a move of bits; the spec names it ``spec.zsel``)."""
+
+    @staticmethod
+    def zsel(e, p):
+        e, p = Float32(e), Float32(p)
+        return _select(e == Float32(0.0), Float32(0.0), p)
 
 
 # ----------------------------------------------------------------------------- plumbing
@@ -215,6 +279,11 @@ class NvFP4QuantKernel:
             cfg,
             variant,
         )
+        self.recipe = variant.recipe
+        # the 4over6 classes: the block's error sum is a register-level fold, so a thread holds a whole block
+        assert self.recipe is None or cfg.elems_per_thread == BLOCK, (
+            "a 4over6 placement holds a whole block in one thread (V = 16)"
+        )
         self.red = row_reduction(K, leaf_x=None)  # the leaves come from the loader
         self.plan = canon.plan(self.red, cfg.placement(K))
         assert self.plan.units["cta"] == 1 and self.plan.units["grid"] == 1
@@ -251,6 +320,13 @@ class NvFP4QuantKernel:
             self.rows, self.rows_per_warp = cfg.rows_per_cta, cfg.rows_per_warp
             self.lane_major = cfg.blk_order == "lane"
             self.needs_xbuf = variant.per_token and self.W > 1
+        # the per-token 4over6 classes: a per-thread table of the eight e2m1 magnitudes' reconstructions per candidate in
+        # shared memory (`_quantize_block_4over6`; entry e of thread t at word e * num_threads + t: conflict-free)
+        self.lut_words = (
+            16 * self.num_threads
+            if (self.recipe is not None and variant.per_token and not self.tile)
+            else 0
+        )
         self.span = BLOCK * self.bl * self.bpt  # elements of a row one warp covers
 
     # -- layouts ---------------------------------------------------------------------
@@ -286,7 +362,9 @@ class NvFP4QuantKernel:
         return cute.make_layout(shape, stride=stride)
 
     def _smem_bytes(self) -> int:
-        return self.rows * self.W * LANES * 4 if self.needs_xbuf else 0
+        return (
+            self.rows * self.W * LANES * 4 if self.needs_xbuf else 0
+        ) + self.lut_words * 4
 
     def _key_for(self, kk: int) -> tuple:
         key: List[Optional[int]] = [None] * self.plan.n_reg
@@ -389,7 +467,7 @@ class NvFP4QuantKernel:
         ``threads_per_row = 32`` placement (lpb lanes per block): the same engine plan and chains as the
         row kernel. The scale bytes are staged in shared memory in the 128x4 layout and the tile's
         contiguous ``128 * bl``-byte scale region is written with one 16-byte store per thread."""
-        fp = CuteF32
+        fp = _QuantFP
         bidx, bidy, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         if enable_pdl:
@@ -443,9 +521,14 @@ class NvFP4QuantKernel:
             )
             r_off = (r % 32) * 16 + (r // 32) * 4
             for kk in cutlass.range_constexpr(bpt):
-                sf_byte = _quantize_block(
-                    self, fp, frag, kk, state[self._key_for(kk)], gs, fy_words
-                )
+                if cutlass.const_expr(self.recipe is not None):
+                    sf_byte = _quantize_block_4over6(
+                        self, fp, frag, kk, state[self._key_for(kk)], gs, None, fy_words
+                    )
+                else:
+                    sf_byte = _quantize_block(
+                        self, fp, frag, kk, state[self._key_for(kk)], gs, fy_words
+                    )
                 if half0:
                     sbuf[sf_lane_off[kk] + r_off] = sf_byte.to(Uint8)
             pY = _predicate(
@@ -496,7 +579,7 @@ class NvFP4QuantKernel:
         tiler_in: cute.Shape,
         tiler_out: cute.Shape,
     ):
-        fp = CuteF32
+        fp = _QuantFP
         bidx, _, _ = cute.arch.block_idx()
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
@@ -525,11 +608,18 @@ class NvFP4QuantKernel:
         store_bound = padded_M  # the padded rows store their (zero) scale bytes too
 
         xbuf = None
-        if cutlass.const_expr(self.needs_xbuf):
+        lut = None
+        if cutlass.const_expr(self.needs_xbuf or self.lut_words > 0):
             smem = cutlass.utils.SmemAllocator()
-            xbuf = smem.allocate_tensor(
-                Float32, cute.make_layout((rows, 1, W, LANES)), byte_alignment=16
-            )
+            if cutlass.const_expr(self.needs_xbuf):
+                xbuf = smem.allocate_tensor(
+                    Float32, cute.make_layout((rows, 1, W, LANES)), byte_alignment=16
+                )
+            if cutlass.const_expr(self.lut_words > 0):
+                lut = smem.allocate_tensor(
+                    Float32, cute.make_layout((self.lut_words,)), byte_alignment=16
+                )
+        tidx, _, _ = cute.arch.thread_idx()
         peers = _CutePeers(xbuf, row_in_cta, w, lane_idx)
 
         # ---- loads: the thread's whole span, zero-filled beyond (M, K) ------------------
@@ -556,9 +646,13 @@ class NvFP4QuantKernel:
         ]  # the block amaxes (complete)
 
         g = mG[0]
+        ramax = None
         if cutlass.const_expr(self.variant.per_token):
             ramax = canon.run(self.plan, dict(state), nxt, peers, fp)
-            g, pts = row_scale_chain(fp, ramax, g)
+            if cutlass.const_expr(self.recipe is not None):
+                g, pts = row_scale_chain_4over6(fp, ramax, g)
+            else:
+                g, pts = row_scale_chain(fp, ramax, g)
             if (t == 0) & (w == 0) & (row < M):
                 mP[srow] = pts
             if cutlass.const_expr(self.cfg.stage == "reread"):
@@ -577,7 +671,12 @@ class NvFP4QuantKernel:
         )
         half0 = (t % self.lpb) == 0
         for kk in cutlass.range_constexpr(bpt):
-            sf_byte = _quantize_block(self, fp, frag, kk, amax[kk], g, fy_words)
+            if cutlass.const_expr(self.recipe is not None):
+                sf_byte = _quantize_block_4over6(
+                    self, fp, frag, kk, amax[kk], g, ramax, fy_words, lut, tidx
+                )
+            else:
+                sf_byte = _quantize_block(self, fp, frag, kk, amax[kk], g, fy_words)
             blk = self.plan.digit_value("blk", coords, self._key_for(kk))
             if half0 & (blk < pcols) & (row < store_bound):
                 mS[self._sf_off(srow, blk, pcols)] = sf_byte.to(Uint8)
@@ -630,6 +729,104 @@ def _quantize_block(k, fp, frag, kk: int, amax, g, fy_words):
     for q in range(V // 8):
         fy_words[kk * (V // 8) + q] = cvt_f32x8_to_e2m1x8(*ys[8 * q : 8 * q + 8])
     return sf_byte
+
+
+E2M1_MAGNITUDES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+)  # the e2m1 values by their 3-bit magnitude index
+
+
+def _quantize_block_4over6(
+    k, fp, frag, kk: int, amax, g, ramax, fy_words, lut=None, tid=None
+):
+    """The 4over6 classes' block: both candidate scales (``spec.sf_candidate_values`` -> e4m3 -> ``spec.inv_scale``), both
+    candidates' codes (``spec.quant_pre`` -> e2m1 pack), the candidates' values read back (``e2m1x8_to_f32x8``), each
+    candidate's reconstruction error as the register-level fold ``spec.block_error`` over ``spec.err_term(spec.recon(...))``
+    in index order, the selection ``e4 < e6`` and the zero rule (``amax == 0``: scale 0, codes +0) as selects. ``ramax``:
+    the row amax of the per-token class (its reconstruction), None for the per-tensor class. Writes the chosen packed
+    words, returns the chosen scale byte.
+    Per-token (``ramax`` given): the reconstruction ``div(mul(mul(q, sfd), ramax), 6 e4m3_max)`` is read from a per-thread
+    table in shared memory (``lut``, entry ``e`` of thread ``tid`` at word ``e * num_threads + tid``) holding the eight e2m1
+    magnitudes' reconstructions per candidate: RN multiplication and division are sign-symmetric, so ``recon(s m) = s (.)
+    recon(m)`` bit for bit and the element's value is its magnitude's entry, negated under its sign bit (16 ``div.rn`` per
+    block instead of 32, no decode of the codes)."""
+    r = k.recipe
+    V = k.V
+    xs = [frag[k._frag_index(kk, v)].to(Float32) for v in range(V)]
+    sf4, sf6 = sf_candidate_values(fp, amax, g)
+    b4, sfd4 = cvt_f32_to_e4m3(sf4)
+    b6, sfd6 = cvt_f32_to_e4m3(sf6)
+    g_inv = fp.div(
+        fp.const(1.0), g
+    )  # div(1, gs): one node, both candidates' inv chains (and the per-tensor factor)
+    inv4, inv6 = inv_scale(fp, sfd4, g, g_inv), inv_scale(fp, sfd6, g, g_inv)
+    y4 = [quant_pre(fp, x, inv4) for x in xs]
+    y6 = [quant_pre(fp, x, inv6) for x in xs]
+    w4 = [cvt_f32x8_to_e2m1x8(*y4[8 * q : 8 * q + 8]) for q in range(V // 8)]
+    w6 = [cvt_f32x8_to_e2m1x8(*y6[8 * q : 8 * q + 8]) for q in range(V // 8)]
+    if ramax is None:
+        q4 = [v for w in w4 for v in e2m1x8_to_f32x8(w)]
+        q6 = [v for w in w6 for v in e2m1x8_to_f32x8(w)]
+        gds = g_inv  # the per-tensor factor: the same div(1, gs) node
+        e4 = block_error(
+            fp,
+            [
+                err_term(
+                    fp, recon(fp, q, sfd4, g, None, r.e4m3_max, gds), x, r.err_mode
+                )
+                for q, x in zip(q4, xs, strict=True)
+            ],
+        )
+        e6 = block_error(
+            fp,
+            [
+                err_term(
+                    fp, recon(fp, q, sfd6, g, None, r.e4m3_max, gds), x, r.err_mode
+                )
+                for q, x in zip(q6, xs, strict=True)
+            ],
+        )
+    else:
+        NT = k.num_threads
+        for c, sfd in ((0, sfd4), (1, sfd6)):
+            for mi, mval in enumerate(E2M1_MAGNITUDES):
+                if mi == 0:
+                    # recon(0) = div(mul(mul(0, sfd), ramax), C) with sfd finite and C finite non-zero: the division of a zero
+                    # or a NaN by C is the identity on the value (+0 / C = +0, NaN / C = NaN), so the entry is the two muls
+                    # alone -- a division of zero would take div.rn's slow path on every block
+                    lut[(c * 8 + mi) * NT + tid] = fp.mul(
+                        fp.mul(fp.const(0.0), sfd), ramax
+                    )
+                else:
+                    lut[(c * 8 + mi) * NT + tid] = recon(
+                        fp, fp.const(mval), sfd, g, ramax, r.e4m3_max
+                    )
+
+        def table_terms(c, words):
+            out = []
+            for e in range(V):
+                nib = (words[e // 8] >> Uint32(4 * (e % 8))) & Uint32(0xF)
+                val = lut[(nib & Uint32(7)).to(Int32) * NT + (c * 8 * NT + tid)]
+                d = _select((nib & Uint32(8)) != Uint32(0), fp.neg(val), val)
+                out.append(err_term(fp, d, xs[e], r.err_mode))
+            return out
+
+        e4 = block_error(fp, table_terms(0, w4))
+        e6 = block_error(fp, table_terms(1, w6))
+    pick4 = e4 < e6
+    zero = Float32(amax) == Float32(0.0)
+    for q in range(V // 8):
+        fy_words[kk * (V // 8) + q] = _select(
+            zero, Uint32(0), _select(pick4, w4[q], w6[q])
+        )
+    return _select(zero, Uint32(0), _select(pick4, b4, b6))
 
 
 def _tile_sf_offsets(k, coords):

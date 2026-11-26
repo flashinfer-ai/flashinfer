@@ -83,6 +83,56 @@ def _with_ref(sx: str, sub: str, ref: str) -> str:
     return ref if sx == sub else lean_str(sx)
 
 
+def _ref_parts(sx: str, refs):
+    """The pieces of a string with embedded sub-terms replaced by their `def` names: `("lit", text)` and `("ref", name)` in
+    order (`refs` substituted in the order given: the innermost sub-terms last)."""
+    parts = [("lit", sx)]
+    for sub, ref in refs:
+        nxt = []
+        for kind, p in parts:
+            if kind != "lit" or sub not in p:
+                nxt.append((kind, p))
+                continue
+            pieces = p.split(sub)
+            for n, piece in enumerate(pieces):
+                if n:
+                    nxt.append(("ref", ref))
+                if piece:
+                    nxt.append(("lit", piece))
+        parts = nxt
+    return parts
+
+
+def _with_refs(sx: str, refs) -> str:
+    """`_with_ref` for several embedded sub-terms: a Lean string expression concatenating literals and the `def` names."""
+    parts = _ref_parts(sx, refs)
+    return " ++ ".join(lean_str(p) if kind == "lit" else p for kind, p in parts) or '""'
+
+
+STR_CHUNK = (
+    128  # pieces per `++` chain: long chains overflow Lean's stack while elaborating
+)
+
+
+def _emit_str_def(L: List[str], name: str, sx: str, refs) -> str:
+    """Emit `def name : String := ...` for `_with_refs(sx, refs)`, split into chunked helper defs when the concatenation has
+    more than `STR_CHUNK` pieces. Returns `name`."""
+    parts = _ref_parts(sx, refs)
+    exprs = [lean_str(p) if kind == "lit" else p for kind, p in parts] or ['""']
+    if len(exprs) <= STR_CHUNK:
+        L.append(f"def {name} : String := {' ++ '.join(exprs)}")
+        return name
+    subs = []
+    for k in range(0, len(exprs), STR_CHUNK):
+        L.append(
+            f"def {name}_{k // STR_CHUNK} : String := {' ++ '.join(exprs[k : k + STR_CHUNK])}"
+        )
+        subs.append(f"{name}_{k // STR_CHUNK}")
+    assert len(subs) <= STR_CHUNK, (name, len(exprs))
+    L.append(f"def {name} : String := {' ++ '.join(subs)}")
+    return name
+
+
 # ----------------------------------------------------------------------------- NVFP4
 def _quant_placements(K: int):
     """The row placements at ``K`` (the per-token space, register staging): every valid per-token configuration."""
@@ -190,6 +240,71 @@ def _odd_form(v: float) -> Tuple[int, int]:
         num //= 2
         e += 1
     return num, e
+
+
+QUANT_4OVER6 = [
+    (False, qspec.Recipe("mae")),
+    (False, qspec.Recipe("mse")),
+    (True, qspec.Recipe("mae", 448)),
+    (True, qspec.Recipe("mae", 256)),
+    (True, qspec.Recipe("mse", 448)),
+    (True, qspec.Recipe("mse", 256)),
+]
+LEAN_RECIPE = {
+    qspec.Recipe("mae", 448): "Quant.Recipe.mae448",
+    qspec.Recipe("mse", 448): "Quant.Recipe.mse448",
+    qspec.Recipe("mae", 256): "Quant.Recipe.mae256",
+    qspec.Recipe("mse", 256): "Quant.Recipe.mse256",
+}
+QUANT46_WHICH = [
+    "sf4",
+    "sf6",
+    "code4_0",
+    "code6_L",
+    "e4",
+    "e6",
+    "pts",
+]  # what the conformance executable prints per case
+QUANT_4OVER6_KS = [16, 48]  # one block (padding columns); three of four blocks present
+
+
+def quant_4over6_cases() -> List[Dict]:
+    """Per size and 4over6 class (`QuantSpec.block(0, 0)` with the row's scale): the block amax, both candidates' scales and
+    encode scales, the first "4" code and the last "6" code of block 0, the two error chains, the row scale and the
+    per-token scale, as Python S-expressions."""
+    out = []
+    for K in QUANT_4OVER6_KS:
+        kb = qsched.padded_blocks(K).bit_length() - 1
+        for pt, r in QUANT_4OVER6:
+            v = qspec.Variant(pt, r)
+            sp = qspec.QuantSpec(K, v)
+            gs, pts = sp.row_scale(0)
+            b = sp.block(0, 0, gs)
+            out.append(
+                dict(
+                    K=K,
+                    kb=kb,
+                    pt=pt,
+                    recipe=r,
+                    lean_recipe=LEAN_RECIPE[v.recipe],
+                    variant=v.name,
+                    rowamax=term.sexpr(sp.row_amax(0)),
+                    amax0=term.sexpr(b["amax"]),
+                    gs=term.sexpr(gs),
+                    sf4=term.sexpr(b["sf4"]),
+                    sf6=term.sexpr(b["sf6"]),
+                    inv4=term.sexpr(b["inv4"]),
+                    inv6=term.sexpr(b["inv6"]),
+                    code4_0=term.sexpr(b["codes4"][0]),
+                    code6_L=term.sexpr(b["codes6"][-1]),
+                    e4=term.sexpr(b["e4"]),
+                    e6=term.sexpr(b["e6"]),
+                    t4=[term.sexpr(t) for t in b["t4"]],
+                    t6=[term.sexpr(t) for t in b["t6"]],
+                    pts=term.sexpr(pts) if pts is not None else "absent",
+                )
+            )
+    return out
 
 
 def e2m1_cases() -> List[Tuple[bool, int, int, int]]:
@@ -380,6 +495,9 @@ def render() -> str:
         "namespace BIK",
         "-- GENERATED by flashinfer/batch_invariant/quantization/lean_cases.py from the Python engine / specs; do not edit.",
         "set_option maxRecDepth 8192",
+        # the 4over6 error-chain theorems (16-step chains of several-KB strings) exceed the default heartbeat budget under
+        # `decide +kernel`, and a declaration after an unlimited one must not inherit a spent budget: no limit in this file
+        "set_option maxHeartbeats 0",
         "",
         "def quantRow : Nat → Term := fun i => Term.x i",
         "",
@@ -463,6 +581,56 @@ def render() -> str:
         "def quantBlockCases : List (Nat × String) := ["
         + ", ".join(f'({b}, "{name}")' for b, name, _ in qbs)
         + "]"
+    )
+    # ---- the 4over6 classes (Quant.lean `spec4over6*` vs `QuantSpec.block` with a recipe): the shared sub-terms (the row and
+    # block amaxes, the row scale, the candidates' scales and encode scales) are string defs; the error chains reference them
+    L.append(
+        "/-! The 4over6 classes: per size and class the candidates' scales, a code of each candidate, the two error chains "
+        "(16-step add chains from +0 in element order) and the per-token scale of block 0, node for node. -/"
+    )
+    q46 = quant_4over6_cases()
+    for c in q46:
+        K, kb, nb = c["K"], c["kb"], c["K"] // 16
+        pt = "true" if c["pt"] else "false"
+        tag = f"q46_{K}_{c['variant']}"
+        rref = qdefs[K]
+        aref = f"{tag}_amax0"
+        L.append(f"def {aref} : String := {lean_str(c['amax0'])}")
+        refs = [(c["rowamax"], rref), (c["amax0"], aref)]
+        gref = f"{tag}_gs"
+        L.append(f"def {gref} : String := {_with_refs(c['gs'], refs)}")
+        refs = [(c["gs"], gref)] + refs
+        sf4ref, sf6ref = f"{tag}_sf4_s", f"{tag}_sf6_s"
+        L.append(f"def {sf4ref} : String := {_with_refs(c['sf4'], refs)}")
+        L.append(f"def {sf6ref} : String := {_with_refs(c['sf6'], refs)}")
+        refs = [(c["sf4"], sf4ref), (c["sf6"], sf6ref)] + refs
+        inv4ref, inv6ref = f"{tag}_inv4", f"{tag}_inv6"
+        L.append(f"def {inv4ref} : String := {_with_refs(c['inv4'], refs)}")
+        L.append(f"def {inv6ref} : String := {_with_refs(c['inv6'], refs)}")
+        refs = [(c["inv4"], inv4ref), (c["inv6"], inv6ref)] + refs
+        # the error chains: the 16 terms of each candidate as a list (the whole chain's string reaches 260 KB: beyond the kernel's
+        # `decide` recursion, and the 16 x 7 KB lists took the kernel more than an hour), decided by the compiled evaluator
+        # like the attention spec cases (`Axioms.lean` names them); the chain is `errChain` by definition and its full string is
+        # compared by the conformance executable
+        for four, key in (("true", "t4"), ("false", "t6")):
+            items = ", ".join(_with_refs(t, refs) for t in c[key])
+            L.append(
+                f"theorem {tag}_{key} : (Quant.spec4over6ErrTerms {c['lean_recipe']} {pt} {nb} {kb} quantRow 0 {four}).map Term.sexpr = [{items}] := by native_decide"
+            )
+        if c["pts"] != "absent":
+            L.append(
+                f"theorem {tag}_pts : osexpr (Quant.spec4over6Pts {nb} {kb} quantRow) = {_with_refs(c['pts'], refs)} := by decide +kernel"
+            )
+    L.append(
+        "def quant4over6Cases : List (Nat × Nat × String × Bool × Quant.Recipe) := ["
+        + ", ".join(
+            f'({c["K"]}, {c["kb"]}, "{c["variant"]}", {"true" if c["pt"] else "false"}, {c["lean_recipe"]})'
+            for c in q46
+        )
+        + "]"
+    )
+    L.append(
+        'theorem quant_4over6_separates_from_plain : Quant.sfCand6 (.x 0) (.sym "gs") ≠ Quant.sfValue (.x 0) (.sym "gs") := Quant.sfCand6_ne_sfValue'
     )
     e2 = e2m1_cases()
     L.append(
@@ -572,7 +740,7 @@ def render() -> str:
 def summary() -> str:
     return (
         f"quant lean_cases coverage: nvfp4 placements={len(quant_cases())} output cases={len(quant_out_cases())} "
-        f"block cases={len(quant_block_cases())} e2m1 cases={len(e2m1_cases())}; mx placements={len(mxquant_cases())} "
+        f"block cases={len(quant_block_cases())} 4over6 cases={len(quant_4over6_cases())} e2m1 cases={len(e2m1_cases())}; mx placements={len(mxquant_cases())} "
         f"output cases={len(mxquant_out_cases())} block cases={len(mxquant_block_cases())} ue8m0 cases={len(ue8m0_cases())}"
     )
 
