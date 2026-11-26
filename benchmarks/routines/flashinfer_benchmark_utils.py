@@ -1101,7 +1101,7 @@ routine_cc_to_supported_backends = {
         "12.1": ["cuda"],
     },
     # gated residual norms (Muse-Spark-style hidden 8192 / head dim 64): CuTe-DSL kernel
-    # gated on _GATED_RESIDUAL_COMPUTE_CAPABILITIES = (10,0),(10,3),(10,7) (norm/__init__.py:196);
+    # gated on _GATED_RESIDUAL_COMPUTE_CAPABILITIES = (10,0),(10,3),(10,7),(12,0) (norm/__init__.py:196);
     # the library's cake route is out of scope, the routine forces backend='cute'.
     "gated_residual_rmsnorm": {
         "7.5": [],
@@ -1112,7 +1112,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
         "10.7": ["cute-dsl"],
-        "12.0": [],
+        "12.0": ["cute-dsl"],
         "12.1": [],
     },
     "gated_residual_next_rmsnorm": {
@@ -1124,7 +1124,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
         "10.7": ["cute-dsl"],
-        "12.0": [],
+        "12.0": ["cute-dsl"],
         "12.1": [],
     },
     "rmsnorm_sigmoid_gate": {
@@ -1136,7 +1136,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
         "10.7": ["cute-dsl"],
-        "12.0": [],
+        "12.0": ["cute-dsl"],
         "12.1": [],
     },
     # QUANTIZATION
