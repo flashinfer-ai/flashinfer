@@ -3586,6 +3586,43 @@ class BatchInvariantFp8PerTensorConfig:
         return "BatchInvariantFp8PerTensorConfig()"
 
 
+@dataclass(frozen=True)
+class SpecializedMoEConfig:
+    """Specialized backend: MoE kernels generated for one served configuration each.
+
+    Each kernel serves exactly one configuration (a model's expert geometry,
+    routing, quantization and token counts on one GPU architecture) and computes
+    the data path of an existing backend, whose prepared weight view it reads.
+    The kernels are registered automatically, one subpackage of
+    ``flashinfer/fused_moe/backends/specialized/kernels/`` each, and
+    ``flashinfer.fused_moe.backends.specialized.registered_kernels()`` lists them
+    with their declarations. A layer binds the kernels whose guard admits its
+    configuration; for any other configuration the layer skips this backend.
+
+    It is the first entry of the default backend list, so a default
+    ``MoELayer`` needs no extra preparation: any call that no bound kernel admits
+    (token count, tensor layout, the first call of a token count under CUDA-graph
+    capture, a kernel not yet built) runs on the other candidates. A kernel
+    admits only the calls where it was measured faster than the other backends,
+    so the backend prefers itself where it admits a call
+    (``prefer_when_accepted``): outside ``flashinfer.autotune(True)``,
+    ``MoELayer`` takes it there without timing it against the other candidates;
+    under ``autotune(True)`` it is timed against them like any candidate. A
+    kernel is built for a device by the first eager call it admits, never inside
+    a capture. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every call on
+    the other candidates.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        from .backends.specialized.registry import supports_arch
+
+        return supports_arch(arch)
+
+    def __repr__(self) -> str:
+        return "SpecializedMoEConfig()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     BatchInvariantBf16Config,
@@ -3632,6 +3669,7 @@ BackendConfigType = Union[
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    SpecializedMoEConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3679,6 +3717,7 @@ ALL_BACKEND_CONFIGS = (
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    SpecializedMoEConfig,
 )
 
 
@@ -3725,6 +3764,9 @@ class BackendOptions:
 # Default backend search order
 _DEFAULT_BACKEND = BackendOptions(
     candidates=(
+        # Kernels specialized for one served configuration, taken first where
+        # they admit a call (see SpecializedMoEConfig).
+        SpecializedMoEConfig(),
         TrtllmFp4Config(),
         TrtllmFp8BlockConfig(),
         TrtllmFp8PerTensorConfig(),

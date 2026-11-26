@@ -77,6 +77,7 @@ from .api import (
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
+    SpecializedMoEConfig,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -128,6 +129,7 @@ from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
+from .backends.specialized.runner import SpecializedMoERunner
 from .batch_invariant.runner import BatchInvariantMoeRunner
 from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
 from .utils import map_to_hybrid_bucket
@@ -179,6 +181,7 @@ _RunnerT = Union[
     TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    SpecializedMoERunner,
 ]
 
 # Map backend-config class -> runner class
@@ -228,11 +231,61 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
     BatchInvariantFp8PerTensorConfig: BatchInvariantFp8PerTensorRunner,
+    SpecializedMoEConfig: SpecializedMoERunner,
 }
+
+
+def _stream_capturing(device: Optional[torch.device] = None) -> bool:
+    """Whether the current CUDA stream of ``device`` is capturing a graph.
+
+    ``torch.cuda.is_current_stream_capturing()`` reads the current device's
+    stream, so a capture on ``device`` while another device is current is
+    read under ``torch.cuda.device(device)``. ``None`` (or a device without
+    an index) means the current device.
+    """
+    index = getattr(device, "index", None)
+    try:
+        if index is None or index == torch.cuda.current_device():
+            return bool(torch.cuda.is_current_stream_capturing())
+        with torch.cuda.device(index):
+            return bool(torch.cuda.is_current_stream_capturing())
+    except (RuntimeError, AssertionError):  # no CUDA in this build
+        return False
+
+
+def _tuner_op(runner: Any) -> str:
+    """The autotuner op name under which ``runner``'s tactics are tuned."""
+    return f"moe_{runner.backend_key}"
 
 
 class NoEligibleBackend(RuntimeError):
     """No configured backend supports the requested MoE configuration."""
+
+
+class _PreferredWinner(tuple):
+    """A cached ``(runner, tactic)`` winner taken because its runner prefers
+    itself (``prefer_when_accepted``), without cross-backend timing.
+
+    It unpacks and compares like the plain tuple; the type only marks the
+    entry, so a later call under ``autotune(True)`` times every eligible
+    backend for that bucket instead of reusing the untimed pick.
+    """
+
+    __slots__ = ()
+
+
+class _CaptureWinner(tuple):
+    """A cached ``(runner, tactic)`` winner taken inside a CUDA-graph capture,
+    where nothing is timed, tuned or precompiled: the first candidate, untimed,
+    with the tactic the autotuner already has for it (else the fallback).
+
+    It unpacks and compares like the plain tuple; the type only marks the
+    entry, so the next call of that bucket outside a capture selects again:
+    it tunes the tactic, times the candidates and precompiles the bucket's
+    variants, with one candidate as with several.
+    """
+
+    __slots__ = ()
 
 
 class MoELayer:
@@ -249,6 +302,10 @@ class MoELayer:
     >>> layer = MoELayer(config)
     >>> out = layer(act_pack, weight_pack)
     """
+
+    # Set by __init__; a layer built without it checks capture on the current
+    # device.
+    device: Optional[torch.device] = None
 
     @flashinfer_api
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
@@ -407,6 +464,28 @@ class MoELayer:
         Candidate pools containing Frost low-latency use exact token counts
         because their bounded tactics need not cover every row in a bucket.
 
+        A backend whose runner sets ``prefer_when_accepted`` (a backend of
+        kernels specialized for one served configuration) is the exception
+        outside ``flashinfer.autotune(True)``: when it accepts the call it wins
+        without being timed against the others, because its acceptance
+        envelope is where it was measured faster than them. Under
+        ``autotune(True)`` every eligible backend is timed, that backend
+        included, and a bucket whose winner was taken untimed is selected
+        again.
+
+        Nothing is timed, tuned or precompiled inside a CUDA-graph capture
+        (each synchronizes the device), also under ``autotune(True)``. A cached
+        winner is replayed. A first call of a bucket takes the first eligible
+        candidate in configured order untimed, leaving out runners that serve
+        captured calls only for winners selected eagerly
+        (``capture_requires_eager_selection``), with the tactic the autotuner
+        already has for it, else the fallback tactic. The next call of that
+        bucket outside a capture selects again among every eligible candidate,
+        even when there is only one, so that it is tuned and precompiled then.
+        Select before capture (an eager call per captured token count) so that
+        a graph records the selected winner. Capture is checked on the layer's
+        device.
+
         Parameters
         ----------
         act_pack : MoEActivationPack
@@ -450,10 +529,32 @@ class MoELayer:
         # and prevent changing weight views or shape eligibility from reusing a winner.
         winner_key = (bucket, mode, eligible)
         winner = self._winners.get(winner_key)
-        if winner is None:
-            runners = [self.runners[index] for index in eligible]
-            winner = self._select_winner(act_pack, weight_pack, runners)
+        pool = eligible
+        if winner is None and len(eligible) > 1 and _stream_capturing(self.device):
+            # A miss inside a CUDA-graph capture selects without the runners that
+            # serve captured calls only for winners timed eagerly (see
+            # _select_winner). Key that selection by the pool it chose from, never
+            # the full pool: an eager call of this bucket must still select among
+            # every eligible runner.
+            pool = (
+                tuple(
+                    index
+                    for index in eligible
+                    if not getattr(
+                        self.runners[index], "capture_requires_eager_selection", False
+                    )
+                )
+                or eligible
+            )
+            winner_key = (bucket, mode, pool)
+            winner = self._winners.get(winner_key)
+        if winner is None or self._retime_untimed_winner(winner):
+            runners = [self.runners[index] for index in pool]
+            winner = self._preferred_winner(act_pack, weight_pack, runners)
+            if winner is None:
+                winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[winner_key] = winner
+            self._winners.move_to_end(winner_key)
             if len(self._winners) > 128:
                 self._winners.popitem(last=False)
         else:
@@ -538,11 +639,26 @@ class MoELayer:
             )
         return candidates
 
+    def _stored_selection_runner(self, act_pack, weight_pack, backend_index):
+        """The runner of a stored selection, or ``None`` when that runner
+        re-checks a stored selection (``stored_selection_requires_accepts``)
+        and no longer accepts the call, e.g. the specialized backend while
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``."""
+        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        if getattr(runner, "stored_selection_requires_accepts", False) and not (
+            act_pack.routing_input_mode in runner.supported_routing_modes
+            and runner.accepts(act_pack, weight_pack)
+        ):
+            return None
+        return runner
+
     def _prepare_tactic(self, act_pack, weight_pack, selection):
         from ..autotuner.autotuner import OptimizationProfile, StaticDim
 
         backend_index, tactic = selection
-        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        runner = self._stored_selection_runner(act_pack, weight_pack, backend_index)
+        if runner is None:
+            return  # _run_tactic selects among the runners that accept the call
         inputs = runner.pack_inputs(act_pack, weight_pack)
         profile = OptimizationProfile(
             [
@@ -558,11 +674,64 @@ class MoELayer:
             runner.forward(inputs, tactic=tactic, do_preparation=True, **kwargs)
 
     def _run_tactic(self, act_pack, weight_pack, selection):
-        """Pack and execute an already selected runner/tactic."""
+        """Pack and execute an already selected runner/tactic.
+
+        A runner that no longer accepts the call (see
+        ``_stored_selection_runner``) does not run it; the call is selected as
+        in ``__call__`` instead.
+        """
         backend_index, tactic = selection
-        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        runner = self._stored_selection_runner(act_pack, weight_pack, backend_index)
+        if runner is None:
+            return self(act_pack, weight_pack)
         inputs = runner.pack_inputs(act_pack, weight_pack)
         return runner.forward(inputs, tactic=tactic, **runner.launch_kwargs_for(inputs))
+
+    def _autotuning(self) -> bool:
+        """Whether ``flashinfer.autotune(True)`` is active."""
+        return bool(getattr(self.tuner, "is_tuning_mode", False))
+
+    def _preferred_winner(
+        self,
+        act_pack: MoEActivationPack,
+        weight_pack: MoEWeightPack,
+        runners: List[_RunnerT],
+    ) -> Optional[Tuple[_RunnerT, Any]]:
+        """The winner among the eligible ``runners`` that is taken untimed, if any,
+        as a ``_PreferredWinner``.
+
+        Outside ``autotune(True)``, the first eligible runner that sets
+        ``prefer_when_accepted`` wins without cross-backend timing: it accepted
+        the call, and a backend sets the flag only when its acceptance envelope
+        is where it was measured faster than the other backends. Its tactic is
+        still chosen by the autotuner, as for a single candidate. Returns
+        ``None``, and the caller selects as before, under ``autotune(True)``,
+        with a single candidate (never timed against another) and inside a
+        CUDA-graph capture (see ``_select_winner``).
+        """
+        if len(runners) < 2 or self._autotuning() or _stream_capturing(self.device):
+            return None
+        for runner in runners:
+            if getattr(runner, "prefer_when_accepted", False):
+                return _PreferredWinner(
+                    self._select_winner(act_pack, weight_pack, [runner])
+                )
+        return None
+
+    def _retime_untimed_winner(self, winner: tuple) -> bool:
+        """Whether a cached winner that was taken untimed must be selected again.
+
+        Never inside a CUDA-graph capture, which cannot time anything. Outside
+        one: a pick made inside a capture (``_CaptureWinner``) on the next
+        call, and a preferred backend taken untimed (``_PreferredWinner``)
+        under ``autotune(True)``, so that autotuning times every eligible
+        backend.
+        """
+        if isinstance(winner, _CaptureWinner):
+            return not _stream_capturing(self.device)
+        if isinstance(winner, _PreferredWinner):
+            return self._autotuning() and not _stream_capturing(self.device)
+        return False
 
     def _select_winner(
         self,
@@ -570,7 +739,33 @@ class MoELayer:
         weight_pack: MoEWeightPack,
         runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
-        """Tune each runner, then select by packing + forward GPU latency."""
+        """Tune each runner, then select by packing + forward GPU latency.
+
+        Inside a CUDA-graph capture nothing is timed, tuned or precompiled:
+        the first candidate is returned untimed, with its tactic looked up
+        (``_capture_tactic``), as a ``_CaptureWinner``.
+        """
+        if _stream_capturing(self.device):
+            # A winner-cache miss inside a CUDA-graph capture, where nothing
+            # that synchronizes the device may run: timing the candidates,
+            # profiling a tactic (also under autotune(True)) or precompiling
+            # the bucket's variants. Runners that serve captured calls only for
+            # winners timed eagerly (the specialized backend) step aside, and
+            # the first remaining candidate in configured order is taken
+            # untimed. It is marked, with one candidate as with several, so
+            # that __call__ selects the bucket again on its next call outside
+            # a capture, which tunes, times and precompiles it.
+            runner = next(
+                (
+                    r
+                    for r in runners
+                    if not getattr(r, "capture_requires_eager_selection", False)
+                ),
+                runners[0],
+            )
+            inputs = runner.pack_inputs(act_pack, weight_pack)
+            return _CaptureWinner((runner, self._capture_tactic(runner, inputs)))
+
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
@@ -581,7 +776,7 @@ class MoELayer:
             launch_kwargs = runner.launch_kwargs_for(inputs)
             # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
-                custom_op=f"moe_{runner.backend_key}",
+                custom_op=_tuner_op(runner),
                 runners=[runner],
                 tuning_config=runner.tuning_config_for(inputs),
                 inputs=inputs,
@@ -627,6 +822,43 @@ class MoELayer:
             precompile(best_inputs, best_tactic)
         return best_runner, best_tactic
 
+    def _capture_tactic(self, runner: _RunnerT, inputs: List[torch.Tensor]) -> Any:
+        """``runner``'s tactic for ``inputs`` inside a CUDA-graph capture.
+
+        It is looked up as ``AutoTuner.choose_one`` does outside
+        ``autotune(True)``: with the active ``autotune()`` overrides and
+        measurement policy applied, the cached tactic, else the fallback
+        (``-1``). It never profiles, also under ``autotune(True)``, where
+        ``choose_one`` would profile on a cache miss and the autotuner refuses
+        profiling during a capture. ``is_tuning_mode`` is left as it is: it is
+        process-wide.
+        """
+        tuner = self.tuner
+        custom_op = _tuner_op(runner)
+        if custom_op in tuner._effective_skip_ops:
+            return -1
+        tuning_config = runner.tuning_config_for(inputs)
+        with tuner._lock:
+            if (
+                tuner._override_tuning_buckets is not None
+                or tuner._override_round_up
+                or tuner._override_cuda_graph_profile_replays is not None
+            ):
+                tuning_config = tuner._apply_tuning_overrides(tuning_config)
+            measure_policy = tuner._effective_measure_policy
+            if measure_policy is not None:
+                tuning_config = tuner._apply_measure_policy(
+                    tuning_config, measure_policy
+                )
+            _, _, tactic, _ = tuner.search_cache(
+                custom_op,
+                [runner],
+                tuple(tuner._get_input_sizes(inputs)),
+                tuning_config,
+                inputs=inputs,
+            )
+        return tactic
+
     # ---- Introspection helpers ---------------------------------------------
 
     @property
@@ -638,6 +870,12 @@ class MoELayer:
         """Clear all cached per-bucket winners — next call re-tunes."""
         self._winners.clear()
         self._last_winner_backend = None
+        # Runners that admit captured calls only for winners selected eagerly
+        # (the specialized backend) forget those selections with the winners.
+        for runner in self.runners:
+            forget = getattr(runner, "forget_selections", None)
+            if forget is not None:
+                forget()
 
     def refresh_backends(self) -> None:
         """Refresh backend preparation and clear cached winners.
