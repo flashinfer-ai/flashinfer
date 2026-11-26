@@ -455,6 +455,10 @@ are collective. Every rank must issue the same sequence and configuration, and
 one workspace belongs to one ordered CUDA stream. Keep the workspace alive
 until every captured CUDA graph replay has completed.
 
+The same ``FLASHINFER_PCIE_IPC_TIMEOUT_S`` bound covers these kernels' waits
+for peers: a rank that waits past the deadline reports where it was waiting
+and traps, failing the call with a CUDA error instead of hanging.
+
 AllGather copies opaque 16-byte packs. ReduceScatter accumulates in FP32 and
 converts to the requested output dtype; its TP8 schedule converts one four-rank
 partial before the final accumulation, so bitwise agreement with NCCL is not

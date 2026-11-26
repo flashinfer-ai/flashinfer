@@ -296,13 +296,30 @@ def gen_pcie_ipc_comm_module(spin_timeout_ns: int = 0) -> JitSpec:
     )
 
 
-def gen_pcie_ipc_ag_rs_module() -> JitSpec:
-    """Build the standalone PCIe IPC AllGather and ReduceScatter ops."""
+def gen_pcie_ipc_ag_rs_module(spin_timeout_ns: int = 0) -> JitSpec:
+    """Build the standalone PCIe IPC AllGather and ReduceScatter ops.
+
+    ``spin_timeout_ns`` > 0 bounds every wait on a peer: past the deadline the
+    kernel reports and traps instead of spinning forever (#9108), the same
+    contract as :func:`gen_pcie_ipc_comm_module`. It is a separate module, so
+    the default (and AOT) build keeps the unbounded wait unchanged.
+    """
+    if spin_timeout_ns <= 0:
+        return gen_jit_spec(
+            "pcie_ipc_ag_rs",
+            [
+                jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_gather.cu",
+                jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_reduce_scatter.cu",
+            ],
+        )
     return gen_jit_spec(
-        "pcie_ipc_ag_rs",
+        f"pcie_ipc_ag_rs_spin_timeout_{spin_timeout_ns}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_gather.cu",
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_reduce_scatter.cu",
+        ],
+        extra_cuda_cflags=[
+            f"-DFLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS={spin_timeout_ns}ULL"
         ],
     )
 
