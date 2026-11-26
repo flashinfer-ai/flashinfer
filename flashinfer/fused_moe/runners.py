@@ -5479,8 +5479,9 @@ class FireflyNvfp4Runner(MoERunner):
     One ``CuteMoE`` per hidden size serves every batch size up to
     ``tune_max_num_tokens`` with one workspace; its kernels choose their
     schedule from the batch size, so there is a single tactic. The weights
-    come with each call (the ``"firefly_nvfp4"`` view), so one runner serves
-    every layer of a shape. Per-token or per-tensor activations
+    come with each call (the ``"firefly_nvfp4"`` view), so the runners of all
+    the layers of a configuration share one ``CuteMoE`` and its workspace
+    (``firefly.moe.shared_moe``), allocated on the first forward. Per-token or per-tensor activations
     (``QuantConfig(per_token_scale=)``; ``None`` is per-tensor), one ``CuteMoE``
     mode per runner.
     """
@@ -5556,14 +5557,15 @@ class FireflyNvfp4Runner(MoERunner):
         warn_experimental_backend_once("fused_moe", self.backend_key)
 
     def _moe_for(self, hidden_size: int) -> Any:
-        """The ``CuteMoE`` of this hidden size, created (and its workspace
-        allocated) on the first pack of that size."""
+        """The ``CuteMoE`` of this hidden size, on the first forward of that
+        size: the one shared by every runner of the same configuration and
+        device (its workspace is allocated once for all the layers)."""
         moe = self._moes.get(hidden_size)
         if moe is None:
-            from ..experimental.firefly.moe import CuteMoE
+            from ..experimental.firefly.moe import shared_moe
 
             experts = self.config.experts
-            moe = CuteMoE(
+            moe = shared_moe(
                 self.config.routing.num_experts,
                 self.config.routing.top_k,
                 hidden_size,
@@ -5629,7 +5631,6 @@ class FireflyNvfp4Runner(MoERunner):
                 "prepare it with the same activation."
             )
         hidden_size = act.hidden_states_q.shape[1] * 2
-        self._moe_for(hidden_size)
         out = act.hidden_states_q.new_empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16
         )

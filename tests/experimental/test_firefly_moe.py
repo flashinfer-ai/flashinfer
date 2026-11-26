@@ -998,3 +998,39 @@ def test_firefly_rejects_misaligned_weight_view():
     view["w1"] = moved
     with pytest.raises(ValueError):
         moe(q, sf, gs, view, topk_ids=ids, topk_weights=wts)
+
+
+def test_firefly_gated_i_odd_multiple_of_128_long_unfused():
+    """A gated I with 256 not dividing it (I % 256 == 128), I >= 4096, on the
+    long batches' unfused weight-major CTA-pair down: its K tiles stay 128 (no
+    K tail for K 256)."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 4096, 4224, SwiGLU()
+    g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 2048)
+    m = 2048
+    x_deq, q, sf, gs, ids, wts = _inputs(g, m, hidden, num_experts, top_k)
+    out = layer(_act_pack(q, sf, gs, ids, wts), pack)
+    ref = _reference(
+        x_deq, ids, wts, w1, w2, act, inter, _mid_per_token(layer, m, hidden)
+    )
+    assert _rel_rmse(out, ref) < 0.005
+
+
+def test_firefly_layers_share_one_workspace():
+    """The layers of one configuration share one CuteMoE (one workspace),
+    allocated on the first forward, not when the inputs are packed; another
+    configuration gets its own."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
+    g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
+    a = _layer(num_experts, top_k, inter, act, 64)
+    b = _layer(num_experts, top_k, inter, act, 64)
+    other = _layer(num_experts, top_k, inter, act, 128)
+    x_deq, q, sf, gs, ids, wts = _inputs(g, 64, hidden, num_experts, top_k)
+    a.runners[0].pack_inputs(_act_pack(q, sf, gs, ids, wts), pack)
+    assert not a.runners[0]._moes  # nothing allocated by packing
+    outs = [layer(_act_pack(q, sf, gs, ids, wts), pack) for layer in (a, b, other)]
+    ref = _reference(x_deq, ids, wts, w1, w2, act, inter, _mid_per_token(a, 64, hidden))
+    for out in outs:
+        assert _rel_rmse(out, ref) < 0.005
+    assert a.runners[0]._moes[hidden] is b.runners[0]._moes[hidden]
+    assert other.runners[0]._moes[hidden] is not a.runners[0]._moes[hidden]

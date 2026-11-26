@@ -66,6 +66,7 @@ import dataclasses
 import enum
 import functools
 import math
+import weakref
 from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -769,6 +770,32 @@ class Plan:
 
 
 _SIZES = {}
+
+
+_SHARED: "weakref.WeakValueDictionary[Any, CuteMoE]" = weakref.WeakValueDictionary()
+
+
+def shared_moe(num_experts, topk, hidden_size, intermediate_size, **kwargs):
+    """The ``CuteMoE`` of these arguments on their device, shared by every caller asking for the same ones (FlashInfer:
+    the runners of all the layers of a shape) while any of them holds it: one workspace, which is sized for
+    ``max_tokens`` (for the unfused finalize it holds the padded routed BF16 rows), instead of one per layer. Its calls
+    must not overlap: one stream at a time, as the layers of a model run."""
+    dev = torch.device(kwargs.get("device") or "cuda")
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    kwargs["device"] = dev
+    key = (
+        num_experts,
+        topk,
+        hidden_size,
+        intermediate_size,
+        repr(sorted(kwargs.items())),
+    )
+    moe = _SHARED.get(key)
+    if moe is None:
+        moe = CuteMoE(num_experts, topk, hidden_size, intermediate_size, **kwargs)
+        _SHARED[key] = moe
+    return moe
 
 
 class CuteMoE:
@@ -1589,9 +1616,12 @@ class CuteMoE:
         # unfused long batches: the down GEMM as weight-major CTA pairs where its MMAs bound it (two_cta_down)
         wm2 = long and not fused and two_cta_down(m, T, H, k2, E)
         # weight-major (unfused) long batches with at least DOWN_MMA_RPE routes per expert: K tiles of 256 with a K
-        # tail (less zero fill past I: Nemotron 3 Super from M=2979) or as CTA pairs with I >= 4096
+        # tail (less zero fill past I: Nemotron 3 Super from M=2979) or as CTA pairs with I >= 4096 a multiple of 256
+        # (a gated I % 256 == 128 has no K tail: its K tiles stay 128)
         k256 = (
-            long and m * T >= DOWN_MMA_RPE * E and (bool(ktk) or (wm2 and k2 >= 4096))
+            long
+            and m * T >= DOWN_MMA_RPE * E
+            and (bool(ktk) or (wm2 and k2 >= 4096 and k2 % 256 == 0))
         )
         if long and (fused or g["dpair"]):
             # Long batches, fused: token-major (128 tokens x bn weight rows per tile, one CTA per SM, tiles from
