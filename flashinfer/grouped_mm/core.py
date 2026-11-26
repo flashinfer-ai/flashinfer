@@ -154,7 +154,7 @@ def grouped_mm_bf16(
 # =========================================================================
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -245,7 +245,9 @@ def grouped_mm_fp8(
     out_dtype : torch.dtype
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
-        Backend selector.  Currently only ``"cudnn"`` is supported.
+        Backend selector.  Currently only ``"cudnn"`` is supported (on SM80 / SM86 /
+        SM87, which have no cuDNN FP8, the SM8x dense FP8 GEMM with ``K % 16 == 0``
+        and no execution plans).
     tactic : int
         cuDNN execution plan index.  ``-1`` (default) uses the heuristic-best
         plan.  Non-negative values select a specific plan.

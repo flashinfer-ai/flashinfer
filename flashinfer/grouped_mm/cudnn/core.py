@@ -286,6 +286,13 @@ def _build_cudnn_moe_grouped_gemm_graph(
     return graph, graph.get_workspace_size(), plan_indices
 
 
+def _sm8x_fp8(a: torch.Tensor) -> bool:
+    """FP8 below SM89, which cuDNN does not run: there ``grouped_mm_fp8`` takes the
+    SM8x dense FP8 GEMM, which has no execution plans."""
+    major, minor = get_compute_capability(a.device)
+    return major == 8 and minor < 9 and a.element_size() == 1
+
+
 def _cudnn_moe_grouped_gemm_plan_count(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -302,6 +309,8 @@ def _cudnn_moe_grouped_gemm_plan_count(
     is refused while a CUDA graph is being captured, so autotuners must query it
     outside capture.
     """
+    if _sm8x_fp8(a):
+        return 0
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, a.shape[0])
@@ -339,6 +348,12 @@ def _run_cudnn_moe_grouped_gemm(
             plan.  Non-negative values select a specific plan built with
             ``build_plan_policy.ALL``.
     """
+    if _sm8x_fp8(a):
+        if tactic != -1:
+            return None  # beyond the plan count, which is 0
+        from ...gemm.sm8x_fp8_dense import sm8x_grouped_mm_fp8
+
+        return sm8x_grouped_mm_fp8(a, b, m_indptr, alpha, out_dtype, out)
     token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
     weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
     alpha_cudnn_dtype = _to_cudnn_dtype(alpha.dtype) if alpha is not None else None

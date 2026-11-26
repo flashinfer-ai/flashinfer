@@ -410,7 +410,11 @@ def _groupwise_tuning_config(gm: int, out_index: int = 4) -> TuningConfig:
             ),
         ),
         constraint_specs=(
-            ConstraintSpec(2, 0, lambda shapes: -(-shapes[0][0] // gm)),
+            *(
+                (ConstraintSpec(2, 0, lambda shapes: -(-shapes[0][0] // gm)),)
+                if gm  # gm 0: per-tensor scales
+                else ()
+            ),
             ConstraintSpec(out_index, 0, lambda shapes: shapes[0][0]),
         ),
     )
@@ -587,6 +591,28 @@ def _run_group_groupwise(a, b, a_scale, b_scale, m_indptr, out, gm: int) -> None
         inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
+
+
+def sm8x_grouped_mm_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """``grouped_mm_fp8`` on SM80 / SM86 / SM87: ``alpha * (a @ b[e]^T)`` over cuDNN's MOE
+    segments (the starts ``m_indptr[:-1]``, the last segment to ``a.shape[0]``)."""
+    cum_m, k = (int(x) for x in a.shape)
+    if k % 16:
+        raise ValueError(f"FP8 GEMM requires K % 16 == 0, got K={k}")
+    if out is None:
+        out = torch.empty((cum_m, b.shape[1]), dtype=out_dtype, device=a.device)
+    if cum_m and b.shape[0]:
+        ip = torch.cat((m_indptr[:-1], m_indptr.new_full((1,), cum_m)))
+        one = _ones(a.device)
+        _run_group_groupwise(a, b, one if alpha is None else alpha, one, ip, out, 0)
+    return out
 
 
 def sm8x_ragged_block_scaled_bmm(
