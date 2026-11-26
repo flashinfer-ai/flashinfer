@@ -151,9 +151,12 @@ int main() {
   CheckDispatch<496, 256>({16, 64, 128});
   CheckDispatch<512, 256>({16});
   CheckDispatch<512, 512>({16, 32});
+  CheckDispatch<256, 512>({16, 32});
   // These planner paths return before any CUDA device query.
+  // FA2DetermineCtaTileQ takes (len, head_dim_vo, head_dim_qk).
   for (int64_t n : {1, 16, 17, 32, 33, 64, 65, 128}) {
     assert(FA2DetermineCtaTileQ(n, 512, 512) == (n <= 32 ? 16 : 32));
+    assert(FA2DetermineCtaTileQ(n, 512, 256) == (n <= 32 ? 16 : 32));
     assert(FA2DetermineCtaTileQ(n, 256, 512) == 16);
   }
   assert(FA2DetermineCtaTileQ(65, 64, 64) == 128);
