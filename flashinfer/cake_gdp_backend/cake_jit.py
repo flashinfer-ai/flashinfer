@@ -40,7 +40,7 @@ runtime-token-count program of the route (``T`` up to its ``max_t_steps``).
 Batch size and head count are runtime scalars, so a changed problem size never
 recompiles anything.  Two kernel bodies ship: the lane-owns-rows body
 (``variant`` ``l8r4`` / ``l8r4p`` / ``l8r4w5`` / ``l8r2`` / ``l4r2``, one
-CTA per batch row and head)
+CTA per batch row and head, and SM90's FP16 ``l8r2h``, two)
 and, for ``T = 1`` with ``B x HV <= 160``, the row-partition body
 (``splitv8_tile8``, eight CTAs per state head); each record names its body
 (``body``: ``lanerow`` for the lane-owns-rows body, ``splitv`` for the row
@@ -55,38 +55,58 @@ for.
 
 A decode record reads and writes a state pool of one dtype, its build's
 ``state_dtype``: ``"f16"`` for an FP16 pool, absent for an FP32 pool (the
-default).  Every FP16 record is the twin of the FP32 record of the same route,
-body, variant and token count, with the same band, and is delivered on SM100 /
-SM103 / SM107 only: its stores round the FP32 state with the hardware
-``cvt.rs`` instruction.  Its kernel takes two more arguments, the int64 ``rand_seed``
+default).  Every FP16 record but the row-split programs below is the twin of
+the FP32 record of the same route, body, variant and token count, with the same
+band less the cells of those programs, and is delivered on the architectures of
+that record (SM90 has the FP16 twins of its own ``l4r2`` program at ``T = 4``
+and of its own build of the row-partition program, and its own FP16 build of
+the ``l8r4`` program of 6 tokens).  Its
+stores round the FP32 state with the hardware ``cvt.rs`` instruction on SM100 /
+SM103 / SM107 and with the same rounding in integer arithmetic on SM90, which
+has no ``cvt.rs``.  Its kernel takes two more arguments, the int64 ``rand_seed``
 tensor it reads on the device and the Philox round count ``philox_rounds``
 (``0`` rounds to nearest even and reads no seed).  The dispatch functions
 take the pool's dtype as ``state_dtype`` (``torch.float32`` by default) and
 consider the records of that dtype only, so an FP16 pool runs the twin of the
-program an FP32 pool would run.
+program an FP32 pool would run, or a row-split program.
 
 An FP16 call also has a launch class: its round count (``philox_rounds``, 0
 without a seed) and whether it stores per-token snapshots
 (``ssm_state_indices`` given).  A selection cell of an FP16 record may bound
 the round count (``rounds_at_least`` / ``rounds_at_most``, inclusive) and name
-the snapshot use (``snapshot``); an absent key admits every value.  Two FP16
-programs have a sibling built with ``snapshot_noise``: the ``l8r4`` program of
-16 tokens and the runtime program of three Householder updates.  The sibling
+the snapshot use (``snapshot``); an absent key admits every value.  The
+``l8r4`` program of 16 tokens and the runtime program of three Householder
+updates have a sibling built with ``snapshot_noise``, and on SM90 so does the
+``l8r4`` program of 6 tokens.  The sibling
 draws a launch's random bits once into shared memory instead of at each store,
 which pays only when the launch stores snapshots; it keeps its program's body,
 variant and band and stores the same bits.  Its cells admit the stochastic
 calls with snapshots of the measured cell, and its plain program's cells admit
 every other call of the band, so every call still selects exactly one program
 and an FP16 pool still runs the body and variant an FP32 pool would run.
-The FP16 row-partition program has a sibling built with ``draw_share``: each
+The FP16 row-partition program of SM100 / SM103 / SM107 has a sibling built
+with ``draw_share`` (SM90 ships none): each
 Philox draw of its store is computed once and shared by a lane shuffle, so it
 stores the same bits.  Its cell admits the stochastic calls of the band
 (``rounds_at_least``), and its plain program keeps the calls that round to
 nearest even (``rounds_at_most``).
 
+SM90 also ships FP16-only row-split programs (``variant`` ``l8r2h``: the
+``l8r2`` lane layout with each state head cut over two CTAs of 128 threads,
+grid rule ``ctas_per_state`` 2), one for each static token count of 2 to 8
+and 16 and one runtime program for each ``n``; no route ships their FP32
+build.  Their
+cells admit the small-grid calls on which they were measured faster, with
+wave bounds that are multiples of 1/2 (``k x SM`` state heads run on
+``2 k`` CTAs per SM).  Such a call runs the row-split program of its token
+count (static or runtime) instead of the program or sibling it would run
+otherwise, whose cells admit every other call of the band, so every call
+still selects exactly one program.
+
 Prefill: the ``prefill`` route holds the single-pass programs of two kernel
 bodies: the V6 fork-order body (``body`` ``prefill_sm90_v6``: the plain, the
-initial-state and the pool-indexed flag sets, final state stored) and the
+initial-state and the pool-indexed flag sets, final state stored, and their
+``split_items`` twins, which the SM90 V6 WARM-UP SPLIT PLAN below feeds) and the
 merged chunked prefill body (``body`` ``prefill_sm90``: the unit programs and
 the ``split_items`` programs); the BODY ROUTE OF RECORD below
 (``prefill_body_class``) picks the body of every sequence from its chunk
@@ -108,7 +128,20 @@ SM103 the route holds the programs of the Blackwell body (``body``
 initial state and stores the final state) over a host item table whose order
 places the work on the persistent CTAs; the BLACKWELL V6 LAUNCH PLAN below
 (``prefill_v6_plan``) builds the table and picks the build, which the
-``v6_launch`` select rule names (``selected_v6_module``).
+``v6_launch`` select rule names (``selected_v6_module``).  The Blackwell
+body's programs come in state forms, each with its block and split build: the
+dense FP32 programs (one ``[N, H, 64, 128]`` record per sequence) and the pool
+programs of the build keys ``use_state_indices`` / ``use_output_state_indices``
+(``state_indices`` / ``output_state_indices`` slot tables over
+``[pool, H, 64, 128]`` pools whose slot strides are kernel arguments; a read
+slot outside the initial pool starts from zero, a write slot outside the output
+pool stores nothing), for an FP32, a BF16 and an FP16 pool (``state_dtype``
+``"bf16"`` / ``"f16"``: the state is read widened exactly and its final value
+rounded once at the store, to nearest even or, with ``rand_seed`` and
+``philox_rounds``, stochastically by the hardware ``cvt.rs``).  A 16-bit record
+is the twin of the FP32 pool record of the same split; the facade runs a dense
+16-bit call on the pool program with identity slots.  ``selected_v6_module``
+takes the state form (``state_dtype``, ``pool``) beside the plan.
 Every grid is computed from host integers; no tensor is read on the host.
 
 The program name ``cake_gdp_<20 hex>`` is the first twenty hex digits of the
@@ -118,13 +151,16 @@ record's ``build`` spells those keywords: ``variant`` (the body's geometry:
 ``l8r4`` = eight lanes per state row, four rows per lane; ``l8r4p`` and
 ``l8r4w5`` = that geometry with the producer preload, for one wave of four
 CTAs per SM and for the many-wave rows (``B x HV > 64 x SM
-count``); ``l8r2``;
+count``); ``l8r2``; ``l8r2h`` = ``l8r2`` with a head cut over two CTAs;
 ``l4r2``; ``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of
 eight rows
 per head), ``num_householder`` (``n``),
 ``t_steps`` (a fixed token count compiled in; ``None`` for a runtime token
 count up to ``max_t_steps``), ``use_qk_l2norm``, on an FP16-pool record
-``state_dtype`` and on a sibling ``snapshot_noise`` or ``draw_share``.  Prefill: the six flags
+``state_dtype``, on a sibling ``snapshot_noise`` or ``draw_share``, and
+``arch`` on an SM90 build whose program differs from that of the other
+architectures (the row-partition programs and the FP16 ``l8r4`` program of 6
+tokens).  Prefill: the six flags
 ``use_initial_state``, ``use_state_indices``, ``store_final_state``,
 ``unit_gates``, ``unit_beta`` and ``segment_pass`` beside the defaults of the
 kernel's build signature (the I/O dtype ``bf16``, the WY solve arm, the O
@@ -134,6 +170,7 @@ store, ...; the split programs spell ``split_items`` too).
 from __future__ import annotations
 
 import functools
+import heapq
 import itertools
 from typing import Any, NamedTuple, Sequence
 
@@ -279,6 +316,162 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "output_state_indices": "output_state_indices",
             "q": "q",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": 160,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_8f8062d89b8b871f1e2f": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "splitv",
+        "build": {
+            "arch": "sm_90a",
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 1,
+            "use_qk_l2norm": True,
+            "variant": "splitv8_tile8",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 8,
+            "kind": "state_heads",
+            "tile_v": 8,
+        },
+        "kernel": "cake_gdp_8f8062d89b8b871f1e2f",
+        "kernel_symbol": "kernel_cake_gdp_8f8062d89b8b871f1e2f",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 2304,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_8f8062d89b8b871f1e2f",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
             "scale": "scale",
             "ssm_state_indices": "ssm_state_indices",
             "state": "state",
@@ -754,6 +947,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_16d24c9e19fa73fe57ee": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -905,6 +1099,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": [
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "ctas_per_sm_above": 2,
                 "kind": "state_heads_between",
@@ -912,9 +1107,27 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "ctas_per_sm_above": 2,
                 "kind": "state_heads_between",
+                "snapshot": False,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
                 "snapshot": False,
             },
         ],
@@ -2929,6 +3142,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_5bc4ef21b6e7aefed05f": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3077,14 +3291,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_6bb51453cd15a43da9c2": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3233,14 +3458,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_717ce3c684b41c37e673": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3389,10 +3625,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": None,
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_72b6872c98ed9abf0bdf": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3541,12 +3792,31 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_78fc9caafee16e2af047": {
         "arches": [
@@ -3692,6 +3962,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_7e4385817ba59915bc61": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3840,15 +4111,35 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_8e26e2c2d0cb0a7fbee9": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -3997,12 +4288,23 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_8f4ad44e524af3f3cbb9": {
         "arches": [
@@ -4163,6 +4465,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_9bfd49d6bbbb3d849f30": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -4311,12 +4614,31 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_a226c899893599e679a3": {
         "arches": [
@@ -4465,8 +4787,334 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "state_heads_between",
         },
     },
+    "cake_gdp_11085a9519b214993653": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "arch": "sm_90a",
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 6,
+            "use_qk_l2norm": True,
+            "variant": "l8r4",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_11085a9519b214993653",
+        "kernel_symbol": "kernel_cake_gdp_11085a9519b214993653",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 17152,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_11085a9519b214993653",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": False,
+            },
+        ],
+    },
+    "cake_gdp_8aabe827188edf904960": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "snapshot_noise": True,
+            "state_dtype": "f16",
+            "t_steps": 6,
+            "use_qk_l2norm": True,
+            "variant": "l8r4",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_8aabe827188edf904960",
+        "kernel_symbol": "kernel_cake_gdp_8aabe827188edf904960",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 33536,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_8aabe827188edf904960",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_above": 2,
+            "kind": "state_heads_between",
+            "rounds_at_least": 5,
+            "snapshot": True,
+        },
+    },
     "cake_gdp_b047f2f1a20630e6f36b": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -4616,14 +5264,26 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-            "rounds_at_least": 5,
-            "snapshot": True,
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": True,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": True,
+            },
+        ],
     },
     "cake_gdp_b81854850bf4b769295c": {
         "arches": [
@@ -4815,6 +5475,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_aa7f7810c60fe76c14a6": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -4963,7 +5624,21 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": None,
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_baca2c2d21cf59fc2d3c": {
         "arches": [
@@ -5109,8 +5784,166 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "state_heads_between",
         },
     },
+    "cake_gdp_b245506c43aed8c3e6b4": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 4,
+            "use_qk_l2norm": True,
+            "variant": "l4r2",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 1,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_b245506c43aed8c3e6b4",
+        "kernel_symbol": "kernel_cake_gdp_b245506c43aed8c3e6b4",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 11392,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_b245506c43aed8c3e6b4",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_above": 0.5,
+            "ctas_per_sm_at_most": 1,
+            "kind": "state_heads_between",
+            "rounds_at_most": 4,
+        },
+    },
     "cake_gdp_bb55d7d5e4db0d95acce": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -5259,15 +6092,26 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_bc76e12e0c247b44a27d": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -5416,15 +6260,26 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_c3cf32174475946d9c35": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -5573,11 +6428,21 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_c51f69d9ac126bbaab36": {
         "arches": [
@@ -5931,6 +6796,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_cbb122ec06d8e7bfbdab": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -6079,12 +6945,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_above": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_dbd09ba202e904a29148": {
         "arches": [
@@ -6246,6 +7122,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_e1047159db983943d97b": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -6394,13 +7271,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 160,
-            "at_most": None,
-            "ctas_per_sm_above": 4,
-            "ctas_per_sm_at_most": 64,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 160,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 4,
+                "ctas_per_sm_at_most": 64,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 160,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_e156ee45668b2455e46d": {
         "arches": [
@@ -6696,6 +7582,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_ee0cdd5d391a7f594356": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -6844,15 +7731,43 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": {
-            "above": 0,
-            "at_most": None,
-            "ctas_per_sm_at_most": 2,
-            "kind": "state_heads_between",
-        },
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 1.5,
+                "ctas_per_sm_at_most": 2,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_efdf403e0df822bfc83f": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -7005,6 +7920,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": [
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "ctas_per_sm_at_most": 3,
                 "kind": "state_heads_between",
@@ -7057,6 +7973,16 @@ MODULES: dict[str, dict[str, Any]] = {
                 "ctas_per_sm_above": 124,
                 "kind": "state_heads_between",
                 "rounds_at_least": 11,
+                "snapshot": True,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 3,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
                 "snapshot": True,
             },
         ],
@@ -7543,6 +8469,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_gdp_f3f05058d0b4a43f6589": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -7691,10 +8618,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "v": "v",
         },
         "role": "decode",
-        "select_rule": None,
+        "select_rule": [
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
+                "at_most": None,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
     },
     "cake_gdp_f5d305e6f05978caca3c": {
         "arches": [
+            "sm_90a",
             "sm_100a",
             "sm_103a",
             "sm_107a",
@@ -7846,12 +8788,14 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": [
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "kind": "state_heads_between",
                 "rounds_at_most": 9,
             },
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a", "sm_107a"],
                 "at_most": None,
                 "kind": "state_heads_between",
                 "snapshot": False,
@@ -7881,6 +8825,32 @@ MODULES: dict[str, dict[str, Any]] = {
                 "ctas_per_sm_above": 124,
                 "kind": "state_heads_between",
                 "rounds_at_most": 10,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 3,
+                "kind": "state_heads_between",
+                "rounds_at_most": 4,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 3,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+                "snapshot": False,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_90a"],
+                "at_most": None,
+                "ctas_per_sm_above": 3,
+                "kind": "state_heads_between",
             },
         ],
     },
@@ -8716,6 +9686,540 @@ MODULES: dict[str, dict[str, Any]] = {
             "use_state_indices": True,
         },
     },
+    "cake_gdp_5acbda2bd1002fd68a95": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": False,
+            "use_state_indices": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_5acbda2bd1002fd68a95",
+        "kernel_symbol": "kernel_cake_gdp_5acbda2bd1002fd68a95",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_5acbda2bd1002fd68a95",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": False,
+            "use_state_indices": False,
+        },
+    },
+    "cake_gdp_edfb71d95c7a9c2a133d": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_edfb71d95c7a9c2a133d",
+        "kernel_symbol": "kernel_cake_gdp_edfb71d95c7a9c2a133d",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_edfb71d95c7a9c2a133d",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": False,
+        },
+    },
+    "cake_gdp_446ecf26f72f95aacf84": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_446ecf26f72f95aacf84",
+        "kernel_symbol": "kernel_cake_gdp_446ecf26f72f95aacf84",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_446ecf26f72f95aacf84",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": True,
+        },
+    },
     "cake_gdp_ff55032bc5fdf2697d77": {
         "arches": [
             "sm_100a",
@@ -8873,6 +10377,1936 @@ MODULES: dict[str, dict[str, Any]] = {
             "at_most": 160,
             "kind": "state_heads_between",
             "rounds_at_least": 5,
+        },
+    },
+    "cake_gdp_4c574be45e595fe98665": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 2,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_4c574be45e595fe98665",
+        "kernel_symbol": "kernel_cake_gdp_4c574be45e595fe98665",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 13952,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_4c574be45e595fe98665",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_db30017cc306551537d8": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 3,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_db30017cc306551537d8",
+        "kernel_symbol": "kernel_cake_gdp_db30017cc306551537d8",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16768,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_db30017cc306551537d8",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2.5,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_03fc4d822d2896c11df9": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 4,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_03fc4d822d2896c11df9",
+        "kernel_symbol": "kernel_cake_gdp_03fc4d822d2896c11df9",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 19584,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_03fc4d822d2896c11df9",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 0.5,
+                "ctas_per_sm_at_most": 1,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_2bbb0a6eea719d10ec5c": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 5,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_2bbb0a6eea719d10ec5c",
+        "kernel_symbol": "kernel_cake_gdp_2bbb0a6eea719d10ec5c",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 22528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_2bbb0a6eea719d10ec5c",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+                "rounds_at_least": 5,
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 2,
+                "ctas_per_sm_at_most": 2.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_c26823b0a9a42e400ad0": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 6,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_c26823b0a9a42e400ad0",
+        "kernel_symbol": "kernel_cake_gdp_c26823b0a9a42e400ad0",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 25344,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_c26823b0a9a42e400ad0",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_e506863593932b5cf7d2": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 7,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_e506863593932b5cf7d2",
+        "kernel_symbol": "kernel_cake_gdp_e506863593932b5cf7d2",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 28160,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_e506863593932b5cf7d2",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_a5f2411d386e80d6c500": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 8,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_a5f2411d386e80d6c500",
+        "kernel_symbol": "kernel_cake_gdp_a5f2411d386e80d6c500",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 30976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_a5f2411d386e80d6c500",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_0e9af5fb535caec5f960": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 16,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_0e9af5fb535caec5f960",
+        "kernel_symbol": "kernel_cake_gdp_0e9af5fb535caec5f960",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 53632,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_0e9af5fb535caec5f960",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": [
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_at_most": 0.5,
+                "kind": "state_heads_between",
+            },
+            {
+                "above": 0,
+                "at_most": None,
+                "ctas_per_sm_above": 1,
+                "ctas_per_sm_at_most": 1.5,
+                "kind": "state_heads_between",
+            },
+        ],
+    },
+    "cake_gdp_527260b8ec384f213efd": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 1,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_527260b8ec384f213efd",
+        "kernel_symbol": "kernel_cake_gdp_527260b8ec384f213efd",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 28928,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_527260b8ec384f213efd",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2.5,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_09db3ffab8d0378caa18": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 2,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_09db3ffab8d0378caa18",
+        "kernel_symbol": "kernel_cake_gdp_09db3ffab8d0378caa18",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 41344,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_09db3ffab8d0378caa18",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2.5,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_ce8bf154da25575debfc": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_ce8bf154da25575debfc",
+        "kernel_symbol": "kernel_cake_gdp_ce8bf154da25575debfc",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 53632,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_ce8bf154da25575debfc",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 2,
+            "kind": "state_heads_between",
+        },
+    },
+    "cake_gdp_1654ec2bd9e2b4374ad9": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "lanerow",
+        "build": {
+            "max_t_steps": 16,
+            "num_householder": 4,
+            "state_dtype": "f16",
+            "t_steps": None,
+            "use_qk_l2norm": True,
+            "variant": "l8r2h",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 2,
+            "kind": "state_heads",
+        },
+        "kernel": "cake_gdp_1654ec2bd9e2b4374ad9",
+        "kernel_symbol": "kernel_cake_gdp_1654ec2bd9e2b4374ad9",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66048,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_1654ec2bd9e2b4374ad9",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": None,
+            "ctas_per_sm_at_most": 1.5,
+            "kind": "state_heads_between",
         },
     },
     "cake_gdp_157b3ebf33cf7c928af5": {
@@ -9279,14 +12713,1390 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
+    "cake_gdp_f52e7ec41bb7f27cd856": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_f52e7ec41bb7f27cd856",
+        "kernel_symbol": "kernel_cake_gdp_f52e7ec41bb7f27cd856",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_f52e7ec41bb7f27cd856",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_4f440244f31edea6a417": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_4f440244f31edea6a417",
+        "kernel_symbol": "kernel_cake_gdp_4f440244f31edea6a417",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_4f440244f31edea6a417",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
+    "cake_gdp_6f505b4fb9199bf89c96": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_6f505b4fb9199bf89c96",
+        "kernel_symbol": "kernel_cake_gdp_6f505b4fb9199bf89c96",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_6f505b4fb9199bf89c96",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_1d27e13364ddfad0595c": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_1d27e13364ddfad0595c",
+        "kernel_symbol": "kernel_cake_gdp_1d27e13364ddfad0595c",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_1d27e13364ddfad0595c",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
+    "cake_gdp_63289a15605137af5bf8": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "state_dtype": "bf16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_63289a15605137af5bf8",
+        "kernel_symbol": "kernel_cake_gdp_63289a15605137af5bf8",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_63289a15605137af5bf8",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_591de83b8e98709df3f3": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "state_dtype": "bf16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_591de83b8e98709df3f3",
+        "kernel_symbol": "kernel_cake_gdp_591de83b8e98709df3f3",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_591de83b8e98709df3f3",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
+    "cake_gdp_0ad4bbaf5ef274640c3a": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "state_dtype": "bf16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_0ad4bbaf5ef274640c3a",
+        "kernel_symbol": "kernel_cake_gdp_0ad4bbaf5ef274640c3a",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_0ad4bbaf5ef274640c3a",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_25d81fdd5cf38d846a0d": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "state_dtype": "bf16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_25d81fdd5cf38d846a0d",
+        "kernel_symbol": "kernel_cake_gdp_25d81fdd5cf38d846a0d",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_25d81fdd5cf38d846a0d",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
+    "cake_gdp_1ffa9f43b2424a9014e7": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "state_dtype": "f16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_1ffa9f43b2424a9014e7",
+        "kernel_symbol": "kernel_cake_gdp_1ffa9f43b2424a9014e7",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_1ffa9f43b2424a9014e7",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_241bf09e6734085e173e": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "state_dtype": "f16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_241bf09e6734085e173e",
+        "kernel_symbol": "kernel_cake_gdp_241bf09e6734085e173e",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_241bf09e6734085e173e",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
+    "cake_gdp_2765b8c0ae143504657e": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "state_dtype": "f16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_2765b8c0ae143504657e",
+        "kernel_symbol": "kernel_cake_gdp_2765b8c0ae143504657e",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_2765b8c0ae143504657e",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_68d934c41a0fbe0fb027": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["buffer", "state_indices"],
+            ["buffer", "output_state_indices"],
+            ["parameter", "initial_state_stride_slot"],
+            ["parameter", "output_state_stride_slot"],
+            ["buffer", "rand_seed"],
+            ["parameter", "philox_rounds"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "state_dtype": "f16",
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_68d934c41a0fbe0fb027",
+        "kernel_symbol": "kernel_cake_gdp_68d934c41a0fbe0fb027",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_68d934c41a0fbe0fb027",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_indices": "state_indices",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
 }
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_90a": {
         "decode_nh1": [
             "cake_gdp_78fc9caafee16e2af047",
+            "cake_gdp_f3f05058d0b4a43f6589",
+            "cake_gdp_527260b8ec384f213efd",
         ],
         "decode_nh2": [
             "cake_gdp_3342c82179fa758b0570",
+            "cake_gdp_aa7f7810c60fe76c14a6",
+            "cake_gdp_09db3ffab8d0378caa18",
         ],
         "decode_nh3": [
             "cake_gdp_068a895d0c8fa77ed2f9",
@@ -9306,9 +14116,40 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_450bb0db3b79acafa419",
             "cake_gdp_c51f69d9ac126bbaab36",
             "cake_gdp_585a5ea4cbdd07f1b2a8",
+            "cake_gdp_8f8062d89b8b871f1e2f",
+            "cake_gdp_6bb51453cd15a43da9c2",
+            "cake_gdp_bc76e12e0c247b44a27d",
+            "cake_gdp_5bc4ef21b6e7aefed05f",
+            "cake_gdp_ee0cdd5d391a7f594356",
+            "cake_gdp_7e4385817ba59915bc61",
+            "cake_gdp_8e26e2c2d0cb0a7fbee9",
+            "cake_gdp_cbb122ec06d8e7bfbdab",
+            "cake_gdp_f5d305e6f05978caca3c",
+            "cake_gdp_efdf403e0df822bfc83f",
+            "cake_gdp_bb55d7d5e4db0d95acce",
+            "cake_gdp_11085a9519b214993653",
+            "cake_gdp_8aabe827188edf904960",
+            "cake_gdp_b245506c43aed8c3e6b4",
+            "cake_gdp_16d24c9e19fa73fe57ee",
+            "cake_gdp_b047f2f1a20630e6f36b",
+            "cake_gdp_c3cf32174475946d9c35",
+            "cake_gdp_9bfd49d6bbbb3d849f30",
+            "cake_gdp_72b6872c98ed9abf0bdf",
+            "cake_gdp_e1047159db983943d97b",
+            "cake_gdp_4c574be45e595fe98665",
+            "cake_gdp_db30017cc306551537d8",
+            "cake_gdp_03fc4d822d2896c11df9",
+            "cake_gdp_2bbb0a6eea719d10ec5c",
+            "cake_gdp_c26823b0a9a42e400ad0",
+            "cake_gdp_e506863593932b5cf7d2",
+            "cake_gdp_a5f2411d386e80d6c500",
+            "cake_gdp_0e9af5fb535caec5f960",
+            "cake_gdp_ce8bf154da25575debfc",
         ],
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",
+            "cake_gdp_717ce3c684b41c37e673",
+            "cake_gdp_1654ec2bd9e2b4374ad9",
         ],
         "prefill": [
             "cake_gdp_0de8fd0ee57885709a1c",
@@ -9319,6 +14160,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_3220d37914678385a837",
             "cake_gdp_245414df8449fb1825a1",
             "cake_gdp_b81854850bf4b769295c",
+            "cake_gdp_5acbda2bd1002fd68a95",
+            "cake_gdp_edfb71d95c7a9c2a133d",
+            "cake_gdp_446ecf26f72f95aacf84",
         ],
     },
     "sm_100a": {
@@ -9378,6 +14222,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "prefill": [
             "cake_gdp_157b3ebf33cf7c928af5",
             "cake_gdp_68796be6ca9ae12f2e19",
+            "cake_gdp_f52e7ec41bb7f27cd856",
+            "cake_gdp_4f440244f31edea6a417",
+            "cake_gdp_63289a15605137af5bf8",
+            "cake_gdp_591de83b8e98709df3f3",
+            "cake_gdp_1ffa9f43b2424a9014e7",
+            "cake_gdp_241bf09e6734085e173e",
         ],
     },
     "sm_103a": {
@@ -9437,6 +14287,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "prefill": [
             "cake_gdp_f108e105bd1ec635650f",
             "cake_gdp_88c5777dabbda5e1e5a8",
+            "cake_gdp_6f505b4fb9199bf89c96",
+            "cake_gdp_1d27e13364ddfad0595c",
+            "cake_gdp_0ad4bbaf5ef274640c3a",
+            "cake_gdp_25d81fdd5cf38d846a0d",
+            "cake_gdp_2765b8c0ae143504657e",
+            "cake_gdp_68d934c41a0fbe0fb027",
         ],
     },
     "sm_107a": {
@@ -9676,6 +14532,18 @@ def route_modules(
     return tuple(names)
 
 
+def _waves_x2(waves: Any) -> int:
+    """Twice a wave bound of a select cell, an int: the bounds are multiples of 1/2 (a program of two CTAs per head
+    runs k x SM heads on 2 k CTAs per SM), so a half-wave edge compares exactly."""
+
+    doubled = 2 * waves
+    if isinstance(waves, bool) or doubled != int(doubled) or doubled <= 0:
+        raise ValueError(
+            f"a Cake GDP decode wave bound must be a positive multiple of 1/2, got {waves!r}"
+        )
+    return int(doubled)
+
+
 def _selects(
     rule: Any,
     state_heads: int,
@@ -9694,7 +14562,8 @@ def _selects(
     ``philox_rounds`` is 0 for a call that rounds to nearest even) and ``snapshot`` equal to the cell's when it
     names one (``True`` for a call that stores per-token snapshots).  A cell naming ``arches`` applies on those
     architectures only (a band that differs per architecture); a list of such cells is a band of several intervals
-    and admits when any cell does.  ``None`` (a runtime program without cells) admits everything."""
+    and admits when any cell does.  ``None`` (a runtime program without cells) admits everything.  Each wave bound
+    is a positive multiple of 1/2 and compares exactly."""
 
     if rule is None:
         return True
@@ -9739,13 +14608,17 @@ def _selects(
         rule.get("ctas_per_sm_at_least"),
         rule.get("ctas_per_sm_below"),
     )
-    if waves_at_most is not None and state_heads > int(waves_at_most) * sm_count:
+    state_heads2 = 2 * state_heads
+    if waves_at_most is not None and state_heads2 > _waves_x2(waves_at_most) * sm_count:
         return False
-    if waves_above is not None and state_heads <= int(waves_above) * sm_count:
+    if waves_above is not None and state_heads2 <= _waves_x2(waves_above) * sm_count:
         return False
-    if waves_at_least is not None and state_heads < int(waves_at_least) * sm_count:
+    if (
+        waves_at_least is not None
+        and state_heads2 < _waves_x2(waves_at_least) * sm_count
+    ):
         return False
-    if waves_below is not None and state_heads >= int(waves_below) * sm_count:
+    if waves_below is not None and state_heads2 >= _waves_x2(waves_below) * sm_count:
         return False
     return True
 
@@ -9770,13 +14643,14 @@ def selected_module(
 
     This is the band rule of the kernel (its ``band_variant``), spelled once as the records' ``select_rule``
     leaves: a route carries static-token-count programs (``build["t_steps"]`` = the call's ``T``), each owning a
-    band of state-head counts (``above < state_heads <= at_most`` within optional wave bounds, multiples of the SM
-    count; a band of several intervals is a list of such cells, and a cell may name the ``arches`` it applies to),
+    band of state-head counts (``above < state_heads <= at_most`` within optional wave bounds, multiples of half the
+    SM count; a band of several intervals is a list of such cells, and a cell may name the ``arches`` it applies to),
     and runtime-token-count programs (``build["t_steps"]`` ``None``, ``T`` up to ``build["max_t_steps"]``) for
     every other call.  Exactly one static program may admit a call; else the admitting runtime program with the
     fewest ``max_t_steps`` runs (two such programs are an error).  Only the records of the pool's dtype take part
-    (``build["state_dtype"]``, ``"f32"`` when absent): an FP16 record has the band of its FP32 twin, so both pools
-    select the same program body and variant.  The cells of an FP16 record may also bound the launch class
+    (``build["state_dtype"]``, ``"f32"`` when absent): an FP16 record has the band of its FP32 twin less the cells
+    of the row-split programs (SM90's FP16-only ``l8r2h`` programs, which take a call of their cells instead), so
+    outside those cells both pools select the same program body and variant.  The cells of an FP16 record may also bound the launch class
     (:func:`_selects`): a ``snapshot_noise`` sibling admits the stochastic calls with snapshots of its cell and its
     plain program every other call, so they split the band of one FP32 program between them.  An FP32 record has
     no class keys, so its choice does not depend on the launch class.
@@ -9899,6 +14773,8 @@ PREFILL_LOGICAL_TENSORS = (
     "ainv_workspace",
     "items",
     "split_workspace",
+    "output_state_indices",
+    "rand_seed",
 )
 PREFILL_LOGICAL_SCALARS = (
     "initial_state_stride_slot",
@@ -9914,6 +14790,7 @@ PREFILL_LOGICAL_SCALARS = (
     "state_stride_slot",
     "num_items",
     "flags",
+    "philox_rounds",
 )
 
 
@@ -10323,6 +15200,324 @@ def prefill_launch_plan(classes) -> list[tuple[str, list[int]]]:
 
 # ---- END BODY ROUTE OF RECORD ----
 
+# ---- BATCH BODY ROUTE (GDP prefill sm_90a: one body, one launch per call) ----
+# The backend runs a whole sm_90a call on ONE body in ONE launch; the per-sequence classes of the route of record only
+# decide whether the merged split body is a candidate (some sequence is merged-class).  The body is then the one of the
+# lesser modeled kernel time of the whole batch.  Both bodies run persistent CTAs that take their work strided (CTA
+# ``b`` of a grid of ``G`` runs work ``b, b + G, ...``) and a CTA's time is the sum of its chunk-steps, so the model
+# is the most loaded CTA: the V6 body over the ``N x H`` sequence-major tiles of each sequence's chunks, the merged
+# body over the ``split_table`` items (each item's chunks, plus ``ROUTE_WARMUP_CHUNKS`` for a cut past 0) on
+# ``min(sm_count, tiles)`` CTAs.  The step and base times are a fit of the H100 (132 SMs) kernel times
+# (2026-11-24: 88 workloads x two gate sets, each body forced on the whole batch; error within 3 %).
+ROUTE_BATCH_V6_STEP_NS = 2040  # one V6 chunk-step
+ROUTE_BATCH_V6_BASE_NS = 15000  # the V6 launch, seed and final store
+ROUTE_BATCH_P3_STEP_NS = 7570  # one merged-body chunk-step
+ROUTE_BATCH_P3_BASE_NS = 27000  # the merged launch, seed and final store
+
+
+def _most_loaded(loads: list[int], grid: int) -> int:
+    """The largest sum of ``loads[b::grid]`` over the ``grid`` CTAs (0 for no work)."""
+    if not loads:
+        return 0
+    return max(sum(loads[b::grid]) for b in range(grid))
+
+
+def prefill_batch_costs(
+    cu_seqlens,
+    n: int,
+    H: int,
+    sm_count: int,
+    total_tokens: int | None = None,
+) -> tuple[int, int]:
+    """The modeled kernel time of the whole batch under each body, ``(t_v6, t_p3)`` in nanoseconds: the base plus the
+    chunk-steps of the most loaded CTA at the body's step time (see the BATCH BODY ROUTE comment).  The merged body
+    runs the items of ``split_table`` (a sequence the rule leaves whole is one item per head)."""
+    chunks = route_chunk_steps(cu_seqlens, n, total_tokens)
+    tiles = [c for c in chunks for _ in range(H)]
+    if not tiles:
+        return 0, 0
+    t_v6 = ROUTE_BATCH_V6_BASE_NS + ROUTE_BATCH_V6_STEP_NS * _most_loaded(
+        tiles, min(sm_count, len(tiles))
+    )
+    items = [
+        min(span, chunks[seq] - cut) + (ROUTE_WARMUP_CHUNKS if cut > 0 else 0)
+        for seq, _head, cut, span in split_table(
+            cu_seqlens, n, H, sm_count, total_tokens=total_tokens
+        )
+    ]
+    t_p3 = ROUTE_BATCH_P3_BASE_NS + ROUTE_BATCH_P3_STEP_NS * _most_loaded(
+        items, min(sm_count, len(items))
+    )
+    return t_v6, t_p3
+
+
+def prefill_batch_body(
+    cu_seqlens,
+    n: int,
+    H: int,
+    sm_count: int,
+    *,
+    store_final_state: bool = True,
+    unit_gates: bool = False,
+    unit_beta: bool = False,
+    total_tokens: int | None = None,
+) -> str:
+    """The one body of a whole sm_90a call: ``ROUTE_BODY_P3`` for a unit-gate / unit-beta call (its exact unit
+    program), ``ROUTE_BODY_V6`` for a call without a final state and for a batch with no merged-class sequence (the
+    route of record), else the body of the lesser ``prefill_batch_costs`` (ties to V6).  A merged choice runs the
+    split program over ``split_table`` of the whole batch: every sequence, a short or empty one included, is in the
+    same launch (a sequence the rule leaves whole is one item per head, bitwise the merged single pass)."""
+    if unit_gates or unit_beta:
+        return ROUTE_BODY_P3
+    if not store_final_state:
+        return ROUTE_BODY_V6
+    classes = prefill_body_classes(
+        cu_seqlens, n, H, sm_count, store_final_state=True, total_tokens=total_tokens
+    )
+    if ROUTE_BODY_P3 not in classes:
+        return ROUTE_BODY_V6
+    t_v6, t_p3 = prefill_batch_costs(cu_seqlens, n, H, sm_count, total_tokens)
+    return ROUTE_BODY_P3 if t_p3 < t_v6 else ROUTE_BODY_V6
+
+
+# ---- END BATCH BODY ROUTE ----
+
+
+# ---- SM90 V6 WARM-UP SPLIT PLAN (GDP prefill sm_90a: the split twins of the V6 programs) ----
+# The V6 body's ``split_items`` programs (the plain, initial-state and pool-indexed flag sets, with per-CTA row lists
+# and the stale-plan guard) run one launch of persistent CTAs, one per SM, over a host table of rows ``(sequence,
+# head, cut, span)`` in chunk units (a chunk is 64 expanded rows: ``ceil(len n / 64)`` chunks per sequence):
+# * A sequence of ``chunks`` chunks is balanced when its slot ``slot = n ceil(ceil(H padded / G) / n)`` (``padded =
+#   n ceil(chunks / n)``: its head-major chunk space cut into ``G`` = SM count slots, each a whole number of
+#   blocks) is at least V6_SM90_MIN_SLOT chunks and shorter than a head, and a head holds at most V6_SM90_SPLIT_MAX
+#   cuts.  Its rows are ``(seq, head, cut, -slot)``: slot ``k`` covers chunks ``[k slot, (k + 1) slot)`` of that
+#   space, one row per head it touches; a cut fewer than V6_SM90_CUT_MIN chunks after its head start moves to the
+#   head start.  The cuts read the sequence's own length and the shape, never the rest of the batch.  At most
+#   V6_SM90_PLAN_ROWS // 2 sequences are balanced, the longest.
+# * Every other sequence is one whole-head row per head, ``(seq, head, 0, chunks)``.
+# * Placement: CTA ``k`` takes slot ``k`` of every balanced sequence, its cut-0 rows first; then each whole-head row,
+#   longest first, goes to the least-loaded CTA (several one-token rows fill the slack of the balanced slots).
+# * Choice: the facade runs the split program when a sequence is balanced and the plan's most loaded CTA (its rows'
+#   chunks, V6_SM90_ROW_COST per row and V6_SM90_WARMUP_COST per row after a cut) is lighter than the most loaded
+#   CTA of the V6 program over the ``N x H`` tiles (each tile's chunks and V6_SM90_ROW_COST, strided over
+#   ``min(SM count, N x H)`` CTAs): both run the same chunk step, so a batch whose tiles already fill the SMs (many
+#   sequences of one or two slots each) keeps the V6 program.
+# The device scans back from every cut past 0 until the log2 gate decay of the chunks before it reaches the build's
+# threshold (within a warm-up cap), runs that warm-up from a zero state and writes O from the cut on; a cut that does
+# not saturate is not taken (the previous row runs through it), so the result does not depend on the cuts beyond
+# rounding.  The row of a head's cut 0 seeds the state and raises a seed-done flag; the row that reaches the head's
+# end stores the final state after that flag (every CTA is resident at once: one CTA per SM, at most SM count CTAs).
+# The table is ``[4 R row words][grid + 1 offsets][N][N + 1 cu_seqlens]``; the guarded program compares the last two
+# with the device offsets and, when they differ, runs no row and writes NaN to ``o[0, 0, :2]`` and, when it stores
+# one, to the final state ``[0, 0, 0, 0]``.  The split workspace (``ainv_workspace``) holds the ``N x H`` seed-done
+# flags, zero at launch; the kernel leaves them zero.
+# Expanded rows per chunk of the V6 body.
+V6_SM90_CHUNK_ROWS = 64
+# A sequence of fewer chunks is one row per head.
+V6_SM90_MIN_CHUNKS = 24
+# Chunks: a shorter balanced slot pays more per-row fill than it gains.
+V6_SM90_MIN_SLOT = 24
+# A cut fewer chunks than this after its head start moves to the head start.
+V6_SM90_CUT_MIN = 24
+# At most this many cuts per head (the device's forward scan reaches every cut).
+V6_SM90_SPLIT_MAX = 48
+# Rows of a CTA's list the device decodes into its shared plan table.
+V6_SM90_PLAN_ROWS = 64
+# A row's modeled cost past its chunks, in chunk steps (decode, seed, fill, final store).
+V6_SM90_ROW_COST = 3
+# The modeled warm-up of a row after a cut (the device decides it).
+V6_SM90_WARMUP_COST = 6
+
+
+class V6Sm90Plan(NamedTuple):
+    """One launch of a V6 split program on sm_90a: the rows in table order, the grid (the SM count when a sequence is
+    balanced) and the ``grid + 1`` offsets of the CTAs' row lists (CTA ``b`` runs rows ``offsets[b] ..
+    offsets[b + 1] - 1``).  ``split`` is whether the facade runs the split program for the batch: some sequence is
+    balanced and the plan's most loaded CTA, ``load``, is lighter than the V6 program's, ``serial_load`` (both in
+    chunk steps)."""
+
+    rows: tuple[tuple[int, int, int, int], ...]
+    offsets: tuple[int, ...]
+    grid: int
+    split: bool
+    load: int
+    serial_load: int
+
+
+def v6_sm90_chunks(
+    cu_seqlens: Sequence[int], n: int, total_tokens: int | None = None
+) -> list[int]:
+    """The V6 chunk count of each sequence as the device reads ``cu_seqlens``: ``ceil(len n / 64)``."""
+    raw = [int(x) for x in cu_seqlens]
+    total = raw[-1] if total_tokens is None else int(total_tokens)
+    out = []
+    for q in range(len(raw) - 1):
+        start, end = split_sequence_bounds(raw[q], raw[q + 1], total)
+        out.append(-(-(end - start) * int(n) // V6_SM90_CHUNK_ROWS))
+    return out
+
+
+def _v6_sm90_padded(chunks: int, n: int) -> int:
+    return n * -(-chunks // n)
+
+
+def v6_sm90_slot(chunks: int, H: int, n: int, slots: int) -> int:
+    """The balanced slot of a sequence of ``chunks`` chunks on ``slots`` slots, 0 when it is not balanced."""
+    if chunks < V6_SM90_MIN_CHUNKS:
+        return 0
+    padded = _v6_sm90_padded(chunks, n)
+    per_slot = -(-(H * padded) // slots)
+    slot = n * -(-per_slot // n)
+    if not V6_SM90_MIN_SLOT <= slot < padded or padded > (V6_SM90_SPLIT_MAX - 1) * slot:
+        return 0
+    return slot
+
+
+def _v6_sm90_slot_rows(
+    seq: int, chunks: int, H: int, n: int, slot: int
+) -> list[list[tuple[int, int, int, int]]]:
+    """The rows of a balanced sequence per slot, each slot's cut-0 rows first."""
+    padded = _v6_sm90_padded(chunks, n)
+    total = H * padded
+    pieces: list[list[list[int]]] = []
+    for k in range(-(-total // slot)):
+        lo, hi = k * slot, min((k + 1) * slot, total)
+        here = []
+        while lo < hi:
+            head, cut = lo // padded, lo % padded
+            if cut < chunks:
+                here.append([seq, head, cut, -slot])
+            lo = (head + 1) * padded if hi > (head + 1) * padded else hi
+        pieces.append(here)
+    for head in range(H):
+        rows = [r for slot_rows in pieces for r in slot_rows if r[1] == head]
+        first = min((r[2] for r in rows if r[2] > 0), default=None)
+        if first is not None and first < V6_SM90_CUT_MIN:
+            for slot_rows in pieces:
+                slot_rows[:] = [
+                    r for r in slot_rows if not (r[1] == head and r[2] == 0)
+                ]
+            for r in rows:
+                if r[2] == first:
+                    r[2] = 0
+    return [
+        [
+            (r[0], r[1], r[2], r[3])
+            for r in sorted(slot_rows, key=lambda r: 0 if r[2] == 0 else 1)
+        ]
+        for slot_rows in pieces
+    ]
+
+
+def _v6_sm90_row_cost(row: Sequence[int], chunks: int, n: int) -> int:
+    """The modeled cost of a row in chunk steps: its chunks (to the next planned cut for a balanced row), plus
+    V6_SM90_ROW_COST and, after a cut, V6_SM90_WARMUP_COST."""
+    _seq, head, cut, span = row
+    if span < 0:
+        slot, padded = -span, _v6_sm90_padded(chunks, n)
+        at = head * padded + cut
+        end = min((at // slot + 1) * slot - head * padded, chunks)
+        if cut == 0 and end < V6_SM90_CUT_MIN:
+            end = min(end + slot, chunks)
+    else:
+        end = chunks
+    return (
+        max(end - cut, 0) + V6_SM90_ROW_COST + (V6_SM90_WARMUP_COST if cut > 0 else 0)
+    )
+
+
+def v6_sm90_serial_load(chunks: Sequence[int], H: int, sm_count: int) -> int:
+    """The most loaded CTA of the V6 program over the ``N x H`` sequence-major tiles of sequences of ``chunks``
+    chunks, strided over ``min(sm_count, N x H)`` persistent CTAs, in chunk steps (a tile costs its chunks and
+    V6_SM90_ROW_COST)."""
+    tiles = [c + V6_SM90_ROW_COST for c in chunks for _ in range(int(H))]
+    if not tiles:
+        return 0
+    grid = min(int(sm_count), len(tiles))
+    return max(sum(tiles[b::grid]) for b in range(grid))
+
+
+def prefill_v6_sm90_plan(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    total_tokens: int | None = None,
+) -> V6Sm90Plan:
+    """The plan of a V6 split program for the host offsets ``cu_seqlens`` (``N + 1`` integers; ``total_tokens``
+    defaults to the last) on a device of ``sm_count`` SMs (see the rule above)."""
+    H, n, sm_count = int(num_heads), int(num_householder), int(sm_count)
+    if sm_count <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    chunks = v6_sm90_chunks(cu_seqlens, n, total_tokens)
+    slot_of = {q: v6_sm90_slot(c, H, n, sm_count) for q, c in enumerate(chunks)}
+    balanced = sorted(
+        sorted((q for q, s in slot_of.items() if s), key=lambda q: (-chunks[q], q))[
+            : V6_SM90_PLAN_ROWS // 2
+        ]
+    )
+    chosen = set(balanced)
+    whole = [
+        (q, h, 0, chunks[q])
+        for q in range(len(chunks))
+        if q not in chosen
+        for h in range(H)
+    ]
+    slot_rows = {
+        q: _v6_sm90_slot_rows(q, chunks[q], H, n, slot_of[q]) for q in balanced
+    }
+    total_rows = sum(len(r) for q in balanced for r in slot_rows[q]) + len(whole)
+    grid = sm_count if balanced else max(1, min(sm_count, total_rows))
+    lists: list[list[tuple[int, int, int, int]]] = [[] for _ in range(grid)]
+    load = [0] * grid
+    for q in balanced:
+        for k, rows in enumerate(slot_rows[q]):
+            for row in rows:
+                lists[k].append(row)
+                load[k] += _v6_sm90_row_cost(row, chunks[q], n)
+    for b in range(grid):
+        lists[b].sort(key=lambda r: 0 if r[2] == 0 else 1)  # stable: cut-0 rows first
+        if len(lists[b]) > V6_SM90_PLAN_ROWS:
+            raise ValueError(
+                f"CTA {b} of the sm_90a split plan has {len(lists[b])} balanced rows, more than its plan table's "
+                f"{V6_SM90_PLAN_ROWS}"
+            )
+    # each whole-head row, longest first, to the least-loaded CTA (ties to the lower index)
+    heap = [(load[b], b) for b in range(grid)]
+    heapq.heapify(heap)
+    for row in sorted(whole, key=lambda r: -_v6_sm90_row_cost(r, chunks[r[0]], n)):
+        cost = _v6_sm90_row_cost(row, chunks[row[0]], n)
+        least, b = heapq.heappop(heap)
+        lists[b].append(row)
+        load[b] = least + cost
+        heapq.heappush(heap, (load[b], b))
+    offsets = (0, *itertools.accumulate(len(x) for x in lists))
+    most = max(load, default=0)
+    serial = v6_sm90_serial_load(chunks, H, sm_count)
+    return V6Sm90Plan(
+        rows=tuple(r for x in lists for r in x),
+        offsets=offsets,
+        grid=grid,
+        split=bool(balanced) and most < serial,
+        load=most,
+        serial_load=serial,
+    )
+
+
+def v6_sm90_item_words(plan: V6Sm90Plan, cu_seqlens: Sequence[int]) -> tuple[int, ...]:
+    """The int32 words of a V6 split program's item table (formal 9, ``output_slot_indices``): the rows (4 words
+    each), the ``grid + 1`` row offsets, then the planned sequence count ``N`` and the ``N + 1`` host offsets
+    ``cu_seqlens`` the plan was made from (the stale-plan guard)."""
+    cu = [int(c) for c in cu_seqlens]
+    words = [int(w) for row in plan.rows for w in row]
+    words.extend(int(o) for o in plan.offsets)
+    words.extend((len(cu) - 1, *cu))
+    return tuple(words)
+
+
+# ---- END SM90 V6 WARM-UP SPLIT PLAN ----
+
 
 # ---- BLACKWELL V6 LAUNCH PLAN (sm_100a / sm_103a prefill) ----
 # The Blackwell prefill body (``prefill_bw_v6``) runs persistent CTAs over a host item table of rows ``(sequence,
@@ -10350,6 +15545,13 @@ V6_SPLIT_WS_PLACEHOLDER = (
 )
 V6_FLAG_INITIAL_STATE = 1
 V6_FLAG_FINAL_STATE = 2
+# The state forms of the Blackwell body's programs: the state dtype as the records' builds spell it (``state_dtype``;
+# an FP32 record spells none) and whether the program addresses slot pools (``use_state_indices``).
+PREFILL_STATE_DTYPES: dict[torch.dtype, str] = {
+    torch.float32: "f32",
+    torch.bfloat16: "bf16",
+    torch.float16: "f16",
+}
 
 
 # ---- INFERENCE PLACEMENT (inference split builds: host rule, no kernel change) ----
@@ -10570,10 +15772,18 @@ def v6_item_words(
     return tuple(words)
 
 
-def v6_route_builds(arch: str) -> dict[bool, str]:
-    """``split_items -> program`` of the Blackwell prefill body on ``arch``."""
+def v6_state_form(name: str) -> tuple[str, bool]:
+    """The state form of the Blackwell prefill program ``name``: its state dtype (``"f32"``, ``"bf16"`` or
+    ``"f16"``) and whether it addresses slot pools."""
 
-    builds: dict[bool, str] = {}
+    build = MODULES[name]["build"]
+    return str(build.get("state_dtype", "f32")), bool(
+        build.get("use_state_indices", False)
+    )
+
+
+def _v6_route_names(arch: str) -> tuple[str, ...]:
+    names = []
     for name in ROUTES.get(arch, {}).get(PREFILL_ROUTE, ()):
         record = MODULES[name]
         if record["body"] != V6_BODY:
@@ -10583,13 +15793,34 @@ def v6_route_builds(arch: str) -> dict[bool, str]:
             raise ValueError(
                 f"not a Cake GDP Blackwell prefill selection rule: {rule!r}"
             )
-        split = bool(rule["split_items"])
+        names.append(name)
+    return tuple(names)
+
+
+def v6_route_builds(
+    arch: str, state_dtype: str = "f32", pool: bool = False
+) -> dict[bool, str]:
+    """``split_items -> program`` of the Blackwell prefill body on ``arch`` for one state form: the programs whose
+    build stores ``state_dtype`` (``"f32"``, ``"bf16"`` or ``"f16"``) and addresses slot pools when ``pool``."""
+
+    builds: dict[bool, str] = {}
+    for name in _v6_route_names(arch):
+        if v6_state_form(name) != (state_dtype, bool(pool)):
+            continue
+        split = bool(MODULES[name]["select_rule"]["split_items"])
         if split in builds:
             raise ValueError(
-                f"two Blackwell prefill programs on {arch} with split_items={split}"
+                f"two Blackwell prefill programs on {arch} with split_items={split}, "
+                f"state_dtype={state_dtype!r} and pool={bool(pool)}"
             )
         builds[split] = name
     return builds
+
+
+def v6_state_forms(arch: str) -> set[tuple[str, bool]]:
+    """The state forms ``(state_dtype, pool)`` the Blackwell prefill programs of ``arch`` ship."""
+
+    return {v6_state_form(name) for name in _v6_route_names(arch)}
 
 
 def v6_householders(arch: str) -> set[int]:
@@ -10597,19 +15828,23 @@ def v6_householders(arch: str) -> set[int]:
     a build constant)."""
 
     return {
-        int(MODULES[name]["build"]["householders"])
-        for name in v6_route_builds(arch).values()
+        int(MODULES[name]["build"]["householders"]) for name in _v6_route_names(arch)
     }
 
 
-def selected_v6_module(arch: str, plan: V6Plan) -> str:
-    """The program of the Blackwell prefill body on ``arch`` that ``plan`` launches."""
+def selected_v6_module(
+    arch: str, plan: V6Plan, *, state_dtype: str = "f32", pool: bool = False
+) -> str:
+    """The program of the Blackwell prefill body on ``arch`` that ``plan`` launches for one state form: the dense
+    FP32 programs by default, the slot-pool programs of ``state_dtype`` with ``pool`` (a 16-bit state is a pool
+    program only)."""
 
-    builds = v6_route_builds(arch)
+    builds = v6_route_builds(arch, state_dtype, pool)
     if plan.split not in builds:
         raise ValueError(
-            f"no Blackwell prefill program on {arch} with split_items={plan.split}; "
-            f"the route ships {sorted(builds)}"
+            f"no Blackwell prefill program on {arch} with split_items={plan.split}, "
+            f"state_dtype={state_dtype!r} and pool={bool(pool)}; the route ships the forms "
+            f"{sorted(v6_state_forms(arch))}"
         )
     return builds[plan.split]
 
@@ -10663,7 +15898,7 @@ def launch_grid(
 ) -> tuple[int, int, int]:
     """Launch grid of one module under its recorded grid rule.  ``state_heads`` (decode): ``ceil(B x HV /
     heads_per_cta) x ctas_per_state`` CTAs (``heads_per_cta`` defaults to one: one CTA per batch row and head for the
-    lane-owns-rows body, eight per state head for ``splitv8_tile8``); ``batch`` and ``heads`` must be positive.
+    lane-owns-rows body, two for SM90's row-split programs, eight per state head for ``splitv8_tile8``); ``batch`` and ``heads`` must be positive.
     ``tiles`` (prefill): ``min(sm_count, tiles)`` persistent CTAs over the host's ``N x H`` tile count, both
     positive.  The public API refuses an empty call before reaching here."""
 
@@ -10783,6 +16018,7 @@ __all__ = [
     "PREFILL_LOGICAL_TENSORS",
     "PREFILL_ROUTE",
     "PREFILL_SPLIT_FLAG",
+    "PREFILL_STATE_DTYPES",
     "ROUTES",
     "ROUTE_BODIES",
     "ROUTE_BODY_P3",
@@ -10791,6 +16027,7 @@ __all__ = [
     "STATE_DTYPES",
     "STATE_STRIDE_ELEMENTS",
     "V6Plan",
+    "V6Sm90Plan",
     "V6_ARCHES",
     "V6_BODY",
     "arch_for_capability",
@@ -10802,6 +16039,8 @@ __all__ = [
     "library_name",
     "load",
     "max_num_tokens",
+    "prefill_batch_body",
+    "prefill_batch_costs",
     "prefill_body_class",
     "prefill_body_classes",
     "prefill_body_costs",
@@ -10810,6 +16049,7 @@ __all__ = [
     "prefill_route_modules",
     "prefill_split_table",
     "prefill_v6_plan",
+    "prefill_v6_sm90_plan",
     "route_applies",
     "route_chunk_steps",
     "route_key",
@@ -10825,4 +16065,8 @@ __all__ = [
     "state_dtype_key",
     "supported_num_householder",
     "v6_householders",
+    "v6_sm90_item_words",
+    "v6_sm90_serial_load",
+    "v6_state_form",
+    "v6_state_forms",
 ]

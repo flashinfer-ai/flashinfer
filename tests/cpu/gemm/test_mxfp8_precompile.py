@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -191,12 +192,8 @@ def test_worker_builds_fp8_persistent_and_splitk_contract(monkeypatch, tactic):
         "_make_blockscaled_gemm_compile_fn",
         lambda gemm, **kw: compiled.append(kw),
     )
-    monkeypatch.setattr(
-        cute_dsl_core.JitSpecCuteDsl, "is_compiled", property(lambda self: False)
-    )
-    monkeypatch.setattr(
-        cute_dsl_core.JitSpecCuteDsl, "compile_and_persist", lambda self: None
-    )
+    persist = Mock()
+    monkeypatch.setattr(cute_dsl_core.JitSpecCuteDsl, "compile_and_persist", persist)
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_103a")
     tile, cluster, swap, prefetch, slices = tactic
     payload = dict(
@@ -212,6 +209,7 @@ def test_worker_builds_fp8_persistent_and_splitk_contract(monkeypatch, tactic):
         source_sha256="test",
     )
     assert precompile._mm_mxfp8_precompile_worker(payload) == ("test", None)
+    persist.assert_called_once_with(force=False)
     expected = (
         ("splitk", (32, tile, slices, True))
         if slices > 1
@@ -316,3 +314,85 @@ def test_top_n_preserves_splitk_and_full_search_order():
     assert set(bounded) <= set(candidates)
     with pytest.raises(ValueError, match="budget"):
         _rank_mm_mxfp8_autotune_tactics(candidates, 8, 512, 4096, 148, 1)
+
+
+@pytest.mark.parametrize("sm_minor,low_m_only", [(0, False), (3, False), (7, True)])
+def test_runner_tactic_pool_signature_follows_budget(monkeypatch, sm_minor, low_m_only):
+    from flashinfer.gemm import gemm_base
+
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(
+        10, sm_minor, False, torch.bfloat16, low_m_only=low_m_only
+    )
+    name = "FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS"
+    monkeypatch.delenv(name, raising=False)
+    assert runner.get_tactic_cache_key([]) == ("max_tactics", 0)
+    monkeypatch.setenv(name, "0")
+    assert runner.get_tactic_cache_key([]) == ("max_tactics", 0)
+    monkeypatch.setenv(name, "32")
+    assert runner.get_tactic_cache_key([]) == ("max_tactics", 32)
+    monkeypatch.setenv(name, "-1")
+    with pytest.raises(ValueError, match="nonnegative"):
+        runner.get_tactic_cache_key([])
+
+
+def test_budget_change_retunes_through_autotuner(monkeypatch):
+    from flashinfer.autotuner import AutoTuner, TuningConfig, autotune
+    from flashinfer.gemm import gemm_base
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    persistent = [
+        ((128, n), (1, 1), swap, False)
+        for n in (64, 128, 192, 256)
+        for swap in (False, True)
+    ]
+    monkeypatch.setattr(
+        gemm_base, "_get_sm100_block_scaled_tactics", lambda **kwargs: persistent
+    )
+    monkeypatch.setattr(gemm_base, "get_device_sm_count", lambda device: 148)
+    monkeypatch.setattr(gemm_base, "precompile_mm_mxfp8_tactics", lambda *args: None)
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 0, False, torch.bfloat16)
+    # M above the split-K limit, so every candidate is a persistent tactic.
+    m, n, k = 256, 512, 4096
+    inputs = [
+        torch.empty(m, k),
+        torch.empty(k, n),
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(m, n, dtype=torch.bfloat16),
+        torch.empty(1),
+    ]
+    full = runner.get_valid_tactics(inputs, None)
+    monkeypatch.setenv("FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS", "2")
+    budgeted = runner.get_valid_tactics(inputs, None)
+    assert len(budgeted) == 2 and set(budgeted) < set(full)
+    # The fastest tactic is one the budget leaves out.
+    fastest = next(t for t in full if t not in budgeted)
+    calls = []
+
+    def profile(self, runner, inputs, tactic, config, **kwargs):
+        calls.append(tactic)
+        return 1.0 if tactic == fastest else 5.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    config = TuningConfig()
+    with autotune():
+        assert tuner.choose_one("mxfp8_budget", [runner], config, inputs)[1] != fastest
+    assert set(calls) == set(budgeted)
+
+    # Returning to the full search must compare the tactics the budget dropped.
+    monkeypatch.setenv("FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS", "0")
+    calls.clear()
+    with autotune():
+        assert tuner.choose_one("mxfp8_budget", [runner], config, inputs)[1] == fastest
+    assert set(calls) == set(full)
+
+    # An unchanged budget reuses the winner without profiling.
+    calls.clear()
+    with autotune():
+        assert tuner.choose_one("mxfp8_budget", [runner], config, inputs)[1] == fastest
+    assert calls == []

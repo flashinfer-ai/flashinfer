@@ -1837,11 +1837,12 @@ def test_localized_weights_homed_through_full_aliases():
 
 
 @_packed_serving
-def test_localize_weights_refuses_what_could_run_slower(monkeypatch):
+def test_localize_weights_refuses_shapes_without_a_listed_twin(monkeypatch):
     """``localize_weights`` returns ``b`` itself for weights of a non-serving
-    shape or dtype, for a shape with an expected_m whose cell is not listed, and
-    for a cut off the allocation granularity; it raises for a ``g_cut`` outside
-    ``[0, B]``."""
+    shape or dtype, for a shape with an expected_m below the homed low bound whose
+    cell lists no twin, and for a cut off the allocation granularity; it raises
+    for a ``g_cut`` outside ``[0, B]``.  (Homing is a trade-off over
+    ``expected_m``; this tests the refusals, not that homed weights are faster.)"""
     import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
 
     device, table = _require_domain()

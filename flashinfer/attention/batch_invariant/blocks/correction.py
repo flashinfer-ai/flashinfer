@@ -15,7 +15,10 @@ row's statistics chain**. Per tile it receives from the softmax warpgroups ``alp
 * the epilogue, holding the accumulator until its reads are done (the next unit's first PV overwrites
   it): the unit's last chunk merged the same way, then ``cvt_bf16(add(mul(O, div(1, l)), +0))`` to the
   output rows (mode 0), or the raw fp32 ``O_c`` rows and ``(m, l)`` to the workspace slot (mode 1, folded
-  by ``fixup.py``).
+  by ``fixup.py``); a mode 0 row's thread also stores the LSE member of its final ``(m, l)`` when asked (``lse.store_lse``).
+  In a kernel compiled for attention sinks (``st.sinks``) a mode 0 row's normaliser is the sink step's
+  (``lse.row_normaliser``: one scalar per row in the place of ``div(1, l)``); a mode 1 row is stored without it, the fold
+  that completes the row takes the step.
 
 TMEM traffic goes through ``tcgen05.copy.Ld32x32bOp`` / ``St32x32bOp`` in ``CT``-column pieces (``StaticPlan.ct``: 32 at
 128 registers, 16 below, 8 under the paired placement whose warpgroup carries two Q tiles' chains at 96). A merge with an ``O_m``
@@ -39,6 +42,7 @@ from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant.fp_interface.cute import CuteF32
 from ..fixup import VEC, fold_row
+from ..lse import row_normaliser, store_lse
 from ..plan import (
     G_CHUNK_LO,
     G_KVHEAD,
@@ -643,6 +647,9 @@ def correction_loop(
     tile_hi: Int32,
     mode: Int32,
     slot_base: Int32,
+    mLse: cute.Tensor,
+    mSink: cute.Tensor,
+    lse_mode: Int32,
 ):
     """``tOtOm`` is the TMEM ``O_m`` (``None`` at D = 256, whose ``O_m`` is row ``(cta, lane)`` of ``mScratch``)."""
     D, g, TPC = st.D, st.g, st.tpc
@@ -779,7 +786,9 @@ def correction_loop(
             else:
                 m_r = m
                 l_r = l
-    inv = CuteF32.div(Float32(1.0), l_r)
+    inv, m_f, l_f = row_normaliser(
+        mSink, kv_head * g + row % g, m_r, l_r, c, st.sinks, mode != 0
+    )
     out_row = (q_base + token) * Hq + kv_head * g + row % g
     o_cons = epilogue(
         a1,
@@ -814,6 +823,8 @@ def correction_loop(
         om_tmem,
         WS,
     )
+    if (mode == 0) & (lse_mode > 0) & row_valid:
+        store_lse(mLse, out_row, m_f, l_f, c, lse_mode, st.sinks)
     return o_cons, stats_cons
 
 
@@ -830,6 +841,9 @@ def fold_group(
     nc: Float32,
     window_left: Int32,
     Hq: Int32,
+    mLse: cute.Tensor,
+    mSink: cute.Tensor,
+    lse_mode: Int32,
 ):
     """The in-kernel chunk fold of a split group (``grp >= 0``: this unit's group is folded in-kernel). After the unit's partial rows
     are written (``epilogue``, mode 1) every correction thread fences them to GPU scope and the warpgroup counts its arrival on the
@@ -889,7 +903,11 @@ def fold_group(
                         chunk_len(st.D),
                         8 if st.n_wg == 1 else 4,
                         st.ws_row,
+                        mLse,
+                        mSink,
+                        lse_mode,
                         causal=st.causal,
+                        sinks=st.sinks,
                     )
             if thread_idx == 0:
                 mCounters[grp] = Int32(
@@ -1034,6 +1052,9 @@ def correction_loop_q2(
     hi_b: Int32,
     mode_b: Int32,
     slot_b: Int32,
+    mLse: cute.Tensor,
+    mSink: cute.Tensor,
+    lse_mode: Int32,
 ):
     """The paired placement's correction warpgroup: both Q tiles' statistics chains, O_c (Q tile B's at ``tmem_q2_stride`` columns past
     A's) and O_m (smem ``sOm``: tile k's 128 x D fp32 block at ``k 128 D``, the row-interleaved layout of ``operands.OM_VEC``), stepped A then B per tile of the union of their ranges (the MMA warp's PV_A(t), PV_B(t) order: no wait of one
@@ -1189,7 +1210,9 @@ def correction_loop_q2(
                 )
             )
     if hi_a > lo_a:
-        inv_a = CuteF32.div(Float32(1.0), lr_a)
+        inv_a, mf_a, lf_a = row_normaliser(
+            mSink, kv_head * g + row % g, mr_a, lr_a, c, st.sinks, mode_a != 0
+        )
         out_a = (q_base + tok_a + row // g) * Hq + kv_head * g + row % g
         o_cons_a = epilogue(
             a1_a,
@@ -1224,8 +1247,12 @@ def correction_loop_q2(
             st.om_tmem,
             WS,
         )
+        if (mode_a == 0) & (lse_mode > 0) & rv_a:
+            store_lse(mLse, out_a, mf_a, lf_a, c, lse_mode, st.sinks)
     if has_b:
-        inv_b = CuteF32.div(Float32(1.0), lr_b)
+        inv_b, mf_b, lf_b = row_normaliser(
+            mSink, kv_head * g + row % g, mr_b, lr_b, c, st.sinks, mode_b != 0
+        )
         out_b = (q_base + tok_b + row // g) * Hq + kv_head * g + row % g
         o_cons_b = epilogue(
             a1_b,
@@ -1260,4 +1287,6 @@ def correction_loop_q2(
             st.om_tmem,
             WS,
         )
+        if (mode_b == 0) & (lse_mode > 0) & rv_b:
+            store_lse(mLse, out_b, mf_b, lf_b, c, lse_mode, st.sinks)
     return o_cons_a, o_cons_b, stats_cons_a, stats_cons_b

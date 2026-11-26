@@ -85,7 +85,6 @@ def dispatched(monkeypatch):
         ("auto", "mxfp8_e4m3", "sm107.mxfp8_mxfp8_bf16_cutedsl"),
         ("sm107", "mxfp8_e5m2", "sm107.mxfp8_mxfp8_bf16_cutedsl"),
         ("auto", "mxfp4_mxfp8", "sm107.mxfp8_mxfp4_bf16_cutedsl"),
-        ("sm100", "nvfp4", "sm100.nvfp4_nvfp4_bf16_cutedsl"),
         ("sm100", "bf16", "sm100.bf16_bf16_bf16_cutedsl"),
         ("sm100", "bf16_mxfp8_e4m3", "sm100.bf16_mxfp8_bf16_cutedsl"),
         ("sm100", "bf16_mxfp8_e5m2", "sm100.bf16_mxfp8_bf16_cutedsl"),
@@ -96,6 +95,21 @@ def dispatched(monkeypatch):
 def test_tuner_dispatch(arch, dtype, backend, dispatched):
     assert tune.main([*_GEOMETRY, "--arch", arch, "--dtype", dtype]) == 17
     assert dispatched == [f".backends.mega.kernel.{backend}.tuner"]
+
+
+@pytest.mark.cpu_only
+def test_bare_sm100_command_tunes_serving_nvfp4(dispatched, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    assert tune.main(_GEOMETRY) == 17
+    assert dispatched == [".backends.mega.kernel.sm100.next_tuning"]
+
+
+@pytest.mark.cpu_only
+def test_blackwell_nvfp4_legacy_tuner_is_explicit(dispatched):
+    assert (
+        tune.main([*_GEOMETRY, "--arch", "sm100", "--implementation", "legacy"]) == 17
+    )
+    assert dispatched == [".backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner"]
 
 
 @pytest.mark.cpu_only
@@ -134,9 +148,21 @@ def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
         ["--arch", "sm90", "--dtype", "nvfp4"],
         ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "nvfp4"],
         ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "mxfp8"],
-        ["--arch", "sm100", "--activation", "situ"],
-        ["--arch", "sm100", "--situ-beta", "1.0"],
-        ["--arch", "sm100", "--fc1-alpha", "0.5"],
+        ["--arch", "sm100", "--implementation", "legacy", "--activation", "situ"],
+        ["--arch", "sm100", "--implementation", "legacy", "--situ-beta", "1.0"],
+        ["--arch", "sm100", "--implementation", "legacy", "--fc1-alpha", "0.5"],
+        ["--arch", "sm100", "--implementation", "legacy", "--dtype", "mxfp8_e4m3"],
+        [
+            "--arch",
+            "sm100",
+            "--implementation",
+            "legacy",
+            "--kernel-variant",
+            "genphase",
+        ],
+        ["--arch", "sm107", "--implementation", "legacy"],
+        ["--dtype", "sm90_mxfp4", "--implementation", "legacy"],
+        ["--dtype", "sm120_mxfp4_mxfp8", "--implementation", "legacy"],
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
         ["--arch", "sm100", "--kernel-variant", "auto"],
@@ -403,8 +429,11 @@ def test_sm107_quantized_combine_reaches_tuner(dtype, combine_dtype, dispatched)
     "options",
     [[], ["--no-do-finalize", "--no-apply-routing-weights-before-fc2"]],
 )
-@pytest.mark.parametrize("implementation", ["default", "next"])
-def test_next_blackwell_dispatch(kind, options, implementation, dispatched):
+@pytest.mark.parametrize(
+    "implementation",
+    [[], ["--implementation", "default"], ["--implementation", "next"]],
+)
+def test_standard_blackwell_dispatch(kind, options, implementation, dispatched):
     assert (
         tune.main(
             [
@@ -413,16 +442,10 @@ def test_next_blackwell_dispatch(kind, options, implementation, dispatched):
                 "sm100",
                 "--dtype",
                 kind,
-                "--implementation",
-                implementation,
+                *implementation,
                 *options,
             ]
         )
         == 17
     )
-    expected = (
-        ".backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner"
-        if kind == "nvfp4" and implementation == "default"
-        else ".backends.mega.kernel.sm100.next_tuning"
-    )
-    assert dispatched == [expected]
+    assert dispatched == [".backends.mega.kernel.sm100.next_tuning"]

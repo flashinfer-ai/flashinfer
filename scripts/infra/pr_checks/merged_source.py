@@ -85,8 +85,10 @@ class MergedSource:
                         if not path.is_absolute():
                             path = reference / path
                         if path.is_dir():
+                            # Git reads the path up to the line feed; a platform line
+                            # ending (\r\n on Windows) would become part of the path.
                             (self.root / ".git/objects/info/alternates").write_text(
-                                str(path.resolve()) + "\n"
+                                str(path.resolve()) + "\n", newline="\n"
                             )
             self.git("remote", "add", "origin", f"https://github.com/{repository}.git")
             for sha in (base_sha, head_sha):

@@ -277,8 +277,6 @@ def _get_compiled_gather_kernel(
     # locality-domain half-GEMM (Rubin only, compile-time - IN cache key)
     localized_half_gemm: bool = False,
     pre_fc2_routing: bool = False,
-    # SM100-family kernel only: tanh.approx ClampedRelu2 clamp (compile-time - IN cache key)
-    clamped_relu2_tanh_approx: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -332,7 +330,6 @@ def _get_compiled_gather_kernel(
         gated,
         use_a_per_token_scale,
         pre_fc2_routing,
-        clamped_relu2_tanh_approx,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -415,7 +412,6 @@ def _get_compiled_gather_kernel(
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
                 pre_fc2_routing=pre_fc2_routing,
-                clamped_relu2_tanh_approx=clamped_relu2_tanh_approx,
             )
         wrapper_fn = gemm.wrapper
 
@@ -607,7 +603,9 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             square and the weighted value to BF16, then quantizes to NVFP4
             with ``global_scale`` of the row's expert. Requires non-gated
             ClampedRelu2 with NVFP4 output, ``mma_tiler_mn=(128, 128)`` and
-            ``cluster_shape_mn=(1, 1)``; SM100/SM103 only.
+            ``cluster_shape_mn=(1, 1)``; SM100/SM103 only. Padding rows of
+            ``out`` and ``out_scale`` (rows of a tile past its
+            ``tile_idx_to_mn_limit``) may be left unwritten.
 
     Returns:
         Tuple of:
@@ -782,18 +780,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             f"mma_tiler/mma_inst_shape select the Rubin (SM107) kernel, but "
             f"the device is SM{major}{minor}."
         )
-
-    # MXFP8 x MXFP8 ClampedRelu2 on SM107 (Rubin) runs the SM100-family kernel
-    # with a tanh.approx.f32 soft clamp, which is on the FC1 epilogue's critical
-    # path there. Every other device and configuration compiles the unchanged
-    # sigmoid-based clamp.
-    clamped_relu2_tanh_approx = (
-        not is_rubin
-        and minor == 7
-        and a_dtype == "float8_e4m3fn"
-        and b_dtype == "float8_e4m3fn"
-        and normalized_activation_type == ActivationType.ClampedRelu2
-    )
 
     localized_half_gemm = domain_id >= 0
     if localized_half_gemm:
@@ -1087,7 +1073,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         use_a_per_token_scale=use_a_per_token_scale,
         localized_half_gemm=localized_half_gemm,
         pre_fc2_routing=pre_fc2_routing,
-        clamped_relu2_tanh_approx=clamped_relu2_tanh_approx,
     )
 
     # Execute kernel with runtime parameters.
