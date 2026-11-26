@@ -31,9 +31,19 @@ the max_seq_len 2049 where the listed ranges of B200 and GB300 start):
   and the binding's caps equal the host's (no GPU needed);
 - more than 32 splits (the wide reducer build), forced at 33, 37, 38, 48 and 64
   splits and at the counts the rule picks: on live rows accuracy against FP64 at
-  the level of TRTLLM-GEN (as above, three draws), padded rows are exact zeros,
+  the level of TRTLLM-GEN (as above, three draws), padded rows hold +0,
   and the bits are run-to-run identical, eager and under CUDA-graph replay; 65
-  splits have no dispatch route.
+  splits have no dispatch route;
+- the wide reducer also reads ``seq_lens`` after its dependency wait and merges
+  only a row's splits that hold KV tiles: rows with fewer KV tiles than splits
+  and rows without KV token, with and without a sink, at forced 33, 37 and 64
+  splits, against FP64 at the level of TRTLLM-GEN; and a graph captured at one
+  row of KV 131072 and 64 splits follows in-place ``seq_lens`` updates (full, no
+  KV token and back, short).
+
+Bit comparisons between two outputs view them as int16, so -0 and +0 differ
+(``torch.equal`` treats them as equal). Padded rows of the wide reducer must hold
+the bits of +0; those of the narrow reducers are compared as values (exact zeros).
 """
 
 import math
@@ -243,6 +253,11 @@ def _nan_out(query):
     )
 
 
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """The two BF16 tensors hold the same bits (-0 and +0 differ)."""
+    return torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
 def _bf16_ulp(value: float) -> float:
     """One BF16 unit in the last place at ``value`` (8 significand bits)."""
     if value <= 0:
@@ -311,7 +326,7 @@ def test_splitkv_matches_trtllm_gen_and_fp64(
         )
         torch.cuda.synchronize()
         label = f"{variant} kv{max_seq_len} rows{rows} seed{seed}"
-        assert torch.equal(cake, stateless), label
+        assert _same_bits(cake, stateless), label
         live = _row_lengths(seq_lens, q_len) > 0
         padded = cake[~live]
         assert torch.equal(padded, torch.zeros_like(padded)), label
@@ -393,8 +408,8 @@ def test_splitkv_is_deterministic(splitkv_device, splitkv_domains, case):
     torch.cuda.synchronize()
     assert bool(first.isfinite().all())
     for call in range(200):
-        assert torch.equal(decode(_nan_out(query)), first), call
-    assert torch.equal(decode(_nan_out(query), stateless=True), first)
+        assert _same_bits(decode(_nan_out(query)), first), call
+    assert _same_bits(decode(_nan_out(query), stateless=True), first)
 
     out = _nan_out(query)
     stream = torch.cuda.Stream()
@@ -409,7 +424,7 @@ def test_splitkv_is_deterministic(splitkv_device, splitkv_domains, case):
     for _ in range(1000):
         out.fill_(float("nan"))
         graph.replay()
-        mismatches += (out != first).any()
+        mismatches += (out.view(torch.int16) != first.view(torch.int16)).any()
     torch.cuda.synchronize()
     assert int(mismatches) == 0
     assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
@@ -425,9 +440,9 @@ def test_splitkv_graph_replay_with_updated_inputs(
     splitkv_device, splitkv_domains, batch, q_len, page_size, max_seq_len, stateless
 ):
     """A graph captured once follows later in-place changes of ``seq_lens``,
-    ``block_tables`` and the query: every replay equals an eager call on fresh
-    tensors holding the same values, matches the FP64 reference on live rows and
-    outputs zeros on padded rows (empty, short and full rows included)."""
+    ``block_tables`` and the query: every replay has the bits of an eager call on
+    fresh tensors holding the same values, matches the FP64 reference on live rows
+    and outputs zeros on padded rows (empty, short and full rows included)."""
     query, kv_cache, block_tables, seq_lens = _inputs(
         batch, q_len, page_size, max_seq_len, "varied", 0
     )
@@ -464,7 +479,7 @@ def test_splitkv_graph_replay_with_updated_inputs(
         graph.replay()
         eager = decode(seq_lens.clone(), block_tables.clone(), None)
         torch.cuda.synchronize()
-        assert torch.equal(out, eager), label
+        assert _same_bits(out, eager), label
         _check_rows(out, query, kv_cache, block_tables, seq_lens, label)
 
     query.copy_(_inputs(batch, q_len, page_size, max_seq_len, "varied", 4)[0])
@@ -519,6 +534,9 @@ def test_splitkv_empty_splits_ignore_stale_shared_memory(
     right before each of eight calls, so an empty split that reads stale shared
     memory instead of writing its LSE -inf and zero partial turns its row
     non-finite. Every call gives the same bits and matches the FP64 reference.
+    These rows take at most 32 splits, whose reducers read every split; the wide
+    reducer (more than 32 splits) reads only a row's splits that hold KV tiles, so
+    on it this check would not cover the mainloop's stores of the empty splits.
     """
     from torch.utils.cpp_extension import load_inline
 
@@ -545,7 +563,7 @@ def test_splitkv_empty_splits_ignore_stale_shared_memory(
         if first is None:
             first = out.clone()
             _check_rows(out, query, kv_cache, block_tables, seq_lens, "empty splits")
-        assert torch.equal(out, first), call
+        assert _same_bits(out, first), call
     assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
 
 
@@ -593,7 +611,7 @@ def test_splitkv_scratch_keyed_by_split_count_and_never_cached_in_capture(
     graph.replay()
     eager = _cake(query, kv_cache, block_tables, seq_lens, 8192, stateless=True)
     torch.cuda.synchronize()
-    assert torch.equal(out, eager)
+    assert _same_bits(out, eager)
 
 
 @pytest.mark.parametrize("start", [2049, 3000, 4097])
@@ -825,8 +843,8 @@ def _wide_accuracy(case, label):
     """Run the cells of ``case`` (``_WIDE_CASES`` layout) and check every draw as
     ``test_splitkv_matches_trtllm_gen_and_fp64`` does: on live rows the maximum
     absolute error against FP64 is within TRTLLM-GEN's plus one BF16 unit of the
-    largest reference value, and within the suite's tolerance; padded rows are
-    exact zeros and the default and the stateless mode agree."""
+    largest reference value, and within the suite's tolerance; padded rows hold
+    +0 and the default and the stateless mode give the same bits."""
     batch, q_len, page_size, has_sink, bmm2_scale, pattern, max_seq_len = case
     for seed in _WIDE_DRAWS:
         query, kv_cache, block_tables, seq_lens = _inputs(
@@ -852,45 +870,64 @@ def _wide_accuracy(case, label):
         ]
         torch.cuda.synchronize()
         cell = f"{label} seed{seed}"
-        assert torch.equal(outputs[0], outputs[1]), cell
-        live = _row_lengths(seq_lens, q_len) > 0
-        padded = outputs[0][~live]
-        assert torch.equal(padded, torch.zeros_like(padded)), cell
-        assert bool(live.any()), cell
-        reference = _reference_fp64(
-            query, kv_cache, block_tables, seq_lens, sink, bmm2_scale
-        )[live]
-        trtllm_gen = _trtllm_gen(
+        assert _same_bits(outputs[0], outputs[1]), cell
+        assert bool((_row_lengths(seq_lens, q_len) > 0).any()), cell
+        _check_wide_rows(
+            outputs[0],
             query,
             kv_cache,
             block_tables,
             seq_lens,
             max_seq_len,
-            sink=sink,
-            bmm2_scale=bmm2_scale,
-            out=_nan_out(query),
+            sink,
+            bmm2_scale,
+            cell,
         )
-        torch.cuda.synchronize()
-        cake_live = outputs[0][live].double()
-        assert bool(cake_live.isfinite().all()), cell
-        cake_error = float((cake_live - reference).abs().max())
-        trtllm_gen_error = float((trtllm_gen[live].double() - reference).abs().max())
-        ulp = _bf16_ulp(float(reference.abs().max()))
-        rel_l2 = float(
-            (cake_live - reference).norm() / reference.norm().clamp_min(1e-30)
-        )
-        print(
-            f"{cell}: max_abs cake {cake_error:.3e} trtllm-gen "
-            f"{trtllm_gen_error:.3e} ulp {ulp:.3e} rel_l2 {rel_l2:.3e}"
-        )
-        assert cake_error <= trtllm_gen_error + ulp, cell
-        torch.testing.assert_close(
-            cake_live.float(),
-            reference.float(),
-            rtol=TOLERANCE,
-            atol=TOLERANCE,
-            msg=lambda message: f"{cell}: {message}",
-        )
+
+
+def _check_wide_rows(
+    out, query, kv_cache, block_tables, seq_lens, max_seq_len, sink, bmm2_scale, cell
+):
+    """Padded rows of ``out`` hold the bits of +0; on live rows the maximum
+    absolute error against FP64 is within TRTLLM-GEN's plus one BF16 unit of the
+    largest reference value, and within the suite's tolerance."""
+    live = _row_lengths(seq_lens, query.shape[1]) > 0
+    padded = out[~live]
+    assert _same_bits(padded, torch.zeros_like(padded)), cell
+    if not bool(live.any()):
+        return
+    reference = _reference_fp64(
+        query, kv_cache, block_tables, seq_lens, sink, bmm2_scale
+    )[live]
+    trtllm_gen = _trtllm_gen(
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        sink=sink,
+        bmm2_scale=bmm2_scale,
+        out=_nan_out(query),
+    )
+    torch.cuda.synchronize()
+    cake_live = out[live].double()
+    assert bool(cake_live.isfinite().all()), cell
+    cake_error = float((cake_live - reference).abs().max())
+    trtllm_gen_error = float((trtllm_gen[live].double() - reference).abs().max())
+    ulp = _bf16_ulp(float(reference.abs().max()))
+    rel_l2 = float((cake_live - reference).norm() / reference.norm().clamp_min(1e-30))
+    print(
+        f"{cell}: max_abs cake {cake_error:.3e} trtllm-gen "
+        f"{trtllm_gen_error:.3e} ulp {ulp:.3e} rel_l2 {rel_l2:.3e}"
+    )
+    assert cake_error <= trtllm_gen_error + ulp, cell
+    torch.testing.assert_close(
+        cake_live.float(),
+        reference.float(),
+        rtol=TOLERANCE,
+        atol=TOLERANCE,
+        msg=lambda message: f"{cell}: {message}",
+    )
 
 
 @pytest.mark.parametrize("num_split", _WIDE_SPLITS)
@@ -899,7 +936,7 @@ def test_splitkv_wide_split_counts_match_trtllm_gen_and_fp64(
     splitkv_device, splitkv_domains, forced_split, case, num_split
 ):
     """33 to 64 splits (the wide reducer build), forced: accuracy against FP64 at
-    the level of TRTLLM-GEN, padded rows exact zeros."""
+    the level of TRTLLM-GEN, padded rows +0."""
     used = forced_split(num_split)
     _wide_accuracy(_WIDE_CASES[case], f"{case} split{num_split}")
     assert used and set(used) == {num_split}
@@ -943,8 +980,8 @@ def _check_deterministic(decode, query):
     torch.cuda.synchronize()
     assert bool(first.isfinite().all())
     for call in range(200):
-        assert torch.equal(decode(_nan_out(query)), first), call
-    assert torch.equal(decode(_nan_out(query), stateless=True), first)
+        assert _same_bits(decode(_nan_out(query)), first), call
+    assert _same_bits(decode(_nan_out(query), stateless=True), first)
     out = _nan_out(query)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -958,7 +995,7 @@ def _check_deterministic(decode, query):
     for _ in range(1000):
         out.fill_(float("nan"))
         graph.replay()
-        mismatches += (out != first).any()
+        mismatches += (out.view(torch.int16) != first.view(torch.int16)).any()
     torch.cuda.synchronize()
     assert int(mismatches) == 0
 
@@ -1010,6 +1047,148 @@ def test_splitkv_wide_split_counts_are_deterministic(
     assert used and min(used) > cake_module._SPLITKV_NARROW_MAX_SPLIT
     if num_split is not None:
         assert set(used) == {num_split}
+    assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
+
+
+def _capture(decode, out):
+    """A CUDA graph of ``decode(out)``, captured after one warm-up call on a side
+    stream."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode(out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode(out)
+    return graph
+
+
+# name: (batch, q_len, page_size, sink, bmm2_scale, seq_lens)
+_WIDE_SHORT_CASES = {
+    "rows2_zero_and_short": (2, 1, 32, False, 1.0, (0, 1000)),
+    "rows2_short_and_one_page64_sink_bmm2": (2, 1, 64, True, 0.5, (20000, 1)),
+    "rows2_q_len2_zero_and_one_page64_sink_bmm2": (1, 2, 64, True, 0.5, (1,)),
+    "rows2_all_zero_sink": (2, 1, 32, True, 1.0, (0, 0)),
+}
+_WIDE_SHORT_SPLITS = (33, 37, 64)
+_WIDE_SHORT_MAX_SEQ_LEN = 32768
+
+
+@pytest.mark.parametrize("num_split", _WIDE_SHORT_SPLITS)
+@pytest.mark.parametrize("case", sorted(_WIDE_SHORT_CASES))
+def test_splitkv_wide_short_rows_match_trtllm_gen_and_fp64(
+    splitkv_device, splitkv_domains, forced_split, case, num_split
+):
+    """Rows with fewer KV tiles than splits (1000, 20000 and 1 tokens: the wide
+    reducer skips their empty splits) and rows without KV token (it skips every
+    split), with and without a sink, at forced 33, 37 and 64 splits and
+    max_seq_len 32768: on live rows accuracy against FP64 at the level of
+    TRTLLM-GEN, padded rows +0, and the default mode, the stateless mode
+    and a CUDA-graph replay give the same bits. Three draws per cell."""
+    batch, q_len, page_size, has_sink, bmm2_scale, lengths = _WIDE_SHORT_CASES[case]
+    max_seq_len = _WIDE_SHORT_MAX_SEQ_LEN
+    used = forced_split(num_split)
+    for seed in _WIDE_DRAWS:
+        query, kv_cache, block_tables, _ = _inputs(
+            batch, q_len, page_size, max_seq_len, "uniform", seed
+        )
+        seq_lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        sink = None
+        if has_sink:
+            generator = torch.Generator(device="cuda").manual_seed(100 + seed)
+            sink = torch.randn(NUM_HEADS, device="cuda", generator=generator) * 2.0
+
+        def decode(output, **kwargs):
+            return _cake(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                sink=sink,
+                bmm2_scale=bmm2_scale,
+                out=output,
+                **kwargs,
+            )
+
+        eager = decode(_nan_out(query))
+        stateless = decode(_nan_out(query), stateless=True)
+        out = _nan_out(query)
+        graph = _capture(decode, out)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        cell = f"{case} split{num_split} seed{seed}"
+        assert _same_bits(stateless, eager), cell
+        assert _same_bits(out, eager), cell
+        _check_wide_rows(
+            eager,
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            sink,
+            bmm2_scale,
+            cell,
+        )
+    assert used and set(used) == {num_split}
+    assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+def test_splitkv_wide_graph_replay_follows_seq_lens_updates(
+    splitkv_device, splitkv_domains, forced_split, stateless
+):
+    """The wide reducer reads ``seq_lens`` after its dependency wait. A graph
+    captured once at one row of KV 131072 and 64 splits follows in-place updates
+    of ``seq_lens``: full, no KV token (every split empty) and full again, then
+    63 of 64 splits holding KV tiles, a short row, one token and no KV token
+    again. Every replay has the bits of an eager call on a fresh tensor holding
+    the same length, matches the FP64 reference on a live row and outputs +0 on
+    a padded one."""
+    used = forced_split(64)
+    max_seq_len = 131072
+    query, kv_cache, block_tables, seq_lens = _inputs(
+        1, 1, 32, max_seq_len, "uniform", 0
+    )
+    out = _nan_out(query)
+
+    def decode(lens, output):
+        return _cake(
+            query,
+            kv_cache,
+            block_tables,
+            lens,
+            max_seq_len,
+            out=output,
+            stateless=stateless,
+        )
+
+    graph = _capture(lambda output: decode(seq_lens, output), out)
+    # 1008 KV tiles in runs of 16: 63 of the 64 splits hold tiles; 5000 tokens
+    # (40 tiles, runs of 1): 40 do.
+    updates = [
+        ("full", max_seq_len),
+        ("all_zero", 0),
+        ("full_again", max_seq_len),
+        ("live63", 129024),
+        ("short", 5000),
+        ("one_token", 1),
+        ("all_zero_again", 0),
+    ]
+    for label, length in updates:
+        seq_lens.fill_(length)
+        out.fill_(float("nan"))
+        graph.replay()
+        eager = decode(seq_lens.clone(), None)
+        torch.cuda.synchronize()
+        assert _same_bits(out, eager), label
+        _check_rows(out, query, kv_cache, block_tables, seq_lens, label)
+        padded = out[~(_row_lengths(seq_lens, 1) > 0)]
+        assert _same_bits(padded, torch.zeros_like(padded)), label
+    assert used and set(used) == {64}
     assert set(splitkv_domains) == {cake_module.DOMAIN_BF16_SPLITKV}
 
 
