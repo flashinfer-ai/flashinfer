@@ -1024,6 +1024,11 @@ def sm8x_masked_scaled_bmm(
     )  # fmt: skip
     if masked_m.numel() != q:
         raise ValueError(f"masked_m must have the same number of elements as Q ({q})")
+    if any(t.device != a.device for t in (b, a_scale, b_scale, masked_m)):
+        raise ValueError(
+            "Scaled BMM operands, scales and masked_m must be on one device"
+        )
+    masked_m = masked_m.reshape(-1)
     if block_scale_type not in ("nvfp4", "mxfp4", "mxfp8", "mixed"):
         raise ValueError(f"Invalid block scale type: {block_scale_type}")
     vec = 16 if block_scale_type == "nvfp4" else 32
@@ -1104,6 +1109,12 @@ def sm8x_ragged_scaled_bmm(
     )  # fmt: skip
     if m_indptr.numel() != q + 1:
         raise ValueError(f"m_indptr must have Q+1 ({q + 1}) elements")
+    gss = [t for t in (a_global_scale, b_global_scale) if t is not None]
+    if any(t.device != a.device for t in (b, a_scale, b_scale, m_indptr, *gss)):
+        raise ValueError(
+            "Scaled BMM operands, scales and m_indptr must be on one device"
+        )
+    m_indptr = m_indptr.reshape(-1)
     vec = 16 if block_scale_type == "nvfp4" else 32
     q_sb, rnb, rkb, n2, k256b = b_scale.shape
     if q_sb != q:
