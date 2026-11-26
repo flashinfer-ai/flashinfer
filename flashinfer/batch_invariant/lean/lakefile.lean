@@ -44,6 +44,9 @@ lean_exe axioms where
 lean_exe moeconformance where
   root := `MoEMain
 
+lean_exe moemxfp8conformance where
+  root := `MoEMxfp8Main
+
 lean_exe numericalmegamoeconformance where
   root := `NumericalMegaMoEMain
 
@@ -55,3 +58,6 @@ lean_exe moenvfp4conformance where
 
 lean_exe moemxfp4conformance where
   root := `MoEMxfp4Main
+
+lean_exe moemxfp4w8aconformance where
+  root := `MoEMxfp4w8aMain

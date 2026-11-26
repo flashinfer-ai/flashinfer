@@ -96,8 +96,11 @@ def mx_quantize(
     config: Optional[MXQuantConfig] = None,
     enable_pdl: bool = False,
     sm_count: Optional[int] = None,
+    valid: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``x`` (bf16 / f16 / fp32, last dim ``K`` a multiple of 32) to the MX format ``fmt``.
+    """Quantize ``x`` (bf16 / f16 / fp32, last dim ``K`` a multiple of 32) to the MX format ``fmt``. ``valid`` (int32
+    ``[M]``, negative = skip) restricts the pass to the rows marked live: the same bytes on those rows, the others
+    untouched (the MoE classes' padded operands).
 
     Returns ``(codes, sf)``: ``codes`` uint8 of shape ``(..., K)`` (e4m3 bytes); ``sf`` the flat uint8 UE8M0 scale bytes in the layout ``swizzled``
     names: ``"128x4"`` (rows padded to 128, scale columns to 4, padding zero), ``"8x4"`` (rows padded to 8, columns to 4)
@@ -145,10 +148,26 @@ def mx_quantize(
         "codes row stride must be a multiple of 16 bytes"
     )
     assert nb >= 1
-    kernel = get_compiled_kernel(
-        _DTYPE_STR[x.dtype], K, config, fmt, rule, swizzled, bool(enable_pdl)
-    )
-    kernel(x2, codes, sf, M, K, padded_M)
+    if valid is None:
+        kernel = get_compiled_kernel(
+            _DTYPE_STR[x.dtype], K, config, fmt, rule, swizzled, bool(enable_pdl)
+        )
+        kernel(x2, codes, sf, M, K, padded_M)
+    else:
+        assert (
+            valid.dtype == torch.int32 and valid.is_contiguous() and valid.numel() >= M
+        ), (valid.dtype, valid.shape, M)
+        kernel = get_compiled_kernel(
+            _DTYPE_STR[x.dtype],
+            K,
+            config,
+            fmt,
+            rule,
+            swizzled,
+            bool(enable_pdl),
+            masked=True,
+        )
+        kernel(x2, codes, sf, valid, M, K, padded_M)
     return codes.view(*x.shape[:-1], kbytes), sf
 
 
@@ -160,8 +179,11 @@ def mxfp8_quantize_batch_invariant(
     *,
     config: Optional[MXQuantConfig] = None,
     sm_count: Optional[int] = None,
+    valid: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``flashinfer.mxfp8_quantize(input, ..., backend="auto", batch_invariant=True)``: the class ``mxfp8.quant``.
+    ``valid`` (int32, one mark per row, negative = skip) restricts the pass to the rows marked live (the MoE classes'
+    padded operands); the other rows' bytes are left as they are.
 
     FlashInfer's contract is reproduced exactly: ``x_q`` is a ``float8_e4m3fn`` tensor of shape
     ``(*input.shape[:-1], padded_K)`` with ``padded_K = ceil(K / alignment) * alignment`` (the padding columns are zero
@@ -243,7 +265,13 @@ def mxfp8_quantize_batch_invariant(
         )
         return codes, sf
     codes, sf = mx_quantize(
-        x2, MXFP8, layout, config=config, enable_pdl=bool(enable_pdl), sm_count=sm_count
+        x2,
+        MXFP8,
+        layout,
+        config=config,
+        enable_pdl=bool(enable_pdl),
+        sm_count=sm_count,
+        valid=valid,
     )
     return codes.view(torch.float8_e4m3fn).view(*input.shape[:-1], padded_k), sf
 

@@ -3482,6 +3482,133 @@ class BatchInvariantBf16Config:
 
 
 # Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space and the two-atom stage follow Prims-TS (the open counterpart of
+# TRTLLM-Gen's MoE GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's MXFP8 decode tactics; the fused
+# requantization of the intermediate in GEMM1's epilogue follows Prims-TS's fused activation and TRTLLM-Gen's block-fp8
+# contract, whose surface this backend mirrors; the dense packing of the expanded rows with the scale factors at the padded atom
+# positions follows TRTLLM-Gen's routed-token layouts; GEMM1 reading the token rows through the routing (the gather form)
+# follows TRTLLM-Gen's in-GEMM row gather and the fp4 backend's gather record; the decode form (no plan launch and no scatter,
+# the GEMM's CTAs taking the routing's ids and building the group tables themselves) follows the Frost low-latency MoE's launch
+# structure; the PDL wait / trigger placement and the launch's tile bound on the persistent grid follow Prims-TS and
+# TRTLLM-Gen; the scatter's placement and the swapped epilogue's warpgroup split are the fp4 backend's; the routing,
+# permutation, combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same
+# bits, placed as those kernels place theirs.
+@dataclass(frozen=True)
+class BatchInvariantFp8BlockConfig:
+    """The batch-invariant fp8-block MoE backend: the fp8 formats with block scales under one backend
+    (``backend_key = "batch_invariant_fp8_block"``), grouped as :class:`TrtllmFp8BlockConfig` groups them, on SM100 / SM103 /
+    SM107. The quantization pair of ``QuantConfig`` selects the class family, each pair keeping its own kernels, classes,
+    fingerprints and pack conventions: ``QuantConfig(weight=MXFP8, activation=MXFP8)`` runs the classes ``moe.mxfp8.<act>``
+    of the mode documented in ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set,
+    as the bf16 backend), the pair served. Another pair is not admitted by the layer (``supported_quant_variants``) and
+    is refused by :meth:`prepare_weights` / :meth:`prepare_activations` with
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` naming the pair served; the weight view names its
+    pair (``quant``) and a view without it is declined by the layer's candidate filter.
+
+    MXFP8 x MXFP8: the expert weights and the activations are MXFP8 (e4m3 values, one UE8M0 scale per 32 elements), both by
+    the batch-invariant quantizer class (``mxfp8_quantize(..., batch_invariant=True)``: the experts per expert at
+    preparation, the activations per token by :meth:`prepare_activations` or any producer of the canonical MXFP8 pack); the
+    two GEMMs are grouped placements of the dense batch-invariant MXFP8 GEMM class of the part (the block scales are
+    operands of the block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32: the
+    architecture is a dimension of the class, as for ``mm_mxfp8``), the activation chain is the bf16 classes' on the
+    dequantised fp32 accumulators, the intermediate is quantized by the same quantizer class on the materialised bf16 row,
+    the combine is the slot-order fp32 fold. The arithmetic is exact (every step of the chain correctly rounded, no SFU
+    table enters the bits; the instruction class of the part is the one architecture dimension). Every output bit is a
+    function of the token's own quantized row, its ``top_k`` experts and routing weights and the quantized expert
+    weights alone. ``MoEFinalizeConfig.do_finalize`` must stay ``True`` and ``use_fused_finalize`` is ignored; fused
+    shared experts and expert-parallel shards are refused by name; all three routing input modes are taken; unsupported
+    inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls back and is
+    not a default candidate.
+
+    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or ``w1 [E, I, H]`` for the
+    ungated activations, and ``w2 [E, H, I]`` -- bf16 or a wider floating dtype, CPU-resident or on the device -- and
+    quantizes the experts one at a time into the pack on ``device`` (the weights' by default; a CUDA device), each
+    expert's slice moved and cast right before its quantization; ``num_local_experts`` / ``hidden_size`` /
+    ``intermediate_size``, when given, must be the weights' own; ``hidden_size`` and ``intermediate_size`` are multiples
+    of 32. Activations: the canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with the token-major UE8M0 scales
+    ``[num_tokens, H / 32]`` (the pack ``TrtllmFp8BlockConfig`` and ``CutlassMxfp8Config`` prepare) in that linear layout
+    alone, taken as given: a swizzled or flattened scale buffer, ``QuantConfig(swizzled_scale_factors=True)`` and a
+    ``per_token_scale`` are refused, rows and scale bytes are 16-byte aligned, and ``num_tokens = 0`` gives the empty
+    output. The 128x4 scale buffers the kernels read carry zero pad columns.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        quant: "QuantConfig",
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The weight view of the pair ``quant`` selects. MXFP8 x MXFP8: the experts quantized one at a time by the
+        batch-invariant MXFP8 quantizer into the pack on ``device`` (the gate / up rows interleaved first for a gated
+        activation), the swizzled scale buffers, the pair tag and the activation's chain (``activation`` defaults to
+        ``SwiGLU()``). A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own
+        (the mode's error names the dimension before any view is built)."""
+        from ..batch_invariant.support import unsupported
+        from .batch_invariant.runner_fp8_block import PAIR_MXFP8, unsupported_pair
+
+        if quant.pair == PAIR_MXFP8:
+            from .batch_invariant.api_mxfp8 import CLASS, MoEWeightsMXFP8
+            from .batch_invariant.spec import activation_of
+
+            chain = activation_of(activation if activation is not None else SwiGLU())
+            if w1.dim() != 3 or w2.dim() != 3:
+                raise TypeError(
+                    "the MXFP8 MoE classes take expert weights w1 [E, N1, H], w2 [E, H, I]"
+                )
+            E, n1, H = w1.shape
+            I = n1 // 2 if chain.gated else n1
+            for name, given, own in (
+                ("num_local_experts", num_local_experts, E),
+                ("hidden_size", hidden_size, H),
+                ("intermediate_size", intermediate_size, I),
+            ):
+                if given is not None and given != own:
+                    raise unsupported(
+                        CLASS,
+                        f"{name} {given} with weights of {own} (w1 {tuple(w1.shape)}, {'gated' if chain.gated else 'ungated'})",
+                        "the weights' own geometry (or no dimension arguments)",
+                    )
+            return MoEWeightsMXFP8.prepare(
+                w1,
+                w2,
+                gated=chain.gated,
+                act=chain.act,
+                params=chain.params,
+                device=device,
+            ).view()
+        raise unsupported_pair(quant)
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states: torch.Tensor, *, quant: "QuantConfig"
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The activation pack of the pair ``quant`` selects. MXFP8 x MXFP8: the canonical MXFP8 pack by the
+        batch-invariant quantizer, e4m3 ``[T, H]`` and the token-major UE8M0 scales ``[T, H / 32]`` (uint8)."""
+        from .batch_invariant.runner_fp8_block import PAIR_MXFP8, unsupported_pair
+
+        if quant.pair == PAIR_MXFP8:
+            from .batch_invariant.api_mxfp8 import quantize_activations_mxfp8
+
+            return quantize_activations_mxfp8(
+                hidden_states.to(torch.bfloat16).contiguous()
+            )
+        raise unsupported_pair(quant)
+
+    def __repr__(self) -> str:
+        return "BatchInvariantFp8BlockConfig()"
+
+
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
 # decode records as ranked members of the dispatcher's space follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE
 # GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's fp8 per-tensor decode tactics; the fused
 # activation and e4m3 requantisation at the static per-tensor multiplier in GEMM1's epilogue follows Prims-TS's fused
@@ -3605,8 +3732,12 @@ def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]
 # dense packing of the expanded rows with the scale factors at the padded atom positions and the token tile's scale rows
 # gathered by one cp.async warp follow CuTe-DSL's gathered-operand pipeline; the PDL wait / trigger placement and the
 # launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation, combine and the
-# ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits, placed as those
-# kernels place theirs.
+# ranking contract are the bf16 backend's. The MXFP4 x MXFP8 pair's fused requantization of the intermediate to MXFP8
+# inside GEMM1's epilogue (the block amax, the UE8M0 scale and the e4m3 codes of each 32-element block of the rounded
+# activation) follows the MXFP8-intermediate recipe of TRTLLM-Gen's MXFP4 x MXFP8 path and of the CUTLASS and cuDNN Frost
+# MXFP8 x MXFP4 backends, with every op the quantizer class's; its swapped decode records on the twin instruction (the e2m1
+# weight as the MMA's A operand) follow Prims-TS's swap-AB templates as the NVFP4 pair's do. Each is a placement of the
+# class's dataflow: the same bits, placed as those kernels place theirs.
 @dataclass(frozen=True)
 class BatchInvariantFp4Config:
     """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped
@@ -3615,13 +3746,14 @@ class BatchInvariantFp4Config:
     MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)``). The pairs served, on SM100 / SM103 / SM107, one class
     per typed activation and parameter set as the bf16 backend, documented in ``flashinfer/batch_invariant/README.md``:
     NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM,
-    per-token NVFP4 activations), and MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
-    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale). A pair the backend does not serve
-    (MXFP4 x MXFP8 among them) is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
+    per-token NVFP4 activations), MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
+    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale), and MXFP4 x MXFP8, the mixed
+    classes ``moe.mxfp4w8a.<act>`` (MXFP4 experts, MXFP8 activations, UE8M0 scales per 32 elements on both). A pair the
+    backend does not serve is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
     ``prepare_activations`` and by the runner with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming
     the served pairs. The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``,
-    ``fingerprint("fused_moe_mxfp4", ...)``); the weight view carries its pair, and a pack prepared for one pair is refused by a
-    layer configured for the other.
+    ``fingerprint("fused_moe_mxfp4", ...)``, ``fingerprint("fused_moe_mxfp4w8a", ...)``); the weight view carries its pair,
+    and a pack prepared for one pair is refused by a layer configured for another.
 
     The guarantee, the routing input modes and the error contract are the bf16 backend's (:class:`BatchInvariantBf16Config`):
     a token's output bits depend on its own row, its ``top_k`` experts and routing weights and the expert weights only; the
@@ -3639,7 +3771,9 @@ class BatchInvariantFp4Config:
     division, the part's SFU primitives (``ex2.approx.ftz`` / ``rcp.approx.ftz``, measured into tables the tests pin per
     part), so the output is deterministic and batch-invariant within a family and not, in general, equal across families
     (``flashinfer/batch_invariant/README.md``: the hardware hypothesis and the pinned digests); the ReLU family and PowLU
-    have no SFU step and are the declared sequences.
+    have no SFU step and are the declared sequences, as is the whole chain of the MXFP4 x MXFP8 pair (its exponential and
+    divisions are the correctly rounded sequences of the bf16 classes, so its bits are a property of the instruction class
+    alone).
 
     Weights (NVFP4 x NVFP4): ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or
     ``[E, I, H]`` for the ungated activations, and ``w2 [E, H, I]``, and quantizes every expert with the mode's per-tensor
@@ -3670,6 +3804,23 @@ class BatchInvariantFp4Config:
     ``mxfp4_quantize(..., batch_invariant=True)`` or the linear ``[num_tokens, H / 32]`` layout) and no ``per_token_scale``
     (``QuantConfig(per_token_scale=True)`` is refused for this pair). ``intermediate`` and ``intermediate_scales`` are the NVFP4
     pair's and are refused for MXFP4.
+
+    MXFP4 x MXFP8 (the proofs are the ``MoEMxfp4w8a`` Lean module): the expert weights MXFP4 by the mode's MXFP4 quantizer
+    (``mxfp4_quantize(..., batch_invariant=True)``, per expert at preparation), the activations MXFP8 by the mode's
+    ``mxfp8_quantize`` per token (``prepare_activations``, or any producer of the canonical MXFP8 pack); the two GEMMs are
+    grouped placements of the dense batch-invariant mixed GEMM class of the part (both operands' block scales are operands
+    of the mixed-format block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32 and
+    reads the e2m1 weight through the TMA's unpacking format: the architecture is a dimension of the class, as for
+    ``mm_mxfp8_mxfp4``), the activation chain is the bf16 classes' exact sequence on the dequantised fp32 accumulators, the intermediate
+    is quantized by the MXFP8 quantizer class inside GEMM1's epilogue, the combine is the slot-order fp32 fold. Weights:
+    the canonical ``w1`` / ``w2`` layouts above, quantized per expert by the MXFP4 quantizer as for MXFP4 x MXFP4 (the same
+    preparation: a CUDA pack device, the experts moved and cast one at a time), ``hidden_size`` and ``intermediate_size``
+    multiples of 32 on SM107 and of 128 on SM100 / SM103 (the unpacking format's 128-element runs). Activations: the
+    canonical MXFP8 pack, e4m3 ``[num_tokens, H]`` with token-major UE8M0 scales ``[num_tokens, H / 32]`` (uint8,
+    ``float8_e8m0fnu`` or the e4m3-typed carrier of the pack ``TrtllmFp4Config`` prepares for this pair; the linear layout
+    alone, taken as given); no ``per_token_scale``; ``intermediate`` and ``intermediate_scales`` are refused as for MXFP4 x
+    MXFP4. The layer's forward captures in a CUDA graph and replays the eager bits (the constants are host-built outside
+    a capture).
     """
 
     intermediate: str = "per_token"
@@ -3705,8 +3856,9 @@ class BatchInvariantFp4Config:
         ``SwiGLU()``). NVFP4 x NVFP4: every expert quantized to NVFP4 with its own per-tensor global scale (the gate / up
         rows interleaved first for a gated activation), the 128x4 swizzled block scales and the alphas
         (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
-        per-expert scales (see the class docstring). MXFP4 x MXFP4: every expert quantized to MXFP4 (one UE8M0 scale per 32
-        elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair. A supplied
+        per-expert scales (see the class docstring). MXFP4 x MXFP4 and MXFP4 x MXFP8: every expert quantized to MXFP4 (one
+        UE8M0 scale per 32 elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of
+        these pairs. A supplied
         ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry, and
         ``intermediate_scales`` need ``intermediate="static"``: a contradiction is refused with the mode's error before any
         view is built. The experts are quantized one at a time into the preallocated pack on ``device`` (the weights' by
@@ -3724,6 +3876,7 @@ class BatchInvariantFp4Config:
             raise TypeError(
                 "BatchInvariantFp4Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
             )
+        cls = PAIRS[pair].cls
         E, N1, H = w1.shape
         for name, given, actual in (
             ("num_local_experts", num_local_experts, E),
@@ -3732,14 +3885,14 @@ class BatchInvariantFp4Config:
         ):
             if given is not None and int(given) != actual:
                 raise unsupported(
-                    PAIRS[pair].cls,
+                    cls,
                     f"{name} {given} with weights of {name} {actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
                     f"{'gated' if chain.gated else 'ungated'} activation)",
                     "dimensions that agree with the weights' geometry (or none)",
                 )
         if intermediate_scales is not None and intermediate != "static":
             raise unsupported(
-                PAIRS[pair].cls,
+                cls,
                 f"intermediate_scales with intermediate={intermediate!r}",
                 "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
             )
@@ -3762,10 +3915,10 @@ class BatchInvariantFp4Config:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """The activation pack of the pair ``quant`` selects, the pair's own form
         (:meth:`~flashinfer.fused_moe.batch_invariant.api_fp4.Fp4Pair.prepare_activations`): ``quant`` defaults to the
-        NVFP4 x NVFP4 pair (``None``), and the MXFP4 x MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4,
-        activation=QuantFormat.MXFP4)``). Both served pairs: bf16
+        NVFP4 x NVFP4 pair (``None``), and the MXFP4 x MXFP4 and MXFP4 x MXFP8 pairs must be named. The fp4 pairs: bf16
         activations as given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is
-        part of the op."""
+        part of the op. MXFP4 x MXFP8: the canonical MXFP8 pack by the batch-invariant quantizer, e4m3 ``[T, H]`` and the
+        token-major UE8M0 scales ``[T, H / 32]`` (uint8)."""
         from .batch_invariant.runner_fp4 import PAIRS
 
         # the served pairs' table drives the form: an unserved pair was refused by _fp4_pair, a served one names its form
@@ -3824,6 +3977,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8BlockConfig,
     BatchInvariantFp8PerTensorConfig,
     BatchInvariantFp4Config,
 ]
@@ -3872,6 +4026,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8BlockConfig,
     BatchInvariantFp8PerTensorConfig,
     BatchInvariantFp4Config,
 )

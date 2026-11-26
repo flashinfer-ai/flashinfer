@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the grouped GEMM bodies, every operand format: one TVM-FFI object per (knobs, chain[, packing]) with
 dynamic Tk, N, K and E, the chain naming its operand format (``bf16`` for the bf16 classes' :class:`GroupedChain`, ``e4m3``
-for the fp8 per-tensor classes' :class:`Fp8Chain`, the NVFP4 instruction classes for :class:`W4A4Chain`), the output format
+for the fp8 per-tensor classes' :class:`Fp8Chain`, the NVFP4 instruction classes for :class:`W4A4Chain`, the MXFP8 ones
+for :class:`.epilogue_mx.MxChain`), the output format
 and the parameters; cache module ``batch_invariant_moe`` in FlashInfer's CuTe-DSL disk cache (this file, the routing,
 permutation, combine and scatter kernels are its roots; the bodies of every format are one source closure, so an edit to
 any moves every object's key). The persistent grid is a dynamic ``Int32`` argument of the compiled kernel
 (``GRID_PLACEHOLDER`` at compile time; the launch passes the device's co-resident cluster count,
 ``flashinfer.gemm.batch_invariant.api.persistent_clusters``), so one object serves every grid. The chain's declared operands
 select the bodies' entry: the plain one (``kernel(a3, b3, out2, counts, grid)``), ``with_scales`` (``kernel(a3, b3, out2,
-counts, alpha, sa, si, grid)``), ``block_scaled`` (``kernel(a3, b3, sfa, sfb, out2, counts, alpha, pts, grid)``) or
-``block_scaled_static`` (``kernel(a3, b3, sfa, sfb, out2, out_sf, counts, alpha, pts, aux, grid)``).
+counts, alpha, sa, si, grid)``), ``block_scaled`` (``kernel(a3, b3, sfa, sfb, out2, counts, alpha, pts, grid)``),
+``block_scaled_static`` (``kernel(a3, b3, sfa, sfb, out2, out_sf, counts, alpha, pts, aux, grid)``), or the MX chains'
+``block_scaled_plain`` (``kernel(a3, b3, sfa, sfb, out2, counts, rows_sf, grid)``) and ``block_scaled_quant`` (``kernel(a3,
+b3, sfa, sfb, out2, out_sf, counts, rows_sf, grid)``: the fused requantization's codes and scale bytes).
 """
 
 from __future__ import annotations
@@ -26,7 +29,15 @@ from cutlass import Float32, Int32
 from ....batch_invariant import jit
 from ....gemm.batch_invariant.blocks.operands import ALIGN, IN_DT, OUT_DT
 from ....gemm.batch_invariant.generator import TILES_N, Knobs
-from ....gemm.batch_invariant.spec import BLOCK_SCALED, SF_ATOM_KBLOCKS, SF_ATOM_ROWS
+from ....gemm.batch_invariant.spec import (
+    A_ELEM_BITS_OF,
+    B_ELEM_BITS_OF,
+    BLOCK_SCALED,
+    SF_ATOM_KBLOCKS,
+    SF_ATOM_ROWS,
+    SF_VEC,
+    k_granule,
+)
 from .epilogue import (
     GROUP,
     OUT_FMTS_W4A4,
@@ -35,6 +46,7 @@ from .epilogue import (
     Mxfp4Chain,
     W4A4Chain,
 )
+from .epilogue_mx import MX_OUT_FMTS, MxChain
 from .kernel import CHAINS, GROUP_ALIGN, GroupedBlockGemm
 from .operands import PACKINGS
 from .scheduler import MAX_E
@@ -43,12 +55,17 @@ from .swap import SwappedGroupedGemm, is_swapped_record, swapped_knobs  # noqa: 
 MODULE = "batch_invariant_moe"
 GRID_PLACEHOLDER = 1  # the compile-time value of the grid argument: a dynamic Int32 of the kernel, never compiled in
 #: The output dtypes by format: the dense GEMM's, plus the e4m3 output stored as bytes (the chain's paired conversion fills
-#: byte registers) and the static NVFP4 class's packed codes; the output alignment of every format is the dense GEMM's
-#: (16-byte rows), the packed codes' row a 16-byte row of codes and whole scale blocks.
-OUT_DT_OF = dict(OUT_DT, e4m3=cutlass.Uint8, nvfp4=cutlass.Uint8)
-OUT_ALIGN_OF = dict(ALIGN, nvfp4=32)
+#: byte registers), the MX fused requantization's e4m3 codes (``mxfp8``: the block scales are its second output) and the
+#: static NVFP4 class's packed codes; the output alignment of every format is the dense GEMM's (16-byte rows), the
+#: requantised outputs' a whole scale block.
+OUT_DT_OF = dict(OUT_DT, e4m3=cutlass.Uint8, mxfp8=cutlass.Uint8, nvfp4=cutlass.Uint8)
+OUT_ALIGN_OF = dict(ALIGN, mxfp8=32, nvfp4=32)
 #: A scale-factor buffer is a whole number of 512-byte atoms.
 SF_BUFFER_DIVISIBILITY = SF_ATOM_ROWS * SF_ATOM_KBLOCKS
+#: The chain classes of the block-scaled formats (each names its instruction class through ``at``).
+BLOCKSCALED_CHAINS = (W4A4Chain, MxChain, Mxfp4Chain)
+#: The output formats the block-scaled bodies' chains declare: the W4A4 chains' and the MX chains'.
+BLOCK_SCALED_OUT_FMTS = tuple(dict.fromkeys(OUT_FMTS_W4A4 + MX_OUT_FMTS))
 
 ChainLike = Union[str, GroupedEpilogueBlock]
 
@@ -79,6 +96,13 @@ def _is_block_scaled(chain: GroupedEpilogueBlock) -> bool:
     return chain.in_fmt in BLOCK_SCALED
 
 
+def blockscaled_k_align(in_fmt: str) -> int:
+    """The K alignment of a block-scaled format's operands: whole scale blocks of whole 16-byte rows (two NVFP4 blocks of 16
+    per 16 bytes, one MX block of 32 e4m3 elements) and whole K granules of the dense class (the sm_100 mixed class's e2m1
+    weight is unpacked by the TMA in 128-element runs: ``spec.k_granule``)."""
+    return max(ALIGN[in_fmt], SF_VEC[in_fmt], k_granule(in_fmt))
+
+
 def kernel_name(
     cfg: Knobs, chain: ChainLike, out_fmt: str = "bf16", packing: str = "dense"
 ) -> str:
@@ -102,8 +126,8 @@ def static_body_ok(knobs: Knobs) -> bool:
 def _operands_ok(chain: GroupedEpilogueBlock, N: int, K: int, E: int) -> bool:
     """The operand rules shared by both bodies: 16-byte-aligned K and N (multiples of the format's alignment), the output
     rows aligned to the output format, whole ``2 x GROUP`` column blocks for the gated chain, at most ``MAX_E`` experts.
-    The block-scaled formats: a whole scale block per 16 bytes of K (the format's alignment), N a multiple of 8, the
-    packed-code output of the static class on whole 16-byte rows of whole scale blocks."""
+    The block-scaled formats: K in whole scale blocks of whole 16-byte rows (:func:`blockscaled_k_align`), N a multiple of
+    8, the chain's output format one of the block-scaled chains' (the requantised outputs on whole scale blocks)."""
     if chain.out_fmt not in OUT_DT_OF:
         return False
     if chain.pair and N % (2 * GROUP):
@@ -112,8 +136,8 @@ def _operands_ok(chain: GroupedEpilogueBlock, N: int, K: int, E: int) -> bool:
     n_out = N // 2 if chain.pair else N
     if _is_block_scaled(chain):
         return (
-            chain.out_fmt in OUT_FMTS_W4A4
-            and K % al == 0
+            chain.out_fmt in BLOCK_SCALED_OUT_FMTS
+            and K % blockscaled_k_align(chain.in_fmt) == 0
             and N % 8 == 0
             and n_out % OUT_ALIGN_OF[chain.out_fmt] == 0
             and 1 <= E <= MAX_E
@@ -173,7 +197,6 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
     c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
     f = dict(counts=c_fake, scales=())
     if _is_block_scaled(chain):
-        # the byte-packed 4-bit operands (two elements per byte, K / 2 bytes per row; the 8-bit element formats one per byte)
         dense_a = packing == "dense"
         sym_m = (
             cute.sym_int(32) if dense_a else cute.sym_int(32, divisibility=GROUP_ALIGN)
@@ -182,10 +205,29 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
             cute.sym_int(32, divisibility=GROUP_ALIGN) if dense_a else sym_m
         )  # the padded rows (pts, scale factors)
         sym_r = cute.sym_int(32)
-        sym_n, sym_kb = (
-            cute.sym_int(32, divisibility=8),
-            cute.sym_int(32, divisibility=16),
-        )
+        sym_n = cute.sym_int(32, divisibility=8)
+        k_al = blockscaled_k_align(chain.in_fmt)
+
+        def operand_fake(bits: int):
+            """The element type, the symbolic K extent and the stride divisibility of an operand of ``bits`` per element: the
+            byte-packed 4-bit operands (two elements per byte, K / 2 bytes per row, K in whole 16-byte rows of both operands),
+            the 8-bit formats as given (K in whole scale blocks and K granules, 16-byte rows)."""
+            if bits == 4:
+                return (
+                    cutlass.Uint8,
+                    cute.sym_int(32, divisibility=max(16, k_al // 2)),
+                    max(16, k_al // 2),
+                )
+            return in_dt, cute.sym_int(32, divisibility=k_al), al
+
+        # the token operand (A: the rows) and the weight operand (B) at their own element widths: the one-format classes
+        # share one width and one symbolic K (the compiled object's assumption, as before the mixed classes); the mixed
+        # classes' tokens are e4m3 and their weights byte-packed e2m1, each with its own symbol
+        a_dt, sym_kd, a_div = operand_fake(A_ELEM_BITS_OF[chain.in_fmt])
+        if A_ELEM_BITS_OF[chain.in_fmt] == B_ELEM_BITS_OF[chain.in_fmt]:
+            b_dt, sym_kd_b, b_div = a_dt, sym_kd, a_div
+        else:
+            b_dt, sym_kd_b, b_div = operand_fake(B_ELEM_BITS_OF[chain.in_fmt])
 
         def flat(div):
             return cute.runtime.make_fake_tensor(
@@ -197,18 +239,22 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
 
         def packed3(sym_rows):
             return cute.runtime.make_fake_tensor(
-                cutlass.Uint8,
-                (sym_rows, sym_kb, 1),
-                (cute.sym_int64(divisibility=16), 1, cute.sym_int64(divisibility=16)),
+                a_dt,
+                (sym_rows, sym_kd, 1),
+                (
+                    cute.sym_int64(divisibility=a_div),
+                    1,
+                    cute.sym_int64(divisibility=a_div),
+                ),
                 assumed_align=16,
             )
 
         f["a"] = packed3(sym_m)
         f["rows"] = packed3(sym_r)
         f["b"] = cute.runtime.make_fake_tensor(
-            cutlass.Uint8,
-            (sym_n, sym_kb, sym_e),
-            (cute.sym_int64(divisibility=16), 1, cute.sym_int64(divisibility=16)),
+            b_dt,
+            (sym_n, sym_kd_b, sym_e),
+            (cute.sym_int64(divisibility=b_div), 1, cute.sym_int64(divisibility=b_div)),
             assumed_align=16,
         )
         f["sfa"], f["sfb"] = flat(SF_BUFFER_DIVISIBILITY), flat(SF_BUFFER_DIVISIBILITY)
@@ -235,6 +281,13 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
             Float32, (cute.sym_int(32),), (1,), assumed_align=4
         )
         f["src"] = cute.runtime.make_fake_tensor(
+            Int32, (cute.sym_int(32),), (1,), assumed_align=16
+        )
+        # the in-kernel plan's ids (slot order) and its dest output
+        f["ids"] = cute.runtime.make_fake_tensor(
+            Int32, (cute.sym_int(32),), (1,), assumed_align=16
+        )
+        f["dest"] = cute.runtime.make_fake_tensor(
             Int32, (cute.sym_int(32),), (1,), assumed_align=16
         )
         return f
@@ -285,9 +338,24 @@ def compile_grouped_fn(
         grid = GRID_PLACEHOLDER  # a dynamic argument of the kernel: the launch passes the device's value
         body = GroupedBlockGemm(cfg, chain, packing=packing)
         if _is_block_scaled(chain):
-            # the plain entry (no operand beyond the output) is the MXFP4 chains'; the W4A4 unscaled oracle keeps the scaled
-            # entry and leaves its alpha / pts unread
-            if isinstance(chain, Mxfp4Chain):
+            if isinstance(chain, (MxChain, Mxfp4Chain)):
+                # the MX chains (MXFP8, MXFP4): no operand beyond the output (the quantising chain writes its scale bytes as a
+                # second output); the W4A4 unscaled oracle keeps the ``block_scaled`` entry and leaves its alpha / pts unread
+                if chain.quant:
+                    return cute.compile(
+                        body.block_scaled_quant,
+                        f["a"],
+                        f["b"],
+                        f["sfa"],
+                        f["sfb"],
+                        f["out"],
+                        f["out_sf"],
+                        f["counts"],
+                        Int32(GROUP_ALIGN),
+                        grid,
+                        stream_fake,
+                        options="--enable-tvm-ffi",
+                    )
                 return cute.compile(
                     body.block_scaled_plain,
                     f["a"],
@@ -364,7 +432,9 @@ def get_compiled_grouped(
     out_sf, counts, alpha, pts, aux, grid)`` for the static class) -- A ``(rows, K/2, 1)`` packed fp4 as uint8 (``packing``
     ``"padded"``: ``rows`` a multiple of 128; ``"dense"``: any row count, the scale factors and ``pts`` at the padded
     positions), B ``(N, K/2, E)``, SFA / SFB flat uint8 128x4 scale-factor buffers (SFB: E consecutive buffers), ``alpha
-    (E,)`` the experts' alphas, ``pts (rows_sf,)`` the per-row scales.
+    (E,)`` the experts' alphas, ``pts (rows_sf,)`` the per-row scales. The MX chains: ``kernel(a3, b3, sfa, sfb, out2,
+    counts, rows_sf, grid)`` (``kernel(a3, b3, sfa, sfb, out2, out_sf, counts, rows_sf, grid)`` for the fused
+    requantization) -- A ``(rows, K, 1)`` e4m3, ``rows_sf`` the rows of its scale-factor buffer.
     ``chain``: a :class:`GroupedEpilogueBlock` or one of the bf16 class's legacy names (``plain`` / ``swiglu`` /
     ``relu2``)."""
     chain = as_chain(chain, out_fmt)
@@ -382,10 +452,10 @@ def get_compiled_grouped(
 # ----------------------------------------------------------------------------- the swapped body (the swapped records)
 
 
-def _swap_epi_wgs(token_tile: int) -> int:
+def _swap_epi_wgs(chain: GroupedEpilogueBlock, token_tile: int) -> int:
     from .swap import epi_warpgroups
 
-    return epi_warpgroups(token_tile)
+    return epi_warpgroups(token_tile, chain)
 
 
 def swapped_kernel_name(
@@ -393,13 +463,17 @@ def swapped_kernel_name(
     chain: ChainLike,
     out_fmt: str = "bf16",
     gather: bool = False,
+    k_block: int = 0,
     sf_src: str = "128x4",
+    plan_in_kernel: bool = False,
 ) -> str:
-    """``swapped_<format>_<chain>_<record>[_gather][_sflin]``: the swapped record (its weight and token tiles) names the object
-    beside the chain; the bf16 gather form (the token box gathered from the unpermuted rows) appends ``_gather`` (the
-    block-scaled gather record carries its own suffix), the linear scale source ``_sflin``. The scale source is the gather
-    form's: the box form reads the 128x4 buffer alone, so ``sf_src="linear"`` with a box record is refused (two objects
-    under one name otherwise)."""
+    """``swapped_<format>_<chain>_<record>[_gather][_sflin][_kb<K>][_e<W>][_ikp]``: the swapped record (its weight and token tiles)
+    names the object beside the chain; the bf16 gather form (the token box gathered from the unpermuted rows) appends ``_gather``
+    (the block-scaled gather record carries its own suffix), the linear scale source ``_sflin``; a block-scaled body's stage of
+    ``k_block`` elements of K (the MXFP8 classes' two-atom stage) appends ``_kb<k_block>``; an epilogue over several warpgroups
+    (the chains on the shared swapped epilogue at the wider token tiles) ``_e<W>``; the in-kernel plan ``_ikp``. The scale
+    source is the gather form's: the box form reads the 128x4 buffer alone, so ``sf_src="linear"`` with a box record is
+    refused (two objects under one name otherwise)."""
     chain = as_chain(chain, out_fmt)
     if sf_src == "linear" and not (gather or cfg.gather_a):
         raise ValueError(
@@ -411,9 +485,11 @@ def swapped_kernel_name(
         f"swapped_{fmt_tag(chain.in_fmt)}_{chain.describe()}_{knobs.describe()}"
         + ("_gather" if gather else "")
         + ("_sflin" if sf_src == "linear" else "")
+        + (f"_kb{k_block}" if k_block else "")
+        + ("_ikp" if plan_in_kernel else "")
         + (
-            f"_e{_swap_epi_wgs(knobs.tile_n)}"
-            if _swap_epi_wgs(knobs.tile_n) > 1
+            f"_e{_swap_epi_wgs(chain, knobs.tile_n)}"
+            if _swap_epi_wgs(chain, knobs.tile_n) > 1
             else ""
         )
     )
@@ -458,22 +534,72 @@ def can_implement(
 
 
 def compile_swapped_fn(
-    cfg: Knobs, chain: GroupedEpilogueBlock, gather: bool = False, sf_src: str = "128x4"
+    cfg: Knobs,
+    chain: GroupedEpilogueBlock,
+    gather: bool = False,
+    k_block: int = 0,
+    sf_src: str = "128x4",
+    plan_in_kernel: bool = False,
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one swapped specialisation: ``kernel(rows3, w3, out2, counts, [alpha, sa, si,]
     grid)`` -- ``rows (R, K, 1)`` the dense permuted rows (``R >= Tk``), ``w (N, K, E)``, ``out (Tk, Nout)``; the gather form
     (the bf16 classes) ``kernel(x2, src, k_div, w3, out2, counts, grid)`` -- ``x (T, K)`` the unpermuted rows, ``src (>= Tk,)``
     int32 the plan's slot of every expanded row; the block-scaled chains ``kernel(rows3, sfa, w3, sfw, out2, counts, alpha,
-    pts, grid)`` (``kernel(rows3, sfa, w3, sfw, out2, out_sf, counts, alpha, pts, aux, grid)`` for the static class)."""
+    pts, grid)`` (``kernel(rows3, sfa, w3, sfw, out2, out_sf, counts, alpha, pts, aux, grid)`` for the static class); the MX
+    chains ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, grid)`` with the stage ``k_block`` elements of K wide when
+    given."""
 
     def compile_fn():
         f = _fakes(chain)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
-        body = SwappedGroupedGemm(cfg, chain, gather=gather, sf_src=sf_src)
+        body = SwappedGroupedGemm(
+            cfg,
+            chain,
+            gather=gather,
+            sf_src=sf_src,
+            k_block=k_block,
+            plan_in_kernel=plan_in_kernel,
+        )
         if _is_block_scaled(chain) and cfg.gather_a:
             sfx = f["sfa_lin"] if sf_src == "linear" else f["sfa"]
-            if isinstance(chain, Mxfp4Chain):
+            if isinstance(chain, (MxChain, Mxfp4Chain)):
+                # the MX chains' gather entries: the fused requantization (the MXFP8 classes; with the in-kernel plan the
+                # decode form) or the plain chain
+                if chain.quant and plan_in_kernel:
+                    return cute.compile(
+                        body.block_scaled_quant_gathered_plan,
+                        f["rows"],
+                        sfx,
+                        f["ids"],
+                        Int32(1),
+                        Int32(1),
+                        f["b"],
+                        f["sfb"],
+                        f["out"],
+                        f["out_sf"],
+                        f["counts"],
+                        f["dest"],
+                        grid,
+                        stream_fake,
+                        options="--enable-tvm-ffi",
+                    )
+                if chain.quant:
+                    return cute.compile(
+                        body.block_scaled_quant_gathered,
+                        f["rows"],
+                        sfx,
+                        f["src"],
+                        Int32(1),
+                        f["b"],
+                        f["sfb"],
+                        f["out"],
+                        f["out_sf"],
+                        f["counts"],
+                        grid,
+                        stream_fake,
+                        options="--enable-tvm-ffi",
+                    )
                 return cute.compile(
                     body.block_scaled_plain_gathered,
                     f["rows"],
@@ -524,9 +650,22 @@ def compile_swapped_fn(
                 options="--enable-tvm-ffi",
             )
         if _is_block_scaled(chain):
-            # the plain entry (no operand beyond the output) is the MXFP4 chains'; the W4A4 unscaled oracle keeps the scaled
-            # entry and leaves its alpha / pts unread
-            if isinstance(chain, Mxfp4Chain):
+            if isinstance(chain, (MxChain, Mxfp4Chain)):
+                # the MX chains' entries; the W4A4 unscaled oracle keeps ``block_scaled`` (alpha / pts unread)
+                if chain.quant:
+                    return cute.compile(
+                        body.block_scaled_quant,
+                        f["rows"],
+                        f["sfa"],
+                        f["b"],
+                        f["sfb"],
+                        f["out"],
+                        f["out_sf"],
+                        f["counts"],
+                        grid,
+                        stream_fake,
+                        options="--enable-tvm-ffi",
+                    )
                 return cute.compile(
                     body.block_scaled_plain,
                     f["rows"],
@@ -605,30 +744,38 @@ def get_compiled_swapped(
     chain: ChainLike = "plain",
     out_fmt: str = "bf16",
     gather: bool = False,
+    k_block: int = 0,
     sf_src: str = "128x4",
+    plan_in_kernel: bool = False,
 ) -> Any:
     """``kernel(rows3, w3, out2, counts, grid)`` (``kernel(rows3, w3, out2, counts, alpha, sa, si, grid)`` for a chain with
     scale operands; ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, alpha, pts, [aux,] grid)`` for the block-scaled
-    chains): the swapped body for a swapped record of the chain's format (module ``batch_invariant_moe``): rows ``(R, K, 1)``
-    K-major (``R >= Tk``), w ``(N, K, E)`` K-major, out ``(Tk, Nout)``, counts ``(E,)``, ``grid`` the persistent grid in CTAs;
-    the gather form ``kernel(x2, src, k_div, w3, out2, counts, grid)`` (the bf16 classes); the block-scaled gather record
+    chains with the W4A4 scales; ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, grid)`` for the MX chains): the
+    swapped body for a swapped record of the chain's format (module ``batch_invariant_moe``): rows ``(R, K, 1)`` K-major
+    (``R >= Tk``), w ``(N, K, E)`` K-major, out ``(Tk, Nout)``, counts ``(E,)``, ``grid`` the persistent grid in CTAs; the
+    gather form ``kernel(x2, src, k_div, w3, out2, counts, grid)`` (the bf16 classes); the block-scaled gather record
     (``cfg.gather_a``): ``kernel(x3, sfx, src, k_div, w3, sfw, out2, [out_sf,] counts, [alpha, pts, [aux,]] grid)`` -- ``x (T,
-    K/2, 1)`` the unpermuted packed token rows, ``sfx`` their flat scale buffer (``sf_src``), ``pts (T,)`` or ``(1,)``."""
+    K/2, 1)`` the unpermuted packed token rows, ``sfx`` their flat scale buffer (``sf_src``), ``pts (T,)`` or ``(1,)``.
+    ``k_block``: a block-scaled body's K elements per stage (0: the format's atom), one object per value."""
     chain = as_chain(chain, out_fmt)
     assert is_swapped_record(cfg, chain.in_fmt), (cfg, chain.in_fmt)
     assert sf_src in ("128x4", "linear"), sf_src
     name = swapped_kernel_name(
-        cfg, chain, gather=gather, sf_src=sf_src
+        cfg,
+        chain,
+        gather=gather,
+        k_block=k_block,
+        sf_src=sf_src,
+        plan_in_kernel=plan_in_kernel,
     )  # refuses the box form with the linear source
     return jit.build_and_load(
-        MODULE, name, compile_swapped_fn(cfg, chain, gather, sf_src)
+        MODULE,
+        name,
+        compile_swapped_fn(cfg, chain, gather, k_block, sf_src, plan_in_kernel),
     )
 
 
 # ----------------------------------------------------------------------------- the block-scaled classes' entries
-
-
-BLOCKSCALED_CHAINS = (W4A4Chain, Mxfp4Chain)
 
 
 def can_implement_grouped_blockscaled(

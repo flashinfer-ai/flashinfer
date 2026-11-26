@@ -178,17 +178,27 @@ class BlockScaledPlan:
     def tmem_alloc_cols(self, need: int) -> int:
         return max(32, _pow2ceil(need))
 
-    def __init__(self, knobs: Knobs, c_dtype, c_layout, cta_chunks: bool = False):
+    def __init__(
+        self,
+        knobs: Knobs,
+        c_dtype,
+        c_layout,
+        cta_chunks: bool = False,
+        k_blocks: Optional[int] = None,
+    ):
         """``cta_chunks``: the in-CTA chunk fold (the CTA folds every chunk of its tile; the count is a runtime value of
         the kernel, the operands' batch extent) -- the TMEM holds the running sum next to the accumulator stages
-        (``sum_stage``)."""
+        (``sum_stage``). ``k_blocks``: the instruction K steps per smem stage (the lowering's inner radix; default the
+        format's one 128-byte atom of K) -- a placement of the same fold (the grouped swapped decode body stages two
+        atoms)."""
         assert knobs.well_formed(self.IN_FMT) and knobs.use_tma_store, knobs
         assert not cta_chunks or knobs.cta_chunks, knobs
         self.knobs = knobs
         self.cta_chunks = cta_chunks
         self.block = MainloopBlock(
-            self.IN_FMT, k_block_override=knobs.k_block
-        )  # the record's k-block (the lowering's inner radix); the block's overrides are named, never positional
+            self.IN_FMT, k_block_override=knobs.k_block, inner_steps=k_blocks
+        )  # the record's k-block (the lowering's inner radix) unless ``k_blocks`` names the steps per stage; the block's
+        # overrides are named, never positional
         self.a_dtype, self.b_dtype = self.A_DT, self.B_DT
         # the smem containers (the hooks above): the operand's own dtype unless the instruction reads an unpacked one
         self.a_smem_dtype = self.A_SMEM_DT or self.A_DT

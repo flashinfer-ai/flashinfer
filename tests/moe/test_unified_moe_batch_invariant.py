@@ -20,8 +20,12 @@ enumerated space.
 
 from __future__ import annotations
 
+import functools
+
+import cutlass.cute as cute
 import pytest
 import torch
+from cutlass import Int32
 
 from flashinfer import batch_invariant as bi
 from flashinfer.fused_moe import (
@@ -114,6 +118,130 @@ def bits(t: torch.Tensor) -> torch.Tensor:
         if t.dtype == torch.bfloat16
         else t.contiguous().view(torch.int32)
     )
+
+
+class _DualScanProbe:
+    """Test kernel: one warp runs the two-scan tables (``build_group_tables`` at the packing's alignment and at ``pad_align``)
+    and the fused ``build_group_tables_dual`` of the same counts into the rows of ``mOut`` (off, pre, off_pad | dual off,
+    dual pre, dual off_pad | the second scan's prefix, which no body keeps)."""
+
+    def __init__(self, cluster_rows: int, pad_align: int, off_align: int):
+        self.cluster_rows, self.pad_align, self.off_align = (
+            cluster_rows,
+            pad_align,
+            off_align,
+        )
+
+    @cute.jit
+    def __call__(self, mCounts: cute.Tensor, mOut: cute.Tensor, E: Int32, stream):
+        self.kernel(mCounts, mOut, E).launch(
+            grid=[1, 1, 1], block=[32, 1, 1], stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, mCounts: cute.Tensor, mOut: cute.Tensor, E: Int32):
+        from flashinfer.fused_moe.batch_invariant.blocks.scheduler import (
+            build_group_tables,
+            build_group_tables_dual,
+        )
+
+        build_group_tables(
+            mCounts, E, self.cluster_rows, mOut[0, None], mOut[1, None], self.off_align
+        )
+        build_group_tables(
+            mCounts, E, self.cluster_rows, mOut[2, None], mOut[6, None], self.pad_align
+        )
+        build_group_tables_dual(
+            mCounts,
+            E,
+            self.cluster_rows,
+            mOut[3, None],
+            mOut[4, None],
+            mOut[5, None],
+            self.pad_align,
+            self.off_align,
+        )
+
+
+@functools.cache
+def _compiled_dual_scan_probe(cluster_rows: int, pad_align: int, off_align: int):
+    sym_e, sym_t = cute.sym_int(32), cute.sym_int(32)
+    c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+    o_fake = cute.runtime.make_fake_tensor(
+        Int32, (7, sym_t), (cute.sym_int64(), 1), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        _DualScanProbe(cluster_rows, pad_align, off_align),
+        c_fake,
+        o_fake,
+        Int32(1),
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+
+
+def _adversarial_counts(max_e: int):
+    g = torch.Generator().manual_seed(7)
+    yield "empty groups", torch.tensor([0, 5, 0, 0, 70, 1, 0, 0], dtype=torch.int32)
+    yield "all zero", torch.zeros(8, dtype=torch.int32)
+    yield (
+        "one group takes all rows",
+        torch.tensor([0, 0, 4096, 0, 0], dtype=torch.int32),
+    )
+    yield "E = 1", torch.tensor([333], dtype=torch.int32)
+    yield (
+        "E = MAX_E random",
+        (
+            torch.randint(0, 700, (max_e,), generator=g)
+            * (torch.rand(max_e, generator=g) < 0.7)
+        ).to(torch.int32),
+    )
+    yield "E = MAX_E ones", torch.ones(max_e, dtype=torch.int32)
+    yield (
+        "E = MAX_E - 1, last group all rows",
+        torch.cat(
+            [
+                torch.zeros(max_e - 2, dtype=torch.int32),
+                torch.tensor([20000], dtype=torch.int32),
+            ]
+        ),
+    )
+    yield (
+        "sub-tile groups",
+        torch.tensor(
+            [1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257],
+            dtype=torch.int32,
+        ),
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("cluster_rows", [8, 16, 32, 128, 256])
+@pytest.mark.parametrize("off_align", [1, 128])
+def test_fused_dual_scan_matches_the_two_scans(cluster_rows, off_align):
+    """``scheduler.build_group_tables_dual`` (one warp pass for the packing's offsets, the padded offsets and the cluster-row
+    prefix) writes the same integers as two ``build_group_tables`` scans (the packing's alignment, then ``pad_align``), bit
+    for bit, on adversarial counts: empty groups, all-zero counts, a single group taking all rows, E = 1 and E = MAX_E,
+    groups a row either side of every tile extent; both packings (``off_align`` 1: dense; 128: the atom-aligned positions)
+    at every cluster-row extent the bodies take (the swapped token tiles, the padded body's cluster extents); entry E the
+    totals."""
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
+
+    fn = _compiled_dual_scan_probe(cluster_rows, 128, off_align)
+    for name, counts in _adversarial_counts(MAX_E):
+        E = counts.numel()
+        c = counts.cuda()
+        out = torch.full((7, MAX_E + 1), -1, dtype=torch.int32, device="cuda")
+        fn(c, out, E)  # torch tensors over tvm-ffi; the stream torch's current
+        torch.cuda.synchronize()
+        o = out.cpu()
+        assert torch.equal(o[3:6], o[0:3]), (name, cluster_rows, off_align)
+        cl = counts.long()
+        assert o[3, E] == ((cl + off_align - 1) // off_align * off_align).sum(), name
+        assert o[5, E] == ((cl + 127) // 128 * 128).sum(), name
+        assert o[4, E] == ((cl + cluster_rows - 1) // cluster_rows).sum(), name
+        assert torch.equal(o[3:6, 0], torch.zeros(3, dtype=torch.int32)), name
 
 
 def _same_bits_or_both_nan(a: torch.Tensor, b: torch.Tensor) -> bool:

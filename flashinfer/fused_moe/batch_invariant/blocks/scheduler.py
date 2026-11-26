@@ -149,58 +149,63 @@ def build_group_tables_dual(
     s_pre: cute.Tensor,
     s_off_pad: cute.Tensor,
     pad_align: cutlass.Constexpr,
+    off_align: cutlass.Constexpr = 1,
 ):
-    """The dense packing's three tables from one read of ``counts`` (one warp): ``s_off`` = exclusive prefix of the counts
-    (the dense group offsets), ``s_pre`` = exclusive prefix of ``ceil(counts[e] / cluster_rows)``, ``s_off_pad`` = exclusive
-    prefix of the counts rounded up to ``pad_align`` rows (the padded positions of the scale factors and row scales): the
-    integers of :func:`build_group_tables` at align 1 and at ``pad_align``. Integer sums: exact in every order."""
+    """``build_group_tables`` twice in one pass: ``s_off`` the exclusive prefix of ``counts`` rounded up to ``off_align``
+    rows, ``s_off_pad`` the same prefix rounded up to ``pad_align`` rows (the scale-factor positions), ``s_pre`` the
+    exclusive prefix of ``ceil(counts[e] / cluster_rows)``; entries ``e > E`` the totals. The same integers as the two
+    scans, one set of loads and one shuffle tree of three running sums."""
     lane = cute.arch.lane_idx()
-    loc_c = cute.make_rmem_tensor((PER_LANE,), Int32)
-    loc_b = cute.make_rmem_tensor((PER_LANE,), Int32)
+    loc_o = cute.make_rmem_tensor((PER_LANE,), Int32)
     loc_p = cute.make_rmem_tensor((PER_LANE,), Int32)
-    # the lane's counts first, all loads in flight together (as build_group_tables), then the three sums
+    loc_b = cute.make_rmem_tensor((PER_LANE,), Int32)
     for i in cutlass.range_constexpr(PER_LANE):
         e = lane * PER_LANE + i
         c = Int32(0)
         if e < E:
             c = counts[e]
-        loc_c[i] = c
-    sum_c = Int32(0)
-    sum_b = Int32(0)
+        loc_o[i] = c
+    sum_o = Int32(0)
     sum_p = Int32(0)
+    sum_b = Int32(0)
     for i in cutlass.range_constexpr(PER_LANE):
-        c = loc_c[i]
-        loc_c[i] = sum_c
-        loc_b[i] = sum_b
+        c = loc_o[i]
+        loc_o[i] = sum_o
         loc_p[i] = sum_p
-        sum_c = sum_c + c
-        sum_b = sum_b + (c + Int32(cluster_rows - 1)) // Int32(cluster_rows)
+        loc_b[i] = sum_b
+        if cutlass.const_expr(off_align > 1):
+            sum_o = sum_o + ((c + Int32(off_align - 1)) // Int32(off_align)) * Int32(
+                off_align
+            )
+        else:
+            sum_o = sum_o + c
         sum_p = sum_p + ((c + Int32(pad_align - 1)) // Int32(pad_align)) * Int32(
             pad_align
         )
-    inc_c = sum_c
-    inc_b = sum_b
+        sum_b = sum_b + (c + Int32(cluster_rows - 1)) // Int32(cluster_rows)
+    inc_o = sum_o
     inc_p = sum_p
+    inc_b = sum_b
     for sh in cutlass.range_constexpr(5):
-        oc = cute.arch.shuffle_sync_up(inc_c, offset=1 << sh)
-        ob = cute.arch.shuffle_sync_up(inc_b, offset=1 << sh)
+        oo = cute.arch.shuffle_sync_up(inc_o, offset=1 << sh)
         op = cute.arch.shuffle_sync_up(inc_p, offset=1 << sh)
+        ob = cute.arch.shuffle_sync_up(inc_b, offset=1 << sh)
         if lane >= (1 << sh):
-            inc_c = inc_c + oc
-            inc_b = inc_b + ob
+            inc_o = inc_o + oo
             inc_p = inc_p + op
-    base_c = inc_c - sum_c
-    base_b = inc_b - sum_b
+            inc_b = inc_b + ob
+    base_o = inc_o - sum_o
     base_p = inc_p - sum_p
+    base_b = inc_b - sum_b
     for i in cutlass.range_constexpr(PER_LANE):
         e = lane * PER_LANE + i
-        s_off[e] = base_c + loc_c[i]
-        s_pre[e] = base_b + loc_b[i]
+        s_off[e] = base_o + loc_o[i]
         s_off_pad[e] = base_p + loc_p[i]
+        s_pre[e] = base_b + loc_b[i]
     if lane == 31:
-        s_off[MAX_E] = inc_c
-        s_pre[MAX_E] = inc_b
+        s_off[MAX_E] = inc_o
         s_off_pad[MAX_E] = inc_p
+        s_pre[MAX_E] = inc_b
     cute.arch.sync_warp()
 
 

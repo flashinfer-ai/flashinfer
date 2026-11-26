@@ -4,19 +4,22 @@
 
 One runner for the 4-bit-weight quantization pairs, grouped as ``TrtllmFp4Config`` groups them: ``QuantConfig(weight=...,
 activation=...)`` selects the pair (:data:`PAIRS`: NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` and the static class
-``moe.nvfp4.<act>.static``; MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>``), the op is :func:`.api_fp4.fused_moe_fp4` on the
-pair. The weight view and the autotuner records live under the backend's key; a pack prepared for the other pair is refused.
-A pair outside ``supported_quant_variants`` (MXFP4 x MXFP8 among them) is skipped by ``MoELayer``'s candidate filter
-(``supports_quant``) and refused by ``check_support`` and by the config's ``prepare_weights`` / ``prepare_activations``
-with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming the served pairs.
+``moe.nvfp4.<act>.static``; MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>``; MXFP4 x MXFP8, the mixed classes
+``moe.mxfp4w8a.<act>``), the op is :func:`.api_fp4.fused_moe_fp4` on the fp4 pairs and :func:`.api_mxfp4w8a.fused_moe_mxfp4w8a`
+on the mixed pair. The weight view and the autotuner records live under the backend's key; a pack prepared for another pair
+is refused. A pair outside ``supported_quant_variants`` is skipped by ``MoELayer``'s candidate filter (``supports_quant``) and
+refused by ``check_support`` and by the config's ``prepare_weights`` / ``prepare_activations`` with
+:class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming the served pairs.
 
-The activations come as bf16 rows (``hidden_states_q`` bf16, no scale: the pair's class quantizes them itself) or already
-quantized (``hidden_states_q`` packed uint8 ``[T, H/2]``, ``hidden_states_scale`` the block scales -- the 128x4 swizzled
+The fp4 pairs' activations come as bf16 rows (``hidden_states_q`` bf16, no scale: the pair's class quantizes them itself) or
+already quantized (``hidden_states_q`` packed uint8 ``[T, H/2]``, ``hidden_states_scale`` the block scales -- the 128x4 swizzled
 buffer of the mode's quantizer or the linear ``[T, H/block]`` layout; NVFP4 also ``per_token_scale [T]`` f32 under
-``QuantConfig(per_token_scale=True)``, unit scales when absent: the per-tensor pack of ``TrtllmFp4Config``; the MX pair has
-no per-token scale and refuses the flag). The three routing input modes of the bf16 backend, the slot-order combine (never an
-atomic finalize), the dispatcher's ranked records as tactics (any tactic gives the same bits); an unsupported configuration
-raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+``QuantConfig(per_token_scale=True)``, unit scales when absent: the per-tensor pack of ``TrtllmFp4Config``; the MX pairs have
+no per-token scale and refuse the flag). The mixed pair's activations are the canonical MXFP8 pack (e4m3 ``hidden_states_q
+[T, H]`` with the token-major UE8M0 ``hidden_states_scale [T, H / 32]``, as ``TrtllmFp4Config`` / ``TrtllmFp8BlockConfig`` /
+this config's ``prepare_activations`` produce it), taken as given. The three routing input modes of the bf16 backend, the
+slot-order combine (never an atomic finalize), the dispatcher's ranked records as tactics (any tactic gives the same bits); an
+unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 """
 
 from __future__ import annotations
@@ -52,30 +55,32 @@ from ..api import (
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
 from . import spec as S
-from .api_fp4 import MXFP4, NVFP4, Fp4Pair
+from .api_fp4 import MXFP4, MXFP4W8A, NVFP4, Fp4Pair
 from .runner import MOE_BF16_ARCHS, _PackedInputs, routing_term
 
 #: The backend's key: the name of its weight view and of its autotuner records.
 BACKEND_KEY = "batch_invariant_fp4"
-#: The compute capabilities the classes are stated for (the dense 4-bit GEMM class's parts).
+#: The compute capabilities the classes are stated for (the dense 4-bit GEMM classes' parts).
 MOE_FP4_ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
 #: The quantization pairs the backend serves, in the order they are advertised.
 PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Fp4Pair] = {
     (QuantFormat.NVFP4, QuantFormat.NVFP4): NVFP4,
     (QuantFormat.MXFP4, QuantFormat.MXFP4): MXFP4,
+    (QuantFormat.MXFP4, QuantFormat.MXFP8): MXFP4W8A,
 }
-#: Positions of the packed inputs: the activation rows (bf16, or packed fp4), their scale factors and per-token scales (or
-#: placeholders), the expert ids, the routing weights, the six weight tensors (the MX pair's alphas are placeholders), the
-#: output, the static class's per-expert scales (placeholders otherwise); the dense plan follows when the router made it.
+#: Positions of the packed inputs: the activation rows (bf16, packed fp4, or the mixed pair's e4m3), their scale factors and
+#: per-token scales (or placeholders), the expert ids, the routing weights, the six weight tensors (the MX pairs' alphas are
+#: placeholders), the output, the static class's per-expert scales (placeholders otherwise); the plan follows when the router
+#: made it (the dual form for the fp4 pairs; the mixed pair's in the form of its packing).
 _X, _SF, _PTS, _IDS, _W, _W1, _W1SF, _W1A, _W2, _W2SF, _W2A, _OUT, _GS2, _INV2 = range(
     14
 )
 #: Plan tensors after the ids and weights in the packed inputs (``route_plan_dual``'s outputs, appended by construction in
 #: ``pack_inputs``) and scalars per record in the tactic tuple (``_tactic_fp4``'s); both pinned to the builders by the suite.
 _PLAN_LEN = 5
-TACTIC_FIELDS = 8
+TACTIC_FIELDS = 9
 
-#: The layer's typed activations, every one a class of either pair.
+#: The layer's typed activations, every one a class of each pair.
 _ACTIVATIONS = (
     SwiGLU,
     SwiGLUStep,
@@ -114,7 +119,7 @@ def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     as the op's constants are (:func:`~.api_fp4._const`: a blocking host copy outside CUDA graph capture; under capture an
     allocation of that capture alone, never cached, so a capture's private pool serves no eager call). The empty vector also
     marks a pre-quantized NVFP4 pack without per-token scales (the per-tensor pack of the TRTLLM backends: unit scales,
-    nothing to read or fill) and stands for the MX pair's absent alphas."""
+    nothing to read or fill) and stands for the MX pairs' absent alphas and per-token scales."""
     from .api_fp4 import _const, _device_key
 
     key = _device_key(device)
@@ -126,7 +131,8 @@ def _no_scales(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
 
 def _tactic_fp4(c1, c2) -> tuple:
     """A pair of records as a flat tuple of scalars (JSON round-trip safe for the autotuner's cache): the bf16 runner's six
-    per record plus the swapped-record and the gather-form flags."""
+    per record plus the swapped-record and the gather-form flags and the record's k-block (the mixed pair's swapped records
+    carry their stage width)."""
     return tuple(
         int(v) if isinstance(v, bool) else v
         for cfg in (c1, c2)
@@ -139,12 +145,20 @@ def _tactic_fp4(c1, c2) -> tuple:
             cfg.raster_along,
             cfg.swap_ab,
             cfg.gather_a,
+            cfg.k_block,
         )
     )
 
 
 def _configs_from_tactic_fp4(t: tuple):
+    """The two records of a tactic tuple; a tuple of another length (a tactic persisted under another tag) is refused by
+    name, never split at the wrong field."""
     from ...gemm.batch_invariant.generator import Knobs
+
+    if len(t) != 2 * TACTIC_FIELDS:
+        raise ValueError(
+            f"the fp4 MoE backend's tactic is {2 * TACTIC_FIELDS} scalars ({TACTIC_FIELDS} per record), got {len(t)}"
+        )
 
     def one(v):
         return Knobs(
@@ -156,6 +170,7 @@ def _configs_from_tactic_fp4(t: tuple):
             1,
             swap_ab=bool(v[6]),
             gather_a=bool(v[7]),
+            k_block=int(v[8]),
         )
 
     return one(t[:TACTIC_FIELDS]), one(t[TACTIC_FIELDS : 2 * TACTIC_FIELDS])
@@ -166,6 +181,7 @@ class BatchInvariantFp4Runner(MoERunner):
     the routed scale constant and the part at build, the intermediate's class from the backend config."""
 
     backend_key = BACKEND_KEY
+    TACTIC_TAG = "moe.fp4-v2"  # v2: the tactic carries the k-block
     supported_quant_variants = tuple(PAIRS)
     supported_output_formats = (QuantFormat.BF16,)
     supported_routing_modes = (
@@ -176,7 +192,7 @@ class BatchInvariantFp4Runner(MoERunner):
     supported_activation_classes = _ACTIVATIONS
     supported_activation_classes_by_quant = {pair: _ACTIVATIONS for pair in PAIRS}
     # the NVFP4 pair consumes a pre-quantized pack's per-token scale (the class's own ``pts``) under the layer's shared
-    # contract; the MX pair has none and refuses the flag at support
+    # contract; the MX pairs have none and refuse the flag at support
     supports_per_token_scale = True
     supports_expert_parallelism = False
 
@@ -192,6 +208,9 @@ class BatchInvariantFp4Runner(MoERunner):
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
         self._scale: Optional[torch.Tensor] = None
+        # the mixed pair's instruction class on this part (set at build; None for the fp4 pairs, whose classes follow the
+        # weight shapes)
+        self._in_fmt: Optional[str] = None
         # the routing term's state, set by _check_support (`_method` None: no from-logits class; a deferred refusal's
         # message, raised afresh at every from-logits call: no exception object, hence no traceback, is kept)
         self._method: Optional[S.RoutingMethod] = None
@@ -228,6 +247,15 @@ class BatchInvariantFp4Runner(MoERunner):
                 "the full expert set (the class's EP form is not part of this backend)",
             )
 
+    def _mixed_class(self) -> Optional[str]:
+        """The mixed pair's instruction class on the runner's device (the dense mixed class's rule per architecture family);
+        None for the fp4 pairs."""
+        if not self.pair.mixed:
+            return None
+        from .api_mxfp4w8a import mx_class_of
+
+        return mx_class_of(self.device)
+
     def _check_support(self) -> None:
         if self._pair is None:
             raise unsupported_pair(self.config.quant)
@@ -236,12 +264,12 @@ class BatchInvariantFp4Runner(MoERunner):
         super()._check_support()
         cfg, pair, cls = self.config, self.pair, self.pair.cls
         if not pair.scaled:
-            # the MX pair carries no per-token scale and no static-intermediate class (both are the NVFP4 pair's)
+            # the MX pairs carry no per-token scale and no static-intermediate class (both are the NVFP4 pair's)
             if cfg.quant.per_token_scale:
                 raise unsupported(
                     cls,
                     "QuantConfig(per_token_scale=True)",
-                    "no per-token scale (the MX pair's scales are the block scales alone)",
+                    "no per-token scale (the MX pairs' scales are the block scales alone)",
                 )
             if self._intermediate != "per_token":
                 raise unsupported(
@@ -249,6 +277,13 @@ class BatchInvariantFp4Runner(MoERunner):
                     f"BatchInvariantFp4Config(intermediate={self._intermediate!r})",
                     "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
                 )
+        if pair.mixed and cfg.quant.swizzled_scale_factors is True:
+            # the MXFP8 pack's scales are the token-major rows: the flag names a layout the pair does not take
+            raise unsupported(
+                cls,
+                "QuantConfig(swizzled_scale_factors=True)",
+                "the token-major linear scale layout of the canonical MXFP8 pack (swizzled_scale_factors unset or False)",
+            )
         check_device(self.device, cls, MOE_FP4_ARCHS)
         try:
             a = self._activation()
@@ -265,9 +300,15 @@ class BatchInvariantFp4Runner(MoERunner):
                 "fused shared experts",
                 "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
             )
-        # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule)
+        # the shape rule on the dimensions the config fixes (H enters at the first call, with the full rule), at the mixed
+        # pair's instruction class of this part
         pair.check_shape(
-            None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
+            None,
+            experts.intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+            a.gated,
+            in_fmt=self._mixed_class(),
         )
         # a routing term the from-logits mode has no class for (Llama4 beyond top-1, a group shape outside the rule) is
         # refused at a from-logits call, not here: the pre-routed modes never consult it (the bf16 runner's rule)
@@ -288,6 +329,7 @@ class BatchInvariantFp4Runner(MoERunner):
         from ...gemm.batch_invariant.api import part_of
 
         self._part = part_of(self.device)
+        self._in_fmt = self._mixed_class()
         method = self._method
         if (
             method is not None
@@ -323,7 +365,7 @@ class BatchInvariantFp4Runner(MoERunner):
         intermediate class being this candidate's -- the two fp4 candidates of a layer share the view key, so a view prepared
         for the other class is the other candidate's pack and is declined here (the runner driven directly refuses it in
         ``pack_inputs``); a view of another pair stays a refusal, since no candidate of the layer serves it. The view names
-        its pair and its class (``prepare_weights`` writes ``quant`` and ``intermediate`` for both pairs); a view without
+        its pair and its class (``prepare_weights`` writes ``quant`` and ``intermediate`` for every pair); a view without
         either key is declined, never read as the NVFP4 pair or the per-token class (``pack_inputs`` names the missing
         key)."""
         if not super().accepts(act, weights):
@@ -335,13 +377,19 @@ class BatchInvariantFp4Runner(MoERunner):
         x = act.hidden_states_q
         if x.ndim != 2:
             return False
+        if self.pair.mixed:
+            return (
+                x.dtype == torch.float8_e4m3fn
+                and x.shape[1] % 32 == 0
+                and act.hidden_states_scale is not None
+            )
         if x.dtype == torch.bfloat16:
             return x.shape[1] % 32 == 0
         return x.dtype == torch.uint8 and (2 * x.shape[1]) % 32 == 0
 
     @staticmethod
     def _hidden_of(x: torch.Tensor) -> int:
-        return int(x.shape[1]) if x.dtype == torch.bfloat16 else 2 * int(x.shape[1])
+        return 2 * int(x.shape[1]) if x.dtype == torch.uint8 else int(x.shape[1])
 
     def _activation_scales(
         self, act: MoEActivationPack, T: int, H: int
@@ -419,31 +467,68 @@ class BatchInvariantFp4Runner(MoERunner):
             pts = pts.to(torch.float32).contiguous()
         return sf_flat, pts
 
+    def _mxfp8_pack(
+        self, act: MoEActivationPack
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The mixed pair's activation pack (the shared MXFP8 pack rule, :func:`~.api_mxfp8.check_activation_pack`): the e4m3
+        rows and their token-major UE8M0 scales in the linear ``[T, H / 32]`` shape, taken as given (uint8, ``float8_e8m0fnu``
+        or the e4m3-typed carrier ``TrtllmFp4Config.prepare_activations`` gives this pair), both 16-byte aligned; no per-token
+        scale (the placeholder stands in the pack)."""
+        from .api_mxfp8 import check_activation_pack
+
+        cls = self.pair.cls
+        if act.per_token_scale is not None:
+            raise unsupported(
+                cls,
+                "a per-token scale",
+                "no per-token scale (the pair's scales are the two operands' block scales alone)",
+            )
+        x, sf = check_activation_pack(
+            act.hidden_states_q,
+            act.hidden_states_scale,
+            cls,
+            sf_dtypes=(torch.uint8, torch.float8_e8m0fnu, torch.float8_e4m3fn),
+        )
+        return x, sf, _no_scales(x.device)[1]
+
+    def _plan_form(self, T: int, H: int) -> dict:
+        """The fused route + plan launch's form: the dual plan (the dense rows with the padded scale positions) for the fp4
+        pairs' dense packing, and for the mixed pair the form of the packing the ranked records run on at this token count
+        (the dual plan, or the padded plan of whole 128-row atoms per group)."""
+        from .api_fp4 import GROUP_ALIGN
+
+        if self.pair.mixed and self._packing(T, H) == "padded":
+            return dict(align=GROUP_ALIGN)
+        return dict(dual=True, pad_align=GROUP_ALIGN)
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        from .api import route
-        from .api_fp4 import MoEWeightsFp4, route_plan_dual
+        from .api import route, route_plan
+        from .api_fp4 import MoEWeightsFp4
 
         cfg, pair, cls = self.config, self.pair, self.pair.cls
         plan: List[torch.Tensor] = []
         w_round = False  # bound to the pack (the bf16 runner's rule): a later pack never changes an earlier one's rounding
         x = act.hidden_states_q
-        if x.ndim != 2 or x.dtype not in (torch.bfloat16, torch.uint8):
-            raise unsupported(
-                cls,
-                f"hidden_states_q {x.dtype} of rank {x.ndim}",
-                "bf16 [num_tokens, hidden_size] rows, or packed fp4 uint8 [num_tokens, hidden_size / 2] with their scales",
-            )
-        x = x.contiguous()
-        if x.data_ptr() % 16:
-            raise unsupported(
-                cls,
-                "hidden_states_q at a storage offset that is not a multiple of 16 bytes",
-                "16-byte aligned rows (the kernels' vector loads and TMA boxes)",
-            )
+        if pair.mixed:
+            x, sf, pts = self._mxfp8_pack(act)
+        else:
+            if x.ndim != 2 or x.dtype not in (torch.bfloat16, torch.uint8):
+                raise unsupported(
+                    cls,
+                    f"hidden_states_q {x.dtype} of rank {x.ndim}",
+                    "bf16 [num_tokens, hidden_size] rows, or packed fp4 uint8 [num_tokens, hidden_size / 2] with their scales",
+                )
+            x = x.contiguous()
+            if x.data_ptr() % 16:
+                raise unsupported(
+                    cls,
+                    "hidden_states_q at a storage offset that is not a multiple of 16 bytes",
+                    "16-byte aligned rows (the kernels' vector loads and TMA boxes)",
+                )
         T = x.shape[0]
         H = self._hidden_of(x)
         k, E = cfg.routing.top_k, cfg.routing.num_experts
@@ -452,20 +537,21 @@ class BatchInvariantFp4Runner(MoERunner):
             raise unsupported(
                 cls,
                 "a weight view without its quantization pair (no `quant` key)",
-                "the view of BatchInvariantFp4Config.prepare_weights, which names the pair for both pairs",
+                "the view of BatchInvariantFp4Config.prepare_weights, which names the pair for every pair",
             )
         if view["quant"] != pair.name:
+            wq, aq = next(q for q, p in PAIRS.items() if p is pair)
             raise unsupported(
                 cls,
                 "weights prepared for another pair of the fp4 backend",
-                f"weights from BatchInvariantFp4Config.prepare_weights(..., quant=QuantConfig(weight={pair.name.upper()}, "
-                f"activation={pair.name.upper()}))",
+                f"weights from BatchInvariantFp4Config.prepare_weights(..., quant=QuantConfig(weight={wq.name}, "
+                f"activation={aq.name}))",
             )
         if "intermediate" not in view:
             raise unsupported(
                 cls,
                 "a weight view without its intermediate class (no `intermediate` key)",
-                "the view of BatchInvariantFp4Config.prepare_weights, which names the class for both pairs",
+                "the view of BatchInvariantFp4Config.prepare_weights, which names the class for every pair",
             )
         w = MoEWeightsFp4.from_view(view)
         if (
@@ -491,8 +577,10 @@ class BatchInvariantFp4Runner(MoERunner):
                 f"intermediate={self._intermediate!r} with weights prepared for intermediate={w.intermediate!r}",
                 "weights prepared with the backend config's intermediate class",
             )
-        pair.check_shape(H, w.intermediate_size, E, k, w.gated)
-        if x.dtype == torch.bfloat16:
+        pair.check_shape(H, w.intermediate_size, E, k, w.gated, in_fmt=self._in_fmt)
+        if pair.mixed:
+            pass  # the pack's rows and scales as validated above
+        elif x.dtype == torch.bfloat16:
             if act.hidden_states_scale is not None or act.per_token_scale is not None:
                 raise unsupported(
                     cls,
@@ -538,10 +626,16 @@ class BatchInvariantFp4Runner(MoERunner):
                 and T * k <= ROUTE_PLAN_MAX_SLOTS
                 and E <= MAX_E
             ):
-                # routing and the dense packing's dual plan in one launch (a placement: the same bits and integers); the
-                # plan tensors follow the ids and weights as the builder returns them
-                ids, wts, *plan = route_plan_dual(
-                    act.routing_logits, k, self._method, bias, scale
+                # routing and the permutation plan in one launch (a placement: the same bits and integers), in the form of
+                # the packing the pair runs on at this token count; the plan tensors follow the ids and weights as the
+                # builder returns them
+                ids, wts, *plan = route_plan(
+                    act.routing_logits,
+                    k,
+                    self._method,
+                    bias,
+                    scale,
+                    **self._plan_form(T, H),
                 )
             else:
                 ids, wts = route(act.routing_logits, k, self._method, bias, scale)
@@ -580,17 +674,18 @@ class BatchInvariantFp4Runner(MoERunner):
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _scatter_launch(self, x: torch.Tensor) -> bool:
         """Whether the box form scatters the quantized rows in a launch of its own: a pre-quantized input, and every input of
-        the MX pair (whose quantizer stores the class's layout); a bf16 NVFP4 input's quantizer scatters in its own pass."""
+        the MX pairs (whose quantizers store the class's layout); a bf16 NVFP4 input's quantizer scatters in its own pass."""
         return x.dtype != torch.bfloat16 or not self.pair.scaled
 
     def _gather_form(self, x: torch.Tensor, sf: torch.Tensor) -> bool:
         """Whether GEMM1's narrow swapped record takes its gather form for this pack: the box form would scatter in a launch
         of its own (:meth:`_scatter_launch`) and the pack's scale layout admits the form (a linear layout's rows as whole
-        4-byte groups: :func:`~.api_fp4.gather_form_ok`; the 128x4 buffer always). The records handed to the op are then
-        the pack's own, so the op never has to fall back from a record the runner chose."""
+        4-byte groups: :func:`~.api_fp4.gather_form_ok`; the 128x4 buffer always). The records handed to the op are then the
+        pack's own, so the op never has to fall back from a record the runner chose. The mixed pair's bodies read the token
+        box: no gather form."""
         from .api_fp4 import gather_form_ok
 
-        if not self._scatter_launch(x):
+        if self.pair.mixed or not self._scatter_launch(x):
             return False
         linear = x.dtype != torch.bfloat16 and sf.ndim == 2
         return gather_form_ok(
@@ -599,15 +694,10 @@ class BatchInvariantFp4Runner(MoERunner):
 
     def _ranked(self, T: int, H: int, gather_form: bool = False) -> Tuple[list, list]:
         """The ranked records of both GEMMs (the tactic space's head); with ``gather_form`` GEMM1's list carries the
-        gather-form twin the structural rule places (:func:`~.schedule_fp4.gather_form_rule`)."""
+        gather-form twin the structural rule places (:func:`~.schedule_fp4.gather_form_rule`). The mixed pair's lists are
+        its dispatcher's over both record spaces (:func:`~.schedule_mxfp4w8a.ranked_mx`), trimmed to the packing the first
+        picks run on (on the padded packing the swapped records cannot run, so they leave the lists)."""
         from .api_fp4 import MoEWeightsFp4
-        from .schedule_fp4 import (
-            TOP_K_FP4,
-            active_experts,
-            gather_form_rule,
-            rank_grouped_fp4,
-            rows_per_expert,
-        )
 
         cfg, pair = self.config, self.pair
         E, k, I = (
@@ -615,10 +705,8 @@ class BatchInvariantFp4Runner(MoERunner):
             cfg.routing.top_k,
             cfg.experts.intermediate_size,
         )
-        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
         a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
-        in1, in2 = pair.classes(H, I, family, a.gated)
         # the chains of the class (the weights' terms without the tensors)
         w = MoEWeightsFp4(
             pair,
@@ -633,6 +721,29 @@ class BatchInvariantFp4Runner(MoERunner):
             a.params,
             intermediate=self._intermediate,
         )  # type: ignore[arg-type]
+        if pair.mixed:
+            from .schedule import TOP_K
+            from .schedule_mxfp4w8a import packing_for, ranked_mx
+
+            in_fmt = self._in_fmt or pair.fmts[0]
+            # both record spaces are ranked for the fused-requantization spelling GEMM1 runs
+            r1, r2 = ranked_mx(
+                T, k, H, I, E, w.chain1_quant, in_fmt, sm_count, family, TOP_K
+            )
+            if packing_for(r1[0], r2[0]) == "padded":
+                r1 = [c for c in r1 if not c.swap_ab]
+                r2 = [c for c in r2 if not c.swap_ab]
+            return r1, r2
+        from .schedule_fp4 import (
+            TOP_K_FP4,
+            active_experts,
+            gather_form_rule,
+            rank_grouped_fp4,
+            rows_per_expert,
+        )
+
+        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
+        in1, in2 = pair.classes(H, I, family, a.gated)
         chain1, chain2 = w.chain1, w.chain2
         n1 = 2 * I if a.gated else I
         r1 = list(
@@ -647,6 +758,13 @@ class BatchInvariantFp4Runner(MoERunner):
         )
         return r1, list(r2)
 
+    def _packing(self, T: int, H: int) -> str:
+        """The mixed pair's packing of the expanded rows at ``T`` tokens: the first picks' (`schedule_mxfp4w8a.packing_for`)."""
+        from .schedule_mxfp4w8a import packing_for
+
+        r1, r2 = self._ranked(T, H)
+        return packing_for(r1[0], r2[0])
+
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile) -> List[Any]:
         self._require_built()
         x = inputs[_X]
@@ -656,10 +774,13 @@ class BatchInvariantFp4Runner(MoERunner):
         return [_tactic_fp4(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
+        """The autotuner cache key's extras: the pair, the intermediate class, the mixed pair's instruction class and the
+        tactic's versioned tag last (a tuple persisted under another tag never reaches the decoder)."""
         return super()._cache_key_extras() + (
-            "moe.fp4-v1",
             self.pair.name,
             self._intermediate,
+            self._in_fmt or "",
+            self.TACTIC_TAG,
         )
 
     # ---- launch ----------------------------------------------------------------------------------------------------
@@ -676,11 +797,47 @@ class BatchInvariantFp4Runner(MoERunner):
         pair = self.pair
         x, sf, pts, ids, wts, w1, w1sf, w1a, w2, w2sf, w2a, out, gs2, inv2 = inputs[:14]
         plan = (
-            tuple(inputs[14 : 14 + _PLAN_LEN])
-            if len(inputs) >= 14 + _PLAN_LEN
-            else None
-        )
+            tuple(inputs[14:]) or None
+        )  # the plan's tensors, in the form the pack built them
         H = self._hidden_of(x)
+        a = self._activation()
+        if pair.mixed:
+            from .api_mxfp4w8a import fused_moe_mxfp4w8a
+            from .schedule_mxfp4w8a import packing_for
+
+            T = int(x.shape[0])
+            if tactic == -1 or tactic is None:
+                r1, r2 = self._ranked(T, H)
+                c1, c2 = r1[0], r2[0]
+            else:
+                c1, c2 = _configs_from_tactic_fp4(tuple(tactic))
+            w = MoEWeightsFp4(
+                pair, w1, w1sf, w2, w2sf, H, self.config.experts.intermediate_size, a.gated, a.act, a.params
+            )  # fmt: skip
+            # the packing is the records' own (a swapped record reads the dense packing, the grouped body reads either): the
+            # layer keys a tuned winner by its token bucket, so a tactic may replay at a token count whose first picks pack
+            # the other way; the plan packed in the first picks' form is kept where the records read it (the dual plan feeds
+            # both bodies) and dropped otherwise (the op computes its own: the same integers, the same bits)
+            path = packing_for(c1, c2)
+            if plan is not None:
+                if len(plan) == _PLAN_LEN:
+                    path = "dense"
+                elif path == "dense":
+                    plan = None
+            fused_moe_mxfp4w8a(
+                (x, sf),
+                ids,
+                wts,
+                w,
+                out=out,
+                config1=c1,
+                config2=c2,
+                in_fmt=self._in_fmt,
+                plan=plan,
+                path=path,
+                w_round=getattr(inputs, "w_round", False),
+            )
+            return out
         if tactic == -1 or tactic is None:
             from .schedule_fp4 import gather_form_rule
 
@@ -693,7 +850,6 @@ class BatchInvariantFp4Runner(MoERunner):
                 # a tuned winner replayed on a pack whose scale layout the gather form cannot copy (the layer keys its
                 # winners by token bucket, not by layout): the record's box form, a placement of the same bits
                 c1 = dataclasses.replace(c1, gather_a=False)
-        a = self._activation()
         static = pair.scaled and self._intermediate == "static"
         w = MoEWeightsFp4(
             pair, w1, w1sf, w2, w2sf, H, self.config.experts.intermediate_size, a.gated, a.act, a.params,

@@ -4,12 +4,13 @@
 group scheduler, with per-tile TMA coordinates (A offset by the group's rows through ``cute.domain_offset``, B indexed by
 the expert as the batch coordinate) and the group-masked epilogue.
 
-One body for the bf16, the fp8 per-tensor and the NVFP4 classes: the operand block (:class:`.operands.DenseOperands`, keyed
+One body for the bf16, the fp8 per-tensor, the NVFP4 and the MXFP8 classes: the operand block (:class:`.operands.DenseOperands`, keyed
 by the chain's operand format: the format's dtype, alignment, K-steps per stage, mainloop block and static plan; or
 :class:`.operands.BlockScaledOperands`: the block-scaled plan of the instruction class, a scale-factor ring beside each
 operand ring, the scale factors staged to TMEM per k-tile, the group tables at the 128-row scale atom with the dense packing's
 second table) and the epilogue block (the chain, :class:`.epilogue.GroupedEpilogueBlock`: the bf16 chains, the W8A8 chains
-with their scale operands, the W4A4 chains with the per-row scale and the static class's fused quantization) are resolved at
+with their scale operands, the W4A4 chains with the per-row scale and the static class's fused quantization, the MX chains
+with the fused requantization's own loop and exchange buffer) are resolved at
 trace time, so every format-dependent choice is a ``const_expr`` branch and each format compiles to its own kernel.
 
 Operands: A ``(Tk, K, 1)`` K-major (the permuted activations; for the 4-bit formats the byte-packed ``(rows, K / 2, 1)``
@@ -61,6 +62,7 @@ from .operands import (  # noqa: F401  (re-exported: the operand blocks' home mo
     BlockScaledOperands,
     DenseOperands,
     operands_for,
+    xch_smem_bytes,
 )
 from .scheduler import (
     EPI_WARPGROUPS_DENSE,
@@ -185,10 +187,11 @@ class GroupedBlockGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """The entry of the block-scaled chains without further operands (the MXFP4 classes: the e8m0 scales of both operands
+        """The entry of the block-scaled chains without further operands (the MX classes, MXFP8 and MXFP4: the e8m0 scales of both operands
         are applied inside the instruction, no global or per-row scale): ``rows_sf`` the rows of the A operand's scale-factor
         buffer (the padded row count of the dense packing)."""
         assert self.operands.block_scaled and not self.chain.operands, self.chain
+        assert not self.chain.quant, self.chain
         self._launch(
             a,
             b,
@@ -199,6 +202,38 @@ class GroupedBlockGemm:
             sfa=sfa,
             sfb=sfb,
             rows_sf=rows_sf,
+        )
+
+    @cute.jit
+    def block_scaled_quant(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        rows_sf: Int32,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The entry of the block-scaled chains without further operands whose epilogue quantizes (the MXFP8 classes' fused
+        requantization, ``chain.quant``): ``out`` the codes (uint8), ``out_sf`` the flat 128x4 scale bytes at the (padded)
+        row positions of ``rows_sf`` rows."""
+        assert self.operands.block_scaled and not self.chain.operands, self.chain
+        assert self.chain.quant, self.chain
+        self._launch(
+            a,
+            b,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            sfa=sfa,
+            sfb=sfb,
+            rows_sf=rows_sf,
+            out_sf=out_sf,
         )
 
     @cute.jit
@@ -258,18 +293,20 @@ class GroupedBlockGemm:
         aux=None,
     ):
         ops = self.operands
-        if cutlass.const_expr(a.element_type != b.element_type):
+        if cutlass.const_expr(not ops.mixed and a.element_type != b.element_type):
             raise TypeError(
                 f"A and B must have one type: {a.element_type} != {b.element_type}"
             )
-        # the ring leaves room for the group tables and the epilogue staging buffers
+        # the ring leaves room for the group tables, the epilogue staging buffers and a quantising chain's exchange buffer
         self.staged = staged_store(self.chain.out_fmt)
+        self.xch_layout = self.chain.smem_layout(self.epi_warpgroups)
         sfa_t = sfb_t = None
         if cutlass.const_expr(ops.block_scaled):
-            a = ops.view_elems(a)
-            b = ops.view_elems(b)
+            a = ops.view_tokens(a)
+            b = ops.view_weights(b)
             sfa_t = ops.sf_view_rows(sfa, rows_sf, a.shape[1])  # the scale rows: padded
             sfb_t = ops.sf_view_experts(sfb, b.shape[0], b.shape[1], b.shape[2])
+            # the A ring ends inside the sm_100 instructions' descriptor window (the plan's bound; None on the sm_107 plans)
             st = ops.plan(
                 self.knobs,
                 lambda st: (
@@ -281,8 +318,10 @@ class GroupedBlockGemm:
                         if self.staged
                         else 0
                     )
+                    + xch_smem_bytes(self.xch_layout)
                 ),
                 "grouped",
+                ops.plan_cls.UMMA_SMEM_ADDR_MAX,
             )
             self.block = st.block
             assert self.block.in_fmt == self.in_fmt, (self.block.in_fmt, self.in_fmt)
@@ -290,6 +329,7 @@ class GroupedBlockGemm:
                 "the grouped body takes the dense records"
             )
         else:
+            assert self.xch_layout is None, self.chain
 
             def plan(extra: int):
                 return ops.plan(self.knobs, a, b, TABLE_SMEM_BYTES + extra, "grouped")
@@ -519,15 +559,17 @@ class GroupedBlockGemm:
                 build_group_tables(counts, E, cluster_rows, s_off, s_pre)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
-        # --- operand staging: smem rings (A, B swizzled; the scale factors plain), multicast masks, partitions
+        # --- operand staging: smem rings (A, B swizzled, at the plan's container types; the scale factors plain), multicast
+        # masks, partitions
+        a_smem_dtype, b_smem_dtype = ops.smem_dtypes(st)
         sA = smem.allocate_tensor(
-            element_type=st.a_dtype,
+            element_type=a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
         sB = smem.allocate_tensor(
-            element_type=st.b_dtype,
+            element_type=b_smem_dtype,
             layout=b_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
@@ -543,6 +585,15 @@ class GroupedBlockGemm:
                 element_type=st.sf_dtype,
                 layout=sfb_smem_layout_staged,
                 byte_alignment=128,
+            )
+        sX = None
+        if cutlass.const_expr(self.xch_layout is not None):
+            # a quantising chain's exchange buffer (the fused requantization's half-block amax between the warpgroups of a pair);
+            # the layout is built here (a layout built at plan time belongs to the host region)
+            sX = smem.allocate_tensor(
+                element_type=cutlass.Float32,
+                layout=self.chain.smem_layout(self.epi_warpgroups),
+                byte_alignment=16,
             )
         sC = None
         if cutlass.const_expr(self.staged):  # one output subtile per epilogue warpgroup
@@ -785,31 +836,56 @@ class GroupedBlockGemm:
                 mma_m_in_cluster,
                 cta_n_in_cluster,
             )
-            grouped_epilogue_loop(
-                st,
-                self.chain,
-                tidx,
-                tile_sched,
-                tCtAcc_base,
-                thr_mma,
-                mOut,
-                Tk,
-                N,
-                epi_tile,
-                acc_pipeline,
-                mma_m_in_cluster,
-                self.epi_warpgroups,
-                sC=sC,
-                cta_v=mma_tile_coord_v,
-                mAlpha=mAlpha,
-                mSa=mSa,
-                mSi=mSi,
-                mPts=mPts,
-                mAux=mAux,
-                mOutSf=mOutSf,
-                s_off=s_off,
-                s_off_pad=s_off_pad,
-            )
+            quant_loop = self.chain.grouped_loop()
+            if cutlass.const_expr(quant_loop is not None):
+                # a quantising chain's own epilogue (the MXFP8 classes' fused requantization: the codes and the 128x4 block
+                # scales of the bf16-rounded chain, the scale bytes at the padded positions)
+                quant_loop(
+                    st,
+                    self.chain,
+                    tidx,
+                    tile_sched,
+                    tCtAcc_base,
+                    thr_mma,
+                    mOut,
+                    mOutSf,
+                    Tk,
+                    N,
+                    epi_tile,
+                    acc_pipeline,
+                    mma_m_in_cluster,
+                    self.epi_warpgroups,
+                    sX,
+                    s_off,
+                    s_off_pad,
+                    cta_v=mma_tile_coord_v,
+                )
+            else:
+                grouped_epilogue_loop(
+                    st,
+                    self.chain,
+                    tidx,
+                    tile_sched,
+                    tCtAcc_base,
+                    thr_mma,
+                    mOut,
+                    Tk,
+                    N,
+                    epi_tile,
+                    acc_pipeline,
+                    mma_m_in_cluster,
+                    self.epi_warpgroups,
+                    sC=sC,
+                    cta_v=mma_tile_coord_v,
+                    mAlpha=mAlpha,
+                    mSa=mSa,
+                    mSi=mSi,
+                    mPts=mPts,
+                    mAux=mAux,
+                    mOutSf=mOutSf,
+                    s_off=s_off,
+                    s_off_pad=s_off_pad,
+                )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: every epilogue warpgroup joins here after its last TMEM load (the
             # staged store's barriers join one group only)

@@ -13,8 +13,8 @@ against an ``fp`` object and run under all three backends.
 from __future__ import annotations
 
 import cutlass.cute as cute
-from cutlass import Float32
-from cutlass._mlir.dialects import llvm
+from cutlass import Boolean, Float32
+from cutlass._mlir.dialects import arith, llvm
 from cutlass.cute.math import RoundingMode
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -187,5 +187,19 @@ def lg2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def select_f32(cond: Boolean, a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """``a`` if ``cond`` else ``b`` (``arith.select`` on a Boolean: a choice between two values, no arithmetic)."""
+    return Float32(
+        arith.select(
+            Boolean(cond).ir_value(loc=loc, ip=ip),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
         )
     )

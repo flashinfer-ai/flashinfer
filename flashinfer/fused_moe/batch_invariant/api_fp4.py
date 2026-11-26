@@ -3,7 +3,9 @@
 """The fp4 MoE classes: ``moe.nvfp4.<act>`` (W4A4: NVFP4 experts with one per-tensor global scale per expert and GEMM,
 per-token NVFP4 activations; the static-intermediate class ``moe.nvfp4.<act>.static``) and ``moe.mxfp4.<act>`` (MXFP4 experts
 and MXFP4 activations, one UE8M0 scale per 32 elements on both operands, no global or per-token scale), on the bf16 classes'
-routing, permutation and combine (:mod:`.api`) and the shared grouped block-scaled bodies (:mod:`.blocks`).
+routing, permutation and combine (:mod:`.api`) and the shared grouped block-scaled bodies (:mod:`.blocks`). The backend's
+third pair, MXFP4 x MXFP8 (``moe.mxfp4w8a.<act>``: MXFP4 experts prepared here, the canonical MXFP8 activation pack), shares
+the pair descriptor and the weight preparation of this module and runs on the MX op (:mod:`.api_mxfp4w8a`).
 
 One pipeline, parametrised by the pair (:class:`Fp4Pair`): the pair's quantization of ``x`` (its quantizer class, or the
 caller's pack) -> the deterministic permutation of the expanded rows (expert order, then token-slot order) with the scale
@@ -20,7 +22,7 @@ at a 128-row atom; the padding rows are zero-filled, computed and never stored).
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
@@ -31,13 +33,21 @@ from ...batch_invariant.support import BatchInvariantUnsupportedError, unsupport
 from ...gemm.batch_invariant.api import part_of, persistent_clusters, sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.schedule import chunks_for, fp4_class_for
-from ...gemm.batch_invariant.spec import MXFP4_FMTS, NVFP4_FMTS
+from ...gemm.batch_invariant.spec import MX_MIXED_FMTS, MXFP4_FMTS, NVFP4_FMTS
 from . import spec as S
-from .api import interleave_fc1, permute_plan, route
-from .blocks.epilogue import MXFP4_GEMM2_CHAIN, GroupedChain, Mxfp4Chain, W4A4Chain
+from .api import interleave_fc1, padded_rows_bound, permute_plan, route
+from .blocks.epilogue import (
+    MXFP4_GEMM2_CHAIN,
+    GroupedEpilogueBlock,
+    Mxfp4Chain,
+    W4A4Chain,
+)
+from .blocks.epilogue_mx import MxChain
 from .schedule import launch_tile_bound
 from .spec_mxfp4 import CLASS as MX_CLASS
 from .spec_mxfp4 import MX_BLOCK, expert_classes_mx
+from .spec_mxfp4w8a import CLASS as MIXED_CLASS
+from .spec_mxfp4w8a import granule_of
 from .spec_nvfp4 import CLASS as NV_CLASS
 from .spec_nvfp4 import (
     E2M1_MAX,
@@ -48,7 +58,7 @@ from .spec_nvfp4 import (
 )
 
 #: The block-scaled chain blocks: the pair's GEMM1 / GEMM2 chains (``.at(in_fmt)`` places them on an instruction class).
-Fp4Chain = Union[W4A4Chain, Mxfp4Chain]
+Fp4Chain = Union[W4A4Chain, Mxfp4Chain, MxChain]
 #: 16-byte rows of the packed fp4 operands (the TMA alignment) and whole scale blocks / scale-factor column groups.
 ALIGN_FP4 = 32
 MAX_TOP_K = 16
@@ -81,13 +91,20 @@ class Fp4Pair:
     """A quantization pair of the fp4 backend: ``name`` tags the weight view and the kernel objects; ``cls`` is the registry
     class; ``block`` the elements per scale; ``fmts`` the instruction classes; ``scaled`` whether the pair carries a per-tensor
     alpha per expert and GEMM and a per-token scale per row (the NVFP4 pair, which also serves the static-intermediate
-    class) -- the MX pair's scales are the block scales alone."""
+    class) -- the MX pairs' scales are the block scales alone; ``act_fmt`` the activations' form: ``"fp4"`` (bf16 rows the
+    pair's class quantizes, or its packed fp4 rows) or ``"mxfp8"`` (the canonical MXFP8 pack of the mixed pair)."""
 
     name: str
     cls: str
     block: int
     fmts: Tuple[str, ...]
     scaled: bool
+    act_fmt: str = field(default="fp4", kw_only=True)
+
+    @property
+    def mixed(self) -> bool:
+        """The mixed MXFP4-weight x MXFP8-activation pair (its op is :mod:`.api_mxfp4w8a`'s)."""
+        return self.act_fmt == "mxfp8"
 
     def sf_numel(self, rows: int, K: int) -> int:
         """Bytes of the 128x4 swizzled scale buffer of ``rows`` rows of ``K`` elements."""
@@ -100,12 +117,14 @@ class Fp4Pair:
     def classes(
         self, H: int, I: int, family: Optional[str], gated: bool = True
     ) -> Tuple[str, str]:
-        """The instruction class of each expert GEMM: the dense rule per weight shape (NVFP4), the part's (MXFP4)."""
-        return (
-            expert_classes(H, I, family, gated)
-            if self.scaled
-            else expert_classes_mx(family)
-        )
+        """The instruction class of each expert GEMM: the dense rule per weight shape (NVFP4), the part's (the MX pairs)."""
+        if self.scaled:
+            return expert_classes(H, I, family, gated)
+        if self.mixed:
+            from .api_mxfp4w8a import expert_classes_mixed
+
+            return expert_classes_mixed(family)
+        return expert_classes_mx(family)
 
     def check_shape(
         self,
@@ -114,16 +133,22 @@ class Fp4Pair:
         E: int,
         k: Optional[int] = None,
         gated: bool = True,
+        in_fmt: Optional[str] = None,
     ) -> None:
-        check_shape_fp4(self, H, I, E, k, gated)
+        check_shape_fp4(self, H, I, E, k, gated, in_fmt)
 
     def prepare_activations(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """The layer's activation pack of the pair: bf16 rows as given and no scale, for both served pairs (the class
-        quantizes the rows inside the op: per token for NVFP4, per 32-element block for MXFP4). A pair whose activations
-        arrive quantized by the caller declares its own form here."""
-        return hidden_states.to(torch.bfloat16).contiguous(), None
+        """The layer's activation pack of the pair: bf16 rows as given and no scale for the fp4 pairs (the class quantizes
+        the rows inside the op: per token for NVFP4, per 32-element block for MXFP4); the canonical MXFP8 pack by the
+        batch-invariant quantizer for the mixed pair (e4m3 ``[T, H]``, the token-major UE8M0 scales ``[T, H / 32]``)."""
+        rows = hidden_states.to(torch.bfloat16).contiguous()
+        if self.mixed:
+            from .api_mxfp8 import quantize_activations_mxfp8
+
+            return quantize_activations_mxfp8(rows)
+        return rows, None
 
     def quantize(
         self,
@@ -142,17 +167,22 @@ class Fp4Pair:
 
 NVFP4 = Fp4Pair("nvfp4", NV_CLASS, NVFP4_BLOCK, NVFP4_FMTS, True)
 MXFP4 = Fp4Pair("mxfp4", MX_CLASS, MX_BLOCK, MXFP4_FMTS, False)
+MXFP4W8A = Fp4Pair(
+    "mxfp4w8a", MIXED_CLASS, MX_BLOCK, MX_MIXED_FMTS, False, act_fmt="mxfp8"
+)
 #: The pairs by their view tag.
-PAIRS_BY_NAME: Dict[str, Fp4Pair] = {NVFP4.name: NVFP4, MXFP4.name: MXFP4}
+PAIRS_BY_NAME: Dict[str, Fp4Pair] = {p.name: p for p in (NVFP4, MXFP4, MXFP4W8A)}
 
 
-def pair_of(chain: GroupedChain) -> Fp4Pair:
+def pair_of(chain: GroupedEpilogueBlock) -> Fp4Pair:
     """The pair of a block-scaled chain block (its class)."""
     if isinstance(chain, Mxfp4Chain):
         return MXFP4
     if isinstance(chain, W4A4Chain):
         return NVFP4
-    raise TypeError(f"not a block-scaled chain: {chain!r}")
+    if isinstance(chain, MxChain) and chain.in_fmt in MX_MIXED_FMTS:
+        return MXFP4W8A
+    raise TypeError(f"not a block-scaled chain of the fp4 pairs: {chain!r}")
 
 
 def check_shape_fp4(
@@ -162,13 +192,20 @@ def check_shape_fp4(
     E: int,
     k: Optional[int] = None,
     gated: bool = True,
+    in_fmt: Optional[str] = None,
 ) -> None:
     """The complete acceptance rule of a pair's classes on ``(H, I, E, k)``: ``H`` and ``I`` positive multiples of 32 (16-byte
-    rows of the packed fp4 operands, whole scale blocks), ``1 <= E <= 1024``, ``1 <= k <= min(E, 16)``, and the expert weight
-    shapes unsplit by the dense class's chunk rule (the grouped classes take one fold per weight). Everything else about a
-    shape is placement. ``H=None`` checks the rules the layer's configuration fixes (the hidden size enters at the first
-    call). Raises :class:`BatchInvariantUnsupportedError`; the class never routes a shape elsewhere."""
+    rows of the packed fp4 operands, whole scale blocks) -- and, for the mixed pair on the instruction class ``in_fmt``, of the
+    class's K granule (128 on the SM100 / SM103 class, whose TMA unpacks the e2m1 weight in 128-element runs; ``in_fmt`` None:
+    the 32-element rule alone, the class entering where the device is known) -- ``1 <= E <= 1024``, ``1 <= k <= min(E, 16)``,
+    and the expert weight shapes unsplit by the dense class's chunk rule (the grouped classes take one fold per weight).
+    Everything else about a shape is placement. ``H=None`` checks the rules the layer's configuration fixes (the hidden size
+    enters at the first call). Raises :class:`BatchInvariantUnsupportedError`; the class never routes a shape elsewhere."""
     from .blocks.scheduler import MAX_E
+
+    if in_fmt is not None and (not pair.mixed or in_fmt not in pair.fmts):
+        raise ValueError(f"{pair.name}: no instruction class {in_fmt!r}")
+    gran = granule_of(in_fmt) if in_fmt is not None else ALIGN_FP4
 
     def bad(what: str, limit: str):
         raise unsupported(
@@ -188,6 +225,14 @@ def check_shape_fp4(
             else f"intermediate size {I}",
             f"positive multiples of {ALIGN_FP4} (16-byte rows of the quantized activations and weights)",
         )
+    if gran != ALIGN_FP4 and (I % gran or (H is not None and H % gran)):
+        bad(
+            f"hidden size {H} / intermediate size {I} on the {in_fmt} class"
+            if H is not None
+            else f"intermediate size {I} on the {in_fmt} class",
+            f"multiples of {gran} (the SM100 / SM103 instruction reads the e2m1 weight through the TMA's unpacking format in "
+            f"{gran}-element runs)",
+        )
     if not 1 <= E <= MAX_E:
         bad(f"{E} experts", f"1 <= num_experts <= {MAX_E}")
     if k is not None and not 1 <= k <= min(E, MAX_TOP_K):
@@ -195,10 +240,22 @@ def check_shape_fp4(
     if H is None:
         return
     n1 = 2 * I if gated else I
-    if chunks_for(n1, H, pair.name) != 1 or chunks_for(H, I, pair.name) != 1:
+    fmt = in_fmt if in_fmt is not None else (pair.fmts[0] if pair.mixed else pair.name)
+    if chunks_for(n1, H, fmt) != 1 or chunks_for(H, I, fmt) != 1:
         bad(
             "the expert weight shapes",
             "unsplit expert weights (the dense class would K-split this shape)",
+        )
+
+
+def _require_cuda_pack(pair: Fp4Pair, dev: torch.device) -> None:
+    """The pack lives on a CUDA device of the classes (the quantizer class runs there): a refusal by name, after the
+    device-free rules of the preparation and before any kernel."""
+    if dev.type != "cuda":
+        raise unsupported(
+            pair.cls,
+            f"expert weights quantized on {dev}",
+            "a CUDA device for the pack (the weights' device, or device=...): the quantizer class runs there",
         )
 
 
@@ -385,8 +442,15 @@ class MoEWeightsFp4:
             raise ValueError(
                 f"fc2 {tuple(fc2.shape)} does not match fc1 {tuple(fc1.shape)} (gated={gated})"
             )
-        check_shape_fp4(pair, H, I, E, gated=gated)
         dev = fc1.device if device is None else torch.device(device)
+        in_fmt = None
+        if pair.mixed and dev.type == "cuda":
+            from .api_mxfp4w8a import mx_class_of
+
+            in_fmt = mx_class_of(
+                dev
+            )  # the pack's part names the mixed class, hence the granule
+        check_shape_fp4(pair, H, I, E, gated=gated, in_fmt=in_fmt)
         # the pack, preallocated and filled one expert at a time (the quantizer writes every byte of its expert's rows and
         # scale buffer; the global scale and the interleave are per expert, so the bits are those of the expert quantized
         # alone): the peak beyond the inputs and the pack is one expert's temporaries -- its slice moved to the pack's
@@ -412,6 +476,7 @@ class MoEWeightsFp4:
             return expert(fc2, e)
 
         if not pair.scaled:
+            _require_cuda_pack(pair, dev)
             for e in range(E):
                 quantize_rows_mx(fc1_rows(e), out=(w1[e], w1_sf[e]))
                 quantize_rows_mx(fc2_rows(e), out=(w2[e], w2_sf[e]))
@@ -436,6 +501,7 @@ class MoEWeightsFp4:
         # div.rn: the alphas as mm_fp4 takes them
         alpha1 = torch.reciprocal(gs1_all).contiguous()
         alpha2 = torch.reciprocal(gs2_all).contiguous()
+        _require_cuda_pack(pair, dev)
         for e in range(E):
             # the expert's scale as its own 1-element tensor: the quantizer's scale operand is 16-byte aligned
             nvfp4_quantize_rows(
@@ -484,8 +550,11 @@ class MoEWeightsFp4:
     @property
     def chain1(self) -> Fp4Chain:
         """The GEMM1 chain of the class: the gated ``act`` on the (gate, up) pair or the ungated ``act`` on the accumulator,
-        with the parameters; bf16 output, or the fused block quantization (``nvfp4``) of the static class."""
+        with the parameters; bf16 output, or the fused block quantization (``nvfp4``) of the static class. The mixed pair's
+        is the MX chain (the bf16 classes' chain on the dequantised accumulators, placed on the launch's instruction class)."""
         kind = "glu" if self.gated else "act"
+        if self.pair.mixed:
+            return MxChain(kind, self.act, "bf16", self.params, self.pair.fmts[0])
         if not self.pair.scaled:
             return Mxfp4Chain(kind, self.act, "bf16", self.params)
         return W4A4Chain(
@@ -493,9 +562,24 @@ class MoEWeightsFp4:
         )
 
     @property
+    def chain1_quant(self) -> MxChain:
+        """The mixed pair's fused-requantization spelling of ``chain1``: the same chain, its bf16-rounded value quantized by
+        the ``mxfp8.quant`` class in the epilogue (codes and 128x4 block scales out, no bf16 intermediate)."""
+        assert self.pair.mixed, self.pair
+        return MxChain(
+            "glu" if self.gated else "act",
+            self.act,
+            "mxfp8",
+            self.params,
+            self.pair.fmts[0],
+        )
+
+    @property
     def chain2(self) -> Fp4Chain:
         """The GEMM2 chain: NVFP4 ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))`` (the static class's with ``inv2[e]``), MXFP4
-        ``cvt_bf16(acc)``."""
+        and the mixed pair ``cvt_bf16(acc)``."""
+        if self.pair.mixed:
+            return MIXED_GEMM2_CHAIN
         if not self.pair.scaled:
             return MXFP4_GEMM2_CHAIN
         return GEMM2_STATIC_CHAIN if self.static else GEMM2_CHAIN
@@ -556,6 +640,8 @@ GEMM2_STATIC_CHAIN = W4A4Chain("plain", "silu", "bf16", (), "w4a4s")
 #: The unscaled oracles: the raw fp32 fold of either pair.
 F32_CHAIN = W4A4Chain("plain", "silu", "f32", (), "none")
 MX_F32_CHAIN = Mxfp4Chain("plain", "silu", "f32", ())
+#: GEMM2 of the mixed pair: the dequantised accumulator converted to bf16 (the instruction class is the launch's).
+MIXED_GEMM2_CHAIN = MxChain("plain", "silu", "bf16", (), MX_MIXED_FMTS[0])
 
 
 def _operands(
@@ -944,51 +1030,17 @@ def _grouped_gemm_fp4_gather(
     return out
 
 
-def padded_rows_bound(T: int, k: int, E: int, align: int = GROUP_ALIGN) -> int:
-    """An upper bound of the padded expanded row count ``sum_e roundup(counts[e], align)`` that does not read the device
-    (CUDA-graph safe): every active expert pads at most ``align - 1`` rows."""
-    n = T * k + (align - 1) * min(E, T * k)
-    return -(-n // align) * align
-
-
 def permute_plan_dual(
     experts: torch.Tensor, E: int, pad_align: int = GROUP_ALIGN
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan (:func:`.api.permute_plan`)
-    plus the positions with the groups padded to ``pad_align`` rows (``dest_pad[i]``) and the padded position of every dense
-    row (``pos_pad[p]``): the dense packing's row map (A rows dense, scale factors and row scales at the padded positions)."""
-    from .api import PLAN_MULTI_MIN_N
-    from .permute import (
-        PLAN_BLOCK,
-        get_compiled_plan,
-        get_compiled_plan_multi,
-        plan_threads,
+    """``(counts [E], dest [T, k], src [Tk], dest_pad [T, k], pos_pad [Tk])``: the dense plan plus the positions with the
+    groups padded to ``pad_align`` rows (``dest_pad[i]``) and the padded position of every dense row (``pos_pad[p]``): the
+    dense packing's row map (A rows dense, scale factors and row scales at the padded positions) -- the shared plan's dual
+    form (:func:`.api.permute_plan` with ``dual=True``)."""
+    counts, dest, src, dest_pad, pos_pad = permute_plan(
+        experts, E, dual=True, pad_align=pad_align
     )
-
-    T, k = experts.shape
-    n = T * k
-    dev = experts.device
-    dest = torch.empty(n, dtype=torch.int32, device=dev)
-    src = torch.empty(n, dtype=torch.int32, device=dev)
-    dest_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    pos_pad = torch.empty(n, dtype=torch.int32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
-    flat = experts.reshape(-1)
-    if not flat.is_contiguous() or flat.dtype != torch.int32:
-        raise TypeError("permute_plan_dual: experts must be a contiguous int32 [T, k]")
-    if n == 0:
-        counts.zero_()
-    elif n >= PLAN_MULTI_MIN_N:
-        nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
-        hist_blk = torch.empty(nb * E, dtype=torch.int32, device=dev)
-        get_compiled_plan_multi(1, True, pad_align)(
-            flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
-        )
-    else:
-        get_compiled_plan(1, True, pad_align, plan_threads(n))(
-            flat, counts, dest, src, dest_pad, pos_pad, n, E
-        )
-    return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
+    return counts, dest, src, dest_pad, pos_pad
 
 
 _GS_INV: Dict[
@@ -1325,6 +1377,10 @@ def fused_moe_fp4(
     structural rule (:func:`~.schedule_fp4.gather_form_rule`); an explicit ``config1`` selects the form itself (``gather_a``).
     ``sf_layout`` names a pack's scale layout (``"128x4"`` / ``"linear"``); without it the shape must name one
     (:func:`gather_sf_layout`: a 2-D ``[T, H / block]`` tensor at a row count that is a multiple of 128 is refused)."""
+    if w.pair.mixed:
+        raise TypeError(
+            "fused_moe_fp4 runs the fp4 pairs; the MXFP4 x MXFP8 pair's op is api_mxfp4w8a.fused_moe_mxfp4w8a"
+        )
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
     from .permute_nvfp4 import (

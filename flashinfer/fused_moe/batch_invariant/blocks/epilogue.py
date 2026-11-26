@@ -166,6 +166,9 @@ class GroupedEpilogueBlock:
       paired chain) and the row's scale ``s``, every op through ``fp`` (the kernels' ``MoeF32``): converted for the 16- and
       32-bit outputs, the fp32 value before the paired conversion for the 8-bit one and before the block quantization for the
       ``nvfp4`` one.
+    * ``quant``: whether the chain writes a second output (the block scales of a requantising chain) through its own
+      epilogue loops (``grouped_loop`` / ``swapped_loop``: the loop functions the bodies call in place of the ones below)
+      with its own shared storage (``smem_layout``: a layout of fp32 words, or None).
 
     A requantising epilogue block of another block-scaled class (its own operands, its chain and conversion) implements this
     surface; the loops below need nothing else of it."""
@@ -236,6 +239,24 @@ class GroupedEpilogueBlock:
 
     def elem(self, fp, acc, acc_gate, s=None, inv=None):
         raise NotImplementedError
+
+    @property
+    def quant(self) -> bool:
+        """Whether the chain writes a second output (a requantising chain's block scales) through its own loops."""
+        return False
+
+    def smem_layout(self, epi_warpgroups: int, token_tile: Optional[int] = None):
+        """The chain's own shared storage in the grouped body (``token_tile`` None) or the swapped one, as a layout of fp32
+        words; None for a chain without one."""
+        return None
+
+    def grouped_loop(self):
+        """The chain's own grouped epilogue loop (a requantising chain), or None for :func:`grouped_epilogue_loop`."""
+        return None
+
+    def swapped_loop(self):
+        """The chain's own swapped epilogue loop (a requantising chain), or None for the swapped body's shared loop."""
+        return None
 
 
 @dataclass(frozen=True)

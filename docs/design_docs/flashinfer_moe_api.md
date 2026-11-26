@@ -889,7 +889,9 @@ python scripts/generate_moe_activation_matrix.py --write
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `batch_invariant_bf16` | `BatchInvariantBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp4` | `BatchInvariantFp4Config` | `MXFP4×MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `batch_invariant_fp4` | `BatchInvariantFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp4` | `BatchInvariantFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `batch_invariant_fp8_block` | `BatchInvariantFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp8_per_tensor` | `BatchInvariantFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
 | `cake_stepfun` | `CakeStepFunConfig` | `BF16×BF16` | `SwiGLUStep` |
@@ -964,12 +966,20 @@ python scripts/generate_moe_activation_matrix.py --write
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 
 The batch-invariant fp4 backend (`BatchInvariantFp4Config`) computes the exponential and the divisions of the typed activations
-above with the part's SFU (`ex2.approx` / `rcp.approx`): deterministic and batch-invariant per part, the bits a property of
-the architecture family (the fold's instruction class and the SFU tables; SM100 and SM103 are one family, SM107 another),
-so an output is not, in general, equal across families; the ReLU family and `PowLU` are the declared sequences with no SFU
-step. The tests pin the SFU tables' digest per part they run on; on a part without a pinned digest the digest test skips
-and reports the part's digest, and the classes run unchanged (deterministic and batch-invariant on that part). The
-verification standard is in `flashinfer/batch_invariant/README.md`.
+above with the part's SFU (`ex2.approx` / `rcp.approx`) on its NVFP4 x NVFP4 and MXFP4 x MXFP4 pairs: deterministic and
+batch-invariant per part, the bits a property of the architecture family (the fold's instruction class and the SFU tables;
+SM100 and SM103 are one family, SM107 another), so an output is not, in general, equal across families; the ReLU family and
+`PowLU` are the declared sequences with no SFU step. The tests pin the SFU tables' digest per part they run on; on a part
+without a pinned digest the digest test skips and reports the part's digest, and the classes run unchanged (deterministic and
+batch-invariant on that part). The verification standard is in `flashinfer/batch_invariant/README.md`.
+
+The batch-invariant fp8-block backend (`BatchInvariantFp8BlockConfig`, the MXFP8×MXFP8 pair) and the fp4 backend's
+MXFP4×MXFP8 pair are exact: their GEMM1 chain is the bf16 backend's declared sequence with every step correctly rounded,
+the UE8M0 block scales are operands of the instruction and the intermediate's requantization is the batch-invariant MXFP8
+quantizer's chain, so no SFU table enters the bits; the one architecture dimension of these classes is the instruction
+class of the part (the SM107 step folds 64 elements, the SM100 / SM103 step 32; the SM100 / SM103 mixed step reads the
+e2m1 weight in 128-element runs, so `H` and `I` are multiples of 128 there), carried by `fingerprint("fused_moe_mxfp8",
+..., arch=)` / `fingerprint("fused_moe_mxfp4w8a", ..., arch=)`.
 
 For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
 [usage, qualification and extension guide](../frost_low_latency_moe.md).

@@ -161,8 +161,12 @@ class BatchInvariantMoeRunnerBase(MoERunner):
     * ``CLASS`` / ``ARCHS``: the class name of the errors and the parts it is stated for;
     * ``X_DTYPE`` / ``ROW_ALIGN`` / ``X_RULE`` / ``ROW_RULE`` / ``SCALE_RULE``: the activation dtype, the elements per
       16-byte row (the activations' and the intermediate's alignment) and the wording of their refusals;
-    * ``TACTIC_TAG``: the class's tag in the autotuner's cache key; ``N_WEIGHT_TENSORS``: the weight view's tensors in the
-      pack (after the activations, the ids and the weights, before the output);
+    * ``TACTIC_TAG``: the class's tag in the autotuner's cache key; ``N_ACT_TENSORS`` / ``_act_tensors``: the activation
+      tensors at the head of the pack (one, or a quantized pack with its scales) with their rules; ``N_WEIGHT_TENSORS``:
+      the weight view's tensors in the pack (after the activations, the ids and the weights, before the output);
+      ``_plan_form``: the fused route + plan launch's form (the block-scaled classes' padded or dual plan);
+      ``_plan_in_kernel``: whether the class's GEMM1 builds the plan itself at this token count (the routing alone is
+      launched from logits, no plan tensors are packed);
     * ``_check_experts`` / ``_check_support_extra``: the class's rules beyond the shared ones (the expert-parallel shard's
       range or its refusal, the finalize mode);
     * ``_weights_from_view`` / ``_weight_tensors`` / ``_weights_from_tensors``: the weight view as the kernels consume it;
@@ -198,6 +202,7 @@ class BatchInvariantMoeRunnerBase(MoERunner):
     ROW_RULE: str = "a positive multiple of 8"
     SCALE_RULE: str = "no activation scale (bf16 activations)"
     TACTIC_TAG: str = "moe.bf16-v2"  # v2: the tactic carries the swapped flag
+    N_ACT_TENSORS: int = 1
     N_WEIGHT_TENSORS: int = 2
 
     def __init__(self, config, device) -> None:
@@ -211,6 +216,11 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
         self._scale: Optional[torch.Tensor] = None
+        # the routing term's state, set by _check_support (`_method` None: no from-logits class; a deferred refusal's
+        # message, raised afresh at every from-logits call: no exception object, hence no traceback, is kept)
+        self._method: Optional[Any] = None
+        self._grouped_other: bool = False
+        self._logits_refusal: Optional[Tuple[Any, ...]] = None
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
@@ -294,17 +304,18 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         """``_method`` / ``_grouped_other`` from :func:`routing_term`; a refusal (a group shape or a Llama4 top-k outside the
         term) is deferred to a from-logits call (``_logits_refusal``), since the pre-routed modes never consult the method:
         a layer that only ever receives pre-routed ids builds under any ``RoutingConfig``."""
-        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
+        self._logits_refusal = None
         try:
             self._method, self._grouped_other = routing_term(routing, cls)
         except BatchInvariantUnsupportedError as e:
-            self._method, self._grouped_other, self._logits_refusal = None, False, e
+            self._method, self._grouped_other = None, False
+            self._logits_refusal = tuple(e.args)
 
     def _build(self) -> None:
         from ...gemm.batch_invariant.api import part_of
 
         self._part = part_of(self.device)
-        method = getattr(self, "_method", None)
+        method = self._method
         if (
             method is not None
             and method.scaled
@@ -367,6 +378,29 @@ class BatchInvariantMoeRunnerBase(MoERunner):
             x.ndim == 2 and x.dtype == self.X_DTYPE and x.shape[1] % self.ROW_ALIGN == 0
         )
 
+    def _act_tensors(self, act: MoEActivationPack) -> List[torch.Tensor]:
+        """The activation tensors at the head of the pack, validated: the class's ``[T, H]`` of ``X_DTYPE`` and no scale
+        tensor (a quantized class with scales overrides this and ``N_ACT_TENSORS``)."""
+        x = act.hidden_states_q
+        if x.dtype != self.X_DTYPE or x.ndim != 2:
+            raise unsupported(
+                self.CLASS, f"hidden_states_q {x.dtype} of rank {x.ndim}", self.X_RULE
+            )
+        if act.hidden_states_scale is not None:
+            raise unsupported(self.CLASS, "hidden_states_scale", self.SCALE_RULE)
+        return [x.contiguous()]
+
+    def _plan_form(self, T: int, H: int) -> dict:
+        """The fused route + plan launch's form at this token count (``route_plan``'s ``align`` / ``dual`` / ``pad_align``):
+        the dense plan by default."""
+        return {}
+
+    def _plan_in_kernel(self, T: int, H: int) -> bool:
+        """Whether the class's first GEMM builds the permutation plan itself at this token count (its decode form): the
+        routing kernel alone is launched from logits and no plan tensors are packed; the class's op takes the ids. False
+        for the classes whose bodies read a plan."""
+        return False
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
@@ -377,14 +411,8 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         cfg = self.config
         cls = self.CLASS
         plan: List[torch.Tensor] = []
-        x = act.hidden_states_q
-        if x.dtype != self.X_DTYPE or x.ndim != 2:
-            raise unsupported(
-                cls, f"hidden_states_q {x.dtype} of rank {x.ndim}", self.X_RULE
-            )
-        if act.hidden_states_scale is not None:
-            raise unsupported(cls, "hidden_states_scale", self.SCALE_RULE)
-        x = x.contiguous()
+        xs = self._act_tensors(act)
+        x = xs[0]
         T = x.shape[0]
         k, E = cfg.routing.top_k, cfg.routing.num_experts
         e_off, e_local = self._local_experts()
@@ -423,7 +451,7 @@ class BatchInvariantMoeRunnerBase(MoERunner):
             _validate_logits_inputs(act, T, E, type(self).__name__)
             # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
             # meaning in this module (with pre-routed ids the group structure never enters the computation)
-            if getattr(self, "_grouped_other", False):
+            if self._grouped_other:
                 raise unsupported(
                     cls,
                     f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
@@ -431,9 +459,8 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 )
             if self._method is None:
                 # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
-                refusal = getattr(self, "_logits_refusal", None)
-                if refusal is not None:
-                    raise refusal
+                if self._logits_refusal is not None:
+                    raise BatchInvariantUnsupportedError(*self._logits_refusal)
                 raise unsupported(
                     cls,
                     f"routing method {cfg.routing.method!r} from logits",
@@ -454,18 +481,20 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 0 < T <= ROUTE_PLAN_MAX_TOKENS
                 and T * k <= ROUTE_PLAN_MAX_SLOTS
                 and cfg.routing.num_experts <= MAX_E
+                and not self._plan_in_kernel(T, x.shape[1])
             ):
-                # routing and the permutation plan in one launch (a placement: the same bits and integers); a shard plans
-                # its local experts by their local ids
-                ids, wts, counts, dest, src = route_plan(
+                # routing and the permutation plan in one launch (a placement: the same bits and integers), in the form the
+                # class's packing takes at this token count; a shard plans its local experts by their local ids. A class
+                # whose first GEMM builds the plan itself at this token count launches the routing alone.
+                ids, wts, *plan = route_plan(
                     act.routing_logits,
                     k,
                     self._method,
                     bias,
                     scale,
                     local=None if (e_off, e_local) == (0, E) else (e_off, e_local),
+                    **self._plan_form(T, x.shape[1]),
                 )
-                plan = [counts, dest, src]
                 if e_off:
                     ids = ids - e_off
             else:
@@ -497,7 +526,7 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 weights_dtype = wts.dtype
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, x.shape[1], dtype=torch.bfloat16, device=x.device)
-        packed = _PackedInputs([x, ids, wts] + self._weight_tensors(w) + [out] + plan)
+        packed = _PackedInputs(xs + [ids, wts] + self._weight_tensors(w) + [out] + plan)
         packed.weights_dtype = weights_dtype
         packed.w_round = w_round
         return packed
@@ -602,17 +631,21 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         **kwargs,
     ) -> torch.Tensor:
         self._require_built()
-        n = 3 + self.N_WEIGHT_TENSORS
-        x, ids, wts = inputs[:3]
-        tensors, out = inputs[3:n], inputs[n]
-        plan = tuple(inputs[n + 1 : n + 4]) if len(inputs) >= n + 4 else None
-        self._hidden = int(x.shape[1])
+        na = self.N_ACT_TENSORS
+        n = na + 2 + self.N_WEIGHT_TENSORS
+        xs, ids, wts = inputs[:na], inputs[na], inputs[na + 1]
+        tensors, out = inputs[na + 2 : n], inputs[n]
+        plan = (
+            tuple(inputs[n + 1 :]) or None
+        )  # the plan's tensors, in the form the class packed them
+        self._hidden = int(xs[0].shape[1])
         if tactic == -1 or tactic is None:
-            r1, r2 = self._ranked(int(x.shape[0]))
+            r1, r2 = self._ranked(int(xs[0].shape[0]))
             c1, c2 = r1[0], r2[0]
         else:
             c1, c2 = _configs_from_tactic(tuple(tactic))
         w = self._weights_from_tensors(self._activation(), tensors)
+        x = xs[0] if na == 1 else tuple(xs)
         return self._launch(x, ids, wts, w, out, c1, c2, plan, inputs)
 
 

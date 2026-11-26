@@ -236,13 +236,13 @@ def exposed_epilogue_cycles(
 ) -> float:
     """The chain work of a CTA's last tile, which no mainloop overlaps (the earlier tiles' epilogues run behind the next tile's
     mainloop through the accumulator stages): a thread's chains times the chain's node cycles. The grouped body computes a
-    row's outputs per thread, the tile's columns split between its epilogue warpgroups (the gated chain pairs two accumulator
-    columns per output); the swapped body computes a weight row's token columns per thread, the whole token tile of them: the
-    quantizing classes' chains run for every column of the tile, and the tile is what the MMA issues whatever the live
-    rows, so the dead columns of a wide tile at a few live rows are priced as work (a class whose guards skip the dead
-    columns' chains pays less here than the term says, which the ranking tolerates: the narrow tile is its pick anyway). The
-    64-row swapped tile gives a thread two weight rows at a quarter of the columns: its busiest thread holds half the chains
-    (plain), a quarter when one of its rows is the gate."""
+    row's outputs per thread, the tile's columns split between its epilogue warpgroups (``epi_warpgroups``: the bf16 classes'
+    two, the block-scaled classes' four; the gated chain pairs two accumulator columns per output); the swapped body computes a
+    weight row's token columns per thread, the whole token tile of them: the quantizing classes' chains run for every column
+    of the tile, and the tile is what the MMA issues whatever the live rows, so the dead columns of a wide tile at a few live
+    rows are priced as work (a class whose guards skip the dead columns' chains pays less here than the term says, which the
+    ranking tolerates: the narrow tile is its pick anyway). The 64-row swapped tile gives a thread two weight rows at a quarter
+    of the columns: its busiest thread holds half the chains (plain), a quarter when one of its rows is the gate."""
     if cfg.swap_ab:
         chains = cfg.tile_n * cfg.tile_m / 128
         if pair and cfg.tile_m < 128:
@@ -389,14 +389,19 @@ def record_cost(
     sm_count: Optional[int] = None,
     in_fmt: str = "bf16",
     nominal: bool = False,
+    *,
+    epi_warpgroups: Optional[int] = None,
     overrides: Optional[dict] = None,
+    fill_fmt: Optional[str] = None,
 ) -> float:
     """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
     (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
     dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
-    chain and the token box's exposed fill; in SM cycles (a launch's fixed cost is the same for both bodies on
-    every measured part, so it is no term)."""
+    chain (over the body's ``epi_warpgroups``: the format's default when not given) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
+    same for both bodies on every measured part, so it is no term). The class-specific arguments are keyword-only: a class
+    that does not pass them gets the shared defaults. ``fill_fmt``: the token rows' element format for the fill term where it
+    differs from the class's (the mixed classes' e4m3 tokens against the e2m1 weights the class is named by)."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
@@ -408,13 +413,15 @@ def record_cost(
 
     canon = dataclasses.replace(cfg, raster_along="m")
     fp4 = in_fmt in FP4_FMTS
+    if epi_warpgroups is None:
+        epi_warpgroups = _EPI_WARPGROUPS_FP4 if fp4 else _EPI_WARPGROUPS
     epi = exposed_epilogue_cycles(
         cfg,
         rows,
         nodes,
         pair,
         scalar_store=fp4,
-        epi_warpgroups=_EPI_WARPGROUPS_FP4 if fp4 else _EPI_WARPGROUPS,
+        epi_warpgroups=epi_warpgroups,
     )
     est = estimate_cycles(
         canon,
@@ -433,7 +440,7 @@ def record_cost(
     return (
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
         + epi
-        + zero_fill_cycles(cfg, rows, K, family, in_fmt)
+        + zero_fill_cycles(cfg, rows, K, family, fill_fmt or in_fmt)
     )
 
 

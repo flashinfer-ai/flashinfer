@@ -68,13 +68,15 @@ def mx_quant_kernel_name(
     cfg_describe: str,
     swizzled,
     enable_pdl: bool,
+    masked: bool = False,
 ) -> str:
     """The cache name of one specialization: the format, the recipe constants' name, the input dtype, the Kbp bucket,
-    the configuration, the scale-factor layout (``sw`` = 128x4, ``8x4``, ``lin``) and PDL; never M (one specialization
-    serves every row count)."""
+    the configuration, the scale-factor layout (``sw`` = 128x4, ``8x4``, ``lin``), PDL and the masked (live-rows)
+    variant; never M (one specialization serves every row count)."""
     tag = _LAYOUT_TAG[swizzled]
     return sanitize_symbol_name(
         f"{fmt_name}_{rule_name}_{dtype_str}_Kbp{Kbp}_{cfg_describe}_{tag}_pdl{int(enable_pdl)}"
+        + ("_masked" if masked else "")
     )
 
 
@@ -105,8 +107,12 @@ class MXQuantKernel:
         fmt: MXFormat = MXFP8,
         rule: ScaleRule = DEFAULT_RULE,
         swizzled="128x4",
+        masked: bool = False,
     ):
-        """``swizzled``: the scale-factor layout, ``"128x4"`` (or ``True``), ``"8x4"``, ``"linear"`` (or ``False``)."""
+        """``swizzled``: the scale-factor layout, ``"128x4"`` (or ``True``), ``"8x4"``, ``"linear"`` (or ``False``).
+        ``masked``: the variant that takes a per-row int32 mark (``call_masked``) and reads / writes only the rows marked
+        live (>= 0): the same term on those rows, nothing on the others (the MoE classes' padded operands)."""
+        self.masked = masked
         K = (
             Kbp * BLOCK
         )  # a representative K of the bucket: everything below depends on K only via Kbp
@@ -218,6 +224,37 @@ class MXQuantKernel:
         enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
+        self._launch(mX, mY, mS, mS, M, K, padded_M, enable_pdl, stream)
+
+    @cute.jit
+    def call_masked(
+        self,
+        mX: cute.Tensor,
+        mY: cute.Tensor,
+        mS: cute.Tensor,
+        mValid: cute.Tensor,
+        M: Int64,
+        K: Int32,
+        padded_M: Int64,
+        enable_pdl: cutlass.Constexpr[bool],
+        stream,
+    ):
+        """The masked variant: ``mValid`` (int32, one entry per input row) marks the live rows (>= 0)."""
+        self._launch(mX, mY, mS, mValid, M, K, padded_M, enable_pdl, stream)
+
+    @cute.jit
+    def _launch(
+        self,
+        mX: cute.Tensor,
+        mY: cute.Tensor,
+        mS: cute.Tensor,
+        mValid: cute.Tensor,
+        M: Int64,
+        K: Int32,
+        padded_M: Int64,
+        enable_pdl: cutlass.Constexpr[bool],
+        stream,
+    ):
         tiler_in, tiler_out = (
             (self.rows, self.span),
             (self.rows, self.span * self.fmt.elem_bits // 8),
@@ -227,6 +264,7 @@ class MXQuantKernel:
                 mX,
                 mY,
                 mS,
+                mValid,
                 M,
                 K,
                 padded_M,
@@ -252,6 +290,7 @@ class MXQuantKernel:
                 mX,
                 mY,
                 mS,
+                mValid,
                 M,
                 K,
                 padded_M,
@@ -274,6 +313,7 @@ class MXQuantKernel:
         mX: cute.Tensor,
         mY: cute.Tensor,
         mS: cute.Tensor,
+        mValid: cute.Tensor,
         M: Int64,
         K: Int32,
         padded_M: Int64,
@@ -318,10 +358,12 @@ class MXQuantKernel:
         for p in cutlass.range_constexpr(self.passes):
             r = warp_idx + W * p  # row within the 128-row tile
             row = bidy.to(Int64) * SF_ROW_TILE + r.to(Int64)
+            live = _live_row(self, mValid, row, M)
             gX = thr_x.partition_S(cute.local_tile(mX, tiler_in, (row, bidx)))
             pX = predicate(
                 thr_x.partition_S(cute.local_tile(idX, tiler_in, (row, bidx))), M, K
             )
+            _mask_pred(pX, live)
             frag = Span(gX, atom_x, pX, mX.element_type).load()
             state, start = canon.init_state(self.plan, fp, _Loader(self, frag))
             state, _ = canon.run_steps(
@@ -347,6 +389,7 @@ class MXQuantKernel:
                 M,
                 K * self.fmt.elem_bits // 8,
             )
+            _mask_pred(pY, live)
             cute.copy(atom_y, fy, gY, pred=pY)
         cute.arch.barrier()
         self.stage.copy_out(sbuf, mS, tidx, bidy, bidx, pcols)
@@ -359,6 +402,7 @@ class MXQuantKernel:
         mX: cute.Tensor,
         mY: cute.Tensor,
         mS: cute.Tensor,
+        mValid: cute.Tensor,
         M: Int64,
         K: Int32,
         padded_M: Int64,
@@ -397,10 +441,12 @@ class MXQuantKernel:
         )
         thr_y, atom_y = tiled_copy(mY, self.out_vec * 8, tv_out, tiler_out, vtid)
         idX = cute.make_identity_tensor(mX.shape)
+        live = _live_row(self, mValid, row, M)
         gX = thr_x.partition_S(cute.local_tile(mX, tiler_in, (bidx, w)))
         pX = predicate(
             thr_x.partition_S(cute.local_tile(idX, tiler_in, (bidx, w))), M, K
         )
+        _mask_pred(pX, live)
         frag = Span(gX, atom_x, pX, mX.element_type).load()
 
         # ===== the block amaxes: driven by the plan ======================================
@@ -417,6 +463,7 @@ class MXQuantKernel:
             M,
             K * self.fmt.elem_bits // 8,
         )
+        _mask_pred(pY, live)
         fy_words = cute.make_rmem_tensor(
             cute.make_layout((self.words_per_block * bpt,)), Uint32
         )
@@ -431,18 +478,18 @@ class MXQuantKernel:
             )
             blk = self.plan.digit_value("blk", coords, self._key_for(kk))
             if cutlass.const_expr(self.layout == "128x4"):
-                if part0 & (blk < pcols) & (row < padded_M):
+                if part0 & (blk < pcols) & (row < padded_M) & live:
                     mS[sf_offset_128x4_dev(row, blk, pcols)] = sf_byte.to(Uint8)
             elif cutlass.const_expr(self.layout == "8x4"):
-                if part0 & (blk < pcols) & (row < padded_M):
+                if part0 & (blk < pcols) & (row < padded_M) & live:
                     mS[sf_offset_8x4_dev(row, blk, pcols)] = sf_byte.to(Uint8)
             else:
-                if part0 & (blk < nb) & (row < M):
+                if part0 & (blk < nb) & (row < M) & live:
                     mS[sf_offset_linear_dev(row, blk, nb)] = sf_byte.to(Uint8)
         cute.copy(atom_y, fy, gY, pred=pY)
         if cutlass.const_expr(self.swizzled and self.Kbp < SF_COL_TILE):
             # the swizzled layouts pad scale columns to 4; a bucket of 1 or 2 blocks owns none of columns Kbp..3
-            if (t == 0) & (w == 0) & (row < padded_M):
+            if (t == 0) & (w == 0) & (row < padded_M) & live:
                 for c in cutlass.range_constexpr(self.Kbp, SF_COL_TILE):
                     if cutlass.const_expr(self.layout == "128x4"):
                         mS[sf_offset_128x4_dev(row, Int32(c), pcols)] = Uint8(0)
@@ -450,6 +497,23 @@ class MXQuantKernel:
                         mS[sf_offset_8x4_dev(row, Int32(c), pcols)] = Uint8(0)
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
+
+
+@cute.jit
+def _live_row(k, mValid: cute.Tensor, row: Int64, M: Int64) -> cutlass.Boolean:
+    """Whether ``row`` is live: every row of the plain variant; the masked variant reads its int32 mark (>= 0)."""
+    live = cutlass.Boolean(True)
+    if cutlass.const_expr(k.masked):
+        live = mValid[cutlass.min(cutlass.max(row, Int64(0)), M - Int64(1))] >= Int32(0)
+    return live
+
+
+@cute.jit
+def _mask_pred(pred: cute.Tensor, live: cutlass.Boolean):
+    """AND a row's liveness into its per-vector predicate (the loads of a dead row zero-fill, its stores are skipped)."""
+    for rest_v in cutlass.range_constexpr(pred.shape[0]):
+        for rest_k in cutlass.range_constexpr(pred.shape[2]):
+            pred[rest_v, 0, rest_k] = pred[rest_v, 0, rest_k] & live
 
 
 def _quantize_block(k, fp, frag, kk: int, amax, fy_words):
@@ -481,12 +545,20 @@ def get_compiled_kernel(
     rule: ScaleRule,
     swizzled,
     enable_pdl: bool,
+    masked: bool = False,
 ):
     """The compiled kernel serving row length ``K``: one kernel per (dtype, Kbp bucket, config, format, rule, layout,
-    pdl); K, M and the row strides are runtime arguments (tile-mode kernels serve every K). ``swizzled`` names the layout.
-    ``kernel(x, codes, sf, M, K, padded_M)``."""
+    pdl, masked); K, M and the row strides are runtime arguments (tile-mode kernels serve every K). ``swizzled`` names the
+    layout. ``kernel(x, codes, sf, M, K, padded_M)``; the masked variant ``kernel(x, codes, sf, valid, M, K, padded_M)``."""
     return _compile_bucket(
-        dtype_str, cfg.bucket(K), cfg, fmt, rule, layout_name(swizzled), enable_pdl
+        dtype_str,
+        cfg.bucket(K),
+        cfg,
+        fmt,
+        rule,
+        layout_name(swizzled),
+        enable_pdl,
+        masked,
     )
 
 
@@ -499,13 +571,21 @@ def _compile_bucket(
     rule: ScaleRule,
     swizzled: str,
     enable_pdl: bool,
+    masked: bool = False,
 ):
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
     elem_bytes = dtype.width // 8
     name = mx_quant_kernel_name(
-        fmt.name, rule.name, dtype_str, Kbp, cfg.describe(), swizzled, enable_pdl
+        fmt.name,
+        rule.name,
+        dtype_str,
+        Kbp,
+        cfg.describe(),
+        swizzled,
+        enable_pdl,
+        masked,
     )
 
     def compile_fn():
@@ -529,7 +609,24 @@ def _compile_bucket(
         )
         s = cute.runtime.make_fake_tensor(Uint8, (sym_n,), (1,), assumed_align=16)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        obj = MXQuantKernel(dtype, Kbp, cfg, fmt, rule, swizzled)
+        obj = MXQuantKernel(dtype, Kbp, cfg, fmt, rule, swizzled, masked)
+        if masked:
+            v = cute.runtime.make_fake_tensor(
+                Int32, (cute.sym_int(32),), (1,), assumed_align=4
+            )
+            return cute.compile(
+                obj.call_masked,
+                x,
+                y,
+                s,
+                v,
+                Int64(1),
+                Int32(BLOCK),
+                Int64(128),
+                enable_pdl,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
         return cute.compile(
             obj,
             x,

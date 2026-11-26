@@ -481,6 +481,59 @@ def _moe_mxfp4_fingerprint(
     )
 
 
+def _moe_mxfp4w8a_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    arch=None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The mixed MXFP4-weight x MXFP8-activation MoE classes behind ``MoELayer`` with ``BatchInvariantFp4Config`` (the
+    MXFP4 x MXFP8 pair): the dimensions of :func:`_moe_class_terms` under the same bounds plus the architecture (the
+    instruction class of the dense mixed GEMM: the SM107 step folds 64 elements, the SM100 / SM103 one 32 and reads the
+    e2m1 weight in 128-element runs, so H and I are multiples of 128 there; ``arch`` as for ``mm_mxfp8_mxfp4``, the current
+    device by default)."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import MXFP4W8A, check_shape_fp4
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4w8a import (
+        BLOCK,
+        granule_of,
+        spec_fingerprint_mxfp4w8a,
+    )
+
+    from ..gemm.batch_invariant.schedule import mx_class_for
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "fused_moe_mxfp4w8a"))
+    gran = granule_of(fmt)
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % gran:
+            raise ValueError(
+                f"fingerprint('fused_moe_mxfp4w8a'): {dim} {value} must be a positive multiple of {gran} on the {fmt} "
+                f"class (whole UE8M0 scale blocks of {BLOCK}; whole 128-element runs of the e2m1 weight on SM100 / SM103)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_mxfp4w8a",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    # the class's complete shape rule at the part's class (the layer's): a shape the runner refuses has no fingerprint
+    check_shape_fp4(MXFP4W8A, H, I, num_experts, top_k, bool(gated), fmt)
+    return spec_fingerprint_mxfp4w8a(
+        H, I, top_k, num_experts, rm, name, params, gated, fmt
+    )
+
+
 def _megamoe_bf16_fingerprint(
     hidden: int,
     intermediate: int,
@@ -502,6 +555,56 @@ def _megamoe_bf16_fingerprint(
         gate_up_clamp=gate_up_clamp,
         arch=_mx_family(arch, "megamoe_bf16"),
         **numerical_kwargs,
+    )
+
+
+def _moe_mxfp8_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    arch=None,
+) -> str:
+    """The MXFP8 x MXFP8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8BlockConfig`` under
+    ``QuantConfig(MXFP8, MXFP8)``: the dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s
+    groups, the activation with its scalars and gating) under the class's complete shape rule (the layer's: a shape the
+    runner refuses has no receipt) plus the architecture (the instruction class of the dense MXFP8 GEMM: the SM107 step
+    folds 64 elements, the SM100 / SM103 one 32; ``arch`` as for ``mm_mxfp8``, the current device by default)."""
+    from flashinfer.fused_moe.batch_invariant.api_mxfp8 import check_shape_mxfp8
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp8 import (
+        BLOCK,
+        spec_fingerprint_mxfp8,
+    )
+
+    from ..gemm.batch_invariant.schedule import mx_class_for
+
+    for dim, value in (("H", H), ("I", I)):
+        if value <= 0 or value % BLOCK:
+            raise ValueError(
+                f"fingerprint('fused_moe_mxfp8'): {dim} {value} must be a positive multiple of {BLOCK} "
+                "(whole UE8M0 scale blocks: the class's e4m3 row alignment)"
+            )
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_mxfp8",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
+    check_shape_mxfp8(H, I, num_experts, top_k)
+    fmt = mx_class_for("mxfp8", _mx_family(arch, "fused_moe_mxfp8"))
+    return spec_fingerprint_mxfp8(
+        H, I, top_k, num_experts, rm, name, params, gated, fmt
     )
 
 
@@ -815,12 +918,29 @@ CLASSES: Dict[str, ClassInfo] = {
             "topk_group",
         ),
     ),
+    # the unified MoE layer with `BatchInvariantFp8BlockConfig` under `QuantConfig(MXFP8, MXFP8)` (the fp8-block backend
+    # groups the fp8 formats with block scales under one key, the pair selecting the classes): the bf16 classes' dimensions
+    # plus the architecture (the instruction class of the dense MXFP8 GEMM, as for mm_mxfp8)
+    "fused_moe_mxfp8": ClassInfo(
+        "moe.mxfp8",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp8_fingerprint,
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
+    ),
     # the MXFP4 x MXFP4 pair of the same backend (UE8M0 block scales on both operands: no global or per-token scale, no
     # static-intermediate class)
     "fused_moe_mxfp4": ClassInfo(
         "moe.mxfp4",
         ("H", "I", "top_k", "num_experts"),
         _moe_mxfp4_fingerprint,
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
+    ),
+    # the unified MoE layer with `BatchInvariantFp4Config` (the MXFP4 x MXFP8 pair): the bf16 classes' dimensions plus the
+    # architecture (the instruction class of the dense mixed MXFP4 x MXFP8 GEMM, as for mm_mxfp8_mxfp4)
+    "fused_moe_mxfp4w8a": ClassInfo(
+        "moe.mxfp4w8a",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp4w8a_fingerprint,
         ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
     ),
 }

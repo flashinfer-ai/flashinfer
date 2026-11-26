@@ -7,8 +7,11 @@ time, so one grouped body (:mod:`.kernel`) and one swapped body (:mod:`.swap`) s
   stage of each body, the mainloop block whose lowering ``mma_loop`` executes and the static plan; the TMA ring is the dense
   GEMM's (one A and one B box per stage).
 * :class:`BlockScaledOperands` -- the block-scaled formats (the 4-bit ``nvfp4`` / ``mxfp4`` and the 8-bit ``mxfp8`` element
-  formats, each with the sm_100 / sm_103 and the sm_107 instruction class), parametrised by the plan of the instruction class
-  (:data:`flashinfer.gemm.batch_invariant.blocks.blockscaled.PLANS`): the element dtype, the scale-factor dtype (``e4m3`` per
+  formats, and the mixed ``mxfp4w8a`` pair of an e4m3 token operand against an e2m1 weight operand, each with the sm_100 /
+  sm_103 and the sm_107 instruction class), parametrised by the plan of the instruction class
+  (:data:`flashinfer.gemm.batch_invariant.blocks.blockscaled.PLANS`, the mixed plans of
+  :mod:`flashinfer.gemm.batch_invariant.blocks.blockscaled_mx_mixed`; the swapped body runs a mixed class on the twin plan
+  with the operand formats exchanged): the element dtype per operand, the scale-factor dtype (``e4m3`` per
   16 elements for NVFP4, ``e8m0`` per 32 for the MX formats) and the scale block, the plan with the grouped bodies' own stage
   rule (the operand and scale-factor rings fill the shared memory after the barriers and the body's own tables and staging
   buffers), the views of the byte-packed operands and of the flat 128x4 swizzled scale-factor buffers, the four-operand TMA
@@ -19,12 +22,12 @@ time, so one grouped body (:mod:`.kernel`) and one swapped body (:mod:`.swap`) s
   the scale factors and the per-row scales at the padded positions through a second table of group offsets) and ``padded``
   (every group's rows start at an atom; the padding rows, zero-filled by the caller, are computed and never stored).
 
-The interface a body consumes (stable; additions only): ``block_scaled``, ``in_fmt``, ``packing`` / ``dense_a``, ``dtype``,
-``align``, ``epi_warpgroups``, ``table_bytes``, ``k_blocks(body)``, ``mainloop(body)``, ``plan(...)``,
-``tmem_alloc_kwargs(st)``; for the block-scaled block also ``sf_dtype``, ``sf_vec``, ``elem_bits``, ``group_align``,
-``view_elems(t)``, ``sf_view_rows(...)``, ``sf_view_experts(...)``, ``tma(...)``, ``sf_groups(st)``,
-``sf_stage_bytes(st)``, and the module-level swapped-body pieces :class:`PipelineCpAsyncUmma`,
-:func:`gather_sf_row_padded`, :func:`swap_sf_producer_loop`.
+The interface a body consumes (stable; additions only): ``block_scaled``, ``mixed``, ``in_fmt``, ``packing`` / ``dense_a``,
+``dtype``, ``align``, ``epi_warpgroups``, ``table_bytes``, ``k_blocks(body)``, ``mainloop(body)``, ``plan(...)``,
+``plan_cls_for(body)``, ``view_tokens(t)`` / ``view_weights(t)``, ``smem_dtypes(st)``, ``tmem_alloc_kwargs(st)``; for the
+block-scaled block also ``sf_dtype``, ``sf_vec``, ``elem_bits``, ``group_align``, ``view_elems(t)``, ``sf_view_rows(...)``,
+``sf_view_experts(...)``, ``tma(...)``, ``sf_groups(st)``, ``sf_stage_bytes(st)``, and the module-level swapped-body pieces
+:class:`PipelineCpAsyncUmma`, :func:`gather_sf_row_padded`, :func:`swap_sf_producer_loop`.
 """
 
 from __future__ import annotations
@@ -56,6 +59,12 @@ from ....gemm.batch_invariant.blocks.blockscaled import (
     fp4_view,
     sf_view,
 )
+from ....gemm.batch_invariant.blocks.blockscaled_mx_mixed import (
+    PLANS as MIXED_PLANS,
+)
+from ....gemm.batch_invariant.blocks.blockscaled_mx_mixed import (
+    SWAPPED_PLANS as MIXED_SWAPPED_PLANS,
+)
 from ....gemm.batch_invariant.blocks.operands import (
     ACC_DTYPE,
     ALIGN,
@@ -66,8 +75,11 @@ from ....gemm.batch_invariant.blocks.operands import (
 )
 from ....gemm.batch_invariant.generator import Knobs, MainloopBlock
 from ....gemm.batch_invariant.spec import (
+    A_ELEM_BITS_OF,
+    B_ELEM_BITS_OF,
     BLOCK_SCALED,
     ELEM_BITS_OF,
+    MX_MIXED_FMTS,
     SF_ATOM_KBLOCKS,
     SF_ATOM_ROWS,
 )
@@ -103,6 +115,7 @@ class DenseOperands:
 
     in_fmt: str = "bf16"
     block_scaled = False
+    mixed = False  # one element format for both operands
     packing: str = "dense"
 
     def __post_init__(self):
@@ -116,6 +129,19 @@ class DenseOperands:
     @property
     def dtype(self):
         return IN_DT[self.in_fmt]
+
+    def view_tokens(self, t: cute.Tensor) -> cute.Tensor:
+        """The token operand as the TMA reads it (the dense formats: as given)."""
+        return t
+
+    def view_weights(self, t: cute.Tensor) -> cute.Tensor:
+        """The weight operand as the TMA reads it (the dense formats: as given)."""
+        return t
+
+    @staticmethod
+    def smem_dtypes(st):
+        """The element types of the A and B smem rings: the operands' own (the dense plan has no container)."""
+        return st.a_dtype, st.b_dtype
 
     @property
     def align(self) -> int:
@@ -196,15 +222,29 @@ class GroupedBlockScaledTma:
             st.cluster_shape_mn, st.tiled_mma.thr_id
         )
         a_one = cute.slice_(st.a_smem_layout_staged, (None, None, None, 0))
+        # `internal_type`: the TMA's unpacking format of a sub-byte global operand into an 8-bit smem container (the mixed
+        # sm_100 class's e2m1 weight, the plan's container hooks); None keeps the operand's own format
         self.atom_a, self.tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op, a, a_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            a_op,
+            a,
+            a_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=st.A_TMA_INTERNAL,
         )
         b_op = utils.sm100.cluster_shape_to_tma_atom_B(
             st.cluster_shape_mn, st.tiled_mma.thr_id
         )
         b_one = cute.slice_(st.b_smem_layout_staged, (None, None, None, 0))
         self.atom_b, self.tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op, b, b_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
+            b_op,
+            b,
+            b_one,
+            st.mma_tiler,
+            st.tiled_mma,
+            st.cluster_layout_vmnk.shape,
+            internal_type=st.B_TMA_INTERNAL,
         )
         sfa_op = utils.sm100.cluster_shape_to_tma_atom_A(
             st.cluster_shape_mn, st.tiled_mma.thr_id
@@ -259,24 +299,36 @@ class GroupedBlockScaledTma:
         ) * st.atom_thr_size
 
 
+def xch_smem_bytes(layout) -> int:
+    """Bytes of an fp32 shared-memory exchange buffer with ``layout`` (a chain's ``smem_layout``; None: no buffer)."""
+    return 0 if layout is None else 4 * cute.cosize(layout)
+
+
 def grouped_plan(
-    plan_cls, knobs: Knobs, own_bytes: Callable, umma_addr_max: Optional[int] = None
+    plan_cls,
+    knobs: Knobs,
+    own_bytes: Callable,
+    umma_addr_max: Optional[int] = None,
+    k_blocks: Optional[int] = None,
 ):
     """The block-scaled plan with the grouped bodies' own stage rule: the operand ring (A, B, SFA, SFB per stage) fills the
     CTA's shared memory after the barrier reserve and the body's own buffers (``own_bytes(st)``: the group tables, the
     epilogue staging buffers), under the dense plan's A-ring cap. The dense plan's output stages are not reserved (the
     grouped epilogue stores from its own staging buffers). ``umma_addr_max``: the operand rings a UMMA reads (A and B,
     behind the barriers and the body's own buffers) end below this many bytes of the CTA's shared memory (the plan's
-    ``UMMA_SMEM_ADDR_MAX`` on the sm_100 instruction plans: their descriptors' address window). A placement: the ring depth
-    moves no bits."""
+    ``UMMA_SMEM_ADDR_MAX`` on the sm_100 instruction plans: their descriptors' address window). ``k_blocks``: the
+    instruction K steps per stage (the swapped body's two-atom stage; None: the format's one swizzle atom of K). A
+    placement: the ring depth moves no bits."""
 
     class _Plan(plan_cls):
         def _stages(self):
+            # the rings at the smem container widths (a sub-byte operand the TMA unpacks occupies a byte per element: the
+            # mixed sm_100 class's e2m1 weight; the one-format plans' containers are their operands' own types)
             a_one = utils.sm100.make_smem_layout_a(
-                self.tiled_mma, self.mma_tiler, self.a_dtype, 1
+                self.tiled_mma, self.mma_tiler, self.a_smem_dtype, 1
             )
             b_one = utils.sm100.make_smem_layout_b(
-                self.tiled_mma, self.mma_tiler, self.b_dtype, 1
+                self.tiled_mma, self.mma_tiler, self.b_smem_dtype, 1
             )
             sfa_one = bs_layout.make_smem_layout_sfa(
                 self.tiled_mma, self.mma_tiler, self.sf_vec, 1
@@ -284,8 +336,8 @@ def grouped_plan(
             sfb_one = bs_layout.make_smem_layout_sfb(
                 self.tiled_mma, self.mma_tiler, self.sf_vec, 1
             )
-            a_bytes = cute.size_in_bytes(self.a_dtype, a_one)
-            b_bytes = cute.size_in_bytes(self.b_dtype, b_one)
+            a_bytes = cute.size_in_bytes(self.a_smem_dtype, a_one)
+            b_bytes = cute.size_in_bytes(self.b_smem_dtype, b_one)
             ab_bytes = (
                 a_bytes
                 + b_bytes
@@ -309,7 +361,7 @@ def grouped_plan(
             )
             return num_ab, NUM_C_STAGE_MIN
 
-    return _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR)
+    return _Plan(knobs, ACC_DTYPE, LayoutEnum.ROW_MAJOR, k_blocks=k_blocks)
 
 
 @dataclass(frozen=True)
@@ -323,12 +375,28 @@ class BlockScaledOperands:
     block_scaled = True
 
     def __post_init__(self):
-        assert self.in_fmt in BLOCK_SCALED and self.in_fmt in PLANS, self.in_fmt
+        assert self.in_fmt in BLOCK_SCALED and (
+            self.in_fmt in PLANS or self.in_fmt in MIXED_PLANS
+        ), self.in_fmt
         assert self.packing in PACKINGS, self.packing
 
     @property
+    def mixed(self) -> bool:
+        """The mixed classes: the token operand e4m3, the weight operand e2m1 (the swapped body's plan is the twin with the
+        formats exchanged); the one-format classes read one element type on both operands."""
+        return self.in_fmt in MX_MIXED_FMTS
+
+    @property
     def plan_cls(self):
-        return PLANS[self.in_fmt]
+        """The grouped body's plan class (the tokens as A, the weights as B)."""
+        return PLANS[self.in_fmt] if self.in_fmt in PLANS else MIXED_PLANS[self.in_fmt]
+
+    def plan_cls_for(self, body: str):
+        """The plan class of a body: the swapped body of a mixed class runs the twin plan with the operand formats exchanged
+        (the weight is the kernel's A); every other case is the class's plan."""
+        if self.mixed and body == "swapped":
+            return MIXED_SWAPPED_PLANS[self.in_fmt]
+        return self.plan_cls
 
     @property
     def dense_a(self) -> bool:
@@ -337,6 +405,7 @@ class BlockScaledOperands:
 
     @property
     def dtype(self):
+        """The token operand's element type (the one-format classes': both operands')."""
         return self.plan_cls.A_DT
 
     @property
@@ -350,7 +419,16 @@ class BlockScaledOperands:
 
     @property
     def elem_bits(self) -> int:
+        """The token operand's element width (the one-format classes': both operands')."""
         return ELEM_BITS_OF[self.in_fmt]
+
+    @property
+    def token_elem_bits(self) -> int:
+        return A_ELEM_BITS_OF[self.in_fmt]
+
+    @property
+    def weight_elem_bits(self) -> int:
+        return B_ELEM_BITS_OF[self.in_fmt]
 
     @property
     def align(self) -> int:
@@ -385,16 +463,34 @@ class BlockScaledOperands:
         own_bytes: Callable,
         body: str,
         umma_addr_max: Optional[int] = None,
+        k_blocks: Optional[int] = None,
     ):
         """The block-scaled plan with the grouped bodies' stage rule (:func:`grouped_plan`); ``own_bytes(st)`` the body's own
-        shared storage beyond the barriers, ``umma_addr_max`` the UMMA descriptors' address window the swapped body's A ring
-        must end inside (``None``: the plan's A-ring cap alone)."""
-        return grouped_plan(self.plan_cls, knobs, own_bytes, umma_addr_max)
+        shared storage beyond the barriers, ``umma_addr_max`` the UMMA descriptors' address window the bodies' A ring must
+        end inside (``None``: the plan's A-ring cap alone), ``k_blocks`` the instruction K steps per stage (None: the
+        format's)."""
+        return grouped_plan(
+            self.plan_cls_for(body), knobs, own_bytes, umma_addr_max, k_blocks
+        )
 
     def view_elems(self, t: cute.Tensor) -> cute.Tensor:
         """The API's operand as the element tensor the TMA reads: the byte-packed 4-bit operand viewed as fp4 of the logical
-        K, an 8-bit element operand as given."""
+        K, an 8-bit element operand as given (the token operand's width; the one-format classes' both operands')."""
         return fp4_view(t) if self.elem_bits == 4 else t
+
+    def view_tokens(self, t: cute.Tensor) -> cute.Tensor:
+        """The token operand as the TMA reads it (its own element width)."""
+        return fp4_view(t) if self.token_elem_bits == 4 else t
+
+    def view_weights(self, t: cute.Tensor) -> cute.Tensor:
+        """The weight operand as the TMA reads it (its own element width: the mixed classes' e2m1 weight is byte-packed)."""
+        return fp4_view(t) if self.weight_elem_bits == 4 else t
+
+    @staticmethod
+    def smem_dtypes(st):
+        """The element types of the A and B smem rings: the plan's containers (a sub-byte operand the TMA unpacks occupies a
+        byte per element; the one-format plans' containers are their operands' own types)."""
+        return st.a_smem_dtype, st.b_smem_dtype
 
     def sf_view_rows(self, sf: cute.Tensor, rows, k) -> cute.Tensor:
         """The flat 128x4 swizzled scale-factor buffer of a ``(rows, k)`` A operand as the scale tensor the TMA reads."""
