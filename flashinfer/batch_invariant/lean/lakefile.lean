@@ -49,3 +49,9 @@ lean_exe numericalmegamoeconformance where
 
 lean_exe a16megamoeconformance where
   root := `A16MegaMoEMain
+
+lean_exe moenvfp4conformance where
+  root := `MoENvfp4Main
+
+lean_exe moemxfp4conformance where
+  root := `MoEMxfp4Main
