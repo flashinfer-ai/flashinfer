@@ -107,14 +107,14 @@ _SMOKE_CASES = [
 )
 def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning):
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:
+    if backend == "cutlass" and compute_capability[0] not in [8, 10, 11, 12]:
         pytest.skip(
-            "bmm_fp8 with cutlass backend is only supported on SM100, SM110, and SM120/121 GPUs."
+            "bmm_fp8 with cutlass backend is only supported on SM8x, SM100, SM110, and SM120/121 GPUs."
         )
     if backend == "cute-dsl":
-        if compute_capability != (10, 7):
+        if compute_capability != (10, 7) and compute_capability[0] != 8:
             pytest.skip(
-                "bmm_fp8 with cute-dsl backend is only supported on SM107 GPUs."
+                "bmm_fp8 with cute-dsl backend is only supported on SM8x and SM107 GPUs."
             )
         # Imported here, not at module scope: on this branch the device is
         # SM107 and the cute-dsl backend was explicitly requested, so the DSL is
