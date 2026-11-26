@@ -31,6 +31,7 @@ from __future__ import annotations
 import array
 import collections
 import functools
+import threading
 from typing import Any, NamedTuple, Optional, Union
 
 import torch
@@ -793,6 +794,7 @@ _IDENTITY_SLOTS: dict[int, torch.Tensor] = {}
 _IDENTITY_SLOTS_SUPERSEDED: list[torch.Tensor] = []
 _NO_SLOTS: dict[int, torch.Tensor] = {}
 _NO_SLOTS_SUPERSEDED: list[torch.Tensor] = []
+_SLOTS_LOCK = threading.Lock()
 
 
 def _cached_slots(
@@ -820,9 +822,12 @@ def _cached_slots(
     torch.cuda.current_stream(
         device
     ).synchronize()  # complete before a call on any stream reads it
-    if table is not None:
-        superseded.append(table)
-    tables[index] = grown
+    with _SLOTS_LOCK:
+        # The table published now, which another thread may have replaced while this one synchronized.
+        previous = tables.get(index)
+        if previous is not None:
+            superseded.append(previous)
+        tables[index] = grown
     return grown[:n]
 
 
