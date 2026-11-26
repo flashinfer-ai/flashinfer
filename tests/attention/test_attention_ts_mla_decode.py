@@ -1358,7 +1358,9 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "workspace_buffer",
         "validate",
         "tuning",
+        "compile",
     )
+    assert plan_parameters["compile"].default is True
     for name in (
         "device",
         "packed_query",
@@ -1594,6 +1596,59 @@ def test_attention_ts_mla_run_requires_plan():
     wrapper = BatchMLADecodePagedTSWrapper()
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
         wrapper.run(None, None, None, None)
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before"):
+        wrapper.is_kernel_cached()
+
+
+def test_attention_ts_mla_plan_defers_compilation(monkeypatch, tmp_path):
+    """Resolve a plan's kernel without compiling or allocating, then compile it."""
+    from flashinfer.jit import cute_dsl_core
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    args = dict(
+        device=device,
+        batch_size=2,
+        num_qo_heads=16,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=32,
+        max_kv_len=256,
+        max_q_len=1,
+        packed_query=False,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    mla_decode_module._get_compiled_mla_decode.cache_clear()
+    cache_info = mla_decode_module._get_compiled_mla_decode.cache_info()
+    wrapper = BatchMLADecodePagedTSWrapper()
+    allocations = torch.cuda.memory_stats(device).get("allocation.all.allocated", 0)
+    wrapper.plan(**args, compile=False)
+    assert (
+        torch.cuda.memory_stats(device).get("allocation.all.allocated", 0)
+        == allocations
+    )
+    spec = wrapper._plan_state.compile_spec
+    assert wrapper._plan_state.compiled is None
+    assert mla_decode_module._get_compiled_mla_decode.cache_info() == cache_info
+    host_workspace = torch.empty(64, dtype=torch.uint8)
+    for compile_kernel in (False, True):
+        with pytest.raises(ValueError, match="workspace_buffer must be on"):
+            wrapper.plan(
+                **args, workspace_buffer=host_workspace, compile=compile_kernel
+            )
+    assert not wrapper.is_kernel_cached()
+    with pytest.raises(RuntimeError, match=r"plan\(compile=True\)"):
+        wrapper.run(None, None, None, None, validate=False)
+    wrapper.plan(**args)
+    compiled = wrapper._plan_state.compiled
+    assert compiled is not None and wrapper._plan_state.compile_spec == spec
+    assert wrapper.is_kernel_cached() == (not cute_dsl_core.cute_dsl_cache_disabled())
+    wrapper.plan(**args, compile=False)
+    assert wrapper._plan_state.compiled is None
+    wrapper.plan(**args)
+    assert wrapper._plan_state.compiled is compiled
 
 
 @pytest.mark.parametrize("cp_world", (1, 8))
