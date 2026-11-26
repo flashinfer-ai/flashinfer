@@ -139,7 +139,7 @@ def _config(
     return moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         **common,
         kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl"
-        + ("_next" if provider != "legacy" else ""),
+        + ("_legacy" if provider == "legacy" else ""),
         kernel_variant="genphase" if provider == "genphase" else "inference",
         finalize_mode=(
             moe_ep.FinalizeMode.PERSISTENT
@@ -468,7 +468,7 @@ def test_nvfp4_batch_invariant_prequantized_batches(provider, early, monkeypatch
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         pytest.skip("single-rank test")
     _device(provider)
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         nvfp4_quantize_per_block_16,
     )
 
@@ -570,7 +570,7 @@ def _torch_reference(
 def _distributed_oracle(provider, early, rank, world):
     from types import SimpleNamespace
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         nvfp4_quantize_per_block_16,
     )
     from ._megamoe_bi_helpers import (
@@ -651,7 +651,7 @@ def test_nvfp4_batch_invariant_independent_reference(
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         pytest.skip("single-rank test")
     _device(provider)
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         nvfp4_quantize_per_block_16,
     )
     from tests.moe_ep.test_nvfp4_cutedsl_kernel_vs_reference import _oracle_atol

@@ -1,0 +1,48 @@
+"""Python adaptation layer for the Cake SM120 MXFP4 x MXFP8 MegaMoE kernel package."""
+
+from flashinfer.moe_ep.shims.sm120.cake_mxfp4.cake_jit import (
+    AOT_DEVICE_PARAMETERS,
+    DEVICE_PARAMETERS,
+    EXPECTED_NCCL_VERSION_INTEGER,
+    GIN_BACKENDS,
+    INSTANCE_NAMES,
+    cake_sm120_megamoe_available,
+    check_exact_sm120,
+    cuobjdump_path,
+    device_cubin,
+    device_cubin_resource_usage,
+    device_defines,
+    gen_cake_sm120_megamoe_aot_modules,
+    gen_cake_sm120_megamoe_kernel_module,
+    gen_cake_sm120_megamoe_module,
+    gin_backend_name,
+    load_cake_sm120_megamoe_module,
+    nccl_installation,
+    nvcc_version,
+    read_geometry,
+    read_manifest,
+)
+
+
+__all__ = [
+    "AOT_DEVICE_PARAMETERS",
+    "DEVICE_PARAMETERS",
+    "EXPECTED_NCCL_VERSION_INTEGER",
+    "GIN_BACKENDS",
+    "INSTANCE_NAMES",
+    "cake_sm120_megamoe_available",
+    "check_exact_sm120",
+    "cuobjdump_path",
+    "device_cubin",
+    "device_cubin_resource_usage",
+    "device_defines",
+    "gen_cake_sm120_megamoe_aot_modules",
+    "gen_cake_sm120_megamoe_kernel_module",
+    "gen_cake_sm120_megamoe_module",
+    "gin_backend_name",
+    "load_cake_sm120_megamoe_module",
+    "nccl_installation",
+    "nvcc_version",
+    "read_geometry",
+    "read_manifest",
+]

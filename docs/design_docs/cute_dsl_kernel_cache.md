@@ -27,14 +27,14 @@ build_and_load()                     JitSpec ABC — shared policy, written once
   try_load() ────── hit ────────────►  return cached kernel        (fast path)
       │ miss
       ▼
+  FLASHINFER_DISABLE_JIT set? ─ yes ►  raise MissingJITCacheError
+      │ no
+      ▼
   FileLock(lock_path)                cross-process lock
       │
       ▼
   try_load() ────── hit ────────────►  return   (another process just built it)
       │ miss
-      ▼
-  FLASHINFER_DISABLE_JIT set? ─ yes ►  raise MissingJITCacheError
-      │ no
       ▼
   build()                            backend-specific compile:
       │                                nvcc: write_ninja + ninja  (host toolchain)
@@ -71,7 +71,8 @@ def _get_compiled_kernel(...):
 
 On a **hit**, the kernel is JITLinked from the cached `.o` (milliseconds).
 On a **miss**, `compile_fn` runs, the result is exported to the module
-directory, and the in-process compiled function is returned directly.
+directory, and the exported artifact is loaded. The in-process compiled
+function is retained as a fallback when no valid artifact is available.
 
 ### 2.2 Cache on disk layout
 
@@ -137,8 +138,11 @@ Hashing whole source files means any edit (even a docstring) invalidates. This i
 
 ### 2.4 Concurrency and crash safety
 
-- A per-module `FileLock` (same `cached_ops/tmp/` convention as `JitSpec`) makes each kernel compile **at most once across processes**: the cache is re-checked after acquisition, so a process that waited behind a builder loads the fresh artifact instead of recompiling. The lock is per-module rather than per-kernel — *different* kernels of one op family also serialize their builds — deliberately: `build()` may wipe the whole module directory and rewrite the module-level `meta.json`, which must not interleave with a sibling kernel's export. (Per-kernel compile locks with a module lock only around wipe/meta-commit would allow parallel cold starts; not worth the complexity today.)
-- Lock recovery: a crashed holder releases the `flock` automatically (kernel behavior), and a leftover lock *file* is harmless. If a lock is truly wedged (e.g. NFS lock-manager state after a node hang), deleting `cached_ops/tmp/<module>.lock` is safe — artifact commits are atomic and idempotent, so breaking the lock risks at most one duplicated compilation, never a corrupt artifact. `rm -rf ~/.cache/flashinfer/` remains the universal reset.
+- `JitSpecCuteDsl.lock_path` identifies a per-kernel `FileLock` in `cached_ops/tmp/`. The inherited `JitSpec.build_and_load()` rechecks the cache after acquiring it and holds it through building and loading, so waiting callers reuse a successfully published artifact. Separate processes can compile different kernels concurrently. Threads in each process serialize entry to the CuTe compiler, whose options are process-wide.
+- `module_lock_path` identifies a separate lock shared by an op family. `build()` compiles outside this lock, then acquires it for module invalidation and export. Readers open the metadata commit marker before inspecting the object and verify the same marker is still published after checking or loading it. This lets read-only deployments use valid exports and prevents readers from combining an old object with a new generation's metadata. Locks remain outside the module directory so invalidation cannot remove them.
+- `compile_and_persist()` forces a rebuild by default. Cache-filling workers use `force=False` to recheck membership under the kernel lock and reuse another process's publication. Neither mode loads the object.
+- A loader error propagates from `load()` when the published generation is unchanged or cannot be verified. If the generation disappears or changes during loading, the spec can use its in-process kernel. An invalidated engine-less export from a successful build can recover by compiling an executable outside the module lock when JIT is enabled.
+- Lock recovery: a crashed holder releases the `flock` automatically (kernel behavior), and a leftover lock *file* is harmless. Do not delete lock files while processes may still use the cache; stop those processes before clearing it.
 - `.o` files are written to a pid-suffixed temp name and committed with atomic `os.replace`, so an `.o` at its final path is always complete.
 - `meta.json` is written **after** the first successful export. A crash between the two leaves an `.o` without matching metadata, which reads as a miss and is recompiled/overwritten — never loaded.
 - Wiping a stale module while another process has its `.o` mapped is safe on POSIX (the inode survives the unlink).
@@ -171,11 +175,11 @@ The abstract methods, side by side:
 
 | Contract | `JitSpecNvcc` | `JitSpecCuteDsl` |
 |---|---|---|
-| one instance = | one **module** (many symbols in one `.so`) | one **kernel specialization** (`.o`; op family shares a module dir, `meta.json`, and lock) |
+| one instance = | one **module** (many symbols in one `.so`) | one **kernel specialization** with a build lock (`.o`; op family shares a module dir, `meta.json`, and publication lock) |
 | compilation input | `.cu`/`.cpp` paths + flags (pure data) | live kernel object in a `compile_fn` closure |
 | `try_load()` | AOT `.so` only — deliberately ignores the JIT-path `.so`, so `build()` always runs and **ninja judges freshness** | `.o` exists **and** `meta.json` matches → JITLink it; else `None` |
-| `build()` | `write_ninja()` + run ninja (no-op if up to date); needs only a host toolchain | wipe module if meta stale, `cute.compile()` (needs a GPU), `export_to_c()`; keeps the compiled kernel in memory |
-| `load()` | `dlopen` the `.so` via `tvm_ffi.load_module` | return the in-memory kernel from `build()`, else JITLink the `.o` |
+| `build()` | `write_ninja()` + run ninja (no-op if up to date); needs only a host toolchain | `cute.compile()`, then module-locked invalidation and export; retains the compiled kernel in memory |
+| `load()` | `dlopen` the `.so` via `tvm_ffi.load_module` | JITLink the valid `.o` from a consistent cache generation, falling back to the retained kernel if no valid artifact exists |
 | invalidation authority | ninja dependency scan, at build time | `meta.json` (DSL-stack fingerprint + source SHA-256), at load time |
 | `is_compiled` / `get_library_path()` | `.so` exists / `.so` path | `.o` + meta match / `.o` path |
 
@@ -251,10 +255,15 @@ are compiled on demand. Set it to 0 to disable the timeout.
 `FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=0` preserves the full search and its
 order. Positive values opt into the FP4 analytical ranking for persistent
 tactics, while retaining every eligible split-K tactic. The budget must fit
-those split-K tactics plus at least one persistent candidate. This ranking
+those split-K tactics plus at least one persistent candidate. The runner
+reports its budget, including 0, through `get_tactic_cache_key()`, so changing
+it retunes entries tuned under a different budget instead of reusing their
+winners. Entries tuned before the budget was reported are retuned once when
+tuning is next enabled; serving from them is unchanged. This ranking
 needs MXFP8 workload validation before becoming a default: a startup reduction
 alone does not establish steady-state performance parity. The newer warp
-split-K runner and SM107/SM12x paths are outside this change.
+split-K runner and SM12x paths are outside this change; the SM107 low-M runner
+(M <= 32) applies the budget.
 
 Use the following regression harness with a **new** output directory:
 

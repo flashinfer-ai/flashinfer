@@ -40,6 +40,7 @@ except (ImportError, RuntimeError):
     _HostOffsetsError = NotImplementedError
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
+    _chunk_gated_delta_rule_gdn_affine_split_sm100,
     _chunk_gated_delta_rule_gdn_cp_sm100,
     chunk_gated_delta_rule_sm80,
     chunk_gated_delta_rule_sm90,
@@ -54,6 +55,7 @@ from .gdn_kernels.delta_rule_dsl.varlen_helper import (
     is_integer_dtype,
     should_use_cp_host,
     should_use_cp_sm80_host,
+    should_use_cp_sm110_host,
     should_use_v32_sm80_host,
 )
 
@@ -810,6 +812,285 @@ def _run_cake_gdn_prefill(
     return output
 
 
+_CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES = {
+    (9, 0): "sm_90a",
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+    (11, 0): "sm_110a",
+    (12, 0): "sm_120a",
+    (12, 1): "sm_121a",
+}
+_CAKE_GDN_AFFINE_SPLIT_HEADS = (4, 8, 16, 32)
+_CAKE_GDN_AFFINE_SPLIT_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+
+
+def _cake_gdn_affine_split_scope(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+    output: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    device_capability: tuple[int, int],
+    cuda_major: int,
+) -> Optional[str]:
+    """Why ``use_affine_split=True`` cannot serve the call, or ``None``.
+
+    Host metadata only: no device read, no allocation, no launch. An
+    ``output`` of ``None`` is the one the entry allocates, which fits."""
+
+    capability = (int(device_capability[0]), int(device_capability[1]))
+    if capability not in _CAKE_GDN_AFFINE_SPLIT_CAPABILITIES:
+        arch = _CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES.get(
+            capability, f"sm_{capability[0]}{capability[1]}"
+        )
+        return f"{arch} is not supported (sm_100a, sm_103a and sm_107a only)"
+    device = q.device
+    io = (q, k, v) if output is None else (q, k, v, output)
+    total = int(q.shape[0]) if q.ndim == 3 else -1
+    if (
+        device.type != "cuda"
+        or any(t.device != device for t in io)
+        or any(t.dtype != torch.bfloat16 for t in io)
+        or any(t.ndim != 3 or not t.is_contiguous() for t in io)
+        or any(int(t.shape[0]) != total or int(t.shape[2]) != 128 for t in io)
+    ):
+        return "requires contiguous BF16 q/k/v/output of head size 128 on one device"
+    num_q_heads, num_k_heads, num_v_heads = (
+        int(q.shape[1]),
+        int(k.shape[1]),
+        int(v.shape[1]),
+    )
+    if (
+        num_v_heads not in _CAKE_GDN_AFFINE_SPLIT_HEADS
+        or num_k_heads != num_q_heads
+        or num_v_heads % num_q_heads != 0
+        or (output is not None and int(output.shape[1]) != num_v_heads)
+    ):
+        return "requires Hv in (4, 8, 16, 32), Hk == Hq and Hv % Hq == 0"
+    if (
+        cu_seqlens.ndim != 1
+        or int(cu_seqlens.numel()) < 2
+        or cu_seqlens.dtype not in (torch.int32, torch.int64)
+        or not cu_seqlens.is_contiguous()
+        or cu_seqlens.device != device
+    ):
+        return "requires contiguous int32 or int64 cu_seqlens"
+    num_seqs = int(cu_seqlens.numel()) - 1
+    states = [
+        tensor
+        for tensor in (initial_state, output_state if output_final_state else None)
+        if tensor is not None
+    ]
+    for tensor in states:
+        if (
+            tensor.dtype != torch.float32
+            or tensor.device != device
+            or tensor.ndim != 4
+            or tuple(tensor.shape) != (num_seqs, num_v_heads, 128, 128)
+            or not tensor.is_contiguous()
+        ):
+            # The kernels' bindings check contiguity, so padded sequence
+            # slots are refused here, before any launch.
+            return "requires contiguous FP32 states [N, H, V, K]"
+    for tensor in states:
+        # Contiguous slots are 16-byte aligned apart from the base, and a
+        # one-sequence state's slot stride is never read.
+        if tensor.data_ptr() & 15:
+            return "requires 16-byte aligned state pointers"
+    for tensor in (g, beta):
+        if tensor is not None and (
+            tensor.dtype != torch.float32
+            or tensor.device != device
+            or tuple(tensor.shape) != (total, num_v_heads)
+            or not tensor.is_contiguous()
+        ):
+            return "requires contiguous FP32 g/beta [tokens, heads]"
+    if use_qk_l2norm_in_kernel and not (
+        cuda_major >= 13 and is_cute_dsl_arch_supported(*capability)
+    ):
+        return (
+            "use_qk_l2norm_in_kernel needs the Q/K normalization kernel, which "
+            "this device or toolchain lacks"
+        )
+    return None
+
+
+def _run_cake_gdn_affine_split(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    scale: float,
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]],
+    max_seqlen: int,
+    use_qk_l2norm_in_kernel: bool,
+    output: torch.Tensor,
+    output_state: Optional[torch.Tensor],
+    device_capability: tuple[int, int],
+    cuda_major: int,
+    split_count: Optional[int],
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """The ``use_affine_split=True`` route: scope checks (``ValueError``
+    before any launch), then the split passes at the cap of the longest
+    possible sequence: the exact longest of ``cu_seqlens_cpu`` when given,
+    else ``max_seqlen`` (the caller's hint or the packed token count)."""
+
+    reason = _cake_gdn_affine_split_scope(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        output=output,
+        output_state=output_state,
+        device_capability=device_capability,
+        cuda_major=cuda_major,
+    )
+    if reason is not None:
+        raise ValueError(f"use_affine_split=True: {reason}")
+    num_seqs = int(cu_seqlens.numel()) - 1
+    bound = int(max_seqlen)
+    if cu_seqlens_cpu is not None:
+        # Validated on every route, the split one included, before a launch.
+        offsets = _cake_gdn_prefill_host_offsets(
+            cu_seqlens_cpu, num_seqs=num_seqs, total_tokens=int(q.shape[0])
+        )
+        longest = max(b - a for a, b in zip(offsets, offsets[1:], strict=False))
+        if longest > bound:
+            raise ValueError(
+                "use_affine_split=True: max_seqlen is smaller than the longest "
+                "sequence in cu_seqlens_cpu"
+            )
+        bound = longest
+    if int(q.shape[0]) == 0:
+        # Every sequence is empty: no launch, each final state is its
+        # initial state (zeros without one).
+        if not output_final_state:
+            return output
+        if output_state is None:
+            output_state = torch.empty(
+                (num_seqs, int(v.shape[1]), 128, 128),
+                dtype=torch.float32,
+                device=q.device,
+            )
+        if initial_state is None:
+            output_state.zero_()
+        else:
+            output_state.copy_(initial_state)
+        return output, output_state
+    from .gdn_kernels.blackwell import cake_gdn_affine_split as _affine_split
+
+    num_v_heads = int(v.shape[1])
+    device_index = int(
+        q.device.index if q.device.index is not None else torch.cuda.current_device()
+    )
+    sm_count = _cake_gdn_sm_count(device_index)
+    plan = _affine_split.plan_split(
+        num_heads=num_v_heads,
+        max_seqlen=bound,
+        sm_count=sm_count,
+        target=_CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES[
+            (int(device_capability[0]), int(device_capability[1]))
+        ],
+        split_count=split_count,
+    )
+    tiles, _ = _affine_split.pass1_grid(num_seqs, num_v_heads, plan.p_bound, sm_count)
+    if (
+        tiles > _affine_split.MAX_PASS1_TILES
+        or int(q.shape[0]) > _affine_split.MAX_TOKENS
+    ):
+        raise ValueError(
+            f"use_affine_split=True: supports at most {_affine_split.MAX_TOKENS} "
+            f"tokens and {_affine_split.MAX_PASS1_TILES} pass-1 tiles "
+            f"(num_seqs * num_v_heads * (4 * P - 2) = {tiles})"
+        )
+    if use_qk_l2norm_in_kernel:
+        from .gdn_kernels.qk_l2norm import normalize_qk
+
+        q, k = normalize_qk(q, k)
+    if output_final_state and output_state is None:
+        output_state = torch.empty(
+            (num_seqs, num_v_heads, 128, 128), dtype=torch.float32, device=q.device
+        )
+    if (
+        plan.p_bound == 1
+        and initial_state is not None
+        and output_final_state
+        and 2 * num_seqs * num_v_heads
+        <= _cake_gdn._ARCH_ACTIVE_CLUSTERS[_cake_gdn_arch(device_index)]
+    ):
+        # Every sequence in one segment, from an initial state to a final
+        # one, where the unsplit kernel resolves its DV-split variant:
+        # bitwise equal to the first kernel alone, per sequence, and faster.
+        # Its full-DV variant (more sequences or heads) has other bits, and
+        # it ships no initial-state variant without a final state, so
+        # neither is used. The launch depends on the bound only, as the
+        # split route's does.
+        try:
+            return _run_cake_gdn_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=False,
+                output=output,
+                output_state=output_state,
+                state_checkpoints=None,
+                checkpoint_cu_starts=None,
+                checkpoint_every_n_tokens=0,
+                state_indices=None,
+                max_seqlen=bound,
+                cu_seqlens_cpu=None,
+            )
+        except _cake_gdn.CakeGDNUnsupportedError:
+            # No unsplit record for this key: the resolver refuses it on the
+            # host, before any launch, and the first kernel alone serves it.
+            pass
+    # p_bound == 1: the first kernel alone at a cap of one segment, the bits
+    # of a one-segment sequence inside any split launch, whatever the batch.
+    _chunk_gated_delta_rule_gdn_affine_split_sm100(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        output=output,
+        output_state=output_state,
+        plan=plan,
+        sm_count=sm_count,
+    )
+    if output_final_state:
+        assert output_state is not None
+        return output, output_state
+    return output
+
+
 def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
     return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
 
@@ -1166,13 +1447,18 @@ def _cp_delta_rule_rejection_reason(
             return "GDN CP SM100 kernel is unavailable"
         if not use_gdn_cp_backend and cp_delta_rule_dsl_sm100 is None:
             return "CP delta rule SM100 DSL kernel is unavailable"
+    elif arch_major == 11:
+        if cuda_version < (13, 0):
+            return "CP delta rule SM110 DSL kernel requires CUDA 13 or newer"
+        if cp_delta_rule_dsl_sm100 is None:
+            return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
         return (
             "CP delta rule is currently implemented only for SM8x, SM90, "
-            "SM100, and SM120"
+            "SM100, SM110, and SM120"
         )
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
@@ -1311,6 +1597,10 @@ def chunk_gated_delta_rule(
     output_state_indices: Optional[torch.Tensor] = None,
     checkpoint_state_indices: Optional[torch.Tensor] = None,
     prefix_lens: Optional[torch.Tensor] = None,
+    use_affine_split: bool = False,
+    _affine_split_count: Optional[int] = None,
+    batch_invariant: bool = False,
+    train_states: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -1346,11 +1636,11 @@ def chunk_gated_delta_rule(
         Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
         float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
-        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM120),
+        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM107/SM110/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
-        from row ``state_indices[i]``; on SM100/SM103 every rank-4 positive,
-        non-overlapping stride layout is accepted.
+        from row ``state_indices[i]``; on SM100/SM103/SM110 every rank-4
+        positive, non-overlapping stride layout is accepted.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
@@ -1378,14 +1668,14 @@ def chunk_gated_delta_rule(
         ``output_state is initial_state``); it must be provided by the
         caller (auto-allocation is rejected, since a compact ``[num_seqs, ...]``
         buffer would be indexed out of bounds by the pool slot ids).
-        SM100/SM103 accepts the same positive, non-overlapping rank-4 stride
-        layouts as ``initial_state``.
+        SM100/SM103/SM110 accepts the same positive, non-overlapping rank-4
+        stride layouts as ``initial_state``.
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
         num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
         float16, float8_e4m3fn, or float8_e5m2. Required when
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
-        currently supported on SM8x, SM90, SM100, and SM120.
+        currently supported on SM8x, SM90, SM100, SM110, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int32 or
         int64 on the same CUDA device as ``q``.
@@ -1405,15 +1695,19 @@ def chunk_gated_delta_rule(
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
         Whether to use the architecture-specific context-parallel DSL
-        implementation on SM8x, SM90, SM100/SM103/SM107 or SM120, where it is
-        supported and low-parallelism heuristics match. SM100/SM103/SM107 uses
+        implementation on SM8x, SM90, SM100/SM103/SM107, SM110 or SM120, where
+        it is supported and low-parallelism heuristics match. SM110 uses the
+        SM100 CuTe-DSL implementation, and its ``"auto"`` rule takes CP only
+        for at most 4 parallel states on a long enough longest sequence: at
+        least 2048 tokens for 1, 3072 for 2-3 and 4096 for 4 (see
+        ``max_seqlen``). SM100/SM103/SM107 uses
         the generated GDN CP-only four-stage implementation for structurally
         supported shapes; other legal configurations retain the CuTe-DSL
         implementation. ``"auto"`` enables conservative routing, ``True``
         requires CP support, and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
         Int32 or int64 tensor of shape ``[num_seqs]``
-        (SM8x/SM90/SM100/SM103/SM120). When provided,
+        (SM8x/SM90/SM100/SM103/SM107/SM110/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
@@ -1504,10 +1798,11 @@ def chunk_gated_delta_rule(
         back from the GPU. When omitted, CP uses ``total_seq_len``, which is
         correct for any batch; passing the exact maximum of a batched call
         lets CP launch smaller grids.  The SM100/SM103 ``use_cp="auto"``
-        band reads the hint (or the exact maximum from ``cu_seqlens_cpu``) as
-        the longest sequence and, without either, the balanced-batch estimate
-        ``ceil(total_seq_len / num_seqs)``; pass the exact maximum so the band
-        decision matches the Cake dispatcher's. ``backend="cake_gdn"`` without
+        band and the SM110 ``use_cp="auto"`` rule read the hint (or the exact
+        maximum from ``cu_seqlens_cpu``) as the longest sequence and, without
+        either, the balanced-batch estimate ``ceil(total_seq_len / num_seqs)``;
+        pass the exact maximum so the band decision matches the Cake
+        dispatcher's. ``backend="cake_gdn"`` without
         CP uses the same bound (or the exact maximum from ``cu_seqlens_cpu``)
         to select its kernel variant; a loose bound is always correct and only
         affects whether the single-chunk kernel is eligible.  The persistent
@@ -1600,9 +1895,121 @@ def chunk_gated_delta_rule(
 
         ``output_state_indices``, ``checkpoint_state_indices`` and
         ``prefix_lens`` are served by the native non-CP kernels on SM8x, SM90,
-        SM100/SM103/SM107 and SM120 (``backend="auto"`` or
+        SM100/SM103/SM107, SM110 and SM120 (``backend="auto"`` or
         ``"flashinfer"``); ``use_cp=True``, ``backend="cake_gdn"`` and
         ``backend="cudnn"`` reject them.
+    use_affine_split : bool
+        Opt-in exact sequence split of the Cake GDN prefill
+        (``backend="cake_gdn"`` only; never selected automatically, and
+        ``use_cp="auto"`` is ignored). A sequence is cut into ``P``
+        chunk-aligned segments: segment 0 from the
+        initial state, every other segment from zeros and from the identity;
+        a second kernel composes the carried states and corrects the later
+        segments' outputs. The result is the same recurrence in another
+        summation order (not bitwise equal to the default route when
+        ``P > 1``), run-to-run deterministic. It pays off for a single long
+        sequence; with several sequences per call it is often slower than
+        the default route. ``P`` depends only on the
+        sequence's own length, the value-head count and the device, so in a
+        batch of several sequences a sequence's output and final state do not
+        depend on the other sequences; without ``_affine_split_count`` a
+        sequence of at most 960 tokens is never split. When the longest
+        possible sequence (the exact longest of ``cu_seqlens_cpu``, else
+        ``max_seqlen``, else ``total_seq_len``) gets ``P = 1``, the first
+        kernel runs alone, the non-CP Cake kernel's DV-split arithmetic: each
+        sequence's output is bitwise equal to the non-CP route
+        (``use_affine_split=False, use_cp=False``) on that sequence alone, and
+        on the whole call while that route resolves its DV-split variant
+        (``2 * num_seqs * num_v_heads`` at most the device's active clusters:
+        148 on SM100, 160 on SM103 and 212 on SM107). Supported: SM100, SM103 and
+        SM107, BF16 Q/K/V/output, head size 128,
+        ``num_v_heads`` in (4, 8, 16, 32) with ``num_k_heads == num_q_heads``
+        dividing it, any number of sequences up to 2**20 packed tokens and
+        131072 first-kernel tiles (``num_seqs * num_v_heads * (4 * P - 2)``
+        at the cap ``P`` of the bound, so a tighter bound from
+        ``cu_seqlens_cpu`` or ``max_seqlen`` admits more sequences), with
+        FP32 ``initial_state`` / ``output_state`` ``[num_seqs, H, V, K]``
+        (contiguous, 16-byte aligned addresses), FP32
+        ``g``/``beta`` (or the gate forms materialized to them). Checkpoints, state pools, ``prefix_lens`` and
+        ``use_cp=True`` are rejected with ``ValueError``. The call owns
+        workspaces (768 B per token and value head, plus 192 KiB per
+        sequence, value head and segment); it is CUDA-graph capturable after
+        one eager call with the same shapes and the same segment cap on the
+        capturing stream, and one capture may repeat the call. The cap comes
+        from the bound at capture (the longest of ``cu_seqlens_cpu``, else
+        ``max_seqlen``), and a replay keeps it: when the lengths change
+        between replays, omit ``cu_seqlens_cpu`` and warm up and capture with
+        a ``max_seqlen`` that covers every replay. A ``max_seqlen`` hint
+        smaller than a live sequence changes that sequence's segments (its
+        result stays exact, its bits change); with ``cu_seqlens_cpu``, a hint
+        smaller than its longest sequence raises ``ValueError``.
+    _affine_split_count : int, optional
+        Internal segment-cap override of ``use_affine_split=True``, used for
+        testing. ``None`` lets the route choose the cap; an explicit positive
+        value caps the split at that many segments (at most what one
+        sequence's tiles fill in one wave), one chunk per segment at least,
+        even at 960 tokens or fewer.
+    batch_invariant : bool
+        Keyword-only. ``True`` runs the batch-invariant class ``gdn.bf16.c64``
+        (``flashinfer.batch_invariant``) in place of the backends: every
+        output row and every state at a multiple of 64 tokens is the native
+        SM100 / SM103 / SM107 chunked prefill kernel's without context parallelism,
+        so decode row ``p`` of a request is bit for bit the row a prefill of
+        the whole sequence gives at ``p``, whatever the batch, the neighbours
+        or the slot. The state is an fp32 pool ``initial_state``
+        ``[slots, HV, 128, 128]`` addressed by ``state_indices`` (int32,
+        ``arange`` when omitted) and updated in place; a slot holds the state
+        at the sequence's last 64-token boundary and the class keeps the rows
+        since it next to the pool. A call with one token per sequence is a
+        decode step and continues the slot's open chunk. A call with more
+        tokens than sequences is a prefill from the slot's state as a chunk
+        boundary (the slot's open rows are dropped), so a chunked prefill
+        cuts at multiples of 64 tokens except for its last piece. With
+        ``prefix_lens`` (here without checkpoints: the tokens of each
+        sequence consumed before the call) a sequence at a multiple of 64
+        starts from its slot's state and any other sequence continues its
+        open chunk, which is the form for multi-token decode steps and for
+        pieces cut anywhere; a sequence whose ``prefix_lens`` is not where
+        its slot's open chunk ends gets NaN rows from a call of fewer than
+        64 tokens per sequence. A new sequence in a slot must start with a
+        prefill call or carry ``prefix_lens``. ``output_final_state=True``
+        returns the pool (the states at the last chunk boundaries, not the
+        states after the last token); ``max_seqlen`` is not used. Without
+        ``initial_state`` the call is stateless (the form of a trainer's
+        forward pass): every sequence is whole and runs from the zero state,
+        its rows are bit for bit the rows the pool calls return for it, no
+        state is kept or returned, and ``state_indices``, ``prefix_lens``,
+        ``output_state`` and ``output_final_state=True`` are refused. The
+        rows carry no ``grad_fn``, also when an input requires grad: the
+        class has no backward (``train_states`` exports the state series one takes).
+        Requires ``backend="auto"``,
+        ``use_cp="auto"``, ``gate_domain="log"`` with fp32 ``g`` and ``beta``,
+        ``use_qk_l2norm_in_kernel=True``, bf16 ``q`` / ``k`` / ``v`` of head
+        size 128, a v-head count that is a multiple of the q-head count and
+        CUDA 13;
+        checkpoints, ``output_state_indices``, the fused gate arguments and
+        a bf16 state are not in the class. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back.
+        ``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")``
+        names the class; see ``flashinfer/batch_invariant/README.md``.
+    train_states : torch.Tensor, optional
+        Keyword-only, with ``batch_invariant=True`` and no ``initial_state``:
+        an fp32 buffer ``[slots, HV, 128, 128]`` with at least
+        ``flashinfer.batch_invariant.gdn.training_state_slots(seq_lens)`` rows
+        that the stateless call fills with the state every 64-token chunk of
+        every sequence starts from (row order:
+        ``flashinfer.batch_invariant.gdn.training_state_rows(seq_lens)``; per
+        sequence the zero state, then the state after each 64 tokens short
+        of its end). It is the row layout cuDNN's GDN backward takes as
+        ``state_checkpoints`` at a 64-token cadence, and the one term a
+        backward pass cannot recompute from a chunk's own inputs without
+        re-running the state scan. A state is ``[HV, 128 (value), 128 (key)]``,
+        one per v head. The output rows are unchanged, and each
+        stored state is bit for bit the state the inference prefill of the
+        same prefix leaves in its pool. The buffer must be 16-byte aligned
+        and share no memory with a state pool (or the storage after one),
+        the output, an input or the offsets.
 
     Returns
     -------
@@ -1627,9 +2034,12 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM8x (Ampere), SM90 (Hopper), SM100/SM103 (Blackwell), SM107 or SM120. The
-      SM100 path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp``
-      supports structurally legal equal-head, GQA, and GVA shapes on
+    - Requires SM8x (Ampere), SM90 (Hopper), SM100/SM103 (Blackwell), SM107, SM110 or SM120.
+      SM110 runs the SM100 non-CP and CP CuTe-DSL kernels (not ``cake_gdn``).
+      The SM100 CuTe-DSL kernels, which SM110 also uses, require CUDA 13 and
+      ``head_size == 128``.
+      On SM100/SM103, ``gdn_cp`` supports structurally legal equal-head, GQA,
+      and GVA shapes on
       CUDA 12.8, CUDA 12.9, and CUDA 13; SM107 supports the same shapes with
       an ``nvcc`` that can emit ``compute_107a``.
       Other SM100 CP DSL routes require CUDA 13 and
@@ -1642,6 +2052,70 @@ def chunk_gated_delta_rule(
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if train_states is not None and not batch_invariant:
+        raise ValueError("train_states requires batch_invariant=True")
+    if batch_invariant:
+        from .batch_invariant.gdn.api import chunk_gated_delta_rule_batch_invariant
+
+        return chunk_gated_delta_rule_batch_invariant(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_indices=state_indices,
+            prefix_lens=prefix_lens,
+            train_states=train_states,
+            gate_domain=gate_domain,
+            backend=backend,
+            use_cp=use_cp,
+            refused=dict(
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                _cp_chunk_len=_cp_chunk_len,
+                use_gate_in_kernel=use_gate_in_kernel,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                beta_is_logit=beta_is_logit,
+                output_state_indices=output_state_indices,
+                checkpoint_state_indices=checkpoint_state_indices,
+                use_affine_split=use_affine_split,
+                _affine_split_count=_affine_split_count,
+            ),
+        )
+    if not isinstance(use_affine_split, bool):
+        raise ValueError(
+            f"use_affine_split must be a bool, got {type(use_affine_split).__name__}"
+        )
+    if _affine_split_count is not None and not use_affine_split:
+        raise ValueError("_affine_split_count requires use_affine_split=True")
+    if use_affine_split:
+        if _affine_split_count is not None and (
+            type(_affine_split_count) is not int or _affine_split_count < 1
+        ):
+            raise ValueError(
+                "_affine_split_count must be a positive int, "
+                f"got {_affine_split_count!r}"
+            )
+        if backend != "cake_gdn":
+            raise ValueError(
+                'use_affine_split=True requires backend="cake_gdn", '
+                f"got backend={backend!r}"
+            )
+        if use_cp is True or _cp_chunk_len is not None:
+            raise ValueError(
+                "use_affine_split=True cannot be combined with use_cp=True or "
+                "_cp_chunk_len"
+            )
     if backend == "sm120_cute":
         from .api_logging import warn_experimental_backend_once
         from .experimental.gdn_sm120_cute import run
@@ -1697,9 +2171,12 @@ def chunk_gated_delta_rule(
     if (
         backend == "cake_gdn"
         and use_cp is not True
+        and not use_affine_split
         and (not _CAKE_GDN_AVAILABLE or _cake_gdn is None)
     ):
         raise RuntimeError("the source-only Cake GDN backend is not installed")
+    if use_affine_split and _chunk_gated_delta_rule_gdn_affine_split_sm100 is None:
+        raise RuntimeError("the Cake GDN affine-split backend is not installed")
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
     if checkpoint_every_n_tokens < 0:
@@ -1725,6 +2202,24 @@ def chunk_gated_delta_rule(
             "state_checkpoints and checkpoint_cu_starts must be None "
             "when checkpoint_every_n_tokens == 0"
         )
+    if use_affine_split:
+        unsupported = [
+            name
+            for name, requested in (
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens > 0),
+                ("state_checkpoints", state_checkpoints is not None),
+                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                ("state_indices", state_indices is not None),
+                ("output_state_indices", output_state_indices is not None),
+                ("checkpoint_state_indices", checkpoint_state_indices is not None),
+                ("prefix_lens", prefix_lens is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise ValueError(
+                f"use_affine_split=True does not support {', '.join(unsupported)}"
+            )
     slot_args = _validate_slot_args(
         q=q,
         cu_seqlens=cu_seqlens,
@@ -1845,6 +2340,27 @@ def chunk_gated_delta_rule(
             return cudnn_chunk_gated_delta_rule(q, k, v, g, beta, scale, **options)
 
     if gate_domain != "linear" or use_gate_in_kernel or beta_is_logit:
+        if use_affine_split:
+            # Reject an unsupported call before the gate materialization
+            # launches; the route checks the materialized g/beta again.
+            _cuda_parts = torch.version.cuda.split(".") if torch.version.cuda else []
+            reason = _cake_gdn_affine_split_scope(
+                q=q,
+                k=k,
+                v=v,
+                g=None,
+                beta=None,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                output=output,
+                output_state=output_state,
+                device_capability=get_compute_capability(q.device),
+                cuda_major=int(_cuda_parts[0]) if _cuda_parts else 0,
+            )
+            if reason is not None:
+                raise ValueError(f"use_affine_split=True: {reason}")
         from .gdn_kernels.gates import materialize_gates
 
         g, beta = materialize_gates(
@@ -1951,6 +2467,26 @@ def chunk_gated_delta_rule(
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
+    if use_affine_split:
+        return _run_cake_gdn_affine_split(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=_scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=cp_max_seqlen,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            device_capability=_device_capability,
+            cuda_major=_cuda_major,
+            split_count=_affine_split_count,
+        )
     _parallel_work = num_seqs * num_sab_heads
     # SM8x routes on the exact longest sequence; max_seqlen may be an upper bound.
     sm8x_max_seqlen = None
@@ -1964,17 +2500,31 @@ def chunk_gated_delta_rule(
                 "max_seqlen is smaller than the longest sequence in cu_seqlens_cpu"
             )
     cp_heuristic_matches = (
-        _arch_major in (9, 10, 12)
-        and should_use_cp_host(
-            _parallel_work,
-            _sm_count,
-            _device_name,
-            device_capability=_device_capability,
+        (
+            _arch_major in (9, 10, 12)
+            and should_use_cp_host(
+                _parallel_work,
+                _sm_count,
+                _device_name,
+                device_capability=_device_capability,
+            )
         )
-    ) or should_use_cp_sm80_host(
-        sm8x_max_seqlen,
-        _parallel_work,
-        _device_capability,
+        or should_use_cp_sm80_host(
+            sm8x_max_seqlen,
+            _parallel_work,
+            _device_capability,
+        )
+        or should_use_cp_sm110_host(
+            _parallel_work,
+            _device_capability,
+            max_seq_len=(
+                _cake_gdn_cp_band_max_seqlen(
+                    max_seqlen, total_seq_len, num_seqs, cu_seqlens_cpu=cu_seqlens_cpu
+                )
+                if _arch_major == 11
+                else None
+            ),
+        )
     )
     cake_cp_domain_matches = bool(
         backend == "cake_gdn"
@@ -2099,9 +2649,9 @@ def chunk_gated_delta_rule(
             )
         # Reject unsupported dispatch paths rather than silently reading/writing
         # the state in packed, sequence-ordered layout.
-        if _arch_major not in (8, 9, 10, 12):
+        if _arch_major not in (8, 9, 10, 11, 12):
             raise NotImplementedError(
-                "state_indices is only supported on the SM80/SM90/SM100/SM103/SM120 "
+                "state_indices is only supported on the SM80/SM90/SM100/SM103/SM110/SM120 "
                 f"GDN prefill kernels; got compute-capability major {_arch_major}, "
                 f"use_cp={use_cp!r}."
             )
@@ -2154,8 +2704,8 @@ def chunk_gated_delta_rule(
 
     if (
         use_qk_l2norm_in_kernel
-        and _arch_major in (8, 9, 10, 12)
-        and (_arch_major != 10 or _cuda_major >= 13)
+        and _arch_major in (8, 9, 10, 11, 12)
+        and (_arch_major not in (10, 11) or _cuda_major >= 13)
         and is_cute_dsl_arch_supported(*_device_capability)
     ):
         # The chunked backends consume caller-normalized operands. Honor the
@@ -2258,6 +2808,7 @@ def chunk_gated_delta_rule(
                     8: cp_delta_rule_dsl_sm80,
                     9: cp_delta_rule_dsl_sm90,
                     10: cp_delta_rule_dsl_sm100,
+                    11: cp_delta_rule_dsl_sm100,
                     12: cp_delta_rule_dsl_sm120,
                 }[_arch_major],
             )
@@ -2270,7 +2821,7 @@ def chunk_gated_delta_rule(
                     "checkpoint_cu_starts": checkpoint_cu_starts,
                     "checkpoint_every_n_tokens": checkpoint_every_n_tokens,
                 }
-                if _arch_major in (8, 9, 10, 12)
+                if _arch_major in (8, 9, 10, 11, 12)
                 else {}
             )
             cp_delta_rule_dsl(
@@ -2349,7 +2900,7 @@ def chunk_gated_delta_rule(
         if slot_args
         else {}
     )
-    if _arch_major == 10:
+    if _arch_major in (10, 11):
         if _cuda_major < 13:
             raise NotImplementedError(
                 "Blackwell GDN prefill is only supported on CUDA 13+"
@@ -2357,7 +2908,7 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm100 is None:
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
-        # Blackwell SM100 and SM103 path (CuTe DSL kernel)
+        # Blackwell SM100, SM103 and SM110 path (CuTe DSL kernel)
         assert head_size == 128, (
             f"Blackwell GDN prefill requires head_size=128, got {head_size}"
         )

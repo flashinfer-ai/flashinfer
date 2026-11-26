@@ -20,42 +20,47 @@ from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
     [
         (
             "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
-            "kernel_src.sm100.cutedsl_megamoe",
+            "shims.sm100.cutedsl_megamoe.pre_unification",
             "nvfp4",
         ),
         (
             "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
-            "kernel_src.sm100.cutedsl_megamoe",
+            "shims.sm100.cutedsl_megamoe.sources",
             "mxfp8",
         ),
         (
+            "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+            "shims.sm100.cutedsl_megamoe.sources",
+            "nvfp4",
+        ),
+        (
             "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
-            "kernel_src.sm100.cutedsl_megamoe",
+            "shims.sm100.cutedsl_megamoe.pre_unification",
             "bf16",
         ),
         (
             "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
-            "kernel_src.sm100.cutedsl_megamoe",
+            "shims.sm100.cutedsl_megamoe.pre_unification",
             "bf16_mxfp8",
         ),
         (
             "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
-            "cute_dsl.megamoe.bf16_nvfp4",
+            "kernels.flashinfer.bf16_nvfp4",
             "bf16_nvfp4",
         ),
         (
             "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
-            "kernel_src.sm90.pull_style_cutedsl_megakernel",
+            "shims.sm90.cutedsl_megamoe",
             "hopper_fp8",
         ),
         (
             "Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig",
-            "kernel_src.sm90.pull_style_cutedsl_megakernel",
+            "shims.sm90.cutedsl_megamoe",
             "hopper_bf16",
         ),
         (
             "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
-            "kernel_src.sm90.pull_style_cutedsl_megakernel",
+            "shims.sm90.cutedsl_megamoe",
             "hopper_mxfp4",
         ),
     ],
@@ -84,12 +89,42 @@ def _check_tuning_result(monkeypatch, config_name, package, dtype):
     import flashinfer.moe_ep as moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    config = getattr(moe_ep, config_name)(intermediate_size=128, top_k=2, knobs="auto")
+    options = {}
+    if dtype == "nvfp4" and package.endswith(".pre_unification"):
+        options["kernel_name"] = "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy"
+    config = getattr(moe_ep, config_name)(
+        intermediate_size=128, top_k=2, knobs="auto", **options
+    )
     backend = create_mega_kernel(config)
     backend.bind_ep_bootstrap(
         moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
     )
     shim = importlib.import_module(f"flashinfer.moe_ep.{package}")
+    if package.endswith(".sources"):
+        from types import SimpleNamespace
+
+        from flashinfer import autotune_v2
+        from flashinfer.moe_ep.core.tuning_state import AutoTuningState
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        fleet = moe_ep.FleetParams(
+            num_experts=4, max_tokens_per_rank=2, token_hidden_size=128
+        )
+        workspace = SimpleNamespace(
+            config=backend._workspace_config(fleet),
+            _tuning_state=AutoTuningState(),
+            staged_tokens=lambda: 2,
+        )
+        winner = {"mma_tiler_mnk": [256, 128, 256]}
+        tune = mock.Mock(return_value=winner)
+        autotune = importlib.import_module(f"{shim.__name__}.autotune")
+        monkeypatch.setattr(autotune, "autotune_sm100_block_scaled_mega_moe", tune)
+        monkeypatch.setattr(shim, "sm100_block_scaled_mega_moe", mock.Mock())
+        with autotune_v2(persistent_cache=False):
+            backend.compute(workspace, (None, None), output=None)
+        assert backend.get_tuned_knobs(workspace) == winner
+        tune.assert_called_once()
+        return
     winner = {"flag_batch": 4, "mma_tiler_mnk": [256, 128, 256]}
     tune = mock.Mock(return_value=winner)
     monkeypatch.setattr(shim, f"autotune_{dtype}_mega_moe", tune)
@@ -134,7 +169,7 @@ def test_rubin_getter_selects_workspace_without_allocation(
 
     from flashinfer.moe_ep import MoEEpConfigError
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_state import (
         AutoTuningState,
     )
     from .test_mega_workspace_api import _create_workspace
