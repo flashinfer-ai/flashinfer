@@ -1128,3 +1128,75 @@ def test_mnnvl_allreduce_rmsnorm_large_magnitude(
         inject_large_magnitude=True,
         strategy=strategy,
     )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.ONESHOT,
+        trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.TWOSHOT,
+    ],
+    ids=["oneshot", "twoshot"],
+)
+@pytest.mark.parametrize("hidden_size", [2048, 8192])
+def test_mnnvl_allreduce_bf16_rmsnorm_sumsq_overflow(strategy, hidden_size):
+    if not torch.cuda.is_available():
+        pytest.skip("MNNVL allreduce requires CUDA")
+    _set_device_from_launcher_local_rank()
+    init_torch_distributed_from_mpi()
+    world_size = dist.get_world_size()
+    if world_size < 2:
+        pytest.skip("MNNVL allreduce requires at least two ranks")
+
+    rank = dist.get_rank()
+    dtype = torch.bfloat16
+    # For H=2048, 2**58 is below the FP32 sum limit, and 2**59 crosses
+    # it without overflowing a single square. The last row also overflows
+    # the individual squares. Most importantly, all results are finite.
+    exponents = [0, 58 if hidden_size == 2048 else 57, 59, 127]
+    pre_norm = torch.empty((len(exponents), hidden_size), device="cuda", dtype=dtype)
+    for i, exponent in enumerate(exponents):
+        pre_norm[i].fill_(2.0**exponent)
+    pre_norm[:, 1::2].neg_()
+    x = pre_norm.clone() if rank == 0 else torch.zeros_like(pre_norm)
+    residual = torch.zeros_like(x)
+    gamma = torch.ones(hidden_size, device=x.device, dtype=dtype)
+    out, residual_out = torch.empty_like(x), torch.empty_like(x)
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        gpus_per_node=torch.cuda.device_count(),
+        tp_size=world_size,
+    )
+    workspace_cls = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace
+    workspace = workspace_cls(
+        mapping,
+        max_num_tokens=len(exponents),
+        hidden_dim=hidden_size,
+        dtype=dtype,
+        comm_backend=TorchDistBackend(),
+        buffer_size_in_bytes=workspace_cls.get_required_buffer_size_bytes(
+            world_size, len(exponents), hidden_size, dtype, strategy
+        ),
+    )
+    try:
+        # Replay an ordinary row and overflow rows together twice to check
+        # that both paths complete the workspace protocol.
+        outputs = []
+        for _ in range(2):
+            trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_add_rmsnorm(
+                x,
+                residual,
+                gamma,
+                workspace,
+                epsilon=0.0,
+                output=out,
+                residual_out=residual_out,
+                strategy=strategy,
+            )
+            outputs.append((out.clone(), residual_out.clone()))
+        for normalized, carried in outputs:
+            torch.testing.assert_close(carried, pre_norm, atol=0, rtol=0)
+            torch.testing.assert_close(normalized, pre_norm.sign(), atol=0, rtol=0)
+    finally:
+        workspace.destroy()
