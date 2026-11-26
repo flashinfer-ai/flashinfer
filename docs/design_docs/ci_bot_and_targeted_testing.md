@@ -226,27 +226,30 @@ pipeline creation, a passing result or a matching tested commit. Unrelated
 bot reports, public `@flashinfer-bot` suggestions and copied replies do not count.
 Finding a qualifying response skips source inspection and inference entirely.
 
-Without a reply, the gate exempts documentation-only or CPU-only changes.
-Experimental status and paths do not grant an exemption from this check.
-GPU-affecting changes under `flashinfer/experimental/`, `tests/experimental/`,
-or experimental APIs require an internal bot response just like other GPU
-changes. Experimental documentation or CPU helpers qualify only when their
-changed behavior is GPU-independent. Isolation from stable CI does not establish
-that GPU validation is unnecessary.
+Without a reply, the gate exempts documentation-only, CPU-only and
+experimental-only changes. Changes confined to the experimental source/test
+trees and documentation can be classified without inference. An experimental
+opt-in in core can qualify if the diff establishes that stable GPU behavior is
+unchanged. Mixed changes that affect stable GPU behavior still require a bot
+response. Experimental tests run in their own lane. To run a specific
+experimental test via the internal bot, use
+`/bot run tests/experimental/<test-file>.py`. The default `/bot run all`
+collection skips this directory.
+
 The optional GPU-impact analysis extends `ai_test_scope.py` with the same
 inspected source/test/CI evidence and an independent impact assessment. File
 extensions and `tests/cpu/` alone cannot establish CPU-only behavior. Kernels,
 launchers, bindings, dispatch, shapes/dtypes/layouts, workspace, JIT/AOT, CUDA
 graphs, synchronization and communication generally need GPU validation. New
 PR tests are included even if they are not among the recommended targets.
-GPU impact with no corresponding selected case still requires a bot response;
-the missing/uncertain test coverage is reported rather than treated as exempt.
+Stable GPU changes still require a bot response when no test case was selected.
+The check reports the gap in test selection.
 The GPU-impact response uses compact JSON with default reasoning. If analysis
 fails validation or returns `unknown`, the gate retries once with
 `reasoning_effort=minimal`. A validated evidence-file request is reused only
 when its context is unchanged; invalid file requests are retried too. If the
 second analysis is still uncertain or invalid, the check fails and requires
-`/bot run` and an internal bot response. A known GPU-related result requires a
+`/bot run` and an internal bot response. A known stable GPU change requires a
 reply immediately, without a model retry.
 
 Use retained patches and supplied file bodies whenever they are available.
@@ -265,8 +268,9 @@ response remains sufficient even when analysis is unavailable.
 | State without a qualifying bot response | Check result |
 | --- | --- |
 | Documentation/CPU-only change | Success: bot run not required, with reason |
-| GPU change, no command | Failure: comment `/bot run` |
-| GPU change, command found | Failure: waiting for `flashinfer-bot`, with command link |
+| Experimental-only change | Success: bot run optional, with an explicit experimental test command |
+| Stable GPU change, no command | Failure: comment `/bot run` |
+| Stable GPU change, command found | Failure: waiting for `flashinfer-bot`, with command link |
 | Unable to establish GPU impact | Failure: specific missing evidence/error and next action |
 
 Commands with multiple spaces or tabs, such as `/bot  run tests/attention`, are

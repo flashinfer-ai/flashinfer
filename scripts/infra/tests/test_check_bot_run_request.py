@@ -211,6 +211,25 @@ class ImpactTests(unittest.TestCase):
             with self.assertRaises(gate.TargetSelectionError):
                 self.select(value)
 
+    def test_experimental_opt_in_outside_experimental_tree(self):
+        result = self.select(
+            {
+                **analysis("experimental_only"),
+                "reason": "Adds an explicit opt-in entry point; default dispatch is unchanged.",
+            }
+        )
+        self.assertEqual("experimental_only", result.gpu_impact["classification"])
+        verdict = gate.evaluate([], lambda: result.gpu_impact)
+        self.assertEqual(
+            ("success", "experimental_only"), (verdict.conclusion, verdict.reason)
+        )
+
+    def test_experimental_opt_in_needs_inspected_core_diff(self):
+        self.fixture.github.get_pr_files.return_value[0]["patch"] = None
+        result = self.select(analysis("experimental_only"))
+        self.assertEqual("unknown", result.gpu_impact["classification"])
+        self.assertIn("flashinfer/rope.py", result.gpu_impact["reason"])
+
     def test_selected_cpu_tests_do_not_override_gpu_impact(self):
         result = self.select(analysis(), "selected", [target()])
         self.assertEqual("gpu_required", result.gpu_impact["classification"])
@@ -401,42 +420,50 @@ class TransportTests(unittest.TestCase):
         with self.assertRaises(gate.TargetSelectionError):
             client.get_pr_files_at(self.pr, "b" * 40)
 
-    def test_experimental_gpu_changes_require_response(self):
+    def test_experimental_only_passes_and_shows_targeted_command(self):
         from unittest.mock import patch
 
-        for path in (
+        paths = (
             "flashinfer/experimental/feature/kernel.cu",
             "tests/experimental/test_new_gpu_kernel.py",
-        ):
+        )
+        for path in paths:
             with self.subTest(path=path):
                 self.client.get_pr_files.return_value = [{"filename": path}]
-                with patch.object(
-                    gate, "analyze_gpu_impact", return_value=analysis()
-                ) as analyze:
+                with patch.object(gate, "analyze_gpu_impact") as analyze:
                     result = gate.run_pr(self.client, 42)
-                self.assertEqual("failure", result.conclusion)
-                self.assertEqual("command_missing", result.reason)
-                self.assertEqual("gpu_required", result.analysis["classification"])
-                analyze.assert_called_once()
+                self.assertEqual(
+                    ("success", "experimental_only"), (result.conclusion, result.reason)
+                )
+                self.assertIn("/bot run tests/experimental/", result.summary)
+                self.assertIn("run all", result.summary)
+                self.assertNotIn("Declare the test scope", result.summary)
+                analyze.assert_not_called()
 
-    def test_experimental_cpu_changes_use_behavioral_analysis(self):
+    def test_rename_from_stable_into_experimental_requires_analysis(self):
         from unittest.mock import patch
 
         self.client.get_pr_files.return_value = [
-            {"filename": "tests/experimental/test_import_helper.py"}
+            {
+                "filename": "flashinfer/experimental/backend.py",
+                "previous_filename": "flashinfer/backend.py",
+                "status": "renamed",
+            }
         ]
         with patch.object(
-            gate, "analyze_gpu_impact", return_value=analysis("cpu_only")
+            gate, "analyze_gpu_impact", return_value=analysis()
         ) as analyze:
             result = gate.run_pr(self.client, 42)
-        self.assertEqual(("success", "cpu_only"), (result.conclusion, result.reason))
+        self.assertEqual(
+            ("failure", "command_missing"), (result.conclusion, result.reason)
+        )
         analyze.assert_called_once()
 
     def test_experimental_gpu_unknown_is_not_an_exemption(self):
         from unittest.mock import patch
 
         self.client.get_pr_files.return_value = [
-            {"filename": "flashinfer/experimental/feature/backend.py"}
+            {"filename": "flashinfer/feature/backend.py"}
         ]
         with patch.object(gate, "analyze_gpu_impact", return_value=analysis("unknown")):
             result = gate.run_pr(self.client, 42)
@@ -454,7 +481,7 @@ class TransportTests(unittest.TestCase):
             result = gate.run_pr(self.client, 42)
         self.assertEqual("command_missing", result.reason)
 
-    def test_experimental_exemption_is_not_a_valid_cached_classification(self):
+    def test_experimental_exemption_cache_checks_analysis_version(self):
         import json
 
         checks = [
@@ -473,7 +500,11 @@ class TransportTests(unittest.TestCase):
                 },
             }
         ]
-        self.assertIsNone(gate.cached_analysis(checks, self.pr, "b" * 40))
+        self.assertEqual(
+            "experimental_only",
+            gate.cached_analysis(checks, self.pr, "b" * 40)["classification"],
+        )
+        self.assertIsNone(gate.cached_analysis(checks, self.pr, "c" * 40))
 
     def test_analysis_timeout_restores_publication_budget(self):
         from unittest.mock import patch

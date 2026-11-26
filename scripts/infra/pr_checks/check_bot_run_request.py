@@ -22,6 +22,12 @@ from ai_test_scope import (
     _public_prose,
     _remaining,
 )
+from gpu_impact import (
+    EXEMPT_CLASSIFICATIONS,
+    changed_paths,
+    is_documentation,
+    is_experimental,
+)
 
 CHECK_NAME = "Bot Run Request Check"
 BOT_ID = 236526959  # Stable GitHub account ID; never rely on copied display text.
@@ -244,11 +250,18 @@ def evaluate(comments, analyze):
             "- " + item["effort"] + ": " + item.get("error", "succeeded")
             for item in impact["analysis_attempts"]
         )
-    if kind in {"cpu_only", "docs_only"}:
+    if kind in EXEMPT_CLASSIFICATIONS:
+        if kind == "experimental_only":
+            details += (
+                "\n\nExperimental-only changes. `/bot run` is optional. "
+                "To run a specific experimental test via the bot, use "
+                "`/bot run tests/experimental/<test-file>.py`. "
+                "`/bot run all` skips this directory."
+            )
         return Result("success", kind, "Bot run not required", details, impact)
     if kind == "unknown":
         title, reason = "Unable to determine GPU impact", "unknown"
-        details += "\n\nNo CPU-only exemption could be established. Comment `/bot run` and wait for the internal bot response."
+        details += "\n\nNo exemption could be established. Comment `/bot run` and wait for the internal bot response."
     elif command:
         title, reason = "Waiting for flashinfer-bot", "waiting_for_bot"
     else:
@@ -413,7 +426,7 @@ def cached_analysis(checks, pr, base_sha):
                 and stored["version"] == analysis_version()
                 and isinstance(stored.get("analysis"), dict)
                 and stored["analysis"].get("classification")
-                in {"docs_only", "cpu_only", "gpu_required"}
+                in EXEMPT_CLASSIFICATIONS | {"gpu_required"}
             ):
                 return stored["analysis"]
         except (KeyError, TypeError, ValueError):
@@ -422,17 +435,21 @@ def cached_analysis(checks, pr, base_sha):
 
 
 def docs_only(changed, expected_count):
-    def is_doc(path):
-        return isinstance(path, str) and path.endswith((".md", ".rst"))
-
     return (
         bool(changed)
         and len(changed) == expected_count
         and all(
-            is_doc(item.get("filename"))
-            and (not item.get("previous_filename") or is_doc(item["previous_filename"]))
-            for item in changed
+            is_documentation(path) for item in changed for path in changed_paths(item)
         )
+    )
+
+
+def experimental_only(changed, expected_count):
+    if not changed or len(changed) != expected_count:
+        return False
+    paths = [path for item in changed for path in changed_paths(item)]
+    return any(is_experimental(path) for path in paths) and all(
+        is_experimental(path) or is_documentation(path) for path in paths
     )
 
 
@@ -462,10 +479,19 @@ def run_pr(client, number):
                 if saved:
                     return saved
                 changed = client.get_pr_files_at(pr, base_sha)
+                kind = None
                 if docs_only(changed, pr.get("changed_files")):
+                    kind = "docs_only"
+                    reason = "Only Markdown/RST documentation changed."
+                elif experimental_only(changed, pr.get("changed_files")):
+                    kind = "experimental_only"
+                    reason = (
+                        "Changes are confined to experimental paths and documentation."
+                    )
+                if kind:
                     return {
-                        "classification": "docs_only",
-                        "reason": "Only Markdown/RST documentation changed.",
+                        "classification": kind,
+                        "reason": reason,
                         "evidence_paths": [item["filename"] for item in changed],
                         "case_gap": "",
                         "targets": [],

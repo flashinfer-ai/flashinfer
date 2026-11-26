@@ -312,8 +312,7 @@ Relative to the "Adding a New Operation" checklist in the root `AGENTS.md`:
 
 ### Isolation from stable tests and checks
 
-Stable correctness lanes and trace/API/documentation checks remain isolated
-from experimental code:
+Stable CI lanes and PR checks must never fail because of experimental code:
 
 - `tests/experimental/` is excluded from `pytest tests/` via `norecursedirs`
   in `pytest.ini`; experimental tests run only in their own lane, invoked
@@ -324,12 +323,6 @@ from experimental code:
   docstring and API/RST coverage checks.
 - Experimental APIs are not listed in `docs/api/*.rst` before graduation
   (the API/RST check would report them as stale).
-
-`Bot Run Request Check` applies the same GPU-validation request policy to stable
-and experimental changes. Experimental GPU code and GPU tests require a
-qualifying internal bot response; their directory or experimental status does
-not grant an exemption. This check only verifies request evidence and does not
-run experimental tests in stable CI lanes.
 
 ## User contract
 

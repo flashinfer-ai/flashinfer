@@ -1,5 +1,22 @@
 """Opt-in GPU-impact policy layered on the existing scope-selection evidence."""
 
+EXPERIMENTAL_ROOTS = ("flashinfer/experimental/", "tests/experimental/")
+EXEMPT_CLASSIFICATIONS = frozenset({"docs_only", "cpu_only", "experimental_only"})
+
+
+def is_experimental(path):
+    return isinstance(path, str) and path.startswith(EXPERIMENTAL_ROOTS)
+
+
+def is_documentation(path):
+    return isinstance(path, str) and path.endswith((".md", ".rst"))
+
+
+def changed_paths(item):
+    previous = item.get("previous_filename")
+    return (item.get("filename"), previous) if previous else (item.get("filename"),)
+
+
 PROMPT = """
 Also return a separate gpu_impact object. GPU impact and case selection are
 independent: GPU-affecting code with no corresponding selected tests remains
@@ -7,7 +24,7 @@ GPU-related. Never infer CPU-only from no_pytest_change, empty targets, missing
 coverage, or tests/cpu/ being among selected paths.
 
 gpu_impact fields:
-- classification: docs_only, cpu_only, gpu_required, or unknown.
+- classification: docs_only, cpu_only, experimental_only, gpu_required, or unknown.
 - reason: specific changed behavior and why GPU-free validation is/isn't enough.
 - evidence_paths: paths supporting this conclusion; budget-omitted filename evidence is allowed as described below.
 - case_gap: missing/uncertain coverage, or empty string if none identified.
@@ -22,14 +39,16 @@ Kernels, launchers, bindings, backend selection, tensor shapes/dtypes/layouts,
 workspace allocation, JIT/AOT, CUDA graphs, synchronization and communication
 generally require GPU validation. A numerical/kernel/graph test added by the
 PR is itself GPU-related even if no previous corresponding case exists.
-Experimental status is not an exemption from GPU validation. Apply the same
-behavioral criteria to flashinfer/experimental/, tests/experimental/, and
-experimental APIs as to all other changes. Experimental GPU kernels and GPU
-tests remain gpu_required; never classify them as cpu_only merely because they
-are experimental or isolated from stable CI. Experimental docs or CPU helpers
-qualify only when their changed effects are GPU-independent.
-Any GPU-related component makes a mixed PR GPU-related. Explicitly consider
-changed source even when no tests cover it or CI does not route it.
+Use experimental_only when functional effects are confined to experimental APIs,
+backends or tests and stable GPU behavior stays unchanged. Experimental changes
+can require GPU testing while qualifying for this separate bot-request exemption.
+An explicit opt-in entry point in core can qualify when the diff shows stable
+defaults and non-opt-in execution are unchanged. Review both paths of renames.
+A directory, PR label or feature name alone does not establish isolation for
+changes outside the experimental trees. Inspect and cite those code diffs before
+granting this exemption. If any change affects stable GPU execution, return
+gpu_required even if the rest is experimental. Use unknown if confinement
+cannot be established. Consider changed source even when no tests cover it.
 Use supplied patches and source_files bodies whenever they are available.
 Budget fallback applies only when a file has neither a supplied patch nor a
 source_files body and its patch_omitted flag or unavailable_evidence reason
@@ -71,12 +90,9 @@ def validate_impact(value, context, file_count_mismatch=False):
     from ai_test_scope import TargetSelectionError, _public_prose
     import os
 
-    if not isinstance(value, dict) or value.get("classification") not in {
-        "docs_only",
-        "cpu_only",
-        "gpu_required",
-        "unknown",
-    }:
+    if not isinstance(value, dict) or value.get("classification") not in (
+        EXEMPT_CLASSIFICATIONS | {"gpu_required", "unknown"}
+    ):
         raise TargetSelectionError("GPU-impact analysis has an invalid classification")
     if not isinstance(value.get("reason"), str) or not value["reason"].strip():
         raise TargetSelectionError("GPU-impact analysis is missing its reason")
@@ -126,11 +142,31 @@ def validate_impact(value, context, file_count_mismatch=False):
         impact["missing_patch_count"] = len(missing_patches)
     # Missing patch text is informational; an incomplete changed-file list can
     # still hide an entire GPU-related change and cannot establish exemption.
-    if impact["classification"] in {"docs_only", "cpu_only"} and (
+    if impact["classification"] in EXEMPT_CLASSIFICATIONS and (
         file_count_mismatch or context["omitted_evidence"]["changed_files"]
     ):
         impact.update(
             classification="unknown",
-            reason="Cannot establish a CPU-only exemption: changed-file list is incomplete.",
+            reason="Cannot establish an exemption: changed-file list is incomplete.",
         )
+    if impact["classification"] == "experimental_only":
+        unverified = [
+            item["filename"]
+            for item in context["changed_files"]
+            if not all(
+                is_experimental(path) or is_documentation(path)
+                for path in changed_paths(item)
+            )
+            and (not item.get("patch") or item["filename"] not in paths)
+        ]
+        if unverified:
+            impact.update(
+                classification="unknown",
+                reason=_public_prose(
+                    "Cannot establish experimental isolation without cited diffs outside the experimental trees: "
+                    + ", ".join(unverified),
+                    secrets,
+                    limit=1000,
+                ),
+            )
     return impact
