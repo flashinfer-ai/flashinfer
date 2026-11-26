@@ -29,8 +29,6 @@ import functools
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import canon, jit
 from .blocks import (
@@ -42,6 +40,7 @@ from .blocks import (
     st_global_v4_u32,
 )
 from .cute_ext import CuteF32
+from .cvt_fp8 import cvt_f32_to_e4m3
 from .layout import layout_name, sanitize_symbol_name
 from .nvfp4_schedule import BLOCK, LANES, SF_COL_TILE, SF_ROW_TILE, QuantConfig
 from .nvfp4_spec import (
@@ -78,36 +77,7 @@ VEC_BYTES = 16  # bytes per input vector; elements per vector = 16 / element byt
 
 
 # ----------------------------------------------------------------------------- declared conversions
-@dsl_user_op
-def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None):
-    """``cvt.rn.satfinite.e4m3x2.f32`` of one value. Returns ``(byte, value)``: the e4m3 byte (in a
-    ``Uint32``) and the byte's value widened back to f32 exactly (``cvt.rn.f16x2.e4m3x2`` then
-    ``cvt.f32.f16``: every e4m3 value is an f16 value is an f32 value)."""
-    res = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.f32()]),
-        [Float32(a).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .b16 pair, lo, hi;
-            .reg .b32 h2;
-            .reg .f32 zero;
-            mov.f32 zero, 0f00000000;
-            cvt.rn.satfinite.e4m3x2.f32 pair, zero, $2;
-            cvt.rn.f16x2.e4m3x2 h2, pair;
-            mov.b32 {lo, hi}, h2;
-            cvt.f32.f16 $1, lo;
-            cvt.u32.u16 $0, pair;
-        }
-        """,
-        "=r,=f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return (
-        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
-        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
-    )
+# the block-scale conversion lives in ``cvt_fp8.py`` (shared with the MoE epilogues that quantize the intermediate in place)
 
 
 # ----------------------------------------------------------------------------- plumbing
