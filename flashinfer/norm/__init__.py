@@ -544,7 +544,7 @@ def supports_gated_residual_rmsnorm(
     enable_pdl: bool = True,
     backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> bool:
-    """Return whether tensors satisfy the SM100/SM103/SM107 fused-kernel contract
+    """Return whether tensors satisfy the SM100/SM103/SM107/SM120 fused-kernel contract
     and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
     the call on their device.  ``"auto"`` answers for the call's row count as
     well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
@@ -626,7 +626,7 @@ def supports_gated_residual_next_rmsnorm(
     post_weight: Optional[torch.Tensor] = None,
     backend: Literal["auto", "cake", "cute"] = "auto",
 ) -> bool:
-    """Return whether inputs satisfy the SM100/SM103/SM107 two-norm kernel contract
+    """Return whether inputs satisfy the SM100/SM103/SM107/SM120 two-norm kernel contract
     and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
     the call on their device.  ``"auto"`` answers for the call's row count as
     well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
@@ -708,7 +708,7 @@ def gated_residual_next_rmsnorm(
     When ``post_weight`` is supplied, ``branch`` is multiplied by
     ``post_weight + post_gain_center`` in FP32 before its RMSNorm.
     The optimized implementation supports contiguous hidden-size-8192 tensors
-    on SM100, SM103, and SM107 GPUs.
+    on SM100, SM103, SM107, and SM120 GPUs.
 
     Parameters
     ----------
@@ -935,7 +935,7 @@ def gated_residual_rmsnorm(
     before its RMS reduction. When it is ``None``, the branch is unweighted.
 
     This optimized implementation currently supports contiguous BF16 tensors
-    with hidden size 8192 on SM100, SM103, and SM107 GPUs.
+    with hidden size 8192 on SM100, SM103, SM107, and SM120 GPUs.
 
     Parameters
     ----------
@@ -1114,7 +1114,7 @@ def rmsnorm_sigmoid_gate(
 
     The last dimension is normalized independently, multiplied by
     ``sigmoid(gate)``, and written back to ``input``. The optimized kernel
-    supports contiguous BF16 head rows of width 64 on SM100, SM103, and SM107 GPUs.
+    supports contiguous BF16 head rows of width 64 on SM100, SM103, SM107, and SM120 GPUs.
 
     Parameters
     ----------
