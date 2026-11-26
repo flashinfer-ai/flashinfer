@@ -1026,6 +1026,58 @@ apps/ @apps
             ["sampling", "org/team", "global"],
         )
 
+    def test_owner_hints_require_non_author_human_maintain_admin(self):
+        from pr_checks.api_gate import Context, Gate
+
+        class API:
+            def request(self, method, path):
+                name = path.split("/")[-2]
+                role, kind = {
+                    "admin": ("admin", "User"),
+                    "maintainer": ("maintain", "User"),
+                    "writer": ("write", "User"),
+                    "bot": ("admin", "Bot"),
+                    "unknown": (None, "User"),
+                }[name]
+                # GitHub reports maintain as permission=write; role_name matters.
+                return {
+                    "role_name": role,
+                    "permission": "write",
+                    "user": {"login": name, "type": kind},
+                }
+
+        gate = Gate(API(), Context("org/repo", "42", {}))
+        rules = "* @writer @admin @maintainer @bot @unknown @AUTHOR @org/team"
+        self.assertEqual(
+            gate.maintainer_hints(
+                {"user": {"login": "author"}}, rules, ["flashinfer/api.py"]
+            ),
+            ["admin", "maintainer"],
+        )
+
+    def test_owner_lookup_failure_omits_unverified_owner(self):
+        from pr_checks.api_gate import Context, Gate
+        from pr_checks.github_api import GitHubError
+
+        class API:
+            def request(self, method, path):
+                if "/unverified/" in path:
+                    raise GitHubError(403, "Permission lookup denied")
+                return {"role_name": "maintain", "user": {"type": "User"}}
+
+        warnings = []
+        gate = Gate(API(), Context("org/repo", "42", {}), warning=warnings.append)
+        self.assertEqual(
+            gate.maintainer_hints(
+                {"user": {"login": "author"}},
+                "* @unverified @verified",
+                ["flashinfer/api.py"],
+            ),
+            ["verified"],
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("unverified", warnings[0])
+
     def test_owner_hints_do_not_claim_unrelated_permissions(self):
         from pr_checks.api_report import render_summary
 

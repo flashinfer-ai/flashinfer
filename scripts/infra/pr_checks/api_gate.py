@@ -233,6 +233,27 @@ class Gate:
             user["type"],
         )
 
+    def maintainer_hints(self, pr: dict, source: str, paths: list[str]) -> list[str]:
+        result = []
+        author = pr["user"]["login"]
+        for owner in owners_for_paths(source, paths):
+            if "/" in owner or owner.lower() == author.lower():
+                continue
+            try:
+                permission = self.api.request(
+                    "GET", f"{self.root}/collaborators/{owner}/permission"
+                )
+                if can_approve(
+                    permission.get("role_name"),
+                    owner,
+                    author,
+                    (permission.get("user") or {}).get("type"),
+                ):
+                    result.append(owner)
+            except Exception as error:
+                self.warning(f"Omitting unverified code owner @{owner}: {error}")
+        return result
+
     def exception_comment(self, pr: dict, item: dict) -> dict | None:
         if (
             item.get("context") != self.exception_context(pr)
@@ -397,7 +418,7 @@ class Gate:
                     for f in report["findings"]
                     if f["classification"] == "BREAKING"
                 ]
-                maintainers = owners_for_paths(owners.stdout, paths)
+                maintainers = self.maintainer_hints(pr, owners.stdout, paths)
         except Exception as error:
             self.warning(f"Code owners could not be resolved: {error}")
         try:

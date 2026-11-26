@@ -65,7 +65,12 @@ All report text is English. A blocked report ends with:
 > A non-author maintainer/admin can comment `@flashinfer-bot API BREAK expected, reason: ...` to unblock all API BREAKs for merging this head.
 
 At most three matching code owners are shown, with a link to the target revision's
-CODEOWNERS file for the rest. They are ownership hints, not approval permissions.
+CODEOWNERS file for the rest. Each suggested owner must be a non-author human
+whose current repository `role_name` is `maintain` or `admin`. Owners with only
+`write` access, teams, bots, and owners whose permissions cannot be verified are
+omitted. GitHub's coarse `permission` field is not used: `maintain` also reports
+`permission: write`. The hint list does not grant approval permission; commands
+recheck the actor's live role independently.
 Signature diffs fold unchanged parameters and annotations. Inline explanations
 combine argument shifts caused by one moved parameter; full signatures and
 per-parameter diagnostics remain in the report artifact.
