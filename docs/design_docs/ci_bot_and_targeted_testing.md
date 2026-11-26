@@ -224,7 +224,8 @@ rejections and trigger errors all qualify. A qualifying historical response
 continues to satisfy this policy after new commits. The gate does not require
 pipeline creation, a passing result or a matching tested commit. Unrelated
 bot reports, public `@flashinfer-bot` suggestions and copied replies do not count.
-Finding a qualifying response skips source inspection and inference entirely.
+Finding a qualifying response skips base SHA lookup, source inspection and
+inference. The gate still verifies that the PR head and target branch are current.
 
 Without a reply, the gate exempts documentation-only, CPU-only and
 experimental-only changes. Changes confined to the experimental source/test
@@ -282,11 +283,14 @@ Quoted examples, fenced code and prose mentions do not issue commands.
 Changed files are read from an immutable comparison of the captured base and
 head commit SHAs, and that same list/base is used throughout source analysis.
 A partial comparison (including GitHub's 300-file compare limit) cannot grant
-an exemption. Before publishing success, the gate rechecks the live PR and
-base. If the snapshot changed, it completes the captured Check as stale and
-re-evaluates once. A second snapshot change finishes with a failure and rerun
-instruction rather than leaving the Check in progress. Post-start evidence
-read failures also complete the captured Check with a failure reason.
+an exemption. The gate rechecks the live PR before completing the Check.
+For conclusions that depend on source, it also rechecks the base after
+preparing the Check payload, immediately before writing it. A detected
+snapshot change completes the captured Check as stale and re-evaluates once.
+A second snapshot change finishes with a failure and rerun instruction.
+Post-start evidence read failures complete the Check with a failure reason.
+The ref read and Check write are separate GitHub API calls, so a base advance
+between them can still occur.
 
 The trusted default-branch workflow handles PR open/synchronize/reopen/ready and
 base-edit events, plus PR comment creation/edit/deletion. It publishes a stable

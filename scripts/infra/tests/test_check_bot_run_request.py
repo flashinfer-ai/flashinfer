@@ -277,12 +277,33 @@ class TransportTests(unittest.TestCase):
         ).deepcopy(self.pr)
         self.client.get_current_base_sha.return_value = "b" * 40
         self.client.checks.return_value = []
+        self.client.begin.return_value = 23
         self.client.comments.return_value = []
         self.client.get_pr_files.return_value = [
             {"filename": "README.md", "status": "modified"}
         ]
         self.client.get_pr_files_at.side_effect = (
             lambda pr, base: self.client.get_pr_files(pr["number"])
+        )
+
+        self.publisher = gate.Client("upstream/flashinfer")
+        self.publisher.get_current_base_sha = self.client.get_current_base_sha
+        self.publisher.request = Mock(return_value={"id": 23})
+        self.client.publish.side_effect = self.publisher.publish
+
+    def test_publication_base_read_error_completes_failed_check(self):
+        self.client.get_current_base_sha.side_effect = [
+            "b" * 40,
+            gate.TargetSelectionError("Final base API failed"),
+        ]
+        result = gate.run_pr(self.client, 42)
+        self.assertEqual(
+            ("failure", "evidence_error"), (result.conclusion, result.reason)
+        )
+        self.assertIn("Final base API failed", result.summary)
+        self.publisher.request.assert_called_once()
+        self.assertEqual(
+            "failure", self.publisher.request.call_args.args[2]["conclusion"]
         )
 
     def test_docs_fast_path_and_no_conversation_writes(self):
@@ -301,6 +322,39 @@ class TransportTests(unittest.TestCase):
         result = gate.run_pr(self.client, 42)
         self.assertEqual("bot_response_found", result.reason)
         self.client.get_pr_files.assert_not_called()
+
+    def test_historical_reply_passes_when_base_lookup_is_unavailable(self):
+        self.client.comments.return_value = [comment(ADVICE, True)]
+        self.client.get_current_base_sha.side_effect = gate.TargetSelectionError(
+            "Base API unavailable"
+        )
+        result = gate.run_pr(self.client, 42)
+        self.assertEqual("bot_response_found", result.reason)
+        self.client.get_current_base_sha.assert_not_called()
+        self.assertIsNone(self.client.publish.call_args.args[3])
+
+    def test_publication_rechecks_base_after_preparing_payload(self):
+        from unittest.mock import patch
+
+        client = gate.Client("upstream/flashinfer")
+        current_base = "b" * 40
+        client.get_current_base_sha = Mock(side_effect=lambda pr: current_base)
+        client.request = Mock()
+        result = gate.Result(
+            "success", "docs_only", "Bot run not required", "Docs only"
+        )
+
+        def version():
+            nonlocal current_base
+            current_base = "c" * 40
+            return "version"
+
+        with (
+            patch.object(gate, "analysis_version", side_effect=version),
+            self.assertRaises(gate.PublicationBaseError),
+        ):
+            client.publish(self.pr, result, check_id=23, base_sha="b" * 40)
+        client.request.assert_not_called()
 
     def test_read_failure_updates_check_as_failure_not_command_missing(self):
         self.client.comments.side_effect = gate.TargetSelectionError(
@@ -322,6 +376,8 @@ class TransportTests(unittest.TestCase):
         self.assertEqual("c" * 40, last.args[0]["head"]["sha"])
 
     def test_base_advance_retries_current_base_and_completes(self):
+        import json
+
         self.client.get_current_base_sha.side_effect = [
             "b" * 40,
             "c" * 40,
@@ -330,9 +386,10 @@ class TransportTests(unittest.TestCase):
         ]
         result = gate.run_pr(self.client, 42)
         self.assertEqual("success", result.conclusion)
-        first, last = self.client.publish.call_args_list
-        self.assertEqual("failure", first.args[1].conclusion)
-        self.assertEqual("c" * 40, last.args[3])
+        first, last = (call.args[2] for call in self.publisher.request.call_args_list)
+        self.assertEqual("failure", first["conclusion"])
+        self.assertEqual("success", last["conclusion"])
+        self.assertEqual("c" * 40, json.loads(last["output"]["text"])["base_sha"])
 
     def test_repeated_base_advance_finishes_failed_instead_of_hanging(self):
         self.client.get_current_base_sha.side_effect = [
@@ -345,7 +402,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual("failure", result.conclusion)
         self.assertEqual("stale_evaluation", result.reason)
         self.assertEqual(2, self.client.begin.call_count)
-        self.assertEqual(2, self.client.publish.call_count)
+        self.assertEqual(2, self.publisher.request.call_count)
 
     def test_base_read_failure_after_begin_completes_failure(self):
         self.client.get_current_base_sha.side_effect = gate.TargetSelectionError(
@@ -440,6 +497,24 @@ class TransportTests(unittest.TestCase):
                 self.assertNotIn("Declare the test scope", result.summary)
                 analyze.assert_not_called()
 
+    def test_experimental_with_documentation_also_passes_without_inference(self):
+        from unittest.mock import patch
+
+        self.pr["changed_files"] = 2
+        self.client.get_pr_files.return_value = [
+            {"filename": "README.md", "status": "modified"},
+            {
+                "filename": "flashinfer/experimental/feature/kernel.cu",
+                "status": "added",
+            },
+        ]
+        with patch.object(gate, "analyze_gpu_impact") as analyze:
+            result = gate.run_pr(self.client, 42)
+        self.assertEqual(
+            ("success", "experimental_only"), (result.conclusion, result.reason)
+        )
+        analyze.assert_not_called()
+
     def test_rename_from_stable_into_experimental_requires_analysis(self):
         from unittest.mock import patch
 
@@ -531,6 +606,7 @@ class TransportTests(unittest.TestCase):
     def test_check_publication_targets_pr_head_and_updates_existing(self):
         client = gate.Client("upstream/flashinfer")
         client.request = Mock(return_value={"id": 23})
+        client.get_current_base_sha = Mock(return_value="b" * 40)
         result = gate.Result(
             "failure",
             "waiting_for_bot",
