@@ -166,6 +166,12 @@ publication. Event delivery/queue delay and the final API read/write window
 remain; this checker is not an atomic per-PR merge authorization service.
 The required check name remains **API compatibility**.
 
+The [same-head validation](pr_api_same_head_validation.md) records live fork
+experiments with ordinary Actions checks and statuses on test-merge commits.
+Neither demonstrated independent merge authorization for two PRs sharing a
+head. An organization required-workflow policy remains an unverified candidate;
+it is not implemented by this gate. The shared-head race above remains open.
+
 ## Validation
 
 `scripts/infra/tests/test_check_pr_api_diff.py` is retained for local validation. PR workflows run
