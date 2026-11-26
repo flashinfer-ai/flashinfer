@@ -731,8 +731,8 @@ def _run_mxfp8_mxfp4(
     the E8M0 scales (flat) where the SM100 kernel reads them: ``b_scale`` group ``i``'s 128x4 at
     ``i pad(N, 128)`` rows, ``a_scale`` group ``i``'s rows from ``(m_indptr[i] + 127 i) // 128 *
     128``. ``gemm_fp4`` (MXFP4) reads ``a`` restored to BF16 exactly in its blocks' row order
-    times 2^119 like ``mm_fp4``'s MXFP4 activation; E5M2, past BF16 there, times 2^112: alpha
-    2^7."""
+    times 2^119 like ``mm_fp4``'s MXFP4 activation; E5M2, past BF16 there, times 2^112, its 2^7
+    added back to each k32 group's scale exponent (``act_shift``)."""
     m, k = (int(x) for x in a.shape)
     groups, n = int(b.shape[0]), int(b.shape[1])
     max_blocks = m // r + groups  # each group's last block partial
@@ -752,9 +752,8 @@ def _run_mxfp8_mxfp4(
     gemm = _out_f16_module() if out.dtype == torch.float16 else module
     gemm.gemm_fp4(
         _aligned(b, 16), _aligned(b_scale, 16),
-        torch.full((groups,), 128.0 if e5 else 1.0, device=a.device), act, meta, rowmap,
-        target, r, n, k,
-        max_blocks, False, _aligned(a_scale, 4), False, (sf_off - ip[:-1]).int(),
+        torch.ones(groups, device=a.device), act, meta, rowmap, target, r, n, k,
+        max_blocks, False, _aligned(a_scale, 4), False, (sf_off - ip[:-1]).int(), 7 if e5 else 0,
     )  # fmt: skip
     if not direct:
         out.copy_(target)

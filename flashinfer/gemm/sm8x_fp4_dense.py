@@ -532,7 +532,7 @@ def _run_fp4(
     gemm = _out_f16_module() if out.dtype == torch.float16 else module
     gemm.gemm_fp4(
         w, sf, alpha, act, meta, rowmap, target, r, n, k, max_blocks, alpha.numel() > 1,
-        asf if mx else None, shuffled, None,
+        asf if mx else None, shuffled, None, 0,
     )  # fmt: skip
     if not direct:
         out.copy_(target[:, :n])

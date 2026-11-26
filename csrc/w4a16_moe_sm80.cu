@@ -248,11 +248,11 @@ __device__ __forceinline__ uint32_t nib2(uint32_t w, uint32_t w4) {
 }
 // OW MX: acc + RN(d 2^(ea + eb - BIAS)) for the E8M0 bytes ea, eb (255: NaN); two power-of-two
 // steps, the first exact (d 2^LO keeps d's last bit, d 2^HI overflows only past the result's
-// range), so a subnormal or overflowing product is rounded once. MXFP4: <247, -109, 117>; MXFP8
-// (F8): E4M3 weights <246, -100, 112>, E5M2 <254, -94, 90>.
+// range), so a subnormal or overflowing product is rounded once. MXFP4: <247, -109, 117> (sh:
+// GemmParamsMx's); MXFP8 (F8): E4M3 weights <246, -100, 112>, E5M2 <254, -94, 90>.
 template <int BIAS, int LO, int HI>
-__device__ __forceinline__ float mx_slow(float acc, float d, uint32_t ea, uint32_t eb) {
-  const int e = static_cast<int>(ea + eb) - BIAS;
+__device__ __forceinline__ float mx_slow(float acc, float d, uint32_t ea, uint32_t eb, int sh = 0) {
+  const int e = static_cast<int>(ea + eb) + sh - BIAS;
   const int e1 = min(max(e, LO), HI), e2 = min(max(e - e1, -149), 127);
   const float s1 = __uint_as_float((e1 + 127) << 23);
   const float s2 = __uint_as_float(e2 >= -126 ? (e2 + 127) << 23 : 1u << (e2 + 149));
@@ -363,9 +363,12 @@ struct GemmParamsOw : GemmParams {
 // MX: GemmParamsOw and asf, the activation's E8M0 scales [pad(M, 128)][4 nka], 128x4 too. Its own
 // type, so the NVFP4 kernels keep their parameters. asf_off (groups, block_expert e the group):
 // row t's scales at row t + asf_off[e], the weights' at e [pad(N, 128)][4 nka]; null: one group.
+// sh: the activation restored at 2^(119 - sh) (an E5M2 one at 2^112: 7), its exponent added back
+// per k32 group.
 struct GemmParamsMx : GemmParamsOw {
   const uint8_t* asf;
   const int* asf_off;
+  int sh;
 };
 // F8 (the dense mm_fp8 / bmm_fp8): w the FP8 weights, byte (b, n, k) at b batch_stride +
 // n row_stride + (k / 128) kstep_stride + k % 128, b the block's expert (its batch); act prep's
@@ -1448,11 +1451,12 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
   auto step = [&](auto ngc, uint32_t sb, bool hf) {
     constexpr int NG = decltype(ngc)::value;
     if constexpr (OW && MX && F8 == 0) {
-      // Each k32 group j: d = the exact MMA sum of (e2m1 2^-126) x (e2m1 2^119), then
-      // acc += RN(d 2^(ea + eb - 247)). When every scale byte the warp reads keeps the
-      // power of two normal (weights 96..159, activations 64..191) that is one FFMA.
+      // Each k32 group j: d = the exact MMA sum of (e2m1 2^-126) x (the activation 2^(119 -
+      // sh)), then acc += RN(d 2^(ea + eb + sh - 247)). When every scale byte the warp reads
+      // keeps the power of two normal (weights 96..159, activations 64..191) that is one FFMA.
       // mx_rows: the tile's real weight rows; sa_mx: the activation scale words of rows
       // wt TW + 2 tq (+ 1, + gi 8)
+      const uint32_t sh = p.sh;
       const int mx_rows = p.N - (blockIdx.x % chunks) * kTileN;
       const uint32_t sa_mx = sbase + kWBytes + 512 + (wt * TW + 2 * tq) * 4;
       uint32_t wq[SC][8], sq[SC][2], aq2[NG][2];
@@ -1517,9 +1521,9 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
                 const uint32_t eb = (aq2[gi][q & 1] >> 8 * j) & 255u;
                 float& c = acc[s][gi][q];
                 if constexpr (decltype(fast_c)::value)
-                  c = __fmaf_rn(d[q], __uint_as_float((ea + eb - 120u) << 23), c);
+                  c = __fmaf_rn(d[q], __uint_as_float((ea + eb + sh - 120u) << 23), c);
                 else
-                  c = mx_slow<247, -109, 117>(c, d[q], ea, eb);
+                  c = mx_slow<247, -109, 117>(c, d[q], ea, eb, p.sh);
               }
             }
           }
@@ -3340,12 +3344,14 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
                              TensorView meta, TensorView rowmap, TensorView out, int64_t row_tile,
                              int64_t N, int64_t K, int64_t max_blocks, bool alpha_rows,
                              tvm::ffi::Optional<TensorView> act_sf, bool shuffled,
-                             tvm::ffi::Optional<TensorView> act_sf_off) {
+                             tvm::ffi::Optional<TensorView> act_sf_off, int64_t act_shift) {
   // act_sf: MXFP4 (E8M0 scales of both operands, the activation's 128x4 [pad(M, 128)][4 nka]).
-  // act_sf_off (MX, int32 [groups]): w, sf and act_sf as GemmParamsMx's groups, act block-ordered
+  // act_sf_off (MX, int32 [groups]): w, sf and act_sf as GemmParamsMx's groups, act block-ordered.
+  // act_shift: MXFP4's sh.
   const bool mx = act_sf.has_value();
   const int64_t groups = act_sf_off.has_value() ? act_sf_off.value().numel() : 1;
   TVM_FFI_ICHECK(mx || groups == 1) << "act_sf_off: MXFP4";
+  TVM_FFI_ICHECK(act_shift == 0 || (mx && act_shift == 7)) << "act_shift: 0, or MXFP4's 7";
   TVM_FFI_ICHECK(!shuffled || (!mx && N % 32 == 0)) << "shuffled weights: NVFP4, N % 32 == 0";
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(sf, dl_uint8);
@@ -3398,6 +3404,7 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   p.asf = mx ? static_cast<const uint8_t*>(act_sf.value().data_ptr()) : nullptr;
   p.asf_off =
       act_sf_off.has_value() ? static_cast<const int*>(act_sf_off.value().data_ptr()) : nullptr;
+  p.sh = static_cast<int>(act_shift);
   const int grid = static_cast<int>(max_blocks * (n_pad / kTileN));
   const int rt = static_cast<int>(row_tile);
   auto tile = [&](auto kt) {
