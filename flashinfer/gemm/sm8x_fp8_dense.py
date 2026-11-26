@@ -29,7 +29,7 @@ def _weight(b: torch.Tensor, k: int, n: int, shuffled: bool):
     K)`` order."""
     if shuffled:
         if not b.is_contiguous() or b.data_ptr() % 16:
-            b = b.contiguous()
+            b = b.clone(memory_format=torch.contiguous_format)
         return b.view(torch.uint8).reshape(-1), 128, n * 128, 0
     batches = int(b.shape[0])
     s0, s1, s2 = b.stride()
@@ -37,7 +37,7 @@ def _weight(b: torch.Tensor, k: int, n: int, shuffled: bool):
     if s1 == 1 and s2 % 16 == 0 and s0 % 16 == 0 and b.data_ptr() % 16 == 0:
         span = (batches - 1) * s0 + (n - 1) * s2 + k
         return b.view(torch.uint8).as_strided((span,), (1,)), s2, 128, s0
-    w = b.transpose(1, 2).contiguous()
+    w = b.transpose(1, 2).clone(memory_format=torch.contiguous_format)
     return w.view(torch.uint8).reshape(-1), k, 128, n * k
 
 
@@ -69,7 +69,7 @@ def _run_fp8(
         return
     x = a.view(torch.uint8)
     if not x.is_contiguous() or x.data_ptr() % 4:
-        x = x.contiguous()
+        x = x.clone(memory_format=torch.contiguous_format)
     w, rs, ks, bs = _weight(b, k, n, shuffled)
     rows, max_blocks = batches * m, batches * -(-m // r)
     ints = (1 + 2 * max_blocks, max_blocks * r)
@@ -96,15 +96,21 @@ def _run_fp8(
         out.copy_(target[:, :n].view(batches, m, n))
 
 
-def _check(names: Sequence[str], a: torch.Tensor, b: torch.Tensor) -> bool:
-    """The SM100+ runners' dtype and layout contract for ``names``; True: ``b`` is the trtllm
-    backend's prepared weight."""
+def _check(
+    names: Sequence[str], a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, *scales
+) -> bool:
+    """The SM100+ runners' dtype and layout contract for ``names``, with ``a`` ``(batch, M, K)``,
+    ``b`` ``(batch, K, N)`` (or the trtllm weight) and ``out`` ``(batch, M, N)`` on one device;
+    True: ``b`` is the trtllm backend's prepared weight."""
+    if any(t.device != a.device for t in (b, out, *scales)):
+        raise ValueError("FP8 GEMM operands, scales and output must be on one device")
     if a.dtype not in _FMT or b.dtype not in _FMT:
         raise ValueError(f"FP8 GEMM requires FP8 operands, got {a.dtype} and {b.dtype}")
     k = int(a.shape[2])
     if k % 16:
         raise ValueError(f"FP8 GEMM requires K % 16 == 0, got K={k}")
-    if "trtllm_low_latency" in names:
+    shuffled = "trtllm_low_latency" in names
+    if shuffled:
         if a.dtype != _E4M3 or b.dtype != _E4M3:
             raise ValueError("trtllm_low_latency mm_fp8 requires e4m3 operands")
         if b.dim() != 3 or int(b.shape[0]) * 128 != k or int(b.shape[2]) != 128:
@@ -114,17 +120,25 @@ def _check(names: Sequence[str], a: torch.Tensor, b: torch.Tensor) -> bool:
             )
         if int(b.shape[1]) % 32:
             raise ValueError("trtllm_low_latency mm_fp8 requires N % 32 == 0")
-        return True
     # cuBLAS rejects e5m2 x e5m2, cuDNN and cutedsl_low_latency take it; an empty list is an
     # explicit cutlass / cute-dsl call whose requirement already admitted the dtypes
-    if (
+    elif (
         a.dtype == _E5M2
         and b.dtype == _E5M2
         and names
         and not {"cudnn", "cutedsl_low_latency"} & set(names)
     ):
         raise ValueError("Unsupported combination: both A and B are e5m2")
-    return False
+    batches, m = int(a.shape[0]), int(a.shape[1])
+    if (
+        b.dim() != 3
+        or (not shuffled and tuple(b.shape[:2]) != (batches, k))
+        or tuple(out.shape) != (batches, m, int(b.shape[1 if shuffled else 2]))
+    ):
+        raise ValueError(
+            f"FP8 GEMM shapes: a {tuple(a.shape)}, b {tuple(b.shape)}, out {tuple(out.shape)}"
+        )
+    return shuffled
 
 
 class Sm8xFp8Runner(TunableRunner):
@@ -142,7 +156,7 @@ class Sm8xFp8Runner(TunableRunner):
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         a, b, scale_a, scale_b, out = inputs[:5]
-        shuffled = _check(self.names, a, b)
+        shuffled = _check(self.names, a, b, out, scale_a, scale_b)
         _run_fp8(
             a,
             b,
