@@ -1164,7 +1164,7 @@ _PDL_PREDECESSOR_CUDA = r"""
 #include <cstdint>
 #include <vector>
 
-constexpr int kMaxRegions = 4;
+constexpr int kMaxRegions = 8;
 
 struct Regions {
   uint32_t* dst[kMaxRegions];
@@ -1264,11 +1264,12 @@ def _byte_span(tensor):
     )
 
 
-def _check_pdl_window():
-    """A PDL dependent of the predecessor runs before it restores anything.
+def _pdl_window_is_open():
+    """Whether a PDL dependent of the predecessor runs before it restores anything.
 
-    Otherwise the attention launches below could not start before their inputs
-    are written, and their bitwise checks would pass however the kernel waits.
+    Without that window (``CUDA_LAUNCH_BLOCKING=1``, or a driver that serializes
+    PDL launches), no launch below can read its inputs before they are written,
+    so the test has nothing to check.
     """
     predecessor = _pdl_predecessor()
     poisoned = torch.full((16,), 0xFF, device="cuda", dtype=torch.uint8)
@@ -1281,43 +1282,73 @@ def _check_pdl_window():
     predecessor.restore_late([poisoned], [torch.zeros_like(poisoned)], _PDL_SPIN_CYCLES)
     predecessor.probe_without_wait(poisoned, seen)
     torch.cuda.synchronize()
-    assert seen.item() == -1, "the PDL dependent waited for its predecessor"
     assert torch.count_nonzero(poisoned) == 0
+    return seen.item() == -1
 
 
-def _late_inputs(compiled):
+def _late_inputs(compiled, launches=None):
     """Precede each launch of a compiled sparse MLA callable with a PDL predecessor
-    that poisons Q and the sparse index tables (NaN and -1 bytes) and restores them
-    only after releasing its dependents, so any read issued before the attention
-    grid's dependency wait changes the output."""
+    that poisons Q and the sparse index tables (NaN and -1 bytes), zeroes the sparse
+    lengths, and restores them only after releasing its dependents, so any read
+    issued before the attention grid's dependency wait changes the output.
+    ``launches`` collects each launch's arguments."""
     predecessor = _pdl_predecessor()
 
     def launch(*args):
+        if launches is not None:
+            launches.append(args)
         # Positional ABI of _launch_mla_decode: Q latent first, sparse inputs
-        # (indices, extra indices, lengths, ...) twelfth.
-        tensors = (args[0], *args[11][:2])
-        regions = [
-            _byte_span(t) for t in tensors if isinstance(t, torch.Tensor) and t.numel()
+        # (indices, extra indices, lengths, extra lengths, ...) twelfth.
+        sparse = args[11]
+        poisons = (
+            (args[0], 0xFF),
+            (sparse[0], 0xFF),
+            (sparse[1], 0xFF),
+            (sparse[2], 0),
+            (sparse[3], 0),
+        )
+        late = [
+            (_byte_span(t), value)
+            for t, value in poisons
+            if isinstance(t, torch.Tensor) and t.numel()
         ]
-        saved = [region.clone() for region in regions]
-        for region in regions:
-            region.fill_(0xFF)
-        predecessor.restore_late(regions, saved, _PDL_SPIN_CYCLES)
+        saved = [region.clone() for region, _ in late]
+        for region, value in late:
+            region.fill_(value)
+        predecessor.restore_late(
+            [region for region, _ in late], saved, _PDL_SPIN_CYCLES
+        )
         return compiled(*args)
 
     return launch
 
 
-def _first_outputs(run_test, check_config, profile=None, pdl=False):
-    """Run ``run_test`` (an existing oracle and replay test) with its compiled configs
-    checked, on ``profile`` instead of the policy's schedule when one is given.
+def _same_bytes(a, b):
+    """Whether two tensors hold the same bytes; unlike ``torch.equal``, ``-0.0``
+    differs from ``+0.0`` and identical NaNs match."""
+    return (
+        a.dtype == b.dtype
+        and a.shape == b.shape
+        and torch.equal(
+            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+        )
+    )
 
-    Returns the output and LSE of the test's first launch, which is eager and whose
-    inputs depend only on the test's arguments, for bitwise comparison between
-    launches. ``pdl`` compiles the attention kernel with ``use_pdl`` and
-    ``pdl_wait_after_prologue``, checks that its trace moved the wait after the
-    prologue, and precedes each launch with a predecessor that writes Q and the
-    sparse indices only after the attention grid may start (_late_inputs).
+
+def _pdl_outputs(run_test, check_config, profile, wait_after_prologue):
+    """Run ``run_test`` (an existing oracle and replay test) with each attention
+    kernel compiled with ``use_pdl`` and ``wait_after_prologue`` as its
+    ``pdl_wait_after_prologue``, each launch preceded by the late predecessor
+    (_late_inputs), its compiled configs checked, and ``profile`` instead of the
+    policy's schedule when one is given.
+
+    The kernel is traced rather than loaded from the compile caches, and its own
+    predicate (ThroughputLatencyMlaDecodeTs.waits_after_prologue: scalar scales,
+    no KV producer, persistent, no split partials) must place the wait as
+    configured. Returns the output and LSE of the test's first launch, which is
+    eager and whose inputs depend only on the test's arguments, for bitwise
+    comparison between launches, and the first compiled kernel's spec, callable
+    and first launch arguments.
     """
     import copy
     from dataclasses import replace
@@ -1329,23 +1360,20 @@ def _first_outputs(run_test, check_config, profile=None, pdl=False):
 
     compile_kernel = mla_decode._get_compiled_mla_decode
     waits_after_prologue = ThroughputLatencyMlaDecodeTs.waits_after_prologue
-    configs, outputs = [], []
+    configs, outputs, first = [], [], {}
 
     def checked_compile(spec):
-        if pdl:
-            kernel = copy.copy(spec.kernel)
-            kernel.use_pdl = True
-            kernel.pdl_wait_after_prologue = True
-            spec = replace(
-                spec,
-                kernel=kernel,
-                kernel_signature=mla_decode._mla_kernel_compile_signature(kernel),
-            )
+        kernel = copy.copy(spec.kernel)
+        kernel.use_pdl = True
+        kernel.pdl_wait_after_prologue = wait_after_prologue
+        spec = replace(
+            spec,
+            kernel=kernel,
+            kernel_signature=mla_decode._mla_kernel_compile_signature(kernel),
+        )
         cfg = spec.kernel._make_config()
         check_config(cfg)
         configs.append(cfg)
-        if not pdl:
-            return compile_kernel(spec)
         traced = []
 
         def recording(self, *args, **kwargs):
@@ -1353,16 +1381,20 @@ def _first_outputs(run_test, check_config, profile=None, pdl=False):
             return traced[-1]
 
         with pytest.MonkeyPatch.context() as trace:
-            # Trace instead of loading a cached binary, so the kernel's own
-            # predicate (scalar scales, no KV producer, persistent, no split
-            # partials) is observed rather than only the config flags.
             trace.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
             trace.setattr(
                 ThroughputLatencyMlaDecodeTs, "waits_after_prologue", recording
             )
             compiled = compile_kernel.__wrapped__(spec)
-        assert traced and all(traced), "the PDL launch kept the entry wait"
-        return _late_inputs(compiled)
+        assert traced
+        if wait_after_prologue:
+            assert all(traced), "the PDL launch kept the entry wait"
+        else:
+            assert not any(traced), "the entry-wait PDL launch moved its wait"
+        launches = []
+        if not first:
+            first.update(spec=spec, compiled=compiled, launches=launches)
+        return _late_inputs(compiled, launches)
 
     run = BatchSparseMLADecodePagedTSWrapper.run
 
@@ -1380,24 +1412,83 @@ def _first_outputs(run_test, check_config, profile=None, pdl=False):
         patch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
         patch.setattr(BatchSparseMLADecodePagedTSWrapper, "run", recording_run)
         run_test()
-    assert configs and outputs
-    return outputs[0]
+    assert configs and outputs and first["launches"]
+    return (
+        *outputs[0],
+        first["spec"],
+        first["compiled"],
+        first["launches"][0],
+    )
+
+
+def _starts_before_inputs(spec, compiled, args):
+    """Whether the attention grid itself starts before its late predecessor
+    (_late_inputs) restores its inputs, eagerly and in a replayed CUDA graph.
+
+    A twin of ``compiled`` traced without its grid-dependency wait reads the
+    poisoned inputs exactly when the grid starts early, and its output then
+    differs from ``compiled``'s on the same arguments.
+    """
+    from cutlass.experimental import primitives as prims
+
+    from flashinfer.attention.prims_ts import mla_decode
+
+    griddepcontrol = prims.griddepcontrol
+
+    def without_wait(*a, kind=None, **kw):
+        if kind == prims.GridDepAction.WAIT:
+            return None
+        return griddepcontrol(*a, kind=kind, **kw)
+
+    with pytest.MonkeyPatch.context() as trace:
+        trace.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+        trace.setattr(prims, "griddepcontrol", without_wait)
+        twin = mla_decode._get_compiled_mla_decode.__wrapped__(spec)
+    # Load the twin (lazy module loading) before any launch that must overlap.
+    twin(*args)
+    torch.cuda.synchronize()
+    outputs = [t for t in (args[5], args[6]) if isinstance(t, torch.Tensor)]
+
+    def eager(launch):
+        launch(*args)
+        torch.cuda.synchronize()
+        return [t.clone() for t in outputs]
+
+    def replayed(launch):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch(*args)
+        graph.replay()
+        torch.cuda.synchronize()
+        return [t.clone() for t in outputs]
+
+    def differ(a, b):
+        return not all(_same_bytes(x, y) for x, y in zip(a, b, strict=True))
+
+    waited, unwaited = _late_inputs(compiled), _late_inputs(twin)
+    return differ(eager(waited), eager(unwaited)) and differ(
+        replayed(waited), replayed(unwaited)
+    )
 
 
 @pytest.mark.parametrize("schedule", ["bf16-static", "fp8-ws-gather", "fp8-nvfp4"])
 def test_pdl_wait_after_prologue_graph(schedule):
     """A PDL launch of a persistent grid that waits after its prologue reads only
-    what its predecessor wrote, and matches the entry-wait launch bit for bit.
+    what its predecessor wrote, and matches the entry-wait PDL launch bit for bit.
 
-    Every eager and replayed launch follows a predecessor that releases it at
-    entry and writes Q and the sparse indices about a millisecond later, so a
-    read issued before the moved wait sees NaN Q and -1 indices.
+    Every eager and replayed launch of both arms follows a predecessor that
+    releases it at entry and writes Q, the sparse indices and their lengths about
+    a millisecond later, so a read issued before the wait sees NaN Q, -1 indices
+    and zero lengths. A twin of the deferred kernel without its wait must see
+    them, eagerly and replayed: otherwise the attention grid started late and the
+    arms could not tell a misplaced wait from a correct one.
     """
     from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
         SparseMlaProfile,
     )
 
-    _check_pdl_window()
+    if not _pdl_window_is_open():
+        pytest.skip("PDL dependents do not overlap their predecessor on this setup")
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     profile = None
     if schedule == "fp8-nvfp4":
@@ -1428,21 +1519,24 @@ def test_pdl_wait_after_prologue_graph(schedule):
         def run_test():
             test_native_graph(dtype, sms + 1, 1, 64, 513, True, False, True)
 
-    def launch_config(pdl):
+    def launch_config(wait_after_prologue):
         def check(cfg):
             # The prologue wait applies to persistent single-split grids only.
             assert cfg.use_persistent_scheduler == 1
             assert cfg.num_ctas_per_seq_kv == 1
             assert cfg.tma_fp8_primary_tiles == (schedule == "fp8-nvfp4")
-            assert cfg.use_pdl == pdl
-            assert cfg.pdl_wait_after_prologue == pdl
+            assert cfg.use_pdl
+            assert cfg.pdl_wait_after_prologue == wait_after_prologue
 
         return check
 
-    reference = _first_outputs(run_test, launch_config(False), profile)
-    out, lse = _first_outputs(run_test, launch_config(True), profile, pdl=True)
-    assert torch.equal(out, reference[0])
-    assert torch.equal(lse, reference[1])
+    reference = _pdl_outputs(run_test, launch_config(False), profile, False)
+    deferred = _pdl_outputs(run_test, launch_config(True), profile, True)
+    assert _same_bytes(deferred[0], reference[0])
+    assert _same_bytes(deferred[1], reference[1])
+    assert _starts_before_inputs(*deferred[2:]), (
+        "the attention grid started only after its predecessor wrote its inputs"
+    )
 
 
 def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
