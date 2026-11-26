@@ -492,9 +492,10 @@ def _run_fp4(
     m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
     if m == 0:
         return
+    a = a.view(torch.uint8)  # mm_fp4 also takes the native packed FP4 dtype
     if not a.is_contiguous() or a.data_ptr() % 16:
         a = a.clone(memory_format=torch.contiguous_format)
-    w = b.t()
+    w = b.view(torch.uint8).t()
     if not w.is_contiguous() or w.data_ptr() % 16:
         w = w.clone(memory_format=torch.contiguous_format)
     sf = _flat_bytes(b_descale)
@@ -578,8 +579,13 @@ def sm8x_mm_fp4_runner(
         raise ValueError(f"out shape {tuple(out.shape)} != expected {(m, n)}")
     if out.dtype != out_dtype:
         raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
-    if any(t.device != a.device for t in (b, a_descale, b_descale, out)):
-        raise ValueError("a, b, a_descale, b_descale and out must be on one device")
+    if any(
+        t is not None and t.device != a.device
+        for t in (b, a_descale, b_descale, alpha, out)
+    ):
+        raise ValueError(
+            "a, b, a_descale, b_descale, alpha and out must be on one device"
+        )
     if alpha is None:
         _ones(a.device)  # outside a tuner's graph capture
     return Sm8xMmFp4Runner()
