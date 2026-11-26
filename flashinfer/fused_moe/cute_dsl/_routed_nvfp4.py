@@ -21,6 +21,7 @@ import torch
 from ...utils import get_compute_capability
 from ...tllm_enums import ActivationType
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    ZERO_OUTPUT_MAX_BYTES,
     blockscaled_contiguous_gather_grouped_gemm_act_fusion as gather_gemm,
 )
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
@@ -89,14 +90,17 @@ def _nvfp4_moe_with_pre_fc2_routing_weights(
         enable_pdl=enable_pdl,
     )
     # In-GEMM1 zeroing needs FP32 weights (passed as the never-read
-    # token_final_scales) and a 16-byte aligned output; otherwise memset.
+    # token_final_scales) and a 16-byte aligned output of at most
+    # ZERO_OUTPUT_MAX_BYTES; otherwise memset.
+    output_bytes = output.numel() * output.element_size()
     zero_in_gemm1 = (
         _ZERO_OUTPUT_IN_GEMM1
         and use_fused_finalize
         and weights.dtype == torch.float32
         and weights.is_contiguous()
         and output.data_ptr() % 16 == 0
-        and (output.numel() * output.element_size()) % 16 == 0
+        and output_bytes % 16 == 0
+        and output_bytes <= ZERO_OUTPUT_MAX_BYTES
     )
     # Zero the atomically finalized output first so GEMM1 -> GEMM2 stay
     # adjacent and can overlap through programmatic dependent launch.

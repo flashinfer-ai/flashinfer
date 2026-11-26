@@ -1973,6 +1973,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # The next kernel (GEMM2) reads it only after its own wait.
             if warp_idx == self.sync_transform_warp_id:
                 zero_base = cutlass.Int64(zero_out.iterator.toint())
+                # The wrapper caps zero_out at 2**30 16-byte chunks
+                # (ZERO_OUTPUT_MAX_BYTES), so 32-bit indices suffice.
                 zero_n16 = cutlass.Int32(
                     cute.size(zero_out) * zero_out.element_type.width // 128
                 )

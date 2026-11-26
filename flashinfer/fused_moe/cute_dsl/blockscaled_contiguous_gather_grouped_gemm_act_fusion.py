@@ -219,6 +219,11 @@ def create_gather_gemm_tensors(
 # Kernel cache for compiled kernels (class-level to persist across calls)
 _gather_kernel_cache: Dict[Tuple, Any] = {}
 
+# Largest zero_output accepted: the kernel's zeroing loop indexes 16-byte chunks
+# with 32-bit integers, so 2**30 chunks (16 GiB) keep the index and its grid
+# stride in range. Callers memset larger outputs instead.
+ZERO_OUTPUT_MAX_BYTES = 1 << 34
+
 
 def _get_compiled_gather_kernel(
     # Problem dimensions (runtime parameters - NOT in cache key)
@@ -614,7 +619,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         zero_output: Optional contiguous BF16 tensor of shape (seq_len, k)
             (the MoE output that GEMM2 finalizes atomically). The kernel's idle
             warp zeroes it after the grid-dependency wait, replacing a separate
-            memset launch. 1-CTA Blackwell tactics only.
+            memset launch. At most ``ZERO_OUTPUT_MAX_BYTES`` (16 GiB); 1-CTA
+            Blackwell tactics only.
 
     Returns:
         Tuple of:
@@ -758,13 +764,14 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             or zero_output.numel() != seq_len * k
             or zero_output.data_ptr() % 16
             or (seq_len * k * 2) % 16
+            or seq_len * k * 2 > ZERO_OUTPUT_MAX_BYTES
             or tuple(mma_tiler_mn)[0] != 128
             or mma_tiler is not None
         ):
             raise ValueError(
                 "zero_output must be a contiguous, 16-byte aligned BF16 tensor of "
-                f"{seq_len} x {k} elements on the input device, with a 1-CTA "
-                "Blackwell tactic"
+                f"{seq_len} x {k} elements (at most {ZERO_OUTPUT_MAX_BYTES} bytes) "
+                "on the input device, with a 1-CTA Blackwell tactic"
             )
 
     # Output quantization is explicit because Float8E4M3FN can also be used as

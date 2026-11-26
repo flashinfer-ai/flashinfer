@@ -1156,3 +1156,64 @@ def test_pre_fc2_output_zeroing_in_gemm1_matches_memset_bitwise(
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int16), ref_fused.view(torch.int16))
+
+
+# Outputs above ZERO_OUTPUT_MAX_BYTES (the in-kernel zeroing loop's 32-bit chunk
+# range) take the memset path; the GEMM1 API rejects them as zero_output. The
+# limit is lowered here so a small output crosses it.
+def test_pre_fc2_output_zeroing_falls_back_to_memset_above_the_size_limit(
+    gpu, monkeypatch
+):
+    import importlib
+
+    from flashinfer.fused_moe.cute_dsl import _routed_nvfp4 as routed
+
+    fc1 = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl."
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion"
+    )
+    tokens = 17
+    inputs, _ = _case(tokens, gpu, True, 768, 4096)
+    t = torch.arange(tokens, device=gpu)
+    ids = inputs["token_selected_experts"]
+    ids[:, 0] = (2 + t % 4).int()
+    ids[:, 1] = (6 + t % 2).int()
+    options = dict(
+        num_experts=8,
+        top_k=2,
+        num_local_experts=3,
+        local_expert_offset=2,
+        activation_type=ActivationType.ClampedRelu2.value,
+        clamped_relu2_limit=torch.tensor([0.15], device=gpu),
+        routing_weights_before_fc2=True,
+        tactic=DEFAULT_BLACKWELL_MOE_TACTIC,
+        use_fused_finalize=True,
+    )
+    zeroing_calls = []
+    gather_gemm = routed.gather_gemm
+
+    def recording_gather_gemm(*args, **kwargs):
+        zeroing_calls.append(kwargs.get("zero_output") is not None)
+        return gather_gemm(*args, **kwargs)
+
+    monkeypatch.setattr(routed, "gather_gemm", recording_gather_gemm)
+
+    def run():
+        out = torch.full((tokens, 768), float("nan"), dtype=torch.bfloat16, device=gpu)
+        cute_dsl_fused_moe(**inputs, **options, moe_output=out)
+        return out
+
+    nbytes = tokens * 768 * 2
+    monkeypatch.setattr(routed, "_ZERO_OUTPUT_IN_GEMM1", False)
+    ref = run()
+    monkeypatch.setattr(routed, "_ZERO_OUTPUT_IN_GEMM1", True)
+    monkeypatch.setattr(routed, "ZERO_OUTPUT_MAX_BYTES", nbytes - 16)
+    above = run()
+    monkeypatch.setattr(routed, "ZERO_OUTPUT_MAX_BYTES", nbytes)
+    at_limit = run()
+    assert zeroing_calls == [False, False, True]
+    assert torch.equal(above.view(torch.int16), ref.view(torch.int16))
+    assert torch.equal(at_limit.view(torch.int16), ref.view(torch.int16))
+    monkeypatch.setattr(fc1, "ZERO_OUTPUT_MAX_BYTES", nbytes - 16)
+    with pytest.raises(ValueError, match="zero_output"):
+        run()
