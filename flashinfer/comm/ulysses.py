@@ -2375,15 +2375,21 @@ class UlyssesCommunicator:
         the stream the communicator's first PCIe collective bound; the hybrid
         and all-RDMA routes refuse CUDA graph capture and block the host in
         the exchange. Both rules are checked before any work is enqueued, and
-        a rejection there is an ordinary error on the RDMA routes. Because
-        those routes wait for every peer in an unbounded barrier, they also
-        vote over NCCL just before the exchange, on an internal stream the
-        host synchronizes: a failure on any rank after admission, including
-        allocating the outputs when ``out`` is ``None``, raises on every rank
-        before any of them enters the barrier, and the communicator stays
-        OPEN. On the all-P2P route, a rejection or failure before this rank
-        enqueues its exchange leaves the communicator BROKEN, as for the
-        backend's other collectives.
+        a rejection there is an ordinary error on the RDMA routes; a call that
+        passes them binds the stream, even if it fails later. Because those
+        routes wait for every peer in an unbounded barrier, they also vote
+        over NCCL just before the exchange, on an internal stream the host
+        synchronizes. Once every rank has voted, a host-side failure on any
+        rank between admission and the vote, such as allocating the outputs
+        when ``out`` is ``None``, raises on every rank before any of them
+        enters the barrier, and the communicator stays OPEN. As for
+        ``prepare_qkv``, missing participants and CUDA/process-group
+        failures, including one inside the statistics AllGather or the vote,
+        are not recoverable this way: peers may wait without bound. A failure
+        inside the native exchange leaves the communicator BROKEN. On the
+        all-P2P route, a rejection or failure before this rank enqueues its
+        exchange leaves the communicator BROKEN, as for the backend's other
+        collectives.
 
         Parameters
         ----------
@@ -2496,10 +2502,12 @@ class UlyssesCommunicator:
         if out is not None:
             out = self._prepare_qkv_out(workspace, out, checked_ranges, lowp)
         if self.backend == "pcie" and not self._pcie_capturing():
-            # The statistics AllGather runs first, and once a rank has
-            # enqueued collective work it has no rank-local way back. The
-            # exchange itself binds the stream.
-            self._pcie_check_stream(bind=False)
+            # Bind at the last check before the first enqueue, as
+            # _pcie_collective does before its exchange: a call the RDMA vote
+            # aborts can leave its pack into the shared landing buffer pending
+            # on this stream, and only the bound stream orders a later call
+            # after it.
+            self._pcie_check_stream(bind=True)
         return out
 
     def _quantize_and_exchange_qkv(self, q, k, v, workspace, out, lowp):
@@ -2564,12 +2572,14 @@ class UlyssesCommunicator:
                 failure = e
                 if stage == "stats":
                     # Peers are already in the statistics AllGather: join it in
-                    # place so this rank's vote pairs with theirs.
+                    # place so this rank's vote pairs with theirs. Zero the
+                    # slice first: it may never have been written (NaN under
+                    # deterministic fill), which TORCH_NCCL_NAN_CHECK asserts on.
                     chunk = workspace._stats_numel
+                    mine = workspace._stats_gather.narrow(0, self.rank * chunk, chunk)
+                    mine.zero_()
                     dist.all_gather_into_tensor(
-                        workspace._stats_gather,
-                        workspace._stats_gather.narrow(0, self.rank * chunk, chunk),
-                        group=self.group,
+                        workspace._stats_gather, mine, group=self.group
                     )
             if vote is not None:
                 self._vote_before_rdma_exchange(workspace, failure)
@@ -2586,9 +2596,11 @@ class UlyssesCommunicator:
 
         That barrier waits for every peer without a deadline, while a failure
         between admission and the exchange (allocating the outputs, or an
-        allocation in the statistics or quantizer, say) is rank-local. Every
-        rank therefore raises here, before entering it, so no peer is left
-        waiting and the communicator stays OPEN.
+        allocation in the statistics or quantizer, say) is rank-local. Once
+        every rank has voted, every rank therefore raises here, before
+        entering it, and the communicator stays OPEN. A failure inside the
+        statistics AllGather or this vote is a CUDA/process-group failure the
+        vote does not recover.
 
         Every failure the vote reports is raised on the host while the
         statistics and quantizer kernels are enqueued, so the vote need not

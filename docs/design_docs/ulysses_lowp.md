@@ -18,9 +18,13 @@ with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
     encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
     # The framework calls the appropriate Sage2 kernel with encoded fields.
     # Its full [B,P*L,H/P,D] output uses encoded.input_dtype and a zero tail.
-    # On the multi-rank PCIe backend gather_heads also needs out= from
-    # comm.allocate_output(attention, "gather_heads") (see ulysses_pcie.md).
-    local_output = comm.gather_heads(sage_adapter(encoded))
+    attention = sage_adapter(encoded)
+    # Multi-rank PCIe requires out= from allocate_output (ulysses_pcie.md);
+    # on NCCL/NVLink it returns ordinary storage. On PCIe the call is
+    # collective, refuses capture and holds max_bytes until close(), so
+    # allocate once per geometry and reuse it; each gather overwrites it.
+    gathered = comm.allocate_output(attention, "gather_heads")
+    local_output = comm.gather_heads(attention, out=gathered)
 ```
 
 `prepare_qkv` is collective, with three joint phases: configuration validation,
@@ -41,9 +45,11 @@ the complete packed Q/K/V operand, including scales and chunk alignment.
 both supported layouts; a single floating Q tensor's size is insufficient.
 Preparation checks the exact byte requirement before allocating wire buffers.
 NCCL allocates the actual wire size, not the full budget. PCIe registers the
-full budget once per communicator (twice it on the hybrid and all-RDMA routes),
-so there `max_bytes` should be the largest payload, about `1.5 * q.nbytes` for
-FP16/BF16 inputs plus scales and alignment, rather than the loose bound.
+full budget once per communicator for the Q/K/V slot and again for each
+`allocate_output`, such as the `gather_heads` output above (each twice on the
+hybrid and all-RDMA routes), so there `max_bytes` should be the largest
+payload, about `1.5 * q.nbytes` for FP16/BF16 inputs plus scales and
+alignment, rather than the loose bound.
 Statistics and final outputs are separate storage, so this limit is not a
 total memory budget.
 Ordinary `UlyssesWorkspace` and `create_workspace(max_elems=...)` continue to
