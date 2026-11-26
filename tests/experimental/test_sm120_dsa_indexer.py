@@ -164,7 +164,13 @@ def _visible(lq, lk, u, offset, ratio):
         # Both routes in one call: short and long segments, a query block
         # straddling them; rows crossing 16K keys within a segment.
         ([6, 64, 33], [5000, 40000, 2000], None, 1, 0.0),
+        # Few resident blocks beside the scan, and enough to fill the GPU.
+        ([128, 128, 5, 128], [20000, 70000, 3000, 30000], None, 1, 0.0),
+        ([1500, 30], [9000, 60000], None, 1, 0.0),
         ([64], [30000], [16384 - 32], 1, 0.0),
+        # Whole waves and a split rest (H64, up to 192 SMs), rows past 16K keys.
+        ([384], [20000], None, 1, 0.0),
+        ([1000], [36000], None, 1, 0.9),
         # Resident rows whose k-th score is one value tied past the list
         # (mostly zero keys).
         ([300], [12000], None, 1, 0.95),
@@ -329,6 +335,109 @@ def test_ragged_cuda_graph(fp4, heads, top_k, monkeypatch):
             q0, k0 = q0 + lq, k0 + lk
 
 
+# (role, fp4, heads) of the schedule tests: plain rows in every format and
+# head count, candidate rows in one.
+_SCHEDULE_CASES = [
+    ("keys", False, 32),
+    ("keys", False, 64),
+    ("keys", True, 32),
+    ("keys", True, 64),
+    ("source", False, 32),
+    ("consumer", False, 32),
+]
+
+
+def _role_kwargs(role, T, C, bs, n_blocks, gen, dev):
+    """candidate_out (filled by source rows, else -1) and the call's kwargs."""
+    out = torch.full((T, C), -1, dtype=torch.int32, device=dev)
+    if role == "source":
+        return out, None, dict(candidate_out=out, candidate_block_size=bs)
+    if role == "consumer":
+        cand = torch.randint(
+            0, n_blocks, (T, C), generator=gen, device=dev, dtype=torch.int32
+        )
+        return out, cand, dict(candidate_blocks=cand, candidate_block_size=bs)
+    return out, None, {}
+
+
+@pytest.mark.parametrize("role,fp4,heads", _SCHEDULE_CASES)
+@pytest.mark.parametrize("whole", [True, False], ids=["waves", "partial"])
+def test_ragged_cuda_graph_rest(role, fp4, heads, whole):
+    """One resident class: the blocks past its whole waves (or all of them)
+    leave the waves or stay, decided on the device. One capture replayed with
+    short rows (stay) and long rows (leave) gives the bits of both forced
+    choices."""
+    from flashinfer.experimental.sm120_dsa_indexer import _api
+
+    dev = torch.device("cuda")
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    block_q = 128 // heads
+    # Whole waves and a quarter wave, or half a wave.
+    T = (sms + max(1, sms // 4) if whole else max(1, sms // 2)) * block_q
+    top_k, bs, C, Tkv = 512, 8, 256, 15000
+    gen = torch.Generator(device=dev).manual_seed(heads + T + len(role))
+    q = _queries(fp4, (T, heads), gen, dev)
+    k = _keys(fp4, (Tkv,), gen, dev)
+    w = _weights((T, heads), gen, dev)
+    cu_q = torch.tensor([0, T], dtype=torch.int32, device=dev)
+    cu_k = torch.zeros(2, dtype=torch.int32, device=dev)
+    offs = torch.zeros(1, dtype=torch.int64, device=dev)
+    idx = torch.empty(T, top_k, dtype=torch.int32, device=dev)
+    sc = torch.empty(T, top_k, dtype=torch.float32, device=dev)
+    out, _, kw = _role_kwargs(role, T, C, bs, Tkv // bs, gen, dev)
+
+    def run():
+        dsa_indexer_det_topk(
+            q.data,
+            k.data,
+            w,
+            cu_q,
+            cu_k,
+            top_k=top_k,
+            backend="sm120",
+            k_scale=k.scale,
+            q_scale=q.scale,
+            q_causal_offsets=offs,
+            indices=idx,
+            scores=sc,
+            max_seqlen_k=Tkv,
+            **kw,
+        )
+
+    def result():
+        torch.cuda.synchronize()
+        return idx.clone(), sc.view(torch.int32).clone(), out.sort(1).values
+
+    cu_k[1] = T
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        run()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for c in (0, Tkv - T, 4000, 0, Tkv - T):
+        cu_k[1] = T + c
+        offs[0] = c
+        graph.replay()
+        got = result()
+        for rule in ("always", "never"):
+            _api._REST_RULE = rule
+            try:
+                run()
+            finally:
+                _api._REST_RULE = None
+            assert all(torch.equal(a, b) for a, b in zip(result(), got, strict=True)), (
+                f"chunk {c}: {rule}"
+            )
+        if role == "keys":
+            full = _scores(q.value, w, k.value[: T + c])
+            for u in range(0, T, max(1, T // 64)):
+                n = _visible(T, T + c, u, c, 1)
+                _check_row(idx[u], sc[u], full[u, :n], top_k, True, f"{c}/{u}")
+
+
 def test_ragged_scratch_bound():
     """The scratch is bounded by the rows, not the keys: a 16K-row call of
     long rows (the scan, in chunks) and short rows (resident) stays within
@@ -367,6 +476,48 @@ def test_ragged_scratch_bound():
     # The caching allocator rounds each of the ~20 tensors up to 512 bytes.
     assert used <= bound + 20 * 512, (used, bound)
     assert bound < 1 << 30
+    # Candidate roles: a word (source) or a bit (consumer) per row per block.
+    bs, C = 8, 2048
+    for role, kw in (
+        (
+            "source",
+            dict(candidate_out=torch.empty(T, C, dtype=torch.int32, device=dev)),
+        ),
+        (
+            "consumer",
+            dict(candidate_blocks=torch.zeros(T, C, dtype=torch.int32, device=dev)),
+        ),
+    ):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        dsa_indexer_det_topk(
+            q,
+            k,
+            w,
+            cu_q,
+            cu_k,
+            top_k=top_k,
+            backend="sm120",
+            k_scale=k_scale,
+            q_causal_offsets=offs,
+            indices=idx,
+            return_scores=False,
+            candidate_block_size=bs,
+            **kw,
+        )
+        torch.cuda.synchronize()
+        used = torch.cuda.max_memory_allocated() - base
+        bound = ragged_scratch_bytes(
+            T,
+            top_k,
+            heads,
+            dev,
+            candidate=role,
+            max_seqlen_k=C + T,
+            candidate_block_size=bs,
+        )
+        assert used <= bound + 24 * 512, (role, used, bound)
 
 
 def _ragged_call(fp4, heads, top_k, seg_q, seg_k, seed, **kw):
@@ -1039,18 +1190,215 @@ def test_paged_candidates_validation():
         candidate_blocks=cand[:0],
     )
     assert idx.shape == (0, 512)
-    with pytest.raises(ValueError, match="paged form"):
-        dsa_indexer_det_topk(
-            q.data.view(1, 32, _D),
-            paged.keys.data,
-            w,
-            torch.tensor([0, 1], dtype=torch.int32, device=dev),
-            torch.tensor([0, 1000], dtype=torch.int32, device=dev),
-            backend="sm120",
-            k_scale=paged.keys.scale,
-            top_k=512,
-            candidate_blocks=cand,
+
+
+# DeepSeek-V4.1 candidate rows: segments off the 128-key and block grids, both
+# routes, block rows longer than one selection CTA's.
+_RAGGED_CAND = [
+    ([37, 3, 13, 9], [16418, 8, 70014, 9], 8, 2048),
+    ([6, 12, 5], [5000, 140003, 2001], 8, 2048),
+    ([33, 7], [40001, 20003], 16, 512),
+    # Replay rows (128 a request): two classes, each split.
+    ([128, 64], [41000, 24000], 8, 2048),
+]
+
+
+def _ragged_cand_inputs(fp4, heads, seg_q, seg_k, gen, dev):
+    T, Tkv = sum(seg_q), sum(seg_k)
+    q = _queries(fp4, (T, heads), gen, dev)
+    k = _keys(fp4, (Tkv,), gen, dev)
+    w = _weights((T, heads), gen, dev)
+    cu_q = [0, *torch.tensor(seg_q).cumsum(0).tolist()]
+    cu_k = [0, *torch.tensor(seg_k).cumsum(0).tolist()]
+    vis = torch.tensor(
+        [
+            _visible(lq, lk, u, None, 1)
+            for lq, lk in zip(seg_q, seg_k, strict=True)
+            for u in range(lq)
+        ],
+        dtype=torch.int32,
+        device=dev,
+    )
+    return q, k, w, cu_q, cu_k, vis
+
+
+def _ragged_cand_call(q, k, w, cu_q, cu_k, top_k, dev, **kw):
+    return dsa_indexer_det_topk(
+        q.data,
+        k.data,
+        w,
+        torch.tensor(cu_q, dtype=torch.int32, device=dev),
+        torch.tensor(cu_k, dtype=torch.int32, device=dev),
+        top_k=top_k,
+        backend="sm120",
+        k_scale=k.scale,
+        q_scale=q.scale,
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+@pytest.mark.parametrize("heads,top_k", [(64, 512), (32, 2048)])
+@pytest.mark.parametrize("seg_q,seg_k,bs,C", _RAGGED_CAND)
+def test_ragged_candidate_source(fp4, heads, top_k, seg_q, seg_k, bs, C):
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(sum(seg_q) + heads + bs)
+    q, k, w, cu_q, cu_k, vis = _ragged_cand_inputs(fp4, heads, seg_q, seg_k, gen, dev)
+    out = torch.full((sum(seg_q), C), 7, dtype=torch.int32, device=dev)
+    # Twice: long block rows keep selection state across calls.
+    for _ in range(2):
+        idx, sc = _ragged_cand_call(
+            q, k, w, cu_q, cu_k, top_k, dev, candidate_out=out, candidate_block_size=bs
         )
+        for s, lq in enumerate(seg_q):
+            q0, k0 = cu_q[s], cu_k[s]
+            full = _scores(
+                q.value[q0 : q0 + lq], w[q0 : q0 + lq], k.value[k0 : cu_k[s + 1]]
+            )
+            for u in range(lq):
+                r, n = q0 + u, int(vis[q0 + u])
+                what = f"segment {s} row {u}"
+                _check_row(idx[r], sc[r], full[u, :n], top_k, True, what)
+                _check_source_row(out[r], full[u, :n], bs, C, what)
+
+
+@pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])
+@pytest.mark.parametrize("heads,top_k", [(64, 512), (32, 2048)])
+@pytest.mark.parametrize("seg_q,seg_k,bs,C", _RAGGED_CAND)
+def test_ragged_candidates(fp4, heads, top_k, seg_q, seg_k, bs, C):
+    """Each row ranks its visible keys with every unlisted block's keys at
+    -inf; the lists hold at least top_k visible keys or all the row's."""
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(sum(seg_q) + heads + bs + 1)
+    q, k, w, cu_q, cu_k, vis = _ragged_cand_inputs(fp4, heads, seg_q, seg_k, gen, dev)
+    cand = _candidate_lists(vis, C, bs, gen, dev)
+    idx, sc = _ragged_cand_call(
+        q, k, w, cu_q, cu_k, top_k, dev, candidate_blocks=cand, candidate_block_size=bs
+    )
+    for s, lq in enumerate(seg_q):
+        q0, k0 = cu_q[s], cu_k[s]
+        full = _scores(
+            q.value[q0 : q0 + lq], w[q0 : q0 + lq], k.value[k0 : cu_k[s + 1]]
+        )
+        for u in range(lq):
+            r, n = q0 + u, int(vis[q0 + u])
+            listed = cand[r][cand[r] >= 0].long()
+            keep = torch.isin(torch.arange(n, device=dev) // bs, listed)
+            row = full[u, :n].clone()
+            row[~keep] = -torch.inf
+            _check_row(idx[r], sc[r], row, top_k, True, f"segment {s} row {u}")
+
+
+@pytest.mark.parametrize("role,fp4,heads", _SCHEDULE_CASES)
+def test_ragged_schedules_bitwise(role, fp4, heads):
+    """Queued and split classes, in one capture replayed with the contexts
+    swapped, give the bits of the serial unsplit launches, also on a 64-SM
+    partition. Some consumer rows list fewer keys than top_k."""
+    from flashinfer.experimental.sm120_dsa_indexer import _api
+    from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+    dev = torch.device("cuda")
+    top_k, bs, C = 512, 8, 2048
+    # Three classes: two of at least the SMs' blocks (queued), one of fewer
+    # (split).
+    seg_q = [1024, 64, 800]
+    ctx_sets = ([8000, 24000, 40000], [9000, 20000, 36000])
+    max_k = max(c + lq for cs in ctx_sets for c, lq in zip(cs, seg_q, strict=True))
+    T = sum(seg_q)
+    Tkv = max(sum(c + lq for c, lq in zip(cs, seg_q, strict=True)) for cs in ctx_sets)
+    gen = torch.Generator(device=dev).manual_seed(41 + heads + fp4)
+    q = _queries(fp4, (T, heads), gen, dev)
+    k = _keys(fp4, (Tkv,), gen, dev)
+    w = _weights((T, heads), gen, dev)
+    cu_q = torch.tensor(
+        [0, *torch.tensor(seg_q).cumsum(0).tolist()], dtype=torch.int32, device=dev
+    )
+    cu_k = torch.zeros(len(seg_q) + 1, dtype=torch.int32, device=dev)
+    offs = torch.zeros(len(seg_q), dtype=torch.int64, device=dev)
+    idx = torch.empty(T, top_k, dtype=torch.int32, device=dev)
+    sc = torch.empty(T, top_k, dtype=torch.float32, device=dev)
+    out, cand, kw = _role_kwargs(role, T, C, bs, max_k // bs, gen, dev)
+    if cand is not None:
+        cand[::7, 5:] = -1
+
+    def run():
+        dsa_indexer_det_topk(
+            q.data,
+            k.data,
+            w,
+            cu_q,
+            cu_k,
+            top_k=top_k,
+            backend="sm120",
+            k_scale=k.scale,
+            q_scale=q.scale,
+            q_causal_offsets=offs,
+            indices=idx,
+            scores=sc,
+            max_seqlen_k=max_k,
+            **kw,
+        )
+
+    def contexts(cs):
+        ends = torch.tensor([c + lq for c, lq in zip(cs, seg_q, strict=True)])
+        cu_k.copy_(torch.tensor([0, *ends.cumsum(0).tolist()]))
+        offs.copy_(torch.tensor(cs))
+
+    def result():
+        # candidate_out rows hold their blocks in no particular order.
+        torch.cuda.synchronize()
+        return idx.clone(), sc.view(torch.int32).clone(), out.sort(1).values
+
+    contexts(ctx_sets[0])
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        run()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    streams, _ = split_device_green_ctx_by_sm_count(
+        torch.device("cuda", torch.cuda.current_device()), [64]
+    )
+    for cs in (ctx_sets[1], ctx_sets[0]):
+        contexts(cs)
+        graph.replay()
+        got = result()
+        _api._RES_CONCURRENT = _api._CLASS_SPLIT = _api._QUEUE = False
+        try:
+            run()
+        finally:
+            _api._RES_CONCURRENT = _api._CLASS_SPLIT = _api._QUEUE = True
+        assert all(torch.equal(a, b) for a, b in zip(result(), got, strict=True)), (
+            f"{cs}: serial"
+        )
+        streams[0].wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(streams[0]):
+            run()
+        torch.cuda.current_stream().wait_stream(streams[0])
+        assert all(torch.equal(a, b) for a, b in zip(result(), got, strict=True)), (
+            f"{cs}: partition"
+        )
+        k0 = 0
+        for s_, (c, lq) in enumerate(zip(cs, seg_q, strict=True)):
+            q0 = int(cu_q[s_])
+            full = _scores(
+                q.value[q0 : q0 + lq], w[q0 : q0 + lq], k.value[k0 : k0 + c + lq]
+            )
+            for u in (0, 7, lq - 1):
+                r, n = q0 + u, _visible(lq, c + lq, u, c, 1)
+                what = f"{cs}/{s_}/{u}"
+                row = full[u, :n].clone()
+                if role == "consumer":
+                    listed = cand[r][cand[r] >= 0].long()
+                    row[
+                        ~torch.isin(torch.arange(n, device=dev) // bs, listed)
+                    ] = -torch.inf
+                _check_row(idx[r], sc[r], row, top_k, True, what)
+                if role == "source":
+                    _check_source_row(out[r], full[u, :n], bs, C, what)
+            k0 += c + lq
 
 
 def test_paged_candidates_small_partition():
@@ -1078,10 +1426,28 @@ def test_paged_candidates_small_partition():
     _check_candidates(idx, sc, q, w, ctx, paged, cand, 8, 512)
 
 
+def _check_source_row(out, scores, bs, C, what):
+    """out: the row's top min(C, blocks) blocks by block score (the largest
+    score of its keys; the newest block first), ties to the larger block, in
+    any order, then -1."""
+    n = scores.numel()
+    nb = (n + bs - 1) // bs
+    if nb == 0:
+        assert bool((out == -1).all()), what
+        return
+    padded = torch.full((nb * bs,), -torch.inf, device=out.device)
+    padded[:n] = scores.float()
+    score = padded.view(nb, bs).amax(1)
+    score[nb - 1] = torch.inf
+    order = torch.argsort(torch.arange(nb, device=out.device), descending=True)
+    order = order[torch.argsort(score[order], descending=True, stable=True)]
+    want = min(C, nb)
+    ref = torch.sort(order[:want]).values.int()
+    assert torch.equal(torch.sort(out[:want]).values, ref), f"{what}: blocks"
+    assert bool((out[want:] == -1).all()), f"{what}: padding"
+
+
 def _check_source(out, q, w, ctx, paged, bs, C):
-    """out: each row's top min(C, blocks) blocks by block score (the largest
-    score of the block's visible keys; the newest block first), ties to the
-    larger block, in any order, then -1."""
     B, next_n = ctx.shape
     for b in range(B):
         n_max = int(ctx[b].max())
@@ -1089,25 +1455,10 @@ def _check_source(out, q, w, ctx, paged, bs, C):
         rows = slice(b * next_n, (b + 1) * next_n)
         full = _scores(q.value[b], w[rows], keys).float()
         for j in range(next_n):
-            r = b * next_n + j
             n = int(ctx[b, j])
-            nb = (n + bs - 1) // bs
-            what = f"request {b} row {j}"
-            if nb == 0:
-                assert bool((out[r] == -1).all()), what
-                continue
-            padded = torch.full((nb * bs,), -torch.inf, device=out.device)
-            padded[:n] = full[j, :n]
-            score = padded.view(nb, bs).amax(1)
-            score[nb - 1] = torch.inf
-            ids = torch.arange(nb, device=out.device)
-            order = torch.argsort(ids, descending=True, stable=True)
-            order = order[torch.argsort(score[order], descending=True, stable=True)]
-            want = min(C, nb)
-            ref = torch.sort(order[:want]).values.int()
-            got = torch.sort(out[r, :want]).values
-            assert torch.equal(got, ref), what
-            assert bool((out[r, want:] == -1).all()), f"{what}: padding"
+            _check_source_row(
+                out[b * next_n + j], full[j, :n], bs, C, f"request {b} row {j}"
+            )
 
 
 @pytest.mark.parametrize("fp4", [False, True], ids=["fp8", "mxfp4"])

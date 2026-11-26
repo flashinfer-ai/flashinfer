@@ -167,6 +167,43 @@ __device__ __forceinline__ float order_value(uint32_t o) {
 // ---------------------------------------------------------------------------
 constexpr int kResClasses = 3;  // resident classes (res_class_cap)
 
+// The row length past which blocks are split over every SM (stream-K)
+// rather than scored a block a CTA. Splitting adds launches and a selection
+// pass but shares the tiles, so the break-even length grows with the share of
+// the SMs the blocks would take. Constants calibrated on equal-block calls.
+// No whole wave: q blocks of ctas.
+__host__ __device__ __forceinline__ int split_min_keys(int top_k, int q, int ctas) {
+  return 512 + static_cast<int>((3ll * top_k * q) / (2ll * ctas));
+}
+// After whole waves: r blocks past them.
+__host__ __device__ __forceinline__ int rest_min_keys(int r, int ctas) {
+  const long long left = ctas - r > 1 ? ctas - r : 1;
+  return static_cast<int>(1280ll * ctas * ctas / (left * left));
+}
+
+// Candidate consumer rows: each row's listed blocks as a bitmap (duplicates,
+// -1 and blocks past the row ignored) and its listed visible keys.
+struct CandBitsParams {
+  const int32_t* cand;
+  int64_t cand_stride;
+  int num_cands;
+  uint32_t* bits;  // [num_rows, words]
+  int64_t words;
+  int shift;
+  int32_t* listed;
+};
+
+// Candidate source rows: each row's block count, and -inf block entries for
+// rows that start off their query block's tile_base() (store_block_max then
+// merges into them by atomic max).
+struct BlkRowsParams {
+  float* blk;
+  int64_t blk_stride;
+  int32_t* blk_len;
+  int block_q;
+  int shift;
+};
+
 struct RowsParams {
   const int32_t* cu_seqlens_q;      // [S + 1]
   const int32_t* cu_seqlens_k;      // [S + 1]
@@ -178,9 +215,22 @@ struct RowsParams {
   // longer ones. Or null.
   uint32_t* row_classes;
   int class_keys;
+  // One class's blocks past its whole waves (the rest) may leave them for a
+  // split launch; one CTA decides into res_ws (see ScoreParams::res_ws).
+  int32_t* res_ws;
+  int rest_rows;
+  int q_blocks;
+  int rest;
+  int rest_always;  // no whole wave
+  int rest_force;
+  int rest_min_keys;
   int num_rows;
   int num_segments;
   int ratio;
+  // rows_kernel<kRole != 0>: CTAs past rows_ctas take a candidate row each.
+  int rows_ctas;
+  CandBitsParams cb;
+  BlkRowsParams bk;
 };
 
 // Programmatic dependent launch: wait for the previous grid, then let the next
@@ -214,7 +264,8 @@ __device__ __forceinline__ int block_keys(const int32_t* row_ks, const int32_t* 
   return m;
 }
 
-__device__ __forceinline__ void rows_row(const RowsParams& p, int t, int64_t& vis_out) {
+// Row t's visible keys [ks, ks + vis) of the key range.
+__device__ __forceinline__ int64_t row_bounds(const RowsParams& p, int t, int32_t& ks) {
   int lo = 0, hi = p.num_segments;  // last segment with cu_q[s] <= t
   while (hi - lo > 1) {
     const int mid = (lo + hi) >> 1;
@@ -235,31 +286,354 @@ __device__ __forceinline__ void rows_row(const RowsParams& p, int t, int64_t& vi
   const int64_t num = offset + u + 1;
   int64_t vis = num >= 0 ? num / p.ratio : -((-num + p.ratio - 1) / p.ratio);  // floor
   vis = vis < 0 ? 0 : (vis > lk ? lk : vis);
-  p.row_ks[t] = p.cu_seqlens_k[s];
-  p.row_ke[t] = p.cu_seqlens_k[s] + static_cast<int32_t>(vis);
+  ks = p.cu_seqlens_k[s];
+  return vis;
+}
+
+__device__ __forceinline__ void rows_row(const RowsParams& p, int t, int64_t& vis_out) {
+  int32_t ks;
+  const int64_t vis = row_bounds(p, t, ks);
+  p.row_ks[t] = ks;
+  p.row_ke[t] = ks + static_cast<int32_t>(vis);
   vis_out = vis;
 }
 
+// Bounds come from row_bounds rather than the row CTAs' outputs, so both
+// parts of rows_kernel run concurrently.
+__device__ __forceinline__ void cand_bits_row(const RowsParams& p, int r) {
+  extern __shared__ uint32_t sbits[];
+  const CandBitsParams& c = p.cb;
+  int32_t ks;
+  const int len = static_cast<int>(row_bounds(p, r, ks));
+  const int nb = (len + (1 << c.shift) - 1) >> c.shift;
+  const int nw = (nb + 31) >> 5;
+  for (int i = threadIdx.x; i < nw; i += blockDim.x) sbits[i] = 0u;
+  __syncthreads();
+  const int32_t* ids = c.cand + static_cast<int64_t>(r) * c.cand_stride;
+  // Batch the loads; they, not the shared atomics, are the latency.
+  constexpr int kLoads = 8;
+  for (int i0 = threadIdx.x; i0 < c.num_cands; i0 += kLoads * blockDim.x) {
+    int b[kLoads];
+#pragma unroll
+    for (int u = 0; u < kLoads; ++u) {
+      const int i = i0 + u * static_cast<int>(blockDim.x);
+      b[u] = i < c.num_cands ? __ldg(ids + i) : -1;
+    }
+#pragma unroll
+    for (int u = 0; u < kLoads; ++u)
+      if (b[u] >= 0 && b[u] < nb) atomicOr(sbits + (b[u] >> 5), 1u << (b[u] & 31));
+  }
+  __syncthreads();
+  uint32_t* out = c.bits + static_cast<int64_t>(r) * c.words;
+  int n = 0;
+  for (int i = threadIdx.x; i < nw; i += blockDim.x) {
+    out[i] = sbits[i];
+    n += __popc(sbits[i]);
+  }
+  n = __reduce_add_sync(0xffffffffu, n);
+  __shared__ int s_n;
+  if (threadIdx.x == 0) s_n = 0;
+  __syncthreads();
+  if ((threadIdx.x & 31) == 0) atomicAdd(&s_n, n);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int keys = s_n << c.shift;
+    // The last block may be partial.
+    if (nb > 0 && (sbits[(nb - 1) >> 5] >> ((nb - 1) & 31) & 1u)) keys -= (nb << c.shift) - len;
+    c.listed[r] = keys;
+  }
+}
+
+__device__ __forceinline__ void blk_rows_row(const RowsParams& p, int r) {
+  const BlkRowsParams& c = p.bk;
+  int32_t ks;
+  const int len = static_cast<int>(row_bounds(p, r, ks));
+  const int nb = (len + (1 << c.shift) - 1) >> c.shift;
+  if (threadIdx.x == 0) c.blk_len[r] = nb;
+  if (nb == 0) return;
+  int start = INT32_MAX;
+  const int q0 = r / c.block_q * c.block_q;
+  for (int i = 0; i < c.block_q && q0 + i < p.num_rows; ++i) {
+    int32_t s;
+    if (row_bounds(p, q0 + i, s) > 0) start = min(start, s);
+  }
+  if (((ks - start) & ((1 << c.shift) - 1)) == 0) return;
+  float* row = c.blk + static_cast<int64_t>(r) * c.blk_stride;
+  for (int b = threadIdx.x; b < nb; b += blockDim.x) row[b] = -INFINITY;
+}
+
+// kRole 1 / 2 adds a CTA per consumer / source candidate row past rows_ctas.
+template <int kRole = 0>
 __global__ void rows_kernel(const __grid_constant__ RowsParams p) {
   pdl_enter();
-  const int t = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t vis = 0;
-  if (t < p.num_rows) rows_row(p, t, vis);
-  if (p.row_classes != nullptr) {
-    uint32_t m = 0u;
-    if (t < p.num_rows) {
-      const int64_t c = vis > 0 ? (vis - 1) / p.class_keys : 0;
-      m = 1u << (c < kResClasses ? static_cast<int>(c) : kResClasses);
+  if constexpr (kRole != 0) {
+    if (static_cast<int>(blockIdx.x) >= p.rows_ctas) {
+      const int r = static_cast<int>(blockIdx.x) - p.rows_ctas;
+      if constexpr (kRole == 1)
+        cand_bits_row(p, r);
+      else
+        blk_rows_row(p, r);
+      return;
     }
-    m = __reduce_or_sync(0xffffffffu, m);
+  }
+  const int row_ctas = kRole == 0 ? static_cast<int>(gridDim.x) : p.rows_ctas;
+  // With res_ws, one CTA strides over all rows so the maxima reduce within it
+  // (no cross-CTA state that calls on other streams could share).
+  const int t0 = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t vis = 0;
+  int m = 0, mr = 0;
+  for (int t = t0; t < p.num_rows; t += row_ctas * blockDim.x) {
+    rows_row(p, t, vis);
+    m = max(m, static_cast<int>(vis));
+    if (t < p.rest_rows) mr = max(mr, static_cast<int>(vis));
+  }
+  if (p.res_ws != nullptr) {
+    // A rest much shorter than the call's longest row is balanced by the
+    // waves' longest-first order; otherwise it leaves if long enough.
+    m = __reduce_max_sync(0xffffffffu, m);
+    mr = __reduce_max_sync(0xffffffffu, mr);
+    __shared__ int wmax[32][2];
+    if ((threadIdx.x & 31) == 0) {
+      wmax[threadIdx.x >> 5][0] = m;
+      wmax[threadIdx.x >> 5][1] = mr;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int all_max = 0, rest_max = 0;
+      for (int w = 0; w < static_cast<int>(blockDim.x >> 5); ++w) {
+        all_max = max(all_max, wmax[w][0]);
+        rest_max = max(rest_max, wmax[w][1]);
+      }
+      const bool leave = p.rest_force ||
+                         ((p.rest_always || 2 * rest_max >= all_max) && rest_max > p.rest_min_keys);
+      p.res_ws[0] = leave ? p.q_blocks - p.rest : p.q_blocks;
+      p.res_ws[1] = leave;
+      p.res_ws[2] = 0;  // the waves' CTA end count
+    }
+  }
+  if (p.row_classes != nullptr) {
+    uint32_t mask = 0u;
+    if (t0 < p.num_rows) {
+      const int64_t c = vis > 0 ? (vis - 1) / p.class_keys : 0;
+      mask = 1u << (c < kResClasses ? static_cast<int>(c) : kResClasses);
+    }
+    mask = __reduce_or_sync(0xffffffffu, mask);
     __shared__ uint32_t wm[8];
-    if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = m;
+    if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = mask;
     __syncthreads();
     if (threadIdx.x == 0) {
       uint32_t a = 0u;
       for (int w = 0; w < static_cast<int>(blockDim.x >> 5); ++w) a |= wm[w];
       p.row_classes[blockIdx.x] = a;
     }
+  }
+}
+
+// Several resident classes: a class with fewer blocks than the SMs is split
+// when its longest row passes split_min_keys (its blocks into list[c * ctas],
+// count and flag in plan[4 * c], its rows removed from the class masks). The
+// other classes' blocks form the queue. A block's class is that of its
+// longest row, as the waves' launches test it. One CTA.
+struct PlanParams {
+  const int32_t* row_ks;
+  const int32_t* row_ke;
+  int num_rows;
+  int block_q;
+  int q_blocks;
+  int classes;
+  int lo[kResClasses], hi[kResClasses];
+  int ctas;
+  int top_k;
+  uint32_t* row_classes;
+  int row_class_words;
+  int32_t* plan;
+  int32_t* list;
+  int list_cap;
+  // Queue (or null): the whole classes' blocks, ascending by longest row in
+  // 1024-key buckets, block order within a bucket.
+  int32_t* qlist;
+  int32_t* qn;
+};
+
+__global__ void split_plan_kernel(const __grid_constant__ PlanParams p) {
+  pdl_enter();
+  constexpr int kBuckets = 64;
+  // A block's key: class in bits 6-7 (kNone: none), bucket in bits 0-5.
+  // Blocks past kKeyCache recompute it.
+  constexpr int kKeyCache = 32768;
+  constexpr int kNone = 3;
+  __shared__ uint8_t s_key[kKeyCache];
+  __shared__ int s_n[kResClasses];
+  __shared__ int s_max[kResClasses];
+  __shared__ int s_warp[32][kResClasses];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int warps = static_cast<int>(blockDim.x >> 5);
+  const int nt = static_cast<int>(blockDim.x);
+  if (tid < kResClasses) s_max[tid] = 0;
+  auto keys_of = [&](int qb) {
+    int bk = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // block_q <= 4 (32 heads)
+      const int r = qb * p.block_q + i;
+      if (i < p.block_q && r < p.num_rows) bk = max(bk, __ldg(p.row_ke + r) - __ldg(p.row_ks + r));
+    }
+    return bk;
+  };
+  auto pack = [&](int bk) {
+    int c = kNone;
+    for (int k = kResClasses - 1; k >= 0; --k)
+      if ((p.classes >> k & 1) && bk > p.lo[k] && bk <= p.hi[k]) c = k;
+    return c << 6 | min(bk >> 10, kBuckets - 1);
+  };
+  auto key = [&](int qb) {
+    return qb < kKeyCache ? static_cast<int>(s_key[qb]) : pack(keys_of(qb));
+  };
+  __syncthreads();
+  // Four blocks in flight per thread: the loads are the latency.
+  for (int q0 = tid; q0 < min(p.q_blocks, kKeyCache); q0 += 4 * nt) {
+    int b4[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int qb = q0 + j * nt;
+      b4[j] = qb < min(p.q_blocks, kKeyCache) ? keys_of(qb) : 0;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int qb = q0 + j * nt;
+      if (qb < min(p.q_blocks, kKeyCache)) {
+        const int k = pack(b4[j]);
+        s_key[qb] = static_cast<uint8_t>(k);
+        if (k >> 6 != kNone) atomicMax(&s_max[k >> 6], b4[j]);
+      }
+    }
+  }
+  __syncthreads();
+  // Each warp owns a contiguous block range: count, scan the warps' counts,
+  // then place. Lists come out in block order without a per-chunk barrier.
+  const int per = (p.q_blocks + warps - 1) / warps;
+  const int w0 = min(warp * per, p.q_blocks), w1 = min(w0 + per, p.q_blocks);
+  {
+    int cnt[kResClasses] = {};
+    for (int q0 = w0; q0 < w1; q0 += 32) {
+      const int qb = q0 + lane;
+      const int c = qb < w1 ? key(qb) >> 6 : kNone;
+      if (qb < w1 && qb >= kKeyCache && c != kNone) atomicMax(&s_max[c], keys_of(qb));
+#pragma unroll
+      for (int k = 0; k < kResClasses; ++k) cnt[k] += __popc(__ballot_sync(0xffffffffu, c == k));
+    }
+    if (lane == 0)
+      for (int k = 0; k < kResClasses; ++k) s_warp[warp][k] = cnt[k];
+  }
+  __syncthreads();
+  if (tid < kResClasses) {
+    int t = 0;
+    for (int w = 0; w < warps; ++w) t += s_warp[w][tid];
+    s_n[tid] = t;
+  }
+  __syncthreads();
+  uint32_t split = 0u;
+  for (int c = 0; c < kResClasses; ++c)
+    if (s_n[c] > 0 && s_n[c] < p.ctas && s_n[c] <= p.list_cap &&
+        s_max[c] > split_min_keys(p.top_k, s_n[c], p.ctas))
+      split |= 1u << c;
+  if (split != 0u) {
+    int at[kResClasses];
+#pragma unroll
+    for (int k = 0; k < kResClasses; ++k) {
+      at[k] = 0;
+      for (int w = 0; w < warp; ++w) at[k] += s_warp[w][k];
+    }
+    for (int q0 = w0; q0 < w1; q0 += 32) {
+      const int qb = q0 + lane;
+      const int c = qb < w1 ? key(qb) >> 6 : kNone;
+#pragma unroll
+      for (int k = 0; k < kResClasses; ++k) {
+        const uint32_t m = __ballot_sync(0xffffffffu, c == k);
+        if (c == k && (split >> k & 1))
+          p.list[k * p.ctas + at[k] + __popc(m & ((1u << lane) - 1u))] = qb;
+        at[k] += __popc(m);
+      }
+    }
+    for (int i = tid; i < p.row_class_words; i += nt) p.row_classes[i] &= ~split;
+  }
+  bool whole = false;
+  for (int c = 0; c < kResClasses; ++c) whole |= s_n[c] > 0 && !(split >> c & 1);
+  if (p.qlist != nullptr && !whole && tid == 0) {
+    *p.qn = 0;
+    p.qn[1] = 0;  // claim counter
+  }
+  if (p.qlist != nullptr && whole) {
+    // A warp's count per bucket, then its next position in the bucket.
+    __shared__ int s_wb[32][kBuckets];
+    __shared__ int s_tot[kBuckets];
+    auto qkey = [&](int qb) {
+      const int k = key(qb), c = k >> 6;
+      return c != kNone && !(split >> c & 1) ? (k & (kBuckets - 1)) : -1;
+    };
+    for (int b = lane; b < kBuckets; b += 32) s_wb[warp][b] = 0;
+    __syncwarp();
+    for (int q0 = w0; q0 < w1; q0 += 32) {
+      const int qb = q0 + lane;
+      const int b = qb < w1 ? qkey(qb) : -1;
+      const uint32_t same = __match_any_sync(0xffffffffu, b);
+      if (b >= 0 && __popc(same & ((1u << lane) - 1u)) == 0) s_wb[warp][b] += __popc(same);
+      __syncwarp();
+    }
+    __syncthreads();
+    for (int bb = warp; bb < kBuckets; bb += warps) {
+      const int v = lane < warps ? s_wb[lane][bb] : 0;
+      int incl = v;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, incl, o);
+        if (lane >= o) incl += y;
+      }
+      if (lane < warps) s_wb[lane][bb] = incl - v;
+      if (lane == 31) s_tot[bb] = incl;
+    }
+    __syncthreads();
+    // Buckets ascending: claims take from the list's end, longest first.
+    if (warp == 0) {
+      const int t0 = s_tot[lane], t1 = s_tot[lane + 32];
+      int lo = t0;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, lo, o);
+        if (lane >= o) lo += y;
+      }
+      const int lo_total = __shfl_sync(0xffffffffu, lo, 31);
+      int hi = t1;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, hi, o);
+        if (lane >= o) hi += y;
+      }
+      s_tot[lane] = lo - t0;
+      s_tot[lane + 32] = lo_total + hi - t1;
+      if (lane == 31) {
+        *p.qn = lo_total + hi;
+        p.qn[1] = 0;
+      }
+    }
+    __syncthreads();
+    for (int b = lane; b < kBuckets; b += 32) s_wb[warp][b] += s_tot[b];
+    __syncwarp();
+    for (int q0 = w0; q0 < w1; q0 += 32) {
+      const int qb = q0 + lane;
+      const int b = qb < w1 ? qkey(qb) : -1;
+      const uint32_t same = __match_any_sync(0xffffffffu, b);
+      const int rank = __popc(same & ((1u << lane) - 1u));
+      if (b >= 0) p.qlist[s_wb[warp][b] + rank] = qb;
+      __syncwarp();
+      if (b >= 0 && rank == 0) s_wb[warp][b] += __popc(same);
+      __syncwarp();
+    }
+  }
+  if (tid < kResClasses) {
+    p.plan[4 * tid] = 0;
+    p.plan[4 * tid + 1] = split >> tid & 1;
+    p.plan[4 * tid + 2] = s_n[tid];
+    p.plan[4 * tid + 3] = 0;
   }
 }
 
@@ -445,6 +819,12 @@ struct TauParams {
   int res_cap;  // rows of short_block() blocks are the resident route's
 };
 
+// A separate type so that calls without candidates keep TauParams' code.
+struct CandTauParams : TauParams {
+  int seg_base;           // tile_base(): the scan writes block maxima
+  const int32_t* listed;  // consumer rows' listed visible keys, or null
+};
+
 struct FinalizeParams {
   const int32_t* row_ks;
   const int32_t* row_ke;
@@ -516,9 +896,47 @@ struct ScoreParams {
   const uint32_t* row_classes;
   int res_class_ctas;
   int res_class;
+  // Candidate source rows (or null): each row's per-block score maxima.
+  float* blk;
+  int64_t blk_stride;
+  int blk_shift;
+  // Candidate consumer rows (or null): a bitmap of each row's listed blocks.
+  const uint32_t* cand_bits;
+  int64_t cand_words;
+  // Split RESIDENT (kResSplit): the blocks past res_first, when rows_kernel
+  // lets them leave (res_ws: [0] the waves' blocks, [1] leave). Block
+  // res_first + j's row i scores into res_split row j * kBlockQ + i.
+  float* res_split;
+  int res_first;
+  const int32_t* res_ws;
+  int res_wait;  // no waves' launch before it: wait for rows_kernel first
+  // A split class (split_plan_kernel): res_ws[2] blocks, res_list[j].
+  const int32_t* res_list;
+  CandTauParams tau_c;
+  // The waves beside a split launch count their ended CTAs here;
+  // split_select_kernel, the call's last launch, waits for all of them.
+  int32_t* res_done;
+  // No whole wave: the split launch starts at once and joins the waves
+  // through res_done.
+  int res_early;
 };
 
-template <int kNumHeads, bool kFp4>
+template <bool kCand>
+__device__ __forceinline__ const auto& tau_params(const ScoreParams& p) {
+  if constexpr (kCand)
+    return p.tau_c;
+  else
+    return p.tau_p;
+}
+
+__device__ __forceinline__ int split_count(const ScoreParams& p) {
+  return p.res_list != nullptr ? p.res_ws[2] : p.num_units;
+}
+__device__ __forceinline__ int split_block(const ScoreParams& p, int j) {
+  return p.res_list != nullptr ? __ldg(p.res_list + j) : p.res_first + j;
+}
+
+template <int kNumHeads, bool kFp4, bool kSeg = false>
 struct ScoreSmem {
   static constexpr int kBlockQ = 128 / kNumHeads;
   // FP4 tiles are half the bytes: 5 stages, as DeepGEMM's FP4 logits kernel.
@@ -528,7 +946,11 @@ struct ScoreSmem {
   static constexpr int kQOff = 0;
   static constexpr int kKOff = kQOff + kNumQStages * kQBytes;   // 1024-aligned (swizzle atom)
   static constexpr int kScaleOff = kKOff + kKStages * kKBytes;  // per-key fp32 scale / int32 sf
-  static constexpr int kWOff = kScaleOff + kKStages * kBlockKV * 4;
+  // kSeg: tile_base() may be unaligned, so a tile's scales load from its
+  // first key rounded down to 16 bytes (TMA alignment): four more words.
+  static constexpr int kScaleWords = kSeg ? kBlockKV + 4 : kBlockKV;
+  static constexpr int kScaleStage = (kScaleWords * 4 + 127) / 128 * 128;
+  static constexpr int kWOff = kScaleOff + kKStages * kScaleStage;
   static constexpr int kQsfBytes = kFp4 ? kBlockQ * kNumHeads * 4 : 0;  // per (row, head) int32 sf
   static constexpr int kQsfOff = kWOff + kNumQStages * kBlockQ * kNumHeads * 4;
   // EXACT's histogram, or SCAN's candidate staging: a slice of kWarpCap
@@ -582,9 +1004,112 @@ __device__ __forceinline__ int sample_count(const ScoreParams& p, int ntiles_tot
   return min(ntiles_total, n);
 }
 
-// A unit's tile range. Tiles are aligned to 128 keys, so every TMA box is;
-// keys outside a row's visible range are masked.
-template <int kBlockQ, Mode kMode>
+// The first key of a query block's tiles: aligned down to the tile, or, with
+// block maxima, the key itself so that candidate blocks start on the warps'
+// 16-key groups (TMA boxes may start at any key).
+__device__ __forceinline__ int tile_base(int start, bool seg_base) {
+  return seg_base ? start : start & ~(kBlockKV - 1);
+}
+
+// Float atomic max on a word initialized to -inf (sign-split int compare).
+__device__ __forceinline__ void atomic_max_float(float* a, float v) {
+  if (!(__float_as_uint(v) >> 31))
+    atomicMax(reinterpret_cast<int*>(a), __float_as_int(v));
+  else
+    atomicMin(reinterpret_cast<unsigned*>(a), __float_as_uint(v));
+}
+
+// Candidate source rows: per-block maxima of a warp's 16 keys for each of the
+// kBlockQ rows, NaN as +inf, the row's newest block +inf. A quad's lanes hold
+// the same sums, so lane t4 takes row t4 % kBlockQ and one butterfly over g
+// reduces every row. A block shared with a neighbouring warp (rows starting
+// off tile_base()) is merged by atomic max into its -inf-initialized entry.
+template <int kBlockQ>
+__device__ __forceinline__ void store_block_max(float* blk, int64_t stride, int row0, int k0,
+                                                const int (&rks)[kBlockQ],
+                                                const int (&rke)[kBlockQ], int shift,
+                                                const float (&v_0)[kBlockQ],
+                                                const float (&v_1)[kBlockQ], int lane) {
+  const int t4 = lane & 3, g = lane >> 2;
+  const int qi = t4 & (kBlockQ - 1);
+  int ks = rks[0], ke = rke[0];
+  float x_0 = v_0[0], x_1 = v_1[0];
+#pragma unroll
+  for (int i = 1; i < kBlockQ; ++i) {
+    if (qi == i) {
+      ks = rks[i];
+      ke = rke[i];
+      x_0 = v_0[i];
+      x_1 = v_1[i];
+    }
+  }
+  const int len = ke - ks;
+  const int l = k0 - ks;
+  const int l_0 = l + g, l_1 = l_0 + 8;
+  float m_0 = l_0 >= 0 && l_0 < len ? x_0 : -INFINITY;
+  float m_1 = l_1 >= 0 && l_1 < len ? x_1 : -INFINITY;
+  if (m_0 != m_0) m_0 = INFINITY;
+  if (m_1 != m_1) m_1 = INFINITY;
+  const int b0 = l >> shift;  // floor: l < 0 on rows starting past k0
+  const int newest = (len - 1) >> shift;
+  const int mask = (1 << shift) - 1;
+  float* row = blk + static_cast<int64_t>(row0 + qi) * stride;
+  if (__all_sync(0xffffffffu, len <= 0 || (l & mask) == 0)) {
+    // Aligned: blocks of 8 are the two key groups, a block of 16 both.
+    if (shift == 4) m_0 = m_1 = fmaxf(m_0, m_1);
+#pragma unroll
+    for (int o = 4; o < 32; o <<= 1) {
+      m_0 = fmaxf(m_0, __shfl_xor_sync(0xffffffffu, m_0, o));
+      m_1 = fmaxf(m_1, __shfl_xor_sync(0xffffffffu, m_1, o));
+    }
+    const int j = g;
+    if (t4 < kBlockQ && len > 0 && j < (shift == 4 ? 1 : 2)) {
+      const int b = b0 + j;
+      if (b >= 0 && b <= newest) row[b] = b == newest ? INFINITY : (j ? m_1 : m_0);
+    }
+    return;
+  }
+  // Unaligned: up to three blocks touch the warp's keys.
+  const int r_0 = (l_0 >> shift) - b0, r_1 = (l_1 >> shift) - b0;
+  float s[3];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) s[j] = fmaxf(r_0 == j ? m_0 : -INFINITY, r_1 == j ? m_1 : -INFINITY);
+#pragma unroll
+  for (int o = 4; o < 32; o <<= 1) {
+#pragma unroll
+    for (int j = 0; j < 3; ++j) s[j] = fmaxf(s[j], __shfl_xor_sync(0xffffffffu, s[j], o));
+  }
+  const int j = g;
+  if (t4 < kBlockQ && len > 0 && j < 3) {
+    const int b = b0 + j, first = b << shift, last = first + (1 << shift);
+    const float m = b == newest ? INFINITY : (j == 0 ? s[0] : j == 1 ? s[1] : s[2]);
+    if (b >= 0 && b <= newest && first < l + 16 && last > l) {
+      if (first >= l && last <= l + 16)
+        row[b] = m;
+      else if (m != -INFINITY)
+        atomic_max_float(row + b, m);
+    }
+  }
+}
+
+// Consumer rows: keys k0 and k0 + 8 of row r score -inf outside its listed
+// blocks.
+__device__ __forceinline__ void mask_unlisted(const ScoreParams& p, int r, int ks, int ke, int k0,
+                                              float& v_0, float& v_1) {
+  const uint32_t* row = p.cand_bits + static_cast<int64_t>(r) * p.cand_words;
+  const int l_0 = k0 - ks, l_1 = l_0 + 8, len = ke - ks;
+  if (l_0 >= 0 && l_0 < len) {
+    const int b = l_0 >> p.blk_shift;
+    if (!((__ldg(row + (b >> 5)) >> (b & 31)) & 1u)) v_0 = -INFINITY;
+  }
+  if (l_1 >= 0 && l_1 < len) {
+    const int b = l_1 >> p.blk_shift;
+    if (!((__ldg(row + (b >> 5)) >> (b & 31)) & 1u)) v_1 = -INFINITY;
+  }
+}
+
+// A unit's tile range.
+template <int kBlockQ, Mode kMode, bool kSeg = false>
 __device__ __forceinline__ void unit_tiles(const ScoreParams& p, int phase, int unit, int& row0,
                                            int& only_qi, int& base, int& ntiles_total,
                                            int& tile_begin, int& ntiles) {
@@ -617,7 +1142,7 @@ __device__ __forceinline__ void unit_tiles(const ScoreParams& p, int phase, int 
         short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, q_block, p.res_cap))
       end = 0;
   }
-  base = end > start ? start & ~(kBlockKV - 1) : 0;
+  base = end > start ? tile_base(start, kSeg) : 0;
   ntiles_total = end > start ? (end - base + kBlockKV - 1) / kBlockKV : 0;
   if constexpr (kMode == Mode::kSample) {
     // This unit's share [tile_begin, tile_begin + ntiles) of the block's
@@ -654,12 +1179,60 @@ __device__ __forceinline__ int num_units_of(const ScoreParams& p) {
 
 // The sequence of work pieces one CTA processes; the producer and the math
 // warps walk identical copies.
-template <int kBlockQ, Mode kMode, bool kResLo = false>
+constexpr int kMaxSplitBlocks = 256;
+
+// kResSplit: stream-K over the split blocks' tiles.
+template <int kBlockQ, Mode kMode, bool kResLo = false, bool kResSplit = false, bool kQueue = false,
+          bool kSeg = false>
 struct WorkIter {
   int unit, num_units;  // unit mode
   int pos, end, qb;     // stream-K mode: global tile range [pos, end)
 
-  __device__ __forceinline__ explicit WorkIter(const ScoreParams& p) {
+  // Split RESIDENT only: an extra member changes the other kernels' code.
+  struct NoPre {};
+  [[no_unique_address]] std::conditional_t<kResSplit, const int*, NoPre> pre;
+  [[no_unique_address]] std::conditional_t<kResSplit, int, NoPre> owner;
+  __device__ __forceinline__ int owner_block() const {
+    if constexpr (kResSplit)
+      return owner;
+    else
+      return 0;
+  }
+
+  // Queue: the producer claims a block (res_list, from its end) and posts it
+  // in unit[st] for the Q stage it loads next, published by that stage's full
+  // barrier (-1 past the list). The caller passes the ring position per call:
+  // iterator state live across the math warps' tile loop slows it.
+  struct QueueAt {
+    int* unit;
+    uint64_t* full;
+    uint64_t* empty;
+    int* iters;
+    int st;
+    uint32_t parity;
+    int count;
+  };
+
+  __device__ __forceinline__ explicit WorkIter(const ScoreParams& p, const int* res_pre = nullptr) {
+    if constexpr (kResSplit) {
+      pre = res_pre;
+      const int n = split_count(p), total = n > 0 ? pre[n - 1] : 0;
+      const int per = (total + gridDim.x - 1) / gridDim.x;
+      pos = min(static_cast<int>(blockIdx.x) * per, total);
+      end = min(pos + per, total);
+      int lo = 0, hi = n;  // first block whose prefix exceeds pos
+      while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (pre[mid] > pos)
+          hi = mid;
+        else
+          lo = mid + 1;
+      }
+      qb = lo;
+      owner = 0;
+      unit = num_units = 0;
+      return;
+    }
     if (kMode == Mode::kScan && p.tile_prefix != nullptr) {
       const int total = p.num_qblocks > 0 ? __ldg(p.tile_prefix + p.num_qblocks - 1) : 0;
       const int per = (total + gridDim.x - 1) / gridDim.x;
@@ -682,14 +1255,62 @@ struct WorkIter {
     }
   }
 
+  template <class U>
+  __device__ __forceinline__ static QueueAt queue_at(U* unit, uint64_t* full, uint64_t* empty,
+                                                     int* iters, int st, uint32_t parity,
+                                                     int count) {
+    if constexpr (kQueue)
+      return QueueAt{reinterpret_cast<int*>(unit), full, empty, iters, st, parity, count};
+    else
+      return QueueAt{};
+  }
+  template <bool kProducer>
+  __device__ __forceinline__ bool next_queue(const ScoreParams& p, int phase, int& row0,
+                                             int& only_qi, int& base, int& ntiles_total,
+                                             int& tile_begin, int& ntiles, const QueueAt& qa) {
+    if constexpr (kQueue) {
+      int u;
+      if constexpr (kProducer) {
+        mbar_wait_sleep(qa.empty + qa.st, qa.parity ^ 1u);
+        const int n = *p.num_unit_rows;
+        const int pos = atomicAdd(const_cast<int32_t*>(p.num_unit_rows) + 1, 1);
+        u = pos < n ? __ldg(p.res_list + n - 1 - pos) : -1;
+        qa.unit[qa.st] = u;
+        if (u < 0) mbar_arrive(qa.full + qa.st);  // end of list: no TMA bytes
+      } else {
+        mbar_wait(qa.full + qa.st, qa.parity);
+        u = qa.unit[qa.st];
+        if (u < 0 && threadIdx.x == 0) *reinterpret_cast<volatile int*>(qa.iters) = qa.count;
+      }
+      if (u < 0) return false;
+      unit_tiles<kBlockQ, kMode, kSeg>(p, phase, u, row0, only_qi, base, ntiles_total, tile_begin,
+                                       ntiles);
+      return true;
+    }
+    return false;
+  }
+
   __device__ __forceinline__ bool next(const ScoreParams& p, int phase, int& row0, int& only_qi,
                                        int& base, int& ntiles_total, int& tile_begin, int& ntiles) {
+    if constexpr (kResSplit) {
+      if (pos >= end) return false;
+      while (pre[qb] <= pos) ++qb;
+      const int first = qb > 0 ? pre[qb - 1] : 0;
+      unit_tiles<kBlockQ, kMode, kSeg>(p, phase, split_block(p, qb), row0, only_qi, base,
+                                       ntiles_total, tile_begin, ntiles);
+      tile_begin = pos - first;
+      ntiles = min(end, pre[qb]) - pos;
+      owner = qb;
+      pos += ntiles;
+      ++qb;
+      return true;
+    }
     if (kMode == Mode::kScan && p.tile_prefix != nullptr) {
       if (pos >= end) return false;
       while (__ldg(p.tile_prefix + qb) <= pos) ++qb;
       const int first = qb > 0 ? __ldg(p.tile_prefix + qb - 1) : 0;
-      unit_tiles<kBlockQ, kMode>(p, phase, qb * p.kv_splits, row0, only_qi, base, ntiles_total,
-                                 tile_begin, ntiles);
+      unit_tiles<kBlockQ, kMode, kSeg>(p, phase, qb * p.kv_splits, row0, only_qi, base,
+                                       ntiles_total, tile_begin, ntiles);
       tile_begin = pos - first;
       ntiles = min(end, __ldg(p.tile_prefix + qb)) - pos;
       pos += ntiles;
@@ -718,8 +1339,8 @@ struct WorkIter {
         if (p.res_cap > 0 && bk > p.res_cap) continue;
         if (kResLo && p.res_lo > 0 && bk <= p.res_lo) continue;
       }
-      unit_tiles<kBlockQ, kMode>(p, phase, u, row0, only_qi, base, ntiles_total, tile_begin,
-                                 ntiles);
+      unit_tiles<kBlockQ, kMode, kSeg>(p, phase, u, row0, only_qi, base, ntiles_total, tile_begin,
+                                       ntiles);
       // SAMPLE: a short row samples fewer tiles than its block has units.
       if (kMode != Mode::kSample || ntiles > 0) return true;
     }
@@ -730,7 +1351,7 @@ struct WorkIter {
 // Inclusive prefix of tiles per query block (one CTA), for stream-K scans.
 __device__ __forceinline__ void tile_prefix_block(const int32_t* row_ks, const int32_t* row_ke,
                                                   int num_rows, int block_q, int num_qblocks,
-                                                  int res_cap, int32_t* prefix) {
+                                                  int res_cap, bool seg_base, int32_t* prefix) {
   __shared__ int s_warp[32];
   __shared__ int s_carry;
   if (threadIdx.x == 0) s_carry = 0;
@@ -751,7 +1372,7 @@ __device__ __forceinline__ void tile_prefix_block(const int32_t* row_ks, const i
         }
       }
       if (end > start && !short_block(row_ks, row_ke, num_rows, block_q, qb, res_cap)) {
-        const int base = start & ~(kBlockKV - 1);
+        const int base = tile_base(start, seg_base);
         n = (end - base + kBlockKV - 1) / kBlockKV;
       }
     }
@@ -1074,13 +1695,22 @@ __device__ __forceinline__ uint32_t radix_select_desc_if(int n, int want, Fetch 
   return *s_prefix;
 }
 
+template <typename TP>
+__device__ __forceinline__ bool seg_base_of(const TP& p) {
+  if constexpr (std::is_same_v<TP, TauParams>)
+    return false;
+  else
+    return p.seg_base != 0;
+}
+
 // ---------------------------------------------------------------------------
 // A row's threshold from its sample: the m-th largest sampled score with
 // m = ceil(target * sampled / visible); -inf when every visible key fits in
 // the candidate buffer. All threads of the block; key: kSampleSlots words of
 // shared memory.
 // ---------------------------------------------------------------------------
-__device__ __noinline__ void tau_row(const TauParams& p, int r, uint32_t* key) {
+template <typename TP>
+__device__ __noinline__ void tau_row(const TP& p, int r, uint32_t* key) {
   if (p.res_cap > 0 &&
       short_block(p.row_ks, p.row_ke, p.num_rows, p.block_q, r / p.block_q, p.res_cap))
     return;  // the resident route's row
@@ -1089,7 +1719,10 @@ __device__ __noinline__ void tau_row(const TauParams& p, int r, uint32_t* key) {
   __shared__ uint32_t s_prefix;
   __shared__ int s_want, s_eq;
   __syncthreads();  // the previous row's readers are done with the shared state
-  const int visible = p.row_ke[r] - __ldg(p.row_ks + r);
+  int visible = p.row_ke[r] - __ldg(p.row_ks + r);
+  if constexpr (!std::is_same_v<TP, TauParams>) {
+    if (p.listed != nullptr) visible = __ldg(p.listed + r);
+  }
   if (threadIdx.x == 0) p.count[r] = 0;
   if (visible <= p.capacity) {
     if (threadIdx.x == 0) p.tau[r] = -INFINITY;
@@ -1142,19 +1775,21 @@ __device__ __noinline__ void tau_row(const TauParams& p, int r, uint32_t* key) {
 
 // Setup shared by the threshold launch and the fused sample launch: zero the
 // later launches' counters (no fill launch) and write the tile prefix.
-__device__ __forceinline__ void tau_setup(const TauParams& p, bool zero_block, bool prefix_block) {
+template <typename TP>
+__device__ __forceinline__ void tau_setup(const TP& p, bool zero_block, bool prefix_block) {
   if (zero_block && p.zero_words != nullptr && threadIdx.x < p.num_zero_words)
     p.zero_words[threadIdx.x] = 0;
   if (zero_block && threadIdx.x == 0) *p.fallback_count = 0;
   if (prefix_block && p.tile_prefix != nullptr)
     tile_prefix_block(p.row_ks, p.row_ke, p.num_rows, p.block_q, p.num_qblocks, p.res_cap,
-                      p.tile_prefix);
+                      seg_base_of(p), p.tile_prefix);
 }
 
 // The parameters stay in parameter space (__grid_constant__): tau_row and
 // finalize_row take them by reference, which otherwise copies them to every
 // thread's stack (several times these kernels' early-exit cost).
-__global__ void __launch_bounds__(1024) tau_kernel(const __grid_constant__ TauParams p) {
+template <typename TP>
+__global__ void __launch_bounds__(1024) tau_kernel(const __grid_constant__ TP p) {
   __shared__ __align__(16) uint32_t key[kSampleSlots];
   pdl_enter();
   if (p.tile_prefix != nullptr && blockIdx.x == gridDim.x - 1) {
@@ -1909,7 +2544,11 @@ __device__ __noinline__ void sel_row_call(const ScoreParams& p, int r, const flo
   sel_row<8, kStageIdx>(p, r, sc, n, lo, hi, list_k, list_i, bm, hist, hbits, t, ss);
 }
 
-template <int kNumHeads, Mode kMode, bool kFp4, int kResSlotsT = kResSlots>
+// kSeg (block maxima), kMask (candidate masks), kResSplit (split blocks) and
+// kQueue (claimed blocks) are template flags so that the other instantiations
+// carry none of their code.
+template <int kNumHeads, Mode kMode, bool kFp4, int kResSlotsT = kResSlots, bool kSeg = false,
+          bool kMask = false, bool kResSplit = false, bool kQueue = false, bool kWaves = false>
 __global__ void __launch_bounds__(kNumWsThreads, 1)
     score_kernel(const __grid_constant__ ScoreParams p, const __grid_constant__ CUtensorMap tmap_q,
                  const __grid_constant__ CUtensorMap tmap_w,
@@ -1918,9 +2557,55 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
                  const __grid_constant__ CUtensorMap tmap_qsf) {
   // EXACT runs its phases in one cooperative launch.
   constexpr int kNumPhases = kMode == Mode::kExact ? kExactPhases : 1;
-  pdl_enter();
+  // Split RESIDENT reads only rows_kernel's outputs, so it does not wait for
+  // the waves before it and takes the SMs they free. It waits at its exit so
+  // that its end implies theirs, unless the waves count their ends
+  // (res_done): then a launch with no block leaves at once.
+  struct WaitAtExit {
+    bool on;
+    __device__ ~WaitAtExit() {
+      if (on) asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+  };
+  std::conditional_t<kResSplit, WaitAtExit, char> wait_at_exit{};
+  if constexpr (kResSplit) wait_at_exit.on = p.res_done == nullptr;
+  (void)wait_at_exit;
+  // Waves beside a split launch count their ended CTAs; the release orders
+  // the CTA's outputs before the count.
+  constexpr bool kCountEnds =
+      kWaves || (kMode == Mode::kResident && !kResSplit && !kQueue && (kSeg || kMask));
+  auto count_end = [&] {
+    if constexpr (kCountEnds) {
+      if (p.res_done != nullptr && threadIdx.x == 0)
+        asm volatile("red.release.gpu.global.add.s32 [%0], 1;" ::"l"(p.res_done) : "memory");
+    }
+  };
+  if constexpr (kResSplit) {
+    if (p.res_wait) asm volatile("griddepcontrol.wait;" ::: "memory");
+    // The rest stays: with res_done, the select launch joins the waves itself,
+    // and starting it early would only hold SMs the waves need.
+    if (!p.res_ws[1]) {
+      if (p.res_done == nullptr) asm volatile("griddepcontrol.launch_dependents;");
+      return;
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
+  } else if constexpr (kCountEnds) {
+    // Beside a split launch, trigger it early only when the rest leaves: an
+    // early trigger slows this grid's last blocks. With no whole wave
+    // (res_early) it starts at once.
+    const bool beside = p.res_done != nullptr;
+    if (beside && p.res_early) asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (!beside || (!p.res_early && p.num_unit_rows[1]))
+      asm volatile("griddepcontrol.launch_dependents;");
+  } else {
+    pdl_enter();
+  }
   // No listed row (the common case): every CTA leaves before any setup.
-  if (p.num_unit_rows != nullptr && *p.num_unit_rows == 0) return;
+  if (p.num_unit_rows != nullptr && *p.num_unit_rows == 0) {
+    count_end();
+    return;
+  }
   // RESIDENT: no row of this launch's class (the launches are fixed by the
   // shapes; the lengths are known only here): every CTA leaves at once.
   if constexpr (kMode == Mode::kResident) {
@@ -1928,13 +2613,16 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
       bool mine = false;
       for (int i = threadIdx.x; i < p.res_class_ctas; i += blockDim.x)
         mine |= (p.row_classes[i] >> p.res_class) & 1u;
-      if (!__syncthreads_or(mine)) return;
+      if (!__syncthreads_or(mine)) {
+        count_end();
+        return;
+      }
     }
   }
   if constexpr (kMode == Mode::kSample) {
-    if (p.fuse_tail && blockIdx.x == 0) tau_setup(p.tau_p, true, false);
+    if (p.fuse_tail && blockIdx.x == 0) tau_setup(tau_params < kSeg || kMask > (p), true, false);
   }
-  using L = ScoreSmem<kNumHeads, kFp4>;
+  using L = ScoreSmem<kNumHeads, kFp4, kSeg>;
   using F = Fmt<kFp4>;
   constexpr int kKSteps = F::kKSteps;
   constexpr int kBlockQ = L::kBlockQ;
@@ -1953,8 +2641,11 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
   constexpr int kSlots = kResSlotsT;
   constexpr bool kResLo = kResSlotsT != kResSlots;  // a longer class: skip the shorter's blocks
   __shared__ uint64_t res_ready[kSlots], res_free[kSlots];
-  __shared__ int res_claim;         // rows claimed so far
-  __shared__ int res_iters;         // the CTA's blocks (selector 0 counts them)
+  __shared__ int res_claim;
+  __shared__ int res_iters;  // the CTA's blocks
+  // Queue: each Q stage's block, and the blocks the math warps released.
+  __shared__ std::conditional_t<kQueue, int[kNumQStages], char> s_qunit;
+  __shared__ std::conditional_t<kQueue, int, char> res_posted;
   __shared__ int res_row0[kSlots];  // each slot's block
   __shared__ SelShared res_ss[kSelClaimers];
   __shared__ uint32_t res_rng[kSlots][kBlockQ][2];
@@ -1962,6 +2653,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
     if constexpr (kMode == Mode::kResident) {
       res_claim = 0;
       res_iters = -1;
+      if constexpr (kQueue) res_posted = 0;
       for (int i = 0; i < kSlots; ++i) {
         mbar_init(res_ready + i, 1);
         mbar_init(res_free + i, kBlockQ);  // a row each
@@ -1982,6 +2674,55 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
     }
     fence_barrier_init();
   }
+  // Split RESIDENT: the split blocks' inclusive tile prefix.
+  const int* res_pre = nullptr;
+  if constexpr (kResSplit) {
+    __shared__ int s_pre[kMaxSplitBlocks];
+    __shared__ int s_part[kNumWsThreads / 32];
+    res_pre = s_pre;
+    int carry = 0;
+    const int n = split_count(p);
+    for (int j0 = 0; j0 < n; j0 += kNumWsThreads) {
+      const int j = j0 + tid;
+      int tiles = 0;
+      if (j < n) {
+        const int qb = split_block(p, j);
+        int start = INT32_MAX, end = 0;
+#pragma unroll
+        for (int i = 0; i < kBlockQ; ++i) {
+          const int r = qb * kBlockQ + i;
+          if (r < p.num_rows) {
+            const int ks = __ldg(p.row_ks + r), ke = __ldg(p.row_ke + r);
+            if (ke > ks) {
+              start = min(start, ks);
+              end = max(end, ke);
+            }
+          }
+        }
+        // A listed block is in the class by its longest row; its key span
+        // across segments may be longer than the cap.
+        if (end > start && (p.res_list != nullptr || p.res_cap <= 0 || end - start <= p.res_cap))
+          tiles = (end - tile_base(start, kSeg) + kBlockKV - 1) / kBlockKV;
+      }
+      int incl = tiles;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, incl, o);
+        if (lane >= o) incl += y;
+      }
+      if (lane == 31) s_part[warp] = incl;
+      __syncthreads();
+      int total = 0;
+#pragma unroll
+      for (int w = 0; w < kNumWsThreads / 32; ++w) {
+        if (w < warp) incl += s_part[w];
+        total += s_part[w];
+      }
+      if (j < n) s_pre[j] = carry + incl;
+      carry += total;
+      __syncthreads();
+    }
+  }
   __syncthreads();
 
   // RESIDENT: claimer warp c takes the CTA's rows in order from res_claim
@@ -1994,22 +2735,51 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
       // The order and the tests must match WorkIter's, or the handshake on
       // res_ready / res_free never completes.
       int iters = 0;
-      if (c < kSelWarps) {
-        if constexpr (kBlockQ == 4) {
-          for (int pos = blockIdx.x + lane * gridDim.x;
-               pos - static_cast<int>(blockIdx.x) < p.num_units; pos += 32 * gridDim.x) {
-            const int u = res_unit<true>(pos, p.num_units);
-            iters += u >= 0 &&
-                     (p.res_cap <= 0 ||
-                      short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, u, p.res_cap)) &&
-                     !(kResLo && short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, u, p.res_lo));
+      if constexpr (kResSplit) {
+        // split_select_kernel selects the split blocks.
+      } else if (kQueue && c < kSelWarps) {
+        // Queue: the count is known only at the list's end.
+        iters = INT32_MAX;
+      } else if (c < kSelWarps) {
+        // The waves and candidate kernels read the count from the device; the
+        // others keep the host count, whose code the scan's schedule follows.
+        if constexpr (!(kWaves || kSeg || kMask)) {
+          if constexpr (kBlockQ == 4) {
+            for (int pos = blockIdx.x + lane * gridDim.x;
+                 pos - static_cast<int>(blockIdx.x) < p.num_units; pos += 32 * gridDim.x) {
+              const int u = res_unit<true>(pos, p.num_units);
+              iters +=
+                  u >= 0 &&
+                  (p.res_cap <= 0 ||
+                   short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, u, p.res_cap)) &&
+                  !(kResLo && short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, u, p.res_lo));
+            }
+          } else {
+            for (int u = blockIdx.x + lane * gridDim.x; u < p.num_units; u += 32 * gridDim.x)
+              iters += (p.res_cap <= 0 || short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ,
+                                                      p.num_units - 1 - u, p.res_cap)) &&
+                       !(kResLo && short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ,
+                                               p.num_units - 1 - u, p.res_lo));
           }
         } else {
-          for (int u = blockIdx.x + lane * gridDim.x; u < p.num_units; u += 32 * gridDim.x)
-            iters += (p.res_cap <= 0 || short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ,
-                                                    p.num_units - 1 - u, p.res_cap)) &&
-                     !(kResLo && short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ,
-                                             p.num_units - 1 - u, p.res_lo));
+          const int units = num_units_of(p);
+          if constexpr (kBlockQ == 4) {
+            for (int pos = blockIdx.x + lane * gridDim.x;
+                 pos - static_cast<int>(blockIdx.x) < units; pos += 32 * gridDim.x) {
+              const int u = res_unit<true>(pos, units);
+              iters +=
+                  u >= 0 &&
+                  (p.res_cap <= 0 ||
+                   short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, u, p.res_cap)) &&
+                  !(kResLo && short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ, u, p.res_lo));
+            }
+          } else {
+            for (int u = blockIdx.x + lane * gridDim.x; u < units; u += 32 * gridDim.x)
+              iters += (p.res_cap <= 0 || short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ,
+                                                      units - 1 - u, p.res_cap)) &&
+                       !(kResLo && short_block(p.row_ks, p.row_ke, p.num_rows, kBlockQ,
+                                               units - 1 - u, p.res_lo));
+          }
         }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) iters += __shfl_xor_sync(0xffffffffu, iters, o);
@@ -2042,6 +2812,21 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
         const int it = g / kBlockQ, qi = g - it * kBlockQ;
         if (it >= iters) break;
         const int slot = it % kSlots;
+        if constexpr (kQueue) {
+          // Claims run ahead of the unknown count, so a slot's barrier may be
+          // two phases back where a parity wait passes at once: wait for the
+          // block's release (or the list's end) first.
+          bool end = false;
+          while (*reinterpret_cast<volatile int*>(&res_posted) <= it) {
+            const int n = *reinterpret_cast<volatile int*>(&res_iters);
+            if (n >= 0 && it >= n) {
+              end = true;
+              break;
+            }
+            __nanosleep(256);
+          }
+          if (end) break;
+        }
         mbar_wait_sleep(res_ready + slot, (it / kSlots) & 1);
         const int r = res_row0[slot] + qi;
         if (r < p.num_rows) {
@@ -2097,9 +2882,13 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
         if (*p.num_unit_rows == 0) break;  // no flagged row: every CTA leaves at once
       }
       if (issuer) {
-        WorkIter<kBlockQ, kMode, kResLo> work(p);
+        using W = WorkIter<kBlockQ, kMode, kResLo, kResSplit, kQueue, kSeg>;
+        W work(p, res_pre);
         int row0, only_qi, base, ntiles_total, tile_begin, ntiles;
-        for (; work.next(p, phase, row0, only_qi, base, ntiles_total, tile_begin, ntiles);
+        for (; kQueue ? work.template next_queue<true>(
+                            p, phase, row0, only_qi, base, ntiles_total, tile_begin, ntiles,
+                            W::queue_at(&s_qunit, full_q, empty_q, &res_iters, qr.st, qr.parity, 0))
+                      : work.next(p, phase, row0, only_qi, base, ntiles_total, tile_begin, ntiles);
              qr.next()) {
           const int qs = qr.st;
           mbar_wait_sleep(empty_q + qs, qr.parity ^ 1u);
@@ -2123,10 +2912,11 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
                 tma_load_2d(dst, &tmap_k, full_k + st, 0, key0);
               }
             } else {
-              mbar_expect_tx(full_k + st, L::kKBytes + kBlockKV * 4);
+              mbar_expect_tx(full_k + st, L::kKBytes + L::kScaleWords * 4);
               const int key0 = base + (tile_begin + i) * kBlockKV;
               tma_load_2d(smem + L::kKOff + st * L::kKBytes, &tmap_k, full_k + st, 0, key0);
-              tma_load_2d(smem + L::kScaleOff + st * kBlockKV * 4, &tmap_ks, full_k + st, key0, 0);
+              tma_load_2d(smem + L::kScaleOff + st * L::kScaleStage, &tmap_ks, full_k + st,
+                          kSeg ? key0 & ~3 : key0, 0);
             }
           }
         }
@@ -2166,12 +2956,17 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
       if constexpr (kMode == Mode::kExact) {
         if (*p.num_unit_rows == 0) break;
       }
-      WorkIter<kBlockQ, kMode, kResLo> work(p);
+      using W = WorkIter<kBlockQ, kMode, kResLo, kResSplit, kQueue, kSeg>;
+      W work(p, res_pre);
       int row0, only_qi, base, ntiles_total, tile_begin, ntiles;
       int res_it = 0;  // RESIDENT: the block's scratch slot is res_it % kSlots
-      for (; work.next(p, phase, row0, only_qi, base, ntiles_total, tile_begin, ntiles);
+      for (; kQueue
+                 ? work.template next_queue<false>(
+                       p, phase, row0, only_qi, base, ntiles_total, tile_begin, ntiles,
+                       W::queue_at(&s_qunit, full_q, empty_q, &res_iters, qr.st, qr.parity, res_it))
+                 : work.next(p, phase, row0, only_qi, base, ntiles_total, tile_begin, ntiles);
            qr.next()) {
-        if constexpr (kMode == Mode::kResident)
+        if constexpr (kMode == Mode::kResident && !kResSplit)
           mbar_wait(res_free + res_it % kSlots,
                     ((res_it / kSlots) & 1) ^ 1u);  // its selection done
         int rks[kBlockQ], rke[kBlockQ];
@@ -2345,6 +3140,13 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
           ws_n[qi] = 0;
         };
         const int nsamp = kMode == Mode::kSample ? sample_count(p, ntiles_total) : 0;
+        // A never-taken lane-dependent test. Without it, the queue and split
+        // iterators are provably warp-uniform and ptxas moves the tile loop's
+        // stage addressing and barrier wait to the uniform datapath, a form
+        // that stalls more on the tensor pipe for MXFP4.
+        if constexpr (kFp4 && (kQueue || kResSplit)) {
+          if (lane == 0 && p.num_rows < 0) __trap();
+        }
         for (int i = 0; i < ntiles; ++i, kr.next()) {
           const int st = kr.st;
           int key_base = 0;
@@ -2368,7 +3170,8 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
           mbar_wait(full_k + st, kr.parity);
           const uint8_t* kt = smem + L::kKOff + st * L::kKBytes;
           const float* sks =
-              reinterpret_cast<const float*>(smem + L::kScaleOff + st * kBlockKV * 4);
+              reinterpret_cast<const float*>(smem + L::kScaleOff + st * L::kScaleStage) +
+              (kSeg ? base & 3 : 0);
           if constexpr (kMode != Mode::kSample) {
             key_base = base + (tile_begin + i) * kBlockKV + warp * 16;
             if constexpr (kFp4) {
@@ -2391,6 +3194,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
               const bool in_0 = r < num_rows_ && key_0 >= rks[qi] && key_0 < rke[qi];
               const bool in_1 = r < num_rows_ && key_1 >= rks[qi] && key_1 < rke[qi];
               exact_scores(kf, qi, scale_0, scale_1, ksf, v_0, v_1);
+              if constexpr (kMask) mask_unlisted(p, r, rks[qi], rke[qi], key_0, v_0, v_1);
               if (t4 == 0 && r < num_rows_) {
                 float* dst = p.sample + static_cast<int64_t>(r) * kSampleSlots +
                              (tile_begin + i) * kBlockKV + warp * 16;
@@ -2400,15 +3204,23 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
             }
           } else if constexpr (kMode == Mode::kResident) {
             const int key_0 = key_base + g, key_1 = key_base + g + 8;
+            float bv_0[kBlockQ], bv_1[kBlockQ];
 #pragma unroll
             for (int qi = 0; qi < kBlockQ; ++qi) {
               float v_0, v_1;
               exact_scores(kf, qi, scale_0, scale_1, ksf, v_0, v_1);
+              if constexpr (kMask) mask_unlisted(p, row0 + qi, rks[qi], rke[qi], key_0, v_0, v_1);
+              bv_0[qi] = v_0;
+              bv_1[qi] = v_1;
               const bool in_0 = key_0 >= rks[qi] && key_0 < rke[qi];
               const bool in_1 = key_1 >= rks[qi] && key_1 < rke[qi];
               if (t4 == 0) {
-                float* dst = p.res_scratch + static_cast<int64_t>(blockIdx.x) * p.res_cta_words +
-                             (res_it % kSlots * kBlockQ + qi) * p.res_stride;
+                // Addressed from the parameters: no pointer live across the
+                // tile loop.
+                float* dst =
+                    kResSplit ? p.res_split + (work.owner_block() * kBlockQ + qi) * p.res_stride
+                              : p.res_scratch + static_cast<int64_t>(blockIdx.x) * p.res_cta_words +
+                                    (res_it % kSlots * kBlockQ + qi) * p.res_stride;
                 if (in_0) dst[key_0 - rks[qi]] = v_0;
                 if (in_1) dst[key_1 - rks[qi]] = v_1;
               }
@@ -2427,12 +3239,16 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
                 }
               }
             }
+            if constexpr (kSeg)
+              store_block_max<kBlockQ>(p.blk, p.blk_stride, row0, key_base, rks, rke, p.blk_shift,
+                                       bv_0, bv_1, lane);
           } else if constexpr (kMode == Mode::kExact) {
             // Only the listed row's scores; histogram or collect by phase.
             const int qi = only_qi;
             float v_0, v_1;
             exact_scores(kf, qi, scale_0, scale_1, ksf, v_0, v_1);
             const int key_0 = key_base + g, key_1 = key_base + g + 8;
+            if constexpr (kMask) mask_unlisted(p, row0 + qi, rks[qi], rke[qi], key_0, v_0, v_1);
             const bool in_0 = t4 == 0 && key_0 >= rks[qi] && key_0 < rke[qi];
             const bool in_1 = t4 == 0 && key_1 >= rks[qi] && key_1 < rke[qi];
             const uint32_t o_0 = score_order(v_0), o_1 = score_order(v_1);
@@ -2486,13 +3302,23 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
               exact_scores(kf, qi, scale_0, scale_1, ksf, v_0[qi], v_1[qi]);
             }
             const int key_0 = key_base + g, key_1 = key_base + g + 8;
+            if constexpr (kMask) {
+#pragma unroll
+              for (int qi = 0; qi < kBlockQ; ++qi)
+                mask_unlisted(p, row0 + qi, rks[qi], rke[qi], key_0, v_0[qi], v_1[qi]);
+            }
+            if constexpr (kSeg)
+              store_block_max<kBlockQ>(p.blk, p.blk_stride, row0, key_base, rks, rke, p.blk_shift,
+                                       v_0, v_1, lane);
             uint32_t m0[kBlockQ], m1[kBlockQ];
 #pragma unroll
             for (int qi = 0; qi < kBlockQ; ++qi) {
               m0[qi] = __ballot_sync(0xffffffffu, t4 == 0 && key_0 >= rks[qi] && key_0 < rke[qi] &&
-                                                      v_0[qi] >= rtau[qi]);
+                                                      v_0[qi] >= rtau[qi] &&
+                                                      !(kMask && v_0[qi] == -INFINITY));
               m1[qi] = __ballot_sync(0xffffffffu, t4 == 0 && key_1 >= rks[qi] && key_1 < rke[qi] &&
-                                                      v_1[qi] >= rtau[qi]);
+                                                      v_1[qi] >= rtau[qi] &&
+                                                      !(kMask && v_1[qi] == -INFINITY));
             }
             // Most tiles add nothing: one uniform test of every row's masks.
             uint32_t any = 0u;
@@ -2532,7 +3358,9 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
         }
         fence_proxy_async();
         mbar_arrive(empty_q + qs);
-        if constexpr (kMode == Mode::kResident) {
+        if constexpr (kMode == Mode::kResident && kResSplit) {
+          // split_select_kernel selects the split blocks.
+        } else if constexpr (kMode == Mode::kResident) {
           // Each row's order-key range over the block: per warp, then over the
           // 8 warps.
           __shared__ uint32_t s_rng[kNumMathThreads / 32][kBlockQ][2];
@@ -2565,6 +3393,7 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
             }
             res_row0[res_it % kSlots] = row0;
             mbar_arrive(res_ready + res_it % kSlots);  // releases the scores and ranges
+            if constexpr (kQueue) *reinterpret_cast<volatile int*>(&res_posted) = res_it + 1;
           }
           math_barrier();  // s_rng read before the next block's writes
           ++res_it;
@@ -2585,16 +3414,20 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
       __syncthreads();
     }
   }  // roles
+  if constexpr (kCountEnds) {
+    __syncthreads();  // every role's writes before the count
+    count_end();
+  }
 
   // Fused tails: every thread of every CTA, the whole dynamic shared memory.
   if (p.fuse_tail) {
     if constexpr (kMode == Mode::kSample) {
       grid_barrier();  // every row's samples written
       for (int r = blockIdx.x; r < p.num_rows; r += gridDim.x)
-        tau_row(p.tau_p, r, reinterpret_cast<uint32_t*>(smem));
+        tau_row(tau_params < kSeg || kMask > (p), r, reinterpret_cast<uint32_t*>(smem));
       if (blockIdx.x == gridDim.x - 1) {
         __syncthreads();
-        tau_setup(p.tau_p, false, true);
+        tau_setup(tau_params < kSeg || kMask > (p), false, true);
       }
     } else if constexpr (kMode == Mode::kScan) {
       grid_barrier();  // every row's candidates appended

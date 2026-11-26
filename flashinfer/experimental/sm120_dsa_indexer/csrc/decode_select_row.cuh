@@ -52,6 +52,27 @@ struct SelParams {
   int cand_shift;
 };
 
+// Ragged split resident rows (split_select_kernel): ids out in ascending
+// order. A separate parameter block keeps the decode selection's code as is.
+struct SplitSelParams : SelParams {
+  const int32_t* split_on;  // whether the split launch took any block
+  const int32_t* row_ks;
+  const int32_t* row_ke;
+  // Class split: logits row j * split_bq + i is output row
+  // split_list[j] * split_bq + i, for j < *split_n.
+  const int32_t* split_list;
+  const int32_t* split_n;
+  int split_bq;
+  int split_rows;
+  // Or null: the waves' CTAs count their ends here (waves_ctas in all).
+  const int32_t* waves_done;
+  int waves_ctas;
+  // Consumer rows (or null): listed keys, and the listed-block bitmap.
+  const int32_t* split_listed;
+  const uint32_t* split_bits;
+  int split_words;
+};
+
 struct RowSelShared {
   uint32_t hist[4096];
   uint32_t list_k[kSelList];
@@ -448,19 +469,215 @@ __device__ __forceinline__ void rowsel_row(RowSelShared& sh, const float* src, i
   rowsel_overflow<kVecs>(&sh, src, len, lo, hi, above, want, out_i, out_s);
 }
 
+// Rewrites the n selected ids (of a row of at most kRowSelKeys keys) in
+// ascending order, through a bitmap in sh.hist.
+__device__ __noinline__ void rowsel_sort_ids(RowSelShared& sh, const float* src, int n,
+                                             int32_t* out_i, float* out_s) {
+  constexpr int kWords = kRowSelKeys / 32;
+  static_assert(kWords <= kSelThreads && kWords <= 4096, "a word a thread");
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t* bm = sh.hist;
+  __syncthreads();  // the selection is done with sh.hist
+  if (tid < kWords) bm[tid] = 0u;
+  __syncthreads();
+  for (int i = tid; i < n; i += kSelThreads) {
+    const int v = out_i[i];
+    atomicOr(bm + (v >> 5), 1u << (v & 31));
+  }
+  __syncthreads();
+  const uint32_t bits = tid < kWords ? bm[tid] : 0u;
+  const int c = __popc(bits);
+  int incl = c;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int y = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= o) incl += y;
+  }
+  if (lane == 31) sh.wsum[warp] = incl;
+  __syncthreads();
+  int at = incl - c;
+  for (int w = 0; w < warp; ++w) at += sh.wsum[w];
+  for (uint32_t b = bits; b != 0u; b &= b - 1u) {
+    const int id = tid * 32 + __ffs(b) - 1;
+    out_i[at] = id;
+    if (out_s) out_s[at] = __fadd_rn(src[id], 0.0f);
+    ++at;
+  }
+}
+
+// The resident route's longest row.
+constexpr int kSplitRowKeys = 3 * kRowSelKeys;
+
+// Top-k of a split row of (kRowSelKeys, kSplitRowKeys] keys, read from L2:
+// radix passes of 12, 12 and 8 bits find the k-th key; ties at it keep the
+// larger ids, as rowsel_row does.
+__device__ __noinline__ void rowsel_stream(RowSelShared& sh, const float* src, int len, int top_k,
+                                           int32_t* out_i, float* out_s) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t prefix = 0u, pmask = 0u;
+  int rest = top_k;
+  bool done = false;
+#pragma unroll 1
+  for (int pass = 0; pass < 3 && !done; ++pass) {
+    const int shift = pass == 0 ? 20 : pass == 1 ? 8 : 0;
+    const int nb = pass == 2 ? 256 : 4096;
+    __syncthreads();
+    for (int i = tid; i < nb; i += kSelThreads) sh.hist[i] = 0u;
+    __syncthreads();
+    for (int i = tid; i < len; i += kSelThreads) {
+      const uint32_t k = score_order(src[i]);
+      if ((k & pmask) == prefix) atomicAdd(&sh.hist[(k >> shift) & (nb - 1)], 1u);
+    }
+    __syncthreads();
+    rowsel_cut(&sh, nb, rest);
+    const uint32_t c = sh.cut[0];
+    const int left = rest - static_cast<int>(sh.cut[1]);
+    done = sh.cut[2] == static_cast<uint32_t>(left);  // the cut bin wholly kept
+    rest = left;
+    prefix |= c << shift;
+    pmask |= static_cast<uint32_t>(nb - 1) << shift;
+  }
+  // Kept: keys whose masked key is above prefix, and with done those equal to
+  // it; else of the keys equal to prefix (the k-th) the rest largest ids.
+  const int words = (len + 31) >> 5;
+  uint32_t* bm = sh.hist;  // words <= kSplitRowKeys / 32 <= 4096
+  __syncthreads();
+  for (int i0 = 0; i0 < len; i0 += kSelThreads) {
+    const int i = i0 + tid;
+    bool keep = false;
+    if (i < len) {
+      const uint32_t k = score_order(src[i]) & pmask;
+      keep = k > prefix || (done && k == prefix);
+    }
+    const uint32_t b = __ballot_sync(0xffffffffu, keep);
+    if (lane == 0 && (i0 >> 5) + warp < words) bm[(i0 >> 5) + warp] = b;
+  }
+  if (!done) {
+    // The ties, from the largest id down.
+    __syncthreads();
+    int taken = 0;
+    for (int top = len - 1; top >= 0 && taken < rest; top -= kSelThreads) {
+      const int i = top - tid;
+      const bool eq = i >= 0 && (score_order(src[i]) & pmask) == prefix;
+      uint32_t total;
+      const int rank = taken + static_cast<int>(rowsel_excl_sum(eq ? 1u : 0u, sh.wsum, total));
+      if (eq && rank < rest) atomicOr(bm + (i >> 5), 1u << (i & 31));
+      taken += static_cast<int>(total);
+    }
+  }
+  __syncthreads();
+  // Out in ascending ids: thread t's words 2t, 2t + 1.
+  const int w0 = 2 * tid;
+  const uint32_t b0 = w0 < words ? bm[w0] : 0u, b1 = w0 + 1 < words ? bm[w0 + 1] : 0u;
+  uint32_t total;
+  uint32_t at = rowsel_excl_sum(static_cast<uint32_t>(__popc(b0) + __popc(b1)), sh.wsum, total);
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    for (uint32_t b = h == 0 ? b0 : b1; b != 0u; b &= b - 1u) {
+      const int id = (w0 + h) * 32 + __ffs(b) - 1;
+      out_i[at] = id;
+      if (out_s) out_s[at] = __fadd_rn(src[id], 0.0f);
+      ++at;
+    }
+  }
+}
+
+// Moves a split row's len listed keys to the front of the row, in order, and
+// their blocks (at most kRowSelKeys >> 3: blocks hold >= 8 keys) to sblk.
+__device__ __forceinline__ void rowsel_compact(RowSelShared& sh, float* row, const uint32_t* bits,
+                                               int nw, int shift, int len, int32_t* sblk) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, mask = (1 << shift) - 1;
+  const int per = (nw + kSelThreads - 1) / kSelThreads;
+  const int w0 = tid * per, w1 = min(w0 + per, nw);
+  int n = 0;
+  for (int i = w0; i < w1; ++i) n += __popc(__ldg(bits + i));
+  int incl = n;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int y = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= o) incl += y;
+  }
+  if (lane == 31) sh.wsum[warp] = incl;
+  __syncthreads();
+  int at = incl - n;
+  for (int w = 0; w < warp; ++w) at += sh.wsum[w];
+  for (int i = w0; i < w1; ++i)
+    for (uint32_t m = __ldg(bits + i); m; m &= m - 1u) sblk[at++] = (i << 5) + __ffs(m) - 1;
+  __syncthreads();
+  // In place: every thread loads before any stores. A float4 never straddles
+  // a block (blocks of >= 8 keys).
+  float4 f[4];
+#pragma unroll
+  for (int v = 0; v < 4; ++v) {
+    const int base = (tid + v * kSelThreads) * 4;
+    if (base >= len) continue;
+    const float* src = row + ((sblk[base >> shift] << shift) | (base & mask));
+    if (base + 4 <= len) {
+      f[v] = __ldcg(reinterpret_cast<const float4*>(src));
+    } else {  // the last block may be partial: no read past the row
+      f[v].x = __ldcg(src);
+      f[v].y = base + 1 < len ? __ldcg(src + 1) : 0.f;
+      f[v].z = base + 2 < len ? __ldcg(src + 2) : 0.f;
+      f[v].w = 0.f;
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int v = 0; v < 4; ++v) {
+    const int base = (tid + v * kSelThreads) * 4;
+    if (base < len) *reinterpret_cast<float4*>(row + base) = f[v];
+  }
+  __syncthreads();
+}
+
 // Row `row` if it has at most kRowSelKeys keys; a longer row's CTA exits
 // before the dependency wait, freeing its SM for the long rows' CTAs.
-template <bool kDrop>
-__device__ __forceinline__ void rowsel_body(const SelParams& p, RowSelShared& sh, int row) {
+// kSplit: a split resident row (SplitSelParams); sblk holds kRowSelKeys >> 3
+// ints for rowsel_compact.
+template <bool kDrop, bool kSplit = false, typename Params = SelParams>
+__device__ __forceinline__ void rowsel_body(const Params& p, RowSelShared& sh, int row,
+                                            int32_t* sblk = nullptr) {
   const int tid = threadIdx.x;
+  int out_row = row;
+  int split_len = 0;
+  bool compact = false;
+  if constexpr (kSplit) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (*p.split_on == 0) return;
+    if (p.split_list != nullptr) {
+      const int j = row / p.split_bq;
+      if (j >= *p.split_n) return;
+      out_row = __ldg(p.split_list + j) * p.split_bq + row % p.split_bq;
+      if (out_row >= p.split_rows) return;
+    }
+    split_len = max(0, __ldg(p.row_ke + out_row) - __ldg(p.row_ks + out_row));
+    if (p.split_listed != nullptr && split_len > kRowSelKeys) {
+      const int listed = __ldg(p.split_listed + out_row);
+      if (listed >= p.top_k && listed <= kRowSelKeys) {  // in-register selection
+        const int words = (((split_len + (1 << p.cand_shift) - 1) >> p.cand_shift) + 31) >> 5;
+        rowsel_compact(sh, const_cast<float*>(p.logits) + static_cast<int64_t>(row) * p.stride,
+                       p.split_bits + static_cast<int64_t>(out_row) * p.split_words, words,
+                       p.cand_shift, listed, sblk);
+        compact = true;
+        split_len = listed;
+      }
+    }
+    if (split_len > kRowSelKeys) {
+      if (split_len <= kSplitRowKeys && split_len > p.top_k)
+        rowsel_stream(sh, p.logits + static_cast<int64_t>(row) * p.stride, split_len, p.top_k,
+                      p.indices + static_cast<int64_t>(out_row) * p.top_k,
+                      p.scores ? p.scores + static_cast<int64_t>(out_row) * p.top_k : nullptr);
+      return;
+    }
+  }
 #pragma unroll
   for (int i = 0; i < 4; ++i) sh.hist[tid + i * kSelThreads] = 0u;
   if (tid == 0) sh.list_n = sh.out_n = 0u;
-  const int len = __ldg(p.row_len + row);
+  const int len = kSplit ? split_len : __ldg(p.row_len + row);
   if (len > kRowSelKeys) return;
   const int top_k = p.top_k;
-  int32_t* out_i = p.indices + static_cast<int64_t>(row) * top_k;
-  float* out_s = p.scores ? p.scores + static_cast<int64_t>(row) * top_k : nullptr;
+  int32_t* out_i = p.indices + static_cast<int64_t>(out_row) * top_k;
+  float* out_s = p.scores ? p.scores + static_cast<int64_t>(out_row) * top_k : nullptr;
   const float* src = p.logits + static_cast<int64_t>(row) * p.stride;
   asm volatile("griddepcontrol.wait;" ::: "memory");
   if (len <= top_k) {
@@ -475,16 +692,29 @@ __device__ __forceinline__ void rowsel_body(const SelParams& p, RowSelShared& sh
   } else {
     rowsel_row<4>(sh, src, len, top_k, out_i, out_s);
   }
-  if (p.cand != nullptr) {
+  bool mapped = p.cand != nullptr;
+  if constexpr (kSplit) {
+    // Sort before mapping: rowsel_sort_ids reads scores by position.
+    rowsel_sort_ids(sh, src, min(len, top_k), out_i, out_s);
+    mapped = compact;
+  }
+  if (mapped) {
     // The selection's writes, made by any thread, are visible after the
     // barrier. The blocks ascend, so the order of positions is the order of
     // keys and ties still go to the larger key.
     __syncthreads();
-    const int32_t* blocks = p.cand + static_cast<int64_t>(row) * p.cand_stride;
     const int shift = p.cand_shift, mask = (1 << shift) - 1;
-    for (int i = tid; i < top_k; i += kSelThreads) {
-      const int v = out_i[i];
-      if (v >= 0) out_i[i] = (__ldg(blocks + (v >> shift)) << shift) | (v & mask);
+    if constexpr (kSplit) {
+      for (int i = tid; i < top_k; i += kSelThreads) {
+        const int v = out_i[i];
+        if (v >= 0) out_i[i] = (sblk[v >> shift] << shift) | (v & mask);
+      }
+    } else {
+      const int32_t* blocks = p.cand + static_cast<int64_t>(row) * p.cand_stride;
+      for (int i = tid; i < top_k; i += kSelThreads) {
+        const int v = out_i[i];
+        if (v >= 0) out_i[i] = (__ldg(blocks + (v >> shift)) << shift) | (v & mask);
+      }
     }
   }
   if constexpr (kDrop) {

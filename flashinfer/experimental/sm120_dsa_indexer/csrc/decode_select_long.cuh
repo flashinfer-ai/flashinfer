@@ -529,4 +529,54 @@ __global__ void __launch_bounds__(kSelThreads, 1)
   }
 }
 
+// Ragged split resident rows, a CTA a row.
+__global__ void __launch_bounds__(kSelThreads, 1)
+    split_select_kernel(const __grid_constant__ SplitSelParams p) {
+  __shared__ __align__(16) LongShared sh;
+  __shared__ int32_t blocks[kRowSelKeys >> 3];  // rowsel_compact
+  rowsel_body<false, true>(p, sh, static_cast<int>(blockIdx.x), blocks);
+  // The call's last launch: its end must imply the waves' end.
+  if (p.waves_done != nullptr && blockIdx.x == 0 && threadIdx.x == 0)
+    while (static_cast<int>(ld_acquire_gpu(reinterpret_cast<const uint32_t*>(p.waves_done))) <
+           p.waves_ctas)
+      __nanosleep(256);
+}
+
+// Candidate source rows: the histogram of a long block row, built after
+// scoring because ragged block maxima merge by atomics and are final only
+// then. CTA (row, slice) counts kRowSelKeys blocks at the row's epoch parity.
+struct BlockHistParams {
+  const float* blk;  // [num_rows, stride]
+  int64_t stride;
+  const int32_t* blk_len;
+  uint32_t* long_ws;  // [num_rows][kLongWords]
+  int num_rows;
+  int slices;  // CTAs per row
+};
+
+__global__ void __launch_bounds__(kSelThreads)
+    block_hist_kernel(const __grid_constant__ BlockHistParams p) {
+  pdl_enter();
+  const int r = blockIdx.x / p.slices, slice = blockIdx.x % p.slices;
+  const int n = p.blk_len[r];
+  const int lo = slice * kRowSelKeys, hi = min(n, lo + kRowSelKeys);
+  if (n <= kRowSelKeys || lo >= hi) return;
+  __shared__ uint32_t h[4096];
+  for (int b = threadIdx.x; b < 4096; b += kSelThreads) h[b] = 0u;
+  __syncthreads();
+  const float* row = p.blk + static_cast<int64_t>(r) * p.stride;
+  for (int i = lo + static_cast<int>(threadIdx.x); i < hi; i += kSelThreads)
+    atomicAdd(h + rowsel_bin(__ldcg(row + i)), 1u);
+  __syncthreads();
+  uint32_t* ws = p.long_ws + static_cast<int64_t>(r) * kLongWords;
+  const uint32_t par = __ldcg(ws + kLongCtr + kCtrEpoch) & 1u;
+  float* hist = reinterpret_cast<float*>(ws + kLongHist0 + par * 4096);
+  for (int b = threadIdx.x * 4; b < 4096; b += kSelThreads * 4) {
+    const uint4 v = *reinterpret_cast<const uint4*>(h + b);
+    if (v.x | v.y | v.z | v.w)
+      red_add_v4_f32_gpu(hist + b, static_cast<float>(v.x), static_cast<float>(v.y),
+                         static_cast<float>(v.z), static_cast<float>(v.w));
+  }
+}
+
 }  // namespace flashinfer::sm120_dsa_indexer
