@@ -2030,7 +2030,7 @@ def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads, capacity):
 def test_quantized_kv_reuses_compiled_kernel_across_row_buckets(
     monkeypatch, cache_format
 ):
-    """Graph batch buckets share a compiled profile while balancing their live grids."""
+    """Row buckets that select the same profile reuse one compiled kernel."""
     import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
     compile_kernel = mla_decode_module._get_compiled_mla_decode

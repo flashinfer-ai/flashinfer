@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the flashinfer public surface of the Cake Gated DeltaProduct (GDP)
-decode kernels (SM90 / SM100 / SM103 / SM107; FP16 state pool on SM100 / SM103 /
-SM107): the ``flashinfer.cake_gdp`` facade and its re-export from the
+decode kernels (SM90 / SM100 / SM103 / SM107; FP32 or FP16 state pool): the
+``flashinfer.cake_gdp`` facade and its re-export from the
 ``flashinfer`` top-level package.  The facade's entry point is a pass-through
 to ``flashinfer.cake_gdp_backend``;
 this module checks that identity (same objects at the top level, the
@@ -191,8 +191,8 @@ def test_facade_matches_the_backend(n: int, T: int) -> None:
 
 @pytest.mark.parametrize("seeded", (False, True))
 def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
-    """Over an FP16 pool (SM100 / SM103 / SM107), to nearest or with stochastic rounding: the facade forwards the
-    seed and the round count, so output and pool bits equal the backend's."""
+    """Over an FP16 pool, to nearest or with stochastic rounding: the facade forwards the seed and the round count,
+    so output and pool bits equal the backend's."""
     if not loader.route_applies(
         device_capability=get_compute_capability(_device()),
         num_householder=3,
@@ -220,8 +220,14 @@ def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
 
 # The Philox round count from which the runtime n = 3 snapshot_noise sibling serves a stochastic snapshot call
 # below 3 x SM state heads (within (3 x SM, 4 x SM] it serves from 11 on SM100 / SM103 and from 16 on SM107, and
-# above 124 x SM from 11 on SM107).
-SNAPSHOT_NOISE_RUNTIME_ROUNDS = {"sm_100a": 10, "sm_103a": 10, "sm_107a": 10}
+# above 124 x SM from 11 on SM107).  On SM90 it serves within (2 x SM, 3 x SM] only: the test's 24 state heads (at
+# most 2 x SM) run the row-split runtime program of n = 3 in every launch class (None).
+SNAPSHOT_NOISE_RUNTIME_ROUNDS = {
+    "sm_90a": None,
+    "sm_100a": 10,
+    "sm_103a": 10,
+    "sm_107a": 10,
+}
 
 
 @pytest.mark.parametrize(
@@ -232,8 +238,9 @@ def test_facade_fp16_launch_class_picks_the_snapshot_noise_sibling(
 ) -> None:
     """A facade call over an FP16 pool that stores per-token snapshots at T = 10 (the runtime program of three
     Householder updates) launches that program's ``snapshot_noise`` sibling when it rounds stochastically with at
-    least the architecture's round count (10 at these state heads, on every architecture), and the plain program
-    below it (5 and 9 rounds) or when it rounds to nearest even; output and pool bits equal the backend's."""
+    least the architecture's round count (at these state heads 10 on SM100 / SM103 / SM107), and the plain program
+    below it (5 and 9 rounds) or when it rounds to nearest even; on SM90 these state heads launch the row-split
+    runtime program (two CTAs per state head) in every launch class; output and pool bits equal the backend's."""
     capability = get_compute_capability(_device())
     if not loader.route_applies(
         device_capability=capability,
@@ -268,8 +275,13 @@ def test_facade_fp16_launch_class_picks_the_snapshot_noise_sibling(
     inputs["initial_state"].copy_(pool_before)
     out_backend, _ = backend.cake_gated_delta_product_mtp(**inputs)
     assert len(launched) == 2 and launched[0] == launched[1], launched
-    sibling = bool(loader.MODULES[launched[0]]["build"].get("snapshot_noise"))
-    assert sibling == (seeded and rounds >= edge), launched
+    record = loader.MODULES[launched[0]]
+    sibling = bool(record["build"].get("snapshot_noise"))
+    if edge is None:
+        assert not sibling and record["grid_rule"]["ctas_per_state"] == 2, launched
+        assert record["build"]["t_steps"] is None, launched
+    else:
+        assert sibling == (seeded and rounds >= edge), launched
     assert _same_bits(out, out_backend)
     assert _same_bits(pool_facade, inputs["initial_state"])
     assert not torch.equal(pool_facade[8], pool_before[8])

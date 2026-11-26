@@ -2702,8 +2702,6 @@ def _resolve_sparse_mla_plan(
     dtype_name = "bf16" if q_dtype == torch.bfloat16 else "e4m3"
     if family == "2cta":
         active_clusters = sm_count // 2
-        # Keep the physical device limit batch-independent. Quantized
-        # persistent launches balance their grid from live tensor extents.
         kernel = MlaDecodeTs(
             page_size=1,
             max_active_clusters=active_clusters,

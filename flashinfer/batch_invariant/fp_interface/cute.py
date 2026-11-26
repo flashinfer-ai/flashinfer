@@ -75,8 +75,14 @@ class CuteF32:
 
     @staticmethod
     def ex2(a):
-        """``ex2.approx.ftz.f32``, pinned as inline asm: the attention class's opaque exponential."""
+        """``ex2.approx.ftz.f32``, pinned as inline asm: the attention class's opaque exponential (and the MoE hardware
+        activation classes')."""
         return ex2_approx_ftz(a)
+
+    @staticmethod
+    def rcp(a):
+        """``rcp.approx.ftz.f32``, pinned as inline asm: the MoE hardware activation classes' opaque reciprocal."""
+        return rcp_approx_ftz(a)
 
     @staticmethod
     def cvt_out(a, fmt_name: str):
@@ -99,6 +105,23 @@ def ex2_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip)],
             "ex2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
+    """PTX ``rcp.approx.ftz.f32`` (MUFU.RCP), deterministic per architecture: ``rcp(+-0) = +-inf``, ``rcp(+-inf) = +-0``, a
+    subnormal input is treated as a signed zero, results below ``2^-126`` flush to a signed zero."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "rcp.approx.ftz.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
             is_align_stack=False,
