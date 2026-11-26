@@ -19,8 +19,8 @@ restore of ``a`` and the dense GEMM ``gemm_fp4``, which reads the ``[N, K/2]`` w
 leaves out ``a``'s E8M0 scales, which ``gemm_fp4`` applies with ``b``'s per 32-value block.
 The ``trtllm`` backend's ``b`` and ``b_descale`` (``nvfp4_quantize(do_shuffle=True)``) are read
 in their row shuffle, and an 8x4-swizzled ``a_descale`` is restored as such.
-``mm_nvfp4_svdquant`` and ``mm_nvfp4_lora`` run the same GEMM into FP32 and add the low-rank
-term there, rounded once to ``out``.
+``mm_nvfp4_svdquant`` runs the same GEMM into FP32 and adds the low-rank term there, rounded
+once to ``out``.
 """
 
 import functools
@@ -614,27 +614,8 @@ def sm8x_mm_fp4_runner(
     return Sm8xMmFp4Runner(shuffled, use_8x4_sf_layout)
 
 
-def _lora_epilogue(
-    c: torch.Tensor,
-    d: Optional[torch.Tensor],
-    l1: Optional[torch.Tensor],
-    s: Optional[torch.Tensor],
-    gate: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
-    out: torch.Tensor,
-) -> None:
-    """``out = c + s * (d @ l1.T) + bias`` from the FP32 ``c``, rounded once. A ``gate`` equal
-    to zero (read on the device) keeps ``c`` bitwise; without ``d`` the term is left out."""
-    if d is not None:
-        lora = c.addcmul(d.float() @ l1.float().t(), s.reshape(1))
-        c = lora if gate is None else torch.where(gate.reshape(1) == 0, c, lora)
-    if bias is not None:
-        c = c + bias.float()
-    out.copy_(c)
-
-
 @functools.cache
-def _nvfp4_lora_tuning() -> TuningConfig:
+def _nvfp4_svdquant_tuning() -> TuningConfig:
     from ..fused_moe.utils import (
         get_hybrid_num_tokens_buckets,
         map_to_hybrid_bucket_uncapped,
@@ -653,34 +634,38 @@ def _nvfp4_lora_tuning() -> TuningConfig:
     )
 
 
-def sm8x_mm_nvfp4_lora(
+def sm8x_mm_nvfp4_svdquant(
     a: torch.Tensor,
     b: torch.Tensor,
     a_sf: torch.Tensor,
     b_sf: torch.Tensor,
     alpha: torch.Tensor,
-    d: Optional[torch.Tensor],
-    l1: Optional[torch.Tensor],
-    s: Optional[torch.Tensor],
-    gate: Optional[torch.Tensor],
+    d: torch.Tensor,
+    l1: torch.Tensor,
     bias: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    """``mm_nvfp4_svdquant`` and ``mm_nvfp4_lora`` on SM8x: the FP32 ``alpha * (a @ b.T)`` of
-    the NVFP4 ``a`` ``(M, K/2)`` and ``b`` ``(N, K/2)`` with their 128x4-swizzled scales, then
-    ``_lora_epilogue``."""
+    """``mm_nvfp4_svdquant`` on SM8x: ``out = alpha * (a @ b.T + d @ l1.T) + bias`` from the
+    FP32 product of the NVFP4 ``a`` ``(M, K/2)`` and ``b`` ``(N, K/2)`` with their
+    128x4-swizzled scales, rounded once; one ``alpha`` on the summed terms as the SM100
+    epilogue."""
     m, n = int(out.shape[0]), int(out.shape[1])
     if m == 0:
         return
     acc = torch.empty((m, n), dtype=torch.float32, device=a.device)
     inputs = [
-        a, b.t(), _flat_bytes(a_sf), _flat_bytes(b_sf), alpha, torch.float32, acc, 16, True,
+        a, b.t(), _flat_bytes(a_sf), _flat_bytes(b_sf), _ones(a.device), torch.float32,
+        acc, 16, True,
     ]  # fmt: skip
     chosen, tactic = AutoTuner.get().choose_one(
-        "mm_nvfp4_lora_sm8x",
+        "mm_nvfp4_svdquant_sm8x",
         [Sm8xMmFp4Runner(False, False)],
-        _nvfp4_lora_tuning(),
+        _nvfp4_svdquant_tuning(),
         inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
-    _lora_epilogue(acc, d, l1, s, gate, bias, out)
+    acc += d.float() @ l1.float().t()
+    acc *= alpha.reshape(1)
+    if bias is not None:
+        acc += bias.float()
+    out.copy_(acc)

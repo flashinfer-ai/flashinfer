@@ -1118,11 +1118,16 @@ def mm_nvfp4_svdquant(
     alpha_scalar = alpha.reshape(-1)[:1]
 
     if get_compute_capability(a.device)[0] == 8:
-        from .sm8x_fp4_dense import sm8x_mm_nvfp4_lora
+        if backend in ("cutlass", "auto"):
+            # The SM100 CUTLASS launcher's operand contract.
+            for name, t in (("d", d), ("l1", l1)):
+                if t.data_ptr() % 16 != 0:
+                    raise ValueError(f"{name} must be 16-byte aligned for TMA")
+            if bias is not None and not bias.is_contiguous():
+                raise ValueError("bias must be contiguous")
+        from .sm8x_fp4_dense import sm8x_mm_nvfp4_svdquant
 
-        sm8x_mm_nvfp4_lora(
-            a, b, a_sf, b_sf, alpha_scalar, d, l1, alpha_scalar, None, bias, out
-        )
+        sm8x_mm_nvfp4_svdquant(a, b, a_sf, b_sf, alpha_scalar, d, l1, bias, out)
         return out
 
     if backend == "cake":
@@ -1322,6 +1327,13 @@ def nvfp4_quantize_smooth(
     x, pre_quant_scale = _normalize_nvfp4_quantize_smooth_inputs(x, pre_quant_scale)
     # SM8x runs the stock quantizer on x * pre_quant_scale.
     if get_compute_capability(x.device)[0] == 8:
+        # The SM100 launcher's checks, ahead of its empty-batch return.
+        if global_scale.dtype != torch.float32 or not global_scale.is_contiguous():
+            raise ValueError("global_scale must be a contiguous float32 tensor")
+        if global_scale.device != x.device:
+            raise ValueError("global_scale must be on the device of x")
+        if global_scale.numel() < 1:
+            raise ValueError("global_scale must contain at least one element")
         if x.shape[0] == 0:
             return (
                 torch.empty(0, x.shape[1] // 2, dtype=torch.uint8, device=x.device),
