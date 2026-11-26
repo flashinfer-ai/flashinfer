@@ -133,21 +133,31 @@ __device__ __forceinline__ float2 x2_f(XT2 v) {
   return RECORDS_X(__bfloat1622float2, __half22float2)(v);
 }
 __device__ __forceinline__ float x_round(float v) { return static_cast<float>(to_x(v)); }
-// RECORDS_OUT_F16 (a BF16 module): GEMM2 alone (no finalize, no row scales) writes FP16, rounded
-// once from FP32 (the dense mm_bf16_fp4's float16 output). OT: GEMM2's output type.
-#ifdef RECORDS_OUT_F16
-static_assert(!kF16, "RECORDS_OUT_F16 is a BF16 module's");
-constexpr bool kOutF16 = true;
+// RECORDS_OUT_F16, RECORDS_OUT_F32 (a BF16 module): GEMM2 alone (no finalize, no row scales)
+// writes FP16, rounded once from FP32, or FP32 (the dense GEMMs' float16, float32 outputs). OT:
+// GEMM2's output type.
+#if defined(RECORDS_OUT_F16) || defined(RECORDS_OUT_F32)
+static_assert(!kF16, "RECORDS_OUT_F16 and RECORDS_OUT_F32 are a BF16 module's");
+constexpr bool kOutOnly = true;
+#else
+constexpr bool kOutOnly = false;
+#endif
+#if defined(RECORDS_OUT_F16)
 using OT = __half;
 __device__ __forceinline__ OT to_o(float v) { return __float2half_rn(v); }
 __device__ __forceinline__ __half2 to_o2(float lo, float hi) { return __floats2half2_rn(lo, hi); }
+constexpr DLDataType kOdl = dl_float16;
+#elif defined(RECORDS_OUT_F32)
+using OT = float;
+__device__ __forceinline__ OT to_o(float v) { return v; }
+__device__ __forceinline__ XT2 to_o2(float lo, float hi) { return to_x2(lo, hi); }  // 2 B OT only
+constexpr DLDataType kOdl = dl_float32;
 #else
-constexpr bool kOutF16 = false;
 using OT = XT;
 __device__ __forceinline__ OT to_o(float v) { return to_x(v); }
 __device__ __forceinline__ XT2 to_o2(float lo, float hi) { return to_x2(lo, hi); }
+constexpr DLDataType kOdl = kXdl;
 #endif
-constexpr DLDataType kOdl = kOutF16 ? dl_float16 : kXdl;
 
 __device__ __forceinline__ void lds64v(uint32_t* d, uint32_t a) {
   asm volatile("ld.volatile.shared.v2.u32 {%0, %1}, [%2];" : "=r"(d[0]), "=r"(d[1]) : "r"(a));
@@ -878,7 +888,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
                    (e * p.N + c * kTileN + (SH ? shuffled_row(tid >> 2) : tid >> 2)) * (K / 2) +
                    iks * (kTileK / 2) + (tid & 3) * 16;
         gsf = MX ? p.sf + ((e * ((p.N + 127) / 128) + c) * p.nka + iks) * 512 + (tid & 31) * 16
-                 : p.sf + (static_cast<long>(c) * p.nka + 2 * iks) * 512 +
+                 : p.sf + ((e * ((p.N + 127) / 128) + c) * p.nka + 2 * iks) * 512 +
                        (SH ? shuffled_row(tid) : tid) * 16;
       } else if constexpr (KT) {
         gws[rec] = p.w + (e * record_chunks + c) * cbytes + tid * 16;
@@ -1100,7 +1110,8 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
     // count are padding that GEMM2 zero-fills on load, so they are not stored.
     constexpr bool kSkipPad = !kSm90 && R == 8 && ACT != 0;
     [[maybe_unused]] const int prows = kSkipPad ? p.block_rows[b] : R;
-    if constexpr (ACT == 0 && (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))) {
+    if constexpr (ACT == 0 && sizeof(OT) == 2 &&
+                  (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))) {
       // v[s][gi][2 hh + h] is column ws 16 + 8 hh + g8, row gi 8 + 2 tq + h:
       // per (s, gi, hh) an 8 x 8 piece, columns x rows, one bf16 pair (rows 2
       // tq, 2 tq + 1) per lane. Transposed, lane (g8, tq) holds row gi 8 + g8,
@@ -3120,9 +3131,9 @@ void w4a16_moe_sm80_gemm(
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(act, kXdl);
   CHECK_INPUT_AND_TYPE(out, kOdl);
-  TVM_FFI_ICHECK(!kOutF16 ||
+  TVM_FFI_ICHECK(!kOutOnly ||
                  (activation == 0 && !topk_weights.has_value() && !row_scales.has_value()))
-      << "the FP16-output module runs GEMM2 alone";
+      << "the FP16- and FP32-output modules run GEMM2 alone";
   TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(act.data_ptr()) & 15) == 0 &&
                  (reinterpret_cast<uintptr_t>(records.data_ptr()) & 15) == 0)
       << "act and records must be 16 B aligned";
@@ -3346,13 +3357,13 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
                              tvm::ffi::Optional<TensorView> act_sf, bool shuffled,
                              tvm::ffi::Optional<TensorView> act_sf_off, int64_t act_shift) {
   // act_sf: MXFP4 (E8M0 scales of both operands, the activation's 128x4 [pad(M, 128)][4 nka]).
-  // act_sf_off (MX, int32 [groups]): w, sf and act_sf as GemmParamsMx's groups, act block-ordered.
-  // act_shift: MXFP4's sh.
+  // act_sf_off (int32 [groups]): w, sf (NVFP4 too, group e's at e [pad(N, 128)][4 nka]) and
+  // act_sf as GemmParamsMx's groups, act block-ordered, alpha [groups]. act_shift: MXFP4's sh.
   const bool mx = act_sf.has_value();
   const int64_t groups = act_sf_off.has_value() ? act_sf_off.value().numel() : 1;
-  TVM_FFI_ICHECK(mx || groups == 1) << "act_sf_off: MXFP4";
   TVM_FFI_ICHECK(act_shift == 0 || (mx && act_shift == 7)) << "act_shift: 0, or MXFP4's 7";
-  TVM_FFI_ICHECK(!shuffled || (!mx && N % 32 == 0)) << "shuffled weights: NVFP4, N % 32 == 0";
+  TVM_FFI_ICHECK(!shuffled || (!mx && N % 32 == 0 && groups == 1))
+      << "shuffled weights: NVFP4, N % 32 == 0, one group";
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(sf, dl_uint8);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
@@ -3364,8 +3375,8 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   TVM_FFI_ICHECK(N > 0 && K > 0 && K % 32 == 0 && Nout % 8 == 0 && Nout <= n_pad)
       << "W4A16 dense FP4 GEMM: shape";
   TVM_FFI_ICHECK(w.numel() >= groups * N * (K / 2) && sf.numel() >= groups * n_pad * nka * 4 &&
-                 alpha.numel() >= (alpha_rows ? out.size(0) : 1))
-      << "w [N, K / 2], sf [pad(N, 128), pad(K / 16, 4)], alpha [1] or [rows]";
+                 alpha.numel() >= (alpha_rows ? out.size(0) : groups))
+      << "w [N, K / 2], sf [pad(N, 128), pad(K / 16, 4)], alpha [groups] or [rows]";
   if (mx) {
     const TensorView asf = act_sf.value();
     CHECK_INPUT_AND_TYPE(asf, dl_uint8);
@@ -3373,9 +3384,9 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
         (act_sf_off.has_value() || asf.numel() >= (out.size(0) + 127) / 128 * 128 * nka * 4) &&
         (reinterpret_cast<uintptr_t>(asf.data_ptr()) & 3) == 0)
         << "act_sf [pad(M, 128), pad(K / 32, 4)], 4 B aligned";
-    if (act_sf_off.has_value()) {
-      CHECK_INPUT_AND_TYPE(act_sf_off.value(), dl_int32);
-    }
+  }
+  if (act_sf_off.has_value()) {
+    CHECK_INPUT_AND_TYPE(act_sf_off.value(), dl_int32);
   }
   TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(w.data_ptr()) & 15) == 0 &&
                  (reinterpret_cast<uintptr_t>(sf.data_ptr()) & 15) == 0 &&

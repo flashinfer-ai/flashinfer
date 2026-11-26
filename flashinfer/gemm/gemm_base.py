@@ -2010,7 +2010,7 @@ def ragged_bmm(
     raise ValueError(f"Unsupported backend for ragged_bmm: {backend!r}")
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 110, 120, 121])
 def _cutile_ragged_block_scaled_bmm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2108,6 +2108,12 @@ def ragged_block_scaled_bmm(
     torch.Tensor
         The ragged block-scaled output tensor.
     """
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs it on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_ragged_block_scaled_bmm
+
+        return sm8x_ragged_block_scaled_bmm(
+            a, b, a_scale, b_scale, m_indptr, max_m_device, out_dtype, segment_alignment
+        )
     if backend == "cutile":
         from .kernels.cutile.ragged_block_scaled_bmm_cutile import (
             ragged_block_scaled_bmm as _ragged_block_scaled_bmm_cutile,
@@ -2130,7 +2136,7 @@ def ragged_block_scaled_bmm(
     raise ValueError(f"Unsupported backend for ragged_block_scaled_bmm: {backend!r}")
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 110, 120, 121])
 def _cutile_masked_scaled_bmm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2205,6 +2211,13 @@ def masked_scaled_bmm(
     torch.Tensor
         The output tensor ``C`` of shape ``(Q, M, N)``.
     """
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs it on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_masked_scaled_bmm
+
+        return sm8x_masked_scaled_bmm(
+            a, b, a_scale, b_scale, masked_m, block_scale_type, max_m_device,
+            transpose_a, transpose_b, out_dtype,
+        )  # fmt: skip
     if backend == "cutile":
         from .kernels.cutile.masked_scaled_bmm_cutile import (
             masked_scaled_bmm as _masked_scaled_bmm_cutile,
@@ -2226,7 +2239,7 @@ def masked_scaled_bmm(
     raise ValueError(f"Unsupported backend for masked_scaled_bmm: {backend!r}")
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 110, 120, 121])
 def _cutile_ragged_scaled_bmm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2315,6 +2328,13 @@ def ragged_scaled_bmm(
     torch.Tensor
         The ragged block-scaled output tensor ``C`` of shape ``(total_m, N)``.
     """
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs it on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_ragged_scaled_bmm
+
+        return sm8x_ragged_scaled_bmm(
+            a, b, a_scale, b_scale, m_indptr, block_scale_type, transpose_a,
+            transpose_b, swizzled_layout_a, a_global_scale, b_global_scale,
+        )  # fmt: skip
     if backend == "cutile":
         from .kernels.cutile.ragged_scaled_bmm_cutile import (
             ragged_scaled_bmm as _ragged_scaled_bmm_cutile,

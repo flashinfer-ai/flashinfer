@@ -13,9 +13,10 @@ FP32 scales of ``A``'s 1- or 128-row groups and ``B``'s 128-row groups per 128-e
 ``group_deepgemm_fp8_nt_groupwise`` and ``batch_deepgemm_fp8_nt_groupwise`` the UE8M0 exponents
 the SM100 DeepGEMM takes of their scales, as MXFP8 scales, the rows routed by ``m_indices`` or
 ``masked_m``; ``group_gemm_mxfp8_mxfp4_nt_groupwise`` the MXFP4 weights on the dense
-``mm_fp4`` GEMM (``gemm_fp4``) with ``A`` restored to BF16 in its routed row order. Every backend
-name keeps its SM100+ requirements and runs here; on SM89 the native per-tensor cuBLAS and cuDNN
-backends keep their own runners.
+``mm_fp4`` GEMM (``gemm_fp4``) with ``A`` restored to BF16 in its routed row order, as
+``masked_scaled_bmm`` and ``ragged_scaled_bmm`` their FP4 weights (MXFP8: ``gemm_f8``). Every
+backend name keeps its SM100+ requirements and runs here; on SM89 the native per-tensor cuBLAS
+and cuDNN backends keep their own runners.
 """
 
 import functools
@@ -32,10 +33,12 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..fused_moe.core import _w4a16_moe_sm80_module
-from .sm8x_fp4_dense import _ones, _out_f16_module, _pad
+from .sm8x_fp4_dense import _ones, _out_module, _pad
 
 _E4M3, _E5M2 = torch.float8_e4m3fn, torch.float8_e5m2
 _FMT = {_E4M3: 1, _E5M2: 2}
+_OUT = (torch.bfloat16, torch.float16, torch.float32)  # the GEMM2 output modules
+_FP4_FMT = {"nvfp4": 0, "mxfp4": 5, "mixed": None}  # the prep's A format (mixed: FP8)
 _I32_MAX = 2**31 - 1
 
 
@@ -78,6 +81,12 @@ def _restack(sf: torch.Tensor, batches: int, rows: int, k: int, g: int) -> torch
         off(t)[:, None] + jo
     ]
     return out
+
+
+def _contiguous(*named: Tuple[str, Optional[torch.Tensor]]) -> None:
+    for name, t in named:
+        if t is not None and not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
 
 
 def _aligned(t: torch.Tensor, align: int) -> torch.Tensor:
@@ -216,7 +225,7 @@ def _run_fp8(
     )
     if not direct and (routed or masked_m is not None):  # rows routed nowhere kept
         target[:, :n].view(batches, m, n).copy_(out)
-    gemm = _out_f16_module() if out.dtype == torch.float16 else module
+    gemm = module if out.dtype == torch.bfloat16 else _out_module(out.dtype)
     alpha, beta, sf, asf, gsa, gsb = scale_a, scale_b, None, None, None, None
     if mx:
         alpha, beta, sf, asf = _ones(a.device), None, scale_b, scale_a
@@ -383,15 +392,6 @@ class Sm8xGroupFp8GroupwiseRunner(Sm8xFp8GroupwiseRunner):
             64 if tactic in (None, -1) else tactic, False, gm=self.gm, m_indptr=m_indptr,
         )  # fmt: skip
         return out
-
-
-class Sm8xGroupMxfp8Mxfp4Runner(Sm8xGroupFp8GroupwiseRunner):
-    """``_run_mxfp8_mxfp4`` behind ``group_gemm_mxfp8_mxfp4_nt_groupwise`` on ``[a, b, a_scale,
-    b_scale, m_indptr, out]`` (the scales flat); tactic: the row tile."""
-
-    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
-        _run_mxfp8_mxfp4(*inputs, 64 if tactic in (None, -1) else tactic)
-        return inputs[5]
 
 
 @functools.cache
@@ -572,6 +572,10 @@ def sm8x_group_gemm_fp8_nt_groupwise(
             a_scale, b_scale = a_scale.t(), b_scale.transpose(1, 2)
     if cum_m == 0 or groups == 0:
         return
+    _run_group_groupwise(a, b, a_scale, b_scale, m_indptr, out, gm)
+
+
+def _run_group_groupwise(a, b, a_scale, b_scale, m_indptr, out, gm: int) -> None:
     runner = Sm8xGroupFp8GroupwiseRunner(gm)
     inputs = [a, b, a_scale, b_scale, m_indptr, out]
     chosen, tactic = AutoTuner.get().choose_one(
@@ -581,6 +585,81 @@ def sm8x_group_gemm_fp8_nt_groupwise(
         inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
+
+
+def sm8x_ragged_block_scaled_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: Optional[torch.Tensor],
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    max_m_device: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    segment_alignment: int,
+) -> torch.Tensor:
+    """``ragged_block_scaled_bmm`` on SM8x after its requirement check, with the cuTile
+    backend's operand contract: ``a`` ``(total_m, K)``, ``b`` ``(Q, N, K)``, the FP32 block
+    scales ``a_scale`` ``(total_m, K / VEC)`` (or None) and ``b_scale`` ``(Q, N / VEC, K /
+    VEC)``; VEC a multiple of 128 dividing N and K here."""
+    _contiguous(
+        ("A matrix", a), ("B matrix", b), ("A scale matrix", a_scale),
+        ("B scale matrix", b_scale), ("m_indptr", m_indptr),
+    )  # fmt: skip
+    total_m, k = (int(x) for x in a.shape)
+    q, n, k_b = (int(x) for x in b.shape)
+    if k != k_b:
+        raise ValueError(f"K dimensions must match: {k} != {k_b}")
+    if m_indptr.shape[0] != q + 1:
+        raise ValueError(
+            f"m_indptr must have Q+1 ({q + 1}) elements; got {m_indptr.shape[0]}"
+        )
+    q_sb, rnb, rkb = (int(x) for x in b_scale.shape)
+    vec = k // rkb
+    if a_scale is not None and a_scale.shape[0] != total_m:
+        raise ValueError(
+            f"a_scale total_m dimension mismatch: {a_scale.shape[0]} != {total_m}"
+        )
+    if q_sb != q:
+        raise ValueError(f"b_scale Q dimension mismatch: {q_sb} != {q}")
+    out_dtype = out_dtype or torch.bfloat16
+    if max_m_device is not None and max_m_device.device != a.device:
+        raise ValueError(
+            f"max_m_device must be on {a.device}; got {max_m_device.device}"
+        )
+    if segment_alignment % 128:
+        raise ValueError(
+            f"BLOCK_M (128) must divide segment_alignment ({segment_alignment})"
+        )
+    if n // rnb != vec:
+        raise ValueError(
+            f"b_scale N granularity ({n // rnb}) must equal BLOCK_K ({vec})"
+        )
+    if a_scale is not None and k // int(a_scale.shape[1]) != vec:
+        raise ValueError(
+            f"a_scale K granularity ({k // int(a_scale.shape[1])}) must equal BLOCK_K "
+            f"({vec})"
+        )
+    scales = (b_scale, m_indptr) + (() if a_scale is None else (a_scale,))
+    if any(t.device != a.device for t in (b, *scales)):
+        raise ValueError("FP8 GEMM operands, scales and output must be on one device")
+    if vec % 128 or n % vec or k % vec or out_dtype not in _OUT:
+        raise NotImplementedError(
+            "ragged_block_scaled_bmm on SM8x requires block scales of a multiple of 128 "
+            f"dividing N and K, a bfloat16, float16 or float32 output; got VEC={vec}, "
+            f"N={n}, K={k}, out_dtype={out_dtype}."
+        )
+    out = torch.empty((total_m, n), dtype=out_dtype, device=a.device)
+    if total_m == 0 or q == 0 or n == 0:
+        return out
+    j = vec // 128  # each 128-element step's scale repeated
+    if a_scale is None:
+        a_scale = _ones(a.device).expand(total_m, k // 128)
+    elif j > 1:
+        a_scale = a_scale.repeat_interleave(j, 1)
+    if j > 1:
+        b_scale = b_scale.repeat_interleave(j, 1).repeat_interleave(j, 2)
+    _run_group_groupwise(a, b, a_scale, b_scale, m_indptr, out, 1)
+    return out
 
 
 def _ue8m0(
@@ -628,7 +707,8 @@ def _mx_rows(e: torch.Tensor) -> torch.Tensor:
 class Sm8xDeepGemmFp8Runner(TunableRunner):
     """``_run_fp8`` on the DeepGEMM scales as MXFP8 behind ``group_deepgemm_fp8_nt_groupwise``
     (``[a, b, a_sf, b_sf, m_indices, out]``, 2-D ``a``) and ``batch_deepgemm_fp8_nt_groupwise``
-    (``[a, b, a_sf, b_sf, masked_m, out]``, 3-D ``a``); tactic: the row tile."""
+    (``[a, b, a_sf, b_sf, masked_m, out]``, 3-D ``a``), and on the MXFP8 scales of
+    ``ragged_scaled_bmm`` and ``masked_scaled_bmm``; tactic: the row tile."""
 
     def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
         return [8, 16, 32, 64]
@@ -718,82 +798,85 @@ def sm8x_deepgemm_fp8_nt_groupwise(
     chosen(inputs=inputs, tactic=tactic)
 
 
-def _run_mxfp8_mxfp4(
+def _run_rows_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    m_indptr: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    alpha: torch.Tensor,
+    asf_off: torch.Tensor,
     out: torch.Tensor,
     r: int,
+    fmt: Optional[int] = None,
 ) -> None:
-    """``out`` rows ``m_indptr[i] .. m_indptr[i + 1]`` (clamped, nondecreasing) ``= a @ b[i]^T``,
-    the E8M0 scales (flat) where the SM100 kernel reads them: ``b_scale`` group ``i``'s 128x4 at
-    ``i pad(N, 128)`` rows, ``a_scale`` group ``i``'s rows from ``(m_indptr[i] + 127 i) // 128 *
-    128``. ``gemm_fp4`` (MXFP4) reads ``a`` restored to BF16 exactly in its blocks' row order
-    times 2^119 like ``mm_fp4``'s MXFP4 activation; E5M2, past BF16 there, times 2^112, its 2^7
-    added back to each k32 group's scale exponent (``act_shift``)."""
-    m, k = (int(x) for x in a.shape)
+    """``out`` rows ``starts[i] .. ends[i]`` (clamped, disjoint) ``= alpha[i] (a @ b[i]^T)`` on
+    ``gemm_fp4``: ``b`` ``(groups, N, K / 2)`` FP4, its 128x4-swizzled scales (flat) group
+    ``i``'s at ``i pad(N, 128)`` rows; ``a`` restored to BF16 exactly in its blocks' row order,
+    packed FP4 by the prep (``fmt`` 0: NVFP4 with its scales, 5: MXFP4 without them, times
+    2^119), FP8 (``fmt`` None) times 2^119 like ``mm_fp4``'s MXFP4 activation, E5M2, past BF16
+    there, times 2^112, its 2^7 added back to each k32 group's scale exponent (``act_shift``);
+    MX: row ``t``'s E8M0 scales those of row ``t + asf_off[i]``."""
+    rows, k = int(a.shape[0]), 2 * int(b.shape[2])
     groups, n = int(b.shape[0]), int(b.shape[1])
-    max_blocks = m // r + groups  # each group's last block partial
-    ints = (1 + 2 * max_blocks, max_blocks * r)
-    meta, rowmap = torch.empty(sum(ints), dtype=torch.int32, device=a.device).split(
-        ints
-    )
-    ip = torch.cummax(m_indptr.clamp(0, m).long(), 0).values
-    _group_rows(ip[:-1], ip[1:], m, r, max_blocks, meta, rowmap)
-    sf_off = (ip[:-1] + 127 * torch.arange(groups, device=a.device)) // 128 * 128
-    e5 = a.dtype == torch.float8_e5m2
-    rows = a.view(torch.uint8).index_select(0, rowmap.clamp(min=0))
-    act = rows.view(a.dtype).to(torch.bfloat16).mul_(2.0 ** (112 if e5 else 119))
+    if rows == 0 or groups == 0 or n == 0:
+        return
+    max_blocks = rows // r + groups  # each group's last block partial
+    ints = (1 + 2 * max_blocks, max_blocks * r, -(-rows // 2048) + 1)
+    meta, rowmap, workspace = torch.empty(
+        sum(ints), dtype=torch.int32, device=a.device
+    ).split(ints)
+    module = _w4a16_moe_sm80_module(None, False, None, False)
+    asf = _aligned(a_scale.view(torch.uint8), 4)
+    if fmt is not None:  # in token order, its blocks replaced by the groups' below
+        tok = torch.empty((rows, k), dtype=torch.bfloat16, device=a.device)
+        module.prep(
+            torch.zeros((rows, 1), dtype=torch.int32, device=a.device), meta, rowmap,
+            workspace, 1, r, max_blocks, _aligned(a.view(torch.uint8), 16).view(rows, -1),
+            asf, tok, True, None, None, fmt, None, None, None, None, None,
+        )  # fmt: skip
+    _group_rows(starts, ends, rows, r, max_blocks, meta, rowmap)
+    idx, e5 = rowmap.clamp(min=0), a.dtype == torch.float8_e5m2
+    if fmt is None:
+        act = a.view(torch.uint8).index_select(0, idx).view(a.dtype)
+        act = act.to(torch.bfloat16).mul_(2.0 ** (112 if e5 else 119))
+    else:
+        act = tok.index_select(0, idx)
     direct = out.is_contiguous() and out.data_ptr() % 16 == 0  # N % 8 == 0
     target = out if direct else out.clone(memory_format=torch.contiguous_format)
-    module = _w4a16_moe_sm80_module(None, False, None, False)
-    gemm = _out_f16_module() if out.dtype == torch.float16 else module
+    gemm = module if out.dtype == torch.bfloat16 else _out_module(out.dtype)
     gemm.gemm_fp4(
-        _aligned(b, 16), _aligned(b_scale, 16),
-        torch.ones(groups, device=a.device), act, meta, rowmap, target, r, n, k,
-        max_blocks, False, _aligned(a_scale, 4), False, (sf_off - ip[:-1]).int(), 7 if e5 else 0,
+        _aligned(b.view(torch.uint8), 16), _aligned(b_scale.view(torch.uint8), 16), alpha,
+        act, meta, rowmap, target, r, n, k, max_blocks, False, None if fmt == 0 else asf,
+        False, asf_off, 7 if e5 else 0,
     )  # fmt: skip
     if not direct:
         out.copy_(target)
 
 
-def sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    m_indptr: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    """``group_gemm_mxfp8_mxfp4_nt_groupwise`` on SM8x after its problem-size check (the tile
-    arguments select no SM8x kernel): ``_run_mxfp8_mxfp4`` with its row tile tuned."""
-    cum_m, groups = int(a.shape[0]), int(b.shape[0])
-    if any(t.device != a.device for t in (b, a_scale, b_scale, m_indptr, out)):
-        raise ValueError(
-            "MXFP4 group GEMM operands, scales and output must be on one device"
-        )
-    if cum_m == 0 or groups == 0:
-        return
-    # group i's scales from row (m_indptr[i] + 127 i) // 128 * 128, its rows' 128-row atoms
-    need = (cum_m + 127 * groups) // 128 * 128 * -(-int(a.shape[1]) // 128) * 4
-    if a_scale.numel() < need:
-        raise ValueError(f"a_scale must hold {need} scales, got {a_scale.numel()}")
-    inputs = [a, b, a_scale.reshape(-1), b_scale.reshape(-1), m_indptr, out]
-    runner = Sm8xGroupMxfp8Mxfp4Runner(0)
-    chosen, tactic = AutoTuner.get().choose_one(
-        "group_gemm_mxfp8_mxfp4_nt_groupwise_sm8x",
-        [runner],
-        _mxfp4_group_tuning_config(),
-        inputs,
-    )
-    chosen(inputs=inputs, tactic=tactic)
+class Sm8xRowsFp4Runner(TunableRunner):
+    """``_run_rows_fp4`` as an autotuner candidate on ``[a, b, a_scale, b_scale, starts, ends,
+    alpha, asf_off, out]`` (the scales flat); tactic: the row tile."""
+
+    def __init__(self, fmt: Optional[int]):
+        self.fmt = fmt
+
+    def get_cache_key_extras(self, inputs) -> tuple:
+        return (inputs[0].dtype, inputs[8].dtype, self.fmt)
+
+    def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
+        return [8, 16, 32, 64]
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        _run_rows_fp4(*inputs, 64 if tactic in (None, -1) else tactic, self.fmt)
+        return inputs[8]
 
 
 @functools.cache
-def _mxfp4_group_tuning_config() -> TuningConfig:
-    """``a``'s rows bucketed, its scales sized for SM100's per-group padding."""
+def _rows_tuning_config(sf_div: int) -> TuningConfig:
+    """``a``'s rows bucketed, its scales (a row's bytes / ``sf_div``) sized for SM100's per-group
+    padding."""
     from ..fused_moe.utils import (
         get_hybrid_num_tokens_buckets,
         map_to_hybrid_bucket_uncapped,
@@ -807,8 +890,232 @@ def _mxfp4_group_tuning_config() -> TuningConfig:
         ),
         constraint_specs=(
             ConstraintSpec(
-                2, 0, lambda s: _pad(s[0][0] + 127 * s[1][0], 128) * (s[0][1] // 32)
+                2, 0, lambda s: _pad(s[0][0] + 127 * s[1][0], 128) * (s[0][1] // sf_div)
             ),
-            ConstraintSpec(5, 0, lambda s: s[0][0]),
+            ConstraintSpec(8, 0, lambda s: s[0][0]),
         ),
     )
+
+
+def _tuned_rows_fp4(name: str, fmt: Optional[int], inputs: list) -> None:
+    div = 32 if fmt is None else 16 if fmt else 8  # FP8, MXFP4, NVFP4
+    chosen, tactic = AutoTuner.get().choose_one(
+        name, [Sm8xRowsFp4Runner(fmt)], _rows_tuning_config(div), inputs
+    )
+    chosen(inputs=inputs, tactic=tactic)
+
+
+def _tuned_mx8(name: str, masked: bool, inputs: list) -> None:
+    chosen, tactic = AutoTuner.get().choose_one(
+        name, [Sm8xDeepGemmFp8Runner()], _deepgemm_tuning_config(masked), inputs
+    )
+    chosen(inputs=inputs, tactic=tactic)
+
+
+def sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``group_gemm_mxfp8_mxfp4_nt_groupwise`` on SM8x after its problem-size check (the tile
+    arguments select no SM8x kernel): ``_run_rows_fp4`` with its row tile tuned, the E8M0 scales
+    where the SM100 kernel reads them: ``b_scale`` group ``i``'s 128x4 at ``i pad(N, 128)``
+    rows, ``a_scale`` group ``i``'s rows from ``(m_indptr[i] + 127 i) // 128 * 128``."""
+    cum_m, groups = int(a.shape[0]), int(b.shape[0])
+    if any(t.device != a.device for t in (b, a_scale, b_scale, m_indptr, out)):
+        raise ValueError(
+            "MXFP4 group GEMM operands, scales and output must be on one device"
+        )
+    if cum_m == 0 or groups == 0:
+        return
+    need = (cum_m + 127 * groups) // 128 * 128 * -(-int(a.shape[1]) // 128) * 4
+    if a_scale.numel() < need:
+        raise ValueError(f"a_scale must hold {need} scales, got {a_scale.numel()}")
+    ip = torch.cummax(m_indptr.clamp(0, cum_m).long(), 0).values
+    sf_off = (ip[:-1] + 127 * torch.arange(groups, device=a.device)) // 128 * 128
+    _tuned_rows_fp4(
+        "group_gemm_mxfp8_mxfp4_nt_groupwise_sm8x", None,
+        [a, b, a_scale.reshape(-1), b_scale.reshape(-1), ip[:-1], ip[1:],
+         torch.ones(groups, device=a.device), (sf_off - ip[:-1]).int(), out],
+    )  # fmt: skip
+
+
+def _scaled_bmm_k(block_scale_type: str, k_a: int, k_b: int) -> int:
+    """K after the cuTile ``*_scaled_bmm`` check of the operands' packed K."""
+    epb_a = 2 if "fp4" in block_scale_type else 1
+    epb_b = 1 if block_scale_type == "mxfp8" else 2
+    if k_a * epb_a != k_b * epb_b:
+        raise ValueError(
+            f"incompatible dimensions: K_A*ELEM_PER_BYTE_A ({k_a * epb_a}) "
+            f"must match K_B*ELEM_PER_BYTE_B ({k_b * epb_b})"
+        )
+    return k_a * epb_a
+
+
+def _nt_only(transpose_a: bool, transpose_b: bool) -> None:
+    if transpose_a or not transpose_b:
+        raise ValueError(
+            "Only NT layout is supported (transpose_a=False, transpose_b=True)"
+        )
+
+
+def sm8x_masked_scaled_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    block_scale_type: str,
+    max_m_device: Optional[torch.Tensor],
+    transpose_a: bool,
+    transpose_b: bool,
+    out_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    """``masked_scaled_bmm`` on SM8x after the cuTile backend's checks (its module needs
+    ``cuda.tile``): ``c[q, :masked_m[q]] = a[q] @ b[q]^T``, ``c[q]``'s other rows unwritten."""
+    q, m, k_a = (
+        a.shape[0],
+        a.shape[2 if transpose_a else 1],
+        a.shape[1 if transpose_a else 2],
+    )
+    q_b, n, k_b = (
+        b.shape[0],
+        b.shape[1 if transpose_b else 2],
+        b.shape[2 if transpose_b else 1],
+    )
+    k = _scaled_bmm_k(block_scale_type, k_a, k_b)
+    if q != q_b:
+        raise ValueError(f"incompatible dimensions: Q_A ({q}) must match Q_B ({q_b})")
+    _nt_only(transpose_a, transpose_b)
+    _contiguous(
+        ("A matrix", a), ("B matrix", b), ("A scale matrix", a_scale),
+        ("B scale matrix", b_scale), ("Masked matrix", masked_m),
+    )  # fmt: skip
+    if masked_m.numel() != q:
+        raise ValueError(f"masked_m must have the same number of elements as Q ({q})")
+    if block_scale_type not in ("nvfp4", "mxfp4", "mxfp8", "mixed"):
+        raise ValueError(f"Invalid block scale type: {block_scale_type}")
+    vec = 16 if block_scale_type == "nvfp4" else 32
+    q_sa, rm, rka, m2, k256a = a_scale.shape
+    q_sb, rn, rkb, n2, k256b = b_scale.shape
+    if m2 != 2 or n2 != 2:
+        raise ValueError("incompatible dimensions: scale dim -2 must be 2")
+    if k256a != 256 or k256b != 256:
+        raise ValueError("incompatible dimensions: scale dim -1 must be 256")
+    if q_sa != q_sb or q_sa != q:
+        raise ValueError("incompatible dimensions: scale batch must match Q")
+    if rm * 128 != m or rn * 128 != n:
+        raise ValueError(
+            "incompatible dimensions: M/N must be a multiple of 128 matching scale shape"
+        )
+    if rka * 4 * vec != k or rkb * 4 * vec != k:
+        raise ValueError("incompatible dimensions: K must match scale K shape")
+    out_dtype = out_dtype or torch.bfloat16
+    if max_m_device is not None:
+        if not isinstance(max_m_device, torch.Tensor) or not max_m_device.is_cuda:
+            raise ValueError(
+                "max_m_device must be a CUDA tensor (a device-side copy of max_m); "
+                f"got {type(max_m_device).__name__}. Pass a CUDA int32 tensor or None."
+            )
+        if max_m_device.device != a.device:
+            raise ValueError(
+                f"max_m_device must be on {a.device}; got {max_m_device.device}."
+            )
+    c = torch.empty((q, m, n), device=a.device, dtype=out_dtype)
+    if c.numel() == 0:
+        return c
+    t = c if out_dtype in _OUT else torch.empty_like(c, dtype=torch.float32)
+    sf = (a_scale.reshape(-1).view(torch.uint8), b_scale.reshape(-1).view(torch.uint8))
+    if block_scale_type == "mxfp8":
+        _tuned_mx8("masked_scaled_bmm_sm8x", True, [a, b, *sf, masked_m, t])
+    else:
+        st = torch.arange(q, device=a.device) * m
+        _tuned_rows_fp4(
+            "masked_scaled_bmm_sm8x", _FP4_FMT[block_scale_type],
+            [a.view(q * m, k_a), b, *sf, st, st + masked_m.long().clamp(0, m),
+             torch.ones(q, device=a.device), torch.zeros_like(masked_m, dtype=torch.int32),
+             t.view(q * m, n)],
+        )  # fmt: skip
+    if t is not c:
+        c.copy_(t)
+    return c
+
+
+def sm8x_ragged_scaled_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    block_scale_type: str,
+    transpose_a: bool,
+    transpose_b: bool,
+    swizzled_layout_a: bool,
+    a_global_scale: Optional[torch.Tensor],
+    b_global_scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """``ragged_scaled_bmm`` on SM8x after the cuTile backend's checks (its module needs
+    ``cuda.tile``): FP32 ``c[m_indptr[q] : m_indptr[q + 1]] = (a @ b[q]^T) / (a_global_scale
+    b_global_scale[q])``, the other rows unwritten."""
+    total_m, k_a = a.shape
+    q, n, k_b = b.shape
+    if block_scale_type not in ("nvfp4", "mxfp4", "mxfp8", "mixed"):
+        raise ValueError(f"Invalid block scale type: {block_scale_type}")
+    k = _scaled_bmm_k(block_scale_type, k_a, k_b)
+    _nt_only(transpose_a, transpose_b)
+    if not swizzled_layout_a:
+        raise ValueError(
+            "Only swizzled_layout_a=True is supported by the cuTile backend"
+        )
+    _contiguous(
+        ("A matrix", a), ("B matrix", b), ("A scale matrix", a_scale),
+        ("B scale matrix", b_scale), ("m_indptr", m_indptr),
+    )  # fmt: skip
+    if m_indptr.numel() != q + 1:
+        raise ValueError(f"m_indptr must have Q+1 ({q + 1}) elements")
+    vec = 16 if block_scale_type == "nvfp4" else 32
+    q_sb, rnb, rkb, n2, k256b = b_scale.shape
+    if q_sb != q:
+        raise ValueError("incompatible b_scale batch dim")
+    if n2 != 2 or k256b != 256:
+        raise ValueError("incompatible b_scale inner dims")
+    if rnb * 128 != n:
+        raise ValueError("incompatible b_scale N dim")
+    if rkb * 4 * vec != k:
+        raise ValueError("incompatible b_scale K dim")
+    total_ma, rka, m2, k256a = a_scale.shape
+    if total_ma * 128 != total_m:
+        raise ValueError("incompatible a_scale total_m dim")
+    if m2 != 2 or k256a != 256:
+        raise ValueError("incompatible a_scale inner dims")
+    if rka * 4 * vec != k:
+        raise ValueError("incompatible a_scale K dim")
+    c = torch.empty((total_m, n), device=a.device, dtype=torch.float32)
+    if q == 0 or c.numel() == 0:
+        return c
+    ip = torch.cummax(m_indptr.clamp(0, total_m).long(), 0).values
+    gs = torch.ones(q, device=a.device)  # the cuTile kernel's 1 / (a_gs b_gs)
+    if a_global_scale is not None or b_global_scale is not None:
+        ag = (
+            _ones(a.device)
+            if a_global_scale is None
+            else a_global_scale.reshape(-1)[:1]
+        )
+        bg = _ones(a.device) if b_global_scale is None else b_global_scale.reshape(-1)
+        gs = (1.0 / (ag.float() * bg.float())).expand(q).contiguous()
+    sf = (a_scale.reshape(-1).view(torch.uint8), b_scale.reshape(-1).view(torch.uint8))
+    if block_scale_type == "mxfp8":
+        seg = torch.searchsorted(ip, torch.arange(total_m, device=a.device), right=True)
+        _tuned_mx8("ragged_scaled_bmm_sm8x", False, [a, b, *sf, seg - 1, c])
+        if a_global_scale is not None or b_global_scale is not None:
+            c.mul_(gs[(seg - 1).clamp_(0, q - 1)][:, None])
+    else:
+        _tuned_rows_fp4(
+            "ragged_scaled_bmm_sm8x", _FP4_FMT[block_scale_type],
+            [a, b, *sf, ip[:-1], ip[1:], gs, torch.zeros(q, dtype=torch.int32,
+             device=a.device), c],
+        )  # fmt: skip
+    return c

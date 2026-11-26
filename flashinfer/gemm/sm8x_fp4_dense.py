@@ -4,8 +4,9 @@
 
 Every ``mm_bf16_fp4`` backend name keeps its SM100+ requirements and runs here on SM8x as the
 records GEMM2 of one expert: activation none, top-k 1, no finalize, the identity row map of
-the MoE prep (one expert keeps the entries in token order). A float16 output runs the BF16
-module whose GEMM2 writes FP16 (``RECORDS_OUT_F16``), rounded once from FP32.
+the MoE prep (one expert keeps the entries in token order). A float16 (float32) output runs
+the BF16 module whose GEMM2 writes FP16 (``RECORDS_OUT_F16``), rounded once from FP32 (FP32,
+``RECORDS_OUT_F32``).
 
 ``prepare_bf16_fp4_weights`` on SM8x returns the records of every backend: ``b`` uint8
 ``[N, ceil(size / N)]`` whose first ``size`` bytes are the records, ``b_descale`` an empty
@@ -358,8 +359,10 @@ def sm8x_prepare_bf16_fp4(
 
 
 @functools.cache
-def _out_f16_module():
-    return gen_w4a16_moe_sm80_module(out_f16=True).build_and_load()
+def _out_module(dtype: torch.dtype):
+    """The BF16 module whose GEMM2 writes ``dtype``, float16 or float32."""
+    out = "f16" if dtype == torch.float16 else "f32"
+    return gen_w4a16_moe_sm80_module(out=out).build_and_load()
 
 
 def _run(
@@ -381,8 +384,8 @@ def _run(
     ).split(ints)
     topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=a.device)
     module = _w4a16_moe_sm80_module(None, False, None, False)
-    # the BF16 module's prep; an FP16 output takes the FP16-output module's GEMM2
-    gemm = _out_f16_module().gemm if out.dtype == torch.float16 else module.gemm
+    # the BF16 module's prep; an FP16 or FP32 output takes that output module's GEMM2
+    gemm = module.gemm if out.dtype == torch.bfloat16 else _out_module(out.dtype).gemm
     module.prep(
         topk_ids, meta, rowmap, workspace, 1, r, max_blocks, None, None, None, False, None,
         None, 0, None, None, None, None, None,
@@ -529,7 +532,7 @@ def _run_fp4(
         if direct
         else torch.empty((m, _pad(n, 8)), dtype=out.dtype, device=a.device)
     )
-    gemm = _out_f16_module() if out.dtype == torch.float16 else module
+    gemm = module if out.dtype == torch.bfloat16 else _out_module(out.dtype)
     gemm.gemm_fp4(
         w, sf, alpha, act, meta, rowmap, target, r, n, k, max_blocks, alpha.numel() > 1,
         asf if mx else None, shuffled, None, 0,

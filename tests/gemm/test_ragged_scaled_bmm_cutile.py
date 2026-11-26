@@ -198,7 +198,11 @@ class Test_FlashInfer_RaggedScaledBMM:
         backend,
     ):
         """cuTile ragged_scaled_bmm must match the dequantized per-segment torch.mm reference."""
-        if backend == "cutile" and not is_cuda_tile_available():
+        if (  # SM8x runs it on its dense GEMM
+            backend == "cutile"
+            and not is_cuda_tile_available()
+            and get_compute_capability(torch.device("cuda:0"))[0] != 8
+        ):
             pytest.skip("cuda.tile not available")
         if not HAS_MXFP:
             pytest.skip(
