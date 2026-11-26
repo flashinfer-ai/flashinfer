@@ -93,6 +93,13 @@ def _use_balanced_scheduler(is_causal: bool) -> bool:
     return is_causal and os.environ.get("PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING") != "1"
 
 
+def _select_tile_sizes(head_dim: int) -> tuple[int, int]:
+    """Return default ``(q_tile, kv_tile)`` for the given head dimension."""
+    if head_dim == 512:
+        return (64, 64)
+    return (128, 128)
+
+
 def _validate_sm120_prims_plan_options(
     *,
     kv_layout: str,
@@ -334,13 +341,18 @@ def sm120_fmha_fp8_ragged_prefill(
     if max_seqlen_q is None:
         max_seqlen_q = int((cu_seqlens_q_i32[1:] - cu_seqlens_q_i32[:-1]).max().item())
 
-    kv_tile = kv_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES[0]
-    q_tile = q_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES[0]
-    if (
-        q_tile not in SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES
-        or kv_tile not in SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES
-        or D not in SM120FusedMultiHeadAttentionFP8ForwardTMA.SUPPORTED_HEAD_TILES
-        or Hq % Hkv != 0
+    default_q_tile, default_kv_tile = _select_tile_sizes(D)
+    kv_tile = kv_tile or default_kv_tile
+    q_tile = q_tile or default_q_tile
+    in_ct = _cutlass_dtype(q.dtype)
+    out_ct = _cutlass_dtype(o.dtype)
+    if not SM120FusedMultiHeadAttentionFP8ForwardTMA._can_implement(
+        in_ct,
+        out_ct,
+        q_shape=(batch_size, 1, Hq, D),
+        k_shape=(batch_size, 1, Hkv, D),
+        kv_tile=kv_tile,
+        q_tile=q_tile,
     ):
         raise RuntimeError(
             f"SM120 FP8 FMHA cannot implement config: "
@@ -513,9 +525,9 @@ def sm120_fmha_fp8_paged_prefill(
     _, Hkv, page_size, D_k = k_pool.shape
     assert D_k == D, f"head_dim mismatch: q={D}, k_pool={D_k}"
 
-    assert block_tables.ndim == 2, (
-        f"block_tables must be (B, max_pages), got {block_tables.shape}"
-    )
+    assert (
+        block_tables.ndim == 2
+    ), f"block_tables must be (B, max_pages), got {block_tables.shape}"
     B = block_tables.shape[0]
     threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, B)
     num_chunks = 1 if kv_tile_ranges is None else kv_tile_ranges.shape[0] // B
@@ -538,8 +550,9 @@ def sm120_fmha_fp8_paged_prefill(
     cu_seqlens_q_i32 = cu_seqlens_q.to(torch.int32)
     if max_seqlen_q is None:
         max_seqlen_q = int((cu_seqlens_q_i32[1:] - cu_seqlens_q_i32[:-1]).max().item())
-    kv_tile = kv_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES[0]
-    q_tile = q_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES[0]
+    default_q_tile, default_kv_tile = _select_tile_sizes(D)
+    kv_tile = kv_tile or default_kv_tile
+    q_tile = q_tile or default_q_tile
 
     # Only structural properties are checked here. Runtime lengths are bounded
     # by cu_seqlens_q, seqlens_kv, and block_tables capacity.
@@ -620,6 +633,7 @@ def _paged_kv_split_bounds(
     fixed_split_tokens: int,
     max_chunks: int,
     gqa_pack_size: int = 1,
+    q_tile: Optional[int] = None,
 ) -> Optional[list]:
     """K/V tile bounds per request and chunk, or ``None`` to run unsplit.
 
@@ -656,7 +670,7 @@ def _paged_kv_split_bounds(
     max_chunks = min([128, max_chunks] + [v + 1 for v in visible])
     if max_chunks < 2:
         return None
-    q_tile_tokens = tile // gqa_pack_size
+    q_tile_tokens = (tile if q_tile is None else q_tile) // gqa_pack_size
     ctas = [
         ceil_div(q, q_tile_tokens) * (num_qo_heads // gqa_pack_size) for q in q_lens
     ]
@@ -769,10 +783,10 @@ class SM120PrimsBatchPrefillBackend:
                 "backend='cute-dsl-prims' requires output dtype float16 or "
                 f"bfloat16; got {o_dtype}"
             )
-        if head_dim_qk != head_dim_vo or head_dim_qk not in (32, 64, 128, 256):
+        if head_dim_qk != head_dim_vo or head_dim_qk not in (32, 64, 128, 256, 512):
             raise ValueError(
                 "backend='cute-dsl-prims' requires equal QK/VO head dimensions "
-                f"in {{32, 64, 128, 256}}; got {head_dim_qk}/{head_dim_vo}"
+                f"in {{32, 64, 128, 256, 512}}; got {head_dim_qk}/{head_dim_vo}"
             )
         if num_kv_heads <= 0 or num_qo_heads % num_kv_heads != 0:
             raise ValueError(
@@ -830,6 +844,9 @@ class SM120PrimsBatchPrefillBackend:
         self._causal = causal
         self._sm_scale = sm_scale
         self._page_size: Optional[int] = None
+        q_tile, kv_tile = _select_tile_sizes(head_dim_qk)
+        self._q_tile = q_tile
+        self._kv_tile = kv_tile
         compile_sm120_fmha_fp8_ragged_kernel(
             in_dtype=q_dtype,
             out_dtype=o_dtype,
@@ -837,8 +854,8 @@ class SM120PrimsBatchPrefillBackend:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
             is_causal=causal,
-            kv_tile=128,
-            q_tile=128,
+            kv_tile=kv_tile,
+            q_tile=q_tile,
             device=self.device,
             with_lse=False,
             balanced_scheduler=_use_balanced_scheduler(causal),
@@ -907,7 +924,10 @@ class SM120PrimsBatchPrefillBackend:
         self._causal = causal
         self._sm_scale = sm_scale
         self._page_size = page_size
-        self._gqa_pack_size = _gqa_pack_size(num_qo_heads, num_kv_heads, 128)
+        q_tile, kv_tile = _select_tile_sizes(head_dim_qk)
+        self._q_tile = q_tile
+        self._kv_tile = kv_tile
+        self._gqa_pack_size = _gqa_pack_size(num_qo_heads, num_kv_heads, q_tile)
         compile_sm120_fmha_fp8_paged_kernel(
             in_dtype=q_dtype,
             out_dtype=o_dtype,
@@ -915,8 +935,8 @@ class SM120PrimsBatchPrefillBackend:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
             is_causal=causal,
-            kv_tile=128,
-            q_tile=128,
+            kv_tile=kv_tile,
+            q_tile=q_tile,
             num_tokens_per_page=page_size,
             device=self.device,
             with_lse=False,
@@ -952,16 +972,18 @@ class SM120PrimsBatchPrefillBackend:
         """Float workspace bytes the paged plan's K/V split needs; 0 when it does not split."""
         if disable_split_kv or use_cuda_graph or head_dim < 64:
             return 0
+        q_tile, kv_tile = _select_tile_sizes(head_dim)
         bounds = _paged_kv_split_bounds(
             (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist(),
             seqlens_kv_host.tolist(),
             num_qo_heads,
             causal,
-            128,
+            kv_tile,
             torch.cuda.get_device_properties(self.device).multi_processor_count,
             fixed_split_size * page_size if fixed_split_size > 0 else 0,
             1 << 30,
-            _gqa_pack_size(num_qo_heads, num_kv_heads, 128),
+            _gqa_pack_size(num_qo_heads, num_kv_heads, q_tile),
+            q_tile=q_tile,
         )
         if bounds is None:
             return 0
@@ -994,7 +1016,7 @@ class SM120PrimsBatchPrefillBackend:
             or float_workspace_buffer is None
         ):
             return
-        tile = 128
+        q_tile, tile = _select_tile_sizes(self._head_dim)
         q_lens = (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist()
         kv_lens = seqlens_kv_host.tolist()
         total_q = int(qo_indptr_host[-1].item())
@@ -1022,6 +1044,7 @@ class SM120PrimsBatchPrefillBackend:
             fixed_split_size * self._page_size if fixed_split_size > 0 else 0,
             max_chunks,
             self._gqa_pack_size,
+            q_tile=q_tile,
         )
         if bounds is None:
             return
@@ -1064,7 +1087,7 @@ class SM120PrimsBatchPrefillBackend:
             head_dim=self._head_dim,
             is_causal=self._causal,
             kv_tile=tile,
-            q_tile=128,
+            q_tile=q_tile,
             num_tokens_per_page=self._page_size,
             device=self.device,
             with_lse=True,
@@ -1136,6 +1159,7 @@ class SM120PrimsBatchPrefillBackend:
             compile_sm120_fmha_fp8_ragged_kernel,
         )
 
+        q_tile, kv_tile = _select_tile_sizes(self._head_dim)
         if self._mode == "ragged":
             compile_sm120_fmha_fp8_ragged_kernel(
                 in_dtype=self._q_dtype,
@@ -1144,8 +1168,8 @@ class SM120PrimsBatchPrefillBackend:
                 num_kv_heads=self._num_kv_heads,
                 head_dim=self._head_dim,
                 is_causal=self._causal,
-                kv_tile=128,
-                q_tile=128,
+                kv_tile=kv_tile,
+                q_tile=q_tile,
                 device=self.device,
                 with_lse=with_lse,
                 balanced_scheduler=_use_balanced_scheduler(self._causal),
@@ -1159,8 +1183,8 @@ class SM120PrimsBatchPrefillBackend:
                 num_kv_heads=self._num_kv_heads,
                 head_dim=self._head_dim,
                 is_causal=self._causal,
-                kv_tile=128,
-                q_tile=128,
+                kv_tile=kv_tile,
+                q_tile=q_tile,
                 num_tokens_per_page=self._page_size,
                 device=self.device,
                 with_lse=with_lse,
