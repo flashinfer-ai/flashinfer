@@ -99,6 +99,12 @@ class PreparationProgramCache:
         return count
 
 
+def _active_preparation_memos():
+    """The active job's factory memos, which stay out of the process registry."""
+    scope = _PREPARATION_CACHE.get()
+    return () if scope is None else tuple(scope._caches.values())
+
+
 def register_program_cache(cache, *, mirrors=(), lock=None):
     if not any(existing is cache for existing, _, _ in _MAPPING_CACHES):
         _MAPPING_CACHES.append((cache, tuple(mirrors), lock))
@@ -198,7 +204,10 @@ def evict_unretained(keep, *, candidates=None):
         evict = frozenset(candidates) - keep
         if not evict:
             return 0
-    removed = sum(cache.evict_unretained(keep, evict=evict) for cache in tuple(_CACHES))
+    removed = sum(
+        cache.evict_unretained(keep, evict=evict)
+        for cache in (*tuple(_CACHES), *_active_preparation_memos())
+    )
     for cache, mirrors, lock in tuple(_MAPPING_CACHES):
         with lock if lock is not None else nullcontext():
             if evict is None:

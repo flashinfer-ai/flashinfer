@@ -530,12 +530,30 @@ def test_graph_replay_of_unplanned_kernels_survives_first_use_preparation():
     device = require_b12x()
     import torch
     from b12x.gemm import bf16_gemv
+    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _w4a16_topk_sum_launch_flat,
         pack_topk_routes_by_expert,
     )
 
     m, topk, hidden_size, num_experts = 4, 2, 128, 8
+    _, packed_routes, route_blocks = route_pack_capacity(
+        m * topk, 16, num_experts, topk=topk
+    )
+
+    def route_workspace():
+        # CUDA graph capture requires a preallocated route-packing workspace.
+        def buffer(elements):
+            return torch.empty(elements, device=device, dtype=torch.int32)
+
+        return dict(
+            packed_route_indices=buffer(packed_routes),
+            block_expert_ids=buffer(route_blocks),
+            packed_route_count=buffer(1),
+            expert_offsets=buffer(num_experts + 1),
+            expert_counts=buffer(num_experts),
+        )
+
     fc2_out = torch.randn(m * topk, hidden_size, device=device, dtype=torch.bfloat16)
     sum_out = torch.empty(m, hidden_size, device=device, dtype=torch.bfloat16)
     topk_ids = torch.randint(
@@ -558,11 +576,12 @@ def test_graph_replay_of_unplanned_kernels_survives_first_use_preparation():
         route_expert_ids=topk_ids,
     )
     packed_ref = pack_topk_routes_by_expert(
-        topk_ids, block_size=16, num_experts=num_experts
+        topk_ids, block_size=16, num_experts=num_experts, **route_workspace()
     )
     torch.cuda.synchronize(device)
     expected_sum = sum_out.clone()
 
+    graph_workspace = route_workspace()
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph):
@@ -579,13 +598,25 @@ def test_graph_replay_of_unplanned_kernels_survives_first_use_preparation():
                 route_expert_ids=topk_ids,
             )
             packed_graph = pack_topk_routes_by_expert(
-                topk_ids, block_size=16, num_experts=num_experts
+                topk_ids,
+                block_size=16,
+                num_experts=num_experts,
+                **graph_workspace,
             )
 
         # Trigger an unprepared first-use preparation on an unrelated b12x op.
         gemv_x = torch.randn(2, 2048, device=device, dtype=torch.bfloat16)
         gemv_w = torch.randn(96, 2048, device=device, dtype=torch.bfloat16)
-        gemv_out = bf16_gemv.mm(gemv_x, gemv_w)
+        gemv_plan = bf16_gemv.plan(bf16_gemv.query_from_call(gemv_x, gemv_w))
+        prepare_default(
+            gemv_plan.request(
+                name="gemv",
+                prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.run(gemv_x, gemv_w)
+                ),
+            )
+        )
+        gemv_out = bf16_gemv.mm(gemv_x, gemv_w, plan=gemv_plan)
         torch.cuda.synchronize(device)
         assert torch.isfinite(gemv_out).all()
 
@@ -643,7 +674,10 @@ def test_prehook_native_triton_specialization_survives_later_preparation(
     prehook_ref = weakref.ref(prehook_compiled)
     del prehook_compiled
 
-    # Confirm discovery sees the pre-hook specialization even with _NATIVE_JITS empty.
+    # Hook installation registers JITs that already exist, so their pre-hook
+    # specializations are counted even though run_observed never saw them.
+    assert prehook_key not in compile_plan.triton_cached_program_keys()
+    compile_plan._discover_native_triton_jits()
     assert prehook_key in compile_plan.triton_cached_program_keys()
 
     job_compiled_refs = []
@@ -838,3 +872,39 @@ def test_external_program_loaded_between_begin_and_advance_survives(
         assert ext3_ref() is not None
     else:
         assert refs["winner"]() is None
+
+
+def test_in_process_compile_evicts_active_job_factory_memo(monkeypatch):
+    """compile_workers=0: the job's own factory memo must not hand back planning output."""
+    planned_key = ProgramKey("cute", "c" * 64, "planned")
+    resolved_key = ProgramKey("cute", "d" * 64, "resolved")
+    calls = []
+
+    @program_cache.program_cache(scope="preparation")
+    def factory(name):
+        calls.append(name)
+        kernel = DeferredCuTeKernel(
+            planned_key if name == "planned" else resolved_key, memory_key=(name,)
+        )
+        if name == "resolved":
+            kernel._resolved = object()
+        return compile_plan.attach_programs(lambda: None, kernel)
+
+    monkeypatch.setattr(program_cache, "_CACHES", weakref.WeakSet())
+    monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
+    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+    scope = program_cache.PreparationProgramCache()
+    with scope.activate():
+        planned = factory("planned")
+        resolved = factory("resolved")
+        assert compile_plan.evict_planning_artifacts((planned_key,)) == 1
+        assert factory("resolved") is resolved
+        assert factory("planned") is not planned
+    assert calls == ["planned", "resolved", "planned"]
+    # Outside the job, eviction does not reach into its memo.
+    with scope.activate():
+        relowered = factory("planned")
+    assert compile_plan.evict_planning_artifacts((planned_key,)) == 0
+    with scope.activate():
+        assert factory("planned") is relowered
+    scope.clear()

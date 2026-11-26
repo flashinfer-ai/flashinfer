@@ -99,7 +99,7 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
     compile of `programs` so the factories lower them for real; with no
     program set, every uncompiled deferred program is dropped.
     """
-    from .program_cache import _CACHES, _MAPPING_CACHES
+    from .program_cache import _CACHES, _MAPPING_CACHES, _active_preparation_memos
 
     targets = None if programs is None else frozenset(programs)
 
@@ -110,7 +110,10 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
         )
 
     removed = 0
-    caches = [(cache._values, (), cache._lock) for cache in tuple(_CACHES)]
+    caches = [
+        (cache._values, (), cache._lock)
+        for cache in (*tuple(_CACHES), *_active_preparation_memos())
+    ]
     for cache, mirrors, lock in (*caches, *_MAPPING_CACHES):
         with lock if lock is not None else nullcontext():
             obsolete = [key for key, value in cache.items() if stale(value)]
@@ -119,7 +122,7 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
                 for mirror in mirrors:
                     mirror.pop(key, None)
             removed += len(obsolete)
-    for jit in _native_triton_jits():
+    for jit in tuple(_NATIVE_JITS):
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
             obsolete = {key for key, kernel in kernel_cache.items() if stale(kernel)}
             for key in obsolete:
@@ -146,26 +149,28 @@ def _iter_subclasses(cls):
         yield from _iter_subclasses(sub)
 
 
-def _native_triton_jits() -> tuple[Any, ...]:
-    jits = list(_NATIVE_JITS)
-    seen = {id(jit) for jit in jits}
+def _discover_native_triton_jits() -> None:
+    """Register native b12x JITs that already exist when the Triton hook installs.
+
+    Their earlier specializations never went through ``run_observed``, so
+    without this they would stay invisible to the keep/evict accounting.
+    """
     jit_module = sys.modules.get("triton.runtime.jit")
     jit_cls = getattr(jit_module, "JITFunction", None)
-    if jit_cls is not None:
-        for cls in _iter_subclasses(jit_cls):
-            for obj in gc.get_referrers(cls):
-                if id(obj) in seen or not isinstance(obj, jit_cls):
-                    continue
-                module = getattr(getattr(obj, "fn", None), "__module__", "")
-                if _is_native_b12x_module(module):
-                    seen.add(id(obj))
-                    jits.append(obj)
-    return tuple(jits)
+    if jit_cls is None:
+        return
+    for cls in _iter_subclasses(jit_cls):
+        for obj in gc.get_referrers(cls):
+            if not isinstance(obj, jit_cls):
+                continue
+            module = getattr(getattr(obj, "fn", None), "__module__", "")
+            if _is_native_b12x_module(module):
+                _NATIVE_JITS.add(obj)
 
 
 def triton_cached_program_keys() -> frozenset[ProgramKey]:
     keys = set()
-    for jit in _native_triton_jits():
+    for jit in tuple(_NATIVE_JITS):
         for kernel_cache, *_ in jit.device_caches.values():
             for kernel in tuple(kernel_cache.values()):
                 keys.update(
@@ -176,7 +181,7 @@ def triton_cached_program_keys() -> frozenset[ProgramKey]:
 
 def evict_unretained_triton(keep, *, evict=None):
     removed = 0
-    for jit in _native_triton_jits():
+    for jit in tuple(_NATIVE_JITS):
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
             if evict is None:
                 obsolete = {
@@ -678,6 +683,7 @@ def _ensure_triton_hook():
     CompiledKernel._init_handles = init_handles
     CompiledKernel.__getitem__ = getitem_observed
     _TRITON_HOOK = compile_or_plan
+    _discover_native_triton_jits()
 
 
 @contextmanager
