@@ -372,3 +372,204 @@ def test_paged_wrapper_run_nhd_page_size_1_reshapes_zero_copy_and_validates():
     bad_v = torch.empty((8, 16, 4, 256), dtype=torch.float8_e4m3fn)
     with pytest.raises(ValueError, match=r"\[num_pages, 1, num_kv_heads, head_dim\]"):
         wrapper.run(q, (bad_k, bad_v), enable_pdl=False)
+
+
+def _plan_options(**overrides):
+    options = dict(
+        kv_layout="HND",
+        required_kv_layout="HND",
+        custom_mask=None,
+        packed_custom_mask=None,
+        pos_encoding_mode="NONE",
+        use_fp16_qk_reduction=False,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        prefix_len_ptr=None,
+        token_pos_in_items_ptr=None,
+        max_item_len_ptr=None,
+        max_sequence_kv=None,
+    )
+    options.update(overrides)
+    return options
+
+
+def test_plan_options_accept_sliding_window_and_keep_other_rejections():
+    from flashinfer.attention.cute_dsl.sm120_fmha import (
+        _validate_sm120_prims_plan_options,
+    )
+
+    for window_left in (-1, 0, 127, 1023):
+        _validate_sm120_prims_plan_options(**_plan_options(window_left=window_left))
+    with pytest.raises(ValueError, match="window_left == -1"):
+        _validate_sm120_prims_plan_options(**_plan_options(window_left=-2))
+    with pytest.raises(TypeError, match="integer window_left"):
+        _validate_sm120_prims_plan_options(**_plan_options(window_left=True))
+    with pytest.raises(NotImplementedError, match="logits_soft_cap"):
+        _validate_sm120_prims_plan_options(
+            **_plan_options(window_left=127, logits_soft_cap=30.0)
+        )
+    with pytest.raises(NotImplementedError, match="custom masks"):
+        _validate_sm120_prims_plan_options(
+            **_plan_options(
+                window_left=127, custom_mask=torch.ones(4, dtype=torch.bool)
+            )
+        )
+
+
+def test_sinks_validation():
+    from flashinfer.attention.cute_dsl.sm120_fmha import _validate_sinks
+
+    q = torch.empty((3, 8, 64), dtype=torch.float8_e4m3fn)
+    _validate_sinks(q, None)
+    _validate_sinks(q, torch.zeros(8))
+    with pytest.raises(ValueError, match=r"shape \(8,\)"):
+        _validate_sinks(q, torch.zeros(4))
+    with pytest.raises(ValueError, match=r"shape \(8,\)"):
+        _validate_sinks(q, torch.zeros(1, 8))
+    with pytest.raises(ValueError, match="dtype torch.float32"):
+        _validate_sinks(q, torch.zeros(8, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="must be contiguous"):
+        _validate_sinks(q, torch.zeros(16)[::2])
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        _validate_sinks(q, [0.0] * 8)
+
+
+def test_window_and_sinks_have_distinct_jit_specializations(monkeypatch):
+    pytest.importorskip("cutlass.experimental")
+
+    from flashinfer.cute_dsl.attention.fmha.sm120.compile import (
+        compile_sm120_fmha_fp8_paged_kernel,
+        compile_sm120_fmha_fp8_ragged_kernel,
+    )
+    from flashinfer.jit import cute_dsl_core
+
+    observed_names = []
+
+    def fake_build_and_load(module_name, kernel_name, compile_fn, **kwargs):
+        observed_names.append(kernel_name)
+        return kernel_name
+
+    compile_sm120_fmha_fp8_ragged_kernel.cache_clear()
+    compile_sm120_fmha_fp8_paged_kernel.cache_clear()
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: (12, 0)
+    )
+    monkeypatch.setattr(
+        cute_dsl_core, "build_and_load_cute_dsl_kernel", fake_build_and_load
+    )
+    common = dict(
+        in_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        num_qo_heads=64,
+        num_kv_heads=8,
+        head_dim=64,
+        is_causal=True,
+        kv_tile=128,
+        q_tile=128,
+        device=torch.device("cuda"),
+        balanced_scheduler=True,
+    )
+    variants = [
+        {},
+        {"sliding_window": True},
+        {"with_sinks": True},
+        {"sliding_window": True, "with_sinks": True},
+    ]
+    ragged = [compile_sm120_fmha_fp8_ragged_kernel(**common, **v) for v in variants]
+    paged = [
+        compile_sm120_fmha_fp8_paged_kernel(**common, num_tokens_per_page=16, **v)
+        for v in variants
+    ]
+    for names in (ragged, paged):
+        assert len(set(names)) == len(variants)
+        # The default kernels keep their pre-existing compile cache keys.
+        assert "_swa" not in names[0] and "_sinks" not in names[0]
+        assert names[1].endswith("_swa")
+        assert names[2].endswith("_sinks")
+        assert names[3].endswith("_swa_sinks")
+    compile_sm120_fmha_fp8_ragged_kernel.cache_clear()
+    compile_sm120_fmha_fp8_paged_kernel.cache_clear()
+
+
+def test_direct_apis_expose_window_left_and_sinks():
+    for fn in (sm120_fmha_fp8_ragged_prefill, sm120_fmha_fp8_paged_prefill):
+        params = inspect.signature(fn).parameters
+        assert params["window_left"].default == -1
+        assert params["sinks"].default is None
+
+
+def test_paged_kv_split_bounds_cover_only_the_window():
+    from flashinfer.attention.cute_dsl.sm120_fmha import _paged_kv_split_bounds
+
+    tile, sms = 128, 188
+    # Gemma-style local layer: chunked prefill of 256 tokens on a 32K prefix.
+    q_lens, kv_lens, window_left = [256], [32768], 1023
+    bounds = _paged_kv_split_bounds(
+        q_lens, kv_lens, 32, True, tile, sms, 0, 128, 2, window_left
+    )
+    begin = (kv_lens[0] - q_lens[0] - window_left) // tile
+    visible = (kv_lens[0] - q_lens[0]) // tile
+    assert bounds is not None and len(bounds[0]) > 2
+    assert bounds[0][0] == begin and bounds[0][-1] == kv_lens[0] // tile
+    assert all(a < b for a, b in zip(bounds[0], bounds[0][1:], strict=False))
+    assert max(bounds[0][1:-1]) <= visible
+    # The unwindowed split of the same request spreads over the whole prefix.
+    full = _paged_kv_split_bounds(q_lens, kv_lens, 32, True, tile, sms, 0, 128, 2)
+    assert full[0][0] == 0 and full[0][1] < begin
+    # A window covering every key leaves the split unchanged.
+    assert (
+        _paged_kv_split_bounds(
+            q_lens, kv_lens, 32, True, tile, sms, 0, 128, 2, kv_lens[0]
+        )
+        == full
+    )
+    # Fixed split: cut at multiples of the step, inside the window only.
+    fixed = _paged_kv_split_bounds(
+        q_lens, kv_lens, 32, True, tile, sms, 512, 128, 2, window_left
+    )
+    assert fixed == [[begin, 248, 252, 256]]
+    # A fresh causal prompt still has no prefix every row sees: no split.
+    assert (
+        _paged_kv_split_bounds([4096], [4096], 64, True, tile, sms, 0, 128, 8, 127)
+        is None
+    )
+    # GPT-OSS decode-like rows with a 128-token window touch two tiles: they may split
+    # those, but never reach outside the window.
+    small = _paged_kv_split_bounds([4], [32768], 64, True, tile, sms, 0, 128, 4, 127)
+    assert small is None or small[0][0] == (32768 - 4 - 127) // tile
+
+
+def test_paged_wrapper_forwards_run_time_sinks_to_prims():
+    from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+
+    captured = []
+
+    class _StubPrimsBackend:
+        _page_size = 16
+
+        def run_paged(self, q, k, v, out, **kwargs):
+            captured.append(kwargs)
+            return out
+
+    wrapper = BatchPrefillWithPagedKVCacheWrapper.__new__(
+        BatchPrefillWithPagedKVCacheWrapper
+    )
+    wrapper._kv_layout = "HND"
+    wrapper._backend = "cute-dsl-prims"
+    wrapper._batch_invariant = None
+    wrapper._cached_q_data_type = torch.float8_e4m3fn
+    wrapper._cached_kv_data_type = torch.float8_e4m3fn
+    wrapper._cached_o_data_type = torch.bfloat16
+    wrapper._qo_indptr_last = 2
+    wrapper._window_left = 127
+    wrapper._prims_backend = _StubPrimsBackend()
+
+    q = torch.empty((2, 8, 64), dtype=torch.float8_e4m3fn)
+    cache = torch.empty((4, 2, 1, 16, 64), dtype=torch.float8_e4m3fn)
+    sinks = torch.zeros(8)
+    wrapper.run(q, cache, sinks=sinks)
+    assert captured[-1]["sinks"] is sinks
+    wrapper.run(q, cache)
+    assert captured[-1]["sinks"] is None
+    with pytest.raises(NotImplementedError, match="run-time window_left"):
+        wrapper.run(q, cache, window_left=-1)

@@ -420,3 +420,211 @@ def test_sm120_paged_page_size_1_fragmented_odd_lengths(D, is_causal):
             kv_lens[b],
         ).to(out_dtype)
         torch.testing.assert_close(o[q_start:q_end], ref_b, **_tol())
+
+
+# ---------------------------------------------------------------------------
+# Sliding window and attention sinks
+# ---------------------------------------------------------------------------
+
+
+def _ref_window_sinks(q_b, k_b, v_b, sm_scale, is_causal, window_left, sinks):
+    """FP32 reference with bottom-right causal/window masks and per-head sinks.
+
+    Returns the output and the log2 LSE.
+    """
+    sq, Hq, _ = q_b.shape
+    skv, Hkv, _ = k_b.shape
+    q_f = q_b.float().permute(1, 0, 2)
+    k_f = k_b.float().permute(1, 0, 2).repeat_interleave(Hq // Hkv, dim=0)
+    v_f = v_b.float().permute(1, 0, 2).repeat_interleave(Hq // Hkv, dim=0)
+    scores = torch.einsum("hqd,hkd->hqk", q_f, k_f) * sm_scale
+    q_pos = (torch.arange(sq, device=q_b.device) + skv - sq).view(-1, 1)
+    k_pos = torch.arange(skv, device=q_b.device).view(1, -1)
+    if is_causal:
+        scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
+    if window_left >= 0:
+        scores = scores.masked_fill(k_pos < q_pos - window_left, float("-inf"))
+    if sinks is not None:
+        scores = torch.cat([scores, sinks[:, None, None].expand(-1, sq, 1)], dim=-1)
+    lse = torch.logsumexp(scores, dim=-1).permute(1, 0) * math.log2(math.e)
+    attn = torch.softmax(scores, dim=-1)
+    if sinks is not None:
+        attn = attn[..., :-1]
+    return torch.einsum("hqk,hkd->hqd", attn, v_f).permute(1, 0, 2), lse
+
+
+def _scattered_paged_inputs(q_lens, kv_lens, Hq, Hkv, D, page_size):
+    """Packed Q plus a shuffled paged K/V pool and its block table."""
+    pages = [-(-kv // page_size) for kv in kv_lens]
+    num_pool_pages = sum(pages) + 3
+    kv_pool = _make_fp8((num_pool_pages, 2, Hkv, page_size, D))
+    k_pool, v_pool = kv_pool.unbind(dim=1)
+    perm = torch.randperm(num_pool_pages, device="cuda", dtype=torch.int32)
+    block_tables = torch.zeros((len(kv_lens), max(pages)), dtype=torch.int32)
+    k_seqs, v_seqs, cursor = [], [], 0
+    for b, (kv_len, n) in enumerate(zip(kv_lens, pages, strict=True)):
+        ids = perm[cursor : cursor + n]
+        cursor += n
+        block_tables[b, :n] = ids.cpu()
+        k_seqs.append(k_pool[ids].transpose(1, 2).reshape(-1, Hkv, D)[:kv_len])
+        v_seqs.append(v_pool[ids].transpose(1, 2).reshape(-1, Hkv, D)[:kv_len])
+    q = _make_fp8((sum(q_lens), Hq, D))
+    cu_seqlens_q = torch.tensor([0, *q_lens], device="cuda").cumsum(
+        0, dtype=torch.int32
+    )
+    seqlens_kv = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    return (
+        q,
+        k_pool,
+        v_pool,
+        block_tables.cuda(),
+        cu_seqlens_q,
+        seqlens_kv,
+        k_seqs,
+        v_seqs,
+    )
+
+
+@pytest.mark.parametrize("page_size", [1, 16, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize(
+    "Hq,Hkv,D,gqa_pack_size,with_sinks",
+    [
+        (64, 8, 64, 8, True),  # GPT-OSS sliding layers
+        (32, 16, 256, 2, False),  # Gemma 4 local layers
+        (8, 2, 128, 1, True),  # GQA without Q-head packing
+    ],
+)
+def test_sm120_paged_sliding_window_sinks_and_lse(
+    page_size, is_causal, Hq, Hkv, D, gqa_pack_size, with_sinks
+):
+    q_lens = [1, 17, 130, 300]
+    kv_lens = [1, 200, 1025, 300] if is_causal else [1, 200, 1025, 129]
+    sm_scale = 1.0 / math.sqrt(D)
+    q, k_pool, v_pool, block_tables, cu_q, seqlens_kv, k_seqs, v_seqs = (
+        _scattered_paged_inputs(q_lens, kv_lens, Hq, Hkv, D, page_size)
+    )
+    sinks = torch.randn(Hq, device="cuda") * 2.0 + 1.0 if with_sinks else None
+    for window_left in (0, 1, 63, 127, 128, 511, 1023):
+        o = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+        lse = torch.empty(q.shape[:2], device="cuda", dtype=torch.float32)
+        sm120_fmha_fp8_paged_prefill(
+            q,
+            k_pool,
+            v_pool,
+            o,
+            block_tables=block_tables,
+            seqlens_kv=seqlens_kv,
+            cu_seqlens_q=cu_q,
+            is_causal=is_causal,
+            sm_scale=sm_scale,
+            max_seqlen_q=max(q_lens),
+            lse=lse,
+            gqa_pack_size=gqa_pack_size,
+            window_left=window_left,
+            sinks=sinks,
+        )
+        torch.cuda.synchronize()
+        for b in range(len(q_lens)):
+            rows = slice(int(cu_q[b]), int(cu_q[b + 1]))
+            ref, ref_lse = _ref_window_sinks(
+                q[rows], k_seqs[b], v_seqs[b], sm_scale, is_causal, window_left, sinks
+            )
+            torch.testing.assert_close(o[rows].float(), ref, **_tol())
+            torch.testing.assert_close(lse[rows], ref_lse, **_tol())
+
+
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_sm120_paged_window_split_kv_merges_to_unsplit(with_sinks):
+    """Hand-built split-KV chunks, some holding no key in a row's window, merge to
+    the unsplit result; sinks are folded into chunk 0 only."""
+    from flashinfer.cascade import merge_states
+
+    Hq, Hkv, D, page_size, window_left = 16, 2, 128, 16, 200
+    q_lens, kv_lens = [130, 7], [2000, 1500]
+    q, k_pool, v_pool, block_tables, cu_q, seqlens_kv, k_seqs, v_seqs = (
+        _scattered_paged_inputs(q_lens, kv_lens, Hq, Hkv, D, page_size)
+    )
+    sinks = torch.randn(Hq, device="cuda") * 2.0 + 1.0 if with_sinks else None
+    # Chunk c of request r covers K/V tiles [begin, end); empty ranges are allowed.
+    chunks = [[(12, 14), (9, 10)], [(14, 15), (10, 11)], [(15, 16), (11, 12)]]
+    ranges = torch.tensor(
+        [list(r) for chunk in chunks for r in chunk], dtype=torch.int32, device="cuda"
+    )
+    n = len(chunks)
+    o_parts = torch.empty((q.shape[0] * n, Hq, D), device="cuda", dtype=torch.bfloat16)
+    lse_parts = torch.empty((q.shape[0] * n, Hq), device="cuda", dtype=torch.float32)
+    common = dict(
+        block_tables=block_tables,
+        seqlens_kv=seqlens_kv,
+        cu_seqlens_q=cu_q,
+        is_causal=True,
+        sm_scale=1.0 / math.sqrt(D),
+        max_seqlen_q=max(q_lens),
+        gqa_pack_size=8,
+        window_left=window_left,
+        sinks=sinks,
+    )
+    sm120_fmha_fp8_paged_prefill(
+        q, k_pool, v_pool, o_parts, lse=lse_parts, kv_tile_ranges=ranges, **common
+    )
+    merged, merged_lse = merge_states(
+        o_parts.view(q.shape[0], n, Hq, D), lse_parts.view(q.shape[0], n, Hq)
+    )
+    o = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(q.shape[:2], device="cuda", dtype=torch.float32)
+    sm120_fmha_fp8_paged_prefill(q, k_pool, v_pool, o, lse=lse, **common)
+    torch.cuda.synchronize()
+    assert torch.isfinite(merged.float()).all()
+    # Each chunk quantizes its P to FP8 against its own running max, so split and
+    # unsplit outputs differ by FP8 rounding; the LSE is accumulated in FP32.
+    torch.testing.assert_close(merged.float(), o.float(), atol=0.1, rtol=0.1)
+    torch.testing.assert_close(merged_lse, lse, atol=5e-3, rtol=5e-3)
+    for b in range(len(q_lens)):
+        rows = slice(int(cu_q[b]), int(cu_q[b + 1]))
+        ref, ref_lse = _ref_window_sinks(
+            q[rows], k_seqs[b], v_seqs[b], 1.0 / math.sqrt(D), True, window_left, sinks
+        )
+        torch.testing.assert_close(merged[rows].float(), ref, **_tol())
+        torch.testing.assert_close(merged_lse[rows], ref_lse, **_tol())
+
+
+@pytest.mark.parametrize("D,gqa_pack_size", [(64, 8), (256, 1)])
+def test_sm120_paged_window_with_skip_softmax(D, gqa_pack_size):
+    """The skip-softmax predicate honours the window: threshold 0 skips nothing
+    that matters, so it matches the dense windowed kernel and the reference."""
+    Hq, Hkv, page_size, window_left = (64, 8, 16, 127) if D == 64 else (8, 4, 16, 300)
+    q_lens, kv_lens = [130, 17], [1025, 600]
+    sm_scale = 1.0 / math.sqrt(D)
+    q, k_pool, v_pool, block_tables, cu_q, seqlens_kv, k_seqs, v_seqs = (
+        _scattered_paged_inputs(q_lens, kv_lens, Hq, Hkv, D, page_size)
+    )
+    sinks = torch.randn(Hq, device="cuda")
+    outs = []
+    for threshold in (None, 0.0):
+        o = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)
+        sm120_fmha_fp8_paged_prefill(
+            q,
+            k_pool,
+            v_pool,
+            o,
+            block_tables=block_tables,
+            seqlens_kv=seqlens_kv,
+            cu_seqlens_q=cu_q,
+            is_causal=True,
+            sm_scale=sm_scale,
+            max_seqlen_q=max(q_lens),
+            gqa_pack_size=gqa_pack_size,
+            skip_softmax_threshold=threshold,
+            window_left=window_left,
+            sinks=sinks,
+        )
+        outs.append(o)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(outs[1], outs[0], atol=1e-2, rtol=1e-2)
+    for b in range(len(q_lens)):
+        rows = slice(int(cu_q[b]), int(cu_q[b + 1]))
+        ref, _ = _ref_window_sinks(
+            q[rows], k_seqs[b], v_seqs[b], sm_scale, True, window_left, sinks
+        )
+        torch.testing.assert_close(outs[1][rows].float(), ref, **_tol())
