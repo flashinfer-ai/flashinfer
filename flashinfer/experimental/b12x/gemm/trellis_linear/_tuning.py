@@ -27,6 +27,11 @@ class TrellisQuery:
     rotated_compute_provided: bool = False
     gemm_output_f16_provided: bool = False
     output_f16_provided: bool = False
+    # False keeps the whole-tile schedule: one CTA reduces each output tile over
+    # the full K. True lets under-filled decode/verify launches split K across
+    # CTAs, which is faster but makes a row's K summation order depend on the
+    # planned M.
+    allow_split_k: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -35,6 +40,9 @@ class TrellisConfig:
     block_rows: int
     tile_k: int
     tile_n: int
+    # None: whole-tile schedule. N >= 2: N CTAs share each tile's K range and
+    # the kernel's lock-ordered split-K finalize combines their partial sums.
+    split_k_slices: int | None = None
 
     @classmethod
     def from_config(cls, payload):
@@ -62,6 +70,7 @@ def validate_query(query):
                 query.rotated_compute_provided,
                 query.gemm_output_f16_provided,
                 query.output_f16_provided,
+                query.allow_split_k,
             )
         )
         or query.weight_layout not in ("native", "p24_k", "p24_n", "p33_k", "p33_n")
@@ -141,10 +150,29 @@ def validate_config(query, config, device):
         uses_m_block_8=config.block_rows == 8,
         weight_layout="trellis_t256",
     )
+    slices = config.split_k_slices
+    if slices is not None:
+        if type(slices) is not int or slices < 2:
+            raise ValueError("Trellis split_k_slices must be None or an integer >= 2")
+        if not query.allow_split_k:
+            raise ValueError(
+                "Trellis split-K changes the K summation order with max_rows; "
+                "declare the query with allow_split_k=True to allow it"
+            )
+        if config.block_rows == 8:
+            raise ValueError(
+                "Trellis split-K requires block_rows >= 16 (the M8 decode "
+                "schedule computes one whole tile per CTA)"
+            )
+        if slices > query.in_features // config.tile_k:
+            raise ValueError("Trellis split_k_slices exceeds the K-tile count")
 
 
 def default_config(query, device):
-    from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
+    from b12x.moe._shared.kernels.w4a16.kernel import (
+        _trellis256_dense_launch_geometry,
+        _trellis256_dense_split_k_slices,
+    )
 
     if device is None:
         raise ValueError("Trellis launch selection requires the device SM count")
@@ -154,8 +182,23 @@ def default_config(query, device):
         size_n=query.out_features,
         sms=device.sm_count,
     )
+    split_k_slices = None
+    if query.allow_split_k:
+        split_k_slices = _trellis256_dense_split_k_slices(
+            size_m=query.max_rows,
+            size_k=query.in_features,
+            size_n=query.out_features,
+            block_rows=block_rows,
+            tile_k=tile_k,
+            tile_n=tile_n,
+            sms=device.sm_count,
+        )
     return TrellisConfig(
-        backend="cutedsl", block_rows=block_rows, tile_k=tile_k, tile_n=tile_n
+        backend="cutedsl",
+        block_rows=block_rows,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        split_k_slices=split_k_slices,
     )
 
 
@@ -177,13 +220,16 @@ def _tuning_parameters(query, device):
     # interdependent CTA-thread, register, shared-memory and packed-layout constraints.
     return {
         "tile_n": (256,) if query.weight_layout.endswith("_n") else (64, 128, 256),
+        # validate_config drops slice counts that block_rows or the K-tile count
+        # cannot use; split-K is searched only where the query allows it.
+        "split_k_slices": (None, 2, 4, 8, 16) if query.allow_split_k else (None,),
     }
 
 
 TUNING = TuningContract(
     component_id="gemm.trellis_linear",
-    query_schema_version=4,
-    config_schema_version=1,
+    query_schema_version=5,
+    config_schema_version=2,
     semantic_version=1,
     query_fields=frozenset(field.name for field in fields(TrellisQuery)),
     config_fields=frozenset(field.name for field in fields(TrellisConfig)),
@@ -203,6 +249,7 @@ TUNING = TuningContract(
         ),
         Knob(name="tile_k", values=(64, 128), binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=(64, 128, 256), binding=ParameterBinding.COMPILE),
+        Knob(name="split_k_slices", values=None, binding=ParameterBinding.COMPILE),
     ),
     parameters=_tuning_parameters,
 )

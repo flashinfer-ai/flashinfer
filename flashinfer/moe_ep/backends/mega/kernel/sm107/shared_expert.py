@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cache
 
 from .....core.validation.common import MoEEpConfigError
 from .....config import Sm107SharedExpertConfig as Sm107SharedExpertConfig
@@ -142,15 +144,35 @@ def validate_shared_inputs(config, tensors, fleet, *, quantize_input):
         )
 
 
+@cache
+def _shared_bf16_stager():
+    import torch
+
+    from flashinfer.utils import version_at_least
+
+    # Torch added the saturating CUDA E4M3 cast in 2.12 for CUDA 13 builds.
+    if not (
+        version_at_least(torch.__version__, "2.12")
+        and version_at_least(torch.version.cuda or "0", "13.0")
+    ):
+        return None
+    # Triton remains optional for the existing shared-expert path.
+    try:
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.shared_staging import (
+            stage_shared_bf16,
+        )
+    except ModuleNotFoundError as error:
+        if error.name == "triton":
+            return None
+        raise
+    return stage_shared_bf16
+
+
 def stage_shared_inputs(tensors, workspace, *, quantize_input):
     shared = workspace.config.shared_expert
     if shared is None:
         return
     import torch
-    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
-        quantize_mxfp8_block32,
-        to_blocked,
-    )
 
     x, sf = (
         getattr(tensors, "shared_hidden_states", None),
@@ -158,6 +180,28 @@ def stage_shared_inputs(tensors, workspace, *, quantize_input):
     )
     if x is None:
         x, sf = tensors.hidden_states, None if quantize_input else tensors.scales
+    # The fused launch pads grid.y to 128 rows and uses int32 offsets.
+    if (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.shape[-1] % 128 == 0
+        and shared.kind == "mxfp8_e4m3"
+        and os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+        and workspace.shared_x.shape[0] <= 65_535 // 128 * 128
+        and workspace.shared_x.numel() <= 2**31
+        and workspace.shared_x_sf.numel() <= 2**31
+    ):
+        stage = _shared_bf16_stager()
+        if stage is not None:
+            stage(x, workspace)
+            return
+
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
+        quantize_mxfp8_block32,
+        to_blocked,
+    )
+
     if tensors.num_tokens and x.dtype == torch.bfloat16:
         dtype = (
             torch.float8_e4m3fn if shared.kind == "mxfp8_e4m3" else torch.float8_e5m2
