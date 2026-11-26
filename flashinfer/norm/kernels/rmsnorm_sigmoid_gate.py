@@ -18,6 +18,8 @@ try:
     import cutlass
     import cutlass.cute as cute
 
+    from ..utils import get_sm_version, max_cluster_n
+
     HAS_CUTEDSL = True
 except ImportError:  # pragma: no cover - exercised without nvidia-cutlass-dsl
     HAS_CUTEDSL = False
@@ -316,7 +318,10 @@ def _get_compiled(
     warps: int,
     cluster: int,
     enable_pdl: bool = False,
+    sm_version: int = 0,
 ):
+    # sm_version only keys the in-process cache per architecture; the on-disk
+    # cache is already scoped per architecture.
     shape = (cute.sym_int(), num_heads, HEAD_DIM)
     x = cute.runtime.make_fake_tensor(
         cutlass.BFloat16,
@@ -398,9 +403,10 @@ def rmsnorm_sigmoid_gate(
     lanes, warps, cluster = _launch_config(rows)
     rows_per_cta = 32 * warps // lanes
     tiles = (rows + rows_per_cta - 1) // rows_per_cta
-    cluster = min(cluster, tiles)
-    if torch.cuda.get_device_capability(x.device)[0] == 12:
-        cluster = min(cluster, 8)  # SM12x: max cluster size is 8 (no non-portable 16)
+    sm_version = get_sm_version(x.device)
+    # 16-CTA clusters are non-portable; some SM12x parts reject them.
+    with torch.cuda.device(x.device):  # max_cluster_n probes the current device
+        cluster = min(cluster, tiles, max_cluster_n(sm_version))
 
     compiled = _get_compiled(
         x.shape[1],
@@ -410,6 +416,7 @@ def rmsnorm_sigmoid_gate(
         warps,
         cluster,
         enable_pdl,
+        sm_version,
     )
     compiled(x, gate, x, eps)
 
