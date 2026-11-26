@@ -293,6 +293,12 @@ def _sm8x_fp8(a: torch.Tensor) -> bool:
     return major == 8 and minor < 9 and a.element_size() == 1
 
 
+def _sm8x_block_scale(a: torch.Tensor) -> bool:
+    """SM8x, where cuDNN runs no block-scaled grouped GEMM: there ``grouped_mm_mxfp8`` and
+    ``grouped_mm_fp4`` take the SM8x dense GEMMs, which have no execution plans."""
+    return get_compute_capability(a.device)[0] == 8
+
+
 def _cudnn_moe_grouped_gemm_plan_count(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -563,6 +569,8 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
     ``range(count)``. Like the plain query, it compiles every plan once and is
     refused while a CUDA graph is being captured.
     """
+    if _sm8x_block_scale(a):
+        return 0
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     token_descale_3d = a_descale.unsqueeze(0)
@@ -625,6 +633,14 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
             plan.  Non-negative values select a specific plan built with
             ``build_plan_policy.ALL``.
     """
+    if _sm8x_block_scale(a) and alpha is None:
+        if tactic != -1:
+            return None  # beyond the plan count, which is 0
+        from ...gemm.sm8x_fp8_dense import sm8x_grouped_mm_mxfp8
+
+        return sm8x_grouped_mm_mxfp8(
+            a, b, a_descale, b_descale, m_indptr, out_dtype, out
+        )
     token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
     weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
     alpha_cudnn_dtype = _to_cudnn_dtype(alpha.dtype) if alpha is not None else None
@@ -721,6 +737,14 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
             plan.  Non-negative values select a specific plan built with
             ``build_plan_policy.ALL``.
     """
+    if _sm8x_block_scale(a):
+        if tactic != -1:
+            return None  # beyond the plan count, which is 0
+        from ...gemm.sm8x_fp8_dense import sm8x_grouped_mm_fp4
+
+        return sm8x_grouped_mm_fp4(
+            a, b, a_descale, b_descale, m_indptr, alpha, out_dtype, out, block_size
+        )
     a_descale_cudnn_type = (
         cudnn.data_type.FP8_E8M0
         if a_descale.dtype == torch.uint8

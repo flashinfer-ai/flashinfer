@@ -871,8 +871,11 @@ def _run_rows_fp4(
         act = act.to(torch.bfloat16).mul_(2.0 ** (112 if e5 else 119))
     else:
         act = tok.index_select(0, idx)
-    direct = out.is_contiguous() and out.data_ptr() % 16 == 0  # N % 8 == 0
-    target = out if direct else out.clone(memory_format=torch.contiguous_format)
+    direct = n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
+    target = out
+    if not direct:  # the rows routed nowhere kept
+        target = torch.empty((rows, _pad(n, 8)), dtype=out.dtype, device=a.device)
+        target[:, :n].copy_(out)
     gemm = module if out.dtype == torch.bfloat16 else _out_module(out.dtype)
     gemm.gemm_fp4(
         _aligned(b.view(torch.uint8), 16), _aligned(b_scale.view(torch.uint8), 16), alpha,
@@ -880,7 +883,7 @@ def _run_rows_fp4(
         False, asf_off, 7 if e5 else 0,
     )  # fmt: skip
     if not direct:
-        out.copy_(target)
+        out.copy_(target[:, :n])
 
 
 class Sm8xRowsFp4Runner(TunableRunner):
@@ -918,7 +921,10 @@ def _rows_tuning_config(sf_div: int) -> TuningConfig:
         ),
         constraint_specs=(
             ConstraintSpec(
-                2, 0, lambda s: _pad(s[0][0] + 127 * s[1][0], 128) * (s[0][1] // sf_div)
+                2,
+                0,
+                lambda s: _pad(s[0][0] + 127 * s[1][0], 128)
+                * _pad(s[0][1] // sf_div, 4),
             ),
             ConstraintSpec(8, 0, lambda s: s[0][0]),
         ),
@@ -1158,6 +1164,93 @@ def sm8x_ragged_scaled_bmm(
              device=a.device), c],
         )  # fmt: skip
     return c
+
+
+def _grouped_mm_rows(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    k: int,
+    vec: int,
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """The output and cuDNN's MOE segment boundaries (the starts ``m_indptr[:-1]``, the last
+    segment to ``a.shape[0]``, nondecreasing; None: nothing to compute) of the block-scaled
+    ``grouped_mm`` after the scales' size check (128x4-swizzled, ``vec``-element blocks)."""
+    cum_m, (groups, n) = int(a.shape[0]), (int(x) for x in b.shape[:2])
+    if k % 32:
+        raise ValueError(f"block-scaled grouped GEMM requires K % 32 == 0, got K={k}")
+    per_row = _pad(k // vec, 4)
+    if (
+        a_descale.numel() < _pad(cum_m, 128) * per_row
+        or b_descale.numel() < groups * _pad(n, 128) * per_row
+    ):
+        raise ValueError(
+            "a_descale and b_descale must hold the 128x4-swizzled scales of a and of "
+            "each expert's b"
+        )
+    if out is None:
+        out = torch.empty((cum_m, n), dtype=out_dtype, device=a.device)
+    if cum_m == 0 or groups == 0 or n == 0:
+        return out, None
+    ends = m_indptr.reshape(-1)[:-1].new_full((1,), cum_m)
+    ip = torch.cat((m_indptr.reshape(-1)[:-1], ends)).clamp(0, cum_m).long()
+    return out, torch.cummax(ip, 0).values
+
+
+def sm8x_grouped_mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """``grouped_mm_mxfp8`` on SM8x: ``a @ b[e]^T`` over cuDNN's MOE segments, the rows before
+    ``m_indptr[0]`` unwritten."""
+    out, ip = _grouped_mm_rows(
+        a, b, a_descale, b_descale, m_indptr, int(a.shape[1]), 32, out_dtype, out
+    )
+    if ip is not None:
+        seg = torch.searchsorted(
+            ip, torch.arange(a.shape[0], device=a.device), right=True
+        )
+        sf = (a_descale.reshape(-1), b_descale.reshape(-1))
+        _tuned_mx8("grouped_mm_mxfp8_sm8x", False, [a, b, *sf, seg - 1, out])
+    return out
+
+
+def sm8x_grouped_mm_fp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    block_size: int,
+) -> torch.Tensor:
+    """``grouped_mm_fp4`` on SM8x (``block_size`` 16: NVFP4, 32: MXFP4): ``alpha * (a @
+    b[e]^T)`` over cuDNN's MOE segments, the rows before ``m_indptr[0]`` unwritten."""
+    k, groups = 2 * int(a.shape[1]), int(b.shape[0])
+    out, ip = _grouped_mm_rows(
+        a, b, a_descale, b_descale, m_indptr, k, block_size, out_dtype, out
+    )
+    if ip is not None:
+        gs = torch.ones(groups, device=a.device) if alpha is None else alpha
+        _tuned_rows_fp4(
+            "grouped_mm_fp4_sm8x", _FP4_FMT["nvfp4" if block_size == 16 else "mxfp4"],
+            [a, b, a_descale.reshape(-1).view(torch.uint8),
+             b_descale.reshape(-1).view(torch.uint8), ip[:-1], ip[1:],
+             gs.reshape(-1).expand(groups).contiguous(),
+             torch.zeros(groups, dtype=torch.int32, device=a.device), out],
+        )  # fmt: skip
+    return out
 
 
 def _run_16(

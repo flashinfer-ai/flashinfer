@@ -440,7 +440,7 @@ def test_cudnn_check_support_rejects_unsupported_options():
         (_BF16_KEY, 75),
         (_FP8_KEY, 75),
         (_MXFP8_KEY, 90),
-        (_NVFP4_KEY, 89),
+        (_NVFP4_KEY, 90),
     ):
         runner = _detached_runner(key, _config(key))
         runner._device_arch = arch
