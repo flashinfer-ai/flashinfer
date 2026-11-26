@@ -813,7 +813,8 @@ inline bool persistentActivationSupported(Data const& data) {
   int const eltBytes = tg::dtypeGetNumBits(data.mDtypeElt) / 8;
   bool const hasControls = data.gatedActAlphaPtr != nullptr || data.gatedActBetaPtr != nullptr ||
                            data.gatedActClampLimitPtr != nullptr;
-  return data.permutedIdxToTokenIdx != nullptr && data.totalMaxPaddedTokens > 0 &&
+  // The persistent kernel currently implements SwiGLU only. SiTU uses the general kernel.
+  return !data.mUseSitu && data.permutedIdxToTokenIdx != nullptr && data.totalMaxPaddedTokens > 0 &&
          data.expandedIdxToPermutedIdx != nullptr &&
          data.mDeepSeekSfBlockSize == DEEP_SEEK_ACTIVATION_PERSISTENT_SF_BLOCK && outputDim > 0 &&
          outputDim % DEEP_SEEK_ACTIVATION_PERSISTENT_SF_BLOCK == 0 &&

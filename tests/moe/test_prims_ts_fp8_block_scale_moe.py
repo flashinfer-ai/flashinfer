@@ -70,10 +70,10 @@ def test_deepseek_fp8_activation_rejects_cpu_auxiliary_tensors(
     """The native staged-activation ABI must reject host pointers before launch."""
     device = torch.device("cuda")
     arguments = [
-        torch.empty((1, 2), dtype=torch.uint8, device=device),
-        torch.empty(1, dtype=torch.float32, device=device),
-        torch.empty((1, 1), dtype=torch.uint8, device=device),
-        torch.empty(1, dtype=torch.float32, device=device),
+        torch.empty((1, 256), dtype=torch.uint8, device=device),
+        torch.empty((2, 1), dtype=torch.float32, device=device),
+        torch.empty((1, 128), dtype=torch.uint8, device=device),
+        torch.empty((1, 1), dtype=torch.float32, device=device),
         torch.zeros(1, dtype=torch.int32, device=device),
         torch.ones(1, dtype=torch.int32, device=device),
         torch.zeros(1, dtype=torch.int32, device=device),
@@ -82,11 +82,12 @@ def test_deepseek_fp8_activation_rejects_cpu_auxiliary_tensors(
         None,
         1,  # num_tokens
         1,  # top_k
-        1,  # intermediate_size
+        128,  # intermediate_size
         1,  # local_num_experts
         1,  # tile_tokens_dim
         ActivationType.Situ.value,
         False,  # enable_pdl
+        128,  # sf_block_size
     ]
     arguments[argument_index] = torch.zeros(1, dtype=dtype, device="cpu")
 
@@ -164,7 +165,6 @@ def test_prims_ts_fp8_block_scale_situ_matches_reference(
     cache_permute_indices,
 ):
     """Kimi K3 SiTU parameters match the dequantized reference."""
-    _skip_prims_ts_on_sm107()
     num_tokens = 128 if quant_mode == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK else 32
     hidden_size = 512
     intermediate_size = 512
