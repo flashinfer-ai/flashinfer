@@ -132,12 +132,21 @@ def add_profile_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {value}")
+    return value
+
+
 def add_layer_args(parser: argparse.ArgumentParser) -> None:
     """Options shared by the layer benchmarks, after ``add_profile_args``."""
     parser.add_argument(
         "--intermediate_size", type=int, default=None, help="Override the profile."
     )
-    parser.add_argument("--iters", type=int, default=200, help="Timed iterations.")
+    parser.add_argument(
+        "--iters", type=_positive_int, default=200, help="Timed iterations."
+    )
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
     parser.add_argument(
         "--perfect_router",

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import enum
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -113,7 +114,7 @@ def _kernel_config(args: argparse.Namespace, shape: Dict[str, Any]):
             f"unknown --kernel_name {args.kernel_name!r}; known: {sorted(types)}"
         )
     config_type = types[args.kernel_name]
-    fields = {field.name for field in dataclasses.fields(config_type)}
+    fields = {field.name: field for field in dataclasses.fields(config_type)}
     kwargs: Dict[str, Any] = {
         "intermediate_size": shape["intermediate_size"],
         "top_k": shape["top_k"],
@@ -124,9 +125,20 @@ def _kernel_config(args: argparse.Namespace, shape: Dict[str, Any]):
     if not isinstance(extra, dict):
         raise ValueError("--backend_config must be a JSON object")
     kwargs.update(extra)
-    unknown = sorted(set(kwargs) - fields)
+    unknown = sorted(set(kwargs) - set(fields))
     if unknown:
         raise ValueError(f"{config_type.__name__} has no fields {unknown}")
+    # JSON cannot hold an enum member, so a string given for a field whose
+    # default is an enum names a member, e.g. '{"finalize_mode": "NONE"}'.
+    for name, value in kwargs.items():
+        enum_type = type(fields[name].default)
+        if isinstance(value, str) and issubclass(enum_type, enum.Enum):
+            if value not in enum_type.__members__:
+                raise ValueError(
+                    f"{name} must name a member of {enum_type.__name__} "
+                    f"{list(enum_type.__members__)}, got {value!r}"
+                )
+            kwargs[name] = enum_type[value]
     return config_type(**kwargs)
 
 
@@ -364,12 +376,15 @@ def main() -> None:
                 use_cuda_graph=use_cuda_graph,
                 cupti_ctx=cupti_ctx,
             )
-        except (RuntimeError, ValueError, TypeError, NotImplementedError) as exc:
+        except (ValueError, TypeError, NotImplementedError) as exc:
+            # A backend rejects a configuration the same way on every rank, so
+            # every rank reaches the agreement below. Runtime errors (a failed
+            # launch, an allocation) can stop one rank inside a collective the
+            # others wait in; they propagate, and torchrun stops every rank.
+            # The report already holds every batch size measured before.
             error = f"{type(exc).__name__}: {exc}"
         error = first_error(error)
         if error is not None:
-            # A failed launch may leave the workspace mid-round, so the sweep
-            # stops here.
             print_rank0(f"[{_TAG}] Stopping at {label}: {error}")
             break
         event_times, span_times, kernels = timings
