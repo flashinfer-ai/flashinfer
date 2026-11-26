@@ -847,7 +847,7 @@ _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG = TuningConfig(
 )
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _cutlass_nvfp4_svdquant_requirement(*args, **kwargs):
     return True
 
@@ -1036,7 +1036,9 @@ def mm_nvfp4_svdquant(
 
     On SM100/SM103, CUTLASS and the ``"cake"`` backend fuse the block-scaled
     NVFP4 residual GEMM with the rank-r
-    BF16 LoRA-up correction and optional bias. On SM120/SM121, ``"cute-dsl"`` fuses the
+    BF16 LoRA-up correction and optional bias; on SM80/SM86/SM87/SM89 CUTLASS runs
+    the NVFP4 GEMM into FP32 and adds the correction and bias there, rounded once.
+    On SM120/SM121, ``"cute-dsl"`` fuses the
     correction and bias into the b12x CuTe DSL kernel's FP32 accumulator epilogue, while
     ``"cute-dsl-unfused"`` retains the compositional implementation as a
     differential oracle and optional autotuning candidate. The LoRA rank ``r`` is inferred
@@ -1114,6 +1116,14 @@ def mm_nvfp4_svdquant(
     # Preserve the historical public numel>=1 contract while specializing all
     # backend kernels and autotune keys on one scalar device element.
     alpha_scalar = alpha.reshape(-1)[:1]
+
+    if get_compute_capability(a.device)[0] == 8:
+        from .sm8x_fp4_dense import sm8x_mm_nvfp4_lora
+
+        sm8x_mm_nvfp4_lora(
+            a, b, a_sf, b_sf, alpha_scalar, d, l1, alpha_scalar, None, bias, out
+        )
+        return out
 
     if backend == "cake":
         from ..cake_nvfp4_svdquant_gemm_backend import run as _run_cake
@@ -1277,7 +1287,8 @@ def nvfp4_quantize_smooth(
     r"""Smooth + NVFP4 quantization: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
 
     The SM100/SM103 CUTLASS backend applies the SVDQuant per-input-channel smoothing scale
-    and NVFP4-quantizes in one pass. The SM120/SM121 CuTe DSL backend also
+    and NVFP4-quantizes in one pass; on SM80/SM86/SM87/SM89 it quantizes the BF16 product
+    ``x * pre_quant_scale``. The SM120/SM121 CuTe DSL backend also
     applies smoothing inside the NVFP4 quantizer, avoiding a BF16 intermediate.
     Both use ue4m3 block scales, the 128x4 swizzled layout, and SF vector size 16.
 
@@ -1309,6 +1320,25 @@ def nvfp4_quantize_smooth(
     if backend == "auto":
         backend = nvfp4_quantize_smooth.suitable_auto_backends[0]
     x, pre_quant_scale = _normalize_nvfp4_quantize_smooth_inputs(x, pre_quant_scale)
+    # SM8x runs the stock quantizer on x * pre_quant_scale.
+    if get_compute_capability(x.device)[0] == 8:
+        if x.shape[0] == 0:
+            return (
+                torch.empty(0, x.shape[1] // 2, dtype=torch.uint8, device=x.device),
+                torch.empty(0, dtype=torch.uint8, device=x.device),
+            )
+        from ..quantization.fp4_quantization import fp4_quantize
+
+        xq, sf = fp4_quantize(
+            x * pre_quant_scale,
+            global_scale.reshape(-1)[:1],
+            16,
+            False,
+            True,
+            enable_pdl=False,
+            nvfp4_4over6=None,
+        )
+        return xq.view(torch.uint8), sf.view(torch.uint8).reshape(-1)
     if backend == "cute-dsl":
         from ..quantization.kernels.nvfp4_quantize import (
             nvfp4_quantize_smooth_cute_dsl,
