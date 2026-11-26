@@ -22,10 +22,15 @@ from packaging.version import Version
 import flashinfer
 from types import SimpleNamespace
 
+# The SM120 host module imports the optional CuTe DSL at module level.
+pytest.importorskip("cutlass.cute", reason="nvidia-cutlass-dsl is not installed")
+
 from flashinfer.attention.cute_dsl import sm120_fmha as sm120_fmha_mod
 from flashinfer.attention.cute_dsl.sm120_fmha import (
     SM120PrimsBatchPrefillBackend,
+    _kv_split_scratch,
     _paged_kv_split_bounds,
+    _resolve_balanced_scheduler,
     _select_tile_sizes,
     _use_balanced_scheduler,
     _validate_hnd_paged_pool,
@@ -350,7 +355,8 @@ def test_validate_hnd_paged_pool_base_alignment_d512():
 
 
 def test_causal_balanced_scheduler_respects_cuda_grid_y_limit(monkeypatch):
-    """Verify long causal prefill falls back to unbalanced scheduling when Q tiles exceed 65,535."""
+    """Verify the scheduler fallback at CUDA's grid.y limit and that backend dispatch reuses the
+    planned scheduler flag even if the environment changes after plan()."""
     pytest.importorskip("cutlass.experimental")
     from flashinfer.cute_dsl.attention.fmha import sm120 as sm120_mod
 
@@ -359,6 +365,8 @@ def test_causal_balanced_scheduler_respects_cuda_grid_y_limit(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: (12, 0)
     )
+    # _ensure_kernel probes CUDA Graph capture, which raises on CPU-only PyTorch.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     # D=512, Q64, GQA 16:1 -> gqa_pack_size=16 -> 4 Q tokens per CTA.
     # 65,535 tiles (262,140 tokens) fits grid.y; 65,536 tiles (262,144 tokens) falls back to grid.x.
@@ -371,6 +379,19 @@ def test_causal_balanced_scheduler_respects_cuda_grid_y_limit(monkeypatch):
     # Ragged (gqa_pack_size=1, Q64): 65,535 * 64 fits; 65,535 * 64 + 1 falls back.
     assert _use_balanced_scheduler(True, max_seqlen_q=65_535 * 64, q_tile=64)
     assert not _use_balanced_scheduler(True, max_seqlen_q=65_535 * 64 + 1, q_tile=64)
+    # The unbalanced grid puts head groups on grid.y.
+    with pytest.raises(ValueError, match="grid.y"):
+        _resolve_balanced_scheduler(
+            False, False, max_seqlen_q=1, q_tile=64, num_qo_heads=65_536
+        )
+    assert not _resolve_balanced_scheduler(
+        None, False, max_seqlen_q=1, q_tile=64, num_qo_heads=65_536, gqa_pack_size=2
+    )
+    # An explicit balanced flag still has to fit its Q tiles on grid.y.
+    with pytest.raises(ValueError, match="grid.y"):
+        _resolve_balanced_scheduler(
+            True, True, max_seqlen_q=65_536 * 64, q_tile=64, num_qo_heads=8
+        )
 
     paged_calls = []
     ragged_calls = []
@@ -411,27 +432,23 @@ def test_causal_balanced_scheduler_respects_cuda_grid_y_limit(monkeypatch):
     assert backend._gqa_pack_size == 16
     assert backend._balanced_scheduler is False
     assert paged_calls[-1]["balanced_scheduler"] is False
-    backend._ensure_kernel(with_lse=True)
-    assert paged_calls[-1]["balanced_scheduler"] is False
-
-    # Direct paged dispatch with max_seqlen_q=262_144 selects the exact same specialization.
     q_small = torch.empty((4, 16, 512), dtype=torch.float8_e4m3fn)
     o_small = torch.empty((4, 16, 512), dtype=torch.bfloat16)
     k_pool = torch.empty((1, 1, 16, 512), dtype=torch.float8_e4m3fn)
     v_pool = torch.empty((1, 1, 16, 512), dtype=torch.float8_e4m3fn)
-    sm120_fmha_fp8_paged_prefill(
-        q_small,
-        k_pool,
-        v_pool,
-        o_small,
-        bt,
-        torch.tensor([16], dtype=torch.int32),
-        torch.tensor([0, 4], dtype=torch.int32),
-        is_causal=True,
-        max_seqlen_q=262_144,
-        gqa_pack_size=16,
-    )
-    assert paged_calls[-1]["balanced_scheduler"] is False
+    run_scales = dict(enable_pdl=False, q_scale=None, k_scale=None, v_scale=None)
+    for return_lse in (False, True):
+        backend.run_paged(
+            q_small,
+            k_pool,
+            v_pool,
+            o_small,
+            return_lse=return_lse,
+            lse=None,
+            **run_scales,
+        )
+        assert paged_calls[-1]["balanced_scheduler"] is False
+        assert paged_calls[-1]["with_lse"] is return_lse
 
     # Boundary that fits (262,140 tokens -> 65,535 Q tiles) retains balanced_scheduler=True.
     qo_fit = torch.tensor([0, 262_140], dtype=torch.int32)
@@ -456,6 +473,27 @@ def test_causal_balanced_scheduler_respects_cuda_grid_y_limit(monkeypatch):
     )
     assert backend._balanced_scheduler is True
     assert paged_calls[-1]["balanced_scheduler"] is True
+    # Changing the environment after plan() must not change the dispatched specialization.
+    monkeypatch.setenv("PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING", "1")
+    backend.run_paged(
+        q_small, k_pool, v_pool, o_small, return_lse=False, lse=None, **run_scales
+    )
+    assert paged_calls[-1]["balanced_scheduler"] is True
+    # Direct callers without a planned flag still follow the environment.
+    sm120_fmha_fp8_paged_prefill(
+        q_small,
+        k_pool,
+        v_pool,
+        o_small,
+        bt,
+        torch.tensor([16], dtype=torch.int32),
+        torch.tensor([0, 4], dtype=torch.int32),
+        is_causal=True,
+        max_seqlen_q=262_140,
+        gqa_pack_size=16,
+    )
+    assert paged_calls[-1]["balanced_scheduler"] is False
+    monkeypatch.delenv("PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING")
 
     # Ragged: 65,536 Q tiles (65,535 * 64 + 1 tokens) falls back to balanced_scheduler=False.
     qo_rag_long = torch.tensor([0, 65_535 * 64 + 1], dtype=torch.int32)
@@ -476,20 +514,35 @@ def test_causal_balanced_scheduler_respects_cuda_grid_y_limit(monkeypatch):
     )
     assert backend._balanced_scheduler is False
     assert ragged_calls[-1]["balanced_scheduler"] is False
-    backend._ensure_kernel(with_lse=True)
-    assert ragged_calls[-1]["balanced_scheduler"] is False
+    q_rag = torch.empty((4, 8, 512), dtype=torch.float8_e4m3fn)
+    kv_rag = torch.empty((4, 2, 512), dtype=torch.float8_e4m3fn)
+    o_rag = torch.empty((4, 8, 512), dtype=torch.bfloat16)
+    lse_rag = torch.empty((4, 8), dtype=torch.float32)
+    for lse in (None, lse_rag):
+        backend.run_ragged(q_rag, kv_rag, kv_rag, o_rag, lse=lse, **run_scales)
+        assert ragged_calls[-1]["balanced_scheduler"] is False
+        assert ragged_calls[-1]["with_lse"] is (lse is not None)
 
-    sm120_fmha_fp8_ragged_prefill(
-        q_small[:, :8],
-        torch.empty((4, 2, 512), dtype=torch.float8_e4m3fn),
-        torch.empty((4, 2, 512), dtype=torch.float8_e4m3fn),
-        o_small[:, :8],
-        torch.tensor([0, 4], dtype=torch.int32),
-        torch.tensor([0, 4], dtype=torch.int32),
-        max_seqlen_q=65_535 * 64 + 1,
-        is_causal=True,
+    qo_rag_fit = torch.tensor([0, 65_535 * 64], dtype=torch.int32)
+    backend.plan_ragged(
+        qo_indptr=qo_rag_fit,
+        kv_indptr=qo_rag_fit,
+        qo_indptr_host=qo_rag_fit,
+        kv_indptr_host=qo_rag_fit,
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        o_dtype=torch.bfloat16,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=512,
+        head_dim_vo=512,
+        causal=True,
+        sm_scale=None,
     )
-    assert ragged_calls[-1]["balanced_scheduler"] is False
+    assert backend._balanced_scheduler is True
+    monkeypatch.setenv("PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING", "1")
+    backend.run_ragged(q_rag, kv_rag, kv_rag, o_rag, lse=None, **run_scales)
+    assert ragged_calls[-1]["balanced_scheduler"] is True
 
 
 def test_split_kv_respects_cuda_grid_z_limit(monkeypatch):
@@ -547,12 +600,45 @@ def test_split_kv_respects_cuda_grid_z_limit(monkeypatch):
     )
     assert ws_bytes > 0
 
-    # Automatic split with large batch caps chunks so num_chunks * batch_size <= 65,535.
-    auto_bounds = _paged_kv_split_bounds(
-        [1] * 1024, [32_768] * 1024, 1, False, 64, 170, 0, 1 << 30, 1, q_tile=64
+    # 16,384 requests leave room for 65,535 // 16,384 = 3 chunks each. One active Q request with
+    # long, equal K/V lengths would otherwise take the 128-chunk maximum.
+    batch = 16_384
+    auto_args = ([1] + [0] * (batch - 1), [32_768] * batch, 1, False, 64, 170, 0)
+    bounds = _paged_kv_split_bounds(*auto_args, 1 << 30, 1, q_tile=64)
+    assert len(bounds[0]) - 1 == 3
+    with monkeypatch.context() as m:
+        m.setattr(sm120_fmha_mod, "_CUDA_MAX_GRID_Z", 1 << 31)
+        bounds = _paged_kv_split_bounds(*auto_args, 1 << 30, 1, q_tile=64)
+        assert len(bounds[0]) - 1 == 128
+    auto_ws = backend.paged_workspace_size(
+        qo_indptr_host=torch.tensor([0] + [1] * batch, dtype=torch.int32),
+        seqlens_kv_host=torch.full((batch,), 32_768, dtype=torch.int32),
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim=512,
+        o_dtype=torch.bfloat16,
+        page_size=16,
+        causal=False,
+        fixed_split_size=-1,
+        disable_split_kv=False,
+        use_cuda_graph=False,
     )
-    if auto_bounds is not None:
-        assert (len(auto_bounds[0]) - 1) * 1024 <= 65_535
+    assert auto_ws == _kv_split_scratch(1, 1, 512, torch.bfloat16, 3)[1]
+    # Workspace sizing rejects a batch the launch grid cannot hold, even without a split.
+    with pytest.raises(ValueError, match="grid.z"):
+        backend.paged_workspace_size(
+            qo_indptr_host=torch.zeros(65_537, dtype=torch.int32),
+            seqlens_kv_host=torch.zeros(65_536, dtype=torch.int32),
+            num_qo_heads=1,
+            num_kv_heads=1,
+            head_dim=512,
+            o_dtype=torch.bfloat16,
+            page_size=16,
+            causal=False,
+            fixed_split_size=-1,
+            disable_split_kv=True,
+            use_cuda_graph=False,
+        )
     # Batch size > 32,767 cannot even split into 2 chunks without exceeding grid.z.
     assert (
         _paged_kv_split_bounds(
@@ -560,6 +646,129 @@ def test_split_kv_respects_cuda_grid_z_limit(monkeypatch):
         )
         is None
     )
+
+
+def _stub_sm120_compile(monkeypatch):
+    """Patch the SM120 checks and kernel compilers so host dispatch runs on CPU."""
+    from flashinfer.cute_dsl.attention.fmha import sm120 as sm120_mod
+
+    monkeypatch.setattr(sm120_fmha_mod, "_check_cutlass_dsl_version", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: (12, 0)
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=170),
+    )
+    calls = []
+    for name in (
+        "compile_sm120_fmha_fp8_paged_kernel",
+        "compile_sm120_fmha_fp8_ragged_kernel",
+    ):
+        monkeypatch.setattr(
+            sm120_mod,
+            name,
+            lambda **kwargs: calls.append(kwargs) or (lambda *a, **kw: None),
+        )
+    return calls
+
+
+def test_paged_metadata_consistency_and_empty_batch(monkeypatch):
+    """Verify paged batch metadata must agree and an empty batch returns without a launch."""
+    pytest.importorskip("cutlass.experimental")
+    calls = _stub_sm120_compile(monkeypatch)
+    q = torch.empty((4, 8, 512), dtype=torch.float8_e4m3fn)
+    o = torch.empty((4, 8, 512), dtype=torch.bfloat16)
+    pool = torch.empty((1, 2, 16, 512), dtype=torch.float8_e4m3fn)
+    bt = torch.zeros((2, 1), dtype=torch.int32)
+    kv = torch.tensor([16, 16], dtype=torch.int32)
+    cu_q = torch.tensor([0, 2, 4], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="cu_seqlens_q"):
+        sm120_fmha_fp8_paged_prefill(q, pool, pool, o, bt, kv, cu_q[:2])
+    with pytest.raises(ValueError, match="seqlens_kv"):
+        sm120_fmha_fp8_paged_prefill(q, pool, pool, o, bt, kv[:1], cu_q)
+    sm120_fmha_fp8_paged_prefill(q, pool, pool, o, bt, kv, cu_q)
+    assert len(calls) == 1
+
+    # B=0: no launch, and Split-KV ranges are not divided by the empty batch.
+    empty_q = q[:0]
+    lse = torch.empty((0, 8), dtype=torch.float32)
+    sm120_fmha_fp8_paged_prefill(
+        empty_q,
+        pool,
+        pool,
+        o[:0],
+        bt[:0],
+        kv[:0],
+        cu_q[:1],
+        lse=lse,
+        kv_tile_ranges=torch.empty((0, 2), dtype=torch.int32),
+    )
+    sm120_fmha_fp8_ragged_prefill(empty_q, q, q, o[:0], cu_q[:1], cu_q[:1], lse=lse)
+    assert len(calls) == 1
+
+    backend = SM120PrimsBatchPrefillBackend(torch.device("cpu"))
+    plan = dict(
+        qo_indptr=cu_q[:1],
+        qo_indptr_host=cu_q[:1],
+        seqlens_kv=kv[:0],
+        seqlens_kv_host=kv[:0],
+        block_tables=bt[:0],
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        o_dtype=torch.bfloat16,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=512,
+        head_dim_vo=512,
+        page_size=16,
+        causal=True,
+        sm_scale=None,
+        float_workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8),
+    )
+    backend.plan_paged(**plan)
+    assert backend._max_seqlen_q == 0 and backend._kv_split is None
+    with pytest.raises(ValueError, match="block_tables rows"):
+        backend.plan_paged(**{**plan, "block_tables": bt})
+    backend.plan_ragged(
+        qo_indptr=cu_q[:1],
+        kv_indptr=cu_q[:1],
+        qo_indptr_host=cu_q[:1],
+        kv_indptr_host=cu_q[:1],
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        o_dtype=torch.bfloat16,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=512,
+        head_dim_vo=512,
+        causal=True,
+        sm_scale=None,
+    )
+    assert backend._max_seqlen_q == 0
+
+
+@pytest.mark.parametrize("sm_scale", [0.0, -0.05, float("nan"), float("inf")])
+def test_rejects_non_positive_sm_scale(monkeypatch, sm_scale):
+    """Verify sm_scale must be finite and positive: the online softmax takes the row max of
+    unscaled logits, and a zero scale turns masked -inf logits into NaN."""
+    pytest.importorskip("cutlass.experimental")
+    calls = _stub_sm120_compile(monkeypatch)
+    q = torch.empty((4, 8, 512), dtype=torch.float8_e4m3fn)
+    kv = torch.empty((4, 2, 512), dtype=torch.float8_e4m3fn)
+    o = torch.empty((4, 8, 512), dtype=torch.bfloat16)
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    pool = torch.empty((1, 2, 16, 512), dtype=torch.float8_e4m3fn)
+    bt = torch.zeros((1, 1), dtype=torch.int32)
+    with pytest.raises(ValueError, match="sm_scale"):
+        sm120_fmha_fp8_ragged_prefill(q, kv, kv, o, cu, cu, sm_scale=sm_scale)
+    with pytest.raises(ValueError, match="sm_scale"):
+        sm120_fmha_fp8_paged_prefill(
+            q, pool, pool, o, bt, cu[1:], cu, sm_scale=sm_scale
+        )
+    assert not calls
 
 
 # ---------------------------------------------------------------------------
@@ -1113,6 +1322,112 @@ def test_sm120_d512_64bit_output_offset_past_int32_boundary():
         lses.append(rl)
     torch.testing.assert_close(merged_o.float(), torch.cat(refs), atol=0.2, rtol=0.2)
     torch.testing.assert_close(merged_lse, torch.cat(lses), atol=2e-3, rtol=2e-3)
+
+
+def _ref_merge_rows(v, s, rows):
+    """Reference merge of the given rows of (n, chunks, h, d) partials with log2 LSEs."""
+    out, lse = [], []
+    for r in rows:
+        s_r = s[r] * math.log(2)
+        w = torch.softmax(s_r, dim=0)
+        out.append((w[..., None] * v[r].float()).sum(0))
+        lse.append(torch.logsumexp(s_r, dim=0) / math.log(2))
+    return torch.stack(out), torch.stack(lse)
+
+
+@_requires_sm120
+@pytest.mark.parametrize(
+    "seq_len,num_chunks,num_heads",
+    [
+        (65_537, 4, 32),  # MergeStatesKernel (num_chunks < seq_len)
+        (256, 257, 128),  # MergeStatesLargeNumIndexSetsKernel (num_chunks >= seq_len)
+    ],
+)
+def test_merge_states_d512_full_buffer_past_uint32_boundary(
+    seq_len, num_chunks, num_heads
+):
+    """Verify merge_states indexes the whole partial buffer with 64-bit offsets.
+
+    The partial O holds more than 2^32 elements, so the last token's offsets wrap in 32-bit math.
+    """
+    d = 512
+    numel = seq_len * num_chunks * num_heads * d
+    assert numel > 1 << 32
+    need = (numel + seq_len * num_heads * d) * 2 + (1 << 30)
+    if torch.cuda.mem_get_info()[0] < need:
+        pytest.skip(f"needs {need / 2**30:.1f} GiB of free GPU memory")
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    v = torch.empty(
+        (seq_len, num_chunks, num_heads, d), dtype=torch.bfloat16, device="cuda"
+    )
+    v.normal_(generator=gen)
+    s = torch.randn((seq_len, num_chunks, num_heads), device="cuda", generator=gen)
+    merged_o, merged_lse = flashinfer.merge_states(v, s)
+    rows = [0, seq_len - 2, seq_len - 1]
+    ref_o, ref_lse = _ref_merge_rows(v, s, rows)
+    torch.testing.assert_close(merged_o[rows].float(), ref_o, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(merged_lse[rows], ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@_requires_sm120
+@pytest.mark.parametrize("num_heads", [33, 40, 64])
+def test_merge_states_d512_more_than_32_heads(num_heads):
+    """Verify merge_states launches a legal block for D=512 with more than 32 heads."""
+    d = 512
+    gen = torch.Generator(device="cuda").manual_seed(num_heads)
+    v = torch.randn(
+        (8, 3, num_heads, d), dtype=torch.bfloat16, device="cuda", generator=gen
+    )
+    s = torch.randn((8, 3, num_heads), device="cuda", generator=gen)
+    merged_o, merged_lse = flashinfer.merge_states(v, s)
+    ref_o, ref_lse = _ref_merge_rows(v, s, range(8))
+    torch.testing.assert_close(merged_o.float(), ref_o, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(merged_lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@_requires_sm120
+def test_sm120_d512_paged_split_kv_40_heads():
+    """Verify the wrapper's Split-KV merge for D=512 with 40 Q heads (40 * 32 merge threads)."""
+    d = 512
+    hq, hkv, page_size = 40, 8, 16
+    q_lens, kv_lens = [7, 33], [384, 640]
+    sm_scale = 1.0 / math.sqrt(d)
+    q_list = [_make_fp8((sq, hq, d), seed=1300 + i) for i, sq in enumerate(q_lens)]
+    k_list = [_make_fp8((sk, hkv, d), seed=1400 + i) for i, sk in enumerate(kv_lens)]
+    v_list = [_make_fp8((sk, hkv, d), seed=1500 + i) for i, sk in enumerate(kv_lens)]
+    q = torch.cat(q_list, dim=0)
+    cu_q = torch.tensor([0, q_lens[0], sum(q_lens)], dtype=torch.int32, device="cuda")
+    _, _, kv_pool, _, page_indptr, page_indices, last_page_len = _make_varlen_paged_kv(
+        k_list, v_list, page_size, seed=78
+    )
+    workspace = torch.empty(128 << 20, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "HND", backend="cute-dsl-prims"
+    )
+    wrapper.plan(
+        cu_q,
+        page_indptr,
+        page_indices,
+        last_page_len,
+        hq,
+        hkv,
+        d,
+        page_size,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+        fixed_split_size=8,
+    )
+    assert wrapper._prims_backend._kv_split is not None
+    out, out_lse = wrapper.run_return_lse(q, kv_pool)
+    refs, lses = [], []
+    for qb, kb, vb in zip(q_list, k_list, v_list, strict=True):
+        ro, rl = _ref_attention(qb, kb, vb, sm_scale, is_causal=True)
+        refs.append(ro)
+        lses.append(rl)
+    torch.testing.assert_close(out.float(), torch.cat(refs), atol=0.2, rtol=0.2)
+    torch.testing.assert_close(out_lse, torch.cat(lses), atol=2e-3, rtol=2e-3)
 
 
 @_requires_sm120
