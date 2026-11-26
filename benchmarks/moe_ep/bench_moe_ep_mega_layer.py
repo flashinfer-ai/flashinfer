@@ -45,7 +45,7 @@ Launch on one node, for example (B300; ``sm_100a`` on B200):
     # NVLinkOneSided MegaMoE and then on DeepGEMM's.
     CUTE_DSL_ARCH=sm_103a torchrun --standalone --nproc-per-node=8 \\
         benchmarks/moe_ep/bench_moe_ep_mega_layer.py \\
-        --kernel_name sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl \\
+        --kernel_name sm103_mxfp8_mxfp4_bf16_nvlink_one_sided \\
         --profile deepseek_v4_1_flash --activation_clamp 10 --perfect_router \\
         -b 1 -e 4096 -f 4 --kernel_breakdown --output_file ours.json
     CUTE_DSL_ARCH=sm_103a torchrun --standalone --nproc-per-node=8 \\

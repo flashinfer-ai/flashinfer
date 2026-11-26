@@ -1,4 +1,4 @@
-"""W4A8 NVLinkOneSided MegaMoE (``sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl``) vs a Torch oracle.
+"""W4A8 NVLinkOneSided MegaMoE (``sm103_mxfp8_mxfp4_bf16_nvlink_one_sided``) vs a Torch oracle.
 
 Launch one rank per SM103 (B300) or SM100 (B200) GPU at the EP size under
 test, with ``CUTE_DSL_ARCH`` naming the device's architecture (``sm_100a`` on
@@ -725,7 +725,7 @@ def _layer(
         FleetParams,
         MegaConfig,
         MoEEpLayer,
-        Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig,
+        Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig,
     )
 
     return MoEEpLayer(
@@ -737,7 +737,7 @@ def _layer(
         ),
         weights,
         backend=MegaConfig(
-            megakernel=Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig(
+            megakernel=Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig(
                 intermediate_size=problem.intermediate,
                 top_k=problem.topk,
                 activation_clamp=CLAMP,
@@ -968,7 +968,7 @@ def test_init_builds_engine(dist_not_initialized):
         BootstrapConfig,
         FleetParams,
         MoEEpConfigError,
-        Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig,
+        Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -981,7 +981,7 @@ def test_init_builds_engine(dist_not_initialized):
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     bootstrap = BootstrapConfig(world_size=4, rank=1, auto_bootstrap=False)
     kernel = create_mega_kernel(
-        Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig(
+        Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig(
             intermediate_size=INTERMEDIATE, top_k=TOPK, activation_clamp=CLAMP
         )
     )
@@ -1967,7 +1967,7 @@ def test_prequantized_staging(monkeypatch, shared):
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided import (
         staging,
     )
 

@@ -30,7 +30,7 @@ from ......core.validation.common import (
 from ......weights import MoEWeightPack
 from .config import (
     KERNEL_NAME,
-    Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig,
+    Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig,
 )
 from .staging import stage_inputs, validate_forward_inputs
 from .weights import (
@@ -99,7 +99,7 @@ class Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
 
     def __init__(
-        self, config: Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig
+        self, config: Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig
     ) -> None:
         super().__init__(config)
         self._kernel_config = config

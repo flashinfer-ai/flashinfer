@@ -1,6 +1,6 @@
 """Host-only contracts of the NVLinkOneSided MegaMoE backend.
 
-``sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl`` without a GPU and without
+``sm103_mxfp8_mxfp4_bf16_nvlink_one_sided`` without a GPU and without
 importing the CuTe DSL: registration and exports, config and knob validation,
 the shapes and devices ``validate_init`` rejects, the CUDA graph capture guard,
 the shared expert's config and weights, and the host mirror of the main
@@ -20,10 +20,10 @@ from flashinfer.moe_ep import (
     BootstrapConfig,
     FleetParams,
     MoEEpConfigError,
-    Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig as Config,
+    Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig as Config,
     preprocess_sm103_mxfp4_nvlink_one_sided_mega_weights,
 )
-from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl import (
+from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided import (
     Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend,
     preprocess_mega_weights,
 )
@@ -34,7 +34,7 @@ from flashinfer.moe_ep.core.kernel.registry import (
 
 pytestmark = pytest.mark.cpu_only
 
-NAME = "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl"
+NAME = "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided"
 HIDDEN = 4096
 INTERMEDIATE = 2048
 EXPERTS = 256
@@ -222,7 +222,7 @@ def test_init_admits_sm100_and_sm103(dist_not_initialized, monkeypatch):
     import torch
 
     from flashinfer.moe_ep import MoEEpArchError
-    from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided import (
         backend,
     )
 

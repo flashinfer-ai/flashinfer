@@ -24,8 +24,8 @@ limitations under the License.
 # Both are lightweight at import time (their JIT loaders and tvm-ffi are
 # imported inside the functions that use them).
 #
-# ``mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl`` registers
-# ``kernel_name="sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl"`` (the
+# ``mxfp8_mxfp4_bf16_nvlink_one_sided`` registers
+# ``kernel_name="sm103_mxfp8_mxfp4_bf16_nvlink_one_sided"`` (the
 # NVLinkOneSided MegaMoE); it also runs on SM100 devices. Importing it imports
 # neither its torch-only host frontend nor the CuTe DSL. The backend imports the
 # frontend when it checks a ``knobs`` dictionary at creation or resolves an
@@ -37,10 +37,10 @@ from flashinfer.experimental.cake_w8a8_megamoe_ep16 import (
     cake_backend as mxfp8_mxfp8_bf16_cake,
 )
 
-from . import bf16_nvfp4_bf16_cake, mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl
+from . import bf16_nvfp4_bf16_cake, mxfp8_mxfp4_bf16_nvlink_one_sided
 
 __all__ = [
     "bf16_nvfp4_bf16_cake",
-    "mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl",
+    "mxfp8_mxfp4_bf16_nvlink_one_sided",
     "mxfp8_mxfp8_bf16_cake",
 ]

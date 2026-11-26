@@ -463,7 +463,7 @@ run_mega_sm107() {
     -m "gpu_2 and arch_rubin"
 }
 
-# Blackwell sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl MoEEpLayer tests against the
+# Blackwell sm103_mxfp8_mxfp4_bf16_nvlink_one_sided MoEEpLayer tests against the
 # Torch oracle, once per EP size in NPROC_SM103_NVLINK_ONE_SIDED (each needs that many
 # SM103 or SM100 GPUs of GPU 0's architecture). The default is "2 4", plus 8
 # when eight such GPUs are visible: the dispatch-round cases need at most 32
@@ -687,7 +687,7 @@ case "${1:-all}" in
   mega_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_mxfp4; print_summary ;;
   mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
   mega_sm107) run_section "sm107 block-scaled mega multirank (Rubin)" run_mega_sm107; print_summary ;;
-  mega_sm103_nvlink_one_sided) run_section "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl mega multirank (Blackwell)" run_mega_sm103_nvlink_one_sided; print_summary ;;
+  mega_sm103_nvlink_one_sided) run_section "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided mega multirank (Blackwell)" run_mega_sm103_nvlink_one_sided; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   sm90_bf16_push_cake) run_section "sm90_bf16_bf16_bf16_push_cake native BF16 backend (2 Hopper GPUs)" run_sm90_bf16_push_cake; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;

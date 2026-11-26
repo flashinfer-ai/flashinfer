@@ -6,11 +6,11 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
-KERNEL_NAME = "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl"
+KERNEL_NAME = "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided"
 
 
 @dataclass
-class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSidedCutedsl_MegaMoeConfig:
+class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     """Blackwell MegaMoE: MXFP8 E4M3 activations x MXFP4 E2M1 weights, BF16 output.
 
     Runs on SM100 (B200) and SM103 (B300) devices.
