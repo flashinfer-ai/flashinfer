@@ -227,11 +227,12 @@ bot reports, public `@flashinfer-bot` suggestions and copied replies do not coun
 Finding a qualifying response skips source inspection and inference entirely.
 
 Without a reply, the gate exempts documentation-only or CPU-only changes.
-Changes confined to `flashinfer/experimental/` and `tests/experimental/` are
-also exempt from this stable check under the experimental containment policy.
-Moving stable code into an experimental directory is not an automatic exemption.
-In mixed PRs, stable GPU effects still require a bot response; experimental GPU
-effects alone do not make the stable check fail.
+Experimental status and paths do not grant an exemption from this check.
+GPU-affecting changes under `flashinfer/experimental/`, `tests/experimental/`,
+or experimental APIs require an internal bot response just like other GPU
+changes. Experimental documentation or CPU helpers qualify only when their
+changed behavior is GPU-independent. Isolation from stable CI does not establish
+that GPU validation is unnecessary.
 The optional GPU-impact analysis extends `ai_test_scope.py` with the same
 inspected source/test/CI evidence and an independent impact assessment. File
 extensions and `tests/cpu/` alone cannot establish CPU-only behavior. Kernels,
@@ -263,7 +264,7 @@ response remains sufficient even when analysis is unavailable.
 
 | State without a qualifying bot response | Check result |
 | --- | --- |
-| Documentation/CPU-only or experimental-only change | Success: bot run not required, with reason |
+| Documentation/CPU-only change | Success: bot run not required, with reason |
 | GPU change, no command | Failure: comment `/bot run` |
 | GPU change, command found | Failure: waiting for `flashinfer-bot`, with command link |
 | Unable to establish GPU impact | Failure: specific missing evidence/error and next action |

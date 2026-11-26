@@ -22,12 +22,13 @@ Kernels, launchers, bindings, backend selection, tensor shapes/dtypes/layouts,
 workspace allocation, JIT/AOT, CUDA graphs, synchronization and communication
 generally require GPU validation. A numerical/kernel/graph test added by the
 PR is itself GPU-related even if no previous corresponding case exists.
-This is a stable PR check: changes confined to flashinfer/experimental/ and
-tests/experimental/, and experimental-only APIs, do not require this stable
-gate. Experimental GPU effects alone must not fail the gate. Assess stable
-components of mixed PRs normally, including changes to stable APIs or automatic
-dispatch that integrate experimental backends.
-Any stable GPU-related component makes a mixed PR GPU-related. Explicitly consider
+Experimental status is not an exemption from GPU validation. Apply the same
+behavioral criteria to flashinfer/experimental/, tests/experimental/, and
+experimental APIs as to all other changes. Experimental GPU kernels and GPU
+tests remain gpu_required; never classify them as cpu_only merely because they
+are experimental or isolated from stable CI. Experimental docs or CPU helpers
+qualify only when their changed effects are GPU-independent.
+Any GPU-related component makes a mixed PR GPU-related. Explicitly consider
 changed source even when no tests cover it or CI does not route it.
 Use supplied patches and source_files bodies whenever they are available.
 Budget fallback applies only when a file has neither a supplied patch nor a

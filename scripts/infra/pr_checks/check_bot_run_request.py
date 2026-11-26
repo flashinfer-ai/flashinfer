@@ -244,7 +244,7 @@ def evaluate(comments, analyze):
             "- " + item["effort"] + ": " + item.get("error", "succeeded")
             for item in impact["analysis_attempts"]
         )
-    if kind in {"cpu_only", "docs_only", "experimental_only"}:
+    if kind in {"cpu_only", "docs_only"}:
         return Result("success", kind, "Bot run not required", details, impact)
     if kind == "unknown":
         title, reason = "Unable to determine GPU impact", "unknown"
@@ -413,7 +413,7 @@ def cached_analysis(checks, pr, base_sha):
                 and stored["version"] == analysis_version()
                 and isinstance(stored.get("analysis"), dict)
                 and stored["analysis"].get("classification")
-                in {"docs_only", "cpu_only", "gpu_required", "experimental_only"}
+                in {"docs_only", "cpu_only", "gpu_required"}
             ):
                 return stored["analysis"]
         except (KeyError, TypeError, ValueError):
@@ -431,26 +431,6 @@ def docs_only(changed, expected_count):
         and all(
             is_doc(item.get("filename"))
             and (not item.get("previous_filename") or is_doc(item["previous_filename"]))
-            for item in changed
-        )
-    )
-
-
-def experimental_only(changed, expected_count):
-    def is_experimental(path):
-        return isinstance(path, str) and path.startswith(
-            ("flashinfer/experimental/", "tests/experimental/")
-        )
-
-    return (
-        bool(changed)
-        and len(changed) == expected_count
-        and all(
-            is_experimental(item.get("filename"))
-            and (
-                not item.get("previous_filename")
-                or is_experimental(item["previous_filename"])
-            )
             for item in changed
         )
     )
@@ -482,19 +462,10 @@ def run_pr(client, number):
                 if saved:
                     return saved
                 changed = client.get_pr_files_at(pr, base_sha)
-                kind = None
                 if docs_only(changed, pr.get("changed_files")):
-                    kind = "docs_only"
-                elif experimental_only(changed, pr.get("changed_files")):
-                    kind = "experimental_only"
-                if kind:
                     return {
-                        "classification": kind,
-                        "reason": (
-                            "Only Markdown/RST documentation changed."
-                            if kind == "docs_only"
-                            else "Experimental-only changes are excluded from stable checks by the containment policy."
-                        ),
+                        "classification": "docs_only",
+                        "reason": "Only Markdown/RST documentation changed.",
                         "evidence_paths": [item["filename"] for item in changed],
                         "case_gap": "",
                         "targets": [],
