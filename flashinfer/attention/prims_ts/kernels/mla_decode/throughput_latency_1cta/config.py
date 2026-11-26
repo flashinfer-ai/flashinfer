@@ -243,8 +243,10 @@ class MlaConfig(Nvfp4KVConfig):
     # With use_pdl, a persistent grid whose scales are launch scalars and
     # whose loaders bind sparse sources without reading them waits after its
     # prologue (TMA descriptor prefetch, shared-memory carve-out and barrier
-    # initialization, TMEM allocation) instead of at entry, so that prologue
-    # overlaps the preceding grid. Other grids keep the entry wait
+    # initialization) instead of at entry, so that prologue overlaps the
+    # preceding grid. It still waits before allocating TMEM, which a
+    # co-resident predecessor that releases its dependents early may yet
+    # need. Other grids keep the entry wait
     # (ThroughputLatencyMlaDecodeTs.waits_after_prologue). Like use_pdl, it is
     # set on the kernel object by callers that launch it directly with PDL,
     # such as TensorRT-LLM's DeepSeek-V4.1 CSA2 decode. No FlashInfer entry

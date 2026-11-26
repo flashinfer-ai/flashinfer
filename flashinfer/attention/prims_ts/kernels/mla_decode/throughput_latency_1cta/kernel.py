@@ -3148,6 +3148,14 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             thread_count=cfg.threads_per_cta,
         )
 
+        if cutlass.const_expr(wait_after_prologue):
+            # The prologue above (descriptor and sink prefetches, shared-memory
+            # carve-out and barrier initialization) overlapped the preceding
+            # grid. TMEM allocation and every task's global memory access follow
+            # this wait: a co-resident predecessor that releases its dependents
+            # before it allocates TMEM must not find the columns held by a grid
+            # that is waiting for it.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if warp_idx == Int32(cfg.mma_warp_idx):
             prims.tcgen05_alloc(
                 tmem_ptr_i32,
@@ -3177,11 +3185,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
                 thread_count=cfg.threads_per_cta,
             )
-        if cutlass.const_expr(wait_after_prologue):
-            # The prologue above (descriptor and sink prefetches, barrier
-            # initialization, TMEM allocation) overlapped the preceding grid;
-            # every task reads and writes global memory only after this wait.
-            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         task_manager.run()
         if cutlass.const_expr(has_runtime_activity_guard):
             if not run_task_graph and query_tile_is_active:
