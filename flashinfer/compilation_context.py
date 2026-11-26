@@ -41,24 +41,41 @@ def _visible_nvml_handles(pynvml) -> list:
     the order can differ on heterogeneous hosts, but the set of devices — all
     that :attr:`CompilationContext.TARGET_CUDA_ARCHS` needs — is the same.
     """
+    all_handles = [
+        pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())
+    ]
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible is None:
-        return [
-            pynvml.nvmlDeviceGetHandleByIndex(i)
-            for i in range(pynvml.nvmlDeviceGetCount())
-        ]
-
+        return all_handles
+    uuids = [_as_str(pynvml.nvmlDeviceGetUUID(h)) for h in all_handles]
     handles = []
     for entry in visible.split(","):
         entry = entry.strip()
-        try:
-            if entry.startswith(("GPU-", "MIG-")):
+        if entry.startswith("MIG-"):
+            try:
                 handles.append(pynvml.nvmlDeviceGetHandleByUUID(entry))
-            else:
-                handles.append(pynvml.nvmlDeviceGetHandleByIndex(int(entry)))
-        except Exception:
-            break  # CUDA ignores this entry and all later ones
+            except pynvml.NVMLError:
+                break  # CUDA ignores this entry and all later ones
+        elif entry.startswith("GPU-"):
+            # CUDA accepts any unique UUID prefix; NVML lookups need the full UUID.
+            matches = [
+                h
+                for h, u in zip(all_handles, uuids, strict=True)
+                if u.startswith(entry)
+            ]
+            if len(matches) != 1:
+                break
+            handles.append(matches[0])
+        else:
+            try:
+                handles.append(all_handles[int(entry)])
+            except (ValueError, IndexError):
+                break
     return handles
+
+
+def _as_str(value) -> str:
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 def get_visible_device_capabilities() -> list[tuple[int, int]]:
@@ -71,22 +88,33 @@ def get_visible_device_capabilities() -> list[tuple[int, int]]:
     context, so it is used until CUDA is initialized.
     """
     if torch.cuda.is_initialized():
-        return [
-            torch.cuda.get_device_capability(device)
-            for device in range(torch.cuda.device_count())
-        ]
+        return _torch_capabilities()
 
-    import pynvml
+    try:
+        import pynvml
 
-    pynvml.nvmlInit()
+        pynvml.nvmlInit()
+    except Exception as e:  # pynvml missing or NVML unavailable (e.g. no libnvidia-ml)
+        logger.debug("NVML unavailable (%s); querying capabilities through torch", e)
+        return _torch_capabilities()
     try:
         caps = []
         for handle in _visible_nvml_handles(pynvml):
             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
             caps.append((int(major), int(minor)))
         return caps
+    except pynvml.NVMLError as e:
+        logger.debug("NVML query failed (%s); querying capabilities through torch", e)
+        return _torch_capabilities()
     finally:
         pynvml.nvmlShutdown()
+
+
+def _torch_capabilities() -> list[tuple[int, int]]:
+    return [
+        torch.cuda.get_device_capability(device)
+        for device in range(torch.cuda.device_count())
+    ]
 
 
 @functools.cache

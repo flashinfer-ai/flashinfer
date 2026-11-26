@@ -142,7 +142,10 @@ def is_cuda_tile_available(device=None) -> bool:
                 from ..compilation_context import get_visible_device_capabilities
 
                 idx = getattr(device, "index", device) or 0
-                major, minor = get_visible_device_capabilities()[idx]
+                caps = get_visible_device_capabilities()
+                if idx >= len(caps):
+                    return False
+                major, minor = caps[idx]
             sm_arch = f"sm_{major}{minor}"
             if not _tileiras_supports_arch(tileiras_path, sm_arch):
                 return False
