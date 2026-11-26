@@ -214,6 +214,8 @@ def _run_fp8(
         if direct
         else torch.empty((rows, _pad(n, 8)), dtype=out.dtype, device=a.device)
     )
+    if not direct and (routed or masked_m is not None):  # rows routed nowhere kept
+        target[:, :n].view(batches, m, n).copy_(out)
     gemm = _out_f16_module() if out.dtype == torch.float16 else module
     alpha, beta, sf, asf, gsa, gsb = scale_a, scale_b, None, None, None, None
     if mx:
@@ -729,7 +731,8 @@ def _run_mxfp8_mxfp4(
     the E8M0 scales (flat) where the SM100 kernel reads them: ``b_scale`` group ``i``'s 128x4 at
     ``i pad(N, 128)`` rows, ``a_scale`` group ``i``'s rows from ``(m_indptr[i] + 127 i) // 128 *
     128``. ``gemm_fp4`` (MXFP4) reads ``a`` restored to BF16 exactly in its blocks' row order
-    times 2^112 (``mm_fp4``'s MXFP4 activation is times 2^119: alpha 2^7)."""
+    times 2^119 like ``mm_fp4``'s MXFP4 activation; E5M2, past BF16 there, times 2^112: alpha
+    2^7."""
     m, k = (int(x) for x in a.shape)
     groups, n = int(b.shape[0]), int(b.shape[1])
     max_blocks = m // r + groups  # each group's last block partial
@@ -740,15 +743,17 @@ def _run_mxfp8_mxfp4(
     ip = torch.cummax(m_indptr.clamp(0, m).long(), 0).values
     _group_rows(ip[:-1], ip[1:], m, r, max_blocks, meta, rowmap)
     sf_off = (ip[:-1] + 127 * torch.arange(groups, device=a.device)) // 128 * 128
+    e5 = a.dtype == torch.float8_e5m2
     rows = a.view(torch.uint8).index_select(0, rowmap.clamp(min=0))
-    act = rows.view(a.dtype).to(torch.bfloat16).mul_(2.0**112)
+    act = rows.view(a.dtype).to(torch.bfloat16).mul_(2.0 ** (112 if e5 else 119))
     direct = out.is_contiguous() and out.data_ptr() % 16 == 0  # N % 8 == 0
-    target = out if direct else torch.empty((m, n), dtype=out.dtype, device=a.device)
+    target = out if direct else out.clone(memory_format=torch.contiguous_format)
     module = _w4a16_moe_sm80_module(None, False, None, False)
     gemm = _out_f16_module() if out.dtype == torch.float16 else module
     gemm.gemm_fp4(
         _aligned(b, 16), _aligned(b_scale, 16),
-        torch.full((groups,), 128.0, device=a.device), act, meta, rowmap, target, r, n, k,
+        torch.full((groups,), 128.0 if e5 else 1.0, device=a.device), act, meta, rowmap,
+        target, r, n, k,
         max_blocks, False, _aligned(a_scale, 4), False, (sf_off - ip[:-1]).int(),
     )  # fmt: skip
     if not direct:
@@ -772,6 +777,10 @@ def sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise(
         )
     if cum_m == 0 or groups == 0:
         return
+    # group i's scales from row (m_indptr[i] + 127 i) // 128 * 128, its rows' 128-row atoms
+    need = (cum_m + 127 * groups) // 128 * 128 * -(-int(a.shape[1]) // 128) * 4
+    if a_scale.numel() < need:
+        raise ValueError(f"a_scale must hold {need} scales, got {a_scale.numel()}")
     inputs = [a, b, a_scale.reshape(-1), b_scale.reshape(-1), m_indptr, out]
     runner = Sm8xGroupMxfp8Mxfp4Runner(0)
     chosen, tactic = AutoTuner.get().choose_one(
