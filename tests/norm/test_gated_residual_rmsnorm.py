@@ -68,8 +68,8 @@ def _kwargs(weight_before_norm: bool):
 def test_gated_residual_rmsnorm_supports_supported_devices():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("SM100, SM103, or SM107 is required")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7), (12, 0)):
+        pytest.skip("SM100, SM103, SM107, or SM120 is required")
     inputs = _inputs(1)
     assert supports_gated_residual_rmsnorm(*inputs)
     assert supports_gated_residual_rmsnorm(

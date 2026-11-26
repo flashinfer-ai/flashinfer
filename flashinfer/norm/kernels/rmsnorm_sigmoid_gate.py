@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - exercised without nvidia-cutlass-dsl
 
 
 HEAD_DIM = 64
-_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7), (12, 0))
 LOG2E = 1.4426950408889634
 INV_HEAD_DIM = 1.0 / HEAD_DIM
 
@@ -397,6 +397,8 @@ def rmsnorm_sigmoid_gate(
     rows_per_cta = 32 * warps // lanes
     tiles = (rows + rows_per_cta - 1) // rows_per_cta
     cluster = min(cluster, tiles)
+    if torch.cuda.get_device_capability(x.device)[0] == 12:
+        cluster = min(cluster, 8)  # SM12x: max cluster size is 8 (no non-portable 16)
 
     compiled = _get_compiled(
         x.shape[1],
