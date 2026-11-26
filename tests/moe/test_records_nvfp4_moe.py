@@ -33,6 +33,7 @@ from flashinfer.quantization.nvfp4_quantization_utils import (
     nvfp4_per_token_scale_inv,
 )
 from flashinfer.utils import get_compute_capability
+from tests.quantization.test_helpers.utils_fp4 import cast_from_fp4
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -41,20 +42,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 E, H, I, K = 8, 512, 256, 2
-E2M1 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
 RECIPES = [None, NVFP44Over6Config()]
 RECIPES.append(NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True))
 
 
-def _e2m1(codes):
-    lut = torch.tensor(E2M1, device=codes.device)
-    codes = codes.long()
-    return torch.stack((lut[codes & 15], lut[codes >> 4]), -1).flatten(-2)
-
-
 def _dq(codes, sf, scale):
     sf = sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, -1)
-    return _e2m1(codes) * sf * scale
+    return cast_from_fp4(codes) * sf * scale
+
+
+def _dq_mx(codes, sf):
+    """MXFP4 codes under linear E8M0 scales, dequantized."""
+    return cast_from_fp4(codes) * torch.exp2(sf.float() - 127).repeat_interleave(32, -1)
 
 
 def _quant(x, gs, recipe=None):
@@ -160,23 +159,51 @@ def _cutlass(m, x, ids, weights, scales, sl=..., **kw):  # sl: EP's local expert
     )[0]  # fmt: skip
 
 
+def _cute_args(m, x, xsf, ids, weights, a1, in2, a2):
+    return (x, xsf, ids, weights, m["w1"], m["r1"], a1, in2, m["w2"], m["r2"], a2)
+
+
+def _cute(m, *args, **kw):
+    act = m["act"].value
+    return cute_dsl_fused_moe(*_cute_args(m, *args), E, K, activation_type=act, **kw)
+
+
+def _cute16(m, x, ids, weights, **kw):
+    g1, g2 = m["w1_g"], m["w2_g"]
+    return _cute(m, x, None, ids, weights, g1, None, g2, quant_mode="w4a16", **kw)
+
+
+def _inputs(tokens):
+    x = torch.randn(tokens, H, device="cuda").bfloat16()
+    return (x, *_routing(tokens))
+
+
+def _a12(x, e4m3=448):
+    """W4A4 input global scales: GEMM1's from x's amax, GEMM2's fixed."""
+    a2 = torch.tensor([e4m3 * 6 / 128.0], device="cuda")
+    return e4m3 * 6 / x.float().abs().amax().view(1), a2
+
+
+def _scales(m, sl=...):
+    return [m["r1"][sl], m["w1_g"][sl], m["r2"][sl], m["w2_g"][sl]]
+
+
+def _eq(a, b):
+    torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("gated", [True, False])
 @pytest.mark.parametrize("tokens", [1, 37, 300])
 def test_w4a16(gated, tokens):
     m = _model(gated)
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     ref = _reference(m, x.float(), ids, weights, lambda a: a.float())
-    scales = [m["r1"], m["w1_g"], m["r2"], m["w2_g"]]
+    scales = _scales(m)
     out = _cutlass(m, x, ids, weights, scales)
     _close(out, ref)
     trt = _trt(m, x, None, ids, weights, None, m["w1_g"], m["w2_g"])[0]
-    cute = cute_dsl_fused_moe(
-        x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
-        m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value,
-    )  # fmt: skip
-    torch.testing.assert_close(trt, out, atol=0, rtol=0)
-    torch.testing.assert_close(cute, out, atol=0, rtol=0)
+    _eq(trt, out)
+    _eq(_cute16(m, x, ids, weights), out)
     with pytest.raises(ValueError, match="2D"):  # [tokens, H, 2]: H a row as given
         _cutlass(m, x[..., None].expand(-1, -1, 2).contiguous(), ids, weights, scales)
     if not gated:  # CUTLASS-only on TRT-LLM, and the sentinel: rejected as on SM100
@@ -189,10 +216,8 @@ def test_w4a16(gated, tokens):
         with pytest.raises(ValueError, match="nvfp4_4over6"):
             _cutlass(m, x, ids, weights, scales, nvfp4_4over6=RECIPES[1])
         with pytest.raises(ValueError, match="must be None"):
-            cute_dsl_fused_moe(
-                x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], m["w2_g"], m["w2"],
-                m["r2"], m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value,
-            )  # fmt: skip
+            g2 = m["w2_g"]
+            _cute(m, x, None, ids, weights, m["w1_g"], g2, g2, quant_mode="w4a16")
         ws = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
         for kw in ({"workspace_buffer": ws}, {"profile_ids": [0, 0]}):  # not read
             with pytest.raises(NotImplementedError, match="profile_ids"):
@@ -206,11 +231,8 @@ def test_w4a4(recipe, gated, tokens):
     """BF16 input quantized by the prep and NVFP4 codes (linear and 128x4 scales) agree. The
     4over6 recipe quantizes cutlass's two GEMM inputs (TRT-LLM's and CuTe-DSL's per token only)."""
     m = _model(gated)
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
-    e4m3 = recipe.e4m3_max if recipe else 448
-    a1 = e4m3 * 6 / x.float().abs().amax().view(1)
-    a2 = torch.tensor([e4m3 * 6 / 128.0], device="cuda")
+    x, ids, weights = _inputs(tokens)
+    a1, a2 = _a12(x, recipe.e4m3_max if recipe else 448)
     codes, sf, xr = _quant(x, a1, recipe)
     ref = _reference(m, xr, ids, weights, lambda a: _quant(a, a2, recipe)[2])
     alpha1, alpha2 = m["w1_g"] / a1, m["w2_g"] / a2
@@ -258,10 +280,8 @@ def test_w4a4(recipe, gated, tokens):
                     _trt(step, *args[1:], **{k: ones})
 
         def cute(inp, xsf=sf, **kw):
-            return cute_dsl_fused_moe(
-                inp, xsf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], alpha1, a2, m["w2"],
-                m["r2"], alpha2, E, K, activation_type=m["act"].value, **kw,
-            )  # fmt: skip
+            args = (m, inp, xsf.unsqueeze(-1), ids, weights, alpha1, a2, alpha2)
+            return _cute(*args, **kw)
 
         outs.append(cute(codes))
         with pytest.raises(ValueError, match="swap_ab"):  # SM100 and SM103 only
@@ -276,7 +296,7 @@ def test_w4a4(recipe, gated, tokens):
             with pytest.raises(NotImplementedError, match="records"):
                 bad()
     for o in outs:
-        torch.testing.assert_close(o, out, atol=0, rtol=0)
+        _eq(o, out)
 
 
 @pytest.mark.parametrize("recipe", RECIPES, ids=nvfp4_4over6_cache_key)
@@ -287,8 +307,7 @@ def test_per_token(recipe, gated, tokens):
     agree, GEMM2 quantizing its rows under the recipe's base inverse scale (SM100's scalars:
     gated output1_scale_scalar the gate's, else ones)."""
     m = _model(gated)
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     codes, sf, s, xr = _quant_pt(x, recipe)
     ref = _reference(m, xr, ids, weights, lambda a: _quant_pt(a, recipe)[3])
     s1 = m["w1_g"] if gated else torch.ones(E, device="cuda")
@@ -301,14 +320,13 @@ def test_per_token(recipe, gated, tokens):
     out = _trt(m, codes, sf8, *args, per_token_scale=s, nvfp4_4over6=recipe)[0]
     _close(out, ref)
     bf16 = _trt(m, x, base, *args, per_token_scale=written, nvfp4_4over6=recipe)[0]
-    cute = cute_dsl_fused_moe(
-        codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], m["w1_g"], base, m["w2"],
-        m["r2"], m["w2_g"], E, K, activation_type=m["act"].value, per_token_scale=s,
-        nvfp4_4over6=recipe,
+    cute = _cute(
+        m, codes, sf.unsqueeze(-1), ids, weights, m["w1_g"], base, m["w2_g"],
+        per_token_scale=s, nvfp4_4over6=recipe,
     )  # fmt: skip
-    torch.testing.assert_close(written, s, atol=0, rtol=0)
-    torch.testing.assert_close(bf16, out, atol=0, rtol=0)
-    torch.testing.assert_close(cute, out, atol=0, rtol=0)
+    _eq(written, s)
+    _eq(bf16, out)
+    _eq(cute, out)
     wide = torch.empty(tokens, 2 * H, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="contiguous"):  # GEMM2's, before the prep's
         _trt(m, x, base, *args, per_token_scale=written.fill_(-1), output=wide[:, ::2])
@@ -351,8 +369,7 @@ def test_exact(recipe, monkeypatch):
 def test_tactics(gated):
     m = _model(gated)
     tokens = 300
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     ref = _reference(m, x.float(), ids, weights, lambda a: a.float())
     for tactic in W4A16_SM80_TACTICS:
         out = x.new_empty(tokens, H)
@@ -366,87 +383,81 @@ def test_expert_parallel(gated):
     """Each rank's output is the full one with the other ranks' experts weighted 0."""
     m = _model(gated)
     tokens = 37
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     half = E // 2
     for rank in range(2):
         local = (ids >= rank * half) & (ids < (rank + 1) * half)
         full = _trt(m, x, None, ids, weights * local, None, m["w1_g"], m["w2_g"])[0]
         sl = slice(rank * half, (rank + 1) * half)
-        scales = [m["r1"][sl], m["w1_g"][sl], m["r2"][sl], m["w2_g"][sl]]
-        ep = _cutlass(m, x, ids, weights, scales, sl, ep_size=2, ep_rank=rank)
+        ep = _cutlass(m, x, ids, weights, _scales(m, sl), sl, ep_size=2, ep_rank=rank)
         sub = {**m, "r1": m["r1"][sl], "r2": m["r2"][sl]}
         trt = _trt(
             sub, x, None, ids, weights, None, m["w1_g"][sl], m["w2_g"][sl],
             offset=rank * half, local=half,
         )[0]  # fmt: skip
-        cute = cute_dsl_fused_moe(
-            x, None, ids, weights, m["w1"][sl], m["r1"][sl], m["w1_g"][sl], None,
-            m["w2"][sl], m["r2"][sl], m["w2_g"][sl], E, K, num_local_experts=half,
-            local_expert_offset=rank * half, quant_mode="w4a16",
-            activation_type=m["act"].value,
+        sub_w = {**m, **{k: m[k][sl] for k in ("w1", "r1", "w2", "r2", "w1_g", "w2_g")}}
+        cute = _cute16(
+            sub_w, x, ids, weights, num_local_experts=half, local_expert_offset=rank * half
         )  # fmt: skip
         outs = [ep, trt, cute]
         if not rank:  # SM100 reads the leading local_num_experts of longer weights
             g1, g2 = m["w1_g"], m["w2_g"]
             outs.append(_trt(m, x, None, ids, weights, None, g1, g2, local=half)[0])
         for o in outs:
-            torch.testing.assert_close(o, full, atol=0, rtol=0)
+            _eq(o, full)
+
+
+def run_tactics(wrapper, args, ref, **kw):
+    for tactic in wrapper.get_valid_tactics():
+        _close(wrapper.run(*args, tactic=tactic, **kw), ref)
 
 
 def test_wrapper_tactics():
     """Below SM100 the CuTe-DSL wrapper offers the records tactics its run takes, and runs
     each: W4A16, W4A4 per token and W4A4 weighting its routing before FC2 (ClampedRelu2)."""
     m, tokens = _model(True), 37
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
-    args = (x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"])
-    args += (m["w2_g"],)
+    x, ids, weights = _inputs(tokens)
+    args = _cute_args(m, x, None, ids, weights, m["w1_g"], None, m["w2_g"])
     wrapper = CuteDslMoEWrapper(E, K, H, I, quant_mode="w4a16")
     assert wrapper.get_valid_tactics() == list(W4A16_SM80_TACTICS)
     with pytest.raises(NotImplementedError, match="mxfp8"):  # no records to run it on
         CuteDslMoEWrapper(E, K, H, I, quant_mode="mxfp8")
     ref = _reference(m, x.float(), ids, weights, lambda a: a.float())
-    for tactic in wrapper.get_valid_tactics():
-        _close(wrapper.run(*args, tactic=tactic), ref)
+    run_tactics(wrapper, args, ref)
     codes, sf, s, xr = _quant_pt(x)
     ref = _reference(m, xr, ids, weights, lambda a: _quant_pt(a)[3])
-    args = (codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], m["w1_g"], _base())
-    args += (m["w2"], m["r2"], m["w2_g"])
+    args = _cute_args(
+        m, codes, sf.unsqueeze(-1), ids, weights, m["w1_g"], _base(), m["w2_g"]
+    )
     wrapper = CuteDslMoEWrapper(E, K, H, I)
     assert wrapper.get_valid_tactics() == list(W4A16_SM80_TACTICS[:4])
-    for tactic in wrapper.get_valid_tactics():
-        _close(
-            wrapper.run(*args, tactic=tactic, per_token_scale=s, nvfp4_4over6=None), ref
-        )
+    run_tactics(wrapper, args, ref, per_token_scale=s, nvfp4_4over6=None)
     # W4A4 weighting its routing before FC2, ClampedRelu2 clamping GEMM1's output
     m, limit = _model(False), torch.tensor([2.0], device="cuda")
-    a1 = 448 * 6 / x.float().abs().amax().view(1)
-    a2 = torch.tensor([448 * 6 / 128.0], device="cuda")
+    a1, a2 = _a12(x)
     codes, sf, xr = _quant(x, a1)
     ref = _reference(
         m, xr, ids, weights, lambda a: _quant(a, a2)[2], pre_fc2=True,
         plain=lambda h: F.relu(limit * torch.tanh(h / limit)).square(),
     )  # fmt: skip
-    args = (codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], m["w1_g"] / a1, a2)
-    args += (m["w2"], m["r2"], m["w2_g"] / a2)
+    args = _cute_args(
+        m, codes, sf.unsqueeze(-1), ids, weights, m["w1_g"] / a1, a2, m["w2_g"] / a2
+    )
     wrapper = CuteDslMoEWrapper(
         E, K, H, I, activation_type=ActivationType.ClampedRelu2.value,
         clamped_relu2_limit=limit, routing_weights_before_fc2=True,
     )  # fmt: skip
     assert wrapper.get_valid_tactics() == list(W4A16_SM80_TACTICS[:4])
-    for tactic in wrapper.get_valid_tactics():
-        _close(wrapper.run(*args, tactic=tactic), ref)
+    run_tactics(wrapper, args, ref)
 
 
 def test_alltoall():
     """cutlass with enable_alltoall leaves the rows without a local expert as they were."""
     m = _model(True)
     tokens, half = 37, E // 2
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     sl = slice(half, E)  # rank 1 of 2
-    scales = [m["r1"][sl], m["w1_g"][sl], m["r2"][sl], m["w2_g"][sl]]
+    scales = _scales(m, sl)
 
     def run(**kw):
         return _cutlass(m, x, ids, weights, scales, sl, ep_size=2, ep_rank=1, **kw)
@@ -456,7 +467,7 @@ def test_alltoall():
     run(output=out, enable_alltoall=True)
     local = (ids >= half).any(1)
     assert local.any() and not local.all()
-    torch.testing.assert_close(out[local], ep[local], atol=0, rtol=0)
+    _eq(out[local], ep[local])
     assert (out[~local] == 7).all()
 
 
@@ -466,8 +477,7 @@ def test_valid_sizes(gated):
     the output and the (zero-padded) activation are the unpadded run's."""
     m = _model(gated)
     tokens, hp, ip, g = 37, H + 128, I + 64, 2 if gated else 1
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     b1 = torch.randn(E, g * I, device="cuda") / 10
     b2 = torch.randn(E, H, device="cuda") / 10
     # LoRA delta: gated only, as on SM100
@@ -483,9 +493,9 @@ def test_valid_sizes(gated):
         gemm1_lora_delta=lora if lora is None else F.pad(lora.view(tokens, K, 2, I), (0, ip - I)).flatten(2),
         valid_hidden_size=H, valid_intermediate_size=I,
     )  # fmt: skip
-    torch.testing.assert_close(padded[0], base[0], atol=0, rtol=0)
+    _eq(padded[0], base[0])
     if gated:
-        torch.testing.assert_close(padded[2][:, :I], base[2], atol=0, rtol=0)
+        _eq(padded[2][:, :I], base[2])
         assert padded[2].shape[1] == ip and not padded[2][:, I:].any()
         with pytest.raises(ValueError, match="gemm1_lora_delta"):  # SM100's top_k slots
             _trt(*args, gemm1_lora_delta=lora[:, :1].contiguous())
@@ -500,12 +510,11 @@ def test_narrow_output(width):
     other shapes (CuTe-DSL, TRT-LLM, cutlass) are refused."""
     m = _model(True)
     tokens = 37
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     args = (m, x, None, ids, weights, None, m["w1_g"], m["w2_g"])
     buf = torch.full((tokens, H), 7.0, device="cuda", dtype=torch.bfloat16)
     out = _trt(*args, output=buf[:, :width])[0]
-    torch.testing.assert_close(out, _trt(*args)[0][:, :width], atol=0, rtol=0)
+    _eq(out, _trt(*args)[0][:, :width])
     assert out.data_ptr() == buf.data_ptr() and (buf[:, width:] == 7).all()
     off = x.new_empty(tokens * H + 1)[1:].view(tokens, H)  # one element off 16 B
     with pytest.raises(RuntimeError, match="16 B aligned"):
@@ -518,24 +527,16 @@ def test_narrow_output(width):
     r1 = m["r1"].new_empty(m["r1"].numel() + 1)[1:].view(m["r1"].shape).copy_(m["r1"])
     with pytest.raises(RuntimeError, match="act and records must be 16 B aligned"):
         _trt({**m, "r1": r1}, *args[1:])
-    scales = [m["r1"], m["w1_g"], m["r2"], m["w2_g"]]
     with pytest.raises(ValueError, match="num_tokens, top_k"):
         _trt(m, x, None, ids[1:], weights[1:], *args[5:])
     with pytest.raises(ValueError, match="num_tokens, top_k"):
-        _cutlass(m, x, ids[1:], weights[1:], scales)
-
-    def cute(ids=ids, weights=weights, **kw):
-        return cute_dsl_fused_moe(
-            x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
-            m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value, **kw,
-        )  # fmt: skip
-
+        _cutlass(m, x, ids[1:], weights[1:], _scales(m))
     for bad in (x.new_empty(tokens + 1, H), x.new_empty(tokens, H, dtype=torch.half)):
         with pytest.raises(ValueError, match="moe_output"):
-            cute(moe_output=bad)
+            _cute16(m, x, ids, weights, moe_output=bad)
     for bad in ((ids[1:], weights[1:]), (ids, weights[:, :1])):
         with pytest.raises(ValueError, match="num_tokens, top_k"):
-            cute(*bad)
+            _cute16(m, x, *bad)
 
 
 def test_fc2_input_out():
@@ -544,8 +545,7 @@ def test_fc2_input_out():
     off the device is refused before any is written."""
     m = _model(False)
     tokens, half, ip = 37, E // 2, I + 64
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     codes, sf, s, _ = _quant_pt(x)
     sub = {**m, "r1": m["r1"][:half], "r2": m["r2"][:half]}
     fo = [torch.full((tokens + 3, K, ip // n), 9, dtype=torch.uint8, device="cuda")
@@ -592,8 +592,7 @@ def test_fc2_input_out():
 def test_deferred_finalize_and_shared_experts():
     m = _model(True, experts=E + 1)
     tokens = 37
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     args = (m, x, None, ids, weights, None, m["w1_g"], m["w2_g"])
     method = RoutingMethodType.DeepSeekV3.value
     shared = _trt(
@@ -603,7 +602,7 @@ def test_deferred_finalize_and_shared_experts():
     w1 = torch.cat((weights, torch.ones_like(weights[:, :1])), 1)
     args1 = (m, x, None, ids1, w1, None, m["w1_g"], m["w2_g"])
     explicit = _trt(*args1, num_experts=E + 1)
-    torch.testing.assert_close(shared[0], explicit[0], atol=0, rtol=0)
+    _eq(shared[0], explicit[0])
     y, w, idx = _trt(*args1, num_experts=E + 1, do_finalize=False)
     # as SM100's launcher
     for bad in ((ids, weights[:, :1]), (ids.long(), weights), (ids, weights.half())):
@@ -633,7 +632,7 @@ def test_from_logits(tokens):
         run(activation_type=ActivationType.InvalidType.value)
     with pytest.raises(NotImplementedError, match="workspace_buffer"):
         run(workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"))
-    torch.testing.assert_close(slots, gathered, atol=0, rtol=0)
+    _eq(slots, gathered)
     ids = torch.topk(logits, K).indices
     assert torch.equal(replay.long().sort(1).values, ids.sort(1).values)
     weights = torch.gather(logits, 1, replay.long()).softmax(-1)
@@ -657,8 +656,7 @@ def test_from_logits_rank0(monkeypatch):
     m, tokens, half = _model(True), 37, E // 2
     x = torch.randn(tokens, H, device="cuda").bfloat16()
     logits = torch.randn(tokens, E, device="cuda")
-    a1 = 448 * 6 / x.float().abs().amax().view(1)
-    a2 = torch.tensor([448 * 6 / 128.0], device="cuda")
+    a1, a2 = _a12(x)
     codes, sf, _ = _quant(x, a1)
     alpha1, alpha2 = m["w1_g"][:half] / a1, m["w2_g"][:half] / a2
     tile8 = W4A16_SM80_TACTICS[0]
@@ -675,7 +673,16 @@ def test_from_logits_rank0(monkeypatch):
     # The other rank's experts first: GEMM2's rows of this rank's left behind (token, k) order
     run(logits.roll(half, 1))
     replay = torch.empty(tokens, K, dtype=torch.int16, device="cuda")
-    torch.testing.assert_close(run(), run(routing_replay_out=replay), atol=0, rtol=0)
+    _eq(run(), run(routing_replay_out=replay))
+
+
+def _prep_mx(w1, s1, w2, s2, act):
+    """The records and global scales of MXFP4 weights, by their model keys."""
+    rec = prepare_records_mxfp4_weights(
+        w1, s1, w2, s2, num_local_experts=E, hidden_size=H, intermediate_size=I,
+        activation_type=act,
+    )  # fmt: skip
+    return dict(zip(("r1", "w1_g", "r2", "w2_g"), rec.values(), strict=True))
 
 
 def _mx_model(gated, split=False, seed=0):
@@ -693,14 +700,8 @@ def _mx_model(gated, split=False, seed=0):
             s[:, I:] += 40  # the gate half
         w[0, :, :16], s[0, :, 0] = 0, 250  # zero blocks: their scales are not read
         m[name], m[name + "_sf"] = w, s
-        m[name + "_deq"] = _e2m1(w) * torch.exp2(s.float() - 127).repeat_interleave(
-            32, -1
-        )
-    rec = prepare_records_mxfp4_weights(
-        m["w1"], m["w1_sf"], m["w2"], m["w2_sf"],
-        num_local_experts=E, hidden_size=H, intermediate_size=I, activation_type=act,
-    )  # fmt: skip
-    m["r1"], m["w1_g"], m["r2"], m["w2_g"] = rec.values()
+        m[name + "_deq"] = _dq_mx(w, s)
+    m.update(_prep_mx(m["w1"], m["w1_sf"], m["w2"], m["w2_sf"], act))
     assert m["w1_g"].shape == ((E, 2) if split else (E,))
     return m
 
@@ -723,14 +724,10 @@ def test_mxfp4_mxfp8(gated, split, tokens):
     """MXFP8 input (linear and 128x4 scales), GEMM2's input MXFP8: cutlass, TRT-LLM and
     CuTe-DSL W4A8 agree."""
     m = _mx_model(gated, split)
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     codes, sf, xr = _mxfp8(x)
     ref = _reference(m, xr, ids, weights, lambda a: _mxfp8(a)[2])
-    x8, scales = (
-        codes.view(torch.float8_e4m3fn),
-        [m["r1"], m["w1_g"], m["r2"], m["w2_g"]],
-    )
+    x8, scales = codes.view(torch.float8_e4m3fn), _scales(m)
     kw = {"use_mxfp8_act_scaling": True}
     out = _cutlass(
         m, x8, ids, weights, scales, input_sf=sf, swizzled_input_sf=False, **kw
@@ -742,14 +739,12 @@ def test_mxfp4_mxfp8(gated, split, tokens):
     outs.append(_trt(m, x8, sf, ids, weights, None, m["w1_g"], m["w2_g"])[0])
 
     def cute(xsf, w=weights, **kw):
-        return cute_dsl_fused_moe(
-            x8, xsf, ids, w, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
-            m["w2_g"], E, K, quant_mode="w4a8", activation_type=m["act"].value, **kw,
-        )  # fmt: skip
+        g1, g2 = m["w1_g"], m["w2_g"]
+        return _cute(m, x8, xsf, ids, w, g1, None, g2, quant_mode="w4a8", **kw)
 
     outs.append(cute(sf))
     for o in outs:
-        torch.testing.assert_close(o, out, atol=0, rtol=0)
+        _eq(o, out)
     with pytest.raises(NotImplementedError, match="records"):  # [M, H/32] as on SM100
         cute(sf.t().contiguous())
     with pytest.raises(ValueError, match="bfloat16 output"):  # as on SM100
@@ -765,8 +760,7 @@ def test_mxfp4_mxfp8(gated, split, tokens):
 def test_mxfp4_fp8_per_tensor(gated, tokens):
     """FP8 input under one scale, GEMM2's input FP8 under q2: cutlass and TRT-LLM agree."""
     m = _mx_model(gated)
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     q1, q2 = 448 / x.float().abs().amax(), torch.tensor([4.0], device="cuda")
     x8 = (x.float() * q1).to(torch.float8_e4m3fn)
 
@@ -779,10 +773,10 @@ def test_mxfp4_fp8_per_tensor(gated, tokens):
     _close(out, ref)
     s1 = q2 * a1 if gated else q2.repeat(E)  # SM100's: gated over the gate half's alpha
     trt = _trt(m, x8, None, ids, weights, s1, a1, a2)[0]
-    torch.testing.assert_close(trt, out, atol=0, rtol=0)
+    _eq(trt, out)
     if not gated:  # one for all experts
         one = _trt(m, x8, None, ids, weights, q2, a1, a2)[0]
-        torch.testing.assert_close(one, out, atol=0, rtol=0)
+        _eq(one, out)
     for bad in (s1[:2], s1[:, None]):  # SM100's [local_num_experts]
         with pytest.raises(ValueError, match="output1_scale_scalar"):
             _trt(m, x8, None, ids, weights, bad, a1, a2)
@@ -793,37 +787,32 @@ def test_mxfp4_w4a16(gated, split):
     """BF16 input: TRT-LLM and, below SM90 (SM90 runs its CUTLASS W4A16 kernels), cutlass."""
     m = _mx_model(gated, split)
     tokens = 37
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    ids, weights = _routing(tokens)
+    x, ids, weights = _inputs(tokens)
     trt = _trt(m, x, None, ids, weights, None, m["w1_g"], m["w2_g"])[0]
     _close(trt, _reference(m, x.float(), ids, weights, lambda a: a.float()), 2e-2)
     if split:  # [num_experts, 2], not its transpose of as many values
         with pytest.raises(ValueError, match="num_experts, 2"):
             _trt(m, x, None, ids, weights, None, m["w1_g"].t().contiguous(), m["w2_g"])
     if get_compute_capability(x.device)[0] < 9:
-        scales = [m["r1"], m["w1_g"], m["r2"], m["w2_g"]]
         out = cutlass_fused_moe(
-            x, ids, weights, m["w1"], m["w2"], torch.bfloat16, scales,
+            x, ids, weights, m["w1"], m["w2"], torch.bfloat16, _scales(m),
             use_w4_group_scaling=True, activation_type=m["act"],
         )[0]  # fmt: skip
-        torch.testing.assert_close(out, trt, atol=0, rtol=0)
+        _eq(out, trt)
 
 
 def test_mxfp4_scale_layouts():
     """Strided weight scales prepare as their contiguous copy; halves 2^128 apart each take
     their own global scale."""
     m = _mx_model(True, True)
-    sizes = dict(num_local_experts=E, hidden_size=H, intermediate_size=I)
 
     def prepare(s1):
-        return prepare_records_mxfp4_weights(
-            m["w1"], s1, m["w2"], m["w2_sf"], **sizes, activation_type=m["act"]
-        ).values()
+        return _prep_mx(m["w1"], s1, m["w2"], m["w2_sf"], m["act"]).values()
 
     for a, b in zip(
         prepare(m["w1_sf"].mT.contiguous().mT), prepare(m["w1_sf"]), strict=True
     ):
-        torch.testing.assert_close(a, b, atol=0, rtol=0)
+        _eq(a, b)
     s1 = m["w1_sf"].clone()
     s1[:, :I], s1[:, I:] = 254, 126  # 2^128 apart
     g = list(prepare(s1))[1]
@@ -847,19 +836,7 @@ def test_mxfp4_split_range(mode):
     for top in (247, 127):  # the gate's block 2^120, else as the linear half's
         s1 = torch.full((E, 2 * I, H // 32), 127, dtype=torch.uint8, device="cuda")
         s1[:, I:, 0] = top
-        rec = prepare_records_mxfp4_weights(
-            w1, s1, w2, s2, num_local_experts=E, hidden_size=H, intermediate_size=I,
-            activation_type=act,
-        )  # fmt: skip
-        names = ("r1", "w1_g", "r2", "w2_g")
-        models.append(
-            {
-                "w1": w1,
-                "w2": w2,
-                "act": act,
-                **dict(zip(names, rec.values(), strict=True)),
-            }
-        )
+        models.append({"w1": w1, "w2": w2, "act": act, **_prep_mx(w1, s1, w2, s2, act)})
     split, joint = models
     assert split["w1_g"].shape == (E, 2) and joint["w1_g"].shape == (E,)
     assert torch.equal(split["w1_g"][:, 0], joint["w1_g"])  # the linear half's
@@ -884,7 +861,7 @@ def test_mxfp4_split_range(mode):
         out = _trt(m, *args, m["w1_g"], m["w2_g"], gemm1_bias=b1, **kw)[0]
         outs.append(out)
     assert outs[1].isfinite().all() and outs[1].abs().amax() > 0
-    torch.testing.assert_close(outs[0], outs[1], atol=0, rtol=0)
+    _eq(outs[0], outs[1])
 
 
 def test_zero_tokens():
@@ -899,10 +876,9 @@ def test_zero_tokens():
     )
     x8, one = x8.view(torch.float8_e4m3fn), torch.ones(1, device="cuda")
     scales = [one, m["r1"], m["w1_g"], one, m["r2"], m["w2_g"]]
-    mx_scales = [mx["r1"], mx["w1_g"], mx["r2"], mx["w2_g"]]
     outs = [
         _cutlass(m, codes, ids, weights, scales, input_sf=sf, swizzled_input_sf=False),
-        _cutlass(mx, x8, ids, weights, mx_scales, input_sf=sf8, swizzled_input_sf=False,
+        _cutlass(mx, x8, ids, weights, _scales(mx), input_sf=sf8, swizzled_input_sf=False,
                  use_mxfp8_act_scaling=True),
         _trt(m, codes, sf, ids, weights, m["w1_g"], m["w1_g"], m["w2_g"])[0],
         _trt(mx, x8, sf8, ids, weights, None, mx["w1_g"], mx["w2_g"])[0],
@@ -913,10 +889,8 @@ def test_zero_tokens():
         )[0],
     ]  # fmt: skip
     for model, x, xsf, a2, mode in ((m, codes, sf, one, "w4a4"), (mx, x8, sf8, None, "w4a8")):  # fmt: skip
-        outs.append(cute_dsl_fused_moe(
-            x, xsf, ids, weights, model["w1"], model["r1"], model["w1_g"], a2, model["w2"],
-            model["r2"], model["w2_g"], E, K, quant_mode=mode, activation_type=model["act"].value,
-        ))  # fmt: skip
+        g1, g2 = model["w1_g"], model["w2_g"]
+        outs.append(_cute(model, x, xsf, ids, weights, g1, a2, g2, quant_mode=mode))
     # TRT-LLM with a LoRA delta, and per token with fc2_input_out
     lora = torch.empty(0, K, 2 * I, device="cuda", dtype=torch.bfloat16)
     lo = _trt(
