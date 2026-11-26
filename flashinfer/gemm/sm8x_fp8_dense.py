@@ -12,8 +12,10 @@ per 32-element k block; groupwise (``gemm_fp8_nt_groupwise``, ``gemm_fp8_nt_bloc
 FP32 scales of ``A``'s 1- or 128-row groups and ``B``'s 128-row groups per 128-element k step;
 ``group_deepgemm_fp8_nt_groupwise`` and ``batch_deepgemm_fp8_nt_groupwise`` the UE8M0 exponents
 the SM100 DeepGEMM takes of their scales, as MXFP8 scales, the rows routed by ``m_indices`` or
-``masked_m``. Every backend name keeps its SM100+ requirements and runs here; on SM89 the native per-tensor
-cuBLAS and cuDNN backends keep their own runners.
+``masked_m``; ``group_gemm_mxfp8_mxfp4_nt_groupwise`` the MXFP4 weights on the dense
+``mm_fp4`` GEMM (``gemm_fp4``) with ``A`` restored to BF16 in its routed row order. Every backend
+name keeps its SM100+ requirements and runs here; on SM89 the native per-tensor cuBLAS and cuDNN
+backends keep their own runners.
 """
 
 import functools
@@ -381,6 +383,15 @@ class Sm8xGroupFp8GroupwiseRunner(Sm8xFp8GroupwiseRunner):
         return out
 
 
+class Sm8xGroupMxfp8Mxfp4Runner(Sm8xGroupFp8GroupwiseRunner):
+    """``_run_mxfp8_mxfp4`` behind ``group_gemm_mxfp8_mxfp4_nt_groupwise`` on ``[a, b, a_scale,
+    b_scale, m_indptr, out]`` (the scales flat); tactic: the row tile."""
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        _run_mxfp8_mxfp4(*inputs, 64 if tactic in (None, -1) else tactic)
+        return inputs[5]
+
+
 @functools.cache
 def _groupwise_tuning_config(gm: int, out_index: int = 4) -> TuningConfig:
     from ..fused_moe.utils import (
@@ -703,3 +714,93 @@ def sm8x_deepgemm_fp8_nt_groupwise(
         inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
+
+
+def _run_mxfp8_mxfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    out: torch.Tensor,
+    r: int,
+) -> None:
+    """``out`` rows ``m_indptr[i] .. m_indptr[i + 1]`` (clamped, nondecreasing) ``= a @ b[i]^T``,
+    the E8M0 scales (flat) where the SM100 kernel reads them: ``b_scale`` group ``i``'s 128x4 at
+    ``i pad(N, 128)`` rows, ``a_scale`` group ``i``'s rows from ``(m_indptr[i] + 127 i) // 128 *
+    128``. ``gemm_fp4`` (MXFP4) reads ``a`` restored to BF16 exactly in its blocks' row order
+    times 2^112 (``mm_fp4``'s MXFP4 activation is times 2^119: alpha 2^7)."""
+    m, k = (int(x) for x in a.shape)
+    groups, n = int(b.shape[0]), int(b.shape[1])
+    max_blocks = m // r + groups  # each group's last block partial
+    ints = (1 + 2 * max_blocks, max_blocks * r)
+    meta, rowmap = torch.empty(sum(ints), dtype=torch.int32, device=a.device).split(
+        ints
+    )
+    ip = torch.cummax(m_indptr.clamp(0, m).long(), 0).values
+    _group_rows(ip[:-1], ip[1:], m, r, max_blocks, meta, rowmap)
+    sf_off = (ip[:-1] + 127 * torch.arange(groups, device=a.device)) // 128 * 128
+    rows = a.view(torch.uint8).index_select(0, rowmap.clamp(min=0))
+    act = rows.view(a.dtype).to(torch.bfloat16).mul_(2.0**112)
+    direct = out.is_contiguous() and out.data_ptr() % 16 == 0  # N % 8 == 0
+    target = out if direct else torch.empty((m, n), dtype=out.dtype, device=a.device)
+    module = _w4a16_moe_sm80_module(None, False, None, False)
+    gemm = _out_f16_module() if out.dtype == torch.float16 else module
+    gemm.gemm_fp4(
+        _aligned(b, 16), _aligned(b_scale, 16),
+        torch.full((groups,), 128.0, device=a.device), act, meta, rowmap, target, r, n, k,
+        max_blocks, False, _aligned(a_scale, 4), False, (sf_off - ip[:-1]).int(),
+    )  # fmt: skip
+    if not direct:
+        out.copy_(target)
+
+
+def sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``group_gemm_mxfp8_mxfp4_nt_groupwise`` on SM8x after its problem-size check (the tile
+    arguments select no SM8x kernel): ``_run_mxfp8_mxfp4`` with its row tile tuned."""
+    cum_m, groups = int(a.shape[0]), int(b.shape[0])
+    if any(t.device != a.device for t in (b, a_scale, b_scale, m_indptr, out)):
+        raise ValueError(
+            "MXFP4 group GEMM operands, scales and output must be on one device"
+        )
+    if cum_m == 0 or groups == 0:
+        return
+    inputs = [a, b, a_scale.reshape(-1), b_scale.reshape(-1), m_indptr, out]
+    runner = Sm8xGroupMxfp8Mxfp4Runner(0)
+    chosen, tactic = AutoTuner.get().choose_one(
+        "group_gemm_mxfp8_mxfp4_nt_groupwise_sm8x",
+        [runner],
+        _mxfp4_group_tuning_config(),
+        inputs,
+    )
+    chosen(inputs=inputs, tactic=tactic)
+
+
+@functools.cache
+def _mxfp4_group_tuning_config() -> TuningConfig:
+    """``a``'s rows bucketed, its scales sized for SM100's per-group padding."""
+    from ..fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket_uncapped,
+    )
+
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                (0,), (0,), get_hybrid_num_tokens_buckets, map_to_hybrid_bucket_uncapped
+            ),
+        ),
+        constraint_specs=(
+            ConstraintSpec(
+                2, 0, lambda s: _pad(s[0][0] + 127 * s[1][0], 128) * (s[0][1] // 32)
+            ),
+            ConstraintSpec(5, 0, lambda s: s[0][0]),
+        ),
+    )

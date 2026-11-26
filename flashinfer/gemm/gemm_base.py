@@ -13031,7 +13031,7 @@ def group_gemm_fp8_nt_groupwise(
     return out
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -13225,7 +13225,11 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    if is_sm12x_supported(a.device):
+    if get_compute_capability(a.device)[0] == 8:
+        from .sm8x_fp8_dense import sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise
+
+        sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise(a, b, a_scale, b_scale, m_indptr, out)
+    elif is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
         get_gemm_sm120_module().group_gemm_mxfp4_nt_groupwise(
             int_workspace_buffer,

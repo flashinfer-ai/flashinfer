@@ -361,9 +361,11 @@ struct GemmParamsOw : GemmParams {
   bool alpha_rows;  // alpha [M] per row (the per-token alpha) in place of alpha[0]
 };
 // MX: GemmParamsOw and asf, the activation's E8M0 scales [pad(M, 128)][4 nka], 128x4 too. Its own
-// type, so the NVFP4 kernels keep their parameters.
+// type, so the NVFP4 kernels keep their parameters. asf_off (groups, block_expert e the group):
+// row t's scales at row t + asf_off[e], the weights' at e [pad(N, 128)][4 nka]; null: one group.
 struct GemmParamsMx : GemmParamsOw {
   const uint8_t* asf;
+  const int* asf_off;
 };
 // F8 (the dense mm_fp8 / bmm_fp8): w the FP8 weights, byte (b, n, k) at b batch_stride +
 // n row_stride + (k / 128) kstep_stride + k % 128, b the block's expert (its batch); act prep's
@@ -872,7 +874,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
         gws[rec] = p.w +
                    (e * p.N + c * kTileN + (SH ? shuffled_row(tid >> 2) : tid >> 2)) * (K / 2) +
                    iks * (kTileK / 2) + (tid & 3) * 16;
-        gsf = MX ? p.sf + (static_cast<long>(c) * p.nka + iks) * 512 + (tid & 31) * 16
+        gsf = MX ? p.sf + ((e * ((p.N + 127) / 128) + c) * p.nka + iks) * 512 + (tid & 31) * 16
                  : p.sf + (static_cast<long>(c) * p.nka + 2 * iks) * 512 +
                        (SH ? shuffled_row(tid) : tid) * 16;
       } else if constexpr (KT) {
@@ -882,9 +884,12 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
       }
     }
     if constexpr (MX) {  // row tid's E8M0 word of k-step iks (a padding row: the last real row's)
-      const int t = p.rowmap[ib * R + min(tid, brows - 1)];
+      int t = p.rowmap[ib * R + min(tid, brows - 1)];
       bool a8x4 = false;  // F8: the trtllm 8x4 activation layout
-      if constexpr (F8 != 0) a8x4 = p.a8x4;
+      if constexpr (F8 != 0)
+        a8x4 = p.a8x4;
+      else if (p.asf_off)
+        t += p.asf_off[e];
       gasf = a8x4 ? p.asf + ((static_cast<long>(t) >> 3) * p.nka + iks) * 32 + (t & 7) * 4
                   : p.asf + ((static_cast<long>(t) >> 7) * p.nka + iks) * 512 + (t & 31) * 16 +
                         ((t >> 5) & 3) * 4;
@@ -3334,9 +3339,13 @@ void w4a16_moe_sm80_gemm(
 void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, TensorView act,
                              TensorView meta, TensorView rowmap, TensorView out, int64_t row_tile,
                              int64_t N, int64_t K, int64_t max_blocks, bool alpha_rows,
-                             tvm::ffi::Optional<TensorView> act_sf, bool shuffled) {
-  // act_sf: MXFP4 (E8M0 scales of both operands, the activation's 128x4 [pad(M, 128)][4 nka])
+                             tvm::ffi::Optional<TensorView> act_sf, bool shuffled,
+                             tvm::ffi::Optional<TensorView> act_sf_off) {
+  // act_sf: MXFP4 (E8M0 scales of both operands, the activation's 128x4 [pad(M, 128)][4 nka]).
+  // act_sf_off (MX, int32 [groups]): w, sf and act_sf as GemmParamsMx's groups, act block-ordered
   const bool mx = act_sf.has_value();
+  const int64_t groups = act_sf_off.has_value() ? act_sf_off.value().numel() : 1;
+  TVM_FFI_ICHECK(mx || groups == 1) << "act_sf_off: MXFP4";
   TVM_FFI_ICHECK(!shuffled || (!mx && N % 32 == 0)) << "shuffled weights: NVFP4, N % 32 == 0";
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(sf, dl_uint8);
@@ -3348,15 +3357,19 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
                 nka = mx ? (K + 127) / 128 : (K + 63) / 64;
   TVM_FFI_ICHECK(N > 0 && K > 0 && K % 32 == 0 && Nout % 8 == 0 && Nout <= n_pad)
       << "W4A16 dense FP4 GEMM: shape";
-  TVM_FFI_ICHECK(w.numel() >= N * (K / 2) && sf.numel() >= n_pad * nka * 4 &&
+  TVM_FFI_ICHECK(w.numel() >= groups * N * (K / 2) && sf.numel() >= groups * n_pad * nka * 4 &&
                  alpha.numel() >= (alpha_rows ? out.size(0) : 1))
       << "w [N, K / 2], sf [pad(N, 128), pad(K / 16, 4)], alpha [1] or [rows]";
   if (mx) {
     const TensorView asf = act_sf.value();
     CHECK_INPUT_AND_TYPE(asf, dl_uint8);
-    TVM_FFI_ICHECK(asf.numel() >= (out.size(0) + 127) / 128 * 128 * nka * 4 &&
-                   (reinterpret_cast<uintptr_t>(asf.data_ptr()) & 3) == 0)
+    TVM_FFI_ICHECK(
+        (act_sf_off.has_value() || asf.numel() >= (out.size(0) + 127) / 128 * 128 * nka * 4) &&
+        (reinterpret_cast<uintptr_t>(asf.data_ptr()) & 3) == 0)
         << "act_sf [pad(M, 128), pad(K / 32, 4)], 4 B aligned";
+    if (act_sf_off.has_value()) {
+      CHECK_INPUT_AND_TYPE(act_sf_off.value(), dl_int32);
+    }
   }
   TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(w.data_ptr()) & 15) == 0 &&
                  (reinterpret_cast<uintptr_t>(sf.data_ptr()) & 15) == 0 &&
@@ -3383,6 +3396,8 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   p.K = static_cast<int>(K);
   p.Nout = static_cast<int>(Nout);
   p.asf = mx ? static_cast<const uint8_t*>(act_sf.value().data_ptr()) : nullptr;
+  p.asf_off =
+      act_sf_off.has_value() ? static_cast<const int*>(act_sf_off.value().data_ptr()) : nullptr;
   const int grid = static_cast<int>(max_blocks * (n_pad / kTileN));
   const int rt = static_cast<int>(row_tile);
   auto tile = [&](auto kt) {
