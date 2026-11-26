@@ -361,3 +361,117 @@ def test_wrapper_preserves_supported_launch_device(monkeypatch, name, backend, k
     backend_call.assert_called_once()
     assert capability_query.call_count > 0
     assert all(call.args[0] == target for call in capability_query.call_args_list)
+
+
+_BATCHED_GROUPED_CASES = [
+    ("nvfp4_batched_quantize", {}),
+    ("scaled_fp4_grouped_quantize", {}),
+]
+
+
+def _call_batched_or_grouped(name, x, device_for_tensors=None, **kwargs):
+    if name == "nvfp4_batched_quantize":
+        global_sf = kwargs.pop("a_global_sf", SimpleNamespace())
+        return fp4.nvfp4_batched_quantize(x, global_sf, **kwargs)
+    mask = (
+        torch.ones(1, dtype=torch.int32, device=device_for_tensors)
+        if device_for_tensors is not None
+        else SimpleNamespace()
+    )
+    global_sf = (
+        torch.ones(1, dtype=torch.float32, device=device_for_tensors)
+        if device_for_tensors is not None
+        else SimpleNamespace()
+    )
+    return fp4.scaled_fp4_grouped_quantize(x, mask, global_sf, **kwargs)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_batched_explicit_fp8_recipe_rejected_before_unsupported_arch(
+    monkeypatch,
+):
+    capability_query = Mock(return_value=(9, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    monkeypatch.setattr(fp4, "get_compute_capability", capability_query)
+    fp4_factory = Mock(side_effect=AssertionError("FP4 JIT must not run"))
+    monkeypatch.setattr(fp4, "get_fp4_quantization_module", fp4_factory)
+    x = SimpleNamespace(device=torch.device("cuda:3"), dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="requires fp16 or bf16 input"):
+        fp4.nvfp4_batched_quantize(
+            x,
+            SimpleNamespace(),
+            nvfp4_4over6=fp4.NVFP44Over6Config(),
+        )
+
+    capability_query.assert_not_called()
+    fp4_factory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(8, 0), (8, 9), (9, 0)])
+@pytest.mark.parametrize("name,kwargs", _BATCHED_GROUPED_CASES)
+def test_batched_and_grouped_unsupported_arch_rejected_before_jit(
+    monkeypatch, capability, name, kwargs
+):
+    device = torch.device("cuda:3")
+    x = SimpleNamespace(device=device, dtype=torch.bfloat16)
+    capability_query = Mock(
+        side_effect=lambda queried: capability if queried == device else (10, 0)
+    )
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    monkeypatch.setattr(fp4, "get_compute_capability", capability_query)
+    fp4_factory = Mock(side_effect=AssertionError("FP4 JIT must not run"))
+    monkeypatch.setattr(fp4, "get_fp4_quantization_module", fp4_factory)
+
+    major, minor = capability
+    with pytest.raises(
+        RuntimeError, match=f"{name} requires SM100 or newer; got SM{major}{minor}"
+    ):
+        _call_batched_or_grouped(name, x, **kwargs)
+
+    capability_query.assert_called_once_with(device)
+    fp4_factory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0)])
+@pytest.mark.parametrize("name,kwargs", _BATCHED_GROUPED_CASES)
+def test_batched_and_grouped_supported_arch_reaches_dispatch(
+    monkeypatch, capability, name, kwargs
+):
+    device = torch.device("cuda:3")
+    x = SimpleNamespace(device=device, dtype=torch.bfloat16)
+    capability_query = Mock(
+        side_effect=lambda queried: capability if queried == device else (9, 0)
+    )
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    monkeypatch.setattr(fp4, "get_compute_capability", capability_query)
+    factory = Mock(side_effect=_BackendReached)
+    monkeypatch.setattr(fp4, "get_fp4_quantization_module", factory)
+
+    with pytest.raises(_BackendReached):
+        _call_batched_or_grouped(name, x, **kwargs)
+
+    expected_arch = f"{capability[0] * 10 + capability[1]}"
+    factory.assert_called_once_with(expected_arch)
+    assert capability_query.call_count > 0
+    assert all(call.args[0] == device for call in capability_query.call_args_list)
+
+
+@pytest.mark.parametrize("name,kwargs", _BATCHED_GROUPED_CASES)
+def test_batched_and_grouped_rejects_real_unsupported_gpu(name, kwargs):
+    if not torch.cuda.is_available():
+        pytest.skip("Requires a CUDA GPU below SM100")
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = utils.get_compute_capability(device)
+    if major >= 10:
+        pytest.skip("Requires a CUDA GPU below SM100")
+    x = torch.ones(1, 2, 32, dtype=torch.bfloat16, device=device)
+    kw = dict(kwargs)
+    if name == "nvfp4_batched_quantize":
+        kw["a_global_sf"] = torch.ones(1, dtype=torch.float32, device=device)
+    with pytest.raises(
+        RuntimeError, match=f"{name} requires SM100 or newer; got SM{major}{minor}"
+    ):
+        _call_batched_or_grouped(name, x, device_for_tensors=device, **kw)

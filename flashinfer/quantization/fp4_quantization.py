@@ -2224,10 +2224,12 @@ def nvfp4_batched_quantize(
 ):
     r"""Quantize batched input tensor to NVFP4 format.
 
+    Requires a CUDA device with compute capability SM100 or newer.
+
     Parameters
     ----------
     a : torch.Tensor
-        Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16.
+        Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16/float8_e4m3fn.
     a_global_sf : torch.Tensor
         Global scale factor of shape ``[1]`` with dtype ``float32``.
     sf_vec_size : int
@@ -2250,6 +2252,13 @@ def nvfp4_batched_quantize(
         ``[B, ceil(M / 128) * 128 * ceil(K / sf_vec_size / 4) * 4]``
         (M is padded to a multiple of 128 and ``K / sf_vec_size`` is
         rounded up to a multiple of 4).
+
+    Raises
+    ------
+    RuntimeError
+        If ``a`` is on a CUDA device with compute capability below SM100.
+    ValueError
+        If an explicit ``nvfp4_4over6`` recipe is given with an FP8 input.
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     # e4m3 input reaches the recipe-less FP8 branch of invokeFP4Quantization;
@@ -2260,6 +2269,7 @@ def nvfp4_batched_quantize(
         and a.dtype in _FP8_TO_FP4_INPUT_DTYPES
     ):
         raise nvfp4_4over6_fp8_input_error(a.dtype)
+    _check_block_scale_quantization_support(a.device, "nvfp4_batched_quantize")
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(device_arch).fp4_batched_quantize_sm100(
@@ -2437,6 +2447,8 @@ def scaled_fp4_grouped_quantize(
 ):
     r"""Quantize a batched input tensor to NVFP4 with a per-row mask.
 
+    Requires a CUDA device with compute capability SM100 or newer.
+
     Parameters
     ----------
     a : torch.Tensor
@@ -2468,8 +2480,14 @@ def scaled_fp4_grouped_quantize(
         ``float8_e4m3fn``.  ``padded_M`` rounds ``M`` up to a multiple
         of 128 and ``padded_K`` rounds ``K // sf_vec_size`` (with
         ``sf_vec_size = 16``) up to a multiple of 4.
+
+    Raises
+    ------
+    RuntimeError
+        If ``a`` is on a CUDA device with compute capability below SM100.
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+    _check_block_scale_quantization_support(a.device, "scaled_fp4_grouped_quantize")
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
