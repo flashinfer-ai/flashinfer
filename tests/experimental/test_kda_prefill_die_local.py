@@ -116,3 +116,13 @@ def test_set_scratch_rejects_a_buffer_that_is_too_small(device):
 
     with pytest.raises(ValueError, match="set_scratch"):
         wrapper.run(**inputs)
+
+
+def test_set_scratch_rejects_a_misaligned_or_strided_buffer(device):
+    wrapper = RecurrentKDAPrefillWrapper(device)
+    storage = torch.empty(4096, dtype=torch.uint8, device=device)
+
+    for scratch in (storage[1:], storage[::2]):
+        with pytest.raises(ValueError, match="16-byte-aligned"):
+            wrapper.set_scratch(scratch)
+    wrapper.set_scratch(storage[16:])

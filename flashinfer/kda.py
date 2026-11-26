@@ -1406,9 +1406,9 @@ class RecurrentKDAPrefillWrapper:
     def set_scratch(self, scratch: torch.Tensor) -> None:
         """Use a caller-owned scratch buffer instead of allocating one.
 
-        ``scratch`` is a 1-D uint8 tensor on this wrapper's device with at
-        least ``scratch_layout(...)[0]`` bytes; its contents need not be
-        initialized.  Call it before the first ``run``.  This lets a caller
+        ``scratch`` is a contiguous, 16-byte-aligned 1-D uint8 tensor on this
+        wrapper's device with at least ``scratch_layout(...)[0]`` bytes; its
+        contents need not be initialized.  Call it before the first ``run``.  This lets a caller
         that places memory (see ``sm_locality_domains`` of
         :func:`flashinfer.kda.recurrent_kda`) home each sequence's scratch
         with that sequence's other data.
@@ -1420,9 +1420,12 @@ class RecurrentKDAPrefillWrapper:
             scratch.dtype != torch.uint8
             or scratch.ndim != 1
             or scratch.device != self.device
+            or not scratch.is_contiguous()
+            or scratch.data_ptr() % 16 != 0
         ):
             raise ValueError(
-                "scratch must be a 1-D uint8 tensor on the wrapper's device"
+                "scratch must be a contiguous, 16-byte-aligned 1-D uint8 "
+                "tensor on the wrapper's device"
             )
         workspace = self._impl.workspace
         workspace.__dict__["_cute_dsl_workspace"] = scratch
