@@ -77,6 +77,9 @@ __device__ __forceinline__ void cp16z(uint32_t s, const void* g, bool valid) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(s), "l"(g),
                "r"(valid ? 16 : 0));
 }
+__device__ __forceinline__ void cp4(uint32_t s, const void* g) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(s), "l"(g));
+}
 // Volatile shared loads: ptxas does not merge them into wider loads.
 __device__ __forceinline__ void lds32v(uint32_t* d, uint32_t a) {
   asm volatile("ld.volatile.shared.u32 %0, [%1];" : "=r"(d[0]) : "r"(a));
@@ -242,6 +245,16 @@ __device__ __forceinline__ uint32_t nib2(uint32_t w, uint32_t w4) {
   const uint32_t q = __byte_perm(w4, w, (I << 4) | ((4 + I) << 12));
   return (q & 0x80008000u) | ((q >> 6) & 0x01C001C0u);
 }
+// OW MXFP4: acc + RN(d 2^(ea + eb - 247)) for the E8M0 bytes ea, eb (255: NaN), d exact; two
+// power-of-two steps, so a subnormal or overflowing product is rounded once.
+__device__ __forceinline__ float mx_slow(float acc, float d, uint32_t ea, uint32_t eb) {
+  const int e = static_cast<int>(ea + eb) - 247;
+  const int e1 = min(max(e, -109), 117), e2 = min(max(e - e1, -149), 127);
+  const float s1 = __uint_as_float((e1 + 127) << 23);
+  const float s2 = __uint_as_float(e2 >= -126 ? (e2 + 127) << 23 : 1u << (e2 + 149));
+  const float r = __fmul_rn(__fmul_rn(d, s1), s2);
+  return ea == 255 || eb == 255 ? __int_as_float(0x7fffffff) : __fadd_rn(acc, r);
+}
 // OW: E4M3 bytes 0 and 2 of y (bytes 1 and 3 copies of them) as a bf16x2 of s x 2^119, as the
 // records' scale pairs; E4M3 NaN stays NaN.
 __device__ __forceinline__ uint32_t e4m3x2(uint32_t y) {
@@ -316,15 +329,21 @@ struct GemmParamsFq : GemmParams {
   bool fin16;
 };
 // OW (the dense mm_fp4): w is the weights [N][K / 2] themselves, sf their 128x4-swizzled E4M3
-// scales [pad(N, 128)][4 nka], nka = ceil(K / 64).
+// scales [pad(N, 128)][4 nka], nka = ceil(K / 64); MXFP4 (MX): E8M0, nka = ceil(K / 128).
 struct GemmParamsOw : GemmParams {
   const uint8_t* sf;
   int nka;
   bool alpha_rows;  // alpha [M] per row (the per-token alpha) in place of alpha[0]
 };
-template <bool FQ, bool OW = false>
-using GemmParamsT =
-    std::conditional_t<FQ, GemmParamsFq, std::conditional_t<OW, GemmParamsOw, GemmParams>>;
+// MX: GemmParamsOw and asf, the activation's E8M0 scales [pad(M, 128)][4 nka], 128x4 too. Its own
+// type, so the NVFP4 kernels keep their parameters.
+struct GemmParamsMx : GemmParamsOw {
+  const uint8_t* asf;
+};
+template <bool FQ, bool OW = false, bool MX = false>
+using GemmParamsT = std::conditional_t<
+    FQ, GemmParamsFq,
+    std::conditional_t<OW, std::conditional_t<MX, GemmParamsMx, GemmParamsOw>, GemmParams>>;
 
 // out[t][8 c, 8 c + 8) = sum_j w[t][j] y[t top_k + j][...], fp32 in slot order over the ids in
 // [0, id_end) (the others have no row).
@@ -670,9 +689,11 @@ __device__ __forceinline__ uint32_t movm_trans(uint32_t x) {
 // ldmatrix, the BF16 activation as the k permutation of their nibbles, the sum times 2^7 then
 // alpha.
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
-          bool Q12F = false, bool VS = false, bool FQ = false, bool PT = false, bool OW = false>
-__device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
+          bool Q12F = false, bool VS = false, bool FQ = false, bool PT = false, bool OW = false,
+          bool MX = false>
+__device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX> const& p) {
   static_assert(!FQ || ACT != 0 || R == 8, "FQ: a GEMM1 epilogue or the R 8 GEMM2 sum");
+  static_assert(!MX || OW, "MX: OW");
   using C = Cfg<R, NC>;
   constexpr int NT = NW * 32;
   constexpr int SC = 8 * NC / WC, WT = NW / WC, TW = R / WT, G = TW / 8;
@@ -751,6 +772,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
   // tid / 4) and its scale source (threads 0..63: 16 B of the k-step's two 512 B atoms)
   [[maybe_unused]] int ow_rows = 0;
   [[maybe_unused]] const uint8_t* gsf = nullptr;
+  [[maybe_unused]] const uint8_t* gasf = nullptr;
   // PT GEMM1: the s_t of this thread's rows (aq 0) and alpha, stored past the ring as row scales
   [[maybe_unused]] float pt_s[PT && ACT ? RJ : 1];
   [[maybe_unused]] float pt_a = 0.f;
@@ -766,12 +788,18 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
         ow_rows = p.N - (c * kTileN + (tid >> 2));
         gws[rec] = p.w + (e * p.N + c * kTileN + (tid >> 2)) * (K / 2) + iks * (kTileK / 2) +
                    (tid & 3) * 16;
-        gsf = p.sf + (static_cast<long>(c) * p.nka + 2 * iks) * 512 + tid * 16;
+        gsf = MX ? p.sf + (static_cast<long>(c) * p.nka + iks) * 512 + (tid & 31) * 16
+                 : p.sf + (static_cast<long>(c) * p.nka + 2 * iks) * 512 + tid * 16;
       } else if constexpr (KT) {
         gws[rec] = p.w + (e * record_chunks + c) * cbytes + tid * 16;
       } else {
         gws[rec] = p.w + (e * upb + iw + rec * S) * kRec + tid * 16;
       }
+    }
+    if constexpr (MX) {  // row tid's E8M0 word of k-step iks (a padding row: the last real row's)
+      const int t = p.rowmap[ib * R + min(tid, brows - 1)];
+      gasf = p.asf + ((static_cast<long>(t) >> 7) * p.nka + iks) * 512 + (t & 31) * 16 +
+             ((t >> 5) & 3) * 4;
     }
 #pragma unroll
     for (int j = 0; j < RJ; ++j) {
@@ -814,7 +842,10 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
         const bool in = kin && q * (NT / 4) < ow_rows;
         cp16z(dst + q * NT * 16, in ? gws[0] + static_cast<long>(q) * (NT / 4) * (K / 2) : p.w, in);
       }
-      if (has_s) {  // atom 1 (k 64..127) is past K in a tail of at most 64
+      if constexpr (MX) {  // the weights' E8M0 atom of the k-step, then R activation words
+        if (tid < 32) cp16z(sw_i + islot + kWBytes, gsf, true);
+        if (tid < R) cp4(sbase + islot + kWBytes + 512 + tid * 4, gasf);
+      } else if (has_s) {  // atom 1 (k 64..127) is past K in a tail of at most 64
         const bool in = 2 * iks + (tid >> 5) < p.nka;
         cp16z(sw_i + islot + kWBytes, in ? gsf : p.sf, in);
       }
@@ -862,7 +893,8 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
     islot = islot + kStage == kRing ? 0u : islot + kStage;
     if constexpr (OW) {
       gws[0] += kTileK / 2;
-      gsf += kSBytes;
+      gsf += MX ? 512 : kSBytes;
+      if constexpr (MX) gasf += 512;
     } else {
 #pragma unroll
       for (int rec = 0; rec < NC; ++rec) gws[rec] += hf ? kTailRec : kRec;
@@ -1078,10 +1110,11 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
               } else if constexpr (OW) {  // the sum (times 2^7, exact) times alpha
                 const float r = p.alpha_rows ? p.alpha[f] : a;
                 if (n < Nout)
-                  reinterpret_cast<OT*>(p.out)[f * Nout + n] = to_o(v[s][gi][h] * 128.f * r);
+                  reinterpret_cast<OT*>(p.out)[f * Nout + n] =
+                      to_o(v[s][gi][h] * (MX ? 1.f : 128.f) * r);
                 if (n + 8 < Nout)
                   reinterpret_cast<OT*>(p.out)[f * Nout + n + 8] =
-                      to_o(v[s][gi][2 + h] * 128.f * r);
+                      to_o(v[s][gi][2 + h] * (MX ? 1.f : 128.f) * r);
               } else {
                 if (n < Nout) reinterpret_cast<OT*>(p.out)[f * Nout + n] = to_o(v[s][gi][h] * a);
                 if (n + 8 < Nout)
@@ -1259,6 +1292,8 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
                (4 * (((ow_x >> 2) & 1) ^ 1) + (tq ^ (ow_x & 3))) * 16
          : 0u;
   [[maybe_unused]] const uint32_t selE = (tq >> 1) * 0x1111u + 0x4400u, selO = selE + 0x2222u;
+  // MX: the k32 groups of the current k-step (fewer in the K tail)
+  [[maybe_unused]] int mx_nj = 4;
   float acc[SC][G][4];
 #pragma unroll
   for (int s = 0; s < SC; ++s)
@@ -1276,7 +1311,89 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
                               : (SC > 1 && G % 4 == 0 ? 4 : 1);
   auto step = [&](auto ngc, uint32_t sb, bool hf) {
     constexpr int NG = decltype(ngc)::value;
-    if constexpr (OW) {
+    if constexpr (OW && MX) {
+      // Each k32 group j: d = the exact MMA sum of (e2m1 2^-126) x (e2m1 2^119), then
+      // acc += RN(d 2^(ea + eb - 247)). When every scale byte the warp reads keeps the
+      // power of two normal (weights 96..159, activations 64..191) that is one FFMA.
+      // mx_rows: the tile's real weight rows; sa_mx: the activation scale words of rows
+      // wt TW + 2 tq (+ 1, + gi 8)
+      const int mx_rows = p.N - (blockIdx.x % chunks) * kTileN;
+      const uint32_t sa_mx = sbase + kWBytes + 512 + (wt * TW + 2 * tq) * 4;
+      uint32_t wq[SC][8], sq[SC][2], aq2[NG][2];
+#pragma unroll
+      for (int s = 0; s < SC; ++s) {
+        const int ws = wc * SC + s;
+        const uint32_t ss = sbase + kWBytes + sb + ((ws & 1) * 16 + g8) * 16 + (ws >> 1) * 4;
+        ldsm_x4(wq[s], sw_o + sb + s * 1024);
+        ldsm_x4(wq[s] + 4, sw_o2 + sb + s * 1024);
+        lds32v(sq[s], ss);
+        lds32v(sq[s] + 1, ss + 128);
+      }
+#pragma unroll
+      for (int gi = 0; gi < NG; ++gi) lds64v(aq2[gi], sa_mx + sb + gi * 32);
+      // bytes outside K and rows past N do not vote
+      const uint32_t vm = KT && mx_nj < 4 ? (1u << 8 * mx_nj) - 1 : ~0u;
+      uint32_t m7 = ~0u, m6 = 0u;
+#pragma unroll
+      for (int s = 0; s < SC; ++s)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t mk = (wc * SC + s) * 16 + h * 8 + g8 < mx_rows ? vm : 0u;
+          const uint32_t x = sq[s][h] ^ (sq[s][h] << 1);
+          m7 &= x | ~mk;
+          m6 |= x & mk;
+        }
+#pragma unroll
+      for (int gi = 0; gi < NG; ++gi)
+#pragma unroll
+        for (int t = 0; t < 2; ++t) m7 &= (aq2[gi][t] ^ (aq2[gi][t] << 1)) | ~vm;
+      const bool fast = __all_sync(~0u, (m7 & 0x80808080u) == 0x80808080u && !(m6 & 0x40404040u));
+      auto blocks = [&](auto fast_c) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          if (KT && j >= mx_nj) break;
+          // a group's d is consumed at once: hold one 8-row group's activation fragment
+          uint32_t a0[SC][4], a1[SC][4];
+#pragma unroll
+          for (int s = 0; s < SC; ++s) {
+            const uint32_t wg = wq[s][2 * j], wg8 = wq[s][2 * j + 1], w4 = wg << 4, w48 = wg8 << 4;
+            a0[s][0] = nib2<0>(wg, w4);
+            a0[s][1] = nib2<0>(wg8, w48);
+            a0[s][2] = nib2<1>(wg, w4);
+            a0[s][3] = nib2<1>(wg8, w48);
+            a1[s][0] = nib2<2>(wg, w4);
+            a1[s][1] = nib2<2>(wg8, w48);
+            a1[s][2] = nib2<3>(wg, w4);
+            a1[s][3] = nib2<3>(wg8, w48);
+          }
+#pragma unroll
+          for (int gi = 0; gi < NG; ++gi) {
+            uint32_t bf[4];
+            lds128(bf, ((j & 1) ? sa_o1 : sa_o0) + sb + gi * 8 * 256 + (j >> 1) * 128);
+#pragma unroll
+            for (int s = 0; s < SC; ++s) {
+              float d[4] = {0.f, 0.f, 0.f, 0.f};
+              mma_x(d, a0[s], bf);
+              mma_x(d, a1[s], bf + 2);
+#pragma unroll
+              for (int q = 0; q < 4; ++q) {
+                const uint32_t ea = (sq[s][q >> 1] >> 8 * j) & 255u;
+                const uint32_t eb = (aq2[gi][q & 1] >> 8 * j) & 255u;
+                float& c = acc[s][gi][q];
+                if constexpr (decltype(fast_c)::value)
+                  c = __fmaf_rn(d[q], __uint_as_float((ea + eb - 120u) << 23), c);
+                else
+                  c = mx_slow(c, d[q], ea, eb);
+              }
+            }
+          }
+        }
+      };
+      if (fast)
+        blocks(std::true_type{});
+      else
+        blocks(std::false_type{});
+    } else if constexpr (OW) {
       // per slot: the k128's weight words (wq[s][2 j], [2 j + 1]: rows g, g + 8 of k32 group j)
       // and the scale words of rows g, g + 8 in atoms 0 and 1 (sq[s][2 a + 0, 1])
       uint32_t wq[SC][8], sq[SC][4];
@@ -1454,6 +1571,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW> const& p) {
     cslot = cslot + kStage == kRing ? 0u : cslot + kStage;
     bool hf = false;
     if constexpr (KT) hf = half && u == S - 1;
+    if constexpr (MX && KT) mx_nj = u == S - 1 ? kr / 32 : 4;
     // clang-format off
 #define W4A16_STEP(n) case n: if constexpr (n < Q) { \
         step(std::integral_constant<int, n * G / Q>{}, sb, hf); break; } [[fallthrough]];
@@ -1492,9 +1610,9 @@ __global__ void __launch_bounds__(NW * 32) gemm_pt(GemmParamsT<FQ> p) {
 #if !defined(RECORDS_F16) && !defined(RECORDS_ACT) && !defined(RECORDS_EXACT) && \
     !defined(RECORDS_E4M3_MAX)
 #define RECORDS_OW
-template <int R, int WC, int NW, int STAGES, bool KT>
-__global__ void __launch_bounds__(NW * 32) gemm_ow(GemmParamsOw p) {
-  gemm_body<R, WC, NW, 0, STAGES, KT, 1, false, false, false, false, false, true>(p);
+template <int R, int WC, int NW, int STAGES, bool KT, bool MX = false>
+__global__ void __launch_bounds__(NW * 32) gemm_ow(GemmParamsT<false, true, MX> p) {
+  gemm_body<R, WC, NW, 0, STAGES, KT, 1, false, false, false, false, false, true, MX>(p);
 }
 #endif
 
@@ -1768,14 +1886,15 @@ __device__ __forceinline__ void dequant_input(DqArgs const& d) {
 // MX inputs (DQ 5 to 7, RECORDS_ACT modules; FP16 no MXFP4) restored for GEMM1, a thread per
 // 16-value block i: F 1 MXFP8 (E4M3 bytes [tokens][K]) and F 3 MXFP4 (E2M1 pairs [tokens][K / 2])
 // under E8M0 scales per 32 values, laid out as NVFP4's; F 2 FP8 E4M3 alone, its per-tensor scale in
-// GEMM1's alpha. Every product is exact in BF16 (FP16: in its range).
-template <int F>
+// GEMM1's alpha. Every product is exact in BF16 (FP16: in its range). RAW (DQ 9, RECORDS_OW):
+// MXFP4 without its scales, times 2^119; gemm_fp4 applies the E8M0 scales.
+template <int F, bool RAW = false>
 __device__ __forceinline__ void dequant_mx(DqArgs const& d) {
   namespace tk = tensorrt_llm::kernels;
   const int stride = (gridDim.x - d.cta0) * blockDim.x;
   for (int i = (blockIdx.x - d.cta0) * blockDim.x + threadIdx.x; i < d.blocks; i += stride) {
-    float s = 1.f;  // 2^(b - 127); byte 255 NaN
-    if constexpr (F != 2) {
+    float s = RAW ? 0x1p119f : 1.f;  // 2^(b - 127); byte 255 NaN
+    if constexpr (F != 2 && !RAW) {
       const uint32_t b = d.sf[sf_index(d, i / d.kb, i % d.kb / 2)];
       s = __uint_as_float(b == 255 ? 0x7FFFFFFFu : b ? b << 23 : 1u << 22);
     }
@@ -1876,7 +1995,7 @@ __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
     }
   } else if constexpr (DQ > 4) {
     if (blockIdx.x >= dq.cta0) {
-      dequant_mx<DQ - 4>(dq);
+      dequant_mx<DQ == 9 ? 3 : DQ - 4, DQ == 9>(dq);
       return;
     }
   } else if constexpr (DQ) {
@@ -2004,7 +2123,7 @@ __global__ void __launch_bounds__(1024, kPrepCtas<DQ>)
     }
   } else if constexpr (DQ > 4) {
     if (blockIdx.x >= dq.cta0) {
-      dequant_mx<DQ - 4>(dq);
+      dequant_mx<DQ == 9 ? 3 : DQ - 4, DQ == 9>(dq);
       return;
     }
   } else if constexpr (DQ) {
@@ -2256,34 +2375,34 @@ void launch_tile(int R, GemmParamsT<FQ> const& p, int grid, cudaStream_t st) {
 }
 
 #ifdef RECORDS_OW
-template <int R, int WC, int NW, int STAGES, bool KT>
-void launch_gemm_ow(GemmParamsOw const& p, int grid, cudaStream_t st) {
+template <int R, int WC, int NW, int STAGES, bool KT, bool MX>
+void launch_gemm_ow(GemmParamsT<false, true, MX> const& p, int grid, cudaStream_t st) {
   const int smem = STAGES * Cfg<R, 1>::kStageBytes;
   TVM_FFI_ICHECK(smem <= max_smem_optin()) << "W4A16 MoE GEMM: tile exceeds device shared memory";
-  cudaFuncSetAttribute(gemm_ow<R, WC, NW, STAGES, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       smem);
-  gemm_ow<R, WC, NW, STAGES, KT><<<grid, NW * 32, smem, st>>>(p);
+  cudaFuncSetAttribute(gemm_ow<R, WC, NW, STAGES, KT, MX>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  gemm_ow<R, WC, NW, STAGES, KT, MX><<<grid, NW * 32, smem, st>>>(p);
 }
 
 // OW: launch_tile's kBase tiles
-template <bool KT>
-void launch_tile_ow(int R, GemmParamsOw const& p, int grid, cudaStream_t st) {
+template <bool KT, bool MX>
+void launch_tile_ow(int R, GemmParamsT<false, true, MX> const& p, int grid, cudaStream_t st) {
   if (R == 8) {  // as launch_tile_pt
     constexpr int s = Cfg<8, 1>::kStageBytes;
-    if (ctas_per_sm<gemm_ow<8, 8, 8, 3, KT>, 3 * s>() >
-        ctas_per_sm<gemm_ow<8, 8, 8, 4, KT>, 4 * s>())
-      launch_gemm_ow<8, 8, 8, 3, KT>(p, grid, st);
+    if (ctas_per_sm<gemm_ow<8, 8, 8, 3, KT, MX>, 3 * s>() >
+        ctas_per_sm<gemm_ow<8, 8, 8, 4, KT, MX>, 4 * s>())
+      launch_gemm_ow<8, 8, 8, 3, KT, MX>(p, grid, st);
     else
-      launch_gemm_ow<8, 8, 8, 4, KT>(p, grid, st);
+      launch_gemm_ow<8, 8, 8, 4, KT, MX>(p, grid, st);
   } else if (R == 16)
-    launch_gemm_ow<16, 8, 8, 2, KT>(p, grid, st);
+    launch_gemm_ow<16, 8, 8, 2, KT, MX>(p, grid, st);
   else if (R == 32) {
     if (max_smem_per_sm() <= 100 * 1024)
-      launch_gemm_ow<32, 8, 8, 2, KT>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 2, KT, MX>(p, grid, st);
     else
-      launch_gemm_ow<32, 8, 8, 4, KT>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 4, KT, MX>(p, grid, st);
   } else
-    launch_gemm_ow<64, 4, 4, 3, KT>(p, grid, st);
+    launch_gemm_ow<64, 4, 4, 3, KT, MX>(p, grid, st);
 }
 #endif
 
@@ -2330,8 +2449,9 @@ using namespace flashinfer::w4a16_moe_sm80;
 // (RECORDS_ACT modules, BF16) 1, 2, 3: x is MXFP8 [tokens][K] or MXFP4 [tokens][K / 2] under E8M0
 // x_sf [tokens][>= K / 32] (or 128x4 swizzled), or FP8 E4M3 [tokens][K] (x_sf unread); x_fmt 4
 // (BF16 or FP16): x quantized per token to FP8 E4M3 as SM90's Humming path, x_ts receiving 1 / q
-// (x_sf unread). With alphas (FP32 [2 num_experts]) the first CTA writes the GEMM alphas num1 /
-// den1, then num2 / den2 (FP32 [num_experts] over [1]).
+// (x_sf unread). x_fmt 5 (RECORDS_OW modules, gemm_fp4's input): x is MXFP4 restored without its
+// scales (times 2^119). With alphas (FP32 [2 num_experts]) the first CTA writes the GEMM alphas
+// num1 / den1, then num2 / den2 (FP32 [num_experts] over [1]).
 void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap,
                          TensorView workspace, int64_t num_experts, int64_t row_tile,
                          int64_t max_blocks, tvm::ffi::Optional<TensorView> x,
@@ -2373,6 +2493,9 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
   TVM_FFI_ICHECK(x_fmt >= 0 && x_fmt <= 4 &&
                  (!x_fmt || (dq && !(kF16 && x_fmt == 3) && x_ts.has_value() == (x_fmt == 4))))
       << "x_fmt: 0, 1 to 3 (FP16 x_out: 1, 2) with no x_ts, or 4 with x_ts";
+#elif defined(RECORDS_OW)
+  TVM_FFI_ICHECK(x_fmt == 0 || (x_fmt == 5 && dq && !slot_experts.has_value() && !x_ts.has_value()))
+      << "x_fmt: 0, or 5 (MXFP4 for gemm_fp4) with x";
 #else
   TVM_FFI_ICHECK(x_fmt == 0) << "MX inputs (x_fmt) take a RECORDS_ACT module";
 #endif
@@ -2409,7 +2532,8 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
     } else if (x_fmt) {  // MX
       const int64_t t32 = (K / 32 + 3) / 4;
       TVM_FFI_ICHECK(
-          K % 32 == 0 && xv.size(0) == tokens && xv.size(1) == (x_fmt == 3 ? K / 2 : K) &&
+          K % 32 == 0 && xv.size(0) == tokens &&
+          xv.size(1) == (x_fmt == 3 || x_fmt == 5 ? K / 2 : K) &&
           (x_fmt == 2 || (sv.dtype().bits == 8 &&
                           (sf_swizzled ? sv.numel() >= (tokens + 127) / 128 * 128 * t32 * 4
                                        : sv.size(0) == tokens && sv.size(1) >= K / 32))))
@@ -2433,8 +2557,9 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
     d.blocks = static_cast<int>(tokens * (K / 16));
     d.kb = static_cast<int>(K / 16);
     d.swizzled = sf_swizzled;
-    TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(d.x) & (bf16 || x_fmt % 3 ? 15 : 7)) == 0 &&
-                   (reinterpret_cast<uintptr_t>(d.out) & 15) == 0)
+    TVM_FFI_ICHECK(
+        (reinterpret_cast<uintptr_t>(d.x) & (bf16 || x_fmt == 1 || x_fmt == 2 ? 15 : 7)) == 0 &&
+        (reinterpret_cast<uintptr_t>(d.out) & 15) == 0)
         << "NVFP4 input: x must be 8 B (16-bit: 16 B) and x_out 16 B aligned";
     dq_ctas = std::max(1, (d.blocks + 4095) / 4096);  // four blocks a thread
     if (x_ts.has_value()) {
@@ -2514,6 +2639,11 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
                        : mx(std::integral_constant<int, 4>{});
           return;
         }
+#elif defined(RECORDS_OW)
+        if (x_fmt) {
+          run(prep<RT, 9, false, O>);
+          return;
+        }
 #endif
         !dq     ? run(prep<RT, 0, false, O>)
         : d.ts  ? (d.lut ? run(prep<RT, 3, true, O>) : run(prep<RT, 3, false, O>))
@@ -2558,6 +2688,12 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
     : x_fmt == 2 ? count_mx(std::integral_constant<int, 2>{}, launch)
     : x_fmt == 3 ? count_mx(std::integral_constant<int, 3>{}, launch)
                  : count_mx(std::integral_constant<int, 4>{}, launch);
+  };
+  if (x_fmt) mx(false);
+#elif defined(RECORDS_OW)
+  auto mx = [&](bool launch) {  // x_fmt 5
+    constexpr auto kern = prepx_count<9>;
+    launch ? kern<<<nC + dq_ctas, 1024, sm_q, st>>>(ids, M, e, ch, pc, d, al) : big(kern, sm_q);
   };
   if (x_fmt) mx(false);
 #else
@@ -2846,19 +2982,30 @@ void w4a16_moe_sm80_gemm(
 // [rows] per row with alpha_rows. Columns N .. Nout - 1 are 0.
 void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, TensorView act,
                              TensorView meta, TensorView rowmap, TensorView out, int64_t row_tile,
-                             int64_t N, int64_t K, int64_t max_blocks, bool alpha_rows) {
+                             int64_t N, int64_t K, int64_t max_blocks, bool alpha_rows,
+                             tvm::ffi::Optional<TensorView> act_sf) {
+  // act_sf: MXFP4 (E8M0 scales of both operands, the activation's 128x4 [pad(M, 128)][4 nka])
+  const bool mx = act_sf.has_value();
   CHECK_INPUT_AND_TYPE(w, dl_uint8);
   CHECK_INPUT_AND_TYPE(sf, dl_uint8);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(act, kXdl);
   CHECK_INPUT_AND_TYPE(out, kOdl);
   CHECK_DIM(2, out);
-  const int64_t Nout = out.size(1), n_pad = (N + kTileN - 1) / kTileN * kTileN, nka = (K + 63) / 64;
+  const int64_t Nout = out.size(1), n_pad = (N + kTileN - 1) / kTileN * kTileN,
+                nka = mx ? (K + 127) / 128 : (K + 63) / 64;
   TVM_FFI_ICHECK(N > 0 && K > 0 && K % 32 == 0 && Nout % 8 == 0 && Nout <= n_pad)
       << "W4A16 dense FP4 GEMM: shape";
   TVM_FFI_ICHECK(w.numel() >= N * (K / 2) && sf.numel() >= n_pad * nka * 4 &&
                  alpha.numel() >= (alpha_rows ? out.size(0) : 1))
       << "w [N, K / 2], sf [pad(N, 128), pad(K / 16, 4)], alpha [1] or [rows]";
+  if (mx) {
+    const TensorView asf = act_sf.value();
+    CHECK_INPUT_AND_TYPE(asf, dl_uint8);
+    TVM_FFI_ICHECK(asf.numel() >= (out.size(0) + 127) / 128 * 128 * nka * 4 &&
+                   (reinterpret_cast<uintptr_t>(asf.data_ptr()) & 3) == 0)
+        << "act_sf [pad(M, 128), pad(K / 32, 4)], 4 B aligned";
+  }
   TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(w.data_ptr()) & 15) == 0 &&
                  (reinterpret_cast<uintptr_t>(sf.data_ptr()) & 15) == 0 &&
                  (reinterpret_cast<uintptr_t>(act.data_ptr()) & 15) == 0)
@@ -2868,7 +3015,7 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   ffi::CUDADeviceGuard device_guard(act.device().device_id);
   const cudaStream_t st = get_stream(act.device());
   const int* m = static_cast<const int*>(meta.data_ptr());
-  GemmParamsOw p{};
+  GemmParamsMx p{};  // the NVFP4 launches take its GemmParamsOw
   p.w = static_cast<const uint8_t*>(w.data_ptr());
   p.sf = static_cast<const uint8_t*>(sf.data_ptr());
   p.nka = static_cast<int>(nka);
@@ -2883,11 +3030,14 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   p.N = static_cast<int>(N);
   p.K = static_cast<int>(K);
   p.Nout = static_cast<int>(Nout);
+  p.asf = mx ? static_cast<const uint8_t*>(act_sf.value().data_ptr()) : nullptr;
   const int grid = static_cast<int>(max_blocks * (n_pad / kTileN));
+  const int rt = static_cast<int>(row_tile);
   if (K % kTileK != 0)
-    launch_tile_ow<true>(static_cast<int>(row_tile), p, grid, st);
+    mx ? launch_tile_ow<true, true>(rt, p, grid, st) : launch_tile_ow<true, false>(rt, p, grid, st);
   else
-    launch_tile_ow<false>(static_cast<int>(row_tile), p, grid, st);
+    mx ? launch_tile_ow<false, true>(rt, p, grid, st)
+       : launch_tile_ow<false, false>(rt, p, grid, st);
 }
 #endif
 

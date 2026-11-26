@@ -11667,8 +11667,7 @@ def mm_fp4(
 
         runners = [
             sm8x_mm_fp4_runner(
-                a, b, a_descale, b_descale, alpha, out_dtype, out,
-                use_8x4_sf_layout, use_nvfp4,
+                a, b, a_descale, b_descale, alpha, out_dtype, out, use_8x4_sf_layout
             )
         ]  # fmt: skip
     else:

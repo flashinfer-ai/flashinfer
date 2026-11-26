@@ -12,9 +12,10 @@ module whose GEMM2 writes FP16 (``RECORDS_OUT_F16``), rounded once from FP32.
 float8_e4m3fn tensor, ``alpha`` unchanged. ``mm_bf16_fp4`` also takes each backend's SM100+
 format (``cute-dsl-native``'s canonical weight among them) and builds its records per call.
 
-``mm_fp4`` (NVFP4 activations) runs on SM8x for every backend as the prep's exact BF16
+``mm_fp4`` (NVFP4 or MXFP4 operands) runs on SM8x for every backend as the prep's exact BF16
 restore of ``a`` and the dense GEMM ``gemm_fp4``, which reads the ``[N, K/2]`` weight and its
-128x4-swizzled scales as given, with a scalar or per-token ``alpha``.
+128x4-swizzled scales as given, with a scalar or per-token ``alpha``. For MXFP4 the restore
+leaves out ``a``'s E8M0 scales, which ``gemm_fp4`` applies with ``b``'s per 32-value block.
 """
 
 import functools
@@ -471,7 +472,7 @@ def sm8x_mm_bf16_fp4(
 
 
 # ---------------------------------------------------------------------------------------------
-# mm_fp4 (NVFP4 x NVFP4)
+# mm_fp4 (NVFP4 x NVFP4, MXFP4 x MXFP4)
 # ---------------------------------------------------------------------------------------------
 
 
@@ -483,10 +484,11 @@ def _run_fp4(
     alpha: Optional[torch.Tensor],
     out: torch.Tensor,
     r: int,
+    mx: bool = False,
 ) -> None:
-    """``out = (a @ b) * alpha`` for ``mm_fp4``'s NVFP4 operands: the prep restores ``a`` to
-    BF16 exactly, then the dense GEMM (``gemm_fp4``) reads ``b`` and its 128x4-swizzled scales
-    as given."""
+    """``out = (a @ b) * alpha`` for ``mm_fp4``'s NVFP4 (MXFP4: ``mx``) operands: the prep
+    restores ``a`` to BF16 exactly (MXFP4: without its scales), then the dense GEMM
+    (``gemm_fp4``) reads ``b`` and its 128x4-swizzled scales as given (MXFP4: and ``a``'s)."""
     m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
     if m == 0:
         return
@@ -507,10 +509,13 @@ def _run_fp4(
     ).split(ints)
     topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=a.device)
     act = torch.empty((m, k), dtype=torch.bfloat16, device=a.device)
+    asf = _flat_bytes(a_descale)
+    if asf.data_ptr() % 4:
+        asf = asf.clone()
     module = _w4a16_moe_sm80_module(None, False, None, False)
     module.prep(
-        topk_ids, meta, rowmap, workspace, 1, r, max_blocks, a, _flat_bytes(a_descale), act,
-        True, None, None, 0, None, None, None, None, None,
+        topk_ids, meta, rowmap, workspace, 1, r, max_blocks, a, asf, act,
+        True, None, None, 5 if mx else 0, None, None, None, None, None,
     )  # fmt: skip
     direct = n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
     target = (
@@ -520,8 +525,9 @@ def _run_fp4(
     )
     gemm = _out_f16_module() if out.dtype == torch.float16 else module
     gemm.gemm_fp4(
-        w, sf, alpha, act, meta, rowmap, target, r, n, k, max_blocks, alpha.numel() > 1
-    )
+        w, sf, alpha, act, meta, rowmap, target, r, n, k, max_blocks, alpha.numel() > 1,
+        asf if mx else None,
+    )  # fmt: skip
     if not direct:
         out.copy_(target[:, :n])
 
@@ -531,7 +537,7 @@ class Sm8xMmFp4Runner(TunableRunner):
     the row tile."""
 
     def get_cache_key_extras(self, inputs) -> tuple:
-        return (inputs[5], inputs[4] is not None and inputs[4].numel() > 1)
+        return (inputs[5], inputs[4] is not None and inputs[4].numel() > 1, inputs[8])
 
     def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
         return [8, 16, 32, 64]
@@ -546,6 +552,7 @@ class Sm8xMmFp4Runner(TunableRunner):
             alpha,
             out,
             64 if tactic in (None, -1) else tactic,
+            not inputs[8],
         )
         return out
 
@@ -559,14 +566,11 @@ def sm8x_mm_fp4_runner(
     out_dtype: torch.dtype,
     out: torch.Tensor,
     use_8x4_sf_layout: bool,
-    use_nvfp4: bool,
 ) -> Sm8xMmFp4Runner:
     """The ``mm_fp4`` runner of every backend on SM8x (after the backend's requirement
     check)."""
-    if use_8x4_sf_layout or not use_nvfp4:
-        raise NotImplementedError(
-            "mm_fp4 on SM8x currently serves NVFP4 with 128x4 scale factors"
-        )
+    if use_8x4_sf_layout:
+        raise NotImplementedError("mm_fp4 on SM8x currently serves 128x4 scale factors")
     m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
     if k % 32:
         raise ValueError(f"mm_fp4 on SM8x requires K % 32 == 0, got K={k}")
