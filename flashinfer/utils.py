@@ -209,6 +209,28 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
+def _check_attention_head_counts(num_qo_heads: int, num_kv_heads: int) -> None:
+    if num_qo_heads <= 0:
+        raise ValueError(f"num_qo_heads must be positive, got {num_qo_heads}")
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be positive, got {num_kv_heads}")
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_qo_heads ({num_qo_heads}) must be a multiple of "
+            f"num_kv_heads ({num_kv_heads})"
+        )
+
+
+def _check_attention_tensor_head_counts(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_layout: str
+) -> None:
+    kv_head_axis = -2 if kv_layout == "NHD" else -3
+    _check_attention_head_counts(q.shape[-2], k.shape[kv_head_axis])
+    num_v_heads = v.shape[kv_head_axis]
+    if num_v_heads <= 0:
+        raise ValueError(f"num_kv_heads in v must be positive, got {num_v_heads}")
+
+
 def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
     """Validate the FA2 prefill head-dimension safety requirements."""
     if head_dim_qk <= 0 or head_dim_vo <= 0:

@@ -52,6 +52,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
     bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0,
     bool fixed_uniform_q_len = false) {
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -82,6 +83,7 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
     int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
     bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
     int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0, bool fixed_uniform_q_len = false) {
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   (void)kv_len_arr;
   (void)causal;
   size_t float_workspace_size_in_bytes = 0;
@@ -121,6 +123,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
   int64_t num_qo_heads = q.size(1);
   int64_t head_dim_qk = q.size(2);
   int64_t num_kv_heads = (kv_layout == QKVLayout::kNHD) ? k.size(1) : k.size(0);
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), k_stride_n, k_stride_h, v_stride_n,
            v_stride_h;
   if (kv_layout == QKVLayout::kNHD) {

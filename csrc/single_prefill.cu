@@ -39,7 +39,8 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
                                   Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
                                   int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q.size(2);
-  unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
+  unsigned int kv_len, qo_len;
+  int64_t num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
   num_qo_heads = q.size(1);
@@ -60,6 +61,9 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
     v_stride_h = v.stride(0);
     v_stride_n = v.stride(1);
   }
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
+  TVM_FFI_ICHECK_EQ(v.size(kv_layout == QKVLayout::kNHD ? 1 : 0), num_kv_heads)
+      << "K and V must have the same number of heads";
   if (maybe_lse.has_value()) {
     const auto& lse = maybe_lse.value();
     TVM_FFI_ICHECK_EQ(lse.size(0), qo_len);

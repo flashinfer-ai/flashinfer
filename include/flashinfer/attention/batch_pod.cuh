@@ -19,6 +19,7 @@
 #include "../utils.cuh"
 #include "cascade.cuh"
 #include "decode.cuh"
+#include "head_count.h"
 #include "mask.cuh"
 #include "prefill.cuh"
 #include "variants.cuh"
@@ -172,12 +173,14 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   static_assert(
       std::is_same<typename PrefillParams::DTypeKV, typename DecodeParams::DTypeKV>::value);
   static_assert(std::is_same<typename PrefillParams::DTypeO, typename DecodeParams::DTypeO>::value);
-  // Ensure heads match
-  assert(prefill_params.paged_kv.num_heads == decode_params.paged_kv.num_heads);
-  assert(prefill_params.num_qo_heads == decode_params.num_qo_heads);
+  FLASHINFER_CHECK(prefill_params.paged_kv.num_heads == decode_params.paged_kv.num_heads,
+                   "POD requires matching prefill and decode KV head counts");
+  FLASHINFER_CHECK(prefill_params.num_qo_heads == decode_params.num_qo_heads,
+                   "POD requires matching prefill and decode QO head counts");
   // Common variables for both prefill and decode
   const uint32_t num_qo_heads = prefill_params.num_qo_heads;
   const uint32_t num_kv_heads = prefill_params.paged_kv.num_heads;
+  const uint32_t group_size = GetGQAGroupSize(num_qo_heads, num_kv_heads);
 
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -198,7 +201,6 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
       typename std::conditional<USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ_P, half>, half,
                                 float>::type;
 
-  const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;

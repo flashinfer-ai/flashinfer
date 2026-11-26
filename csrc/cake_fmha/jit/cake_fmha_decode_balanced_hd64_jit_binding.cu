@@ -192,8 +192,9 @@ void cake_paged_attention_decode(
   int64_t const num_q_heads = query.size(1);
   int64_t const num_kv_heads = key_cache.size(1);
   TVM_FFI_ICHECK_EQ(value_cache.size(1), num_kv_heads);
-  TVM_FFI_ICHECK(num_q_heads % num_kv_heads == 0 && num_q_heads >= num_kv_heads &&
-                 num_q_heads <= kMaxGroup * num_kv_heads)
+  TVM_FFI_ICHECK_GT(num_q_heads, 0) << "num_q_heads must be positive";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be positive";
+  TVM_FFI_ICHECK(num_q_heads % num_kv_heads == 0 && num_q_heads / num_kv_heads <= kMaxGroup)
       << "the balanced " << kRouteName << " decode route serves 1.." << kMaxGroup
       << " query heads per KV head";
   int64_t const group = num_q_heads / num_kv_heads;

@@ -29,7 +29,7 @@ from .trace.templates.cascade import (
     merge_state_trace,
     merge_states_trace,
 )
-from .utils import register_custom_op, register_fake_op
+from .utils import _check_attention_head_counts, register_custom_op, register_fake_op
 
 
 @functools.cache
@@ -479,6 +479,7 @@ class MultiLevelCascadeAttentionWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         for i, (
             wrapper,
             qo_indptr,

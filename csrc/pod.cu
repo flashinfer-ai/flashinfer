@@ -47,7 +47,7 @@ template <MaskMode MASK_MODE_P, MaskMode MASK_MODE_D, typename DTypeQ, typename 
 void pod_with_kv_cache_tensor_impl_(
     PrefillParams& prefill_params, DecodeParams& decode_params, const int64_t* k_strides_d,
     const int64_t* v_strides_d, TensorView q_p, TensorView k_p, TensorView v_p, TensorView o_p,
-    Optional<TensorView> maybe_lse_p, unsigned int num_qo_heads, unsigned int num_kv_heads,
+    Optional<TensorView> maybe_lse_p, int64_t num_qo_heads, int64_t num_kv_heads,
     unsigned int qo_len_p, unsigned int kv_len_p, uint32_t q_stride_n_p, uint32_t q_stride_h_p,
     uint32_t k_stride_n_p, uint32_t k_stride_h_p, uint32_t v_stride_n_p, uint32_t v_stride_h_p,
     int64_t window_left_p, Optional<TensorView> maybe_custom_mask_p,
@@ -117,7 +117,7 @@ void pod_with_kv_cache_tensor_impl_(
     params.lse =
         maybe_lse_d.has_value() ? static_cast<float*>(maybe_lse_d.value().data_ptr()) : nullptr;
     params.num_qo_heads = num_qo_heads;
-    params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
+    params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
     params.q_stride_n = q_stride_n_d;
     params.q_stride_h = q_stride_h_d;
     params.window_left = window_left_d;
@@ -188,7 +188,8 @@ void pod_with_kv_cache_tensor(
     bool enable_pdl) {
   // Prefill setup
   unsigned int head_dim_qk = q_p.size(2);
-  unsigned int kv_len_p, qo_len_p, num_kv_heads, num_qo_heads;
+  unsigned int kv_len_p, qo_len_p;
+  int64_t num_kv_heads, num_qo_heads;
   QKVLayout kv_layout_p = static_cast<QKVLayout>(layout_p);
   qo_len_p = q_p.size(0);
   num_qo_heads = q_p.size(1);
@@ -209,6 +210,9 @@ void pod_with_kv_cache_tensor(
     v_stride_h_p = v_p.stride(0);
     v_stride_n_p = v_p.stride(1);
   }
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
+  TVM_FFI_ICHECK_EQ(v_p.size(kv_layout_p == QKVLayout::kNHD ? 1 : 0), num_kv_heads)
+      << "K and V must have the same number of heads";
   if (maybe_lse_p.has_value()) {
     const auto& lse = maybe_lse_p.value();
     TVM_FFI_ICHECK_EQ(lse.size(0), qo_len_p);

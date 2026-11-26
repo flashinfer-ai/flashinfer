@@ -222,12 +222,7 @@ void trtllm_paged_attention_launcher(
   if (is_causal && window_left >= 0 && window_right == -1) {
     window_right = 0;
   }
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
-            << " and num_qo_heads: " << num_qo_heads;
-    FLASHINFER_ERROR(err_msg.str());
-  }
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
 
   // For paged attention, K and V have the same dtype (kv_data_type).
   auto fmha_runner =
@@ -929,12 +924,7 @@ void trtllm_ragged_attention_launcher(
   int64_t const window_right = is_causal && window_left >= 0 ? 0 : -1;
   validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
                                 /*has_variable_window=*/false);
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
-            << " and num_qo_heads: " << num_qo_heads;
-    FLASHINFER_ERROR(err_msg.str());
-  }
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, k_data_type, v_data_type, o_data_type,
                                                  num_elts_sage_q, num_elts_sage_k, num_elts_sage_p,
                                                  num_elts_sage_v);

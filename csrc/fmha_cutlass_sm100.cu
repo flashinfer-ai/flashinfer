@@ -95,8 +95,9 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   int total_qo_len = q.size(0);
   int total_kv_len = k.size(0);
-  int num_qo_heads = q.size(1);
-  int num_kv_heads = k.size(1);
+  int64_t num_qo_heads = q.size(1);
+  int64_t num_kv_heads = k.size(1);
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   int head_dim_qk = q.size(2);
   int head_dim_vo = v.size(2);
   int batch_size = qo_segment_offsets.size(0) - 1;

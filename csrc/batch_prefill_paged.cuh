@@ -43,6 +43,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
     page_size = paged_k_cache.size(1);
     num_kv_heads = paged_k_cache.size(2);
   }
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
@@ -91,7 +92,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;
-        params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
+        params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
         params.window_left = window_left;

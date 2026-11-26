@@ -28,6 +28,8 @@ from .jit.xqa import (
     swap_ab_eligible,
 )
 from .utils import (
+    _check_attention_head_counts,
+    _check_attention_tensor_head_counts,
     get_device_sm_count,
     register_custom_op,
     register_fake_op,
@@ -315,6 +317,9 @@ def xqa(
     - head_group_ratio from num_q_heads // num_kv_heads
     - max_seq_len from page_table.shape[-1] * page_size
     """
+    num_q_heads = q.shape[-2]
+    _check_attention_head_counts(num_q_heads, num_kv_heads)
+    _check_attention_tensor_head_counts(q, k_cache, v_cache, kv_layout)
     # Handle optional parameters
     if sm_count is None:
         sm_count = get_device_sm_count(q.device)
@@ -352,7 +357,6 @@ def xqa(
 
     # Infer parameters from tensors
     batch_size = seq_lens.shape[0] if use_ragged_q else q.shape[0]
-    num_q_heads = q.shape[-2]
     head_dim = q.shape[-1]
 
     # Calculate head_group_ratio

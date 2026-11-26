@@ -123,8 +123,8 @@ void LaunchCompat(const CommonArgs& args) {
   TVM_FFI_ICHECK_EQ(args.key_cache.dtype(), args.value_cache.dtype())
       << "key and value cache dtypes must match";
   int const o_dtype = CakeDType(args.out.dtype(), true, "output");
-  int const num_q_heads = static_cast<int>(args.query.size(1));
-  int const num_kv_heads = static_cast<int>(args.key_cache.size(1));
+  int64_t const num_q_heads = args.query.size(1);
+  int64_t const num_kv_heads = args.key_cache.size(1);
   int const head_dim = static_cast<int>(args.query.size(2));
   int const kv_head_dim =
       static_cast<int>(args.key_cache.size(3)) * (kv_dtype == kNvFp4 ? 2 : 1);
@@ -134,9 +134,7 @@ void LaunchCompat(const CommonArgs& args) {
       << "Cake FMHA compatibility route supports head_dim 128 or 256";
   TVM_FFI_ICHECK_EQ(kv_head_dim, head_dim) << "query and KV head dimensions must match";
   TVM_FFI_ICHECK_EQ(out_head_dim, head_dim) << "query and output head dimensions must match";
-  TVM_FFI_ICHECK_GT(num_kv_heads, 0);
-  TVM_FFI_ICHECK_EQ(num_q_heads % num_kv_heads, 0)
-      << "num_q_heads must be divisible by num_kv_heads";
+  check_attention_head_counts(num_q_heads, num_kv_heads);
   TVM_FFI_ICHECK(!(!args.is_causal && args.window_left >= 0))
       << "Cake FMHA does not support non-causal sliding-window attention";
   TVM_FFI_ICHECK(args.block_tables.dtype() == dl_int32 ||

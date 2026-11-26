@@ -34,6 +34,8 @@ from .utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
+    _check_attention_head_counts,
+    _check_attention_tensor_head_counts,
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -344,6 +346,7 @@ class PODWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         # Logits soft cap is not supported currently
         batch_size = len(last_page_len)
         logits_soft_cap = 0.0
@@ -581,6 +584,10 @@ class PODWithPagedKVCacheWrapper:
             **not** part of the return value even when ``return_lse_p`` /
             ``return_lse_d`` is ``True`` (see those parameter notes).
         """
+        _check_kv_layout(kv_layout_p)
+        _check_attention_tensor_head_counts(q_p, k_p, v_p, kv_layout_p)
+        k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
+        _check_attention_tensor_head_counts(q_d, k_cache_d, v_cache_d, self._kv_layout)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)
 
@@ -589,7 +596,6 @@ class PODWithPagedKVCacheWrapper:
         logits_soft_cap_d = None
         # Prefill setup
         _check_pos_encoding_mode(pos_encoding_mode_p)
-        _check_kv_layout(kv_layout_p)
         tmp_p = _get_cache_buf("pod_with_kv_cache_tmp", 32 * 1024 * 1024, q_p.device)
         if logits_soft_cap_p is None:
             logits_soft_cap_p = 0.0
@@ -622,7 +628,6 @@ class PODWithPagedKVCacheWrapper:
         out_p = torch.empty_like(q_p)
 
         # Decode setup
-        k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
         _check_cached_qkv_data_type(
             q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -992,6 +997,7 @@ class BatchPODWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         # Logits soft cap is not supported currently
         logits_soft_cap = 0.0
 
@@ -1196,6 +1202,10 @@ class BatchPODWithPagedKVCacheWrapper:
             output.  When ``return_lse`` is ``True`` the return becomes
             ``((out_p, lse_p), (out_d, lse_d))``.
         """
+        k_cache_p, v_cache_p = _unpack_paged_kv_cache(paged_kv_cache_p, self._kv_layout)
+        _check_attention_tensor_head_counts(q_p, k_cache_p, v_cache_p, self._kv_layout)
+        k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
+        _check_attention_tensor_head_counts(q_d, k_cache_d, v_cache_d, self._kv_layout)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)
 
@@ -1203,7 +1213,6 @@ class BatchPODWithPagedKVCacheWrapper:
         logits_soft_cap_p = None
         logits_soft_cap_d = None
         # Prefill setup
-        k_cache_p, v_cache_p = _unpack_paged_kv_cache(paged_kv_cache_p, self._kv_layout)
         _check_cached_qkv_data_type(
             q_p, k_cache_p, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -1247,7 +1256,6 @@ class BatchPODWithPagedKVCacheWrapper:
         out_p = torch.empty_like(q_p)
 
         # Decode setup
-        k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
         _check_cached_qkv_data_type(
             q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
         )

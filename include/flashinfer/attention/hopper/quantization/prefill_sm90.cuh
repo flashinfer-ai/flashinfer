@@ -23,6 +23,7 @@
 
 #include "../../../cutlass_utils.cuh"
 #include "../../../exception.h"
+#include "../../head_count.h"
 #include "../../mask.cuh"
 #include "../sparse_mainloop.cuh"
 #include "../tile_scheduler.cuh"
@@ -288,7 +289,7 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
   // TODO(Zihao): also support kv-head major
   typename Scheduler::Arguments scheduler_args = {
       num_tiles_q, params.num_qo_heads, params.qo_len, params.kv_len,
-      cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads)};
+      cutlass::FastDivmod(GetGQAGroupSize(params.num_qo_heads, params.num_kv_heads))};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   auto kernel =
@@ -362,7 +363,7 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched(Params& params
       params.qo_lens,
       params.kv_lens,
       params.batch_indices,
-      cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
+      cutlass::FastDivmod(GetGQAGroupSize(params.num_qo_heads, params.num_kv_heads)),
       params.num_qo_heads};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
@@ -525,7 +526,7 @@ cudaError_t BatchFP8PrefillWithRaggedKVCacheKernelTraitsDispatched(Params& param
       params.qo_lens,
       params.kv_lens,
       params.batch_indices,
-      cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
+      cutlass::FastDivmod(GetGQAGroupSize(params.num_qo_heads, params.num_kv_heads)),
       params.num_qo_heads};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 

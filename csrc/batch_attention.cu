@@ -41,6 +41,7 @@ Array<int64_t> BatchPagedAttentionPlan(TensorView float_workspace_buffer,
                                        TensorView qo_indptr, TensorView kv_indptr,
                                        TensorView kv_len, int64_t batch_size, int64_t num_qo_heads,
                                        int64_t num_kv_heads, int64_t head_dim_o, bool causal) {
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -73,6 +74,7 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
                             double v_scale,  // must use double due to pytorch binding
                             double sm_scale,
                             double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   HolisticPlanInfo<2> plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 

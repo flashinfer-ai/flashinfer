@@ -48,6 +48,7 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
     int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
     bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
     int64_t window_left) {
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -99,6 +100,10 @@ void BatchPrefillWithRaggedKVCacheSM90Run(ffi::TensorView float_workspace_buffer
   int64_t head_dim_vo = v.size(2);
 
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+  const bool kv_is_nhd = kv_layout == QKVLayout::kNHD;
+  const int64_t num_qo_heads = q.size(1);
+  const int64_t num_kv_heads = k.size(kv_is_nhd ? 1 : 0);
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
 
   cudaSetDevice(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
@@ -119,7 +124,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(ffi::TensorView float_workspace_buffer
         params.q_stride_h = q.stride(1);
         params.o_stride_n = o.stride(0);
         params.o_stride_h = o.stride(1);
-        if (kv_layout == QKVLayout::kNHD) {
+        if (kv_is_nhd) {
           params.k_stride_n = k.stride(0);
           params.k_stride_h = k.stride(1);
           params.v_stride_n = v.stride(0);
@@ -131,10 +136,10 @@ void BatchPrefillWithRaggedKVCacheSM90Run(ffi::TensorView float_workspace_buffer
           params.v_stride_n = v.stride(1);
         }
         params.nnz_qo = q.size(0);
-        params.nnz_kv = k.size(0);
-        params.num_qo_heads = q.size(1);
-        params.num_kv_heads = k.size(1);
-        params.group_size = params.num_qo_heads / params.num_kv_heads;
+        params.nnz_kv = k.size(kv_is_nhd ? 0 : 1);
+        params.num_qo_heads = num_qo_heads;
+        params.num_kv_heads = num_kv_heads;
+        params.group_size = num_qo_heads / num_kv_heads;
         params.window_left = window_left;
         params.causal = mask_mode_code == 1;
         params.qo_tile_indices =
@@ -189,6 +194,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     TVM_FFI_ICHECK_EQ(lse.size(1), q.size(1));
   }
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+  const int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
   int64_t head_dim_qk = q.size(2);
   int64_t head_dim_vo = paged_v_cache.size(3);
@@ -199,6 +205,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     page_size = paged_k_cache.size(1);
     num_kv_heads = paged_k_cache.size(2);
   }
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
 
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
@@ -242,9 +249,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           params.v_page_stride = paged_v_cache.stride(0);
         }
         params.nnz_qo = q.size(0);
-        params.num_qo_heads = q.size(1);
+        params.num_qo_heads = num_qo_heads;
         params.num_kv_heads = num_kv_heads;
-        params.group_size = params.num_qo_heads / num_kv_heads;
+        params.group_size = num_qo_heads / num_kv_heads;
         params.page_size = page_size;
         params.window_left = window_left;
         params.causal = mask_mode_code == 1;

@@ -38,6 +38,7 @@ from .utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
+    _check_attention_head_counts,
     _check_pos_encoding_mode,
     check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
@@ -212,8 +213,6 @@ def _vsa_common_checks(
     C: int,
     M: int,
     N: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
     mask,
     packed_mask,
     causal: bool,
@@ -221,10 +220,6 @@ def _vsa_common_checks(
     logits_soft_cap,
 ) -> None:
     """Validate the arguments that are identical across all VSA backends."""
-    if num_qo_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
-        )
     if M % R != 0:
         raise ValueError(f"M={M} must be divisible by block size R={R}")
     if N % C != 0:
@@ -671,6 +666,7 @@ class BlockSparseAttentionWrapper:
             The ``vsa_sm100_blk64`` backend does not support GQA/MQA: it has no
             KV-head mapping and requires ``num_kv_heads == num_qo_heads``.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -704,8 +700,6 @@ class BlockSparseAttentionWrapper:
                 C,
                 M,
                 N,
-                num_qo_heads,
-                num_kv_heads,
                 mask,
                 packed_mask,
                 causal,
@@ -788,15 +782,6 @@ class BlockSparseAttentionWrapper:
                 raise NotImplementedError(
                     "cuTile block-sparse backend does not support causal masking "
                     "under the block-sparse (gathered-block) mapping."
-                )
-            if num_qo_heads % num_kv_heads != 0:
-                # run() maps each (block-row, kv-head) onto QUERY_GROUP_SIZE =
-                # num_qo_heads // num_kv_heads query heads; a non-multiple would
-                # silently drop the remainder heads.
-                raise ValueError(
-                    "cuTile block-sparse backend requires num_qo_heads % "
-                    f"num_kv_heads == 0 (num_qo_heads={num_qo_heads}, "
-                    f"num_kv_heads={num_kv_heads})."
                 )
             num_col_blocks = N // C
             if indices.numel() > 0:
@@ -889,8 +874,6 @@ class BlockSparseAttentionWrapper:
                 C,
                 M,
                 N,
-                num_qo_heads,
-                num_kv_heads,
                 mask,
                 packed_mask,
                 causal,
@@ -1018,8 +1001,6 @@ class BlockSparseAttentionWrapper:
                 C,
                 M,
                 N,
-                num_qo_heads,
-                num_kv_heads,
                 mask,
                 packed_mask,
                 causal,
@@ -1118,8 +1099,6 @@ class BlockSparseAttentionWrapper:
                 C,
                 M,
                 N,
-                num_qo_heads,
-                num_kv_heads,
                 mask,
                 packed_mask,
                 causal,
@@ -1896,6 +1875,7 @@ class VariableBlockSparseAttentionWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -2034,9 +2014,6 @@ class VariableBlockSparseAttentionWrapper:
         self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
 
         # Sanity check
-        assert num_qo_heads % num_kv_heads == 0, (
-            "num_qo_heads must be a multiple of num_kv_heads"
-        )
         assert num_blocks_row * num_kv_heads + 1 == kv_indptr_host.shape[0]
         assert kv_indptr_host[-1].item() == kv_indices_host.shape[0], (
             f"{kv_indptr_host[-1].item()} != {kv_indices_host.shape[0]}"

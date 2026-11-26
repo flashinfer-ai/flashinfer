@@ -33,6 +33,8 @@ from ..utils import (
     canonicalize_torch_dtype,
     PosEncodingMode,
     TensorLayout,
+    _check_attention_head_counts,
+    _check_attention_tensor_head_counts,
     _check_kv_layout,
     _unpack_paged_kv_cache,
     determine_attention_backend,
@@ -175,6 +177,7 @@ class BatchAttention:
             Whether to compile the profiler-enabled variant of the kernel.  Defaults
             to ``False``.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._logits_soft_cap = logits_soft_cap
@@ -327,6 +330,7 @@ class BatchAttention:
             )
 
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
+        _check_attention_tensor_head_counts(q, k_cache, v_cache, self._kv_layout)
         if out is None:
             out = torch.empty_like(q)
         if lse is None:

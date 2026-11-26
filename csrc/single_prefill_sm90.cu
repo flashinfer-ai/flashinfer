@@ -38,10 +38,13 @@ void single_prefill_with_kv_cache_sm90(ffi::TensorView q, ffi::TensorView k, ffi
                                        int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q.size(2);
   unsigned int head_dim_vo = v.size(2);
-  unsigned int num_qo_heads = q.size(1);
-  unsigned int qo_len = q.size(0);
-
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+  const bool kv_is_nhd = kv_layout == QKVLayout::kNHD;
+  const int64_t num_qo_heads = q.size(1);
+  const int64_t num_kv_heads = k.size(kv_is_nhd ? 1 : 0);
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
+  TVM_FFI_ICHECK_EQ(v.size(kv_is_nhd ? 1 : 0), num_kv_heads)
+      << "K and V must have the same number of heads";
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
@@ -60,7 +63,7 @@ void single_prefill_with_kv_cache_sm90(ffi::TensorView q, ffi::TensorView k, ffi
                      params.q_stride_h = q.stride(1);
                      params.o_stride_n = o.stride(0);
                      params.o_stride_h = o.stride(1);
-                     if (kv_layout == QKVLayout::kNHD) {
+                     if (kv_is_nhd) {
                        params.k_stride_n = k.stride(0);
                        params.k_stride_h = k.stride(1);
                        params.v_stride_n = v.stride(0);
@@ -72,11 +75,11 @@ void single_prefill_with_kv_cache_sm90(ffi::TensorView q, ffi::TensorView k, ffi
                        params.v_stride_n = v.stride(1);
                      }
                      params.qo_len = q.size(0);
-                     params.kv_len = k.size(0);
-                     params.num_qo_heads = q.size(1);
-                     params.num_kv_heads = k.size(1);
+                     params.kv_len = k.size(kv_is_nhd ? 0 : 1);
+                     params.num_qo_heads = num_qo_heads;
+                     params.num_kv_heads = num_kv_heads;
                      params.causal = mask_mode == MaskMode::kCausal;
-                     params.group_size = params.num_qo_heads / params.num_kv_heads;
+                     params.group_size = num_qo_heads / num_kv_heads;
                      params.window_left = window_left;
 
                      ADDITIONAL_PARAMS_SETTER
