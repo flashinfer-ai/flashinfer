@@ -593,6 +593,13 @@ def _run_group_groupwise(a, b, a_scale, b_scale, m_indptr, out, gm: int) -> None
     chosen(inputs=inputs, tactic=tactic)
 
 
+def _grouped_one_device(a: torch.Tensor, *ts: Optional[torch.Tensor]) -> None:
+    if any(t is not None and t.device != a.device for t in ts):
+        raise ValueError(
+            "grouped GEMM operands, scales, alpha, m_indptr and output must be on one device"
+        )
+
+
 def sm8x_grouped_mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -603,13 +610,15 @@ def sm8x_grouped_mm_fp8(
 ) -> torch.Tensor:
     """``grouped_mm_fp8`` on SM80 / SM86 / SM87: ``alpha * (a @ b[e]^T)`` over cuDNN's MOE
     segments (the starts ``m_indptr[:-1]``, the last segment to ``a.shape[0]``)."""
+    _grouped_one_device(a, b, m_indptr, alpha, out)
     cum_m, k = (int(x) for x in a.shape)
     if k % 16:
         raise ValueError(f"FP8 GEMM requires K % 16 == 0, got K={k}")
     if out is None:
         out = torch.empty((cum_m, b.shape[1]), dtype=out_dtype, device=a.device)
     if cum_m and b.shape[0]:
-        ip = torch.cat((m_indptr[:-1], m_indptr.new_full((1,), cum_m)))
+        starts = m_indptr.reshape(-1)[:-1]
+        ip = torch.cat((starts, starts.new_full((1,), cum_m)))
         one = _ones(a.device)
         _run_group_groupwise(a, b, one if alpha is None else alpha, one, ip, out, 0)
     return out
@@ -1180,6 +1189,7 @@ def _grouped_mm_rows(
     """The output and cuDNN's MOE segment boundaries (the starts ``m_indptr[:-1]``, the last
     segment to ``a.shape[0]``, nondecreasing; None: nothing to compute) of the block-scaled
     ``grouped_mm`` after the scales' size check (128x4-swizzled, ``vec``-element blocks)."""
+    _grouped_one_device(a, b, a_descale, b_descale, m_indptr, out)
     cum_m, (groups, n) = int(a.shape[0]), (int(x) for x in b.shape[:2])
     if k % 32:
         raise ValueError(f"block-scaled grouped GEMM requires K % 32 == 0, got K={k}")
@@ -1196,8 +1206,8 @@ def _grouped_mm_rows(
         out = torch.empty((cum_m, n), dtype=out_dtype, device=a.device)
     if cum_m == 0 or groups == 0 or n == 0:
         return out, None
-    ends = m_indptr.reshape(-1)[:-1].new_full((1,), cum_m)
-    ip = torch.cat((m_indptr.reshape(-1)[:-1], ends)).clamp(0, cum_m).long()
+    starts = m_indptr.reshape(-1)[:-1]
+    ip = torch.cat((starts, starts.new_full((1,), cum_m))).clamp(0, cum_m).long()
     return out, torch.cummax(ip, 0).values
 
 
@@ -1237,6 +1247,7 @@ def sm8x_grouped_mm_fp4(
 ) -> torch.Tensor:
     """``grouped_mm_fp4`` on SM8x (``block_size`` 16: NVFP4, 32: MXFP4): ``alpha * (a @
     b[e]^T)`` over cuDNN's MOE segments, the rows before ``m_indptr[0]`` unwritten."""
+    _grouped_one_device(a, alpha)
     k, groups = 2 * int(a.shape[1]), int(b.shape[0])
     out, ip = _grouped_mm_rows(
         a, b, a_descale, b_descale, m_indptr, k, block_size, out_dtype, out
