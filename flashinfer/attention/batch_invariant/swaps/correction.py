@@ -8,7 +8,8 @@ The per-row coefficients every thread needs for its columns (``alpha`` from the 
 thread into smem, one named barrier) are applied column-wise: ``O^T[d, n] *= alpha[n]`` (``mul.rn``, skipped when no live row's maximum
 moved -- ``mul(O, 1.0)`` is an identity), ``O_m^T[d, n] = fma(O_c^T[d, n], a2[n], mul(O_m^T[d, n], a1[n]))`` in TMEM at every D, and the
 epilogue ``cvt_bf16(add(mul(O, inv[n]), +0))`` to the output rows (mode 0) or the raw fp32 ``O^T`` columns and ``(m, l)`` to the workspace
-rows (mode 1, folded by ``fixup.py`` or the in-kernel last arriver).
+rows (mode 1, folded by ``fixup.py`` or the in-kernel last arriver). The owning thread of a mode 0 row also stores the LSE member
+of its final ``(m, l)`` when asked (``lse.store_lse``); in a kernel compiled for attention sinks its ``inv`` is the sink step's (``lse.row_normaliser``).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from cutlass.cute.nvgpu import tcgen05
 from ....batch_invariant.fp_interface.cute import CuteF32
 from ..blocks.correction import merge_coeffs, row_sum
 from ..blocks.operands import ACC_DTYPE, IN_DTYPE
+from ..lse import row_normaliser, store_lse
 from .operands import BAR_COEF
 
 _NEG_INF = float("-inf")
@@ -82,6 +84,9 @@ def correction_loop(
     tile_hi: Int32,
     mode: Int32,
     slot_base: Int32,
+    mLse: cute.Tensor,
+    mSink: cute.Tensor,
+    lse_mode: Int32,
 ):
     D, g, TPC, NP, WS = st.D, st.g, st.tpc, st.n_pad, st.ws_row
     SPT = st.slots_per_tile
@@ -201,11 +206,18 @@ def correction_loop(
         sth.release()
     # ---- epilogue: the normaliser (mode 0) or (m, l) of the partial rows (mode 1) from the owning threads, then every thread's columns
     if own:
-        inv = CuteF32.div(Float32(1.0), l_r)
+        inv, m_f, l_f = row_normaliser(
+            mSink, kv_head * g + thread_idx % g, m_r, l_r, c, st.sinks, mode != 0
+        )
         s_inv[thread_idx] = inv
         if (mode != 0) & (thread_idx < rows_valid):
             mWs[(slot_base + thread_idx).to(Int64) * WS + D] = m_r
             mWs[(slot_base + thread_idx).to(Int64) * WS + D + 1] = l_r
+        if (mode == 0) & (lse_mode > 0) & (thread_idx < rows_valid):
+            lse_row = (
+                (q_base + q_tok0 + thread_idx // g) * Hq + kv_head * g + thread_idx % g
+            )
+            store_lse(mLse, lse_row, m_f, l_f, c, lse_mode, st.sinks)
     cute.arch.barrier(barrier_id=BAR_COEF, number_of_threads=128)
     load_coefs(s_ab, Int32(0), tLDc, rA)
     load_coefs(s_ab, Int32(1), tLDc, rB)

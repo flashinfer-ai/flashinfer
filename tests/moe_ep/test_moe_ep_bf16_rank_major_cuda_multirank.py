@@ -5,6 +5,10 @@ nodes with four R200 GPUs each in one NVLink domain::
 
     bash tests/moe_ep/run_tests.sh bf16-rank-major
 
+Across two nodes, set ``NVSHMEM_DISABLE_NVLS=1`` and
+``NVSHMEM_REMOTE_TRANSPORT=none`` on every rank (the target above does this);
+NVSHMEM's default NVLS setup there runs out of internal teams.
+
 The layer tests launch the backend only through the public layer API. Their
 reference uses canonical weights, PyTorch matrix products and collectives, not
 the backend's generated source, transformed layouts, launch session, or another

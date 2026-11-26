@@ -45,6 +45,64 @@ def test_public_nvfp4_preparation_matches_default_selector():
         assert legacy_leg[1].dtype == torch.uint8
 
 
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e4m3fn, torch.int8])
+def test_sm100_nvfp4_loads_transformed_scale_views(monkeypatch, variant, scale_dtype):
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.backends.mega.kernel.sm100 import standard_cutedsl
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources
+
+    validate = sources.validate_standard_weights
+    monkeypatch.setattr(standard_cutedsl, "validate_mega_arch", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        sources,
+        "validate_standard_weights",
+        lambda weights, config, device: validate(weights, config, torch.device("cpu")),
+    )
+
+    pack = moe_ep.MoEWeightPack(
+        torch.zeros(1, 256, 128, dtype=torch.uint8),
+        torch.zeros(1, 256, 64, dtype=torch.uint8),
+        torch.full((1, 256, 16), 56, dtype=torch.uint8),
+        torch.full((1, 256, 8), 56, dtype=torch.uint8),
+    )
+    typed = moe_ep.preprocess_nvfp4_cutedsl_mega_weights(
+        pack, hidden_size=256, intermediate_size=128
+    )
+    transformed = tuple((weight, scale.view(scale_dtype)) for weight, scale in typed)
+    args = (
+        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+        moe_ep.FleetParams(1, 16, 256),
+        None,
+        moe_ep.MegaConfig(
+            megakernel=moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=128, top_k=1, kernel_variant=variant
+            ),
+            preprocess_weights=False,
+            transformed_weights=transformed,
+        ),
+    )
+    if scale_dtype == torch.int8:
+        with pytest.raises(ValueError, match="requires .*float8_e4m3fn scales"):
+            moe_ep.MoEEpMegaLayer(*args)
+        return
+
+    layer = moe_ep.MoEEpMegaLayer(*args)
+    try:
+        prepared = layer.get_transformed_weights()
+        if scale_dtype == torch.float8_e4m3fn:
+            assert prepared is transformed
+        for (weight, scale), (original_w, original_sf) in zip(
+            prepared, transformed, strict=True
+        ):
+            assert weight is original_w
+            assert scale.dtype == torch.float8_e4m3fn
+            assert scale.data_ptr() == original_sf.data_ptr()
+    finally:
+        layer.destroy()
+
+
 @pytest.mark.parametrize("name", ["bf16", "bf16_mxfp8"])
 @pytest.mark.parametrize(
     "positional, keywords, expected",

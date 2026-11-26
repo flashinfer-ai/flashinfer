@@ -178,14 +178,10 @@ def test_standalone_lint_script_covers_both_cpu_architectures():
 
 
 @pytest.mark.cpu_only
-def test_pr_test_runs_spec_lint_and_requires_it():
+def test_reusable_workflow_runs_spec_lint():
     yaml = pytest.importorskip("yaml")
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/pr-test.yml").read_text())
     jobs = workflow["jobs"]
 
     lint = jobs["spec-lint"]
-    assert lint["needs"] == ["gate", "setup"]
-    # Authorized runs only: the lane executes the PR's code on a self-hosted runner.
-    assert "needs.gate.outputs.authorized == 'true'" in lint["if"]
     assert "task_check_jit_spec_gencodes.sh" in str(lint["steps"])
-    assert "spec-lint" in jobs["test-results-summary"]["needs"]

@@ -61,6 +61,9 @@ PARAMETERS = (
     "backend",
     "state_indices",
     "cu_seqlens_cpu",
+    "output_state_indices",
+    "rand_seed",
+    "philox_rounds",
 )
 
 
@@ -112,6 +115,14 @@ def test_signature_adds_the_cake_backend() -> None:
     host = signature.parameters["cu_seqlens_cpu"]
     assert host.kind is inspect.Parameter.KEYWORD_ONLY and host.default is None
     assert "Tensor" in str(host.annotation)
+    for name, default in (
+        ("output_state_indices", None),
+        ("rand_seed", None),
+        ("philox_rounds", 10),
+    ):
+        parameter = signature.parameters[name]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default == default
     backend_signature = inspect.signature(backend.cake_chunk_gated_delta_product)
     assert tuple(backend_signature.parameters) == tuple(
         p for p in PARAMETERS if p != "backend"
@@ -193,6 +204,66 @@ def test_cake_backend_forwards_the_pool_and_the_scalars(monkeypatch) -> None:
     assert recorded["scale"] == 0.5 and recorded["use_qk_l2norm_in_kernel"] is True
     assert recorded["num_householder"] == 2 and recorded["output_final_state"] is False
     assert recorded["cu_seqlens"] is inputs["cu_seqlens"]
+    assert recorded["output_state_indices"] is None and recorded["rand_seed"] is None
+    assert recorded["philox_rounds"] == 10
+    seed = torch.tensor([3], device=_device(), dtype=torch.int64)
+    chunk_gated_delta_product(
+        **{**inputs, "initial_state": pool, "output_final_state": False},
+        backend="cake",
+        state_indices=slots,
+        output_state_indices=slots.flip(0),
+        rand_seed=seed,
+        philox_rounds=7,
+    )
+    assert torch.equal(recorded["output_state_indices"], slots.flip(0))
+    assert recorded["rand_seed"] is seed and recorded["philox_rounds"] == 7
+
+
+def test_other_backends_refuse_the_cake_arguments() -> None:
+    """``output_state_indices`` and ``rand_seed`` belong to the Cake backend; the cuDNN backends refuse them rather
+    than ignore them."""
+    inputs = _inputs(
+        2, (129, 65), 3, torch.Generator(device=_device()).manual_seed(SEED)
+    )
+    slots = torch.tensor([1, 0], device=_device(), dtype=torch.int32)
+    seed = torch.tensor([3], device=_device(), dtype=torch.int64)
+    for which in ("auto", "cudnn"):
+        for kwargs in ({"output_state_indices": slots}, {"rand_seed": seed}):
+            with pytest.raises(ValueError, match='backend="cake"'):
+                chunk_gated_delta_product(**inputs, backend=which, **kwargs)
+
+
+def test_sm90_refuses_the_blackwell_state_forms() -> None:
+    """On SM90 the programs read and store a float32 state: output slots, a seed and a float16 / bfloat16 stored
+    state are refused (a bfloat16 per-sequence initial state is still converted)."""
+    inputs = _inputs(
+        2, (129, 65), 3, torch.Generator(device=_device()).manual_seed(SEED)
+    )
+    slots = torch.tensor([1, 0], device=_device(), dtype=torch.int32)
+    pool = torch.zeros((4, 3, V, K), device=_device())
+    seed = torch.tensor([3], device=_device(), dtype=torch.int64)
+    for kwargs, match in (
+        (
+            {"state_indices": slots, "output_state_indices": slots},
+            "output_state_indices",
+        ),
+        ({"rand_seed": seed}, "rand_seed"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            chunk_gated_delta_product(
+                **{**inputs, "initial_state": pool[:2], "output_final_state": True},
+                backend="cake",
+                **kwargs,
+            )
+    with pytest.raises(ValueError, match="float32"):
+        chunk_gated_delta_product(
+            **{
+                **inputs,
+                "initial_state": pool[:2].half(),
+                "output_final_state": True,
+            },
+            backend="cake",
+        )
 
 
 def test_unit_gate_calls_dispatch_to_the_unit_programs(monkeypatch) -> None:
@@ -262,9 +333,9 @@ def test_unit_gate_calls_dispatch_to_the_unit_programs(monkeypatch) -> None:
 
 def test_cu_seqlens_cpu_reaches_the_cake_backend(monkeypatch) -> None:
     """``cu_seqlens_cpu`` (the host copy of ``cu_seqlens``) is forwarded to the Cake backend, where the body route
-    and the split rule read it: a merged-class batch (two sequences of 384 chunks over ten heads, the pinned row of
-    the route) selects the split program of the merged body; without it the backend synchronizes the copy and
-    selects the same program; a device tensor is refused."""
+    and the split rule read it: a batch of two sequences of 384 chunks over ten heads (balanced on 132 SMs) selects
+    the warm-up split program of the V6 body; without it the backend synchronizes the copy and selects the same
+    program; a device tensor is refused."""
     inputs = _inputs(
         3, (8192, 8192), 10, torch.Generator(device=_device()).manual_seed(SEED)
     )
@@ -275,7 +346,7 @@ def test_cu_seqlens_cpu_reaches_the_cake_backend(monkeypatch) -> None:
     host = inputs["cu_seqlens"].cpu()
     chunk_gated_delta_product(**inputs, backend="cake", cu_seqlens_cpu=host)
     assert len(launched) == 1
-    assert loader.MODULES[launched[0]]["body"] == loader.ROUTE_BODY_P3
+    assert loader.MODULES[launched[0]]["body"] == loader.ROUTE_BODY_V6
     assert loader.MODULES[launched[0]]["build"].get(loader.PREFILL_SPLIT_FLAG) is True
     chunk_gated_delta_product(**inputs, backend="cake")
     assert launched == [launched[0]] * 2
@@ -346,7 +417,7 @@ def test_other_devices_are_refused_naming_the_exported_architectures(
     monkeypatch,
 ) -> None:
     """``backend="cake"`` on a device without an exported prefill route: ``ValueError`` names the capabilities and
-    architectures the kernel is exported for (SM90) and nothing is launched."""
+    architectures the kernel is exported for (SM90, SM100, SM103) and nothing is launched."""
     inputs = _inputs(
         3, (129, 65), 2, torch.Generator(device=_device()).manual_seed(SEED)
     )
@@ -354,7 +425,7 @@ def test_other_devices_are_refused_naming_the_exported_architectures(
     monkeypatch.setattr(
         loader, "run_module", lambda name, values, **kwargs: launched.append(name)
     )
-    for capability in ((10, 0), (10, 3), (12, 0), (8, 0)):
+    for capability in ((12, 0), (8, 0)):
         monkeypatch.setattr(
             torch.cuda, "get_device_capability", lambda device=None, cap=capability: cap
         )
@@ -367,6 +438,8 @@ def test_other_devices_are_refused_naming_the_exported_architectures(
             str(capability) in str(info.value)
             and "(9, 0)" in str(info.value)
             and "sm_90a" in str(info.value)
+            and "(10, 0)" in str(info.value)
+            and "sm_103a" in str(info.value)
         )
     assert not launched
 

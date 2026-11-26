@@ -1964,6 +1964,87 @@ def create_mma_task(
     )
 
 
+@dataclass
+class _LoopMaskState:
+    """Per-work-tile inputs of one softmax warp group's LOOP score mask."""
+
+    q_offset: Any
+    seqlen_k: Any = None
+    window_start: Any = None
+    window_end: Any = None
+
+
+def _cache_loop_mask_state(
+    sp: TmemSPResource, tmem_sp: TmemSPResource, q_offset: Any
+) -> _LoopMaskState:
+    """Cache a work tile's mask inputs and unmasked LOOP tile range (HEAD).
+
+    Runs once per work tile, before the K/V loop. Each warp's unmasked range
+    ``[begin, end)`` splits the LOOP into left-masked, unmasked, and
+    right-masked tiles, so ``_loop_row_max`` selects the masked path with one
+    test. Window masks store the range in SMEM here; masks with a single right
+    bound test it in key space from the cached ``q_offset`` / ``seqlen_k``,
+    which their masked tiles reuse (``TmemSPResource.uses_loop_unmasked_tile_range``).
+    """
+    if tmem_sp.uses_varlen_q_offset_cache:
+        q_offset = sp.cache_q_offset()
+    mask = _LoopMaskState(q_offset=q_offset)
+    if tmem_sp.uses_packed_dense_k_mask:
+        mask.seqlen_k = sp.cache_seqlen_k()
+    if tmem_sp.uses_variable_window:
+        mask.window_start, mask.window_end = sp.cache_variable_window_bounds()
+    if tmem_sp.uses_loop_unmasked_tile_range:
+        kind = tmem_sp.loop_mask_kind
+        if kind == "variable_window":
+            sp.cache_unmasked_tile_range_window(
+                window_start=mask.window_start, window_end=mask.window_end
+            )
+        else:
+            sp.cache_unmasked_tile_range_q_offset(q_offset=mask.q_offset)
+    return mask
+
+
+def _loop_row_max(
+    sp: TmemSPResource,
+    tmem_sp: TmemSPResource,
+    row_max: Any,
+    mask: _LoopMaskState,
+    unmasked_row_max: Callable[[], Any],
+    *,
+    fixed_dense_k_tail_in_fallback: bool = False,
+) -> Any:
+    """Return ``(old_row_max, row_max)`` of one LOOP tile for every schedule.
+
+    Dispatches on ``loop_mask_kind``; ``unmasked_row_max`` runs when the loop
+    has no mask (and, with ``fixed_dense_k_tail_in_fallback``, when that
+    fallback masks the fixed dense K tail itself).
+    """
+    kind = tmem_sp.loop_mask_kind
+    if kind == "variable_window":
+        return sp.variable_window_row_max(
+            row_max=row_max,
+            window_start=mask.window_start,
+            window_end=mask.window_end,
+        )
+    if kind == "left_window":
+        return sp.left_masked_row_max(row_max=row_max, q_offset=mask.q_offset)
+    if kind == "varlen_right":
+        return sp.right_masked_row_max(
+            row_max=row_max, q_offset=mask.q_offset, section=FmhaStage.Loop
+        )
+    if kind == "query_paired_causal":
+        return sp.loop_masked_row_max(row_max=row_max, q_offset=mask.q_offset)
+    if kind == "fixed_dense_k_tail" and not fixed_dense_k_tail_in_fallback:
+        return sp.fixed_dense_k_tail_masked_row_max(row_max=row_max)
+    if kind == "packed_dense_k":
+        return sp.packed_dense_k_masked_row_max(
+            row_max=row_max,
+            seqlen_k=mask.seqlen_k,
+            section=FmhaStage.Loop,
+        )
+    return unmasked_row_max()
+
+
 def create_softmax_task(
     index: int,
     tmem_sp: TmemSPResource,
@@ -2012,52 +2093,19 @@ def create_softmax_task(
                         sp.init_softmax_work_tile_state()
                     )
                     vec.init_store_work_tile_state()
-                    if tmem_sp.uses_varlen_q_offset_cache:
-                        q_offset = sp.cache_q_offset()
-                    if tmem_sp.uses_packed_dense_k_mask:
-                        seqlen_k = sp.cache_seqlen_k()
-                    window_start = Int32(0)
-                    window_end = Int32(0)
-                    if tmem_sp.uses_variable_window:
-                        window_start, window_end = sp.cache_variable_window_bounds()
+                    mask = _cache_loop_mask_state(sp, tmem_sp, q_offset)
+                    q_offset = mask.q_offset
                     vec.acquire()
                     with domain_loop(loop_start, loop_end, loop_step):
                         # Softmax(i): wait for QK(Q,Ki) -> S(i).
                         sp.wait()
-                        if tmem_sp.uses_variable_window:
-                            old_row_max, row_max = sp.variable_window_row_max(
-                                row_max=row_max,
-                                window_start=window_start,
-                                window_end=window_end,
-                            )
-                        elif tmem_sp.uses_left_window_loop_mask:
-                            old_row_max, row_max = sp.left_masked_row_max(
-                                row_max=row_max,
-                                q_offset=q_offset,
-                            )
-                        elif tmem_sp.uses_varlen_loop_right_mask:
-                            old_row_max, row_max = sp.right_masked_row_max(
-                                row_max=row_max,
-                                q_offset=q_offset,
-                                section=FmhaStage.Loop,
-                            )
-                        elif tmem_sp.uses_query_paired_q_offset_loop_mask:
-                            old_row_max, row_max = sp.loop_masked_row_max(
-                                row_max=row_max,
-                                q_offset=q_offset,
-                            )
-                        elif tmem_sp.uses_fixed_dense_k_tail_mask:
-                            old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                                row_max=row_max,
-                            )
-                        elif tmem_sp.uses_packed_dense_k_mask:
-                            old_row_max, row_max = sp.packed_dense_k_masked_row_max(
-                                row_max=row_max,
-                                seqlen_k=seqlen_k,
-                                section=FmhaStage.Loop,
-                            )
-                        else:
-                            old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                        old_row_max, row_max = _loop_row_max(
+                            sp,
+                            tmem_sp,
+                            row_max,
+                            mask,
+                            lambda: sp.compute_row_max(row_max=row_max),
+                        )
                         if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
                             row_max = sp.freeze_row_max(
                                 old_row_max=old_row_max,
@@ -2300,51 +2348,18 @@ def create_softmax_task(
                         )
                     )
                     vec.create_work_tile_variables()
-                if tmem_sp.uses_varlen_q_offset_cache:
-                    q_offset = sp.cache_q_offset()
-                if tmem_sp.uses_packed_dense_k_mask:
-                    seqlen_k = sp.cache_seqlen_k()
-                window_start = Int32(0)
-                window_end = Int32(0)
-                if tmem_sp.uses_variable_window:
-                    window_start, window_end = sp.cache_variable_window_bounds()
+                mask = _cache_loop_mask_state(sp, tmem_sp, q_offset)
+                q_offset = mask.q_offset
                 vec.acquire()
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp.wait()
-                    if tmem_sp.uses_variable_window:
-                        old_row_max, row_max = sp.variable_window_row_max(
-                            row_max=row_max,
-                            window_start=window_start,
-                            window_end=window_end,
-                        )
-                    elif tmem_sp.uses_left_window_loop_mask:
-                        old_row_max, row_max = sp.left_masked_row_max(
-                            row_max=row_max,
-                            q_offset=q_offset,
-                        )
-                    elif tmem_sp.uses_varlen_loop_right_mask:
-                        old_row_max, row_max = sp.right_masked_row_max(
-                            row_max=row_max,
-                            q_offset=q_offset,
-                            section=FmhaStage.Loop,
-                        )
-                    elif tmem_sp.uses_query_paired_q_offset_loop_mask:
-                        old_row_max, row_max = sp.loop_masked_row_max(
-                            row_max=row_max,
-                            q_offset=q_offset,
-                        )
-                    elif tmem_sp.uses_fixed_dense_k_tail_mask:
-                        old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                            row_max=row_max
-                        )
-                    elif tmem_sp.uses_packed_dense_k_mask:
-                        old_row_max, row_max = sp.packed_dense_k_masked_row_max(
-                            row_max=row_max,
-                            seqlen_k=seqlen_k,
-                            section=FmhaStage.Loop,
-                        )
-                    else:
-                        old_row_max, row_max = sp.row_max(row_max)
+                    old_row_max, row_max = _loop_row_max(
+                        sp,
+                        tmem_sp,
+                        row_max,
+                        mask,
+                        lambda: sp.row_max(row_max),
+                    )
                     vec.store_vec(
                         old_row_max,
                         row_max,
@@ -2628,14 +2643,8 @@ def create_softmax_task(
                 vc_state["sums"] = init[2]
                 vc_state["kept"] = init[3]
                 vc_state["k_next"] = init[4]
-            if tmem_sp.uses_varlen_q_offset_cache:
-                q_offset = sp.cache_q_offset()
-            if tmem_sp.uses_packed_dense_k_mask:
-                seqlen_k = sp.cache_seqlen_k()
-            window_start = Int32(0)
-            window_end = Int32(0)
-            if tmem_sp.uses_variable_window:
-                window_start, window_end = sp.cache_variable_window_bounds()
+            mask = _cache_loop_mask_state(sp, tmem_sp, q_offset)
+            q_offset = mask.q_offset
             sage_q_scale = sage_k_words = None
             if use_sage:
                 sage_q_scale, sage_k_first_atom = sp.cache_sage_scales()
@@ -2689,42 +2698,25 @@ def create_softmax_task(
                     old_row_max, row_max = sage_row_max(
                         row_max, sage_k_words, FmhaStage.Loop
                     )
-                elif tmem_sp.uses_variable_window:
-                    old_row_max, row_max = sp.variable_window_row_max(
-                        row_max=row_max,
-                        window_start=window_start,
-                        window_end=window_end,
-                    )
-                elif tmem_sp.uses_left_window_loop_mask:
-                    old_row_max, row_max = sp.left_masked_row_max(
-                        row_max=row_max,
-                        q_offset=q_offset,
-                    )
-                elif tmem_sp.uses_varlen_loop_right_mask:
-                    old_row_max, row_max = sp.right_masked_row_max(
-                        row_max=row_max,
-                        q_offset=q_offset,
-                        section=FmhaStage.Loop,
-                    )
-                elif tmem_sp.uses_query_paired_q_offset_loop_mask:
-                    old_row_max, row_max = sp.loop_masked_row_max(
-                        row_max=row_max,
-                        q_offset=q_offset,
-                    )
-                elif tmem_sp.uses_packed_dense_k_mask:
-                    old_row_max, row_max = sp.packed_dense_k_masked_row_max(
-                        row_max=row_max,
-                        seqlen_k=seqlen_k,
-                        section=FmhaStage.Loop,
-                    )
-                elif vc_attention:
+                elif vc_attention and tmem_sp.loop_mask_kind in (
+                    None,
+                    "fixed_dense_k_tail",
+                ):
                     old_row_max, row_max, vc_state["k_next"] = sp.vc_compute_row_max(
                         row_max=row_max,
                         vc_row_scale=vc_row_scale,
                         vc_k_scale_next=vc_state["k_next"],
                     )
                 else:
-                    old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                    # compute_row_max masks a fixed dense K tail itself.
+                    old_row_max, row_max = _loop_row_max(
+                        sp,
+                        tmem_sp,
+                        row_max,
+                        mask,
+                        lambda: sp.compute_row_max(row_max=row_max),
+                        fixed_dense_k_tail_in_fallback=True,
+                    )
                 if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
                     row_max = sp.freeze_row_max(
                         old_row_max=old_row_max,
