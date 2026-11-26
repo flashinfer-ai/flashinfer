@@ -22,6 +22,7 @@ from pathlib import Path
 
 from b12x._lib.compile_plan import (
     compiled_program_available,
+    ensure_triton_hook,
     observe_programs,
     program_keys,
     retain_compiled_programs,
@@ -845,6 +846,7 @@ class PreparationJob:
         # cooperative advances) remain protected as external programs.
         self._job_introduced_programs = set()
         self._step_before_programs = None
+        ensure_triton_hook()
         session._record_external_programs(cached_program_keys())
         self._dependency_programs = {}
         self._coverage = {}
@@ -994,6 +996,7 @@ class PreparationJob:
         started = time.perf_counter()
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
+        ensure_triton_hook()
         self._step_before_programs = cached_program_keys()
         self.session._record_external_programs(self._step_before_programs)
         try:

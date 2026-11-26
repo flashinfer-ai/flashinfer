@@ -908,3 +908,84 @@ def test_in_process_compile_evicts_active_job_factory_memo(monkeypatch):
     with scope.activate():
         assert factory("planned") is relowered
     scope.clear()
+
+
+def test_prehook_native_triton_discovered_before_first_advance_snapshot(
+    tmp_path, monkeypatch
+):
+    """Hook installation during preparation discovers pre-hook JITs before the first snapshot."""
+    import triton
+    from triton.compiler.compiler import CompiledKernel
+    from triton.runtime.jit import JITFunction
+
+    class _FakeCompiledTritonKernel(CompiledKernel):
+        def __init__(self, program_key: ProgramKey):
+            self.__b12x_programs__ = (program_key,)
+            self.module = object()
+
+        def __call__(self):
+            return None
+
+        def __del__(self):
+            pass
+
+    prehook_key = ProgramKey("triton", "93" * 32, "prehook.before.advance.spec1")
+    job_key = ProgramKey("triton", "94" * 32, "job.during.advance.spec2")
+
+    @triton.jit
+    def _native_kernel(x):
+        pass
+
+    _native_kernel.fn.__module__ = "b12x.test_prehook_advance"
+    prehook_compiled = _FakeCompiledTritonKernel(prehook_key)
+    kernel_cache = {"k_prehook": prehook_compiled}
+    key_cache = {"sig_prehook": "k_prehook"}
+    _native_kernel.device_caches[0] = (kernel_cache, key_cache, None, None)
+
+    monkeypatch.setattr(program_cache, "_CACHES", set())
+    monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
+    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+    # Simulate a process whose Triton hook has not been installed yet before begin()/advance().
+    monkeypatch.setattr(compile_plan, "_TRITON_HOOK", None)
+    monkeypatch.setattr(JITFunction, "_do_compile", JITFunction._do_compile)
+    monkeypatch.setattr(JITFunction, "run", JITFunction.run)
+    monkeypatch.setattr(CompiledKernel, "_init_handles", CompiledKernel._init_handles)
+    monkeypatch.setattr(CompiledKernel, "__getitem__", CompiledKernel.__getitem__)
+
+    prehook_ref = weakref.ref(prehook_compiled)
+    del prehook_compiled
+
+    job_compiled_refs = []
+
+    def make_plan(_cfg):
+        with compile_plan.observe_programs():
+            compile_plan._NATIVE_JITS.add(_native_kernel)
+            job_compiled = _FakeCompiledTritonKernel(job_key)
+            kernel_cache["k_job"] = job_compiled
+            key_cache["sig_job"] = "k_job"
+            job_compiled_refs.append(weakref.ref(job_compiled))
+            return job_compiled
+
+    with session(tmp_path, autotune=False) as engine:
+        req = _plan_with_program(make_plan, name="prehook_advance_op")
+        job = engine.begin((req,))
+        # Also simulate hook still uninstalled right before the first advance().
+        compile_plan._TRITON_HOOK = None
+        compile_plan._NATIVE_JITS.clear()
+        while not job.advance().done:
+            pass
+        assert prehook_key not in job._job_introduced_programs
+        assert prehook_ref() is not None
+        assert "k_prehook" in kernel_cache and "sig_prehook" in key_cache
+        assert "k_job" in kernel_cache
+
+        engine.release(req.plan)
+        gc.collect()
+        assert prehook_ref() is not None
+        assert "k_prehook" in kernel_cache and "sig_prehook" in key_cache
+        assert "k_job" not in kernel_cache and "sig_job" not in key_cache
+
+    gc.collect()
+    assert prehook_ref() is not None
+    assert "k_prehook" in kernel_cache and "sig_prehook" in key_cache
+    assert job_compiled_refs and job_compiled_refs[0]() is None

@@ -240,7 +240,7 @@ def compile_only_launches():
 @contextmanager
 def forbid_lowering():
     """Resolve existing Triton objects, rejecting misses before lowering."""
-    _ensure_triton_hook()
+    ensure_triton_hook()
     token = _FORBID_LOWERING.set(True)
     try:
         yield
@@ -374,7 +374,7 @@ def observe_programs():
 @contextmanager
 def retain_compiled_programs(*, isolated: bool = False):
     """Own warmed programs until captured graphs release their CUDA functions."""
-    _ensure_triton_hook()
+    ensure_triton_hook()
     retained = _RETAINED_PROGRAMS.get()
     if retained is not None and not isolated:
         yield retained
@@ -551,7 +551,7 @@ def _plan_triton(source, target=None, options=None, _env_vars=None):
 @contextmanager
 def serialized_compilations():
     """Single-flight Triton lowering by its real persistent cache key."""
-    _ensure_triton_hook()
+    ensure_triton_hook()
     token = _SERIALIZE_TRITON.set(True)
     try:
         yield
@@ -587,7 +587,7 @@ def _locked_triton_compile(
     return result
 
 
-def _ensure_triton_hook():
+def ensure_triton_hook():
     global _TRITON_HOOK
     if _TRITON_HOOK is not None:
         return
@@ -689,7 +689,7 @@ def _ensure_triton_hook():
 @contextmanager
 def plan_compilations():
     """Capture the real requests of one metadata-only production factory."""
-    _ensure_triton_hook()
+    ensure_triton_hook()
     captured = set()
     token = _PLANNING.set(captured)
     try:
@@ -705,6 +705,7 @@ __all__ = [
     "attach_programs",
     "compile_only_launches",
     "compile_only_launches_enabled",
+    "ensure_triton_hook",
     "observe_programs",
     "launch_triton",
     "plan_compilations",
