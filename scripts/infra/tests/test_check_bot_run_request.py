@@ -1,6 +1,7 @@
 """CPU-only tests for the bot-response merge gate; never execute PR code."""
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
@@ -102,6 +103,21 @@ class GateTests(unittest.TestCase):
         ]:
             result = gate.evaluate([comment("/bot run"), reply], lambda: analysis())
             self.assertEqual("failure", result.conclusion)
+
+    def test_actual_public_scope_note_is_not_an_internal_response(self):
+        from ai_test_scope import TargetSelection
+
+        public_note = TargetSelection(
+            [], outcome="no_pytest_change", reason="Only documentation changed"
+        ).note("a" * 40)
+        self.assertIn("@flashinfer-bot run all", public_note)
+        self.assertFalse(gate.is_bot_response(comment(public_note, True)))
+        # Internal src/pytest_targets.py uses /bot run (verified against service source).
+        self.assertTrue(
+            gate.is_bot_response(
+                comment(ADVICE + "\nUse `/bot run all` for the full suite.", True)
+            )
+        )
 
     def test_gpu_with_no_selected_case_still_fails(self):
         result = gate.evaluate([], lambda: analysis())
@@ -236,6 +252,7 @@ class TransportTests(unittest.TestCase):
             "changed_files": 1,
         }
         self.client = Mock()
+        self.client.deadline = time.monotonic() + 540
         self.client.get_pr_details.side_effect = lambda number: __import__(
             "copy"
         ).deepcopy(self.pr)
@@ -245,6 +262,9 @@ class TransportTests(unittest.TestCase):
         self.client.get_pr_files.return_value = [
             {"filename": "README.md", "status": "modified"}
         ]
+        self.client.get_pr_files_at.side_effect = (
+            lambda pr, base: self.client.get_pr_files(pr["number"])
+        )
 
     def test_docs_fast_path_and_no_conversation_writes(self):
         from unittest.mock import patch
@@ -272,18 +292,153 @@ class TransportTests(unittest.TestCase):
         self.assertEqual("failure", result.conclusion)
         self.client.publish.assert_called_once()
 
-    def test_push_during_analysis_does_not_publish_old_verdict(self):
+    def test_push_during_analysis_never_publishes_old_success(self):
+        latest = {**self.pr, "head": {"sha": "c" * 40}}
+        self.client.get_pr_details.side_effect = [self.pr, latest, latest, latest]
+        result = gate.run_pr(self.client, 42)
+        self.assertEqual("success", result.conclusion)
+        first, last = self.client.publish.call_args_list
+        self.assertEqual("failure", first.args[1].conclusion)
+        self.assertEqual("a" * 40, first.args[0]["head"]["sha"])
+        self.assertEqual("c" * 40, last.args[0]["head"]["sha"])
+
+    def test_base_advance_retries_current_base_and_completes(self):
+        self.client.get_current_base_sha.side_effect = [
+            "b" * 40,
+            "c" * 40,
+            "c" * 40,
+            "c" * 40,
+        ]
+        result = gate.run_pr(self.client, 42)
+        self.assertEqual("success", result.conclusion)
+        first, last = self.client.publish.call_args_list
+        self.assertEqual("failure", first.args[1].conclusion)
+        self.assertEqual("c" * 40, last.args[3])
+
+    def test_repeated_base_advance_finishes_failed_instead_of_hanging(self):
+        self.client.get_current_base_sha.side_effect = [
+            "b" * 40,
+            "c" * 40,
+            "c" * 40,
+            "d" * 40,
+        ]
+        result = gate.run_pr(self.client, 42)
+        self.assertEqual("failure", result.conclusion)
+        self.assertEqual("stale_evaluation", result.reason)
+        self.assertEqual(2, self.client.begin.call_count)
+        self.assertEqual(2, self.client.publish.call_count)
+
+    def test_base_read_failure_after_begin_completes_failure(self):
+        self.client.get_current_base_sha.side_effect = gate.TargetSelectionError(
+            "Base API failed"
+        )
+        result = gate.run_pr(self.client, 42)
+        self.assertEqual("evidence_error", result.reason)
+        self.client.publish.assert_called_once()
+
+    def test_failure_completion_has_time_after_evidence_deadline_expires(self):
+        def expired(pr):
+            self.client.deadline = time.monotonic() - 1
+            raise gate.TargetSelectionError("Evidence deadline exceeded")
+
+        self.client.get_current_base_sha.side_effect = expired
+
+        def publish(*args):
+            self.assertGreater(self.client.deadline, time.monotonic())
+
+        self.client.publish.side_effect = publish
+        self.assertEqual("failure", gate.run_pr(self.client, 42).conclusion)
+        self.assertLess(self.client.deadline, time.monotonic())
+
+    def test_final_read_failure_after_begin_completes_failure(self):
         self.client.get_pr_details.side_effect = [
             self.pr,
-            {**self.pr, "head": {"sha": "c" * 40}},
+            gate.TargetSelectionError("Final PR API failed"),
         ]
-        self.assertIsNone(gate.run_pr(self.client, 42))
-        self.client.publish.assert_not_called()
+        result = gate.run_pr(self.client, 42)
+        self.assertEqual("evidence_error", result.reason)
+        self.client.publish.assert_called_once()
 
-    def test_base_advance_during_analysis_does_not_publish_stale_exemption(self):
-        self.client.get_current_base_sha.side_effect = ["b" * 40, "c" * 40]
-        self.assertIsNone(gate.run_pr(self.client, 42))
-        self.client.publish.assert_not_called()
+    def test_docs_fastpath_uses_captured_commit_files_even_after_head_aba(self):
+        from unittest.mock import patch
+
+        self.client.get_pr_files_at.side_effect = None
+        self.client.get_pr_files_at.return_value = [
+            {"filename": "kernel.cu", "status": "modified"}
+        ]
+        # The mutable endpoint shows docs, while final PR metadata is back at A.
+        with patch.object(
+            gate, "analyze_gpu_impact", return_value=analysis()
+        ) as analyze:
+            result = gate.run_pr(self.client, 42)
+        self.assertEqual("command_missing", result.reason)
+        self.client.get_pr_files_at.assert_called_once_with(self.pr, "b" * 40)
+        self.client.get_pr_files.assert_not_called()
+        pinned = analyze.call_args.args[0]
+        self.client.get_current_base_sha.return_value = "c" * 40
+        self.assertEqual("b" * 40, pinned.get_current_base_sha(self.pr))
+        changed = pinned.get_pr_files(42)
+        changed[0]["filename"] = "README.md"
+        self.assertEqual("kernel.cu", pinned.get_pr_files(42)[0]["filename"])
+
+    def test_commit_file_comparison_is_immutable_and_count_checked(self):
+        client = gate.Client("upstream/flashinfer")
+        client.request = Mock(
+            return_value={
+                "base_commit": {"sha": "b" * 40},
+                "files": [{"filename": "README.md"}],
+            }
+        )
+        self.assertEqual(
+            "README.md", client.get_pr_files_at(self.pr, "b" * 40)[0]["filename"]
+        )
+        self.assertIn("b" * 40 + "..." + "a" * 40, client.request.call_args.args[0])
+        client.request.return_value["base_commit"] = None
+        with self.assertRaises(gate.TargetSelectionError):
+            client.get_pr_files_at(self.pr, "b" * 40)
+        client.request.return_value["base_commit"] = {"sha": "b" * 40}
+        client.request.return_value["files"] = []
+        with self.assertRaises(gate.TargetSelectionError):
+            client.get_pr_files_at(self.pr, "b" * 40)
+
+    def test_experimental_only_change_does_not_fail_stable_check(self):
+        from unittest.mock import patch
+
+        self.client.get_pr_files.return_value = [
+            {"filename": "flashinfer/experimental/feature/kernel.cu"}
+        ]
+        with patch.object(
+            gate,
+            "analyze_gpu_impact",
+            side_effect=AssertionError("Experimental-only needs no stable analysis"),
+        ):
+            result = gate.run_pr(self.client, 42)
+        self.assertEqual(
+            ("success", "experimental_only"), (result.conclusion, result.reason)
+        )
+
+    def test_stable_gpu_with_experimental_change_still_requires_bot(self):
+        from unittest.mock import patch
+
+        self.pr["changed_files"] = 2
+        self.client.get_pr_files.return_value = [
+            {"filename": "flashinfer/experimental/new.py"},
+            {"filename": "csrc/stable_kernel.cu"},
+        ]
+        with patch.object(gate, "analyze_gpu_impact", return_value=analysis()):
+            result = gate.run_pr(self.client, 42)
+        self.assertEqual("command_missing", result.reason)
+        self.assertFalse(
+            gate.experimental_only(
+                [
+                    {
+                        "filename": "flashinfer/experimental/new.py",
+                        "previous_filename": "flashinfer/stable.py",
+                    }
+                ],
+                1,
+            )
+        )
 
     def test_analysis_timeout_restores_publication_budget(self):
         from unittest.mock import patch
@@ -516,18 +671,20 @@ class RetryAnalysisTests(unittest.TestCase):
     def test_budget_omitted_file_can_supply_filename_evidence(self):
         from gpu_impact import validate_impact
 
-        context = {
-            "source_files": {},
-            "changed_files": [{"filename": "docs/large.md", "patch_omitted": True}],
-            "ci_files": {},
-            "unavailable_evidence": {},
-            "omitted_evidence": {"changed_files": 0},
-        }
-        impact = validate_impact(
-            {**analysis("cpu_only"), "evidence_paths": ["docs/large.md"]}, context
-        )
-        self.assertEqual("cpu_only", impact["classification"])
-        self.assertEqual(["docs/large.md"], impact["filename_only_evidence"])
+        # This validates the agreed fallback policy, not path-based ground truth.
+        for path in ("docs/large.md", "tests/cpu/host_utils.py"):
+            context = {
+                "source_files": {},
+                "changed_files": [{"filename": path, "patch_omitted": True}],
+                "ci_files": {},
+                "unavailable_evidence": {},
+                "omitted_evidence": {"changed_files": 0},
+            }
+            impact = validate_impact(
+                {**analysis("cpu_only"), "evidence_paths": [path]}, context
+            )
+            self.assertEqual("cpu_only", impact["classification"])
+            self.assertEqual([path], impact["filename_only_evidence"])
 
     def test_missing_patch_note_is_bounded_for_large_changes(self):
         from gpu_impact import validate_impact
@@ -547,6 +704,23 @@ class RetryAnalysisTests(unittest.TestCase):
         self.assertEqual(30, len(impact["missing_patch_paths"]))
         self.assertEqual(100, impact["missing_patch_count"])
         self.assertIn("first 30 of 100", gate.evaluate([], lambda: impact).summary)
+
+    def test_available_body_is_not_labeled_filename_only(self):
+        from gpu_impact import validate_impact
+
+        context = {
+            "source_files": {"helper.py": "def host_only(): pass"},
+            "changed_files": [{"filename": "helper.py", "patch_omitted": True}],
+            "ci_files": {},
+            "unavailable_evidence": {},
+            "omitted_evidence": {"changed_files": 0},
+        }
+        impact = validate_impact(
+            {**analysis("cpu_only"), "evidence_paths": ["helper.py"]}, context
+        )
+        self.assertEqual("cpu_only", impact["classification"])
+        self.assertNotIn("filename_only_evidence", impact)
+        self.assertEqual(["helper.py"], impact["missing_patch_paths"])
 
     def test_evidence_cache_is_not_reused_for_changed_context(self):
         model = fixtures.FakeInference(

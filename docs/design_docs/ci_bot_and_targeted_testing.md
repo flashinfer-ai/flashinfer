@@ -227,6 +227,11 @@ bot reports, public `@flashinfer-bot` suggestions and copied replies do not coun
 Finding a qualifying response skips source inspection and inference entirely.
 
 Without a reply, the gate exempts documentation-only or CPU-only changes.
+Changes confined to `flashinfer/experimental/` and `tests/experimental/` are
+also exempt from this stable check under the experimental containment policy.
+Moving stable code into an experimental directory is not an automatic exemption.
+In mixed PRs, stable GPU effects still require a bot response; experimental GPU
+effects alone do not make the stable check fail.
 The optional GPU-impact analysis extends `ai_test_scope.py` with the same
 inspected source/test/CI evidence and an independent impact assessment. File
 extensions and `tests/cpu/` alone cannot establish CPU-only behavior. Kernels,
@@ -243,8 +248,13 @@ second analysis is still uncertain or invalid, the check fails and requires
 `/bot run` and an internal bot response. A known GPU-related result requires a
 reply immediately, without a model retry.
 
-For content omitted by the context budget, GPU classification may use the
-file's name/path; the check records filename-only evidence. Missing patch text
+Use retained patches and supplied file bodies whenever they are available.
+Only when neither content source is supplied and the context budget omitted it
+may GPU classification fall back to the filename/path. The check records this
+as filename-only evidence. The model still must not infer CPU-only merely from
+a `.py` suffix or a `tests/cpu/` location. Under this gate's policy, filename-only
+evidence does not by itself trigger a hard rejection of a model's CPU/docs
+classification; the model should return `unknown` if it cannot support one. Missing patch text
 is informational and does not automatically override a documentation/CPU-only
 model conclusion. The model should return `unknown` when the available evidence
 cannot support a conclusion. Missing changed-file records, invalid evidence
@@ -253,7 +263,7 @@ response remains sufficient even when analysis is unavailable.
 
 | State without a qualifying bot response | Check result |
 | --- | --- |
-| Documentation/CPU-only change | Success: bot run not required, with reason |
+| Documentation/CPU-only or experimental-only change | Success: bot run not required, with reason |
 | GPU change, no command | Failure: comment `/bot run` |
 | GPU change, command found | Failure: waiting for `flashinfer-bot`, with command link |
 | Unable to establish GPU impact | Failure: specific missing evidence/error and next action |
@@ -263,6 +273,15 @@ recognized. This check does not repeat the internal bot's path validation;
 invalid trailing arguments still count as a request for the waiting message,
 and the bot's rejection response satisfies the agreed response-only policy.
 Quoted examples, fenced code and prose mentions do not issue commands.
+
+Changed files are read from an immutable comparison of the captured base and
+head commit SHAs, and that same list/base is used throughout source analysis.
+A partial comparison (including GitHub's 300-file compare limit) cannot grant
+an exemption. Before publishing success, the gate rechecks the live PR and
+base. If the snapshot changed, it completes the captured Check as stale and
+re-evaluates once. A second snapshot change finishes with a failure and rerun
+instruction rather than leaving the Check in progress. Post-start evidence
+read failures also complete the captured Check with a failure reason.
 
 The trusted default-branch workflow handles PR open/synchronize/reopen/ready and
 base-edit events, plus PR comment creation/edit/deletion. It publishes a stable

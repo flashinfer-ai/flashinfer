@@ -22,11 +22,18 @@ Kernels, launchers, bindings, backend selection, tensor shapes/dtypes/layouts,
 workspace allocation, JIT/AOT, CUDA graphs, synchronization and communication
 generally require GPU validation. A numerical/kernel/graph test added by the
 PR is itself GPU-related even if no previous corresponding case exists.
-Any GPU-related component makes a mixed PR GPU-related. Explicitly consider
+This is a stable PR check: changes confined to flashinfer/experimental/ and
+tests/experimental/, and experimental-only APIs, do not require this stable
+gate. Experimental GPU effects alone must not fail the gate. Assess stable
+components of mixed PRs normally, including changes to stable APIs or automatic
+dispatch that integrate experimental backends.
+Any stable GPU-related component makes a mixed PR GPU-related. Explicitly consider
 changed source even when no tests cover it or CI does not route it.
-Budget fallback: when a changed-file record has patch_omitted=true, or a source
-path is listed in unavailable_evidence with reason "context budget", use only
-that file's filename/path to assess its GPU relevance. Do not return unknown
+Use supplied patches and source_files bodies whenever they are available.
+Budget fallback applies only when a file has neither a supplied patch nor a
+source_files body and its patch_omitted flag or unavailable_evidence reason
+"context budget" records a budget omission. Then use the filename/path to
+assess its GPU relevance. Do not return unknown
 solely because that explicitly budget-omitted content was not supplied. State
 that the affected part is judged from its filename, not an inspected diff/body.
 Use the rest of the supplied diff normally. A .py suffix alone does not imply
@@ -77,21 +84,22 @@ def validate_impact(value, context, file_count_mismatch=False):
             "GPU-impact analysis is missing its case-gap assessment"
         )
     paths = value.get("evidence_paths")
-    filename_only = {
-        item["filename"]
-        for item in context["changed_files"]
-        if item.get("patch_omitted") is True
-    } | {
-        path
-        for path, reason in context.get("unavailable_evidence", {}).items()
-        if reason == "context budget"
+    supplied = set(context["source_files"]) | {
+        item["filename"] for item in context["changed_files"] if item.get("patch")
     }
-    inspected = (
-        set(context["source_files"])
-        | {item["filename"] for item in context["changed_files"] if item.get("patch")}
-        | set(context["ci_files"])
-        | filename_only
-    )
+    filename_only = (
+        {
+            item["filename"]
+            for item in context["changed_files"]
+            if item.get("patch_omitted") is True
+        }
+        | {
+            path
+            for path, reason in context.get("unavailable_evidence", {}).items()
+            if reason == "context budget"
+        }
+    ) - supplied
+    inspected = supplied | set(context["ci_files"]) | filename_only
     if (
         not isinstance(paths, list)
         or len(paths) > 30

@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 from ai_test_scope import (
     EVIDENCE_PROMPT,
@@ -26,6 +27,36 @@ CHECK_NAME = "Bot Run Request Check"
 BOT_ID = 236526959  # Stable GitHub account ID; never rely on copied display text.
 PUBLIC_NOTE = "<!-- flashinfer-bot:ci-bot-commands-note -->"
 VERSION = "bot-run-request-v1"
+
+
+class PinnedPRSource:
+    """Bind source analysis to one immutable base/head/file-list snapshot."""
+
+    def __init__(self, client, pr, base_sha, changed):
+        self.client = client
+        self.number = pr["number"]
+        self.base_sha = base_sha
+        self.changed = copy.deepcopy(changed)
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    @property
+    def deadline(self):
+        return self.client.deadline
+
+    @deadline.setter
+    def deadline(self, value):
+        self.client.deadline = value
+
+    def get_current_base_sha(self, pr):
+        # run_pr checks the real current base separately before publication.
+        return self.base_sha
+
+    def get_pr_files(self, number):
+        if number != self.number:
+            raise TargetSelectionError("Unexpected PR for pinned file list")
+        return copy.deepcopy(self.changed)
 
 
 class RetryingImpactInference:
@@ -213,7 +244,7 @@ def evaluate(comments, analyze):
             "- " + item["effort"] + ": " + item.get("error", "succeeded")
             for item in impact["analysis_attempts"]
         )
-    if kind in {"cpu_only", "docs_only"}:
+    if kind in {"cpu_only", "docs_only", "experimental_only"}:
         return Result("success", kind, "Bot run not required", details, impact)
     if kind == "unknown":
         title, reason = "Unable to determine GPU impact", "unknown"
@@ -233,6 +264,32 @@ def evaluate(comments, analyze):
 
 
 class Client(GitHub):
+    def get_pr_files_at(self, pr, base_sha):
+        head_sha = pr["head"]["sha"]
+        if not all(
+            isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)
+            for sha in (base_sha, head_sha)
+        ):
+            raise TargetSelectionError("Invalid pinned comparison commits")
+        comparison = self.request(
+            f"repos/{self.repository}/compare/{base_sha}...{head_sha}?per_page=1"
+        )
+        files = comparison.get("files") if isinstance(comparison, dict) else None
+        if (
+            not isinstance(files, list)
+            or len(files) != pr.get("changed_files")
+            or any(
+                not isinstance(item, dict) or not isinstance(item.get("filename"), str)
+                for item in files
+            )
+            or not isinstance(comparison.get("base_commit"), dict)
+            or comparison.get("base_commit", {}).get("sha") != base_sha
+        ):
+            # GitHub's immutable compare response contains at most 300 files.
+            # Never use a partial list to grant a documentation/CPU exemption.
+            raise TargetSelectionError("Pinned changed-file comparison is incomplete")
+        return files
+
     def request(self, endpoint, method="GET", data=None):
         args = ["gh", "api", "--method", method, endpoint]
         if data is not None:
@@ -356,7 +413,7 @@ def cached_analysis(checks, pr, base_sha):
                 and stored["version"] == analysis_version()
                 and isinstance(stored.get("analysis"), dict)
                 and stored["analysis"].get("classification")
-                in {"docs_only", "cpu_only", "gpu_required"}
+                in {"docs_only", "cpu_only", "gpu_required", "experimental_only"}
             ):
                 return stored["analysis"]
         except (KeyError, TypeError, ValueError):
@@ -379,68 +436,122 @@ def docs_only(changed, expected_count):
     )
 
 
-def run_pr(client, number):
-    pr = client.get_pr_details(number)
-    if pr["state"] != "open" or pr["base"]["ref"] != "main":
-        return None
-    checks = client.checks(pr["head"]["sha"])
-    owned = [
-        item
-        for item in checks
-        if item.get("app", {}).get("slug") == "github-actions"
-        and item.get("external_id") == f"{VERSION}:{number}"
-        and item.get("name") == CHECK_NAME
-    ]
-    existing_id = max((item["id"] for item in owned), default=None)
-    existing_id = client.begin(pr, existing_id)
-    base_sha = client.get_current_base_sha(pr)
-    try:
-        comments = client.comments(number)
-        saved = cached_analysis(owned, pr, base_sha)
-
-        def analyze():
-            if saved:
-                return saved
-            changed = client.get_pr_files(number)
-            if docs_only(changed, pr.get("changed_files")):
-                return {
-                    "classification": "docs_only",
-                    "reason": "Only Markdown/RST documentation changed.",
-                    "evidence_paths": [item["filename"] for item in changed],
-                    "case_gap": "",
-                    "targets": [],
-                }
-            root = Path(__file__).resolve().parents[3]
-            return analyze_gpu_impact(
-                client, pr, lambda path: (root / path).read_text()
-            )
-
-        result = evaluate(comments, analyze)
-    except TargetSelectionError as error:
-        result = Result(
-            "failure",
-            "evidence_error",
-            "Unable to read bot request evidence",
-            _public_prose(str(error)),
+def experimental_only(changed, expected_count):
+    def is_experimental(path):
+        return isinstance(path, str) and path.startswith(
+            ("flashinfer/experimental/", "tests/experimental/")
         )
-    latest = client.get_pr_details(number)
-    if (
-        latest["head"]["sha"] != pr["head"]["sha"]
-        or latest["base"]["ref"] != pr["base"]["ref"]
-        or latest["state"] != "open"
-        or client.get_current_base_sha(latest) != base_sha
-    ):
-        print("PR changed during evaluation; discard stale result")
-        return None
-    client.publish(pr, result, existing_id, base_sha)
-    summary = (
-        f"## {CHECK_NAME} — PR #{number}\n\n**{result.title}**\n\n{result.summary}\n"
+
+    return (
+        bool(changed)
+        and len(changed) == expected_count
+        and all(
+            is_experimental(item.get("filename"))
+            and (
+                not item.get("previous_filename")
+                or is_experimental(item["previous_filename"])
+            )
+            for item in changed
+        )
     )
-    if os.getenv("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
-            stream.write(summary)
-    print(f"PR #{number}: {result.reason} ({result.conclusion})")
-    return result
+
+
+def run_pr(client, number):
+    for attempt in range(2):
+        pr = copy.deepcopy(client.get_pr_details(number))
+        if pr["state"] != "open" or pr["base"]["ref"] != "main":
+            return None
+        checks = client.checks(pr["head"]["sha"])
+        owned = [
+            item
+            for item in checks
+            if item.get("app", {}).get("slug") == "github-actions"
+            and item.get("external_id") == f"{VERSION}:{number}"
+            and item.get("name") == CHECK_NAME
+        ]
+        existing_id = max((item["id"] for item in owned), default=None)
+        existing_id = client.begin(pr, existing_id)
+        base_sha = None
+        retry = False
+        try:
+            base_sha = client.get_current_base_sha(pr)
+            comments = client.comments(number)
+            saved = cached_analysis(owned, pr, base_sha)
+
+            def analyze():
+                if saved:
+                    return saved
+                changed = client.get_pr_files_at(pr, base_sha)
+                kind = None
+                if docs_only(changed, pr.get("changed_files")):
+                    kind = "docs_only"
+                elif experimental_only(changed, pr.get("changed_files")):
+                    kind = "experimental_only"
+                if kind:
+                    return {
+                        "classification": kind,
+                        "reason": (
+                            "Only Markdown/RST documentation changed."
+                            if kind == "docs_only"
+                            else "Experimental-only changes are excluded from stable checks by the containment policy."
+                        ),
+                        "evidence_paths": [item["filename"] for item in changed],
+                        "case_gap": "",
+                        "targets": [],
+                    }
+                root = Path(__file__).resolve().parents[3]
+                return analyze_gpu_impact(
+                    PinnedPRSource(client, pr, base_sha, changed),
+                    pr,
+                    lambda path: (root / path).read_text(),
+                )
+
+            result = evaluate(comments, analyze)
+            latest = client.get_pr_details(number)
+            fresh = (
+                latest["head"]["sha"] == pr["head"]["sha"]
+                and latest["base"]["ref"] == pr["base"]["ref"]
+                and latest["state"] == "open"
+            )
+            if not fresh or client.get_current_base_sha(latest) != base_sha:
+                retry = latest["state"] == "open" and latest["base"]["ref"] == "main"
+                result = Result(
+                    "failure",
+                    "stale_evaluation",
+                    "PR changed during evaluation",
+                    "The captured head/base changed. No stale success was published. "
+                    + (
+                        "Re-evaluating the current snapshot once."
+                        if attempt == 0 and retry
+                        else "Rerun this check against the current snapshot."
+                    ),
+                )
+        except TargetSelectionError as error:
+            result = Result(
+                "failure",
+                "evidence_error",
+                "Unable to read bot request evidence",
+                _public_prose(str(error)),
+            )
+        # A read can exhaust the evidence deadline. Give completion its own
+        # bounded budget so an already-started Check is not left in progress.
+        deadline = client.deadline
+        client.deadline = time.monotonic() + 45
+        try:
+            client.publish(pr, result, existing_id, base_sha)
+        finally:
+            client.deadline = deadline
+        summary = f"## {CHECK_NAME} — PR #{number}\n\n**{result.title}**\n\n{result.summary}\n"
+        if os.getenv("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+                stream.write(summary)
+        print(f"PR #{number}: {result.reason} ({result.conclusion})")
+        if not retry or attempt == 1:
+            return result
+        try:
+            _remaining(client.deadline, 1)
+        except TargetSelectionError:
+            return result
 
 
 def main():
