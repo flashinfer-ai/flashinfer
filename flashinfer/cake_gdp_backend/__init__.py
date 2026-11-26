@@ -73,8 +73,9 @@ _KERNEL_DTYPE = torch.bfloat16
 # kernel sources.
 _QK_ALIGNMENT_BYTES = 8
 _OUTPUT_ALIGNMENT_BYTES = 8
-# The state pool dtypes: FP32 everywhere, FP16 where the registry ships FP16-pool
-# programs (SM100 / SM103 / SM107: the stores round with the hardware ``cvt.rs``).
+# The state pool dtypes: FP32 and FP16 on every architecture.  An FP16 store rounds
+# with the hardware ``cvt.rs`` on SM100 / SM103 / SM107 and with the same rounding
+# in integer arithmetic on SM90, which has no ``cvt.rs``.
 _STATE_DTYPES = (torch.float32, torch.float16)
 # Stochastic rounding of an FP16 pool: the accepted Philox round counts.
 PHILOX_ROUNDS_MIN = 5
@@ -107,7 +108,7 @@ def is_cake_gdp_supported(
     state_dtype: torch.dtype = torch.float32,
 ) -> bool:
     """Whether ``device`` (and optionally ``num_householder`` / ``num_tokens``) has an exported route for a
-    ``state_dtype`` state pool (``torch.float32``, or ``torch.float16`` on SM100 / SM103 / SM107)."""
+    ``state_dtype`` state pool (``torch.float32`` or ``torch.float16``)."""
 
     device = torch.device(device)
     if device.type != "cuda" or state_dtype not in _STATE_DTYPES:
@@ -243,15 +244,12 @@ def _index_input(
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
-def _state_pool(
-    tensor: torch.Tensor, *, heads: int, device: torch.device, arch: str
-) -> None:
+def _state_pool(tensor: torch.Tensor, *, heads: int, device: torch.device) -> None:
     """The state pool ``[pool_size, HV, V, K]`` is read and written in place: dense rows of ``K`` elements,
     strides that are multiples of :data:`STATE_STRIDE_ELEMENTS` and an aligned base -- FP32:
     :data:`STATE_ALIGNMENT_BYTES` (the kernels stage a head's rows with 16-byte asynchronous copies); FP16:
-    :data:`F16_STATE_ALIGNMENT_BYTES` (8-byte pieces), on an architecture with FP16-pool programs only.  A pool of
-    another dtype or layout is refused: its slots are the caller's state and cannot be copied behind the caller's
-    back."""
+    :data:`F16_STATE_ALIGNMENT_BYTES` (8-byte pieces).  A pool of another dtype or layout is refused: its slots are
+    the caller's state and cannot be copied behind the caller's back."""
 
     if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
         raise ValueError("initial_state must be a [pool_size, HV, 64, 128] tensor")
@@ -260,13 +258,6 @@ def _state_pool(
     if tensor.dtype not in _STATE_DTYPES:
         raise ValueError(
             f"initial_state must be float32 or float16, got {tensor.dtype}"
-        )
-    if tensor.dtype == torch.float16 and not supported_num_householder(
-        arch, state_dtype=torch.float16
-    ):
-        raise ValueError(
-            "a float16 state pool needs the hardware stochastic rounding of SM100 / SM103 / SM107 "
-            f"(cvt.rs); {arch} has no float16-pool program"
         )
     pool_size = int(tensor.shape[0])
     if tuple(tensor.shape[1:]) != (heads, HEAD_SIZE_V, HEAD_SIZE_K):
@@ -413,7 +404,7 @@ def cake_gated_delta_product_mtp(
     )
     a = _model_input(a, "a", shape=(B, T, HV), device=device, dtype=model_dtype)
     b = _model_input(b, "b", shape=(B, T, n, HV), device=device, dtype=model_dtype)
-    _state_pool(initial_state, heads=HV, device=device, arch=arch)
+    _state_pool(initial_state, heads=HV, device=device)
     state_dtype = initial_state.dtype
     rounds = 0  # the launch class of an FP32 pool: its stores do not round
     if state_dtype == torch.float16:
@@ -516,8 +507,8 @@ def cake_gated_delta_product_mtp(
         use_qk_l2norm=use_qk_l2norm,
         state_dtype=state_dtype,
         # The launch class (host values, so a captured call keeps its program): an FP16 pool's round count and
-        # whether the call stores per-token snapshots pick a program's sibling (snapshot_noise or draw_share)
-        # where it is faster.
+        # whether the call stores per-token snapshots pick a program's sibling (snapshot_noise or draw_share), or
+        # on SM90 a row-split program, where it is faster.
         philox_rounds=rounds,
         use_ssm_state_indices=bool(use_scatter),
     )
