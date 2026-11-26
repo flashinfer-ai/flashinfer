@@ -1387,6 +1387,48 @@ class RecurrentKDAPrefillWrapper:
         self._impl.plan(cu_seqlens, non_blocking=non_blocking)
 
     @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
+    def scratch_layout(
+        self, seq_lens: Sequence[int], num_heads: int
+    ) -> tuple[int, list[list[tuple[int, int]]]]:
+        """Size and layout of the scratch buffer ``run`` uses for these lengths.
+
+        Returns ``(num_bytes, ranges)``: ``ranges[i]`` lists the ``(start,
+        stop)`` byte ranges that hold sequence ``i``'s intermediate factors.
+        ``num_bytes`` is 0 when the shape needs no scratch.  The size depends
+        only on the number of sequences, their total length and ``num_heads``.
+        """
+
+        from .kda_prefill_cute import _scratch_layout
+
+        return _scratch_layout(seq_lens, num_heads, self.device)
+
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
+    def set_scratch(self, scratch: torch.Tensor) -> None:
+        """Use a caller-owned scratch buffer instead of allocating one.
+
+        ``scratch`` is a 1-D uint8 tensor on this wrapper's device with at
+        least ``scratch_layout(...)[0]`` bytes; its contents need not be
+        initialized.  Call it before the first ``run``.  This lets a caller
+        that places memory (see ``sm_locality_domains`` of
+        :func:`flashinfer.kda.recurrent_kda`) home each sequence's scratch
+        with that sequence's other data.
+        """
+
+        if self._impl.total_tokens is not None:
+            raise RuntimeError("set_scratch must be called before the first run")
+        if (
+            scratch.dtype != torch.uint8
+            or scratch.ndim != 1
+            or scratch.device != self.device
+        ):
+            raise ValueError(
+                "scratch must be a 1-D uint8 tensor on the wrapper's device"
+            )
+        workspace = self._impl.workspace
+        workspace.__dict__["_cute_dsl_workspace"] = scratch
+        workspace.__dict__["_cute_dsl_workspace_is_callers"] = True
+
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
     def run(
         self,
         q: torch.Tensor,

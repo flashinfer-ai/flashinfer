@@ -7059,6 +7059,31 @@ def _decomp_ws_bytes(heads: int, total_chunks: int) -> int:
     )
 
 
+def workspace_ranges(
+    seq_lens, heads: int, total_chunks: int
+) -> list[list[tuple[int, int]]]:
+    """Byte ranges of the decomp workspace that hold each sequence's factors.
+
+    ``ranges[i]`` lists the ``(start, stop)`` ranges of sequence ``i``, one per
+    region and head, for a workspace of capacity ``total_chunks``.  A caller
+    that places memory (for example by locality domain) uses them to home a
+    sequence's scratch with the rest of that sequence's data.
+    """
+
+    ranges: list[list[tuple[int, int]]] = [[] for _ in seq_lens]
+    off = 0
+    for nbytes, _, _ in _decomp_ws_regions(heads, total_chunks):
+        chunk_bytes = nbytes // (heads * total_chunks)
+        for head in range(heads):
+            start = off + head * total_chunks * chunk_bytes
+            for seq, seq_len in enumerate(seq_lens):
+                stop = start + -(-int(seq_len) // BT) * chunk_bytes
+                ranges[seq].append((start, stop))
+                start = stop
+        off += _align_up(nbytes, WS_REGION_ALIGN)
+    return ranges
+
+
 def _partition_workspace(workspace, heads: int, total_chunks: int) -> dict:
     """View the user uint8 buffer as the six factor/flag tensors (no copy)."""
 
