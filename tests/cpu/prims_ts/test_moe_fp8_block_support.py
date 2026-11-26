@@ -351,7 +351,8 @@ def test_mxfp8_block_support_accepts_bias(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_deepseek_fp8_support_accepts_situ_params(monkeypatch):
+@pytest.mark.parametrize("block_size", [32, 128])
+def test_deepseek_fp8_support_accepts_situ_params(monkeypatch, block_size):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
 
@@ -362,18 +363,24 @@ def test_deepseek_fp8_support_accepts_situ_params(monkeypatch):
             fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
             activation_type=ActivationType.Situ,
         ),
-        _inputs(hidden_states_scale=torch.empty((4, 1), dtype=torch.float32)),
+        _inputs(
+            hidden_states_scale=torch.empty((128 // block_size, 4), dtype=torch.float32)
+        ),
         [8, 0],
         weight_layout=WeightLayout.MajorK,
         use_shuffled_weight=True,
-        gemm1_weights_scale=torch.empty((1,), dtype=torch.float32),
-        gemm2_weights_scale=torch.empty((1,), dtype=torch.float32),
+        gemm1_weights_scale=torch.empty(
+            (1, 512 // block_size, 128 // block_size), dtype=torch.float32
+        ),
+        gemm2_weights_scale=torch.empty(
+            (1, 128 // block_size, 256 // block_size), dtype=torch.float32
+        ),
         gemm1_alpha=torch.ones((1,), dtype=torch.float32),
         gemm1_beta=torch.ones((1,), dtype=torch.float32),
         gemm1_clamp_limit=torch.ones((1,), dtype=torch.float32),
     )
 
-    assert ok
+    assert ok, reason
     assert reason == ""
 
 

@@ -154,20 +154,24 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
 
 
 @pytest.mark.parametrize(
-    "quant_mode",
+    ("quant_mode", "block_size", "intermediate_size"),
     [
-        pytest.param(QuantMode.FP8_BLOCK_SCALE_MXFP8, id="MxFp8"),
-        pytest.param(QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, id="DeepSeekFp8"),
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_MXFP8, 128, 512, id="MxFp8"),
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, 128, 512, id="DeepSeekFp8"),
+        pytest.param(
+            QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, 32, 160, id="DeepSeekFp8-block32"
+        ),
     ],
 )
 def test_prims_ts_fp8_block_scale_situ_matches_reference(
     quant_mode,
+    block_size,
+    intermediate_size,
     cache_permute_indices,
 ):
     """Kimi K3 SiTU parameters match the dequantized reference."""
     num_tokens = 128 if quant_mode == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK else 32
     hidden_size = 512
-    intermediate_size = 512
     num_experts = 64
     top_k = 8
     device = torch.device("cuda")
@@ -176,7 +180,9 @@ def test_prims_ts_fp8_block_scale_situ_matches_reference(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        moe_impl=FP8BlockScaleMoe(fp8_quantization_type=quant_mode),
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=quant_mode, block_size=block_size
+        ),
         routing_config={
             "num_experts": num_experts,
             "top_k": top_k,
