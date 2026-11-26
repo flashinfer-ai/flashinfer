@@ -3811,6 +3811,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 fixed_split_size=fixed_split_size or -1,
                 disable_split_kv=disable_split_kv,
                 use_cuda_graph=self._use_cuda_graph,
+                window_left=window_left,
             )
             return (float_bytes, 0)
 
@@ -4703,6 +4704,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
                 use_cuda_graph=self._use_cuda_graph,
+                window_left=window_left,
             )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -6959,6 +6961,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_vo=head_dim_vo,
                 causal=causal,
                 sm_scale=sm_scale,
+                window_left=window_left,
             )
         elif self._backend == "cute-dsl":
             self._plan_info = None

@@ -23,6 +23,7 @@ The kernel implements key optimizations including:
 - Shared-memory epilogue staging that aliases the K/V buffer after compute warps
   finish reading the last tile
 - Optional causal masking for autoregressive models
+- Optional sliding-window masking that skips K/V tiles left of the window
 - Grouped-query attention (GQA), packed variable lengths, and paged K/V pools
 
 The kernel is compiled and launched through the ``cute-dsl-prims`` backend.
@@ -67,6 +68,8 @@ from cutlass.experimental import primitives as prims
 # its affiliates is strictly prohibited.
 
 SUPPORTED_PAGE_SIZES = (1, 16, 32, 64, 128)
+# ``window_left`` launch argument of kernels compiled without a sliding window.
+NO_SLIDING_WINDOW = cutlass.Int32(-1)
 
 # ---------------------------------------------------------------------------
 # PTX helpers.
@@ -356,6 +359,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         num_tokens_per_page: int | None = None,
         balanced_scheduler: bool = False,
         gqa_pack_size: int = 1,
+        sliding_window: bool = False,
     ) -> None:
         """Initialize the FMHA prefill kernel configuration.
 
@@ -372,6 +376,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             that causal masking is enabled when this option is true.
         :param gqa_pack_size: Q heads sharing one K/V head packed into each Q
             tile (row ``r`` is token ``r // gqa_pack_size``). Must divide ``q_tile``.
+        :param sliding_window: Restrict each query to keys at most
+            ``window_left`` (a runtime launch argument) positions before its
+            bottom-right aligned position. K/V tiles entirely left of a Q
+            tile's window are skipped; only boundary tiles are masked.
         """
         # Data types
         if in_dtype != cutlass.Float8E4M3FN:
@@ -383,9 +391,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         self.is_causal = is_causal
         self.use_paged_kv = use_paged_kv
         self.balanced_scheduler = balanced_scheduler
-        # All causal paths use bottom-right alignment, so Q is positioned at
-        # the end of its logical K/V sequence when their lengths differ.
-        self.has_causal_q_offset = self.is_causal
+        self.sliding_window = sliding_window
+        # Causal and sliding-window masks use bottom-right alignment, so Q is
+        # positioned at the end of its logical K/V sequence when their lengths
+        # differ.
+        self.has_causal_q_offset = self.is_causal or self.sliding_window
 
         # Tiling
         if head_tile not in self.SUPPORTED_HEAD_TILES:
@@ -533,6 +543,64 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         if cutlass.const_expr(self.gqa_pack_size > 1):
             offset = (row % self.gqa_pack_size) * head_dim
         return offset
+
+    @cute.jit
+    def window_first_col(
+        self, basic_params: SimpleNamespace, row: cutlass.Int32
+    ) -> cutlass.Int32:
+        """First K/V position inside tile row ``row``'s sliding window.
+
+        Matches FlashInfer's ``kv_idx + qo_len + window_left >= kv_len + qo_idx``:
+        the window ends at the row's bottom-right aligned position.
+        """
+        return (
+            basic_params.q_seq_idx
+            + self.q_row_token(row)
+            + basic_params.causal_q_offset
+            - basic_params.window_left
+        )
+
+    @cute.jit
+    def window_col_range(
+        self,
+        basic_params: SimpleNamespace,
+        row: cutlass.Int32,
+        kv_seq_idx: cutlass.Int32,
+        valid_cols: cutlass.Int32,
+    ) -> tuple:
+        """Visible K/V columns of tile row ``row`` as one unsigned range.
+
+        Key ``j`` is visible when ``window_first <= j < valid_cols``. For this
+        lane's column ``kv_seq_idx + 2 * lane_mod4 + c`` that is
+        ``(u32)(rel + c) < (u32)width``, a single compare per score.
+        """
+        window_first = self.window_first_col(basic_params, row)
+        rel = kv_seq_idx + 2 * basic_params.lane_mod4 - window_first
+        width = cute.math.max(valid_cols - window_first, cutlass.Int32(0))
+        return rel, width
+
+    @cute.jit
+    def mask_outside_window(
+        self,
+        score: cutlass.Float32,
+        rel: cutlass.Int32,
+        col: cutlass.Constexpr[int],
+        width: cutlass.Int32,
+    ) -> cutlass.Float32:
+        """Return ``score`` when column ``col`` of the lane is visible, else -inf."""
+        return cute.arch.inline_ptx(
+            (
+                "{\n"
+                "  .reg .pred p;\n"
+                "  .reg .u32 t;\n"
+                f"  add.u32 t, $2, {col};\n"
+                "  setp.lt.u32 p, t, $3;\n"
+                "  selp.f32 $0, $1, 0fFF800000, p;\n"
+                "}"
+            ),
+            write_only_types=[cutlass.Float32],
+            read_only_args=[score, rel, width],
+        )
 
     @cute.jit
     def get_kv_stage_ptr(
@@ -1192,7 +1260,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param row_state: One persistent scalar per lane. Lanes 0/1 in each
             threadquad hold row maxima; lanes 2/3 hold row sums.
         :param kv_seq_idx: Logical row offset within the current K/V sequence.
-        :param is_masked_frontier_tile: Marks the causal/K-tail frontier. It
+        :param is_masked_frontier_tile: Marks the causal/K-tail/window frontier. It
             enables causal limits and explicit K/V-length bounds.
         :param uses_softmax_init_path: Select the cheaper update that bypasses
             merging prior state. The generic path is also correct for a first
@@ -1237,6 +1305,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         basic_params.seqlen_k,
                     )
                     has_valid_cols = kv_seq_idx < valid_cols
+            window_rel = cutlass.Int32(0)
+            window_width = cutlass.Int32(0)
+            if cutlass.const_expr(is_masked_frontier_tile and self.sliding_window):
+                window_rel, window_width = self.window_col_range(
+                    basic_params, q_row_in_cta, kv_seq_idx, valid_cols
+                )
 
             # Reduce max across this lane's S values for the current Q row.
             cur_max0 = -cutlass.Float32.inf
@@ -1245,7 +1319,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 s_off = k_frag * 4
                 s0 = s_regs[s_off + s_reg_idx_lo]
                 s1 = s_regs[s_off + s_reg_idx_hi]
-                if cutlass.const_expr(is_masked_frontier_tile):
+                if cutlass.const_expr(is_masked_frontier_tile and self.sliding_window):
+                    s0 = self.mask_outside_window(
+                        s0, window_rel, k_frag * 8, window_width
+                    )
+                    s1 = self.mask_outside_window(
+                        s1, window_rel, k_frag * 8 + 1, window_width
+                    )
+                elif cutlass.const_expr(is_masked_frontier_tile):
                     k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
                     k_col1 = k_col0 + 1
                     if cutlass.const_expr(self.is_causal):
@@ -1447,6 +1528,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         basic_params.seqlen_k,
                     )
                     has_valid_cols = kv_seq_idx < valid_cols
+            window_rel = cutlass.Int32(0)
+            window_width = cutlass.Int32(0)
+            if cutlass.const_expr(is_masked_frontier_tile and self.sliding_window):
+                window_rel, window_width = self.window_col_range(
+                    basic_params, q_row_in_cta, kv_seq_idx, valid_cols
+                )
 
             if cutlass.const_expr(uses_precomputed_tile_row_max):
                 cur_max = nvvm_threadquad_reduction_max(tile_row_max[row_half])
@@ -1457,7 +1544,16 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     s_off = k_frag * 4
                     s0 = s_regs[s_off + s_reg_idx_lo]
                     s1 = s_regs[s_off + s_reg_idx_hi]
-                    if cutlass.const_expr(is_masked_frontier_tile):
+                    if cutlass.const_expr(
+                        is_masked_frontier_tile and self.sliding_window
+                    ):
+                        s0 = self.mask_outside_window(
+                            s0, window_rel, k_frag * 8, window_width
+                        )
+                        s1 = self.mask_outside_window(
+                            s1, window_rel, k_frag * 8 + 1, window_width
+                        )
+                    elif cutlass.const_expr(is_masked_frontier_tile):
                         k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
                         k_col1 = k_col0 + 1
                         if cutlass.const_expr(self.is_causal):
@@ -1991,13 +2087,26 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         basic_params.seqlen_k,
                     )
                     has_valid_cols = kv_seq_idx < valid_cols
+            window_rel = cutlass.Int32(0)
+            window_width = cutlass.Int32(0)
+            if cutlass.const_expr(is_masked_frontier_tile and self.sliding_window):
+                window_rel, window_width = self.window_col_range(
+                    basic_params, q_row_in_cta, kv_seq_idx, valid_cols
+                )
 
             tile_row_max = -cutlass.Float32.inf
             for k_frag in cutlass.range_constexpr(self.qk_k_frags):
                 s_off = k_frag * 4
                 s0 = s_regs[s_off + row_half * 2]
                 s1 = s_regs[s_off + row_half * 2 + 1]
-                if cutlass.const_expr(is_masked_frontier_tile):
+                if cutlass.const_expr(is_masked_frontier_tile and self.sliding_window):
+                    s0 = self.mask_outside_window(
+                        s0, window_rel, k_frag * 8, window_width
+                    )
+                    s1 = self.mask_outside_window(
+                        s1, window_rel, k_frag * 8 + 1, window_width
+                    )
+                elif cutlass.const_expr(is_masked_frontier_tile):
                     k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
                     k_col1 = k_col0 + 1
                     if cutlass.const_expr(self.is_causal):
@@ -2100,7 +2209,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param row_state: One distributed max/sum scalar per lane.
         :param kv_tile_idx: K/V tile index processed by this iteration.
         :param k_stage: K slot in the repeating ``0, 2, 1`` ring schedule.
-        :param is_masked_frontier_tile: Marks the causal/K-tail frontier for
+        :param is_masked_frontier_tile: Marks the causal/K-tail/window frontier for
             causal limits and explicit K/V-length bounds.
         :param uses_softmax_init_path: Whether to bypass the neutral initial
             softmax/O state instead of using the generic merge path.
@@ -2308,6 +2417,52 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 count=cute.arch.WARP_SIZE,
             )
 
+    @cute.jit
+    def compute_kv_tile(
+        self,
+        basic_params: SimpleNamespace,
+        mma_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        q_regs: cutlass.Array,
+        row_state: cutlass.Float32,
+        num_kv_tiles: cutlass.Int32,
+        kv_tile_idx: cutlass.Int32,
+        k_stage: cutlass.Int32,
+        is_masked_frontier_tile: cutlass.Constexpr[bool],
+        uses_softmax_init_path: cutlass.Constexpr[bool],
+    ) -> cutlass.Float32:
+        """Run one K/V tile with the row-state layout of this configuration."""
+        if cutlass.const_expr(
+            self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
+        ):
+            row_state = self.compute_one_kv_tile(
+                basic_params,
+                mma_params,
+                softmax_params,
+                q_regs,
+                row_state,
+                kv_tile_idx,
+                k_stage,
+                is_masked_frontier_tile=is_masked_frontier_tile,
+                uses_softmax_init_path=uses_softmax_init_path,
+            )
+        else:
+            self.compute_one_kv_tile_direct_state(
+                basic_params,
+                mma_params,
+                softmax_params,
+                q_regs,
+                num_kv_tiles,
+                kv_tile_idx,
+                k_stage,
+                uses_kv_ring=(
+                    self.head_tile == 128 and self.q_tile == 128 and self.kv_tile == 128
+                ),
+                is_masked_frontier_tile=is_masked_frontier_tile,
+                uses_softmax_init_path=uses_softmax_init_path,
+            )
+        return row_state
+
     @cute.kernel
     def kernel(
         self,
@@ -2326,6 +2481,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         block_tables: cute.Tensor | None = None,
         cu_seqlens_k: cute.Tensor | None = None,
         kv_tile_ranges: cute.Tensor | None = None,
+        window_left: cutlass.Int32 = NO_SLIDING_WINDOW,
     ) -> None:
         """SM120 FMHA prefill FP8 kernel.
 
@@ -2345,6 +2501,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param cu_seqlens_q: Optional cumulative offsets for packed Q/O.
         :param block_tables: Shared K/V page indices with shape ``[B,max_pages]``.
         :param cu_seqlens_k: Optional cumulative offsets for packed K/V.
+        :param kv_tile_ranges: Optional split-KV tile ranges.
+        :param window_left: Sliding-window size; read only when the kernel is
+            compiled with ``sliding_window=True``.
         """
         tidx, _, _ = cute.arch.thread_idx()
         block_x, block_y, block_z = cute.arch.block_idx()
@@ -2447,6 +2606,27 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             kv_begin_tile = cutlass.Int32(kv_tile_ranges[batch_idx, 0])
             num_kv_tiles = cute.math.min(
                 num_kv_tiles, cutlass.Int32(kv_tile_ranges[batch_idx, 1])
+            )
+            has_kv_work = num_kv_tiles > kv_begin_tile
+        # Sliding window: tiles left of the first row's window are skipped,
+        # and tiles at or after the last row's window start are fully visible.
+        # Rows of this Q tile are ordered by token, so tiles between those two
+        # bounds (at most two) form the masked left frontier.
+        window_unmasked_tile = kv_begin_tile
+        if cutlass.const_expr(self.sliding_window):
+            window_first = q_seq_idx + causal_q_offset - window_left
+            kv_begin_tile = cute.math.max(
+                kv_begin_tile,
+                cute.math.max(window_first, cutlass.Int32(0)) // self.kv_tile,
+            )
+            window_unmasked_tile = cute.math.max(
+                kv_begin_tile,
+                ceil_div(
+                    cute.math.max(
+                        window_first + self.q_tile_tokens - 1, cutlass.Int32(0)
+                    ),
+                    self.kv_tile,
+                ),
             )
             has_kv_work = num_kv_tiles > kv_begin_tile
 
@@ -2842,6 +3022,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 q_seq_idx=q_seq_idx,
                 q_head_base=q_head_base,
                 causal_q_offset=causal_q_offset,
+                window_left=window_left,
                 q_seq_stride=q_seq_stride,
                 q_l2_cache_hint=q_l2_cache_hint,
                 # Compute-warp row and lane ownership.
@@ -2902,48 +3083,39 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     self.q_tile_tokens + self.kv_tile - 1, self.kv_tile
                 )
 
+            # A sliding window adds a masked left frontier. D=256 keeps its
+            # distributed row state at the register limit, where a separate
+            # left-frontier loop (a fourth inlined tile body) spills; it runs
+            # every tile after the first through one loop with a CTA-uniform
+            # masked/unmasked branch instead. Other head dims keep the default
+            # unmasked hot loop and add a masked loop after it.
+            uses_merged_window_loop = cutlass.const_expr(
+                self.sliding_window and uses_distributed_row_state
+            )
+            phase2_end_tile = kv_begin_tile
+            if cutlass.const_expr(self.sliding_window):
+                right_unmasked_end = num_kv_tiles - masked_kv_tile_count
+                phase2_end_tile = window_unmasked_tile
+            if cutlass.const_expr(uses_merged_window_loop):
+                masked_kv_tile_count = 1
+                phase2_end_tile = kv_begin_tile
+
             # Phase 1: potentially masked iterations.
             pipeline_k_stage = cutlass.Int32(0)
             for step in cutlass.range_constexpr(masked_kv_tile_count):
                 if kv_tile_idx >= kv_begin_tile:
-                    if cutlass.const_expr(uses_distributed_row_state):
-                        row_state = self.compute_one_kv_tile(
-                            basic_params,
-                            mma_params,
-                            softmax_params,
-                            q_regs,
-                            row_state,
-                            kv_tile_idx,
-                            pipeline_k_stage,
-                            is_masked_frontier_tile=True,
-                            uses_softmax_init_path=(step == 0),
-                        )
-                    elif cutlass.const_expr(uses_direct_state_ring):
-                        self.compute_one_kv_tile_direct_state(
-                            basic_params,
-                            mma_params,
-                            softmax_params,
-                            q_regs,
-                            num_kv_tiles,
-                            kv_tile_idx,
-                            pipeline_k_stage,
-                            uses_kv_ring=True,
-                            is_masked_frontier_tile=True,
-                            uses_softmax_init_path=(step == 0),
-                        )
-                    else:
-                        self.compute_one_kv_tile_direct_state(
-                            basic_params,
-                            mma_params,
-                            softmax_params,
-                            q_regs,
-                            num_kv_tiles,
-                            kv_tile_idx,
-                            pipeline_k_stage,
-                            uses_kv_ring=False,
-                            is_masked_frontier_tile=True,
-                            uses_softmax_init_path=(step == 0),
-                        )
+                    row_state = self.compute_kv_tile(
+                        basic_params,
+                        mma_params,
+                        softmax_params,
+                        q_regs,
+                        row_state,
+                        num_kv_tiles,
+                        kv_tile_idx,
+                        pipeline_k_stage,
+                        is_masked_frontier_tile=True,
+                        uses_softmax_init_path=(step == 0),
+                    )
                 kv_tile_idx -= 1
                 if cutlass.const_expr(uses_unified_kv_ring):
                     if pipeline_k_stage == 0:
@@ -2952,43 +3124,49 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         pipeline_k_stage -= 1
 
             # Phase 2: remaining tiles outside the explicit mask frontier.
-            while kv_tile_idx >= kv_begin_tile:
-                if cutlass.const_expr(uses_unified_kv_ring):
-                    if cutlass.const_expr(uses_distributed_row_state):
-                        row_state = self.compute_one_kv_tile(
+            while kv_tile_idx >= phase2_end_tile:
+                if cutlass.const_expr(uses_merged_window_loop):
+                    # Tiles in [window_unmasked_tile, right_unmasked_end) are
+                    # fully visible.
+                    if (
+                        kv_tile_idx < right_unmasked_end
+                        and kv_tile_idx >= window_unmasked_tile
+                    ):
+                        row_state = self.compute_kv_tile(
                             basic_params,
                             mma_params,
                             softmax_params,
                             q_regs,
                             row_state,
+                            num_kv_tiles,
                             kv_tile_idx,
                             pipeline_k_stage,
                             is_masked_frontier_tile=False,
                             uses_softmax_init_path=False,
                         )
                     else:
-                        self.compute_one_kv_tile_direct_state(
+                        row_state = self.compute_kv_tile(
                             basic_params,
                             mma_params,
                             softmax_params,
                             q_regs,
+                            row_state,
                             num_kv_tiles,
                             kv_tile_idx,
                             pipeline_k_stage,
-                            uses_kv_ring=True,
-                            is_masked_frontier_tile=False,
+                            is_masked_frontier_tile=True,
                             uses_softmax_init_path=False,
                         )
                 else:
-                    self.compute_one_kv_tile_direct_state(
+                    row_state = self.compute_kv_tile(
                         basic_params,
                         mma_params,
                         softmax_params,
                         q_regs,
+                        row_state,
                         num_kv_tiles,
                         kv_tile_idx,
                         pipeline_k_stage,
-                        uses_kv_ring=False,
                         is_masked_frontier_tile=False,
                         uses_softmax_init_path=False,
                     )
@@ -2998,6 +3176,28 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         pipeline_k_stage = cutlass.Int32(2)
                     else:
                         pipeline_k_stage -= 1
+
+            # Phase 3: the sliding window's masked left frontier.
+            if cutlass.const_expr(self.sliding_window and not uses_merged_window_loop):
+                while kv_tile_idx >= kv_begin_tile:
+                    row_state = self.compute_kv_tile(
+                        basic_params,
+                        mma_params,
+                        softmax_params,
+                        q_regs,
+                        row_state,
+                        num_kv_tiles,
+                        kv_tile_idx,
+                        pipeline_k_stage,
+                        is_masked_frontier_tile=True,
+                        uses_softmax_init_path=False,
+                    )
+                    kv_tile_idx -= 1
+                    if cutlass.const_expr(uses_unified_kv_ring):
+                        if pipeline_k_stage == 0:
+                            pipeline_k_stage = cutlass.Int32(2)
+                        else:
+                            pipeline_k_stage -= 1
 
             prims.barrier_cta_sync(
                 self.COMPUTE_BARRIER_ID, thread_count=self.threads_compute
@@ -3081,6 +3281,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             row_sum_inv_1 = (
                 cute.math.rcp(row_sum_1, approx=True, ftz=True) * output_scale
             )
+            if cutlass.const_expr(self.sliding_window):
+                # A split-KV chunk can hold no key inside a row's window. Its
+                # partial O is 0 and its LSE is -inf, which merge_states drops.
+                if row_sum_0 == 0.0:
+                    row_sum_inv_0 = cutlass.Float32(0.0)
+                if row_sum_1 == 0.0:
+                    row_sum_inv_1 = cutlass.Float32(0.0)
             for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
                 o_off = (d_frag_pair * 2) * 4
                 o_scaled0 = mul_packed_f32x2(
@@ -3209,6 +3416,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         max_seqlen_q: cutlass.Int32 | None = None,
         use_pdl: bool = False,
         kv_tile_ranges: cute.Tensor | None = None,
+        window_left: cutlass.Int32 = NO_SLIDING_WINDOW,
     ) -> None:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
@@ -3236,6 +3444,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param kv_tile_ranges: Split KV: Int32 ``(num_chunks * B, 2)`` K/V tile
             ranges, row ``c * B + r`` for chunk ``c`` of request ``r``. ``o``/``lse``
             then hold row ``p * num_chunks + c`` for chunk ``c`` of token ``p``.
+        :param window_left: Sliding-window size (>= 0) for a kernel compiled
+            with ``sliding_window=True``: key ``j`` is visible to query ``i``
+            only when ``j >= i + kv_len - q_len - window_left``. Ignored
+            otherwise.
 
         Direct callers must satisfy the same shape contract enforced by
         :meth:`can_implement_paged`.
@@ -3347,6 +3559,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             block_tables,
             cu_seqlens_k,
             kv_tile_ranges,
+            window_left,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),

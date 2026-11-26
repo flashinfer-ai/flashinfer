@@ -23,6 +23,10 @@ Causal mask conventions
 -----------------------
 - Both paths use bottom-right alignment: query i attends to key j when
   ``j <= i + (kv_len - q_len)``.
+- ``window_left >= 0`` additionally requires
+  ``j >= i + (kv_len - q_len) - window_left``, with or without causal masking,
+  matching the other FlashInfer prefill backends. K/V tiles left of a Q tile's
+  window are skipped, not masked.
 
 Sequence lengths are runtime metadata. ``max_seqlen_q`` only sizes the launch
 grid and is not part of the compiled kernel cache key.
@@ -80,6 +84,12 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
     }[torch_dtype]
 
 
+def _mask_kwargs(window_left: int) -> dict:
+    """Compile options for the sliding window; empty when unused so the default
+    kernels keep their compile cache keys."""
+    return {"sliding_window": True} if window_left >= 0 else {}
+
+
 def _check_sm120(device: torch.device) -> None:
     major, minor = torch.cuda.get_device_capability(device)
     if not (major == 12 and minor == 0):
@@ -126,10 +136,7 @@ def _validate_sm120_prims_plan_options(
             f"{backend} uses FP32 accumulation and does not support "
             "use_fp16_qk_reduction=True"
         )
-    if window_left >= 0:
-        raise NotImplementedError(
-            f"{backend} does not support sliding window; got window_left={window_left}"
-        )
+    _validate_window_left(window_left)
     if logits_soft_cap > 0:
         raise NotImplementedError(
             f"{backend} does not support logits_soft_cap={logits_soft_cap}"
@@ -146,6 +153,25 @@ def _validate_sm120_prims_plan_options(
             f"{backend} does not support max_sequence_kv={max_sequence_kv}; "
             "this option is only supported by the cuDNN backend"
         )
+
+
+def _validate_window_left(window_left: int) -> None:
+    if isinstance(window_left, bool) or not isinstance(window_left, int):
+        raise TypeError(
+            "backend='cute-dsl-prims' requires an integer window_left; got "
+            f"{window_left!r}"
+        )
+    if not -1 <= window_left < 2**31:
+        raise ValueError(
+            "backend='cute-dsl-prims' requires window_left == -1 (no sliding "
+            f"window) or 0 <= window_left < 2**31; got {window_left}"
+        )
+
+
+def _kernel_window_left(window_left: int) -> int:
+    """Clamp the window passed to the kernel so its Int32 window bounds cannot
+    overflow; any window wider than 2**30 keys already covers every sequence."""
+    return min(window_left, 1 << 30)
 
 
 def _validate_lse(q: torch.Tensor, lse: Optional[torch.Tensor]) -> None:
@@ -245,6 +271,7 @@ def sm120_fmha_fp8_ragged_prefill(
     v_scale: Optional[float] = None,
     enable_pdl: bool = False,
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
+    window_left: int = -1,
 ) -> None:
     """Run SM120 FP8 FMHA on packed contiguous ragged Q/K/V.
 
@@ -292,6 +319,9 @@ def sm120_fmha_fp8_ragged_prefill(
         avoid a device-to-host synchronization. ``None`` selects the dense
         specialization; every supplied value, including zero, selects the
         skip-enabled specialization.
+    window_left : int
+        Sliding-window size. ``-1`` disables it; otherwise key ``j`` is visible
+        to query ``i`` only when ``j >= i + kv_len - q_len - window_left``.
     Raises
     ------
     RuntimeError
@@ -309,6 +339,7 @@ def sm120_fmha_fp8_ragged_prefill(
 
     _check_sm120(q.device)
     _validate_lse(q, lse)
+    _validate_window_left(window_left)
 
     batch_size = cu_seqlens_q.numel() - 1
     threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, batch_size)
@@ -361,6 +392,7 @@ def sm120_fmha_fp8_ragged_prefill(
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
         enable_skip_softmax=threshold is not None,
+        **_mask_kwargs(window_left),
     )
 
     if sm_scale is None:
@@ -384,6 +416,7 @@ def sm120_fmha_fp8_ragged_prefill(
         Int32(max_seqlen_q),
         enable_pdl,
         None,  # kv_tile_ranges
+        Int32(_kernel_window_left(window_left)),
     )
 
 
@@ -411,6 +444,7 @@ def sm120_fmha_fp8_paged_prefill(
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     kv_tile_ranges: Optional[torch.Tensor] = None,
     gqa_pack_size: int = 1,
+    window_left: int = -1,
 ) -> None:
     """Run SM120 FP8 FMHA prefill with paged K/V cache.
 
@@ -479,6 +513,9 @@ def sm120_fmha_fp8_paged_prefill(
         ``p``, the layout ``merge_states`` reads.
     gqa_pack_size : int
         Q heads sharing one K/V head packed into each Q tile. Must divide ``Hq // Hkv`` and ``q_tile``.
+    window_left : int
+        Sliding-window size. ``-1`` disables it; otherwise key ``j`` is visible
+        to query ``i`` only when ``j >= i + kv_len - q_len - window_left``.
     Raises
     ------
     RuntimeError
@@ -495,6 +532,7 @@ def sm120_fmha_fp8_paged_prefill(
 
     _check_sm120(q.device)
     _validate_lse(o, lse)
+    _validate_window_left(window_left)
 
     assert q.ndim == 3, f"q must be packed (total_q, Hq, D), got {q.shape}"
     _, Hq, D = q.shape
@@ -579,6 +617,7 @@ def sm120_fmha_fp8_paged_prefill(
         enable_skip_softmax=threshold is not None,
         **({"with_kv_tile_ranges": True} if kv_tile_ranges is not None else {}),
         **({"gqa_pack_size": gqa_pack_size} if gqa_pack_size > 1 else {}),
+        **_mask_kwargs(window_left),
     )
 
     if sm_scale is None:
@@ -607,6 +646,7 @@ def sm120_fmha_fp8_paged_prefill(
         Int32(max_seqlen_q),
         enable_pdl,
         kv_tile_ranges,
+        Int32(_kernel_window_left(window_left)),
     )
 
 
@@ -620,6 +660,7 @@ def _paged_kv_split_bounds(
     fixed_split_tokens: int,
     max_chunks: int,
     gqa_pack_size: int = 1,
+    window_left: int = -1,
 ) -> Optional[list]:
     """K/V tile bounds per request and chunk, or ``None`` to run unsplit.
 
@@ -627,6 +668,9 @@ def _paged_kv_split_bounds(
     prefix, so its bounds do not depend on the rest of the batch. Otherwise the chunk count minimizes the
     estimated time in K/V tiles: the larger of the longest CTAs' waves and the total CTA work spread over
     ``num_ctas_per_wave`` SMs.
+
+    With a sliding window (``window_left >= 0``), each request's chunks cover only the tiles from the
+    first one inside its first query's window, and the cost uses the tiles one CTA actually visits.
     """
     overhead = 4  # Fixed cost of one CTA (Q load, epilogue, merge share), in K/V tiles.
     kv_tiles = [ceil_div(kv, tile) for kv in kv_lens]
@@ -634,11 +678,26 @@ def _paged_kv_split_bounds(
         (kv - q) // tile if causal else t
         for q, kv, t in zip(q_lens, kv_lens, kv_tiles, strict=True)
     ]
+    q_tile_tokens = tile // gqa_pack_size
+    if window_left >= 0:
+        begins = [
+            max(kv - q - window_left, 0) // tile
+            for q, kv in zip(q_lens, kv_lens, strict=True)
+        ]
+        # A causal CTA's window spans its Q tile plus window_left keys.
+        cta_tiles = ceil_div(window_left + q_tile_tokens, tile) + 1
+        work_tiles = [
+            min(t - b, cta_tiles) if causal else t - b
+            for t, b in zip(kv_tiles, begins, strict=True)
+        ]
+    else:
+        begins = [0] * len(kv_tiles)
+        work_tiles = kv_tiles
     if fixed_split_tokens > 0:
         step = ceil_div(fixed_split_tokens, tile)
         cuts = [
-            list(range(step, min(v, t - 1) + 1, step))
-            for t, v in zip(kv_tiles, visible, strict=True)
+            [c for c in range(step, min(v, t - 1) + 1, step) if c > b]
+            for t, v, b in zip(kv_tiles, visible, begins, strict=True)
         ]
         num_chunks = max(len(c) for c in cuts) + 1
         if num_chunks < 2:
@@ -650,22 +709,23 @@ def _paged_kv_split_bounds(
             )
         # Requests with fewer chunks get empty [t, t) ranges, which add nothing in the merge.
         return [
-            [0, *c, t] + [t] * (num_chunks - 1 - len(c))
-            for c, t in zip(cuts, kv_tiles, strict=True)
+            [b, *c, t] + [t] * (num_chunks - 1 - len(c))
+            for c, t, b in zip(cuts, kv_tiles, begins, strict=True)
         ]
-    max_chunks = min([128, max_chunks] + [v + 1 for v in visible])
+    max_chunks = min(
+        [128, max_chunks] + [v - b + 1 for v, b in zip(visible, begins, strict=True)]
+    )
     if max_chunks < 2:
         return None
-    q_tile_tokens = tile // gqa_pack_size
     ctas = [
         ceil_div(q, q_tile_tokens) * (num_qo_heads // gqa_pack_size) for q in q_lens
     ]
-    longest_tiles = max(kv_tiles)
+    longest_tiles = max(work_tiles)
     longest_ctas = sum(
-        c for c, t in zip(ctas, kv_tiles, strict=True) if t == longest_tiles
+        c for c, t in zip(ctas, work_tiles, strict=True) if t == longest_tiles
     )
     total_ctas = sum(ctas)
-    total_work = sum(c * t for c, t in zip(ctas, kv_tiles, strict=True))
+    total_work = sum(c * t for c, t in zip(ctas, work_tiles, strict=True))
 
     def cost(n: int) -> float:
         waves = ceil_div(n * longest_ctas, num_ctas_per_wave)
@@ -678,10 +738,10 @@ def _paged_kv_split_bounds(
     if num_chunks < 2:
         return None
     bounds = []
-    for t, v in zip(kv_tiles, visible, strict=True):
-        b = [0]
+    for t, v, begin in zip(kv_tiles, visible, begins, strict=True):
+        b = [begin]
         for c in range(1, num_chunks):
-            target = round(c * t / num_chunks)
+            target = begin + round(c * (t - begin) / num_chunks)
             b.append(min(max(target, b[-1] + 1), v - (num_chunks - 1 - c)))
         b.append(t)
         bounds.append(b)
@@ -728,6 +788,8 @@ class SM120PrimsBatchPrefillBackend:
         self._split_buffers: dict = {}
         self._gqa_pack_size = 1
         self._mode: Optional[str] = None
+        self._window_left = -1
+        self._kv_split: Optional[SimpleNamespace] = None
         self._compiled_lse_variants: set[bool] = set()
 
     @staticmethod
@@ -796,6 +858,7 @@ class SM120PrimsBatchPrefillBackend:
         head_dim_vo: int,
         causal: bool,
         sm_scale: Optional[float],
+        window_left: int = -1,
     ) -> None:
         from flashinfer.cute_dsl.attention.fmha.sm120 import (
             compile_sm120_fmha_fp8_ragged_kernel,
@@ -829,7 +892,9 @@ class SM120PrimsBatchPrefillBackend:
         self._head_dim = head_dim_qk
         self._causal = causal
         self._sm_scale = sm_scale
+        self._window_left = window_left
         self._page_size: Optional[int] = None
+        self._kv_split = None
         compile_sm120_fmha_fp8_ragged_kernel(
             in_dtype=q_dtype,
             out_dtype=o_dtype,
@@ -843,6 +908,7 @@ class SM120PrimsBatchPrefillBackend:
             with_lse=False,
             balanced_scheduler=_use_balanced_scheduler(causal),
             enable_skip_softmax=False,
+            **_mask_kwargs(window_left),
         )
         self._compiled_lse_variants = {False}
 
@@ -868,6 +934,7 @@ class SM120PrimsBatchPrefillBackend:
         fixed_split_size: int = -1,
         disable_split_kv: bool = False,
         use_cuda_graph: bool = False,
+        window_left: int = -1,
     ) -> None:
         from flashinfer.cute_dsl.attention.fmha.sm120 import (
             compile_sm120_fmha_fp8_paged_kernel,
@@ -906,6 +973,7 @@ class SM120PrimsBatchPrefillBackend:
         self._head_dim = head_dim_qk
         self._causal = causal
         self._sm_scale = sm_scale
+        self._window_left = window_left
         self._page_size = page_size
         self._gqa_pack_size = _gqa_pack_size(num_qo_heads, num_kv_heads, 128)
         compile_sm120_fmha_fp8_paged_kernel(
@@ -923,6 +991,7 @@ class SM120PrimsBatchPrefillBackend:
             balanced_scheduler=_use_balanced_scheduler(causal),
             enable_skip_softmax=False,
             **self._pack_kwargs(),
+            **_mask_kwargs(window_left),
         )
         self._compiled_lse_variants = {False}
         self._plan_kv_split(
@@ -948,6 +1017,7 @@ class SM120PrimsBatchPrefillBackend:
         fixed_split_size: int,
         disable_split_kv: bool,
         use_cuda_graph: bool,
+        window_left: int = -1,
     ) -> int:
         """Float workspace bytes the paged plan's K/V split needs; 0 when it does not split."""
         if disable_split_kv or use_cuda_graph or head_dim < 64:
@@ -962,6 +1032,7 @@ class SM120PrimsBatchPrefillBackend:
             fixed_split_size * page_size if fixed_split_size > 0 else 0,
             1 << 30,
             _gqa_pack_size(num_qo_heads, num_kv_heads, 128),
+            window_left,
         )
         if bounds is None:
             return 0
@@ -1022,6 +1093,7 @@ class SM120PrimsBatchPrefillBackend:
             fixed_split_size * self._page_size if fixed_split_size > 0 else 0,
             max_chunks,
             self._gqa_pack_size,
+            self._window_left,
         )
         if bounds is None:
             return
@@ -1072,6 +1144,7 @@ class SM120PrimsBatchPrefillBackend:
             enable_skip_softmax=False,
             with_kv_tile_ranges=True,
             **self._pack_kwargs(),
+            **_mask_kwargs(self._window_left),
         )
 
     def _pack_kwargs(self) -> dict:
@@ -1131,6 +1204,7 @@ class SM120PrimsBatchPrefillBackend:
                 f"(return_lse={with_lse}) was not compiled before CUDA Graph "
                 "capture; warm up the same run configuration before capture"
             )
+        mask_kwargs = _mask_kwargs(self._window_left)
         from flashinfer.cute_dsl.attention.fmha.sm120 import (
             compile_sm120_fmha_fp8_paged_kernel,
             compile_sm120_fmha_fp8_ragged_kernel,
@@ -1150,6 +1224,27 @@ class SM120PrimsBatchPrefillBackend:
                 with_lse=with_lse,
                 balanced_scheduler=_use_balanced_scheduler(self._causal),
                 enable_skip_softmax=False,
+                **mask_kwargs,
+            )
+        elif self._kv_split is not None:
+            # The split launch always writes partial LSE rows for the merge.
+            compile_sm120_fmha_fp8_paged_kernel(
+                in_dtype=self._q_dtype,
+                out_dtype=self._o_dtype,
+                num_qo_heads=self._num_qo_heads,
+                num_kv_heads=self._num_kv_heads,
+                head_dim=self._head_dim,
+                is_causal=self._causal,
+                kv_tile=128,
+                q_tile=128,
+                num_tokens_per_page=self._page_size,
+                device=self.device,
+                with_lse=True,
+                balanced_scheduler=_use_balanced_scheduler(self._causal),
+                enable_skip_softmax=False,
+                with_kv_tile_ranges=True,
+                **self._pack_kwargs(),
+                **mask_kwargs,
             )
         else:
             compile_sm120_fmha_fp8_paged_kernel(
@@ -1167,6 +1262,7 @@ class SM120PrimsBatchPrefillBackend:
                 balanced_scheduler=_use_balanced_scheduler(self._causal),
                 enable_skip_softmax=False,
                 **self._pack_kwargs(),
+                **mask_kwargs,
             )
         self._compiled_lse_variants.add(with_lse)
 
@@ -1208,6 +1304,7 @@ class SM120PrimsBatchPrefillBackend:
             v_scale=scale_v,
             lse=lse,
             enable_pdl=enable_pdl,
+            window_left=self._window_left,
         )
 
     def run_paged(
@@ -1265,6 +1362,7 @@ class SM120PrimsBatchPrefillBackend:
                 enable_pdl=enable_pdl,
                 kv_tile_ranges=split.kv_tile_ranges,
                 gqa_pack_size=self._gqa_pack_size,
+                window_left=self._window_left,
             )
             rows, n = split.total_q, split.num_chunks
             get_cascade_module().merge_states(
@@ -1291,6 +1389,7 @@ class SM120PrimsBatchPrefillBackend:
             lse=lse,
             enable_pdl=enable_pdl,
             gqa_pack_size=self._gqa_pack_size,
+            window_left=self._window_left,
         )
         if return_lse:
             return out, lse
