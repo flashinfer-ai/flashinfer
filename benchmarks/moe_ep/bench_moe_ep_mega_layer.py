@@ -124,6 +124,15 @@ def _kernel_config(args: argparse.Namespace, shape: Dict[str, Any]):
     extra = json.loads(args.backend_config)
     if not isinstance(extra, dict):
         raise ValueError("--backend_config must be a JSON object")
+    # The fields set above also shape the generated inputs and weights, so they
+    # come only from the benchmark's own options.
+    overridden = sorted(set(extra) & set(kwargs))
+    if overridden:
+        raise ValueError(
+            f"--backend_config cannot set {overridden}; set them through the "
+            "benchmark's own options (e.g. --top_k, --intermediate_size), "
+            "which also shape the inputs and weights"
+        )
     kwargs.update(extra)
     unknown = sorted(set(kwargs) - set(fields))
     if unknown:
