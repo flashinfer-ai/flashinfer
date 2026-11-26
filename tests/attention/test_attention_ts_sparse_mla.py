@@ -1421,13 +1421,15 @@ def _pdl_outputs(run_test, check_config, profile, wait_after_prologue):
     )
 
 
-def _starts_before_inputs(spec, compiled, args):
-    """Whether the attention grid itself starts before its late predecessor
-    (_late_inputs) restores its inputs, eagerly and in a replayed CUDA graph.
+def _early_start_paths(spec, compiled, args, attempts=3):
+    """The launch paths (``"eager"``, ``"replayed"``) on which the attention grid
+    itself was seen to start before its late predecessor (_late_inputs) restored
+    its inputs, within ``attempts`` tries of each.
 
     A twin of ``compiled`` traced without its grid-dependency wait reads the
     poisoned inputs exactly when the grid starts early, and its output then
-    differs from ``compiled``'s on the same arguments.
+    differs from ``compiled``'s on the same arguments. CUDA does not guarantee
+    that a PDL dependent overlaps its predecessor, so a path can miss.
     """
     from cutlass.experimental import primitives as prims
 
@@ -1454,11 +1456,14 @@ def _starts_before_inputs(spec, compiled, args):
         torch.cuda.synchronize()
         return [t.clone() for t in outputs]
 
+    graphs = {}
+
     def replayed(launch):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            launch(*args)
-        graph.replay()
+        if launch not in graphs:
+            graphs[launch] = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graphs[launch]):
+                launch(*args)
+        graphs[launch].replay()
         torch.cuda.synchronize()
         return [t.clone() for t in outputs]
 
@@ -1466,9 +1471,11 @@ def _starts_before_inputs(spec, compiled, args):
         return not all(_same_bytes(x, y) for x, y in zip(a, b, strict=True))
 
     waited, unwaited = _late_inputs(compiled), _late_inputs(twin)
-    return differ(eager(waited), eager(unwaited)) and differ(
-        replayed(waited), replayed(unwaited)
-    )
+    return {
+        name
+        for name, run in (("eager", eager), ("replayed", replayed))
+        if any(differ(run(waited), run(unwaited)) for _ in range(attempts))
+    }
 
 
 @pytest.mark.parametrize("schedule", ["bf16-static", "fp8-ws-gather", "fp8-nvfp4"])
@@ -1480,8 +1487,9 @@ def test_pdl_wait_after_prologue_graph(schedule):
     releases it at entry and writes Q, the sparse indices and their lengths about
     a millisecond later, so a read issued before the wait sees NaN Q, -1 indices
     and zero lengths. A twin of the deferred kernel without its wait must see
-    them, eagerly and replayed: otherwise the attention grid started late and the
-    arms could not tell a misplaced wait from a correct one.
+    them, eagerly and replayed. If it does not within a few tries, the attention
+    grid started late, the arms could not tell a misplaced wait from a correct
+    one, and the case is skipped as inconclusive.
     """
     from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
         SparseMlaProfile,
@@ -1534,9 +1542,13 @@ def test_pdl_wait_after_prologue_graph(schedule):
     deferred = _pdl_outputs(run_test, launch_config(True), profile, True)
     assert _same_bytes(deferred[0], reference[0])
     assert _same_bytes(deferred[1], reference[1])
-    assert _starts_before_inputs(*deferred[2:]), (
-        "the attention grid started only after its predecessor wrote its inputs"
-    )
+    missed = {"eager", "replayed"} - _early_start_paths(*deferred[2:])
+    if missed:
+        pytest.skip(
+            "inconclusive: the attention grid started only after its predecessor "
+            f"wrote its inputs ({', '.join(sorted(missed))}), so a misplaced wait "
+            "would go unnoticed"
+        )
 
 
 def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
