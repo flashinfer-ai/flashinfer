@@ -1650,6 +1650,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     ),
                     tidx=tidx,
                 )
+                # Order the scale loads above before the async-proxy refill.
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
