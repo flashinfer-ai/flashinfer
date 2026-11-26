@@ -92,12 +92,31 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int, causal: Optional[bool] = None) -> str:
+def _attention_fingerprint(
+    head_dim: int,
+    causal: Optional[bool] = None,
+    lse_base: Optional[str] = None,
+    sinks: bool = False,
+) -> str:
     """The attention class at ``head_dim`` under a mask mode; ``None`` is the causal class (the decode wrapper's
-    ``is_causal=None``), never a truth value."""
-    from ..attention.batch_invariant.spec import spec_fingerprint
+    ``is_causal=None``), never a truth value. ``lse_base`` / ``sinks`` name the class's LSE and sink members, which
+    exist in both modes with a receipt each."""
+    from ..attention.batch_invariant.spec import (
+        lse_fingerprint,
+        sink_fingerprint,
+        spec_fingerprint,
+    )
 
-    return spec_fingerprint(head_dim, causal=True if causal is None else bool(causal))
+    if not isinstance(sinks, bool):
+        raise ValueError(
+            f"sinks names the sink member of the class: True or False, got {sinks!r}"
+        )
+    causal = True if causal is None else bool(causal)
+    if lse_base is not None:
+        return lse_fingerprint(head_dim, lse_base, sinks, causal=causal)
+    if sinks:
+        return sink_fingerprint(head_dim, causal=causal)
+    return spec_fingerprint(head_dim, causal=causal)
 
 
 #: The prefill wrappers' ``plan()`` defaults to ``causal=False``, which runs the non-causal class: their receipt has no
@@ -747,20 +766,27 @@ CLASSES: Dict[str, ClassInfo] = {
     # on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its request's key count
     # and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode. The mode is a fixed
     # dimension of the prefill wrappers' receipt (their plan() defaults to the non-causal class) and optional for the decode
-    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class
+    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class. `lse_base` names the
+    # class's LSE member (`return_lse=True`), a receipt of its own per head dim, mode and base; `sinks=True` names the sink
+    # member (a call with attention sinks), with its own output and LSE receipts in each mode
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
+        "attention.bf16",
+        ("head_dim",),
+        _attention_fingerprint,
+        ("causal", "lse_base", "sinks"),
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("lse_base", "sinks"),
         note=_PREFILL_CAUSAL_NOTE,
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("lse_base", "sinks"),
         note=_PREFILL_CAUSAL_NOTE,
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
@@ -898,7 +924,15 @@ def fingerprint(op: str, **dims) -> str:
     optional: omitted or ``None`` is the causal class, as ``is_causal=None`` is in its ``plan()``, and a single-token decode
     step is the causal class whatever ``is_causal`` says. The sliding window (``window_left``) is a per-call input of the
     causal class, like the KV position: the receipt is the digest of the class's no-window sample row and covers windowed
-    calls too.
+    calls too. The optional ``lse_base`` (``"log2"`` or ``"ln"``) names the LSE member the wrappers return with
+    ``return_lse=True`` -- ``add.rn(mul.rn(m, c), lg2.approx.ftz(l))`` of the row's final maximum and sum, times
+    ``fp32(ln 2)`` in base e -- with its own receipt per head dim, mode and base; the receipt without it is the attention
+    output's and does not depend on whether the LSE is requested. The optional ``sinks=True`` names the sink member, the
+    class of a call with attention sinks (one more merge per row, of its final state with a virtual key of the head's sink
+    logit: ``attn-bf16-d<D>-sink-...``, and with ``lse_base`` the LSE that includes the sink); the sink values are per-call
+    inputs, and the receipts without ``sinks`` are those of calls without sinks. Both members exist in both mask modes;
+    the mode precedes the members in the name (``attn-bf16-d<D>-nc-lse-<base>-...``, ``attn-bf16-d<D>-nc-sink-...``,
+    ``attn-bf16-d<D>-nc-sink-lse-<base>-...``).
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -922,6 +956,10 @@ def fingerprint(op: str, **dims) -> str:
     'kda-bf16-c16-engine-...'
     >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
     'moe-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, lse_base="ln")  # doctest: +SKIP
+    'attn-bf16-d128-lse-ln-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=64, sinks=True)  # doctest: +SKIP
+    'attn-bf16-d64-sink-...'
 
     ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
     ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
