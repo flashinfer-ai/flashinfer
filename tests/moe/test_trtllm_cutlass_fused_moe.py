@@ -1557,8 +1557,12 @@ def test_moe_nvfp4_autotune_profiles_finalize(monkeypatch):
     monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
     original_profile = AutoTuner._profile_single_kernel
     finalized_tactics = set()
+    successful_profiles = 0
+    successful_cuda_profiles = 0
 
     def observe_profile(self, runner, inputs, tactic, tuning_config, *args, **kwargs):
+        nonlocal successful_profiles, successful_cuda_profiles
+
         if (
             kwargs.get("gemm_idx") != 2
             or not getattr(runner, "use_fused_finalize", False)
@@ -1574,18 +1578,26 @@ def test_moe_nvfp4_autotune_profiles_finalize(monkeypatch):
             elapsed = original_profile(
                 self, runner, inputs, tactic, tuning_config, *args, **kwargs
             )
-        if math.isfinite(elapsed) and any(
-            event.device_type == torch.autograd.DeviceType.CUDA
+        if not math.isfinite(elapsed):
+            return elapsed
+        successful_profiles += 1
+        cuda_events = [
+            event
+            for event in trace.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        successful_cuda_profiles += bool(cuda_events)
+        if any(
             # These are the two SwapAB variants of the Blackwell FINALIZE
             # fusion op; an unfused finalizeMoeRoutingKernel must not count.
-            and any(
+            any(
                 fusion_op in event.name
                 for fusion_op in (
                     "ScaledAccPerRowBiasPerColScaleScatter",
                     "ScaledAccPerColBiasPerRowScaleScatter",
                 )
             )
-            for event in trace.events()
+            for event in cuda_events
         ):
             finalized_tactics.add(tactic)
         return elapsed
@@ -1614,6 +1626,12 @@ def test_moe_nvfp4_autotune_profiles_finalize(monkeypatch):
     finally:
         torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
 
+    # A long JIT build can invalidate the initial probe. Wait until all tactics
+    # and the numerical check finish before treating empty traces as unavailable.
+    if not finalized_tactics and successful_profiles and not successful_cuda_profiles:
+        pytest.skip(
+            "torch.profiler records no CUDA activity during successful GEMM2 profiling"
+        )
     assert finalized_tactics, "Cold GEMM2 autotuning did not profile a FINALIZE kernel"
 
 

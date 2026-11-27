@@ -122,6 +122,11 @@ SPLIT_FLAGS = {
 # an 8192-token sequence at n = 3 from H = 8 on -- and the plan lighter than the V6 program's tiles), every sequence
 # of the batch in the one launch.
 V6_SPLIT_FLAGS = V6_FLAGS
+# ... and the V6 pool programs with the write slot table (``use_output_state_indices``; ABI v2.3): the
+# pool-indexed flag set for an FP32, a BF16 and an FP16 pool, then the warm-up split twin of each.  A BF16 / FP16
+# state or ``output_state_indices`` runs them (``tests/gdp/test_cake_gdp_prefill_state_sm90.py``).
+V6_POOL_FLAGS = (True, True, True, False, False)
+V6_POOL_DTYPES = ("f32", "bf16", "f16")
 # The exact programs of the route: every routed program but the split ones.
 ROUTED_FLAGS = V6_FLAGS | UNIT_FLAGS
 # A batch of two 384-chunk sequences at n = 3, merged-class at the head counts the tests pass it (3 and 10; every
@@ -1271,7 +1276,8 @@ def test_every_prefill_program_is_launched(monkeypatch) -> None:
     its final state discarded), the two unit programs, the three merged split programs through merged-class long
     batches at H = 3 and the three V6 split programs through a balanced sequence at H = 10, both with the host
     copy of ``cu_seqlens``; every uniform batch is one launch whose record names the body and the split flag of
-    its launch."""
+    its launch.  (The pool programs with the write slot table run a BF16 / FP16 state or ``output_state_indices``:
+    ``test_cake_gdp_prefill_state_sm90.py`` launches each.)"""
     arch = _arch()
     launched: list[str] = []
     original = loader.run_module
@@ -1339,7 +1345,9 @@ def test_every_prefill_program_is_launched(monkeypatch) -> None:
     prefill = {
         name
         for name, record in loader.MODULES.items()
-        if record["role"] == "prefill" and arch in record["arches"]
+        if record["role"] == "prefill"
+        and arch in record["arches"]
+        and not record["select_rule"].get("use_output_state_indices")
     }
     assert set(launched) == prefill, (sorted(set(launched)), sorted(prefill))
     assert len(prefill) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS) + len(
@@ -1575,8 +1583,9 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
 
 def test_route_tables_are_consistent() -> None:
     """The ``prefill`` route of the device: the three V6 records (every one storing a final state, no unit
-    program, no segment pass), the two unit records and the three split records of the merged body, then the
-    three V6 split records, in that order; ``selected_prefill_module`` resolves every flag set of each body and
+    program, no segment pass), the two unit records and the three split records of the merged body, the three V6
+    split records, then the V6 pool records with the write slot table (an FP32, a BF16 and an FP16 pool) and their
+    three split twins, in that order; ``selected_prefill_module`` resolves every flag set of each body and
     refuses the removed merged exact programs, a V6 unit program, a V6 program without a final state, an unknown
     further flag and both unit flags; the grid rule, the route predicate and the logical names."""
     arch = _arch()
@@ -1587,15 +1596,46 @@ def test_route_tables_are_consistent() -> None:
     single = routes[loader.PREFILL_ROUTE]
     V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     assert loader.ROUTE_BODIES == (P3, V6)
-    assert len(single) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS) + len(
-        V6_SPLIT_FLAGS
+    pools = len(V6_POOL_DTYPES)
+    assert (
+        len(single)
+        == len(V6_FLAGS)
+        + len(UNIT_FLAGS)
+        + len(SPLIT_FLAGS)
+        + len(V6_SPLIT_FLAGS)
+        + 2 * pools
     )
     v6_flags = set()
     unit_flags = set()
     split_flags = set()
     v6_split_flags = set()
+    pool_forms = []
     for name in single:
         record = loader.MODULES[name]
+        if record["select_rule"].get("use_output_state_indices"):
+            # a pool program with the write slot table: the V6 pool-indexed flags, its dtype in its build alone
+            rule = record["select_rule"]
+            split = bool(record["build"].get(loader.PREFILL_SPLIT_FLAG))
+            assert record["body"] == V6 and record["arches"] == [arch]
+            assert record["grid_rule"] == {"kind": "tiles"}
+            assert record["launch"]["block"] == (384, 1, 1)
+            assert set(rule) == {
+                "kind",
+                "use_output_state_indices",
+                *loader.PREFILL_FLAGS,
+                *((loader.PREFILL_SPLIT_FLAG,) if split else ()),
+            }
+            assert (
+                tuple(rule[flag] for flag in loader.PREFILL_FLAGS[:5]) == V6_POOL_FLAGS
+                and not rule["segment_pass"]
+            )
+            dtype = record["build"].get("state_dtype", "f32")
+            assert record["build"]["use_output_state_indices"] is True
+            assert ("output_state_indices" in record["logical"].values()) and (
+                ("rand_seed" in record["logical"].values()) == (dtype != "f32")
+            )
+            pool_forms.append((dtype, split))
+            continue
         assert (
             record["role"] == "prefill"
             and record["body"] in loader.ROUTE_BODIES
@@ -1651,6 +1691,9 @@ def test_route_tables_are_consistent() -> None:
             unit_flags.add(five)
     assert v6_flags == V6_FLAGS and unit_flags == UNIT_FLAGS
     assert split_flags == SPLIT_FLAGS and v6_split_flags == V6_SPLIT_FLAGS
+    assert pool_forms == [(dtype, False) for dtype in V6_POOL_DTYPES] + [
+        (dtype, True) for dtype in V6_POOL_DTYPES
+    ]
     assert [
         (
             loader.MODULES[name]["body"],
@@ -1659,7 +1702,45 @@ def test_route_tables_are_consistent() -> None:
         for name in single
     ] == [(V6, False)] * len(V6_FLAGS) + [(P3, False)] * len(UNIT_FLAGS) + [
         (P3, True)
-    ] * len(SPLIT_FLAGS) + [(V6, True)] * len(V6_SPLIT_FLAGS)
+    ] * len(SPLIT_FLAGS) + [(V6, True)] * len(V6_SPLIT_FLAGS) + [
+        (V6, False)
+    ] * pools + [(V6, True)] * pools
+    # the pool programs resolve by the write slot table flag and the state dtype; the f32 pool program and P-C
+    # spell one flag set and are told apart by that flag
+    for split in (False, True):
+        extra = {loader.PREFILL_SPLIT_FLAG: True} if split else {}
+        for dtype in V6_POOL_DTYPES:
+            name = loader.selected_prefill_module(
+                arch,
+                body=V6,
+                use_initial_state=True,
+                use_state_indices=True,
+                store_final_state=True,
+                use_output_state_indices=True,
+                state_dtype=dtype,
+                **extra,
+            )
+            record = loader.MODULES[name]
+            assert record["build"].get("state_dtype", "f32") == dtype
+            assert bool(record["build"].get(loader.PREFILL_SPLIT_FLAG)) == split
+        plain = loader.selected_prefill_module(
+            arch,
+            body=V6,
+            use_initial_state=True,
+            use_state_indices=True,
+            store_final_state=True,
+            **extra,
+        )
+        assert not loader.MODULES[plain]["build"].get("use_output_state_indices")
+    with pytest.raises(ValueError, match="0 programs"):
+        loader.selected_prefill_module(
+            arch,
+            body=V6,
+            use_initial_state=True,
+            use_state_indices=True,
+            store_final_state=True,
+            state_dtype="bf16",
+        )  # a 16-bit state without the write slot table: no program
     for body, table, extra in (
         (V6, V6_FLAGS, {}),
         (P3, UNIT_FLAGS, {}),
@@ -1818,16 +1899,22 @@ def test_route_tables_are_consistent() -> None:
     assert loader.PREFILL_LOGICAL_TENSORS[:4] == ("q", "k", "v", "o")
     # the logical names of the shared prefill vocabulary but the Blackwell body's own (its item table, workspace,
     # flags word and counts, and the pool programs' write slots, rounding seed and Philox rounds)
+    # (the SM90 pool programs take the write slots, the seed and the rounds too, after the shared formals)
     blackwell_only = {
         "items",
         "split_workspace",
         "state_stride_slot",
         "num_items",
         "flags",
-        "output_state_indices",
-        "rand_seed",
-        "philox_rounds",
     }
+    pool_only = {"output_state_indices", "rand_seed", "philox_rounds"}
+    assert not blackwell_only & {
+        logical
+        for record in loader.MODULES.values()
+        if record["role"] == "prefill" and arch in record["arches"]
+        for logical in record["logical"].values()
+    }
+    blackwell_only |= pool_only
     for name in (base, merged):
         assert (
             set(loader.MODULES[name]["logical"].values())
@@ -1901,7 +1988,8 @@ def test_prefill_records_reference_the_build_manifest() -> None:
             continue
         seen += 1
         assert record["library"] == record["kernel"] == name
-        # two prefill bodies: the merged body and the V6 fork-order body (three flag sets and their split twins)
+        # two prefill bodies: the merged body and the V6 fork-order body (three flag sets, the pool programs with
+        # the write slot table and their split twins)
         assert record["body"] in (loader.ROUTE_BODY_P3, loader.ROUTE_BODY_V6), (
             name,
             record["body"],
@@ -1918,8 +2006,9 @@ def test_prefill_records_reference_the_build_manifest() -> None:
                 assert (package / source).is_file(), source
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
             assert "--use_fast_math" in entry["nvcc_flags"], (name, entry["nvcc_flags"])
-    assert seen == len(ROUTED_FLAGS) + len(SPLIT_FLAGS) + len(V6_SPLIT_FLAGS)
-    assert v6_seen == len(V6_FLAGS) + len(V6_SPLIT_FLAGS), v6_seen
+    pools = 2 * len(V6_POOL_DTYPES)
+    assert seen == len(ROUTED_FLAGS) + len(SPLIT_FLAGS) + len(V6_SPLIT_FLAGS) + pools
+    assert v6_seen == len(V6_FLAGS) + len(V6_SPLIT_FLAGS) + pools, v6_seen
 
 
 def test_is_supported_reports_the_routes() -> None:
@@ -1977,15 +2066,18 @@ def test_rejects_invalid_arguments() -> None:
         call(beta=c.beta.to(torch.float64))
     with pytest.raises(ValueError, match="initial_state must have shape"):
         call(initial_state=c.initial_state[:1])
-    with pytest.raises(ValueError, match="initial_state must be float32"):
+    # one state dtype per call (a bfloat16 initial_state with a float32 final state is converted, PR 1)
+    with pytest.raises(
+        ValueError, match="a float16 initial_state stores a float16 final state"
+    ):
         call(initial_state=c.initial_state.to(torch.float16))
-    with pytest.raises(ValueError, match="output_state must be float32"):
+    with pytest.raises(ValueError, match="must share one dtype"):
         call(output_state=c.initial_state.to(torch.bfloat16))
     with pytest.raises(ValueError, match="output_state must be contiguous"):
         call(output_state=torch.zeros((c.N, c.H, V, 2 * K), device=device)[:, :, :, :K])
     with pytest.raises(ValueError, match="explicit output_state pool"):
         call(state_indices=torch.zeros((c.N,), device=device, dtype=torch.int32))
-    with pytest.raises(ValueError, match="initial_state must be float32"):
+    with pytest.raises(ValueError, match="pools must share one dtype"):
         call(
             initial_state=c.initial_state.to(torch.bfloat16),
             state_indices=torch.zeros((c.N,), device=device, dtype=torch.int32),

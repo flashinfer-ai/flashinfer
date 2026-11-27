@@ -22,6 +22,7 @@ raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instea
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -186,8 +187,6 @@ class BatchInvariantFp4Runner(MoERunner):
         self.device = torch.device(device)
         if self.device.index is None and self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
-        # an unserved pair is refused by check_support (the layer's filter never constructs this case)
-        self._pair: Optional[Fp4Pair] = PAIRS.get(config.quant.pair)
         # exact shapes: the dispatcher's pick is a function of the token count (every tactic computes the same bits)
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
@@ -200,6 +199,11 @@ class BatchInvariantFp4Runner(MoERunner):
         # the intermediate's class (`per_token` / `static`): the bound backend config's field
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
+
+    @functools.cached_property
+    def _pair(self) -> Optional[Fp4Pair]:
+        """The configuration's pair, or ``None`` for an unserved pair (the layer's filter never constructs this case)."""
+        return PAIRS.get(self.config.quant.pair)
 
     @property
     def pair(self) -> Fp4Pair:

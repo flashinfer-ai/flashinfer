@@ -233,29 +233,80 @@ def test_other_backends_refuse_the_cake_arguments() -> None:
                 chunk_gated_delta_product(**inputs, backend=which, **kwargs)
 
 
-def test_sm90_refuses_the_blackwell_state_forms() -> None:
-    """On SM90 the programs read and store a float32 state: output slots, a seed and a float16 / bfloat16 stored
-    state are refused (a bfloat16 per-sequence initial state is still converted)."""
-    inputs = _inputs(
-        2, (129, 65), 3, torch.Generator(device=_device()).manual_seed(SEED)
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    wide = torch.int32 if a.element_size() == 4 else torch.int16
+    return a.dtype == b.dtype and torch.equal(
+        a.contiguous().view(wide), b.contiguous().view(wide)
     )
-    slots = torch.tensor([1, 0], device=_device(), dtype=torch.int32)
-    pool = torch.zeros((4, 3, V, K), device=_device())
+
+
+def test_sm90_takes_the_pool_state_forms() -> None:
+    """On SM90 the V6 pool programs with the write slot table take ``output_state_indices`` and a bfloat16 /
+    float16 state.  Through the public function and the package alike, an in-place pool call (read slots ``[1,
+    0]``, write slots ``[3, 2]``) returns the output bits of the dense float32 call on the gathered, widened rows (a
+    float32 program, not a pool program) and stores that call's final state, rounded to nearest even, at the write
+    slots, bit for bit: the pool programs are the indexed V6 twins, so a float32 pool is the dense call and a 16-bit
+    pool its rounding.  ``rand_seed`` rounds a bfloat16 / float16 pool stochastically (the public function and
+    the package store the same bits) and is refused for a float32 state; a float16 per-sequence
+    ``initial_state`` needs a float16 ``output_state`` (a bfloat16 one is still converted to the float32 state
+    allocated for the call)."""
+    generator = torch.Generator(device=_device()).manual_seed(SEED)
+    inputs = _inputs(2, (129, 65), 3, generator)
+    reads, writes = [1, 0], [3, 2]
+    slots = torch.tensor(reads, device=_device(), dtype=torch.int32)
     seed = torch.tensor([3], device=_device(), dtype=torch.int64)
-    for kwargs, match in (
-        (
-            {"state_indices": slots, "output_state_indices": slots},
-            "output_state_indices",
-        ),
-        ({"rand_seed": seed}, "rand_seed"),
-    ):
-        with pytest.raises(ValueError, match=match):
-            chunk_gated_delta_product(
-                **{**inputs, "initial_state": pool[:2], "output_final_state": True},
-                backend="cake",
-                **kwargs,
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        initial = (
+            0.1 * torch.randn(4, 3, V, K, device=_device(), generator=generator)
+        ).to(dtype)
+        ref_out, ref_state = backend.cake_chunk_gated_delta_product(
+            **{**inputs, "initial_state": initial[reads].float()}
+        )
+        expected = initial.clone()
+        expected[writes] = ref_state.to(dtype)
+        for function in (
+            lambda **kw: chunk_gated_delta_product(**kw, backend="cake"),
+            backend.cake_chunk_gated_delta_product,
+        ):
+            pool = initial.clone()
+            out, state = function(
+                **{**inputs, "initial_state": pool, "output_state": pool},
+                state_indices=slots,
+                output_state_indices=torch.tensor(
+                    writes, device=_device(), dtype=torch.int64
+                ),
             )
-    with pytest.raises(ValueError, match="float32"):
+            assert state is pool
+            assert _same_bits(out, ref_out) and _same_bits(pool, expected), dtype
+        if dtype == torch.float32:
+            continue
+        stochastic = []
+        for function in (
+            lambda **kw: chunk_gated_delta_product(**kw, backend="cake"),
+            backend.cake_chunk_gated_delta_product,
+        ):
+            pool = initial.clone()
+            out, _ = function(
+                **{**inputs, "initial_state": pool, "output_state": pool},
+                state_indices=slots,
+                output_state_indices=torch.tensor(
+                    writes, device=_device(), dtype=torch.int64
+                ),
+                rand_seed=seed,
+            )
+            assert _same_bits(out, ref_out), dtype
+            stochastic.append(pool)
+        assert _same_bits(stochastic[0], stochastic[1]), dtype
+        assert not _same_bits(stochastic[0], expected), dtype
+    pool = torch.zeros((4, 3, V, K), device=_device())
+    with pytest.raises(ValueError, match="float32 state"):
+        chunk_gated_delta_product(
+            **{**inputs, "initial_state": pool, "output_state": pool},
+            state_indices=slots,
+            rand_seed=seed,
+            backend="cake",
+        )
+    with pytest.raises(ValueError, match="float16 output_state"):
         chunk_gated_delta_product(
             **{
                 **inputs,
@@ -264,6 +315,10 @@ def test_sm90_refuses_the_blackwell_state_forms() -> None:
             },
             backend="cake",
         )
+    out, state = chunk_gated_delta_product(
+        **{**inputs, "initial_state": pool[:2].bfloat16()}, backend="cake"
+    )
+    assert state.dtype == torch.float32
 
 
 def test_unit_gate_calls_dispatch_to_the_unit_programs(monkeypatch) -> None:
