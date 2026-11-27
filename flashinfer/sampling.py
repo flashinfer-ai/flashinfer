@@ -783,8 +783,18 @@ def get_sampling_module():
         draft_probs = draft_probs.float()
         draft_token_ids = draft_token_ids.int()
         target_probs = target_probs.float()
-        output_accepted_token_num = output_accepted_token_num.int()
-        output_emitted_draft_token_num = output_emitted_draft_token_num.int()
+        if output_accepted_token_num.dtype != torch.int32:
+            raise ValueError(
+                f"output_accepted_token_num must be int32, got {output_accepted_token_num.dtype}"
+            )
+        if not output_accepted_token_num.is_contiguous():
+            raise ValueError("output_accepted_token_num must be contiguous")
+        if output_emitted_draft_token_num.dtype != torch.int32:
+            raise ValueError(
+                f"output_emitted_draft_token_num must be int32, got {output_emitted_draft_token_num.dtype}"
+            )
+        if not output_emitted_draft_token_num.is_contiguous():
+            raise ValueError("output_emitted_draft_token_num must be contiguous")
         b, n = draft_token_ids.shape
         output_token_ids = torch.empty((b, n + 1), dtype=torch.int32, device=device)
         batch_size = b
@@ -3153,10 +3163,22 @@ def chain_speculative_sampling(
     if maybe_output_accepted_token_num is None:
         output_accepted_token_num = torch.zeros(b, dtype=torch.int32, device=dev)
     else:
+        if maybe_output_accepted_token_num.dtype != torch.int32:
+            raise ValueError(
+                f"maybe_output_accepted_token_num must be int32, got {maybe_output_accepted_token_num.dtype}"
+            )
+        if not maybe_output_accepted_token_num.is_contiguous():
+            raise ValueError("maybe_output_accepted_token_num must be contiguous")
         output_accepted_token_num = maybe_output_accepted_token_num
     if maybe_output_emitted_draft_token_num is None:
         output_emitted_draft_token_num = torch.zeros(b, dtype=torch.int32, device=dev)
     else:
+        if maybe_output_emitted_draft_token_num.dtype != torch.int32:
+            raise ValueError(
+                f"maybe_output_emitted_draft_token_num must be int32, got {maybe_output_emitted_draft_token_num.dtype}"
+            )
+        if not maybe_output_emitted_draft_token_num.is_contiguous():
+            raise ValueError("maybe_output_emitted_draft_token_num must be contiguous")
         output_emitted_draft_token_num = maybe_output_emitted_draft_token_num
     output_token_ids = get_sampling_module().chain_speculative_sampling(
         draft_probs,

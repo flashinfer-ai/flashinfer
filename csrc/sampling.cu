@@ -354,8 +354,14 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(target_probs);
+  CHECK_INPUT(output_token_ids);
+  CHECK_INPUT_AND_TYPE(output_accepted_token_num, tvm::ffi::DataType::Int(32));
+  CHECK_INPUT_AND_TYPE(output_emitted_draft_token_num, tvm::ffi::DataType::Int(32));
   CHECK_DEVICE(draft_token_ids, draft_probs);
   CHECK_DEVICE(target_probs, draft_probs);
+  CHECK_DEVICE(output_token_ids, draft_probs);
+  CHECK_DEVICE(output_accepted_token_num, draft_probs);
+  CHECK_DEVICE(output_emitted_draft_token_num, draft_probs);
   const auto rng_strides = validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr,
                                                         draft_probs, draft_probs.size(0));
 
