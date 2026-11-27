@@ -109,8 +109,11 @@ class _Sm8xCutlassMoEBase(_CudnnGroupedGemmRunnerBase):
     runner, which checked the configuration and packed the inputs; ``run`` maps
     its packed inputs onto this pipeline's."""
 
-    # Packed-input index of GEMM1's [E] float32 per-expert alpha, if any.
+    # Packed-input indices of GEMM1's and GEMM2's [E] float32 per-expert alphas, if
+    # any. CUTLASS scales the float32 accumulator in the GEMM epilogue, before the
+    # BF16 store: those GEMMs write float32 here and ``_epilogue`` rounds.
     _gemm1_alpha_input: ClassVar[Optional[int]] = None
+    _gemm2_alpha_input: ClassVar[Optional[int]] = None
     _intermediate_alignment: ClassVar[int]
 
     def __init__(self, config: MoEConfig, device: torch.device) -> None:
@@ -162,13 +165,27 @@ class _Sm8xCutlassMoEBase(_CudnnGroupedGemmRunnerBase):
         inputs: List[torch.Tensor],
     ) -> torch.Tensor:
         row_expert = layout.row_expert(gemm1_out.shape[0])
-        x = gemm1_out.float()
-        if self._gemm1_alpha_input is not None:
-            x.mul_(inputs[self._gemm1_alpha_input].index_select(0, row_expert)[:, None])
         y = cutlass_activation(
-            x, self.config.activation.type, self._activation_params, row_expert
+            gemm1_out.float(),
+            self.config.activation.type,
+            self._activation_params,
+            row_expert,
         )
         return self._gemm2_operand(y, workspace, inputs)
+
+    @staticmethod
+    def _epilogue(
+        acc: torch.Tensor,
+        alpha_input: Optional[int],
+        layout: _GroupedGemmLayout,
+        inputs: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """CUTLASS's epilogue ``bf16(alpha[e] * acc)`` on a float32 GEMM output."""
+        if alpha_input is None:
+            return acc
+        row_expert = layout.row_expert(acc.shape[0])
+        alpha = inputs[alpha_input].index_select(0, row_expert)[:, None]
+        return acc.mul_(alpha).to(torch.bfloat16)
 
     def _gemm2_operand(
         self,
@@ -191,7 +208,7 @@ class Sm8xCutlassFp8PerTensorMoE(_Sm8xCutlassMoEBase):
     _expected_num_inputs = 8
     _gemm1_alpha_input = 5
     _fc2_act_quant_input = 6
-    _fc2_dequant_input = 7
+    _gemm2_alpha_input = 7
     _intermediate_dtype = torch.float8_e4m3fn
     _intermediate_alignment = 16  # GEMM2's K
 
@@ -199,14 +216,15 @@ class Sm8xCutlassFp8PerTensorMoE(_Sm8xCutlassMoEBase):
         return [*inputs[1:9], inputs[0]]
 
     def _gemm1(self, inputs, layout, workspace, tactic) -> torch.Tensor:
-        return sm8x_grouped_mm_fp8(
+        acc = sm8x_grouped_mm_fp8(
             workspace.permuted_hidden_states,
             inputs[3],
             layout.m_indptr,
             None,
-            torch.bfloat16,
-            workspace.gemm1_out,
+            torch.float32,
+            None,
         )
+        return self._epilogue(acc, self._gemm1_alpha_input, layout, inputs)
 
     def _gemm2_operand(self, y, workspace, inputs) -> torch.Tensor:
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
@@ -217,9 +235,10 @@ class Sm8xCutlassFp8PerTensorMoE(_Sm8xCutlassMoEBase):
         )
 
     def _gemm2(self, inputs, layout, workspace, intermediate, tactic) -> torch.Tensor:
-        return sm8x_grouped_mm_fp8(
-            intermediate, inputs[4], layout.m_indptr, None, torch.bfloat16, None
+        acc = sm8x_grouped_mm_fp8(
+            intermediate, inputs[4], layout.m_indptr, None, torch.float32, None
         )
+        return self._epilogue(acc, self._gemm2_alpha_input, layout, inputs)
 
 
 class _Sm8xCutlassMxfp8MoEBase(
@@ -253,33 +272,35 @@ class Sm8xCutlassMxfp8MoE(_Sm8xCutlassMxfp8MoEBase):
     backend_key = "cutlass_mxfp8"
     _weight_dtype = torch.float8_e4m3fn
     _gemm1_alpha_input = 7
-    _fc2_dequant_input = 8
+    _gemm2_alpha_input = 8
 
     def _gemm1(self, inputs, layout, workspace, tactic) -> torch.Tensor:
         assert workspace.permuted_hidden_states_scale is not None
-        return sm8x_grouped_mm_mxfp8(
+        acc = sm8x_grouped_mm_mxfp8(
             workspace.permuted_hidden_states,
             inputs[3],
             workspace.permuted_hidden_states_scale,
             inputs[5].view(torch.uint8),
             layout.m_indptr,
-            torch.bfloat16,
-            workspace.gemm1_out,
+            torch.float32,
+            None,
         )
+        return self._epilogue(acc, self._gemm1_alpha_input, layout, inputs)
 
     def _gemm2(self, inputs, layout, workspace, intermediate, tactic) -> torch.Tensor:
         from .prepare import _quantize_mxfp8_rows
 
         quantized, scale = _quantize_mxfp8_rows(intermediate)
-        return sm8x_grouped_mm_mxfp8(
+        acc = sm8x_grouped_mm_mxfp8(
             quantized,
             inputs[4],
             scale,
             inputs[6].view(torch.uint8),
             layout.m_indptr,
-            torch.bfloat16,
+            torch.float32,
             None,
         )
+        return self._epilogue(acc, self._gemm2_alpha_input, layout, inputs)
 
 
 class Sm8xCutlassMxfp8Mxfp4MoE(_Sm8xCutlassMxfp8MoEBase):
