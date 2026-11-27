@@ -324,6 +324,34 @@ def test_use_shuffled_matrix_cli_accepts_boolean_spelling(value, expected):
 
 
 @pytest.mark.cpu_only
+def test_locality_cli_mapping():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+    from flashinfer.prims_ts.batched_gemm.config_types import (
+        LocalitySideSource,
+        LocalitySplit,
+    )
+
+    parser = build_arg_parser()
+    defaults = _parse_overrides(parser.parse_args([]))
+    assert defaults["locality_split"] == int(LocalitySplit.OFF)
+    assert defaults["locality_side_source"] == int(LocalitySideSource.DOMAIN)
+    args = parser.parse_args(
+        [
+            "--locality-split",
+            "weights_activations_output",
+            "--locality-side-source",
+            "zero",
+        ]
+    )
+    overrides = _parse_overrides(args)
+    assert overrides["locality_split"] == int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+    assert overrides["locality_side_source"] == int(LocalitySideSource.ZERO)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("distribution", ("default", "allZeros"))
 def test_data_distribution_cli_matches_trtllm_gen_spelling(distribution):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import build_arg_parser
