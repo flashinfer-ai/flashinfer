@@ -527,6 +527,18 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return support_nvlink_and_all_up
 
 
+def _fabric_cluster_uuid(fabric_info: Any) -> bytes:
+    """Return the raw 16-byte cluster UUID of an NVML fabric info struct.
+
+    nvidia-ml-py 12.x declares ``clusterUuid`` as ``c_char * 16``, and its
+    struct wrapper UTF-8 decodes ``c_char`` arrays on attribute access: a
+    binary UUID then raises ``UnicodeDecodeError`` or is cut at its first zero
+    byte. Read the field from the struct's memory instead.
+    """
+    field = type(fabric_info).clusterUuid
+    return ctypes.string_at(ctypes.addressof(fabric_info) + field.offset, field.size)
+
+
 def is_mnnvl_fabric_supported(device_idx: int) -> bool:
     fabric_handle_supported = checkCudaErrors(
         cuda.cuDeviceGetAttribute(
@@ -545,7 +557,7 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         return (
             fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
             # A binary UUID may start with zero; only an all-zero UUID is absent.
-            and any(fabric_info.clusterUuid)
+            and any(_fabric_cluster_uuid(fabric_info))
         )
     finally:
         pynvml.nvmlShutdown()
@@ -646,7 +658,7 @@ def _local_fabric_status(dev_id: int) -> Tuple[Optional[str], bytes]:
         return None, b""
     if fabric_info.state < pynvml.NVML_GPU_FABRIC_STATE_COMPLETED:
         return None, b""
-    return None, bytes(fabric_info.clusterUuid)
+    return None, _fabric_cluster_uuid(fabric_info)
 
 
 def choose_mnnvl_handle_type(comm: CommBackend, dev_id: int) -> Tuple[Any, bool]:
