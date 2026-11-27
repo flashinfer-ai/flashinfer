@@ -32,6 +32,7 @@ from flashinfer.fused_moe import (
     prims_ts_fp8_block_scale_moe,
     prims_ts_fp8_block_scale_routed_moe,
 )
+from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
 from flashinfer.utils import device_support_pdl, get_compute_capability
@@ -40,6 +41,59 @@ from flashinfer.utils import device_support_pdl, get_compute_capability
 @pytest.fixture(scope="module")
 def cache_permute_indices():
     return {}
+
+
+@pytest.mark.parametrize(
+    ("argument_index", "dtype", "error_match"),
+    [
+        pytest.param(
+            6,
+            torch.int32,
+            "cta_idx_xy_to_batch_idx must be a CUDA tensor",
+            id="tile-map",
+        ),
+        pytest.param(7, torch.float32, "gemm1_alpha must be a CUDA tensor", id="alpha"),
+        pytest.param(8, torch.float32, "gemm1_beta must be a CUDA tensor", id="beta"),
+        pytest.param(
+            9,
+            torch.float32,
+            "gemm1_clamp_limit must be a CUDA tensor",
+            id="clamp-limit",
+        ),
+    ],
+)
+def test_deepseek_fp8_activation_rejects_cpu_auxiliary_tensors(
+    argument_index,
+    dtype,
+    error_match,
+):
+    """The native staged-activation ABI must reject host pointers before launch."""
+    device = torch.device("cuda")
+    arguments = [
+        torch.empty((1, 256), dtype=torch.uint8, device=device),
+        torch.empty((2, 1), dtype=torch.float32, device=device),
+        torch.empty((1, 128), dtype=torch.uint8, device=device),
+        torch.empty((1, 1), dtype=torch.float32, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
+        None,
+        None,
+        None,
+        1,  # num_tokens
+        1,  # top_k
+        128,  # intermediate_size
+        1,  # local_num_experts
+        1,  # tile_tokens_dim
+        ActivationType.Situ.value,
+        False,  # enable_pdl
+        128,  # sf_block_size
+    ]
+    arguments[argument_index] = torch.zeros(1, dtype=dtype, device="cpu")
+
+    moe_op = get_trtllm_moe_sm100_module().moe_op
+    with pytest.raises(RuntimeError, match=error_match):
+        moe_op.trtllm_moe_run_deepseek_fp8_activation(*arguments)
 
 
 @pytest.mark.parametrize(
@@ -95,6 +149,68 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
         activation_type=ActivationType.Swiglu,
         cache_permute_indices=cache_permute_indices,
         routing_logits_dtype=torch.bfloat16,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_mode", "block_size", "intermediate_size"),
+    [
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_MXFP8, 128, 512, id="MxFp8"),
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, 128, 512, id="DeepSeekFp8"),
+        pytest.param(
+            QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, 32, 160, id="DeepSeekFp8-block32"
+        ),
+    ],
+)
+def test_prims_ts_fp8_block_scale_situ_matches_reference(
+    quant_mode,
+    block_size,
+    intermediate_size,
+    cache_permute_indices,
+):
+    """Kimi K3 SiTU parameters match the dequantized reference."""
+    num_tokens = 128 if quant_mode == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK else 32
+    hidden_size = 512
+    num_experts = 64
+    top_k = 8
+    device = torch.device("cuda")
+
+    run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=quant_mode, block_size=block_size
+        ),
+        routing_config={
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [intermediate_size],
+            "compatible_activation_types": [ActivationType.Situ],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Situ,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        gemm1_alpha=torch.full((num_experts,), 4.0, device=device, dtype=torch.float32),
+        gemm1_beta=torch.full((num_experts,), 25.0, device=device, dtype=torch.float32),
+        gemm1_clamp_limit=torch.full(
+            (num_experts,), 6.0, device=device, dtype=torch.float32
+        ),
         moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
     )
 
