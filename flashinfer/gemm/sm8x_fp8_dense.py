@@ -265,7 +265,7 @@ def _run_fp8(
     x = a.view(torch.uint8)
     if not x.is_contiguous() or x.data_ptr() % 4:
         x = x.clone(memory_format=torch.contiguous_format)
-    w, rs, ks, bs = _weight(b, k, n, shuffled and not mx)
+    w, rs, ks, bs = _weight(b, k, n, shuffled and not mx and not routed)
     rows, max_blocks = batches * m, batches * -(-m // r)
     if routed:  # each group's last block partial: at most M / r + groups
         max_blocks = m // r + groups
@@ -458,7 +458,12 @@ class Sm8xFp8GroupwiseRunner(TunableRunner):
 class Sm8xGroupFp8GroupwiseRunner(Sm8xFp8GroupwiseRunner):
     """``_run_fp8`` over ``m_indptr``'s row groups behind ``group_gemm_fp8_nt_groupwise`` on
     ``[a, b, a_scale, b_scale, m_indptr, out]`` (``b`` ``(batch, N, K)``, the scales as
-    ``_run_fp8`` reads them); tactic: the row tile."""
+    ``_run_fp8`` reads them; ``shuffled``: the trtllm MoE weight's rows in the shuffle);
+    tactic: the row tile."""
+
+    def __init__(self, gm: int, shuffled: bool = False):
+        super().__init__(gm)
+        self.shuffled = shuffled
 
     def get_cache_key_extras(self, inputs) -> tuple:
         return (inputs[0].dtype, inputs[5].dtype, self.gm)
@@ -467,7 +472,8 @@ class Sm8xGroupFp8GroupwiseRunner(Sm8xFp8GroupwiseRunner):
         a, b, scale_a, scale_b, m_indptr, out = inputs
         _run_fp8(
             a[None], b.transpose(1, 2), scale_a, scale_b, out[None],
-            64 if tactic in (None, -1) else tactic, False, gm=self.gm, m_indptr=m_indptr,
+            64 if tactic in (None, -1) else tactic, self.shuffled, gm=self.gm,
+            m_indptr=m_indptr,
         )  # fmt: skip
         return out
 
@@ -657,11 +663,13 @@ def sm8x_group_gemm_fp8_nt_groupwise(
     _run_group_groupwise(a, b, a_scale, b_scale, m_indptr, out, gm)
 
 
-def _run_group_groupwise(a, b, a_scale, b_scale, m_indptr, out, gm: int) -> None:
-    runner = Sm8xGroupFp8GroupwiseRunner(gm)
+def _run_group_groupwise(
+    a, b, a_scale, b_scale, m_indptr, out, gm: int, shuffled: bool = False
+) -> None:
+    runner = Sm8xGroupFp8GroupwiseRunner(gm, shuffled)
     inputs = [a, b, a_scale, b_scale, m_indptr, out]
     chosen, tactic = AutoTuner.get().choose_one(
-        "group_gemm_fp8_nt_groupwise_sm8x",
+        "group_gemm_fp8_nt_groupwise_sm8x" + ("_shuffled" if shuffled else ""),
         [runner],
         _groupwise_tuning_config(gm, 5),
         inputs,
@@ -683,9 +691,11 @@ def sm8x_grouped_mm_fp8(
     alpha: Optional[torch.Tensor],
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor],
+    shuffled: bool = False,
 ) -> torch.Tensor:
     """``grouped_mm_fp8`` on SM80 / SM86 / SM87: ``alpha * (a @ b[e]^T)`` over cuDNN's MOE
-    segments (the starts ``m_indptr[:-1]``, the last segment to ``a.shape[0]``)."""
+    segments (the starts ``m_indptr[:-1]``, the last segment to ``a.shape[0]``);
+    ``shuffled``: ``b`` the trtllm MoE weight, its rows in the shuffle."""
     _grouped_one_device(a, b, m_indptr, alpha, out)
     cum_m, k = (int(x) for x in a.shape)
     if k % 16:
@@ -696,7 +706,9 @@ def sm8x_grouped_mm_fp8(
         starts = m_indptr.reshape(-1)[:-1]
         ip = torch.cat((starts, starts.new_full((1,), cum_m)))
         one = _ones(a.device)
-        _run_group_groupwise(a, b, one if alpha is None else alpha, one, ip, out, 0)
+        _run_group_groupwise(
+            a, b, one if alpha is None else alpha, one, ip, out, 0, shuffled
+        )
     return out
 
 
@@ -821,7 +833,11 @@ class Sm8xDeepGemmFp8Runner(TunableRunner):
     """``_run_fp8`` on the DeepGEMM scales as MXFP8 behind ``group_deepgemm_fp8_nt_groupwise``
     (``[a, b, a_sf, b_sf, m_indices, out]``, 2-D ``a``) and ``batch_deepgemm_fp8_nt_groupwise``
     (``[a, b, a_sf, b_sf, masked_m, out]``, 3-D ``a``), and on the MXFP8 scales of
-    ``ragged_scaled_bmm`` and ``masked_scaled_bmm``; tactic: the row tile."""
+    ``ragged_scaled_bmm`` and ``masked_scaled_bmm`` (``shuffled``: the trtllm MoE weight's
+    rows, 2-D ``a``); tactic: the row tile."""
+
+    def __init__(self, shuffled: bool = False):
+        self.shuffled = shuffled
 
     def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
         return [8, 16, 32, 64]
@@ -831,8 +847,8 @@ class Sm8xDeepGemmFp8Runner(TunableRunner):
         r = 64 if tactic in (None, -1) else tactic
         if a.dim() == 2:
             _run_fp8(
-                a[None], b.transpose(1, 2), a_sf, b_sf, out[None], r, False, True,
-                m_keys=rows,
+                a[None], b.transpose(1, 2), a_sf, b_sf, out[None], r, self.shuffled,
+                True, m_keys=rows,
             )  # fmt: skip
         else:
             _run_fp8(
@@ -1032,9 +1048,12 @@ def _tuned_rows_fp4(name: str, fmt: Optional[int], inputs: list) -> None:
     chosen(inputs=inputs, tactic=tactic)
 
 
-def _tuned_mx8(name: str, masked: bool, inputs: list) -> None:
+def _tuned_mx8(name: str, masked: bool, inputs: list, shuffled: bool = False) -> None:
     chosen, tactic = AutoTuner.get().choose_one(
-        name, [Sm8xDeepGemmFp8Runner()], _deepgemm_tuning_config(masked), inputs
+        name + ("_shuffled" if shuffled else ""),
+        [Sm8xDeepGemmFp8Runner(shuffled)],
+        _deepgemm_tuning_config(masked),
+        inputs,
     )
     chosen(inputs=inputs, tactic=tactic)
 
@@ -1303,9 +1322,11 @@ def sm8x_grouped_mm_mxfp8(
     m_indptr: torch.Tensor,
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor],
+    shuffled: bool = False,
 ) -> torch.Tensor:
     """``grouped_mm_mxfp8`` on SM8x: ``a @ b[e]^T`` over cuDNN's MOE segments, the rows before
-    ``m_indptr[0]`` unwritten."""
+    ``m_indptr[0]`` unwritten; ``shuffled``: ``b`` and its scales the trtllm MoE weight's, the
+    rows in the shuffle."""
     out, ip = _grouped_mm_rows(
         a, b, a_descale, b_descale, m_indptr, int(a.shape[1]), 32, out_dtype, out
     )
@@ -1314,7 +1335,7 @@ def sm8x_grouped_mm_mxfp8(
             ip, torch.arange(a.shape[0], device=a.device), right=True
         )
         sf = (a_descale.reshape(-1), b_descale.reshape(-1))
-        _tuned_mx8("grouped_mm_mxfp8_sm8x", False, [a, b, *sf, seg - 1, out])
+        _tuned_mx8("grouped_mm_mxfp8_sm8x", False, [a, b, *sf, seg - 1, out], shuffled)
     return out
 
 

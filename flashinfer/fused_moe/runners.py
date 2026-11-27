@@ -5778,6 +5778,7 @@ class _TrtllmRunnerBase(MoERunner):
 
     _module: Any
     _inner: Any
+    _sm8x: Any = None  # set by check_support; replaces the trtllm-gen kernels
     _pair: tuple[QuantFormat, QuantFormat]
     _num_weight_rows: int
     _intermediate_size: int
@@ -5807,7 +5808,35 @@ class _TrtllmRunnerBase(MoERunner):
                 "by the CUTLASS MXFP8 runners only."
             )
 
+    def check_support(self) -> None:
+        # Attach the SM8x pipeline only after every runner-level check, the
+        # subclasses' configuration and arch checks included, has passed.
+        self._support_checked = False
+        self._sm8x = None
+        self._check_support()
+        body = self._sm8x_body_class()
+        if body is not None:
+            from ..utils import get_compute_capability
+
+            major, minor = get_compute_capability(self.device)
+            if major * 10 + minor in body._supported_archs:
+                self._sm8x = body(self.config, self.device)
+                self._sm8x.check_support()
+        self._support_checked = True
+
+    def _sm8x_body_class(self) -> Any:
+        """The ``sm8x_fp8_moe`` pipeline that runs this runner where the trtllm-gen
+        kernels do not exist (its ``_supported_archs``), or None."""
+        return None
+
     def _build(self) -> None:
+        if self._sm8x is not None:
+            from .backends.trtllm.sm100_runner import MoERunner as _TuningRunner
+
+            # pack_inputs' tuning config only; the SM8x pipeline runs the forward.
+            self._module = _CakeStepFunTuningModule(_TuningRunner)
+            self._sm8x.build()
+            return
         from .core import get_trtllm_moe_sm100_module
 
         self._module = get_trtllm_moe_sm100_module()
@@ -5825,6 +5854,11 @@ class _TrtllmRunnerBase(MoERunner):
             raise RuntimeError(
                 "TRTLLM forward requires the launch state returned by pack_inputs."
             )
+        if self._sm8x is not None:
+            # One pipeline, no tactics or preparation launch.
+            if do_preparation:
+                return inputs[0]
+            return self._sm8x.run(inputs, launch_state.static_kwargs)
         result = self._inner.forward(
             inputs,
             tactic=tactic,
@@ -6467,6 +6501,14 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
                 f"SM100/SM103 targets, got sm{arch}."
             )
 
+    def _sm8x_body_class(self) -> Any:
+        from .api import QuantFormat
+        from .sm8x_fp8_moe import Sm8xTrtllmDeepSeekFp8MoE, Sm8xTrtllmMxfp8MoE
+
+        if self._pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
+            return Sm8xTrtllmMxfp8MoE
+        return Sm8xTrtllmDeepSeekFp8MoE
+
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
@@ -6537,6 +6579,8 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
+        if self._sm8x is not None:
+            return [(0, 0)]  # one pipeline; its forward ignores the tactic
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -6768,6 +6812,8 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             routing_replay_out=None,
         )
 
+        if self._sm8x is not None:
+            self._sm8x._ensure_workspace(num_tokens, hidden_size)
         self._ensure_inner(hidden_size)
         tuning_config = self._inner._make_tuning_config(
             moe_inputs,
@@ -6844,6 +6890,11 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
                 f"SM100/SM103 targets, got sm{arch}."
             )
 
+    def _sm8x_body_class(self) -> Any:
+        from .sm8x_fp8_moe import Sm8xTrtllmFp8PerTensorMoE
+
+        return Sm8xTrtllmFp8PerTensorMoE
+
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
@@ -6900,6 +6951,8 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
+        if self._sm8x is not None:
+            return [(0, 0)]  # one pipeline; its forward ignores the tactic
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -7085,6 +7138,8 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             routing_replay_out=None,
         )
 
+        if self._sm8x is not None:
+            self._sm8x._ensure_workspace(num_tokens, hidden_size)
         self._ensure_inner(hidden_size)
         tuning_config = self._inner._make_tuning_config(
             moe_inputs,
