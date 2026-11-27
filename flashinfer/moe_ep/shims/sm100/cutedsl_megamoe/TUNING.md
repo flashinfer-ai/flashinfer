@@ -495,22 +495,22 @@ workaround; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
   `is_valid_bf16`); per-size bf16 profiles are pending a tuning pass.  Its
   token-back defaults to `epi_warps` when `enable_in_kernel_fc2_reduce=False`,
   and `reuse_dispatch_warps` when `enable_in_kernel_fc2_reduce=False`.
-  Mixed BF16×MXFP8 has per-size measured profiles.  Three legal impl tuples
+  Mixed BF16×MXFP8 has per-size measured profiles.  Four legal impl tuples
   (`is_valid_bf16_mxfp8`; others fail at kernel construction):
+  - N64/tmem/no-overlap/tk128
   - N128/tmem/no-overlap/tk128 + `epi_warps` — recommended <1024 tok/rank
   - N128/tmem/no-overlap/tk128 + `reuse_dispatch_warps` - recommended 1024-2048 tok/rank
   - N256/tmem/overlap/tk64 + `epi_warps` — recommended 2048-4096 tok/rank;
   - N256/tmem/overlap/tk64 + `reuse_dispatch_warps` - recommended >4096 tok/rank
   - N256/smem/no-overlap/tk128
   The FI shim default (`dtype="bf16_mxfp8"`) is the N128 small-batch profile;
-  `bf16_mxfp8_candidates()` sweeps all three impl tuples × `flag_batch`
+  `bf16_mxfp8_candidates()` sweeps all four impl tuples × `flag_batch`
   {1, 4} × token-back {``epi_warps``, ``reuse_dispatch_warps``}, the
-  dispatch-warp half also timing `epi_flag_batch=(1, 1)` (18 candidates, or
-  36 when ikr is permitted; per-size winners above are the measured starting
+  dispatch-warp half also timing `epi_flag_batch=(1, 1)` (24 candidates, or
+  48 when ikr is permitted; per-size winners above are the measured starting
   point).
   `runtime_mma_split` (N128 only, on in the default knobs): uses an N64 MMA
-  instead of N128 when the selected expert's tokens do not fill the tile
-  (at most 64 valid tokens).
+  instead of N128 for each CTA tile with at most 64 valid tokens.
 - Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.

@@ -448,9 +448,6 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
     )
     if impl not in _BF16_MXFP8_IMPLS:
         return False
-    stages = knobs.get("num_activation_stages")
-    if stages is None:
-        stages = Sm100SwapABMxfp8Bf16Fc12Kernel._DefaultBStages[impl[1]]
     weight_stages = knobs.get("num_weight_stages")
     # Session configs carry the shape; bare knob dicts check the tiles only.
     dispatch_bytes = 0
@@ -462,12 +459,17 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         dispatch_bytes = Sm100MegaMoEMxfp8Bf16Kernel.dispatch_smem_bytes(
             knobs["hidden"], knobs["num_total_experts"]
         )
-    max_stages = Sm100SwapABMxfp8Bf16Fc12Kernel.max_b_stages(
-        *impl, weight_stages, dispatch_bytes
-    )
+    try:
+        Sm100SwapABMxfp8Bf16Fc12Kernel._derive_b_stages(
+            *impl,
+            weight_stages,
+            knobs.get("num_activation_stages"),
+            dispatch_bytes,
+        )
+    except ValueError:
+        return False
     return (
-        2 <= stages <= max_stages
-        and (weight_stages is None or weight_stages >= 2)
+        (weight_stages is None or weight_stages >= 2)
         and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
         and knobs.get("use_2cta_instrs", True)
         and knobs.get("token_back_mode", "epi_warps")

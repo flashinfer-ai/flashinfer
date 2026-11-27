@@ -199,7 +199,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         allocates outside the base storage, e.g. MegaMoE dispatch buffers).
         ``num_weight_stages=None`` uses the implementation's default depth.
         """
-        stages = cls._derive_pipeline_stages(
+        stages = cls._derive_a_stages(
             mma_tiler_mnk,
             transform_buffer,
             accumulator_overlap,
@@ -231,14 +231,49 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         return (smem_capacity - fixed) // b_stage_bytes
 
     @classmethod
-    def _derive_pipeline_stages(
+    def _derive_b_stages(
+        cls,
+        mma_tiler_mnk: Tuple[int, int, int],
+        transform_buffer: str,
+        accumulator_overlap: bool,
+        transform_k_tile: int,
+        num_weight_stages: Optional[int],
+        num_activation_stages: Optional[int],
+        extra_smem_bytes: int,
+    ) -> int:
+        """Resolve the B depth: the default clamped to the SMEM budget, or the
+        explicit request if it fits."""
+        max_stages = cls.max_b_stages(
+            mma_tiler_mnk,
+            transform_buffer,
+            accumulator_overlap,
+            transform_k_tile,
+            num_weight_stages,
+            extra_smem_bytes,
+        )
+        if num_activation_stages is None:
+            stages = min(cls._DefaultBStages[transform_buffer], max_stages)
+        else:
+            stages = num_activation_stages
+        if stages < 2 or stages > max_stages:
+            raise ValueError(
+                f"num_activation_stages={stages} must be in [2, {max_stages}] for "
+                f"{mma_tiler_mnk} with transform_buffer={transform_buffer!r}, "
+                f"num_weight_stages={num_weight_stages} and "
+                f"{extra_smem_bytes} extra SMEM bytes."
+            )
+        return stages
+
+    @classmethod
+    def _derive_a_stages(
         cls,
         mma_tiler_mnk: Tuple[int, int, int],
         transform_buffer: str,
         accumulator_overlap: bool,
         transform_k_tile: int,
     ) -> dict[str, int]:
-        """Validate an implementation tuple and derive all pipeline depths."""
+        """Validate an implementation tuple and derive the shape-independent
+        pipeline depths (everything except B)."""
 
         config = (
             mma_tiler_mnk,
@@ -279,7 +314,6 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             "a": common_depth,
             "scale": common_depth,
             "transformed_a": common_depth,
-            "b": cls._DefaultBStages[transform_buffer],
             "acc": 2,
         }
 
@@ -299,7 +333,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         The traced layout calculation below checks the same values against
         CuTeDSL's actual fragment layouts.
         """
-        stages = cls._derive_pipeline_stages(
+        stages = cls._derive_a_stages(
             mma_tiler_mnk,
             transform_buffer,
             accumulator_overlap,
@@ -367,7 +401,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                 f"{supported_mma_tilers}; "
                 f"got {mma_tiler_mnk}."
             )
-        pipeline_stages = self._derive_pipeline_stages(
+        pipeline_stages = self._derive_a_stages(
             mma_tiler_mnk,
             transform_buffer,
             accumulator_overlap,
@@ -395,23 +429,15 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                 "clc_bundle_size is only meaningful for the dynamic CLC "
                 "scheduler; mixed FC12 requires force_static_sched=True."
             )
-        if num_activation_stages is not None and num_activation_stages < 2:
-            raise ValueError("num_activation_stages must be at least 2.")
-        if num_activation_stages is not None:
-            max_stages = self.max_b_stages(
-                mma_tiler_mnk,
-                transform_buffer,
-                accumulator_overlap,
-                transform_k_tile,
-                num_weight_stages,
-                0,
-            )
-            if num_activation_stages > max_stages:
-                raise ValueError(
-                    f"num_activation_stages must be at most {max_stages} for "
-                    f"{mma_tiler_mnk} with transform_buffer={transform_buffer!r} "
-                    f"and num_weight_stages={num_weight_stages}."
-                )
+        num_b_stage = self._derive_b_stages(
+            mma_tiler_mnk,
+            transform_buffer,
+            accumulator_overlap,
+            transform_k_tile,
+            num_weight_stages,
+            num_activation_stages,
+            0,
+        )
 
         self.mma_tiler_mnk = mma_tiler_mnk
         self.transform_buffer = transform_buffer
@@ -507,7 +533,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             if num_weight_stages is None
             else num_weight_stages
         )
-        self.num_b_stage = pipeline_stages["b"] if num_activation_stages is None else num_activation_stages
+        self.num_b_stage = num_b_stage
         self.num_transformed_a_stage = pipeline_stages["transformed_a"]
         self.num_acc_stage = pipeline_stages["acc"]
         self.tmem_col_budget = self.get_tmem_col_budget(

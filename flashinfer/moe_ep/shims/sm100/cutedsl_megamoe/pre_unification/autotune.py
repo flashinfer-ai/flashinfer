@@ -207,6 +207,9 @@ def bf16_mxfp8_candidates(
             "transform_buffer": "tmem",
             "accumulator_overlap": False,
             "transform_k_tile": 128,
+            "runtime_mma_split": False,
+            "num_weight_stages": None,
+            "num_activation_stages": None,
         },
         {
             "mma_tiler_mnk": (256, 128, 128),
@@ -222,12 +225,18 @@ def bf16_mxfp8_candidates(
             "transform_buffer": "smem",
             "accumulator_overlap": False,
             "transform_k_tile": 128,
+            "runtime_mma_split": False,
+            "num_weight_stages": None,
+            "num_activation_stages": None,
         },
         {
             "mma_tiler_mnk": (256, 256, 128),
             "transform_buffer": "tmem",
             "accumulator_overlap": True,
             "transform_k_tile": 64,
+            "runtime_mma_split": False,
+            "num_weight_stages": None,
+            "num_activation_stages": None,
         },
     )
     base: Dict[str, Any] = {

@@ -257,21 +257,16 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         )
         self.sf_uint32_per_token = 0
 
-        max_b_stages = self.max_b_stages(
+        # Re-resolve with the dispatch buffer, which the base budget omits.
+        self.num_b_stage = self._derive_b_stages(
             mma_tiler_mnk,
             transform_buffer,
             accumulator_overlap,
             transform_k_tile,
             self.num_a_stage,
+            num_activation_stages,
             self.dispatch_smem_bytes(hidden, self.num_total_experts),
         )
-        if self.num_b_stage > max_b_stages:
-            raise ValueError(
-                f"{self.num_b_stage} activation stages with "
-                f"{self.num_a_stage} weight stages exceed SMEM at "
-                f"hidden={hidden} and {self.num_total_experts} experts; at "
-                f"most {max_b_stages} activation stages fit."
-            )
 
         # Swap-AB token axis is MMA N.  Cluster N is one for the supported
         # mixed geometry, but retain the general formula for later layouts.

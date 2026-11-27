@@ -164,10 +164,21 @@ def test_mixed_knobs_and_candidates():
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     frontend.apply_knobs(knobs)
     assert frontend.config == _config(
+        group_hint=512,
+        flag_batch=4,
+        epi_flag_batch=(2, 4),
         runtime_mma_split=True,
         num_weight_stages=6,
         num_activation_stages=5,
     )
+
+
+@pytest.mark.cpu_only
+@cuda_13_required
+def test_mixed_batch_invariant_config_defaults_and_runtime_split():
+    assert _config(batch_invariant=True).batch_invariant
+    with pytest.raises(ValueError, match="runtime_mma_split=False"):
+        _config(batch_invariant=True, runtime_mma_split=True)
 
 
 @pytest.mark.cpu_only

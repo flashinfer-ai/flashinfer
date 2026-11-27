@@ -146,8 +146,8 @@ SM100 shared-memory limit) and adds an optional `num_activation_stages`
 constructor argument (2 up to that per-implementation maximum) that overrides
 it. `megamoe_kernel_mxfp8_bf16.py` also forwards the argument (not in the MR) so
 `MegaMoEBf16Mxfp8Config` can expose it as `num_activation_stages` (default
-`None`: per-implementation depth). Drop once the MR merges and the tree
-re-syncs past it.
+`None`: per-implementation depth, clamped to the SMEM left after the MegaMoE
+dispatch buffer). Drop once the MR merges and the tree re-syncs past it.
 
 ## FlashInfer selectors
 
