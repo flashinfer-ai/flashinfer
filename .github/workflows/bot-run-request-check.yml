@@ -46,7 +46,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INFERENCE_API_KEY: ${{ secrets.INFERENCE_API_KEY }}
           INFERENCE_BASE_URL: ${{ vars.INFERENCE_BASE_URL }}
-          CI_BOT_TARGET_MODEL: ${{ vars.CI_BOT_TARGET_MODEL }}
+          CI_BOT_TARGET_MODEL: 'azure/openai/gpt-6-luna'
           CI_BOT_TARGET_TIMEOUT_SECONDS: ${{ vars.CI_BOT_TARGET_TIMEOUT_SECONDS }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
