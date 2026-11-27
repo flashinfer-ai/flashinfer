@@ -27,7 +27,8 @@
     },
     "mounts": [
         "type=bind,source=${localEnv:HOME}/.ssh,target=/home/devuser/.ssh,readonly",
-        "type=volume,source=flashinfer-sccache-${devcontainerId},target=/home/devuser/.cache/sccache"
+        "type=volume,source=flashinfer-sccache-${devcontainerId},target=/home/devuser/.cache/sccache",
+        "type=volume,source=flashinfer-guardwords-scan-${devcontainerId},target=/home/devuser/.flashinfer-guardwords-scan"
     ],
     "containerEnv": {
         "FLASHINFER_CXX_LAUNCHER": "sccache",

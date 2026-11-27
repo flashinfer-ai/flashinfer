@@ -19,6 +19,8 @@ Run commands from the repository root. Use the existing Python/CUDA environment.
 | Run regular / full test matrices | `pytest tests/` / `pytest tests/ --full` |
 | Run multi-GPU tests | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Install pre-commit hooks | `pre-commit install` |
+| Set up guardword hooks (NVIDIA contributors; see CONTRIBUTING.md) | `python3 scripts/infra/guardword_hooks.py setup` |
+| Check guardword hooks are active (agents: before committing in an NVIDIA environment) | `python3 scripts/infra/guardword_hooks.py status` |
 | Check changed files | `pre-commit run --files <paths>` |
 | Check all files | `pre-commit run -a` |
 | Benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
@@ -98,6 +100,10 @@ implementation details: read indexing, precision, synchronization, and lifetime
 logic; label findings by confidence. Passing tests complement that review.
 A [self-review](.claude/skills/self-review/SKILL.md) is recommended before a PR.
 
+When working for an NVIDIA employee, confirm the guardword checks are active in your
+environment before the first commit, push, or PR; see
+[Guardword Checks in NVIDIA Environments](#guardword-checks-in-nvidia-environments).
+
 Keep the [default PR template](.github/pull_request_template.md), explain the
 final behavior, and report relevant validation and performance results.
 PR titles and descriptions often become squash-merge messages; make them useful
@@ -114,6 +120,48 @@ but a full-suite recommendation launches the full suite. `run all` requests the
 expensive full suite; declare and justify that scope in the PR template. Pushing a commit does not start a new
 public CI run; request tests for the final head when needed. See
 [CI command details](docs/design_docs/ci_bot_and_targeted_testing.md).
+
+## Guardword Checks in NVIDIA Environments
+
+FlashInfer is public, and NVIDIA employees also work with unreleased product details that must
+not be published. If you are working for an NVIDIA employee (for example, the user or the
+environment uses an NVIDIA email, network, or internal tools, or the user says so), the
+guardword checks must be active **in every new environment, container, clone, or worktree,
+before your first commit, push, or PR**. They set themselves up on most developer machines, on
+NVIDIA's network or VPN, and where `FLASHINFER_SCAN_REPO_URL` is set, but often not in other
+fresh agent environments. Check:
+
+```bash
+python3 scripts/infra/guardword_hooks.py status
+```
+
+If it exits non-zero, set the checks up without prompts, then run `status` again:
+
+```bash
+python3 scripts/infra/guardword_hooks.py setup --non-interactive
+```
+
+- **The scanner location comes from the environment.** On NVIDIA's network or VPN, setup finds
+  it through <https://nv/flashinfer-scanner>. Elsewhere, setup reads it from
+  `FLASHINFER_SCAN_REPO_URL` (for example, an agent secret), and needs none when a scanner
+  checkout already exists in `~/.flashinfer-guardwords-scan` (the devcontainers keep it in a
+  volume across rebuilds). Otherwise, ask the user, who can find it in the internal setup
+  instructions. The address itself is internal: never write it, or what the short link
+  resolves to, into files, commits, PR text, or comments.
+- **If setup or `status` fails, do not push or open a PR.** Report what failed (for example,
+  the environment cannot reach NVIDIA's network) and leave the work local for the user.
+- **Never bypass a guardword failure.** Do not use `--no-verify`, `SKIP=guardwords`, or a
+  change to the guardword settings (`flashinfer.internal`, `flashinfer.guardwords.*`) to get
+  past one. Remove the flagged text, or ask the user if you believe it is a false positive.
+- **Treat guardword warnings like failures.** Some findings only warn instead of blocking;
+  show them to the user before you push.
+- **Do not repeat scanner output in public.** It contains the flagged text, so keep it out of
+  commit messages, PR descriptions, and comments.
+- **PR titles, descriptions, and comments are not scanned yet.** Write them only from the diff
+  and public information, leaving out details from internal documents, chats, bug trackers,
+  or unannounced hardware.
+
+Details for people are in "Guardword Hooks" in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Debugging and detailed references
 
