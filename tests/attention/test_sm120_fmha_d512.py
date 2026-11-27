@@ -13,6 +13,7 @@ Run on an SM120 GPU:
 """
 
 import math
+import tracemalloc
 from importlib.metadata import PackageNotFoundError, version
 
 import pytest
@@ -556,6 +557,32 @@ def test_split_kv_respects_cuda_grid_z_limit(monkeypatch):
         "get_device_properties",
         lambda device=None: SimpleNamespace(multi_processor_count=170),
     )
+
+    # 8,192 requests x 262,144 KV tokens need 4,096 chunks each. The rejection counts them
+    # without materializing the ~33M cut points.
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="increase fixed_split_size"):
+            _paged_kv_split_bounds(
+                [1] * 8192,
+                [262_144] * 8192,
+                1,
+                False,
+                64,
+                170,
+                16,
+                1 << 30,
+                1,
+                q_tile=64,
+            )
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 16 << 20
+    # Accepted splits keep their boundaries: cuts every 2 tiles, padded with empty ranges.
+    assert _paged_kv_split_bounds(
+        [1, 1], [300, 130], 1, False, 64, 170, 128, 1 << 30, 1, q_tile=64
+    ) == [[0, 2, 4, 5], [0, 2, 3, 3]]
 
     # 128 noncausal requests x 32,768 KV tokens, D=512 (tile=64), page_size=16:
     # fixed_split_size=1 -> 512 chunks -> 128 * 512 = 65,536 > 65,535 -> rejected.

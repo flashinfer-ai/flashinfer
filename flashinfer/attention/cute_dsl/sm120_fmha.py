@@ -829,8 +829,9 @@ def _paged_kv_split_bounds(
     ]
     if fixed_split_tokens > 0:
         step = ceil_div(fixed_split_tokens, tile)
+        # Lazy ranges: count the chunks before materializing any cut list.
         cuts = [
-            list(range(step, min(v, t - 1) + 1, step))
+            range(step, min(v, t - 1) + 1, step)
             for t, v in zip(kv_tiles, visible, strict=True)
         ]
         num_chunks = max(len(c) for c in cuts) + 1
