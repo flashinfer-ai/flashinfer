@@ -361,3 +361,42 @@ def test_wrapper_preserves_supported_launch_device(monkeypatch, name, backend, k
     backend_call.assert_called_once()
     assert capability_query.call_count > 0
     assert all(call.args[0] == target for call in capability_query.call_args_list)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_per_token_cuda_tensor_scale_avoids_host_item_read(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    capability_query = Mock(return_value=(10, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    monkeypatch.setattr(fp4, "get_compute_capability", capability_query)
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    item_read = Mock(side_effect=AssertionError("Tensor.item must not run"))
+    monkeypatch.setattr(torch.Tensor, "item", item_read)
+
+    x_cuda = SimpleNamespace(device=torch.device("cuda:0"))
+    x = SimpleNamespace(
+        device=torch.device("cuda:0"), is_cuda=True, cuda=Mock(return_value=x_cuda)
+    )
+    a_global_sf = torch.ones(1, dtype=torch.float32)
+    sentinel = (object(), object(), object())
+    quant_op = Mock(return_value=sentinel)
+    monkeypatch.setattr(
+        fp4,
+        "get_fp4_quantization_module",
+        Mock(
+            return_value=SimpleNamespace(nvfp4_quant_and_per_token_scale_sm100=quant_op)
+        ),
+    )
+
+    result = fp4.nvfp4_quantize(
+        x,
+        a_global_sf,
+        per_token_activation=True,
+        backend="cuda",
+        nvfp4_4over6=None,
+    )
+
+    assert result == sentinel
+    item_read.assert_not_called()
+    quant_op.assert_called_once()
+    assert quant_op.call_args.args[1] is a_global_sf

@@ -1067,10 +1067,6 @@ def testNvfp4Quantize(args):
         global_scale=global_scale,
         nvfp4_4over6_config=nvfp4_4over6_config,
     )
-    # The per-token cuda path reads a tensor scale with .item() and the cute-dsl
-    # path uploads a host float with torch.tensor(); either breaks CUDA graph
-    # capture, so give cuda a host float and the others the device tensor.
-    global_sf_host = float(global_sf_tensor.item()) if per_token_activation else None
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
@@ -1099,8 +1095,6 @@ def testNvfp4Quantize(args):
                 batch_invariant=True,
                 **nvfp4_4over6_kwargs,
             )
-        if per_token_activation and backend == "cuda":
-            global_sf_tensor = global_sf_host
         return flashinfer.nvfp4_quantize(
             input_tensor,
             global_sf_tensor,

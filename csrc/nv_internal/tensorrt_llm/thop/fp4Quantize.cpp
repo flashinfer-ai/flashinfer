@@ -272,7 +272,8 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
 void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, TensorView output,
                                      TensorView output_scale, TensorView output_per_token_scale,
                                      Optional<TensorView> expanded_idx_to_permuted_idx,
-                                     int64_t sfLayout_, int64_t nvfp44Over6Code) {
+                                     int64_t sfLayout_, int64_t nvfp44Over6Code,
+                                     Optional<TensorView> scale_inv_tensor) {
   auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp44Over6Code);
   CHECK_CUDA(input);
   CHECK_CONTIGUOUS(input);
@@ -320,6 +321,15 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
   const float scale_inv = static_cast<float>(scale_inv_);
   auto const in_dtype = input.dtype();
 
+  float const* scale_inv_ptr = nullptr;
+  if (scale_inv_tensor.has_value()) {
+    auto const& scale_t = scale_inv_tensor.value();
+    CHECK_INPUT_AND_TYPE(scale_t, dl_float32);
+    CHECK_DEVICE(scale_t, input);
+    TVM_FFI_ICHECK_EQ(scale_t.numel(), 1) << "scale_inv_tensor must have exactly 1 element";
+    scale_inv_ptr = static_cast<float const*>(scale_t.data_ptr());
+  }
+
   int32_t* expanded_idx_to_permuted_idx_ptr = nullptr;
   if (expanded_idx_to_permuted_idx.has_value()) {
     CHECK_CUDA(expanded_idx_to_permuted_idx.value());
@@ -336,14 +346,16 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
         m, n, reinterpret_cast<half const*>(input.data_ptr()), scale_inv,
         expanded_idx_to_permuted_idx_ptr, reinterpret_cast<uint8_t*>(output.data_ptr()),
         reinterpret_cast<uint8_t*>(output_scale.data_ptr()),
-        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, recipe, stream);
+        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, recipe, stream,
+        /*enable_pdl=*/false, scale_inv_ptr);
   } else if (in_dtype == dl_bfloat16) {
 #ifdef ENABLE_BF16
     tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         m, n, reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()), scale_inv,
         expanded_idx_to_permuted_idx_ptr, reinterpret_cast<uint8_t*>(output.data_ptr()),
         reinterpret_cast<uint8_t*>(output_scale.data_ptr()),
-        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, recipe, stream);
+        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, recipe, stream,
+        /*enable_pdl=*/false, scale_inv_ptr);
 #else
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "nvfp4_quant_and_per_token_scale: BFloat16 support is not enabled.";

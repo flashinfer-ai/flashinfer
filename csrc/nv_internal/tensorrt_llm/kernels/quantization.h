@@ -82,7 +82,8 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       int32_t* expanded_idx_to_permuted_idx, uint8_t* weightOutput,
                                       uint8_t* scaleOutput, float* perTokenScaleOutput,
                                       QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-                                      cudaStream_t stream = 0, bool enable_pdl = false);
+                                      cudaStream_t stream = 0, bool enable_pdl = false,
+                                      float const* globalScaleInvPtr = nullptr);
 
 // Copy the permuted rows written by invokeNvfp4QuantAndPerTokenScale back to expanded
 // (token * topK + slot) order with linear block scales. Expanded rows that map to no

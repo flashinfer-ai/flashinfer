@@ -567,7 +567,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
     def nvfp4_quant_and_per_token_scale_out_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         output: torch.Tensor,
         output_scale: torch.Tensor,
         output_per_token_scale: torch.Tensor,
@@ -576,21 +576,43 @@ def get_fp4_quantization_module(backend: str = "100"):
         # Appended last so existing positional construction keeps working.
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> None:
+        if isinstance(scale_inv, torch.Tensor):
+            if scale_inv.numel() != 1:
+                raise ValueError(
+                    f"scale_inv tensor must have exactly 1 element, got {scale_inv.numel()}"
+                )
+            scale_inv_tensor = scale_inv
+            if (
+                scale_inv_tensor.device != input.device
+                or scale_inv_tensor.dtype != torch.float32
+            ):
+                scale_inv_tensor = scale_inv_tensor.to(
+                    device=input.device, dtype=torch.float32
+                )
+            if scale_inv_tensor.ndim != 1:
+                scale_inv_tensor = scale_inv_tensor.reshape(1)
+            if not scale_inv_tensor.is_contiguous():
+                scale_inv_tensor = scale_inv_tensor.contiguous()
+            scale_inv_scalar = 0.0
+        else:
+            scale_inv_tensor = None
+            scale_inv_scalar = float(scale_inv)
         module.nvfp4_quant_and_per_token_scale(
             input,
-            scale_inv,
+            scale_inv_scalar,
             output,
             output_scale,
             output_per_token_scale,
             expanded_idx_to_permuted_idx,
             sf_layout,
             nvfp4_4over6_code,
+            scale_inv_tensor,
         )
 
     @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_out_sm100")
     def _fake_nvfp4_quant_and_per_token_scale_out_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         output: torch.Tensor,
         output_scale: torch.Tensor,
         output_per_token_scale: torch.Tensor,
@@ -606,7 +628,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
     def nvfp4_quant_and_per_token_scale_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
         sf_layout: int = SfLayout.layout_linear.value,
         # Appended last so existing positional construction keeps working.
@@ -658,7 +680,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_sm100")
     def _fake_nvfp4_quant_and_per_token_scale_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
         sf_layout: int = SfLayout.layout_linear.value,
         # Output shapes do not depend on the recipe; accepted and ignored.
@@ -1844,15 +1866,15 @@ def nvfp4_quantize(
             assert sfLayout == SfLayout.layout_128x4
 
         if backend == "cuda":
+            a_cuda = a.cuda()
+            # Device-tensor scales remain unchecked and stay on device: reading
+            # them on the host would add a stream synchronization and be
+            # illegal under CUDA graph capture.
             scale_inv = (
-                float(a_global_sf.item())
+                a_global_sf.cuda()
                 if isinstance(a_global_sf, torch.Tensor)
                 else float(a_global_sf)
             )
-            # Free: this path already materialized the scale on the host above.
-            if nvfp4_4over6_is_explicit and isinstance(a_global_sf, torch.Tensor):
-                _check_per_token_global_scale(scale_inv, nvfp4_4over6_config)
-            a_cuda = a.cuda()
             expanded_idx_to_permuted_idx_cuda = (
                 expanded_idx_to_permuted_idx.cuda()
                 if expanded_idx_to_permuted_idx is not None

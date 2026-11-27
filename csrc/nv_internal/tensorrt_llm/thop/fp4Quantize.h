@@ -44,8 +44,11 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
                                                 int64_t nvfp44Over6Code);
 
 // sfLayout lost its `= 2` default because nvfp44Over6Code follows it without one.
-// Python always passes it explicitly.
+// Python always passes all arguments explicitly. When scale_inv_tensor is provided
+// (a 1-element float32 CUDA tensor on input's device), the kernel reads the inverse
+// global scale from device memory instead of using scale_inv.
 void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv, TensorView output,
                                      TensorView output_scale, TensorView output_per_token_scale,
                                      Optional<TensorView> expanded_idx_to_permuted_idx,
-                                     int64_t sfLayout, int64_t nvfp44Over6Code);
+                                     int64_t sfLayout, int64_t nvfp44Over6Code,
+                                     Optional<TensorView> scale_inv_tensor);
