@@ -296,8 +296,11 @@ experimental-only changes. It checks for documentation first, including
 Python comment and docstring edits verified against both versions of the file.
 Changes confined to the experimental source/test trees and documentation can
 also be classified without inference. An experimental
-opt-in in core can qualify if the diff establishes that stable GPU behavior is
-unchanged. Mixed changes that affect stable GPU behavior still require a bot
+opt-in in core can qualify if the evidence establishes that stable GPU behavior
+is unchanged. The analysis prioritizes outside diffs and can use the full
+source of an added file. The Check cites the evidence that supports the
+conclusion. An uncited supplemental diff does not by itself prevent exemption.
+Mixed changes that affect stable GPU behavior still require a bot
 response. Experimental tests run in their own lane. To run a specific
 experimental test via the internal bot, use
 `/bot run tests/experimental/<test-file>.py`. The default `/bot run all`
@@ -331,8 +334,8 @@ evidence does not by itself trigger a hard rejection of a model's CPU/docs
 classification; the model should return `unknown` if it cannot support one. Missing patch text
 is informational and does not automatically override a documentation/CPU-only
 model conclusion. The model should return `unknown` when the available evidence
-cannot support a conclusion. Missing changed-file records, invalid evidence
-paths and invalid test targets still prevent an exemption. A verified bot
+cannot support a conclusion. An incomplete changed-file list or invalid
+classification evidence still prevents an exemption. A verified bot
 response remains sufficient even when analysis is unavailable.
 
 | State without a qualifying bot response | Check result |

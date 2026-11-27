@@ -563,6 +563,13 @@ class PytestTargetSelector:
             read_routing(".github/workflows/pr-test-dispatch.yml")
         candidates = [path for path in inventory if _TEST_FILE.fullmatch(path)]
         candidate_set = set(candidates)
+        if include_gpu_impact:
+            from gpu_impact import outside_experimental_scope
+
+            # Preserve outside diffs first when the gate needs to verify isolation.
+            changed = sorted(
+                changed, key=lambda item: not outside_experimental_scope(item)
+            )
         try:
             budget = EvidenceContext(
                 pr,
@@ -642,18 +649,36 @@ class PytestTargetSelector:
             if include_gpu_impact and path not in files:
                 optional_error("Supplemental evidence is unavailable", path)
 
+        added_source_evidence = set()
+        if include_gpu_impact:
+            added_source_evidence = {
+                item["filename"]
+                for item in context["changed_files"]
+                if item.get("status") == "added"
+                and item["filename"] in blobs
+                and not item.get("patch")
+                and outside_experimental_scope(item)
+            }
+            # A complete new file can stand in for a patch trimmed from the context.
+            for path in sorted(added_source_evidence):
+                inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
+
         for path in context["configuration_files"]:
             inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         # Include changed test bodies before asking the model for more evidence.
         changed_candidates = changed_paths & set(context["candidate_test_files"])
-        for path in sorted(changed_candidates):
+        for path in sorted(changed_candidates - added_source_evidence):
             inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         if include_gpu_impact:
             # Include changed implementations and nonstandard added tests too;
             # GPU impact is not limited to the selected pytest candidates.
-            for path in sorted((changed_paths & blobs.keys()) - changed_candidates):
+            for path in sorted(
+                (changed_paths & blobs.keys())
+                - changed_candidates
+                - added_source_evidence
+            ):
                 inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         evidence = infer(EVIDENCE_PROMPT)

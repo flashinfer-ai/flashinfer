@@ -230,6 +230,32 @@ class ImpactTests(unittest.TestCase):
         self.assertEqual("unknown", result.gpu_impact["classification"])
         self.assertIn("flashinfer/rope.py", result.gpu_impact["reason"])
 
+    def test_experimental_opt_in_does_not_require_every_outside_diff_as_a_citation(
+        self,
+    ):
+        f = self.fixture
+        f.github.get_pr_files.return_value.append(
+            {
+                "filename": "examples/try_opt_in.py",
+                "status": "added",
+                "patch": "+from flashinfer.rope import experimental_rope",
+            }
+        )
+        result = self.select(analysis("experimental_only"))
+        self.assertEqual("experimental_only", result.gpu_impact["classification"])
+        self.assertEqual(["flashinfer/rope.py"], result.gpu_impact["evidence_paths"])
+
+    def test_experimental_opt_in_can_cite_full_source_of_added_file(self):
+        changed = self.fixture.github.get_pr_files.return_value[0]
+        changed.update(status="added", patch=None)
+        result = self.select(analysis("experimental_only"))
+        self.assertIn(
+            changed["filename"], self.fixture.inference.calls[0][0]["source_files"]
+        )
+        first_blob = self.fixture.github.get_repository_blob.call_args_list[0].args[1]
+        self.assertEqual("blob:" + changed["filename"], first_blob)
+        self.assertEqual("experimental_only", result.gpu_impact["classification"])
+
     def test_selected_cpu_tests_do_not_override_gpu_impact(self):
         result = self.select(analysis(), "selected", [target()])
         self.assertEqual("gpu_required", result.gpu_impact["classification"])

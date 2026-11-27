@@ -17,6 +17,13 @@ def changed_paths(item):
     return (item.get("filename"), previous) if previous else (item.get("filename"),)
 
 
+def outside_experimental_scope(item):
+    return any(
+        not (is_experimental(path) or is_documentation(path))
+        for path in changed_paths(item)
+    )
+
+
 PROMPT = """
 Also return a separate gpu_impact object. GPU impact and case selection are
 independent: GPU-affecting code with no corresponding selected tests remains
@@ -45,10 +52,16 @@ can require GPU testing while qualifying for this separate bot-request exemption
 An explicit opt-in entry point in core can qualify when the diff shows stable
 defaults and non-opt-in execution are unchanged. Review both paths of renames.
 A directory, PR label or feature name alone does not establish isolation for
-changes outside the experimental trees. Inspect and cite those code diffs before
-granting this exemption. If any change affects stable GPU execution, return
-gpu_required even if the rest is experimental. Use unknown if confinement
-cannot be established. Consider changed source even when no tests cover it.
+changes outside the experimental trees. Inspect the available outside diffs and
+explain why key outside changes leave stable GPU behavior unchanged. Cite only
+the decisive evidence, such as the opt-in entry point or changed dispatch.
+Do not require a citation for each benchmark, example, or support-file diff.
+For added files, a complete supplied source body can establish what was added.
+For modified or renamed files, use the diff to establish what changed.
+If any change affects stable GPU execution, return gpu_required even if the rest
+is experimental. Use unknown if missing key evidence prevents determining
+whether the change is confined to experimental behavior. Consider changed
+source even when no tests cover it.
 Use supplied patches and source_files bodies whenever they are available.
 Budget fallback applies only when a file has neither a supplied patch nor a
 source_files body and its patch_omitted flag or unavailable_evidence reason
@@ -153,17 +166,22 @@ def validate_impact(value, context, file_count_mismatch=False):
         unverified = [
             item["filename"]
             for item in context["changed_files"]
-            if not all(
-                is_experimental(path) or is_documentation(path)
-                for path in changed_paths(item)
+            if outside_experimental_scope(item)
+            and item["filename"] in paths
+            and not (
+                item.get("patch")
+                or (
+                    item.get("status") == "added"
+                    and not item.get("previous_filename")
+                    and item["filename"] in context["source_files"]
+                )
             )
-            and (not item.get("patch") or item["filename"] not in paths)
         ]
         if unverified:
             impact.update(
                 classification="unknown",
                 reason=_public_prose(
-                    "Cannot establish experimental isolation without cited diffs outside the experimental trees: "
+                    "Cannot establish experimental isolation from the cited outside changes without source evidence: "
                     + ", ".join(unverified),
                     secrets,
                     limit=1000,
