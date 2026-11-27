@@ -24,6 +24,7 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 
 from __future__ import annotations
 
+import re
 import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -160,6 +161,10 @@ TILE_M_BREUSE = 512
 BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128", "mxfp4w8a_k64")
 
 
+#: the ``describe()`` tokens of the launch placements: ``_r<m|n>_sw<s>`` and the forced grid ``_g<n>``
+_PLACEMENT_TOKENS = re.compile(r"_r[mn]_sw\d+|_g\d+")
+
+
 @dataclass(frozen=True)
 class Knobs:
     """One point of the generator's configuration space. Field layout, equality and ``describe()`` are stable:
@@ -176,6 +181,7 @@ class Knobs:
     cluster_k: int = 1  # in-cluster split-K factor (block-scaled body): the record computes the class kchunk[cluster_k]
     swap_ab: bool = False  # the decode specialisation (block-scaled body): operands swapped, one token tile for all tokens
     k_block: int = 0  # K elements per smem stage: 0 = the format's default, else a value of K_BLOCK_VALUES[in_fmt] (a lowering choice)
+    gather_a: bool = False  # the gather form (block-scaled swapped body): the token rows read by the kernel through the plan's map
 
     # named views
     @property
@@ -308,7 +314,14 @@ class Knobs:
             + ("_swap" if self.swap_ab else "")
             + ("_cc" if self.cta_chunks else "")
             + (f"_kb{self.k_block}" if self.k_block else "")
+            + ("_ga" if self.gather_a else "")
         )
+
+    def describe_object(self) -> str:
+        """The compile-time identity of the knobs: ``describe()`` without its placement tokens (the raster order, the
+        swizzle size and the grid are launch arguments of the compiled object, ``blocks/scheduler.py``). Derived from
+        ``describe()`` so that a knob added there is part of the object's identity too."""
+        return _PLACEMENT_TOKENS.sub("", self.describe())
 
     def instruction(self, in_fmt: str = "bf16") -> str:
         """The MMA instruction variant these knobs select for the format: the A2 assumption surface."""

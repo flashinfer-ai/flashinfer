@@ -39,7 +39,7 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
     import torch
 
     from .....weights import MoEWeightPack
-    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         concatenate_block_scaled_weights,
     )
 
@@ -119,12 +119,12 @@ def _candidates(args, rank, world_size, max_tokens, quant_kind, variant):
     """Build the default grid or expand the explicit or cached schedule base."""
     import json
 
-    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         resolve_knobs,
         sm107_candidates,
         sm107_schedule_candidates,
     )
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
         _unique_candidates,
     )
 
@@ -344,9 +344,7 @@ def _tune_variants(
     import json
 
     from flashinfer.autotuner import AutoTuner
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
-        is_valid_sm107,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import is_valid_sm107
     from .variant_selection import NAMESPACE, _VariantProtocol
 
     tensors = workspace.tensors
@@ -436,7 +434,7 @@ def run_tuning(args, quant_kind: str) -> int:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if os.environ.get("MEGA_NO_DIST") == "1" and world_size != 1:
         raise SystemExit("MEGA_NO_DIST=1 cannot be used in a multi-rank SM107 job")
-    from .....kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import require_sm107_dsl
 
     require_sm107_dsl()
     runtime = None
@@ -471,7 +469,7 @@ def run_tuning(args, quant_kind: str) -> int:
 
             finalize_moe_ep_runtime(runtime)
     if rank == 0:
-        from .....kernel_src.sm107.next_cutedsl_megamoe import knob_cache_path
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache_path
 
         print(
             f"[moe_ep-tune] done; MegaMoE cache: {knob_cache_path() or 'DISABLED'}; "
