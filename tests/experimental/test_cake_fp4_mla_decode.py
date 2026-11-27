@@ -27,7 +27,9 @@ kernel, so the bound is on the per-row relative L2 error.
 """
 
 import dataclasses
+import gc
 import math
+import weakref
 
 import pytest
 import torch
@@ -481,6 +483,152 @@ def test_every_decode_build_gives_the_per_item_builds_bits(num_split):
     assert bool(torch.isfinite(want.float()).all())
     for build, out in outs.items():
         assert torch.equal(out.view(torch.int16), want.view(torch.int16)), build
+
+
+# Requests of fewer rows than an output box of the tensor-map stores (32 rows:
+# ``q_len * heads < 32``, such as 16 heads at ``q_len`` 1), at 32 and past it.
+SMALL_HEADS = (1, 8, 16, 31, 32, 33, 64, 96, 128)
+
+
+@pytest.mark.parametrize("q_len", [1, 2, 4, 8])
+def test_every_decode_build_serves_requests_of_few_rows(q_len):
+    """Every decode build delivered for the device gives the per-item
+    build's bits on requests of 1 to 31 rows (and at 32 and past it), with
+    one split and with three, and the plan's own build stays within the FP64
+    bound."""
+    device = _device_or_skip()
+    arch = registry.device_arch(device.index)
+    kv_lens, width = (300, 1500), 13
+    sm_scale = 1.0 / math.sqrt(192.0)
+    builds = sorted(
+        (b["long_rows"], b["persistent"], b["early_exp"], b["epi_x"], b["tma_o"])
+        for b in (
+            record["build"]
+            for record in registry.MODULES.values()
+            if record["stage"] == "decode" and arch in record["arches"]
+        )
+    )
+    for heads in SMALL_HEADS:
+        case = _write_case(heads * 16 + q_len, heads, q_len, kv_lens, width, device)
+        base = pkg.plan_fp4_mla_decode(
+            batch=len(kv_lens),
+            q_len=q_len,
+            num_heads=heads,
+            page_table_width=width,
+            device=device,
+        )
+        rows = len(kv_lens) * q_len * heads
+        out = torch.full((rows, 512), float("nan"), dtype=torch.bfloat16, device=device)
+        _run(base, case, out, sm_scale)
+        torch.cuda.synchronize()
+        ref = _reference(case, heads, q_len, kv_lens, sm_scale)
+        assert float(_row_rel(out, ref).max()) <= REL_L2_BOUND, (heads, q_len)
+        for num_split in (1, 3):
+            outs = {}
+            for build in builds:
+                long_rows, persistent, early_exp, epi_x, tma_o = build
+                plan = dataclasses.replace(
+                    base.plan,
+                    num_split=num_split,
+                    long_rows=long_rows,
+                    persistent=persistent,
+                    early_exp=early_exp,
+                    epi_x=epi_x,
+                    tma_o=tma_o,
+                )
+                got = torch.full_like(out, float("nan"))
+                _run(backend.Fp4MlaDecodeRunner(plan, device), case, got, sm_scale)
+                outs[build] = got
+            torch.cuda.synchronize()
+            want = outs[(True, False, True, False, False)]
+            for build, got in outs.items():
+                assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+                    heads,
+                    q_len,
+                    num_split,
+                    build,
+                )
+
+
+@pytest.mark.parametrize("batch,width", [(1, 3), (16, 9), (128, 3), (256, 13)])
+@pytest.mark.parametrize("heads", [1, 16, 31])
+def test_the_plans_build_serves_requests_of_few_rows(batch, width, heads):
+    """The build the plan picks for buckets of 1 to 31 rows per request (one
+    wave of short items: the ``tma_o`` form; several waves: the persistent
+    builds) runs and stays within the FP64 bound."""
+    device = _device_or_skip()
+    q_len = 1
+    kv_lens = tuple(1 + (97 * i) % (width * PAGE - 1) for i in range(batch))
+    sm_scale = 1.0 / math.sqrt(192.0)
+    case = _write_case(batch + heads, heads, q_len, kv_lens, width, device)
+    decode = pkg.plan_fp4_mla_decode(
+        batch=batch, q_len=q_len, num_heads=heads, page_table_width=width, device=device
+    )
+    rows = batch * q_len * heads
+    out = torch.full((rows, 512), float("nan"), dtype=torch.bfloat16, device=device)
+    _run(decode, case, out, sm_scale)
+    torch.cuda.synchronize()
+    ref = _reference(case, heads, q_len, kv_lens, sm_scale)
+    keyless = ref.norm(dim=1) == 0
+    assert float(_row_rel(out[~keyless], ref[~keyless]).max()) <= REL_L2_BOUND
+
+
+def test_the_runner_refuses_what_the_kernels_cannot_take():
+    """A misaligned ``out`` or query, a ``sm_scale`` that is not finite and
+    positive and a bucket past the kernels' 32-bit offsets are refused before
+    a launch; a per-item grid past CUDA's y / z limit takes the persistent
+    build."""
+    device = _device_or_skip()
+    case = _write_case(3, 128, 4, (300,), 4, device)
+    decode = pkg.plan_fp4_mla_decode(
+        batch=1, q_len=4, num_heads=128, page_table_width=4, device=device
+    )
+    out = torch.empty((512, 512), dtype=torch.bfloat16, device=device)
+    for sm_scale in (0.0, -0.1, math.inf, math.nan):
+        with pytest.raises(ValueError, match="sm_scale"):
+            _run(decode, case, out, sm_scale)
+    shifted = torch.empty(512 * 512 + 16, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="out: address"):
+        _run(decode, case, shifted[8 : 8 + 512 * 512].view(512, 512), 0.1)
+    q = case["q_fp4"]
+    q_buf = torch.empty(q.numel() + 16, dtype=torch.uint8, device=device)
+    q_shifted = q_buf[4 : 4 + q.numel()].view(q.shape)
+    q_shifted.copy_(q)
+    with pytest.raises(ValueError, match="q_fp4: address"):
+        _run(decode, dict(case, q_fp4=q_shifted), out, 0.1)
+    with pytest.raises(ValueError, match="2\\*\\*31"):
+        pkg.plan_fp4_mla_decode(
+            batch=32769, q_len=1, num_heads=128, page_table_width=1, device=device
+        )
+    wide = pkg.plan_fp4_mla_decode(
+        batch=65536,
+        q_len=1,
+        num_heads=1,
+        page_table_width=256,
+        max_splits=1,
+        device=device,
+    )
+    assert wide.plan.persistent and max(wide.decode_grid[1:]) <= 65535
+
+
+def test_the_runner_keeps_no_reference_to_the_callers_tensors():
+    """After a call, the runner holds no reference to the caller's tensors:
+    a query and an output dropped by the caller are freed."""
+    device = _device_or_skip()
+    case = _write_case(3, 128, 4, (300,), 4, device)
+    decode = pkg.plan_fp4_mla_decode(
+        batch=1, q_len=4, num_heads=128, page_table_width=4, device=device
+    )
+    refs = []
+    for _ in range(3):
+        q = case["q_fp4"].clone()
+        out = torch.empty((512, 512), dtype=torch.bfloat16, device=device)
+        _run(decode, dict(case, q_fp4=q), out, 0.1)
+        refs += [weakref.ref(q), weakref.ref(out)]
+        del q, out
+    torch.cuda.synchronize()
+    gc.collect()
+    assert all(ref() is None for ref in refs)
 
 
 def test_plan_picks_the_builds_from_the_bucket():

@@ -260,7 +260,7 @@ CUtensorMap EncodeTma_out_map(const TensorView& t, int64_t p_q_len, int64_t p_nu
   cuuint64_t global_strides[2] = {Stride(s2, "out_map"), Stride(CheckedMul(s2, static_cast<int64_t>(static_cast<int64_t>(CheckedMul(p_q_len, p_num_heads)))), "out_map")};
   cuuint32_t box_dim[3] = {64u, 32u, 1u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
-  const bool allow_oob_box[3] = {false, false, false};
+  const bool allow_oob_box[3] = {false, true, false};
   for (int axis = 0; axis < 3; ++axis) {
     TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
         << KERNEL_NAME << ": descriptor 'out_map' axis " << axis << " (0 is the innermost) has a TMA box of "
@@ -294,7 +294,7 @@ CUtensorMap EncodeTma_po_map(const TensorView& t, int64_t p_q_len, int64_t p_num
   cuuint64_t global_strides[3] = {Stride(s2, "po_map"), Stride(s3, "po_map"), Stride(CheckedMul(s3, static_cast<int64_t>(static_cast<int64_t>(CheckedMul(p_q_len, p_num_heads)))), "po_map")};
   cuuint32_t box_dim[4] = {64u, 1u, 32u, 1u};
   cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  const bool allow_oob_box[4] = {false, false, false, false};
+  const bool allow_oob_box[4] = {false, false, true, false};
   for (int axis = 0; axis < 4; ++axis) {
     TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
         << KERNEL_NAME << ": descriptor 'po_map' axis " << axis << " (0 is the innermost) has a TMA box of "

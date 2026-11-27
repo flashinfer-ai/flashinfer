@@ -26,14 +26,23 @@ returned
 call (no copy of the cache, the query or its scales) and writes the
 caller-owned BF16 output.  A call allocates no CUDA memory and reads no
 device value on the host, so one runner serves every CUDA-graph replay of
-its bucket while ``kv_lens`` changes.  The runner keeps the FFI views it
-derives from the caller's tensors, keyed by each tensor's address, dtype,
-shape, strides and device, so a call with the tensors of an earlier call
-repeats none of the layout checks and conversions.
+its bucket while ``kv_lens`` changes.  The runner keeps what its checks
+derive from the caller's tensors (page counts and strides), keyed by each
+tensor's address, dtype, shape, strides and device, so a call with the
+tensors of an earlier call repeats none of the layout checks; it builds the
+FFI views of the tensors on every call and keeps no reference to them.
+
+The kernels address the output, the split partials, the page table and the
+K-scale pool with 32-bit offsets: the plan keeps ``rows * num_split * 512``
+and ``batch * page_table_width`` at most ``2**31`` (the split count capped,
+a larger bucket refused) and the runner refuses a pool of more than
+``MAX_POOL_PAGES`` pages.  A bucket whose per-item grid exceeds CUDA's
+limit of 65,535 in y or z takes the persistent decode build.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -117,8 +126,19 @@ TMA_O_PAGES_SM103 = 16
 # EPI_X_PAGES_SM100 pages.
 LATE_EXP_PAGES_SM103 = 24
 EPI_X_PAGES_SM100 = 8
-# Views of the caller's tensors a runner keeps (their FFI tensors).
+# The checks' results a runner keeps for the caller's tensors.
 VIEW_CACHE_ENTRIES = 256
+# The kernels' 32-bit offsets: elements of the output, the partials and the
+# page table, and the pages of a pool (page p's K-scale words start at
+# 1,280 p and end below 2**31).
+INT32_ELEMENTS = 2_147_483_648  # 2**31
+MAX_POOL_PAGES = 1_677_721
+# CUDA's limit of a grid's y and z dimensions.
+MAX_GRID_YZ = 65535
+# The byte alignment of ``out`` (256-bit stores) and of the query and the
+# scale pools (16-byte loads).
+OUT_ALIGN = 32
+IN_ALIGN = 16
 
 _U8 = (torch.uint8, torch.float8_e4m3fn)
 
@@ -331,14 +351,23 @@ def _plan(
         raise ValueError(f"max_splits {max_splits} outside 1..{MAX_SPLITS}")
     if max_kv is not None and max_kv < 0:
         raise ValueError(f"max_kv {max_kv}: a bound on kv_lens, >= 0")
+    rows = batch * q_len * num_heads
+    if rows * LATENT > INT32_ELEMENTS or batch * page_table_width > INT32_ELEMENTS:
+        raise ValueError(
+            f"batch {batch}, q_len {q_len}, num_heads {num_heads}, page_table_width "
+            f"{page_table_width}: the output's {rows} x {LATENT} and the page "
+            f"table's {batch} x {page_table_width} elements must each be at most "
+            "2**31 (the kernels' 32-bit offsets)"
+        )
     m_tiles = -(-(q_len * num_heads) // TILE_ROWS)
     splits = num_split_for(
         pairs=sm_count // 2,
         batch=batch,
         m_tiles=m_tiles,
-        rows=batch * q_len * num_heads,
+        rows=rows,
         page_table_width=page_table_width,
-        max_splits=max_splits,
+        # the partials' rows * splits * 512 elements within 32-bit offsets
+        max_splits=min(max_splits, INT32_ELEMENTS // (rows * LATENT)),
         one_wave_slack=one_wave_slack_for(
             arch=arch, long_rows=long_rows_for(page_table_width=page_table_width)
         ),
@@ -352,7 +381,10 @@ def _plan(
         long_rows=long_rows,
     )
     tma_o = tma_o_for(**bucket, num_split=splits)
-    persistent = not tma_o and persistent_for(**bucket, num_split=splits)
+    # A per-item grid (2 splits, m_tiles, batch) past CUDA's y / z limit
+    # cannot launch: the bucket takes the persistent build (the same bits).
+    too_large = max(m_tiles, batch) > MAX_GRID_YZ
+    persistent = not tma_o and (too_large or persistent_for(**bucket, num_split=splits))
     return Fp4MlaDecodePlan(
         batch,
         q_len,
@@ -522,8 +554,9 @@ class Fp4MlaDecodeRunner:
         self._ffi_device = tvm_ffi.device(f"cuda:{self.device_index}")
         self._entries = None
         # (role, address, dtype, shape, strides, device) -> what the role's
-        # checks derived from that tensor (its FFI view and page geometry).
-        self._views: dict[tuple, object] = {}
+        # checks derived from that tensor (a pool's page count and stride);
+        # no tensor and no FFI view is kept.
+        self._checked: dict[tuple, object] = {}
 
     def _entry_points(self):
         """The ``run`` entries of the decode and the reducer (loaded, or
@@ -536,54 +569,74 @@ class Fp4MlaDecodeRunner:
         return self._entries
 
     def _view(self, role, tensor):
-        """What ``role``'s checks derive from ``tensor``, kept per tensor
-        geometry: a later call with a tensor of the same address, dtype,
-        shape, strides and device reuses it."""
+        """``(derived, FFI view)`` of ``tensor`` for ``role``: its checks run
+        once per tensor geometry (a later call with a tensor of the same
+        address, dtype, shape, strides and device reuses what they derived),
+        its FFI view is made on every call, so the runner holds no reference
+        to the caller's tensor between calls."""
         key = (
             role,
             tensor.data_ptr(),
             tensor.dtype,
-            tensor.shape,
+            tuple(tensor.shape),
             tensor.stride(),
             tensor.get_device(),
         )
-        found = self._views.get(key)
-        if found is None:
-            found = _DERIVE[role](self, tensor)
-            if len(self._views) >= VIEW_CACHE_ENTRIES:
-                del self._views[next(iter(self._views))]
-            self._views[key] = found
-        return found
+        check, make = _ROLES[role]
+        if key in self._checked:
+            derived = self._checked[key]
+        else:
+            derived = check(self, tensor)
+            if len(self._checked) >= VIEW_CACHE_ENTRIES:
+                del self._checked[next(iter(self._checked))]
+            self._checked[key] = derived
+        return derived, make(self, tensor, derived)
 
     def _device_check(self, tensor):
         if tensor.get_device() != self.device_index:
             raise ValueError(f"every tensor must be on {self.device}")
 
-    def _kv(self, kv_cache):
+    @staticmethod
+    def _aligned(name, tensor, align):
+        if tensor.data_ptr() % align:
+            raise ValueError(
+                f"{name}: address {tensor.data_ptr():#x} is not {align}-byte aligned"
+            )
+
+    def _check_kv(self, kv_cache):
         pages, stride = _page_view(kv_cache, KV_PAGE_BYTES, "kv_cache")
         if stride % 16:
             raise ValueError(
                 f"kv_cache: page stride {stride} B is not a multiple of 16"
             )
+        if pages > MAX_POOL_PAGES:
+            raise ValueError(
+                f"kv_cache: {pages} pages; the decode addresses at most "
+                f"{MAX_POOL_PAGES} (32-bit offsets of the K-scale words)"
+            )
         self._device_check(kv_cache)
+        return pages, stride
+
+    def _kv(self, kv_cache, derived):
+        pages, stride = derived
         kv = torch.as_strided(
             kv_cache.view(torch.uint8),
             (pages, PAGE_TOKENS, TOKEN_BYTES),
             (stride, TOKEN_BYTES, 1),
         )
-        return pages, tvm_ffi.from_dlpack(kv)
+        return tvm_ffi.from_dlpack(kv)
 
-    def _sf(self, kv_scale_cache):
+    def _check_sf(self, kv_scale_cache):
         pages, stride = _page_view(kv_scale_cache, SF_PAGE_BYTES, "kv_scale_cache")
         if stride != SF_PAGE_BYTES:
             raise ValueError(
                 f"kv_scale_cache: page stride {stride} B, expected {SF_PAGE_BYTES}"
             )
+        self._aligned("kv_scale_cache", kv_scale_cache, IN_ALIGN)
         self._device_check(kv_scale_cache)
-        words = kv_scale_cache.view(torch.uint8).view(-1).view(torch.uint32)
-        return pages, tvm_ffi.from_dlpack(words)
+        return pages
 
-    def _vsf(self, v_scale_cache):
+    def _check_vsf(self, v_scale_cache):
         pages, stride = _page_view(v_scale_cache, V_SCALE_PAGE_BYTES, "v_scale_cache")
         if stride != V_SCALE_PAGE_BYTES:
             raise ValueError(
@@ -592,11 +645,14 @@ class Fp4MlaDecodeRunner:
                 f"at a {V_SCALE_PAGE_BYTES}-byte stride, addressed by kv_cache's "
                 "page ids, and takes no other layout"
             )
+        self._aligned("v_scale_cache", v_scale_cache, IN_ALIGN)
         self._device_check(v_scale_cache)
-        words = v_scale_cache.view(torch.uint8).view(-1).view(torch.uint32)
-        return pages, tvm_ffi.from_dlpack(words)
+        return pages
 
-    def _q(self, q_fp4):
+    def _words(self, pool, derived):
+        return tvm_ffi.from_dlpack(pool.view(torch.uint8).view(-1).view(torch.uint32))
+
+    def _check_q(self, q_fp4):
         p = self.plan
         if q_fp4.dtype not in _U8 or q_fp4.dim() != 2 or q_fp4.shape[1] != TOKEN_BYTES:
             raise ValueError(
@@ -604,11 +660,14 @@ class Fp4MlaDecodeRunner:
             )
         if not q_fp4.is_contiguous() or q_fp4.shape[0] < p.rows:
             raise ValueError(f"q_fp4: contiguous with at least {p.rows} rows")
+        self._aligned("q_fp4", q_fp4, IN_ALIGN)
         self._device_check(q_fp4)
-        words = q_fp4.view(torch.uint8)[: p.rows].view(torch.uint32)
+
+    def _q(self, q_fp4, derived):
+        words = q_fp4.view(torch.uint8)[: self.plan.rows].view(torch.uint32)
         return tvm_ffi.from_dlpack(words)
 
-    def _q_sf(self, q_scale):
+    def _check_q_sf(self, q_scale):
         need = -(-self.plan.rows // 128) * Q_SF_BLOCK_BYTES
         if (
             q_scale.dtype not in _U8
@@ -617,10 +676,13 @@ class Fp4MlaDecodeRunner:
         ):
             raise ValueError(f"q_scale: contiguous E4M3 bytes, at least {need}")
         self._device_check(q_scale)
+        return need
+
+    def _q_sf(self, q_scale, need):
         words = q_scale.view(torch.uint8).view(-1)[:need].view(torch.uint32)
         return tvm_ffi.from_dlpack(words)
 
-    def _page_table(self, page_table):
+    def _check_page_table(self, page_table):
         p = self.plan
         if (
             page_table.dtype != torch.int32
@@ -632,9 +694,8 @@ class Fp4MlaDecodeRunner:
                 f"{page_table.dtype} {tuple(page_table.shape)}"
             )
         self._device_check(page_table)
-        return tvm_ffi.from_dlpack(page_table)
 
-    def _kv_lens(self, kv_lens):
+    def _check_kv_lens(self, kv_lens):
         p = self.plan
         if (
             kv_lens.dtype != torch.int32
@@ -644,15 +705,16 @@ class Fp4MlaDecodeRunner:
         ):
             raise ValueError(f"kv_lens: contiguous int32 [>= {p.batch}]")
         self._device_check(kv_lens)
-        return tvm_ffi.from_dlpack(kv_lens[: p.batch])
 
-    def _scale(self, name, scale):
+    def _kv_lens(self, kv_lens, derived):
+        return tvm_ffi.from_dlpack(kv_lens[: self.plan.batch])
+
+    def _check_scale(self, name, scale):
         if scale.dtype != torch.float32 or scale.numel() != 1:
             raise ValueError(f"{name}: an FP32 one-element device tensor")
         self._device_check(scale)
-        return tvm_ffi.from_dlpack(scale.view(1))
 
-    def _out(self, out):
+    def _check_out(self, out):
         p = self.plan
         if (
             out.dtype != torch.bfloat16
@@ -660,8 +722,11 @@ class Fp4MlaDecodeRunner:
             or not out.is_contiguous()
         ):
             raise ValueError(f"out: contiguous BF16 with {p.rows} x {LATENT} elements")
+        self._aligned("out", out, OUT_ALIGN)
         self._device_check(out)
-        return tvm_ffi.from_dlpack(out.view(p.rows, LATENT))
+
+    def _out(self, out, derived):
+        return tvm_ffi.from_dlpack(out.view(self.plan.rows, LATENT))
 
     def __call__(
         self,
@@ -699,34 +764,41 @@ class Fp4MlaDecodeRunner:
         (at most the plan's ``max_kv`` when it was given one: the decode build
         without long rows does not dither longer rows).
         ``q_global_scale`` / ``kv_global_scale``: FP32 one-element device
-        tensors.  ``out``: BF16, ``B q_len H x 512`` contiguous elements.
+        tensors.  ``out``: BF16, ``B q_len H x 512`` contiguous elements, its
+        address 32-byte aligned; ``q_fp4``, ``kv_scale_cache`` and
+        ``v_scale_cache`` 16-byte aligned.  ``sm_scale``: finite and positive
+        (the decode scales the masked scores, -inf, by it).  ``kv_cache``
+        holds at most ``MAX_POOL_PAGES`` pages.
         """
+        sm_scale = float(sm_scale)
+        if not (math.isfinite(sm_scale) and sm_scale > 0.0):
+            raise ValueError(f"sm_scale must be finite and positive, got {sm_scale}")
         view = self._view
         pages, kv = view("kv_cache", kv_cache)
         sf_pages, sf = view("kv_scale_cache", kv_scale_cache)
-        if sf_pages < pages:
+        if sf_pages < pages[0]:
             raise ValueError(
-                f"kv_scale_cache holds {sf_pages} pages, fewer than kv_cache's {pages}"
+                f"kv_scale_cache holds {sf_pages} pages, fewer than kv_cache's {pages[0]}"
             )
         vsf_pages, vsf = view("v_scale_cache", v_scale_cache)
-        if vsf_pages < pages:
+        if vsf_pages < pages[0]:
             raise ValueError(
                 f"v_scale_cache holds {vsf_pages} pages, fewer than kv_cache's "
-                f"{pages}: the decode reads the V-scale page of every kv_cache page id"
+                f"{pages[0]}: the decode reads the V-scale page of every kv_cache page id"
             )
         values = (
             kv,
             kv,
             sf,
             vsf,
-            view("q_fp4", q_fp4),
-            view("q_scale", q_scale),
-            view("page_table", page_table),
-            view("kv_lens", kv_lens),
-            view("q_global_scale", q_global_scale),
-            view("kv_global_scale", kv_global_scale),
-            view("out", out),
-            float(sm_scale),
+            view("q_fp4", q_fp4)[1],
+            view("q_scale", q_scale)[1],
+            view("page_table", page_table)[1],
+            view("kv_lens", kv_lens)[1],
+            view("q_global_scale", q_global_scale)[1],
+            view("kv_global_scale", kv_global_scale)[1],
+            view("out", out)[1],
+            sm_scale,
         )
         decode, merge = self._entry_points()
         decode_args, decode_slots = self._decode_args
@@ -746,18 +818,34 @@ class Fp4MlaDecodeRunner:
         return out
 
 
-# What each role's checks derive from the caller's tensor (Fp4MlaDecodeRunner._view).
-_DERIVE = {
-    "kv_cache": Fp4MlaDecodeRunner._kv,
-    "kv_scale_cache": Fp4MlaDecodeRunner._sf,
-    "v_scale_cache": Fp4MlaDecodeRunner._vsf,
-    "q_fp4": Fp4MlaDecodeRunner._q,
-    "q_scale": Fp4MlaDecodeRunner._q_sf,
-    "page_table": Fp4MlaDecodeRunner._page_table,
-    "kv_lens": Fp4MlaDecodeRunner._kv_lens,
-    "q_global_scale": lambda runner, t: runner._scale("q_global_scale", t),
-    "kv_global_scale": lambda runner, t: runner._scale("kv_global_scale", t),
-    "out": Fp4MlaDecodeRunner._out,
+def _ffi(runner, tensor, derived):
+    return tvm_ffi.from_dlpack(tensor)
+
+
+def _scale_view(runner, scale, derived):
+    return tvm_ffi.from_dlpack(scale.view(1))
+
+
+# Per role: its checks (run once per tensor geometry, their result kept) and
+# the FFI view made on every call from the tensor and that result
+# (Fp4MlaDecodeRunner._view).
+_ROLES = {
+    "kv_cache": (Fp4MlaDecodeRunner._check_kv, Fp4MlaDecodeRunner._kv),
+    "kv_scale_cache": (Fp4MlaDecodeRunner._check_sf, Fp4MlaDecodeRunner._words),
+    "v_scale_cache": (Fp4MlaDecodeRunner._check_vsf, Fp4MlaDecodeRunner._words),
+    "q_fp4": (Fp4MlaDecodeRunner._check_q, Fp4MlaDecodeRunner._q),
+    "q_scale": (Fp4MlaDecodeRunner._check_q_sf, Fp4MlaDecodeRunner._q_sf),
+    "page_table": (Fp4MlaDecodeRunner._check_page_table, _ffi),
+    "kv_lens": (Fp4MlaDecodeRunner._check_kv_lens, Fp4MlaDecodeRunner._kv_lens),
+    "q_global_scale": (
+        lambda runner, t: runner._check_scale("q_global_scale", t),
+        _scale_view,
+    ),
+    "kv_global_scale": (
+        lambda runner, t: runner._check_scale("kv_global_scale", t),
+        _scale_view,
+    ),
+    "out": (Fp4MlaDecodeRunner._check_out, Fp4MlaDecodeRunner._out),
 }
 
 

@@ -34,7 +34,11 @@ allows 32,768 keys, the runner uses the decode build without the long-row
 branch of the P quantization, which gives the same result on shorter rows. A
 call of the runner allocates no CUDA memory and reads no device value on the
 host, so one runner serves every CUDA Graph replay of its bucket while
-`kv_lens` changes. CUDA Graph capture belongs to the caller.
+`kv_lens` changes. CUDA Graph capture belongs to the caller: run one eager
+call of the runner before the capture (the first call loads the libraries,
+JIT-building them when no prebuilt library exists), and keep the runner (it
+owns the split partials a replay writes and reads) and every tensor a
+captured call reads or writes alive until the last replay.
 
 The runner takes TensorRT-LLM's per-layer views as they are: `kv_cache`
 (`[pages, ...]`, 40,960 bytes per page), `kv_scale_cache` (`[pages, ...]`,
@@ -49,7 +53,10 @@ global scales on the device. The scale pools have no padding between pages
 the runner refuses a pool in any other layout with a `ValueError`. The decode
 reads the V scales from the V-scale pool on every call (it does not derive
 them from `kv_scale_cache`), so the pool must hold the V scales TensorRT-LLM
-writes with the cache. The split-KV reducer
+writes with the cache. `out` must be 32-byte aligned and `q_fp4` and the
+scale pools 16-byte aligned, `sm_scale` finite and positive, and `kv_cache`
+at most 1,677,721 pages; the runner refuses anything else with a
+`ValueError` before a launch. The split-KV reducer
 launches with programmatic dependent launch: its blocks start while the
 decode finishes and wait for the decode's results.
 
@@ -73,9 +80,14 @@ entry, the grid rule a launch follows, its workspace and the kernel-parameter
 to logical-argument map) and the loader glue (`record_for`, `launch_grid`,
 `launch_args`, `load`). What to compile is recorded once in `build.json`: the
 generated CUDA sources under `csrc/`, their digests and nvcc flags, one entry
-per (program, architecture). `cake_build.py` loads a prebuilt library from
-`aot/` when a builder compiled one and otherwise JIT-builds the manifest entry
-through FlashInfer from the same sources and flags.
+per (program, architecture). The decode entries carry an `nvrtc` record:
+`cake_nvrtc.py` compiles their device source with NVRTC to a cubin, nvcc
+compiles the binding, and the library embeds the cubin (NVRTC and CUDA 12.9
+or newer). The reducer entries, and the prebuilt library of any entry, load
+through `cake_build.py`, which loads a
+prebuilt library from `aot/` when a builder compiled one and otherwise
+JIT-builds the manifest entry through FlashInfer from the same sources and
+flags.
 `scripts/check_cake_build_manifests.py` checks the manifest against the
 registry and the sources without importing the package.
 `tests/experimental/test_cake_fp4_mla_decode.py` checks the decode against a

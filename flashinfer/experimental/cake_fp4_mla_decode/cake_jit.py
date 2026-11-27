@@ -1054,10 +1054,14 @@ def run_module(
     device_index: int,
 ) -> None:
     """Launch record ``name`` with logical argument ``values`` on ``grid`` (the
-    record's :func:`launch_grid`) on the current torch stream of the device."""
+    record's :func:`launch_grid`) on the current torch stream of device
+    ``device_index`` (not the current device's)."""
+    import torch
+
     record = MODULES[name]
     module = load(name, device_arch(device_index))
-    with tvm_ffi.use_torch_stream():
+    stream = torch.cuda.current_stream(device_index).cuda_stream
+    with tvm_ffi.use_raw_stream(tvm_ffi.device(f"cuda:{device_index}"), stream):
         getattr(module, record["ffi_entry"])(*launch_args(record, values, grid))
 
 

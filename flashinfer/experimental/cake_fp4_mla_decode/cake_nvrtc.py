@@ -102,12 +102,20 @@ def compile_options(library: str) -> list[str]:
 
 
 def compile_cubin(library: str) -> bytes:
-    """NVRTC's cubin of ``library``'s device source (digest-checked first)."""
+    """NVRTC's cubin of ``library``'s device source (digest-checked first;
+    refused when the loaded NVRTC is older than the entry's ``min_cuda``)."""
     from cuda.bindings import nvrtc
 
     record = nvrtc_record(library)
     if record is None:
         raise KeyError(f"{library} has no NVRTC build in build.json")
+    floor = cake_build.libraries_by_name()[library]["min_cuda"]
+    if _nvrtc_version() < tuple(int(part) for part in floor.split(".")[:2]):
+        major, minor = _nvrtc_version()
+        raise RuntimeError(
+            f"{library} needs NVRTC {floor} or newer (its options and PTX); "
+            f"the loaded NVRTC is {major}.{minor}"
+        )
     source = _checked(record["source"], record["sha256"], library)
     options = [option.encode() for option in compile_options(library)]
     status, program = nvrtc.nvrtcCreateProgram(

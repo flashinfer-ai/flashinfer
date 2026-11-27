@@ -501,7 +501,7 @@ def _check_flags_if(package: Package, where: str, items: Any) -> list[Finding]:
         if (
             not isinstance(item, dict)
             or set(item) != {"cuda", "flags"}
-            or not re.match(r"^(==|>=|<=|>|<)\d+\.\d+$", str(item.get("cuda")))
+            or not re.match(r"^(==|>=)\d+\.\d+$", str(item.get("cuda")))
             or not _is_str_list(item.get("flags"))
         ):
             found.append(
