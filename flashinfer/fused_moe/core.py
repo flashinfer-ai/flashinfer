@@ -1606,11 +1606,17 @@ def cutlass_fused_moe(
         GEMM2 weights for each expert.
 
     output_dtype : torch.dtype
-        Desired output data type. For 16-bit activations and weights: their dtype, or
-        ``torch.float32``, for which the GEMMs stay 16-bit and the output is the routing
-        sum in FP32 (so partial outputs, e.g. of expert groups, can be added without
-        rounding). Other modes: the activation dtype, and for the FP8 and FP4 modes
-        ``torch.float16`` or ``torch.bfloat16``. Any other dtype raises.
+        Desired output data type; any dtype not listed for the mode raises.
+
+        - 16-bit activations and weights of the same dtype: that dtype, or
+          ``torch.float32``, for which the GEMMs stay 16-bit and the output is the
+          routing sum in FP32 (so partial outputs, e.g. of expert groups, can be added
+          without rounding).
+        - FP8, MXFP8 and NVFP4 modes, and MXFP4 weights with FP8 or MXFP8 activations:
+          ``torch.float16`` or ``torch.bfloat16`` (not an FP8 output). Humming-style
+          MXFP4 x FP8, which quantizes 16-bit inputs online: the input dtype only.
+        - 16-bit activations with FP8, INT4 or MXFP4 (W4A16) weights: the activation
+          dtype.
 
     quant_scales : List[torch.Tensor]
         Quantization scales for the operation.
