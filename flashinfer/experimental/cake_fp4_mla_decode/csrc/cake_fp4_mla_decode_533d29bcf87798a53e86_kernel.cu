@@ -238,6 +238,8 @@ __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
 
 
 
+#if __CUDA_ARCH__ == 1030
+#else
 __device__ __forceinline__ void tma_3d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
     asm volatile(
@@ -249,6 +251,7 @@ __device__ __forceinline__ void tma_3d_gmem2smem(
 }
 
 
+#endif
 __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
     int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
     asm volatile(
@@ -256,14 +259,24 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
         ".mbarrier::complete_tx::bytes.cta_group::2"
         " [%0], [%1, {%2, %3, %4}], [%5];"
         :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
+#if __CUDA_ARCH__ == 1030
            "r"(mbar_addr) : "memory");
 }
 
 
-#if __CUDA_ARCH__ == 1030
-
+__device__ __forceinline__ void tma_4d_gmem2smem(
+    int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.4d.shared::cta.global"
+        ".mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3, %4, %5}], [%6];"
+        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
 #else
 #endif
+           "r"(mbar_addr) : "memory");
+}
+
+
 __device__ __forceinline__ void tma_5d_gmem2smem_cta2(
     int dst, const void *tmap_ptr, int x, int y, int z, int w, int v, int mbar_addr) {
     asm volatile(
@@ -341,9 +354,9 @@ extern "C" {
 
 __global__ __launch_bounds__(480) __cluster_dims__(2,1,1) void
 #if __CUDA_ARCH__ == 1030
-kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map, const __grid_constant__ CUtensorMap out_map, const __grid_constant__ CUtensorMap po_map)
+kernel_cake_fp4_mla_decode_533d29bcf87798a53e86(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map, const __grid_constant__ CUtensorMap out_map, const __grid_constant__ CUtensorMap po_map)
 #else
-kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
+kernel_cake_fp4_mla_decode_533d29bcf87798a53e86(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, int batch, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map)
 #endif
 {
     const int tid = threadIdx.x;
@@ -426,66 +439,47 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
     // Mbarrier init (35 barriers at smem_raw[0..280))
 
     if (warp == 0) {
-        uint32_t leader = elect_sync();
-        if (leader) {
-            // --- pipeline 'k_pipe' ---
-            // k_full: 2 barriers, init_count=2
-            mbarrier_init(smem + 0, 2);
-            mbarrier_init(smem + 8, 2);
-            // k_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 16, 1);
-            mbarrier_init(smem + 24, 1);
-            // --- pipeline 'raw_pipe' ---
-            // raw_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 32, 1);
-            mbarrier_init(smem + 40, 1);
-            // raw_empty: 2 barriers, init_count=128
-            mbarrier_init(smem + 48, 128);
-            mbarrier_init(smem + 56, 128);
-            // --- pipeline 'vt_pipe' ---
-            // vt_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 64, 256);
-            mbarrier_init(smem + 72, 256);
-            // vt_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
-            // --- pipeline 'vs_pipe' ---
-            // vs_full: 4 barriers, init_count=2
-            mbarrier_init(smem + 96, 2);
-            mbarrier_init(smem + 104, 2);
-            mbarrier_init(smem + 112, 2);
-            mbarrier_init(smem + 120, 2);
-            // vs_empty: 4 barriers, init_count=1
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
-            mbarrier_init(smem + 144, 1);
-            mbarrier_init(smem + 152, 1);
-            // q_full: 1 barriers, init_count=256
-            mbarrier_init(smem + 160, 256);
-            // q_empty: 1 barriers, init_count=1
-            mbarrier_init(smem + 168, 1);
-            // o_free: 1 barriers, init_count=8
-            mbarrier_init(smem + 176, 8);
-            // s_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 184, 1);
-            mbarrier_init(smem + 192, 1);
-            // s_empty: 2 barriers, init_count=256
-            mbarrier_init(smem + 200, 256);
-            mbarrier_init(smem + 208, 256);
-            // p_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 216, 256);
-            mbarrier_init(smem + 224, 256);
-            // pv_done: 2 barriers, init_count=1
-            mbarrier_init(smem + 232, 1);
-            mbarrier_init(smem + 240, 1);
-            // m_ready: 2 barriers, init_count=128
-            mbarrier_init(smem + 248, 128);
-            mbarrier_init(smem + 256, 128);
-            // l_ready: 2 barriers, init_count=128
-            mbarrier_init(smem + 264, 128);
-            mbarrier_init(smem + 272, 128);
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        // --- pipeline 'k_pipe' ---
+        // k_full: 2 barriers, init_count=2
+        // k_empty: 2 barriers, init_count=1
+        // --- pipeline 'raw_pipe' ---
+        // raw_full: 2 barriers, init_count=1
+        // raw_empty: 2 barriers, init_count=128
+        // --- pipeline 'vt_pipe' ---
+        // vt_full: 2 barriers, init_count=256
+        // vt_empty: 2 barriers, init_count=1
+        // --- pipeline 'vs_pipe' ---
+        // vs_full: 4 barriers, init_count=2
+        // vs_empty: 4 barriers, init_count=1
+        // q_full: 1 barriers, init_count=256
+        // q_empty: 1 barriers, init_count=1
+        // o_free: 1 barriers, init_count=8
+        // s_full: 2 barriers, init_count=1
+        // s_empty: 2 barriers, init_count=256
+        // p_full: 2 barriers, init_count=256
+        // pv_done: 2 barriers, init_count=1
+        // m_ready: 2 barriers, init_count=128
+        // l_ready: 2 barriers, init_count=128
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 128;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(31), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(29), "r"((uint32_t)(256)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(25), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(23), "r"((uint32_t)(8)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(22), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(21), "r"((uint32_t)(256)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(20), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(16), "r"((uint32_t)(2)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(12), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(10), "r"((uint32_t)(256)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(8), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(6), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(2), "r"((uint32_t)(2)));
+        mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
+        if (lane < 3) {
+            mbarrier_init(smem + 256 + lane * 8, 128);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
     __syncwarp();
@@ -2329,8 +2323,9 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     mbarrier_wait(pv_done_addr + (grp) * 8, _phase_pv_done_2);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1030
-                    unsigned int box = smem_os_addr + (unsigned int)((4 * grp + qs) * 4096);
+                    unsigned int box0 = smem_os_addr + (unsigned int)((4 * grp + qs) * 2 * 4096);
                     int row_w = row0 + cta_rank * 64 + qs % 2 * 32;
+                    unsigned int box_0 = box0 + 0;
 #else
 #endif
                     float o_vals_0[32];
@@ -2359,10 +2354,8 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         o_bf16_0[_lp] = *(uint32_t*)&_bf2;
                     }
 #if __CUDA_ARCH__ == 1030
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_0[0]), "r"(o_bf16_0[1]), "r"(o_bf16_0[2]), "r"(o_bf16_0[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_0[4]), "r"(o_bf16_0[5]), "r"(o_bf16_0[6]), "r"(o_bf16_0[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_0[8]), "r"(o_bf16_0[9]), "r"(o_bf16_0[10]), "r"(o_bf16_0[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_0[12]), "r"(o_bf16_0[13]), "r"(o_bf16_0[14]), "r"(o_bf16_0[15]) : "memory");
+                    if (elect_sync()) {
+                        asm volatile("cp.async.bulk.wait_group.read 1;");
 #else
                     int dim0_0 = 0;
                     if (row_ok_c != 0) {
@@ -2396,7 +2389,15 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                                     :: "l"((void*)(partial_O + (o_base + dim0_0 + 16))), "r"(_raw_stv8_75[0]), "r"(_raw_stv8_75[1]), "r"(_raw_stv8_75[2]), "r"(_raw_stv8_75[3]), "r"(_raw_stv8_75[4]), "r"(_raw_stv8_75[5]), "r"(_raw_stv8_75[6]), "r"(_raw_stv8_75[7]) : "memory");
                             }
                         }
+#endif
                     }
+#if __CUDA_ARCH__ == 1030
+                    __syncwarp();
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_0[0]), "r"(o_bf16_0[1]), "r"(o_bf16_0[2]), "r"(o_bf16_0[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_0[4]), "r"(o_bf16_0[5]), "r"(o_bf16_0[6]), "r"(o_bf16_0[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_0[8]), "r"(o_bf16_0[9]), "r"(o_bf16_0[10]), "r"(o_bf16_0[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_0[12]), "r"(o_bf16_0[13]), "r"(o_bf16_0[14]), "r"(o_bf16_0[15]) : "memory");
+#else
 #endif
                     float o_vals_1[32];
                     asm volatile(
@@ -2424,10 +2425,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         o_bf16_1[_lp] = *(uint32_t*)&_bf2;
                     }
 #if __CUDA_ARCH__ == 1030
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_1[0]), "r"(o_bf16_1[1]), "r"(o_bf16_1[2]), "r"(o_bf16_1[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_1[4]), "r"(o_bf16_1[5]), "r"(o_bf16_1[6]), "r"(o_bf16_1[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_1[8]), "r"(o_bf16_1[9]), "r"(o_bf16_1[10]), "r"(o_bf16_1[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_1[12]), "r"(o_bf16_1[13]), "r"(o_bf16_1[14]), "r"(o_bf16_1[15]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_1[0]), "r"(o_bf16_1[1]), "r"(o_bf16_1[2]), "r"(o_bf16_1[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_1[4]), "r"(o_bf16_1[5]), "r"(o_bf16_1[6]), "r"(o_bf16_1[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_1[8]), "r"(o_bf16_1[9]), "r"(o_bf16_1[10]), "r"(o_bf16_1[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_0 + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_1[12]), "r"(o_bf16_1[13]), "r"(o_bf16_1[14]), "r"(o_bf16_1[15]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     int dim_b_0 = 128 * half;
@@ -2438,7 +2439,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
 #endif
                         if (direct != 0) {
 #if __CUDA_ARCH__ == 1030
-                            tma_store_3d((&out_map), dim_b_0, row_w, b_i, box);
+                            tma_store_3d((&out_map), dim_b_0, row_w, b_i, box_0);
 #else
                             {
                                 const unsigned* _raw_stv8_77 = reinterpret_cast<const unsigned*>(o_bf16_1);
@@ -2449,7 +2450,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
 #endif
                         } else {
 #if __CUDA_ARCH__ == 1030
-                            tma_store_4d((&po_map), dim_b_0, split_i, row_w, b_i, box);
+                            tma_store_4d((&po_map), dim_b_0, split_i, row_w, b_i, box_0);
 #else
                             {
                                 const unsigned* _raw_stv8_78 = reinterpret_cast<const unsigned*>(o_bf16_1);
@@ -2479,6 +2480,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         }
 #endif
                     }
+#if __CUDA_ARCH__ == 1030
+                    unsigned int box_1 = box0 + 4096;
+#else
+#endif
                     float o_vals_2[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -2506,7 +2511,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     }
 #if __CUDA_ARCH__ == 1030
                     if (elect_sync()) {
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
+                        asm volatile("cp.async.bulk.wait_group.read 1;");
 #else
                     int dim0_2 = 64;
                     if (row_ok_c != 0) {
@@ -2544,10 +2549,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     }
 #if __CUDA_ARCH__ == 1030
                     __syncwarp();
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_2[0]), "r"(o_bf16_2[1]), "r"(o_bf16_2[2]), "r"(o_bf16_2[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_2[4]), "r"(o_bf16_2[5]), "r"(o_bf16_2[6]), "r"(o_bf16_2[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_2[8]), "r"(o_bf16_2[9]), "r"(o_bf16_2[10]), "r"(o_bf16_2[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_2[12]), "r"(o_bf16_2[13]), "r"(o_bf16_2[14]), "r"(o_bf16_2[15]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_2[0]), "r"(o_bf16_2[1]), "r"(o_bf16_2[2]), "r"(o_bf16_2[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_2[4]), "r"(o_bf16_2[5]), "r"(o_bf16_2[6]), "r"(o_bf16_2[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_2[8]), "r"(o_bf16_2[9]), "r"(o_bf16_2[10]), "r"(o_bf16_2[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_2[12]), "r"(o_bf16_2[13]), "r"(o_bf16_2[14]), "r"(o_bf16_2[15]) : "memory");
 #else
 #endif
                     float o_vals_3[32];
@@ -2576,10 +2581,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         o_bf16_3[_lp] = *(uint32_t*)&_bf2;
                     }
 #if __CUDA_ARCH__ == 1030
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_3[0]), "r"(o_bf16_3[1]), "r"(o_bf16_3[2]), "r"(o_bf16_3[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_3[4]), "r"(o_bf16_3[5]), "r"(o_bf16_3[6]), "r"(o_bf16_3[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_3[8]), "r"(o_bf16_3[9]), "r"(o_bf16_3[10]), "r"(o_bf16_3[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_3[12]), "r"(o_bf16_3[13]), "r"(o_bf16_3[14]), "r"(o_bf16_3[15]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_3[0]), "r"(o_bf16_3[1]), "r"(o_bf16_3[2]), "r"(o_bf16_3[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_3[4]), "r"(o_bf16_3[5]), "r"(o_bf16_3[6]), "r"(o_bf16_3[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_3[8]), "r"(o_bf16_3[9]), "r"(o_bf16_3[10]), "r"(o_bf16_3[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_1 + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_3[12]), "r"(o_bf16_3[13]), "r"(o_bf16_3[14]), "r"(o_bf16_3[15]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     int dim_b_1 = 128 * half + 64;
@@ -2590,7 +2595,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
 #endif
                         if (direct != 0) {
 #if __CUDA_ARCH__ == 1030
-                            tma_store_3d((&out_map), dim_b_1, row_w, b_i, box);
+                            tma_store_3d((&out_map), dim_b_1, row_w, b_i, box_1);
 #else
                             {
                                 const unsigned* _raw_stv8_87 = reinterpret_cast<const unsigned*>(o_bf16_3);
@@ -2601,7 +2606,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
 #endif
                         } else {
 #if __CUDA_ARCH__ == 1030
-                            tma_store_4d((&po_map), dim_b_1, split_i, row_w, b_i, box);
+                            tma_store_4d((&po_map), dim_b_1, split_i, row_w, b_i, box_1);
 #else
                             {
                                 const unsigned* _raw_stv8_88 = reinterpret_cast<const unsigned*>(o_bf16_3);
@@ -2631,6 +2636,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         }
 #endif
                     }
+#if __CUDA_ARCH__ == 1030
+                    unsigned int box_2 = box0 + 0;
+#else
+#endif
                     float o_vals_4[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -2658,7 +2667,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     }
 #if __CUDA_ARCH__ == 1030
                     if (elect_sync()) {
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
+                        asm volatile("cp.async.bulk.wait_group.read 1;");
 #else
                     int dim0_4 = 256;
                     if (row_ok_c != 0) {
@@ -2696,10 +2705,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     }
 #if __CUDA_ARCH__ == 1030
                     __syncwarp();
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_4[0]), "r"(o_bf16_4[1]), "r"(o_bf16_4[2]), "r"(o_bf16_4[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_4[4]), "r"(o_bf16_4[5]), "r"(o_bf16_4[6]), "r"(o_bf16_4[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_4[8]), "r"(o_bf16_4[9]), "r"(o_bf16_4[10]), "r"(o_bf16_4[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_4[12]), "r"(o_bf16_4[13]), "r"(o_bf16_4[14]), "r"(o_bf16_4[15]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_4[0]), "r"(o_bf16_4[1]), "r"(o_bf16_4[2]), "r"(o_bf16_4[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_4[4]), "r"(o_bf16_4[5]), "r"(o_bf16_4[6]), "r"(o_bf16_4[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_4[8]), "r"(o_bf16_4[9]), "r"(o_bf16_4[10]), "r"(o_bf16_4[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_4[12]), "r"(o_bf16_4[13]), "r"(o_bf16_4[14]), "r"(o_bf16_4[15]) : "memory");
 #else
 #endif
                     float o_vals_5[32];
@@ -2728,10 +2737,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         o_bf16_5[_lp] = *(uint32_t*)&_bf2;
                     }
 #if __CUDA_ARCH__ == 1030
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_5[0]), "r"(o_bf16_5[1]), "r"(o_bf16_5[2]), "r"(o_bf16_5[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_5[4]), "r"(o_bf16_5[5]), "r"(o_bf16_5[6]), "r"(o_bf16_5[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_5[8]), "r"(o_bf16_5[9]), "r"(o_bf16_5[10]), "r"(o_bf16_5[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_5[12]), "r"(o_bf16_5[13]), "r"(o_bf16_5[14]), "r"(o_bf16_5[15]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_5[0]), "r"(o_bf16_5[1]), "r"(o_bf16_5[2]), "r"(o_bf16_5[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_5[4]), "r"(o_bf16_5[5]), "r"(o_bf16_5[6]), "r"(o_bf16_5[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_5[8]), "r"(o_bf16_5[9]), "r"(o_bf16_5[10]), "r"(o_bf16_5[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_2 + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_5[12]), "r"(o_bf16_5[13]), "r"(o_bf16_5[14]), "r"(o_bf16_5[15]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     int dim_b_2 = 256 + 128 * half;
@@ -2742,7 +2751,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
 #endif
                         if (direct != 0) {
 #if __CUDA_ARCH__ == 1030
-                            tma_store_3d((&out_map), dim_b_2, row_w, b_i, box);
+                            tma_store_3d((&out_map), dim_b_2, row_w, b_i, box_2);
 #else
                             {
                                 const unsigned* _raw_stv8_97 = reinterpret_cast<const unsigned*>(o_bf16_5);
@@ -2753,7 +2762,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
 #endif
                         } else {
 #if __CUDA_ARCH__ == 1030
-                            tma_store_4d((&po_map), dim_b_2, split_i, row_w, b_i, box);
+                            tma_store_4d((&po_map), dim_b_2, split_i, row_w, b_i, box_2);
 #else
                             {
                                 const unsigned* _raw_stv8_98 = reinterpret_cast<const unsigned*>(o_bf16_5);
@@ -2783,6 +2792,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         }
 #endif
                     }
+#if __CUDA_ARCH__ == 1030
+                    unsigned int box_3 = box0 + 4096;
+#else
+#endif
                     float o_vals_6[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -2810,7 +2823,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     }
 #if __CUDA_ARCH__ == 1030
                     if (elect_sync()) {
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
+                        asm volatile("cp.async.bulk.wait_group.read 1;");
 #else
                     int dim0_6 = 320;
                     if (row_ok_c != 0) {
@@ -2848,10 +2861,10 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     }
 #if __CUDA_ARCH__ == 1030
                     __syncwarp();
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_6[0]), "r"(o_bf16_6[1]), "r"(o_bf16_6[2]), "r"(o_bf16_6[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_6[4]), "r"(o_bf16_6[5]), "r"(o_bf16_6[6]), "r"(o_bf16_6[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_6[8]), "r"(o_bf16_6[9]), "r"(o_bf16_6[10]), "r"(o_bf16_6[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_6[12]), "r"(o_bf16_6[13]), "r"(o_bf16_6[14]), "r"(o_bf16_6[15]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (0 ^ lane % 8) * 16)), "r"(o_bf16_6[0]), "r"(o_bf16_6[1]), "r"(o_bf16_6[2]), "r"(o_bf16_6[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (1 ^ lane % 8) * 16)), "r"(o_bf16_6[4]), "r"(o_bf16_6[5]), "r"(o_bf16_6[6]), "r"(o_bf16_6[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (2 ^ lane % 8) * 16)), "r"(o_bf16_6[8]), "r"(o_bf16_6[9]), "r"(o_bf16_6[10]), "r"(o_bf16_6[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (3 ^ lane % 8) * 16)), "r"(o_bf16_6[12]), "r"(o_bf16_6[13]), "r"(o_bf16_6[14]), "r"(o_bf16_6[15]) : "memory");
 #else
 #endif
                     float o_vals_7[32];
@@ -2862,62 +2875,34 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         : "r"(taddr + (unsigned int)lane_base_s + 224));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
 #if __CUDA_ARCH__ == 1030
-                    const float2 _scale2_85 = {inv, inv};
 #else
                     const float2 _scale2_106 = {inv, inv};
-#endif
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
-#if __CUDA_ARCH__ == 1030
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_85);
-#else
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_106);
-#endif
                     unsigned int o_bf16_7[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_vals_7[_lp*2 + 0], o_vals_7[_lp*2+1 + 0]));
                         o_bf16_7[_lp] = *(uint32_t*)&_bf2;
                     }
-#if __CUDA_ARCH__ == 1030
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_7[0]), "r"(o_bf16_7[1]), "r"(o_bf16_7[2]), "r"(o_bf16_7[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_7[4]), "r"(o_bf16_7[5]), "r"(o_bf16_7[6]), "r"(o_bf16_7[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_7[8]), "r"(o_bf16_7[9]), "r"(o_bf16_7[10]), "r"(o_bf16_7[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_7[12]), "r"(o_bf16_7[13]), "r"(o_bf16_7[14]), "r"(o_bf16_7[15]) : "memory");
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    __syncwarp();
-                    int dim_b_3 = 256 + 128 * half + 64;
-                    if (elect_sync()) {
-#else
                     int dim0_7 = 352;
                     if (row_ok_c != 0) {
-#endif
                         if (direct != 0) {
-#if __CUDA_ARCH__ == 1030
-                            tma_store_3d((&out_map), dim_b_3, row_w, b_i, box);
-#else
                             {
                                 const unsigned* _raw_stv8_107 = reinterpret_cast<const unsigned*>(o_bf16_7);
                                 asm volatile(
                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                     :: "l"((void*)(out + (row_g * 512 + 128 * half + dim0_7))), "r"(_raw_stv8_107[0]), "r"(_raw_stv8_107[1]), "r"(_raw_stv8_107[2]), "r"(_raw_stv8_107[3]), "r"(_raw_stv8_107[4]), "r"(_raw_stv8_107[5]), "r"(_raw_stv8_107[6]), "r"(_raw_stv8_107[7]) : "memory");
                             }
-#endif
                         } else {
-#if __CUDA_ARCH__ == 1030
-                            tma_store_4d((&po_map), dim_b_3, split_i, row_w, b_i, box);
-#else
                             {
                                 const unsigned* _raw_stv8_108 = reinterpret_cast<const unsigned*>(o_bf16_7);
                                 asm volatile(
                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                     :: "l"((void*)(partial_O + (o_base + dim0_7))), "r"(_raw_stv8_108[0]), "r"(_raw_stv8_108[1]), "r"(_raw_stv8_108[2]), "r"(_raw_stv8_108[3]), "r"(_raw_stv8_108[4]), "r"(_raw_stv8_108[5]), "r"(_raw_stv8_108[6]), "r"(_raw_stv8_108[7]) : "memory");
                             }
-#endif
                         }
-#if __CUDA_ARCH__ == 1030
-                        asm volatile("cp.async.bulk.commit_group;");
-#else
                         if (direct != 0) {
                             {
                                 const unsigned* _raw_stv8_109 = reinterpret_cast<const unsigned*>(o_bf16_7 + (8));
@@ -2933,19 +2918,12 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                                     :: "l"((void*)(partial_O + (o_base + dim0_7 + 16))), "r"(_raw_stv8_110[0]), "r"(_raw_stv8_110[1]), "r"(_raw_stv8_110[2]), "r"(_raw_stv8_110[3]), "r"(_raw_stv8_110[4]), "r"(_raw_stv8_110[5]), "r"(_raw_stv8_110[6]), "r"(_raw_stv8_110[7]) : "memory");
                             }
                         }
-#endif
                     }
-#if __CUDA_ARCH__ == 1030
-                    if (elect_sync()) {
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
-                    }
-                    __syncwarp();
-#else
-#endif
                     if (row_ok_c != 0 && half == 0 && direct == 0) {
                         partial_max[row_g * num_split + split_i] = m;
                         partial_sum[row_g * num_split + split_i] = l_row;
                     }
+#endif
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     __syncwarp();
                     if (elect_sync()) {
@@ -2957,20 +2935,64 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                             "}"
                             :: "r"(o_free_addr), "r"(0) : "memory");
                     }
+#if __CUDA_ARCH__ == 1030
+                    const float2 _scale2_85 = {inv, inv};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 16; _ls++)
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_vals_7)[_ls], _scale2_85);
+                    unsigned int o_bf16_7[16];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 16; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_vals_7[_lp*2 + 0], o_vals_7[_lp*2+1 + 0]));
+                        o_bf16_7[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (4 ^ lane % 8) * 16)), "r"(o_bf16_7[0]), "r"(o_bf16_7[1]), "r"(o_bf16_7[2]), "r"(o_bf16_7[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (5 ^ lane % 8) * 16)), "r"(o_bf16_7[4]), "r"(o_bf16_7[5]), "r"(o_bf16_7[6]), "r"(o_bf16_7[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (6 ^ lane % 8) * 16)), "r"(o_bf16_7[8]), "r"(o_bf16_7[9]), "r"(o_bf16_7[10]), "r"(o_bf16_7[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(box_3 + (unsigned int)(lane * 128 + (7 ^ lane % 8) * 16)), "r"(o_bf16_7[12]), "r"(o_bf16_7[13]), "r"(o_bf16_7[14]), "r"(o_bf16_7[15]) : "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    __syncwarp();
+                    int dim_b_3 = 256 + 128 * half + 64;
+                    if (elect_sync()) {
+                        if (direct != 0) {
+                            tma_store_3d((&out_map), dim_b_3, row_w, b_i, box_3);
+                        } else {
+                            tma_store_4d((&po_map), dim_b_3, split_i, row_w, b_i, box_3);
+                        }
+                        asm volatile("cp.async.bulk.commit_group;");
+                    }
+                    if (row_ok_c != 0 && half == 0 && direct == 0) {
+                        partial_max[row_g * num_split + split_i] = m;
+                        partial_sum[row_g * num_split + split_i] = l_row;
+                    }
+#else
+#endif
                 }
                 g0_s = g0_s + my_n;
             }
             mbarrier_wait(pv_done_addr + (grp) * 8, _phase_pv_done_2);
+#if __CUDA_ARCH__ == 1030
+            if (elect_sync()) {
+                asm volatile("cp.async.bulk.wait_group.read 0;");
+            }
+            __syncwarp();
+#else
+#endif
         }
     }
     // ---- Role: xpose ----
     if (warp >= 8 && warp <= 11) {
         { // xpose_main
             int xw = make_warp_uniform(warp - 8);
+#if __CUDA_ARCH__ == 1030
+            int par_row = lane & 15;
+            int raw_lane = (lane >> 4) * 4096 + par_row * 64 + (xw ^ par_row >> 1 & 3) * 16;
+#else
             int src_row = (lane >> 2 & 3) * 8 + (lane >> 2 & 1 ^ lane >> 4) * 4 + (lane & 3);
             int raw_lane = src_row * 64 + (xw ^ src_row >> 1 & 3) * 16;
             unsigned int sel_u = (((lane & 1) == 1) ? 8292 : 25632);
             unsigned int sel_v = (((lane & 1) == 1) ? 12661 : 30001);
+#endif
             int swap_x = lane >> 3 & 1 ^ lane >> 2 & 1;
             int dim_row = xw * 32 + (lane & 7) * 2 + (lane >> 4) * 16 + swap_x;
             int raw_x = 0;
@@ -3501,15 +3523,29 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         : "memory");
                     asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(lw[4]), "=r"(lw[5]), "=r"(lw[6]), "=r"(lw[7])
+#if __CUDA_ARCH__ == 1030
+                        : "r"(smem_raw_addr + (unsigned int)(raw_x * 2 * 8192 + 1024 + raw_lane))
+                        : "memory");
+                    asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+                        : "=r"(lw[8]), "=r"(lw[9]), "=r"(lw[10]), "=r"(lw[11])
+#else
+#endif
                         : "r"(smem_raw_addr + (unsigned int)(raw_x * 2 * 8192 + 2048 + raw_lane))
                         : "memory");
                     asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+#if __CUDA_ARCH__ == 1030
+#else
                         : "=r"(lw[8]), "=r"(lw[9]), "=r"(lw[10]), "=r"(lw[11])
                         : "r"(smem_raw_addr + (unsigned int)(raw_x * 2 * 8192 + 4096 + raw_lane))
                         : "memory");
                     asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+#endif
                         : "=r"(lw[12]), "=r"(lw[13]), "=r"(lw[14]), "=r"(lw[15])
+#if __CUDA_ARCH__ == 1030
+                        : "r"(smem_raw_addr + (unsigned int)(raw_x * 2 * 8192 + 3072 + raw_lane))
+#else
                         : "r"(smem_raw_addr + (unsigned int)(raw_x * 2 * 8192 + 6144 + raw_lane))
+#endif
                         : "memory");
                     asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(lw[16]), "=r"(lw[17]), "=r"(lw[18]), "=r"(lw[19])
@@ -3517,29 +3553,53 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         : "memory");
                     asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(lw[20]), "=r"(lw[21]), "=r"(lw[22]), "=r"(lw[23])
+#if __CUDA_ARCH__ == 1030
+                        : "r"(smem_raw_addr + (unsigned int)((raw_x * 2 + 1) * 8192 + 1024 + raw_lane))
+                        : "memory");
+                    asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+                        : "=r"(lw[24]), "=r"(lw[25]), "=r"(lw[26]), "=r"(lw[27])
+#else
+#endif
                         : "r"(smem_raw_addr + (unsigned int)((raw_x * 2 + 1) * 8192 + 2048 + raw_lane))
                         : "memory");
                     asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+#if __CUDA_ARCH__ == 1030
+#else
                         : "=r"(lw[24]), "=r"(lw[25]), "=r"(lw[26]), "=r"(lw[27])
                         : "r"(smem_raw_addr + (unsigned int)((raw_x * 2 + 1) * 8192 + 4096 + raw_lane))
                         : "memory");
                     asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+#endif
                         : "=r"(lw[28]), "=r"(lw[29]), "=r"(lw[30]), "=r"(lw[31])
+#if __CUDA_ARCH__ == 1030
+                        : "r"(smem_raw_addr + (unsigned int)((raw_x * 2 + 1) * 8192 + 3072 + raw_lane))
+#else
                         : "r"(smem_raw_addr + (unsigned int)((raw_x * 2 + 1) * 8192 + 6144 + raw_lane))
+#endif
                         : "memory");
                     unsigned int pw_0[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_0 = lw[0];
+                    unsigned int v_0 = lw[2];
+#else
                     uint32_t u_0;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_0) : "r"(lw[0]), "r"(lw[2]), "r"(sel_u));
                     uint32_t v_0;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_0) : "r"(lw[0]), "r"(lw[2]), "r"(sel_v));
+#endif
                     unsigned int even_0 = u_0 & 252645135 | v_0 << 4 & 4042322160u;
                     unsigned int odd_0 = u_0 >> 4 & 252645135 | v_0 & 4042322160u;
                     pw_0[0] = ((lane >= 16) ? odd_0 : even_0);
                     pw_0[1] = ((lane >= 16) ? even_0 : odd_0);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_1 = lw[1];
+                    unsigned int v_1 = lw[3];
+#else
                     uint32_t u_1;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_1) : "r"(lw[1]), "r"(lw[3]), "r"(sel_u));
                     uint32_t v_1;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_1) : "r"(lw[1]), "r"(lw[3]), "r"(sel_v));
+#endif
                     unsigned int even_1 = u_1 & 252645135 | v_1 << 4 & 4042322160u;
                     unsigned int odd_1 = u_1 >> 4 & 252645135 | v_1 & 4042322160u;
                     pw_0[2] = ((lane >= 16) ? odd_1 : even_1);
@@ -3549,18 +3609,28 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         :: "r"(_stmatrix_addr_22), "r"(*reinterpret_cast<const uint32_t*>(&pw_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&pw_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&pw_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&pw_0[3]))
                         : "memory");
                     unsigned int pw_1[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_2 = lw[4];
+                    unsigned int v_2 = lw[6];
+#else
                     uint32_t u_2;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_2) : "r"(lw[4]), "r"(lw[6]), "r"(sel_u));
                     uint32_t v_2;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_2) : "r"(lw[4]), "r"(lw[6]), "r"(sel_v));
+#endif
                     unsigned int even_2 = u_2 & 252645135 | v_2 << 4 & 4042322160u;
                     unsigned int odd_2 = u_2 >> 4 & 252645135 | v_2 & 4042322160u;
                     pw_1[0] = ((lane >= 16) ? odd_2 : even_2);
                     pw_1[1] = ((lane >= 16) ? even_2 : odd_2);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_3 = lw[5];
+                    unsigned int v_3 = lw[7];
+#else
                     uint32_t u_3;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_3) : "r"(lw[5]), "r"(lw[7]), "r"(sel_u));
                     uint32_t v_3;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_3) : "r"(lw[5]), "r"(lw[7]), "r"(sel_v));
+#endif
                     unsigned int even_3 = u_3 & 252645135 | v_3 << 4 & 4042322160u;
                     unsigned int odd_3 = u_3 >> 4 & 252645135 | v_3 & 4042322160u;
                     pw_1[2] = ((lane >= 16) ? odd_3 : even_3);
@@ -3570,18 +3640,28 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         :: "r"(_stmatrix_addr_23), "r"(*reinterpret_cast<const uint32_t*>(&pw_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&pw_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&pw_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&pw_1[3]))
                         : "memory");
                     unsigned int pw_2[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_4 = lw[8];
+                    unsigned int v_4 = lw[10];
+#else
                     uint32_t u_4;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_4) : "r"(lw[8]), "r"(lw[10]), "r"(sel_u));
                     uint32_t v_4;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_4) : "r"(lw[8]), "r"(lw[10]), "r"(sel_v));
+#endif
                     unsigned int even_4 = u_4 & 252645135 | v_4 << 4 & 4042322160u;
                     unsigned int odd_4 = u_4 >> 4 & 252645135 | v_4 & 4042322160u;
                     pw_2[0] = ((lane >= 16) ? odd_4 : even_4);
                     pw_2[1] = ((lane >= 16) ? even_4 : odd_4);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_5 = lw[9];
+                    unsigned int v_5 = lw[11];
+#else
                     uint32_t u_5;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_5) : "r"(lw[9]), "r"(lw[11]), "r"(sel_u));
                     uint32_t v_5;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_5) : "r"(lw[9]), "r"(lw[11]), "r"(sel_v));
+#endif
                     unsigned int even_5 = u_5 & 252645135 | v_5 << 4 & 4042322160u;
                     unsigned int odd_5 = u_5 >> 4 & 252645135 | v_5 & 4042322160u;
                     pw_2[2] = ((lane >= 16) ? odd_5 : even_5);
@@ -3591,18 +3671,28 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         :: "r"(_stmatrix_addr_24), "r"(*reinterpret_cast<const uint32_t*>(&pw_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&pw_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&pw_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&pw_2[3]))
                         : "memory");
                     unsigned int pw_3[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_6 = lw[12];
+                    unsigned int v_6 = lw[14];
+#else
                     uint32_t u_6;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_6) : "r"(lw[12]), "r"(lw[14]), "r"(sel_u));
                     uint32_t v_6;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_6) : "r"(lw[12]), "r"(lw[14]), "r"(sel_v));
+#endif
                     unsigned int even_6 = u_6 & 252645135 | v_6 << 4 & 4042322160u;
                     unsigned int odd_6 = u_6 >> 4 & 252645135 | v_6 & 4042322160u;
                     pw_3[0] = ((lane >= 16) ? odd_6 : even_6);
                     pw_3[1] = ((lane >= 16) ? even_6 : odd_6);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_7 = lw[13];
+                    unsigned int v_7 = lw[15];
+#else
                     uint32_t u_7;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_7) : "r"(lw[13]), "r"(lw[15]), "r"(sel_u));
                     uint32_t v_7;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_7) : "r"(lw[13]), "r"(lw[15]), "r"(sel_v));
+#endif
                     unsigned int even_7 = u_7 & 252645135 | v_7 << 4 & 4042322160u;
                     unsigned int odd_7 = u_7 >> 4 & 252645135 | v_7 & 4042322160u;
                     pw_3[2] = ((lane >= 16) ? odd_7 : even_7);
@@ -3612,18 +3702,28 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         :: "r"(_stmatrix_addr_25), "r"(*reinterpret_cast<const uint32_t*>(&pw_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&pw_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&pw_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&pw_3[3]))
                         : "memory");
                     unsigned int pw_4[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_8 = lw[16];
+                    unsigned int v_8 = lw[18];
+#else
                     uint32_t u_8;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_8) : "r"(lw[16]), "r"(lw[18]), "r"(sel_u));
                     uint32_t v_8;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_8) : "r"(lw[16]), "r"(lw[18]), "r"(sel_v));
+#endif
                     unsigned int even_8 = u_8 & 252645135 | v_8 << 4 & 4042322160u;
                     unsigned int odd_8 = u_8 >> 4 & 252645135 | v_8 & 4042322160u;
                     pw_4[0] = ((lane >= 16) ? odd_8 : even_8);
                     pw_4[1] = ((lane >= 16) ? even_8 : odd_8);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_9 = lw[17];
+                    unsigned int v_9 = lw[19];
+#else
                     uint32_t u_9;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_9) : "r"(lw[17]), "r"(lw[19]), "r"(sel_u));
                     uint32_t v_9;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_9) : "r"(lw[17]), "r"(lw[19]), "r"(sel_v));
+#endif
                     unsigned int even_9 = u_9 & 252645135 | v_9 << 4 & 4042322160u;
                     unsigned int odd_9 = u_9 >> 4 & 252645135 | v_9 & 4042322160u;
                     pw_4[2] = ((lane >= 16) ? odd_9 : even_9);
@@ -3633,18 +3733,28 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         :: "r"(_stmatrix_addr_26), "r"(*reinterpret_cast<const uint32_t*>(&pw_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&pw_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&pw_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&pw_4[3]))
                         : "memory");
                     unsigned int pw_5[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_10 = lw[20];
+                    unsigned int v_10 = lw[22];
+#else
                     uint32_t u_10;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_10) : "r"(lw[20]), "r"(lw[22]), "r"(sel_u));
                     uint32_t v_10;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_10) : "r"(lw[20]), "r"(lw[22]), "r"(sel_v));
+#endif
                     unsigned int even_10 = u_10 & 252645135 | v_10 << 4 & 4042322160u;
                     unsigned int odd_10 = u_10 >> 4 & 252645135 | v_10 & 4042322160u;
                     pw_5[0] = ((lane >= 16) ? odd_10 : even_10);
                     pw_5[1] = ((lane >= 16) ? even_10 : odd_10);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_11 = lw[21];
+                    unsigned int v_11 = lw[23];
+#else
                     uint32_t u_11;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_11) : "r"(lw[21]), "r"(lw[23]), "r"(sel_u));
                     uint32_t v_11;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_11) : "r"(lw[21]), "r"(lw[23]), "r"(sel_v));
+#endif
                     unsigned int even_11 = u_11 & 252645135 | v_11 << 4 & 4042322160u;
                     unsigned int odd_11 = u_11 >> 4 & 252645135 | v_11 & 4042322160u;
                     pw_5[2] = ((lane >= 16) ? odd_11 : even_11);
@@ -3654,18 +3764,28 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         :: "r"(_stmatrix_addr_27), "r"(*reinterpret_cast<const uint32_t*>(&pw_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&pw_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&pw_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&pw_5[3]))
                         : "memory");
                     unsigned int pw_6[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_12 = lw[24];
+                    unsigned int v_12 = lw[26];
+#else
                     uint32_t u_12;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_12) : "r"(lw[24]), "r"(lw[26]), "r"(sel_u));
                     uint32_t v_12;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_12) : "r"(lw[24]), "r"(lw[26]), "r"(sel_v));
+#endif
                     unsigned int even_12 = u_12 & 252645135 | v_12 << 4 & 4042322160u;
                     unsigned int odd_12 = u_12 >> 4 & 252645135 | v_12 & 4042322160u;
                     pw_6[0] = ((lane >= 16) ? odd_12 : even_12);
                     pw_6[1] = ((lane >= 16) ? even_12 : odd_12);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_13 = lw[25];
+                    unsigned int v_13 = lw[27];
+#else
                     uint32_t u_13;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_13) : "r"(lw[25]), "r"(lw[27]), "r"(sel_u));
                     uint32_t v_13;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_13) : "r"(lw[25]), "r"(lw[27]), "r"(sel_v));
+#endif
                     unsigned int even_13 = u_13 & 252645135 | v_13 << 4 & 4042322160u;
                     unsigned int odd_13 = u_13 >> 4 & 252645135 | v_13 & 4042322160u;
                     pw_6[2] = ((lane >= 16) ? odd_13 : even_13);
@@ -3675,18 +3795,28 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                         :: "r"(_stmatrix_addr_28), "r"(*reinterpret_cast<const uint32_t*>(&pw_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&pw_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&pw_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&pw_6[3]))
                         : "memory");
                     unsigned int pw_7[4];
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_14 = lw[28];
+                    unsigned int v_14 = lw[30];
+#else
                     uint32_t u_14;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_14) : "r"(lw[28]), "r"(lw[30]), "r"(sel_u));
                     uint32_t v_14;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_14) : "r"(lw[28]), "r"(lw[30]), "r"(sel_v));
+#endif
                     unsigned int even_14 = u_14 & 252645135 | v_14 << 4 & 4042322160u;
                     unsigned int odd_14 = u_14 >> 4 & 252645135 | v_14 & 4042322160u;
                     pw_7[0] = ((lane >= 16) ? odd_14 : even_14);
                     pw_7[1] = ((lane >= 16) ? even_14 : odd_14);
+#if __CUDA_ARCH__ == 1030
+                    unsigned int u_15 = lw[29];
+                    unsigned int v_15 = lw[31];
+#else
                     uint32_t u_15;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u_15) : "r"(lw[29]), "r"(lw[31]), "r"(sel_u));
                     uint32_t v_15;
                     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v_15) : "r"(lw[29]), "r"(lw[31]), "r"(sel_v));
+#endif
                     unsigned int even_15 = u_15 & 252645135 | v_15 << 4 & 4042322160u;
                     unsigned int odd_15 = u_15 >> 4 & 252645135 | v_15 & 4042322160u;
                     pw_7[2] = ((lane >= 16) ? odd_15 : even_15);
@@ -3723,6 +3853,13 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
     if (warp == 12) {
         { // load_main
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#if __CUDA_ARCH__ == 1030
+#else
+            asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_k))) : "memory");
+            asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&ksf_map))) : "memory");
+            asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_v))) : "memory");
+            asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&vsf_map))) : "memory");
+#endif
             int k_l = 0;
             int raw_l = 0;
             int vs_l = 0;
@@ -3959,8 +4096,13 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(raw_full_addr + (raw_l) * 8, 16384);
+#if __CUDA_ARCH__ == 1030
+                        tma_4d_gmem2smem(smem_raw_addr + (unsigned int)(raw_l * 2 * 8192), (&kv_v), 64 * cta_rank, 0, 0, page_l, raw_full_addr + (raw_l) * 8);
+                        tma_4d_gmem2smem(smem_raw_addr + (unsigned int)((raw_l * 2 + 1) * 8192), (&kv_v), 64 * (2 + cta_rank), 0, 0, page_l, raw_full_addr + (raw_l) * 8);
+#else
                         tma_3d_gmem2smem(smem_raw_addr + (unsigned int)(raw_l * 2 * 8192), (&kv_v), 64 * cta_rank, 0, page_l, raw_full_addr + (raw_l) * 8);
                         tma_3d_gmem2smem(smem_raw_addr + (unsigned int)((raw_l * 2 + 1) * 8192), (&kv_v), 64 * (2 + cta_rank), 0, page_l, raw_full_addr + (raw_l) * 8);
+#endif
                     }
                     raw_l += 1;
                     if (raw_l == 2) { raw_l = 0; _phase_raw_empty ^= 1; }
@@ -4680,7 +4822,7 @@ kernel_cake_fp4_mla_decode_c3b4af0f7a2f5380a76a(const __grid_constant__ CUtensor
 
     // Cleanup
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    asm volatile("barrier.cluster.arrive.release.aligned;");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     if (warp == 0) {

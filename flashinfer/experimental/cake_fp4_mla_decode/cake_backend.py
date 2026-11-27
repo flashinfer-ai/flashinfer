@@ -18,8 +18,9 @@ Host side of the Cake MLA decode over TensorRT-LLM's ``fp4_mla`` KV cache.
 :func:`plan_fp4_mla_decode` fixes one decode bucket (batch, query tokens per
 request, heads, page-table width, optionally a bound on the KV lengths) on one
 device, chooses the KV split count, the decode build (with or without long
-rows, per item or persistent, and the form of the persistent build without
-long rows) and the reducer build, and allocates the split partials once; the
+rows, per item or persistent, the form of the persistent build without long
+rows and the ``tma_o`` form of the per-item build without long rows) and the
+reducer build, and allocates the split partials once; the
 returned
 :class:`Fp4MlaDecodeRunner` reads TensorRT-LLM's own tensors in place on every
 call (no copy of the cache, the query or its scales) and writes the
@@ -66,12 +67,15 @@ MAX_SPLITS = 16
 # item fits one wave at some count, the plan takes the cheapest one-wave count
 # if, priced with ``ITEM_PAGES_ONE_WAVE`` per item, it is within
 # ``SPLIT_SLACK_ONE_WAVE`` of the least cost so priced (waves that keep the
-# whole device busy run each page slower than one partly filled wave).
+# whole device busy run each page slower than one partly filled wave);
+# ``SPLIT_SLACK_ONE_WAVE_LONG_SM103`` on sm_103a for a page table wide enough
+# for long rows, whose build runs per item there.
 ITEM_PAGES = 6.2
 MERGE_ROW_PAGES = 0.0002
 SPLIT_SLACK = 0.03
 ITEM_PAGES_ONE_WAVE = 9.0
 SPLIT_SLACK_ONE_WAVE = 0.01
+SPLIT_SLACK_ONE_WAVE_LONG_SM103 = 0.03
 MIN_PAGES_PER_SPLIT = 2
 # The decode dithers the P scales of near-flat key blocks in rows that see at
 # least DITHER_KEYS keys; a bucket none of whose rows can see that many runs
@@ -90,11 +94,20 @@ MERGE_WARPS = 8
 # PER_ITEM_PAGES_SM100 at more (one item per cluster leaves nothing to
 # overlap).  sm_103a, whose persistent loop runs each page of the build with
 # long rows slower, takes it only for a bucket without long rows whose items
-# take several waves.
+# take several waves, or whose items are one split of at most
+# PERSISTENT_ONE_SPLIT_PAGES_SM103 pages.
 PER_ITEM_PAGES_SM100 = 6
-PER_ITEM_PAGES_ONE_SPLIT_SM100 = 7
+PER_ITEM_PAGES_ONE_SPLIT_SM100 = 8
 PER_ITEM_PAGES_FEW_SPLITS_SM100 = 9
 FEW_SPLITS_SM100 = 4
+PERSISTENT_ONE_SPLIT_PAGES_SM103 = 16
+# The per-item build without long rows has a ``tma_o`` form, the same bits,
+# whose epilogue stores the output by TMA boxes over the K ring's shared
+# memory: on sm_103a for one wave of the device's pairs of items (any split
+# count) of at most TMA_O_PAGES_SM103 pages each, on sm_100a for every bucket
+# it runs per item (one wave of items of few pages, per_item_pages_sm100).
+# The plan takes it in place of the persistent and the per-item build.
+TMA_O_PAGES_SM103 = 16
 # Two forms of the persistent build without long rows, the same bits: on
 # sm_103a the late form (each page's exponentials after the hand-off of the
 # previous page's anchor) for more than two waves of items of at most
@@ -118,11 +131,12 @@ def num_split_for(
     rows: int,
     page_table_width: int,
     max_splits: int = MAX_SPLITS,
+    one_wave_slack: float = SPLIT_SLACK_ONE_WAVE,
 ) -> int:
     """KV splits per row tile for ``pairs`` two-CTA clusters (``sm_count //
     2``), ``batch * m_tiles`` work items, ``rows`` output rows and a page
     table ``page_table_width`` pages wide (the module's cost model, with its
-    one-wave exception)."""
+    one-wave exception within ``one_wave_slack``, :func:`one_wave_slack_for`)."""
     items = batch * m_tiles
 
     def cost(splits: int, item_pages: float = ITEM_PAGES) -> float:
@@ -140,9 +154,19 @@ def num_split_for(
         return chosen
     best_one = min(cost(s, ITEM_PAGES_ONE_WAVE) for s in counts)
     cheapest = min(one_wave, key=lambda s: cost(s, ITEM_PAGES_ONE_WAVE))
-    if cost(cheapest, ITEM_PAGES_ONE_WAVE) <= best_one * (1.0 + SPLIT_SLACK_ONE_WAVE):
+    if cost(cheapest, ITEM_PAGES_ONE_WAVE) <= best_one * (1.0 + one_wave_slack):
         return cheapest
     return chosen
+
+
+def one_wave_slack_for(*, arch: str | None, long_rows: bool) -> float:
+    """The one-wave count's slack of :func:`num_split_for`:
+    ``SPLIT_SLACK_ONE_WAVE_LONG_SM103`` on ``sm_103a`` for a page table wide
+    enough for long rows (``long_rows``, :func:`long_rows_for` of the width
+    alone), ``SPLIT_SLACK_ONE_WAVE`` otherwise."""
+    if arch == "sm_103a" and long_rows:
+        return SPLIT_SLACK_ONE_WAVE_LONG_SM103
+    return SPLIT_SLACK_ONE_WAVE
 
 
 def persistent_for(
@@ -158,14 +182,42 @@ def persistent_for(
     every bucket but one whose ``items`` (splits included) fit the device's
     ``pairs`` with at most :func:`per_item_pages_sm100` pages each for its
     ``num_split``; on ``sm_103a`` a bucket without long rows whose items
-    exceed the pairs; none on another architecture.  The choice changes
-    neither the split count nor the arithmetic."""
+    exceed the pairs, or whose items are one split of at most
+    ``PERSISTENT_ONE_SPLIT_PAGES_SM103`` pages; none on another architecture.
+    The choice changes neither the split count nor the arithmetic."""
     if arch == "sm_100a":
         return not (
             items <= pairs and pages_per_item <= per_item_pages_sm100(num_split)
         )
     if arch == "sm_103a":
-        return not long_rows and items > pairs
+        one_split = (
+            num_split == 1 and pages_per_item <= PERSISTENT_ONE_SPLIT_PAGES_SM103
+        )
+        return not long_rows and (items > pairs or one_split)
+    return False
+
+
+def tma_o_for(
+    *,
+    arch: str | None,
+    items: int,
+    pairs: int,
+    pages_per_item: int,
+    long_rows: bool,
+    num_split: int = 1,
+) -> bool:
+    """Whether the bucket takes the ``tma_o`` form of the per-item build
+    without long rows: on ``sm_103a`` one wave of the device's ``pairs`` of
+    ``items`` (splits included) of at most ``TMA_O_PAGES_SM103`` pages each;
+    on ``sm_100a`` every bucket without long rows that it runs per item (one
+    wave of items of at most :func:`per_item_pages_sm100` pages); never for
+    the build with long rows or on another architecture."""
+    if long_rows or items > pairs:
+        return False
+    if arch == "sm_103a":
+        return pages_per_item <= TMA_O_PAGES_SM103
+    if arch == "sm_100a":
+        return pages_per_item <= per_item_pages_sm100(num_split)
     return False
 
 
@@ -237,6 +289,7 @@ class Fp4MlaDecodePlan:
     persistent: bool = False
     early_exp: bool = True  # the persistent build's form on sm_103a
     epi_x: bool = False  # the persistent build's form on sm_100a
+    tma_o: bool = False  # the per-item build's form without long rows
 
     @property
     def pairs(self) -> int:
@@ -286,6 +339,9 @@ def _plan(
         rows=batch * q_len * num_heads,
         page_table_width=page_table_width,
         max_splits=max_splits,
+        one_wave_slack=one_wave_slack_for(
+            arch=arch, long_rows=long_rows_for(page_table_width=page_table_width)
+        ),
     )
     long_rows = long_rows_for(page_table_width=page_table_width, max_kv=max_kv)
     bucket = dict(
@@ -295,7 +351,8 @@ def _plan(
         pages_per_item=-(-page_table_width // splits),
         long_rows=long_rows,
     )
-    persistent = persistent_for(**bucket, num_split=splits)
+    tma_o = tma_o_for(**bucket, num_split=splits)
+    persistent = not tma_o and persistent_for(**bucket, num_split=splits)
     return Fp4MlaDecodePlan(
         batch,
         q_len,
@@ -307,6 +364,7 @@ def _plan(
         persistent,
         early_exp=not (persistent and late_exp_for(**bucket)),
         epi_x=persistent and epi_x_for(**bucket),
+        tma_o=tma_o,
     )
 
 
@@ -408,6 +466,7 @@ class Fp4MlaDecodeRunner:
             persistent=plan.persistent,
             early_exp=plan.early_exp,
             epi_x=plan.epi_x,
+            tma_o=plan.tma_o,
         )
         self.merge = record_for(
             "merge", self.arch, warps_per_row=plan.merge_warps_per_row
@@ -758,7 +817,9 @@ __all__ = [
     "long_rows_for",
     "merge_warps_per_row",
     "num_split_for",
+    "one_wave_slack_for",
     "per_item_pages_sm100",
     "persistent_for",
     "plan_fp4_mla_decode",
+    "tma_o_for",
 ]

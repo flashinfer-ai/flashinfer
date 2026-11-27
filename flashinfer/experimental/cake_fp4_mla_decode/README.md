@@ -64,7 +64,9 @@ warps per output row). The decode builds are with and without long rows, each
 per item (a cluster per work item) and persistent (at most a cluster per SM
 pair, looping over the items), plus two forms of the persistent build without
 long rows: a late form on SM103 and a form that runs each item's epilogue in
-the V transpose warps on SM100. Every build gives the same result; the runner
+the V transpose warps on SM100, and a form of the per-item build without long
+rows that stores the output through TMA on both. Every build gives the same
+result; the runner
 picks one from the bucket and the device. A record carries the host plan
 (the architectures it is delivered for, its stage, its launch record, the argument plan of its `run`
 entry, the grid rule a launch follows, its workspace and the kernel-parameter

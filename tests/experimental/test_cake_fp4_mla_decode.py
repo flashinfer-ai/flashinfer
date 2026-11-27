@@ -433,7 +433,8 @@ def test_short_build_gives_the_long_builds_bits_on_short_rows():
 @pytest.mark.parametrize("num_split", [1, 3])
 def test_every_decode_build_gives_the_per_item_builds_bits(num_split):
     """Every decode build delivered for the device (per item and persistent,
-    with and without long rows, and the persistent build's forms) gives the
+    with and without long rows, the persistent build's forms and the per-item
+    build's ``tma_o`` form) gives the
     per-item build's bits, here over several waves of items of the device's
     SM pairs, with one split (the output written directly) and with several
     (the split partials and the reducer)."""
@@ -451,17 +452,17 @@ def test_every_decode_build_gives_the_per_item_builds_bits(num_split):
     ).plan
     assert num_split * base.m_tiles * base.batch > base.pairs
     builds = sorted(
-        (b["long_rows"], b["persistent"], b["early_exp"], b["epi_x"])
+        (b["long_rows"], b["persistent"], b["early_exp"], b["epi_x"], b["tma_o"])
         for b in (
             record["build"]
             for record in registry.MODULES.values()
             if record["stage"] == "decode" and arch in record["arches"]
         )
     )
-    assert len(builds) == 5
+    assert len(builds) == 6
     rows = len(kv_lens) * q_len * heads
     outs = {}
-    for long_rows, persistent, early_exp, epi_x in builds:
+    for long_rows, persistent, early_exp, epi_x, tma_o in builds:
         plan = dataclasses.replace(
             base,
             num_split=num_split,
@@ -469,13 +470,14 @@ def test_every_decode_build_gives_the_per_item_builds_bits(num_split):
             persistent=persistent,
             early_exp=early_exp,
             epi_x=epi_x,
+            tma_o=tma_o,
         )
         decode = backend.Fp4MlaDecodeRunner(plan, device)
         out = torch.full((rows, 512), float("nan"), dtype=torch.bfloat16, device=device)
         _run(decode, case, out, sm_scale)
-        outs[(long_rows, persistent, early_exp, epi_x)] = out
+        outs[(long_rows, persistent, early_exp, epi_x, tma_o)] = out
     torch.cuda.synchronize()
-    want = outs[(True, False, True, False)]
+    want = outs[(True, False, True, False, False)]
     assert bool(torch.isfinite(want.float()).all())
     for build, out in outs.items():
         assert torch.equal(out.view(torch.int16), want.view(torch.int16)), build
