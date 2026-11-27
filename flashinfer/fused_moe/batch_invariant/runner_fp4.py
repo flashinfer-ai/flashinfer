@@ -202,9 +202,7 @@ class BatchInvariantFp4Runner(MoERunner):
 
     @functools.cached_property
     def _pair(self) -> Optional[Fp4Pair]:
-        """The configuration's pair, or ``None`` for an unserved pair (the layer's filter never constructs this case).
-        Read from ``config`` alone, so ``check_support`` needs no state set by ``__init__``; cached because ``pair`` is
-        read several times per forward call."""
+        """The configuration's pair, or ``None`` for an unserved pair (the layer's filter never constructs this case)."""
         return PAIRS.get(self.config.quant.pair)
 
     @property
