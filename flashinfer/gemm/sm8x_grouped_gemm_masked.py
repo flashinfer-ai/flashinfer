@@ -2,15 +2,20 @@
 and tensor contract, the GEMM on the SM8x MXFP8 or FP4 path, then the kernel's epilogue in
 PyTorch; rows from ``masked_m[e]`` on are left unwritten."""
 
+import functools
 from typing import Callable, Optional, Tuple
 
+import cuda.bindings.driver as cuda
 import cutlass
+import cutlass.cute as cute
+import cutlass.torch as cutlass_torch
 import torch
 
 from ..cute_dsl.utils import cutlass_to_torch_dtype
 from ..tllm_enums import ActivationType
 from .kernels.grouped_gemm_masked_blackwell import (
     Sm100BlockScaledPersistentDenseGemmKernel,
+    atomic_add_release_global,
 )
 from .sm8x_fp4_dense import _pad
 from .sm8x_fp8_dense import _OUT, _tuned_mx8, _tuned_rows_fp4
@@ -54,6 +59,34 @@ def _masked_store(dst: torch.Tensor, val: torch.Tensor, keep: torch.Tensor) -> N
     if dst.element_size() == 1:
         dst, val = dst.view(torch.uint8), val.view(torch.uint8)
     dst.copy_(torch.where(keep, val, dst))
+
+
+@cute.kernel
+def _signal_kernel(addr: cutlass.Int64, value: cutlass.Int32):
+    atomic_add_release_global(addr, value)
+
+
+@cute.jit
+def _signal_launch(addr: cutlass.Int64, value: cutlass.Int32, stream: cuda.CUstream):
+    _signal_kernel(addr, value).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+
+
+@functools.cache
+def _compiled_signal() -> Callable:
+    return cute.compile(
+        _signal_launch,
+        cutlass.Int64(0),
+        cutlass.Int32(0),
+        cutlass_torch.current_stream(),
+    )
+
+
+def _signal(addr: int, value: int) -> None:
+    """The SM100 kernel's ``dst_signals`` add: ``atom.add.release.gpu`` of ``value`` at
+    ``addr``, after the work before it on the current stream."""
+    _compiled_signal()(
+        cutlass.Int64(addr), cutlass.Int32(value), cutlass_torch.current_stream()
+    )
 
 
 def sm8x_masked_gemm_api(
@@ -117,8 +150,8 @@ def sm8x_masked_gemm_api(
         raise ValueError("NVFP4 output does not support combine fusion or swap_ab")
     if is_combine_fusion:
         raise NotImplementedError(
-            "Masked grouped GEMM combine fusion stores through multimem/multicast, "
-            "which SM8x lacks"
+            "Masked grouped GEMM combine fusion's cross-rank barrier is a multimem.red on "
+            "a multicast object, which SM8x lacks"
         )
     if enable_dst_signals:
         assert l <= 8, "need to be packable into a u64"
@@ -136,6 +169,7 @@ def sm8x_masked_gemm_api(
     cta_m = mma_tiler_mn[0] // (2 if mma_tiler_mn[0] == 256 else 1)
     cta_n = mma_tiler_mn[1] // (2 if gated else 1)
     tiles = l * _cdiv(_cdiv(m, cta_m), cm) * _cdiv(_cdiv(c_n, cta_n), cn)
+    nl = l  # the problem's experts (``_run`` takes a range of them)
 
     def tensor_api(
         a_tensor_gpu: torch.Tensor,
@@ -171,37 +205,50 @@ def sm8x_masked_gemm_api(
         assert quantize_output == (out_scale_tensor_gpu is not None)
         assert quantize_output == (out_global_scale_tensor_gpu is not None)
         dev = a_tensor_gpu.device
-        if l and big and small and k:
-            _run(
-                a_tensor_gpu, b_tensor_gpu, sfa_tensor_gpu, sfb_tensor_gpu,
-                _at(masked_m_tensor_gpu, torch.int32, (l,)), c_tensor_gpu,
-                alpha_tensor_gpu, alpha_up_tensor_gpu, a_per_token_scale_tensor_gpu,
-                out_scale_tensor_gpu, out_global_scale_tensor_gpu, dev,
-            )  # fmt: skip
-        if dst_signals_tensor_gpu is not None:  # each CTA of the persistent grid adds 1
-            sms = torch.cuda.get_device_properties(dev).multi_processor_count
-            ctas = min(sms // (cm * cn), sm_count, tiles) * cm * cn
-            _at(dst_signals_tensor_gpu, torch.int32, (l,)).add_(ctas)
+        args = (
+            a_tensor_gpu, b_tensor_gpu, sfa_tensor_gpu, sfb_tensor_gpu,
+            _at(masked_m_tensor_gpu, torch.int32, (l,)), c_tensor_gpu,
+            alpha_tensor_gpu, alpha_up_tensor_gpu, a_per_token_scale_tensor_gpu,
+            out_scale_tensor_gpu, out_global_scale_tensor_gpu, dev,
+        )  # fmt: skip
+        work = bool(l and big and small and k)
+        if dst_signals_tensor_gpu is None:
+            if work:
+                _run(*args, 0, l)
+            return c_tensor_gpu
+        # Each CTA of the persistent grid adds 1 to an expert's signal once its tiles of
+        # that expert and the experts before it are stored: experts in order, each signal
+        # released only after the expert's output.
+        sms = torch.cuda.get_device_properties(dev).multi_processor_count
+        ctas = min(sms // (cm * cn), sm_count, tiles) * cm * cn
+        for e in range(l):
+            if work:
+                _run(*args, e, 1)
+            _signal(dst_signals_tensor_gpu.data_ptr() + 4 * e, ctas)
         return c_tensor_gpu
 
-    def _run(a, b, sfa, sfb, mm, c, alpha, alpha_up, token_scale, out_scale, gsf, dev):
-        A = _at(a, ab_t, (l, m, kb) if a_major == "k" else (l, kb, m))
-        B = _at(b, ab_t, (l, n, kb) if b_major == "k" else (l, kb, n))
+    def _run(a, b, sfa, sfb, mm, c, alpha, alpha_up, token_scale, out_scale, gsf, dev,
+             e0, ne):  # fmt: skip
+        """Experts ``e0 : e0 + ne`` of the problem."""
+        sl = slice(e0, e0 + ne)
+        A = _at(a, ab_t, (nl, m, kb) if a_major == "k" else (nl, kb, m))[sl]
+        B = _at(b, ab_t, (nl, n, kb) if b_major == "k" else (nl, kb, n))[sl]
         A = A if a_major == "k" else A.transpose(1, 2).contiguous()
         B = B if b_major == "k" else B.transpose(1, 2).contiguous()
-        sa = _at(sfa, torch.uint8, (l * _pad(m, 128) * rk * 4,))
-        sb = _at(sfb, torch.uint8, (l * _pad(n, 128) * rk * 4,))
+        sa = _at(sfa, torch.uint8, (nl, _pad(m, 128) * rk * 4))[sl].reshape(-1)
+        sb = _at(sfb, torch.uint8, (nl, _pad(n, 128) * rk * 4))[sl].reshape(-1)
         (tok, s_tok), (wt, s_wt) = (
             ((B, sb), (A, sa)) if is_swap_ab else ((A, sa), (B, sb))
         )
         if quantize_output:
-            out = _at(c, torch.uint8, (l, m, c_n // 2))
+            out = _at(c, torch.uint8, (nl, m, c_n // 2))[sl]
         else:
-            out = _at(c, c_t, (l, m, c_n) if c_major == "n" else (l, c_n, m))
+            out = _at(c, c_t, (nl, m, c_n) if c_major == "n" else (nl, c_n, m))[sl]
             out = out if (c_major == "n") != is_swap_ab else out.transpose(1, 2)
+        l, mm = ne, mm[sl]
         rows = torch.arange(big, device=dev)
         keep = (rows[None, :] < mm.view(l, 1))[..., None]
-        al = None if alpha is None else _at(alpha, alpha_t, (l,)).float()
+        al = None if alpha is None else _at(alpha, alpha_t, (nl,))[sl].float()
 
         def gemm(dst: torch.Tensor, scale: Optional[torch.Tensor]) -> None:
             """``dst`` (masked rows) ``= scale (tok @ wt^T)``, ``scale`` FP4 only."""
@@ -260,9 +307,11 @@ def sm8x_masked_gemm_api(
             up = blocks[:, :, :, 0].reshape(l, m, c_n)
             gate = blocks[:, :, :, 1].reshape(l, m, c_n)
             gs = 1.0 if al is None else al.view(l, 1, 1)
-            us = gs if alpha_up is None else _at(alpha_up, torch.float32, (l, 1, 1))
+            us = (
+                gs if alpha_up is None else _at(alpha_up, torch.float32, (nl, 1, 1))[sl]
+            )
             if token_scale is not None:
-                ts = _at(token_scale, torch.float32, (l, m, 1))
+                ts = _at(token_scale, torch.float32, (nl, m, 1))[sl]
                 gs, us = gs * ts, us * ts
             gate = (gate * gs).clamp(max=swiglu_limit)
             up = (up * us).clamp(-swiglu_limit, swiglu_limit)
@@ -278,11 +327,11 @@ def sm8x_masked_gemm_api(
         from ..quantization.fp4_quantization import scaled_fp4_grouped_quantize
 
         q, s = scaled_fp4_grouped_quantize(
-            v.contiguous(), mm, _at(gsf, torch.float32, (l,)), nvfp4_4over6=None
+            v.contiguous(), mm, _at(gsf, torch.float32, (nl,))[sl], nvfp4_4over6=None
         )
         _masked_store(out, q.permute(2, 0, 1).view(torch.uint8), keep)
         rm, rkc = _cdiv(m, 128), _cdiv(c_n, 64)
-        osf = _at(out_scale, torch.uint8, (l, rm, rkc, 32, 4, 4))
+        osf = _at(out_scale, torch.uint8, (nl, rm, rkc, 32, 4, 4))[sl]
         row = (  # (rm, 32, 4): the 128x4 atom's row rmi * 128 + r4 * 32 + r32
             torch.arange(rm, device=dev).view(rm, 1, 1) * 128
             + torch.arange(32, device=dev).view(32, 1)
