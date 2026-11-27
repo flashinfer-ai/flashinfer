@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import check_pr_api_diff as api_diff  # noqa: E402
+from pr_checks import git_compare  # noqa: E402
 
 
 def api_function(signature: str) -> api_diff.ApiFunction:
@@ -92,9 +94,253 @@ def compare_snapshots(
             return api_diff.check(base, head)
 
 
+class PrComparisonTest(unittest.TestCase):
+    @contextmanager
+    def repository(
+        self,
+        *,
+        sync_main: bool,
+        change_pr_api: bool,
+        add_undocumented_apis: bool = False,
+    ) -> Iterator[tuple[Path, str, str, str, str]]:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            run_git(repo, "init", "-q", "-b", "main")
+            run_git(repo, "config", "user.name", "API checker test")
+            run_git(repo, "config", "user.email", "api-checker@example.com")
+            source = (
+                "@flashinfer_api\ndef api(*, mode: str = 'old') -> None:\n    pass\n"
+            )
+            files = {
+                "flashinfer/main_api.py": source,
+                "flashinfer/pr_api.py": source,
+            }
+            if add_undocumented_apis:
+                files["docs/api/example.rst"] = (
+                    ".. currentmodule:: flashinfer.main_api\n\n"
+                    ".. autofunction:: api\n\n"
+                    ".. currentmodule:: flashinfer.pr_api\n\n"
+                    ".. autofunction:: api\n"
+                )
+            stale_base = commit_snapshot(repo, files, "initial main")
+            run_git(repo, "checkout", "-q", "-b", "pr")
+            pr_files = {**files, "packaging.txt": "PR packaging fix\n"}
+            if change_pr_api:
+                pr_files["flashinfer/pr_api.py"] = source.replace("'old'", "'new'")
+                if add_undocumented_apis:
+                    pr_files["flashinfer/pr_api.py"] += (
+                        "\n@flashinfer_api\ndef pr_added() -> None:\n"
+                        '    """Run the PR operation."""\n    pass\n'
+                    )
+            commit_snapshot(repo, pr_files, "PR changes")
+            run_git(repo, "checkout", "-q", "main")
+            main_files = {
+                **files,
+                "flashinfer/main_api.py": source.replace("'old'", "'new'"),
+            }
+            if add_undocumented_apis:
+                main_files["flashinfer/main_api.py"] += (
+                    "\n@flashinfer_api\ndef main_added() -> None:\n"
+                    '    """Run the main operation."""\n    pass\n'
+                )
+            target = commit_snapshot(repo, main_files, "unrelated main API change")
+            run_git(repo, "checkout", "-q", "pr")
+            if sync_main:
+                run_git(repo, "merge", "--no-ff", "main", "-m", "sync main")
+            pr_head = run_git(repo, "rev-parse", "HEAD")
+            run_git(repo, "checkout", "-q", "main")
+            run_git(repo, "merge", "--no-ff", "pr", "-m", "PR test merge")
+            merge = run_git(repo, "rev-parse", "HEAD")
+            yield repo, stale_base, target, pr_head, merge
+
+    def test_main_sync_does_not_introduce_pr_api_findings(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, merge = snapshot
+            with working_directory(repo):
+                self.assertEqual(len(api_diff.check(stale_base, pr_head)), 1)
+                base, head = git_compare.resolve_pr_comparison(merge, pr_head)
+                self.assertEqual((base, head), (target, pr_head))
+                self.assertEqual(api_diff.check(base, head), [])
+
+    def test_own_api_changes_still_report_with_or_without_main_sync(self) -> None:
+        for sync_main in (False, True):
+            with (
+                self.subTest(sync_main=sync_main),
+                self.repository(sync_main=sync_main, change_pr_api=True) as snapshot,
+            ):
+                repo, _, _, pr_head, merge = snapshot
+                with working_directory(repo):
+                    base, head = git_compare.resolve_pr_comparison(merge, pr_head)
+                    findings = api_diff.check(base, head)
+                self.assertEqual(
+                    [(f.check, f.path) for f in findings],
+                    [("public_api_signature_changed", "flashinfer/pr_api.py")],
+                )
+
+    def test_reject_non_merge_and_mismatched_head(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, merge = snapshot
+            with working_directory(repo):
+                with self.assertRaisesRegex(RuntimeError, "two-parent PR test merge"):
+                    git_compare.resolve_pr_comparison(target, pr_head)
+                with self.assertRaisesRegex(RuntimeError, "expected head"):
+                    git_compare.resolve_pr_comparison(merge, stale_base)
+
+    def test_static_documentation_filters_synced_main_findings(self) -> None:
+        for change_pr_api in (False, True):
+            with (
+                self.subTest(change_pr_api=change_pr_api),
+                self.repository(
+                    sync_main=True,
+                    change_pr_api=change_pr_api,
+                    add_undocumented_apis=True,
+                ) as snapshot,
+            ):
+                repo, stale_base, target, pr_head, merge = snapshot
+                with working_directory(repo):
+                    base, head = git_compare.resolve_pr_comparison(merge, pr_head)
+                reports = {}
+                for label, comparison_base in (
+                    ("stale", stale_base),
+                    ("aligned", base),
+                ):
+                    report = repo / f"{label}.json"
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPTS_DIR / "check_pr_document.py"),
+                            "--base",
+                            comparison_base,
+                            "--head",
+                            head,
+                            "--report-json",
+                            str(report),
+                        ],
+                        cwd=repo,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    reports[label] = json.loads(report.read_text())
+
+                main_message = (
+                    "flashinfer.main_api.main_added is absent from docs/api/*.rst"
+                )
+                pr_message = "flashinfer.pr_api.pr_added is absent from docs/api/*.rst"
+                self.assertIn(
+                    main_message, [f["message"] for f in reports["stale"]["findings"]]
+                )
+                aligned = reports["aligned"]
+                self.assertEqual((aligned["base"], aligned["head"]), (target, pr_head))
+                self.assertEqual(
+                    [f["message"] for f in aligned["findings"]],
+                    [pr_message] if change_pr_api else [],
+                )
+
+    def test_cli_outputs_one_comparison_for_both_checkers(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, _ = snapshot
+            output = repo / "github-output"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "pr_checks/git_compare.py"),
+                    "--head",
+                    pr_head,
+                    "--github-output",
+                    str(output),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(output.read_text(), f"base={target}\nhead={pr_head}\n")
+            self.assertNotIn(stale_base, result.stdout)
+
+    def test_trusted_scan_excludes_synced_main_and_preserves_own_changes(self) -> None:
+        from pr_checks.api_gate import Context, Gate
+
+        for sync_main in (False, True):
+            for change_pr_api in (False, True):
+                with (
+                    self.subTest(sync_main=sync_main, change_pr_api=change_pr_api),
+                    self.repository(
+                        sync_main=sync_main, change_pr_api=change_pr_api
+                    ) as snapshot,
+                ):
+                    repo, stale_base, target, pr_head, merge = snapshot
+                    run_git(repo, "remote", "add", "origin", str(repo))
+                    run_git(repo, "update-ref", "refs/pull/3/merge", merge)
+                    run_git(repo, "checkout", "-q", "--detach", target)
+                    gate = Gate(None, Context("org/repo", "1", {}))
+                    pr = {
+                        "number": 3,
+                        "base": {"sha": stale_base},
+                        "head": {"sha": pr_head},
+                    }
+                    with working_directory(repo):
+                        report = gate.scan(pr)
+                    self.assertEqual(report["execution_status"], "COMPLETE")
+                    self.assertEqual(
+                        [f["path"] for f in report["findings"]],
+                        ["flashinfer/pr_api.py"] if change_pr_api else [],
+                    )
+                    self.assertEqual(run_git(repo, "rev-parse", "HEAD"), target)
+
+    def test_trusted_scan_rejects_missing_or_mismatched_merge(self) -> None:
+        from pr_checks.api_gate import Context, Gate
+
+        for missing in (False, True):
+            with (
+                self.subTest(missing=missing),
+                self.repository(sync_main=True, change_pr_api=False) as snapshot,
+            ):
+                repo, stale_base, target, pr_head, merge = snapshot
+                run_git(repo, "remote", "add", "origin", str(repo))
+                if not missing:
+                    run_git(repo, "update-ref", "refs/pull/3/merge", merge)
+                run_git(repo, "checkout", "-q", "--detach", target)
+                gate = Gate(None, Context("org/repo", "1", {}))
+                pr = {
+                    "number": 3,
+                    "base": {"sha": stale_base},
+                    "head": {"sha": pr_head if missing else stale_base},
+                }
+                error = subprocess.CalledProcessError if missing else RuntimeError
+                with working_directory(repo), self.assertRaises(error):
+                    gate.scan(pr)
+                self.assertFalse((repo / "reports/public-api.json").exists())
+
+
 class SignatureCompatibilityTest(unittest.TestCase):
     def test_compatible_signature_changes(self) -> None:
         cases = (
+            (
+                "positional-only kind changed",
+                "def api(value: int, /) -> None",
+                "def api(value: int) -> None",
+            ),
+            (
+                "return union widened without an opt-in input",
+                "def api(value: int) -> int",
+                "def api(value: int) -> int | str",
+            ),
+            (
+                "return union widened with an opt-in input",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
+            ),
+            (
+                "return tuple member widens",
+                "def api(value: int) -> tuple[int, str]",
+                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
+            ),
+            (
+                "fixed return tuple widens to variadic",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
+            ),
             (
                 "keyword-only insertion",
                 "def api(value: int, *, first: int = 1, last: int = 2) -> None",
@@ -184,11 +430,6 @@ class SignatureCompatibilityTest(unittest.TestCase):
     def test_breaking_signature_changes(self) -> None:
         cases = (
             (
-                "positional-only kind changed",
-                "def api(value: int, /) -> None",
-                "def api(value: int) -> None",
-            ),
-            (
                 "positional parameter removed",
                 "def api(first: int, second: str) -> None",
                 "def api(first: int) -> None",
@@ -274,26 +515,6 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int) -> int",
             ),
             (
-                "return union widened without an opt-in input",
-                "def api(value: int) -> int",
-                "def api(value: int) -> int | str",
-            ),
-            (
-                "return union widened with an opt-in input",
-                "def api(value: int) -> tuple[int, int]",
-                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
-            ),
-            (
-                "return tuple member widens",
-                "def api(value: int) -> tuple[int, str]",
-                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
-            ),
-            (
-                "fixed return tuple widens to variadic",
-                "def api(value: int) -> tuple[int, int]",
-                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
-            ),
-            (
                 "function became async",
                 "def api(value: int) -> None",
                 "async def api(value: int) -> None",
@@ -364,7 +585,7 @@ class TypeAliasCompatibilityTest(unittest.TestCase):
             ("public_api_signature_changed",),
         )
 
-    def test_module_local_alias_cannot_hide_return_widening(self) -> None:
+    def test_module_local_alias_return_widening_is_compatible(self) -> None:
         base = {
             "flashinfer/example.py": textwrap.dedent(
                 """
@@ -388,7 +609,7 @@ class TypeAliasCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(
             tuple(finding.check for finding in compare_snapshots(base, head)),
-            ("public_api_signature_changed",),
+            (),
         )
 
 
@@ -767,6 +988,235 @@ class ListApisExperimentalExclusionTest(unittest.TestCase):
             included = run("-x")
             for name in ("stable_api", "experimental_api", "backend_entry"):
                 self.assertIn(f"def {name}(", included)
+
+
+class CodeOwnerHintsTest(unittest.TestCase):
+    def test_codeowners_matching(self):
+        from pr_checks.api_codeowners import owners_for_paths
+
+        rules = """* @global @flashinfer-bot
+/flashinfer/ @core
+/flashinfer/sampling.py @sampling @org/team # inline comment
+/docs/* @docs
+apps/ @apps
+**/logs @logs
+/apps/private
+*.cu @cuda
+!bad @invalid
+[ab].py @invalid
+"""
+        cases = {
+            "README.md": ["global"],
+            "flashinfer/sampling.py": ["sampling", "org/team"],
+            "flashinfer/sub/api.py": ["core"],
+            "nested/flashinfer/sampling.py": ["global"],
+            "docs/start.md": ["docs"],
+            "docs/nested/start.md": ["global"],
+            "nested/apps/api.py": ["apps"],
+            "apps/private/api.py": [],
+            "nested/logs/error.txt": ["logs"],
+            "csrc/kernel.cu": ["cuda"],
+            "Flashinfer/sampling.py": ["global"],
+        }
+        for path, owners in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(owners_for_paths(rules, [path]), owners)
+        self.assertEqual(
+            owners_for_paths(rules, ["flashinfer/sampling.py", "README.md"]),
+            ["sampling", "org/team", "global"],
+        )
+
+    def test_owner_hints_require_non_author_human_maintain_admin(self):
+        from pr_checks.api_gate import Context, Gate
+
+        class API:
+            def request(self, method, path):
+                name = path.split("/")[-2]
+                role, kind = {
+                    "admin": ("admin", "User"),
+                    "maintainer": ("maintain", "User"),
+                    "writer": ("write", "User"),
+                    "bot": ("admin", "Bot"),
+                    "unknown": (None, "User"),
+                }[name]
+                # GitHub reports maintain as permission=write; role_name matters.
+                return {
+                    "role_name": role,
+                    "permission": "write",
+                    "user": {"login": name, "type": kind},
+                }
+
+        gate = Gate(API(), Context("org/repo", "42", {}))
+        rules = "* @writer @admin @maintainer @bot @unknown @AUTHOR @org/team"
+        self.assertEqual(
+            gate.maintainer_hints(
+                {"user": {"login": "author"}}, rules, ["flashinfer/api.py"]
+            ),
+            ["admin", "maintainer"],
+        )
+
+    def test_owner_lookup_failure_omits_unverified_owner(self):
+        from pr_checks.api_gate import Context, Gate
+        from pr_checks.github_api import GitHubError
+
+        class API:
+            def request(self, method, path):
+                if "/unverified/" in path:
+                    raise GitHubError(403, "Permission lookup denied")
+                return {"role_name": "maintain", "user": {"type": "User"}}
+
+        warnings = []
+        gate = Gate(API(), Context("org/repo", "42", {}), warning=warnings.append)
+        self.assertEqual(
+            gate.maintainer_hints(
+                {"user": {"login": "author"}},
+                "* @unverified @verified",
+                ["flashinfer/api.py"],
+            ),
+            ["verified"],
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("unverified", warnings[0])
+
+    def test_owner_hints_do_not_claim_unrelated_permissions(self):
+        from pr_checks.api_report import render_summary
+
+        report = {
+            "execution_status": "COMPLETE",
+            "findings": [
+                {
+                    "api": "flashinfer.foo",
+                    "path": "flashinfer/foo.py",
+                    "line": 1,
+                    "classification": "BREAKING",
+                    "message": "Removed API",
+                    "before": "def foo(x)",
+                    "after": "",
+                    "anchors": [],
+                }
+            ],
+        }
+        body = render_summary(
+            report, repo="org/repo", head="a" * 40, maintainers=["owner", "org/team"]
+        )
+        self.assertIn("Code owners: @owner, @org/team", body)
+        self.assertIn("non-author maintainer/admin", body)
+
+
+class CompactReportTest(unittest.TestCase):
+    def finding(self, before, after):
+        from dataclasses import asdict
+
+        return asdict(
+            api_diff.classify_signature(api_function(before), api_function(after))
+        )
+
+    def test_moved_parameter_does_not_repeat_shifted_parameters(self):
+        from pr_checks.api_report import render_inline
+
+        args = ", ".join(f"p{i}: Tensor" for i in range(40))
+        f = self.finding(
+            f"def api(x, scale: Tensor, {args})",
+            f"def api(x, {args}, scale: Tensor=None)",
+        )
+        body = render_inline(f)
+        self.assertLess(len(body), 900)
+        self.assertNotIn("p20", body)
+        self.assertIn("scale=None", body)
+        self.assertIn("became optional", body)
+        self.assertIn("`scale` moved", body)
+        self.assertEqual(body.count("Existing positional calls"), 1)
+        self.assertNotIn("accepted calling convention", body)
+
+    def test_separate_changes_and_return_annotation_are_preserved(self):
+        from pr_checks.api_report import diff
+
+        args = ", ".join(f"p{i}" for i in range(30))
+        body = diff(
+            self.finding(
+                f"def api(x, {args}, z=0) -> Tensor",
+                f"def api(x, added, {args}, z=1) -> Tuple[Tensor, Tensor]",
+            )
+        )
+        for changed in ("added", "z=0", "z=1", "-> Tensor", "-> Tuple[Tensor, Tensor]"):
+            self.assertIn(changed, body)
+        self.assertNotIn("p15", body)
+
+    def test_annotation_changes_and_nested_defaults_survive(self):
+        from pr_checks.api_report import diff
+
+        body = diff(
+            self.finding(
+                'def api(x: Tensor | None, cfg=(1, 2), mode="a,b")',
+                'def api(x: Tensor, cfg=(1, 3), mode="a,c")',
+            )
+        )
+        for changed in ("Tensor | None", "x: Tensor", "(1, 2)", "(1, 3)", "a,b", "a,c"):
+            self.assertIn(changed, body)
+
+    def test_removed_long_signature_only_needs_the_removed_api(self):
+        from pr_checks.api_report import diff
+
+        args = ", ".join(f"p{i}: Tensor" for i in range(40))
+        body = diff({"before": f"def removed_api({args})", "after": "(removed)"})
+        self.assertIn("removed_api(...)", body)
+        self.assertNotIn("p20", body)
+
+    def test_moved_positional_only_parameter_can_become_optional(self):
+        from pr_checks.api_report import render_inline
+
+        body = render_inline(
+            self.finding("def api(scale, x, /)", "def api(x, scale=None, /)")
+        )
+        self.assertIn("became optional", body)
+
+    def test_alias_only_changes_remain_visible(self):
+        from pr_checks.api_report import diff
+
+        body = diff(
+            {
+                "before": "def api(x: Alias)  # Alias = Tensor | None",
+                "after": "def api(x: Alias)  # Alias = Tensor",
+            }
+        )
+        self.assertIn("Alias = Tensor | None", body)
+        self.assertIn("Alias = Tensor", body)
+
+    def test_owners_are_limited_and_link_to_target_revision(self):
+        from pr_checks.api_report import render_summary
+
+        f = self.finding("def api(x, y)", "def api(x)")
+        body = render_summary(
+            {"execution_status": "COMPLETE", "base": "b" * 40, "findings": [f]},
+            repo="org/repo",
+            head="a" * 40,
+            maintainers=["one", "two", "three", "four", "five"],
+        )
+        self.assertIn("@one, @two, @three", body)
+        self.assertNotIn("@four", body)
+        self.assertIn("+2 owners", body)
+        self.assertIn("/blob/" + "b" * 40 + "/.github/CODEOWNERS", body)
+        self.assertIn("API BREAK expected, reason: ...", body)
+
+    def test_expected_reason_is_optional_but_must_be_nonempty_when_present(self):
+        from pr_checks.api_gate import parse_command, can_approve
+
+        for body in (
+            "@flashinfer-bot API BREAK expected",
+            "@flashinfer-bot API BREAK expected, reason: intentional cleanup",
+            "@flashinfer-bot API BREAK expected, REASON: migration: v2",
+        ):
+            self.assertEqual(parse_command(body), "expected")
+        for body in (
+            "@flashinfer-bot API BREAK expected, reason:",
+            "@flashinfer-bot API BREAK expected, reason:   ",
+            "@flashinfer-bot API BREAK expected, reason: ok\nextra command",
+            "@flashinfer-bot API BREAK expected please",
+        ):
+            self.assertIsNone(parse_command(body))
+        self.assertEqual(parse_command("@flashinfer-bot API BREAK revoke"), "revoke")
+        self.assertFalse(can_approve("admin", "author", "author", "User"))
+        self.assertFalse(can_approve("write", "owner", "author", "User"))
 
 
 if __name__ == "__main__":

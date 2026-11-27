@@ -169,11 +169,9 @@ jobs:
               comment.user?.login === 'github-actions[bot]'
               && comment.body.includes(marker)
             );
-            const publicApiFindings = [];
             const documentationFindings = [];
             const reportErrors = [];
             const reportTargets = [
-              ['reports/public-api.json', publicApiFindings],
               ['reports/static-documentation.json', documentationFindings],
             ];
             for (const [file, target] of reportTargets) {
@@ -192,7 +190,9 @@ jobs:
             let executionStatus = {};
             if (fs.existsSync('reports/execution-status.json')) {
               try {
-                executionStatus = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
+                const parsed = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected checker outcomes');
+                executionStatus = parsed;
               } catch (error) {
                 reportErrors.push('execution-status.json is malformed');
               }
@@ -202,7 +202,7 @@ jobs:
             const failedChecks = Object.entries(executionStatus)
               .filter(([, outcome]) => outcome !== 'success')
               .map(([name]) => name);
-            const findings = [...publicApiFindings, ...documentationFindings];
+            const findings = documentationFindings;
             const hasProblems = Boolean(
               findings.length || failedChecks.length || reportErrors.length
             );
@@ -219,23 +219,8 @@ jobs:
               }
               return;
             }
-            const publicRows = publicApiFindings.slice(0, 20);
             const documentationRows = documentationFindings.slice(0, 20);
             const sections = [marker];
-            if (publicApiFindings.length) {
-              sections.push(
-                '# 🚨 POTENTIAL API BREAK 🚨',
-                '',
-                '> [!CAUTION]',
-                '> **THIS PR APPEARS TO BREAK THE PUBLIC API. AUTHORS AND REVIEWERS: DO NOT MISS THIS.**',
-                '>',
-                '> This is an advisory warning and does not gate merging. Confirm compatibility and provide a deprecation or migration path, or track the fix in a follow-up PR.',
-                '',
-                `${publicApiFindings.length} public API finding(s):`,
-                '',
-                publicRows.map((f) => `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`).join('\n'),
-              );
-            }
             if (documentationFindings.length) {
               sections.push(
                 '## Documentation checks ⚠️',
@@ -292,7 +277,6 @@ jobs:
             const documentationBody = (finding, key) => `<!-- ${marker} --><!-- key:${key} -->\n⚠️ **Documentation check:** ${escape(finding.message)}\n\n**How to fix:**\n${fixFor(finding)}`;
             const findings = [];
             for (const [file, category] of [
-              ['reports/public-api.json', 'public_api'],
               ['reports/static-documentation.json', 'documentation'],
             ]) {
               if (!fs.existsSync(file)) continue;
@@ -356,9 +340,7 @@ jobs:
                 path,
                 line,
                 side: 'RIGHT',
-                body: finding.category === 'public_api'
-                  ? `<!-- ${marker} --><!-- key:${key} -->\n🚨🚨🚨 **POTENTIAL BREAKING PUBLIC API CHANGE:** ${escape(finding.message)}`
-                  : documentationBody(finding, key),
+                body: documentationBody(finding, key),
               })
             );
             if (!reviewComments.length) {
