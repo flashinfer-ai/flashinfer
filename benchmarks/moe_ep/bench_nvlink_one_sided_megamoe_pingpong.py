@@ -2,19 +2,27 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Two-rank ping-pong of one dispatch-sized row: data-as-flag versus flag-after-data.
 
-Rank 0 pushes a 4224-byte row into rank 1's landing slot; rank 1 waits for it and
-pushes a row back; repeat. One warp per rank. The round trip divided by two bounds
-the one-way publish-to-observe latency of each protocol:
+The synchronization primitives of the NVLinkOneSided MegaMoE
+(``sm103_mxfp8_mxfp4_bf16_nvlink_one_sided``) in isolation: rank 0 pushes a
+4224-byte row (4096 E4M3 bytes and 128 UE8M0 scales) into rank 1's landing slot;
+rank 1 waits for it and pushes a row back; repeat. One warp per rank. The round
+trip divided by two bounds the one-way publish-to-observe latency of each
+protocol:
 
 - ``sentinel``: rows are pushed with ``st.volatile.v4``; the receiver polls every
-  16-byte vector until no byte is the 0xFF sentinel, checks the payload, and resets
-  the slot with 0xFF. Two slots alternate so a reset slot is rewritten only after
-  the peer has seen the next reply.
-- ``flag``: rows are pushed with weak stores, then ``fence.acq_rel.sys`` and a
-  ``st.release.sys`` flag; the receiver polls the flag with ``ld.acquire.sys`` and then
-  reads and checks the row.
+  16-byte vector until no byte is the 0xFF init sentinel, checks the payload, and
+  resets the slot to 0xFF. Two slots alternate so a reset slot is rewritten only
+  after the peer has seen the next reply.
+- ``flag``: rows are pushed with the same stores, then ``fence.acq_rel.sys`` and a
+  ``st.release.sys`` flag; the receiver polls the flag with ``ld.acquire.sys`` and
+  then reads and checks the row.
 
-Run with ``torchrun --nproc-per-node=2 -m flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.litmus.pingpong``.
+Each mode compiles once and runs three repeats of ``ITERS`` (default 2000) round
+trips; rank 0 prints the one-way latency and the payload errors of each. Run on
+two GPUs of one NVLink domain (``sm_103a`` on B300, ``sm_100a`` on B200)::
+
+    CUTE_DSL_ARCH=sm_103a torchrun --standalone --nproc-per-node=2 \\
+        benchmarks/moe_ep/bench_nvlink_one_sided_megamoe_pingpong.py
 """
 
 import os
@@ -33,7 +41,9 @@ def _build(mode: str):
     import cutlass.cute as cute
     from cutlass import Int32, Int64, Uint32
 
-    from ..comm import ptx
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.comm import (
+        ptx,
+    )
 
     vectors = ROW_BYTES // 16
     sentinel = mode == "sentinel"
@@ -49,23 +59,13 @@ def _build(mode: str):
     @cute.jit
     def send(peer_slot: Int64, iteration: Int32, lane: Int32):
         for vector in cutlass.range(lane, vectors, 32):
-            address = peer_slot + Int64(vector) * Int64(16)
-            if cutlass.const_expr(sentinel):
-                ptx.st_volatile_v4_words(
-                    address,
-                    pattern(iteration, vector, Int32(0)),
-                    pattern(iteration, vector, Int32(1)),
-                    pattern(iteration, vector, Int32(2)),
-                    pattern(iteration, vector, Int32(3)),
-                )
-            else:
-                ptx.st_volatile_v4_words(
-                    address,
-                    pattern(iteration, vector, Int32(0)),
-                    pattern(iteration, vector, Int32(1)),
-                    pattern(iteration, vector, Int32(2)),
-                    pattern(iteration, vector, Int32(3)),
-                )
+            ptx.st_volatile_v4_words(
+                peer_slot + Int64(vector) * Int64(16),
+                pattern(iteration, vector, Int32(0)),
+                pattern(iteration, vector, Int32(1)),
+                pattern(iteration, vector, Int32(2)),
+                pattern(iteration, vector, Int32(3)),
+            )
 
     per_lane = (vectors + 31) // 32
 

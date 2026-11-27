@@ -144,6 +144,7 @@ exclude = [
 "flashinfer.moe_ep.shims.sm107.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernels.flashinfer.sm120_split" = ["*.md"]
 "flashinfer.moe_ep.kernels.flashinfer.sm120_swapab" = ["*.md"]
+"flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided" = ["*.md"]
 "flashinfer.moe_ep.kernels.kimi_k3" = ["*.md", "*.json", "LICENSE", "NOTICE"]
 "flashinfer.prims_ts.moe" = [
   "prims_ts_moe_configs.json",
@@ -234,7 +235,7 @@ exclude = [
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
   "flashinfer/attention/prims_ts/kernels/",
-  "flashinfer/moe_ep/cute_dsl/megamoe/mxfp8_mxfp4_nvlink_one_sided/engine/",
+  "flashinfer/moe_ep/kernels/flashinfer/mxfp8_mxfp4_nvlink_one_sided/engine/",
   # Imported CuTe DSL kernels are kept byte-faithful to their source.
   "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "3rdparty/",

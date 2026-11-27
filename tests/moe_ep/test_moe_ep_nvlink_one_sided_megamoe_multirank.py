@@ -1221,13 +1221,13 @@ def test_layer_vs_oracle(request, capacity, sync_protocol, knobs):
         MoEWeightPack,
         preprocess_sm103_mxfp4_nvlink_one_sided_mega_weights,
     )
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         nvlink_one_sided_tiling,
     )
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
         JUST_IN_TIME_CLAIMS_MAX_TOKENS,
     )
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
         PULL_JUST_IN_TIME_MIN_TOKENS,
     )
 
@@ -1487,7 +1487,7 @@ def test_die_local_weights(request, capacity):
     import torch.distributed as dist
 
     from flashinfer.moe_ep import preprocess_sm103_mxfp4_nvlink_one_sided_mega_weights
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.die_local import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.die_local import (
         locality_domain_count,
     )
 

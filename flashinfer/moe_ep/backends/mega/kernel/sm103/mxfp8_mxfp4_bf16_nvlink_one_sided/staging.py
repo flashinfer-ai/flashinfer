@@ -92,7 +92,7 @@ def stage_inputs(t, workspace, *, quantize_input: bool) -> None:
     are never read. Layouts the kernel does not take stage through the Torch
     sequence below, with the same bytes.
     """
-    from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.kernel_helpers import (
+    from ......kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.kernel_helpers import (
         quantize_mxfp8_block32,
     )
     from .staging_kernel import stage

@@ -209,7 +209,7 @@ def test_knob_validation(dist_not_initialized, capacity, knobs, fields, message)
 
 def test_engine_config_validation():
     """The engine config rejects the combinations the backend never resolves to."""
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         Sm100GenphaseMoeConfig,
     )
 
@@ -264,7 +264,7 @@ def test_engine_config_validation():
 )
 def test_dispatch_rule(tokens, world, experts, topk, dispatch):
     """The Sentinel dispatch to 192 tokens per rank, to 256 within 1.5 routes per reached rank; the combine follows."""
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         dispatch_protocol,
         nvlink_one_sided_tiling,
     )
@@ -293,13 +293,13 @@ def test_sync_protocol(dist_not_initialized, capacity, world):
     dispatch's pipelined groups and just-in-time claims, and the in-kernel
     top-k reduce, follow the protocol, not the capacity alone.
     """
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         dispatch_protocol,
     )
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
         JUST_IN_TIME_CLAIMS_MAX_TOKENS,
     )
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
         PIPELINED_GROUPS_MIN_TOKENS,
         PULL_JUST_IN_TIME_MIN_TOKENS,
         SINGLE_GROUP_MAX_TOKENS,
@@ -350,7 +350,7 @@ def test_sync_protocol(dist_not_initialized, capacity, world):
 
 
 def test_sync_protocol_tiling_rejects_other_names():
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         nvlink_one_sided_tiling,
     )
 
@@ -503,7 +503,7 @@ def test_situ_config(dist_not_initialized):
 
 def test_situ_engine_config_validation():
     """The engine config takes SiTU with its betas, without a clamp or a shared expert."""
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         Sm100GenphaseMoeConfig,
     )
 
@@ -549,7 +549,7 @@ def test_shared_expert_weights(dist_not_initialized):
 
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep import PrequantizedMoEWeightsWithSharedExpert as Pack
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.kernel_helpers import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.kernel_helpers import (
         swizzled_flat_sf_size,
     )
 
@@ -608,7 +608,7 @@ def test_shared_expert_weights(dist_not_initialized):
 
 def test_token_tile_choice_rule():
     """The host mirror of the main kernel's choice: the alternate exactly when every plan tile fits it."""
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         chosen_token_tile_n,
     )
 

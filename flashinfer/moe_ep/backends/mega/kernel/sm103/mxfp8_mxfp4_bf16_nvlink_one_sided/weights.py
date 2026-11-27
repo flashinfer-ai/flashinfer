@@ -127,7 +127,7 @@ def preprocess_mega_weights(
         )
     if not die_local_weights:
         return transformed + shared
-    from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.die_local import (
+    from ......kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.die_local import (
         die_local_weight_leg,
     )
 
@@ -144,7 +144,7 @@ def _preprocess_shared_expert_weights(
     hidden_size: int,
 ) -> TransformedMegaWeights:
     """The shared expert's E4M3 weights and UE8M0 scales -> its (FC1, FC2) kernel legs, K-major."""
-    from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from ......kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         preprocess_genphase_prequantized_weights,
     )
 
@@ -193,7 +193,7 @@ def _preprocess_mega_weights(
 ) -> TransformedMegaWeights:
     import torch
 
-    from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+    from ......kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         preprocess_genphase_prequantized_weights,
         preprocess_genphase_weights,
     )
@@ -244,7 +244,7 @@ def validate_transformed_mega_weights(
     """Check caller-supplied kernel-layout weights against an engine config."""
     import torch
 
-    from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
+    from ......kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
         validate_genphase_weights,
     )
 

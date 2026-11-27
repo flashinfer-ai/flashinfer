@@ -54,7 +54,7 @@ def _modules():
 
 def _workspace(capacity, hidden, top_k, *, shared_tiles=None, sf_pad=4, seed=0):
     """Staging planes of a ``BlockScaledSymmBuffer``, holding arbitrary bytes."""
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
+    from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
         BlockScaledSymmBuffer,
     )
 

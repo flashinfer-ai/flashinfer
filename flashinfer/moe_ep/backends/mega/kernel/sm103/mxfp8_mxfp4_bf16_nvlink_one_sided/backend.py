@@ -1,6 +1,6 @@
 """SM100 / SM103 NVLinkOneSided MegaMoE: MXFP8 activations, MXFP4 weights.
 
-Wraps ``flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided``. The engine
+Wraps ``flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided``. The engine
 configuration is static: ``nvlink_one_sided_tiling`` picks the token tile, cluster,
 schedule and protocols from the workspace capacity, EP size, routing shape and
 ``sync_protocol``, and ``knobs`` may override any of those fields but the
@@ -60,7 +60,7 @@ _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 
 
 def _frontend():
-    from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided import frontend
+    from ......kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided import frontend
 
     return frontend
 
@@ -90,7 +90,7 @@ def _build_engine(config) -> None:
 
 def _distributed() -> bool:
     """Whether workspaces are symmetric allocations (not ``MEGA_NO_DIST=1``)."""
-    from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import comm
+    from ......kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import comm
 
     return not comm._no_dist()
 

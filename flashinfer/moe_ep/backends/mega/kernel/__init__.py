@@ -3,8 +3,8 @@
 Organized by taxonomy: ``sm<arch>/<act_dtype>_<weight_dtype>_<out_dtype>_<kernel_style>``.
 Adapters live in ``moe_ep/shims/<sm>/``; sources live in ``moe_ep/kernels/``,
 grouped by the project that supplies their updates.
-``sm103`` wraps the CuTe DSL kernels under ``moe_ep/cute_dsl/`` and the
-experimental backend under ``flashinfer/experimental/cake_w8a8_megamoe_ep16/``.
+``sm103`` also wraps the experimental backend under
+``flashinfer/experimental/cake_w8a8_megamoe_ep16/``.
 """
 
 from . import sm90, sm100, sm103, sm107, sm120
