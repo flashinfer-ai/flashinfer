@@ -95,9 +95,10 @@ while keeping at least two KV tiles per split. Larger grids use the persistent
 reuse schedule. The resource layout therefore does not fall back to duplicated
 conversion just because the planned row count is small.
 
-Quantized persistent 2CTA launches balance their waves using live tensor
-extents. The compilation key retains the physical SM limit, so different
-row buckets that choose the same profile reuse one compiled kernel.
+Static persistent 2CTA launches use up to the physical cluster limit. The
+compilation key retains that limit, so different row buckets that choose
+the same profile reuse one compiled kernel. BF16 persistent 2CTA uses CLC
+and sizes the launch grid to the logical work, which can exceed that limit.
 
 Routine task-builder HEAD/LOOP overlap and unused-routing advisories are quiet
 by default. Set `FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` before a cold build to display
@@ -123,30 +124,29 @@ bounds; runs bind live metadata and reuse scratch. See the shared
 [runtime split-KV policy](../../README.md#runtime-split-kv-policy), and
 [final statistics contract](../../README.md#final-statistics-and-sink-semantics).
 
-## Per-query local-KV prefixes
+## Context-parallel local-KV prefixes
 
-Dense MLA `plan(use_kv_bounds=True)` specializes a graph-live `kv_bounds` input.
-It is a contiguous, 4-byte-aligned CUDA int32 vector with one count per logical
-query token: `[B*SQ]` for fixed Q and `[total_q]` for packed Q. All heads of a
-token share its bound. Bounds must be nondecreasing within each request and
-lie in `[0, seq_lens_kv[b]]`; they replace both dense and bottom-right causal
-visibility, rather than intersecting the selected mask. The raw local-KV
-length still determines producer/reducer split partitioning, preserving FP8
-probability quantization across the same split/instance streams.
+Dense MLA specializes `cp_world` and `cp_interleave_size` when planning, and
+takes `cp_rank` as a runtime scalar. `seq_lens_kv` always contains global
+logical lengths, including the current Q tokens. The page table, cache, planned
+`max_kv_len`, and split/workspace capacity remain rank-local.
 
-Supply bounds exactly when enabled, including with `validate=False`. Validation
-checks structure and values outside capture; trusted runs perform no host
-readback. Retain the vector and mutate its contents between completed launches
-or graph replays. A zero prefix writes zero O and optional LSE `-inf`. A bounds-only neutral initialization launch also
-covers requests with zero local KV when the ordinary task schedule skips them.
-`plan(zero_empty_rows=False)` omits this initialization launch while retaining
-per-query prefix masking. In that mode empty-row results are unspecified, not
-guaranteed preserved; initialize them or exclude them from merging. The default
-is `True`, including in the one-shot API. It is ignored without bounds and
-changes the compiled launch program, not workspace size.
-Unbounded zero-KV behavior is unchanged. The static K/V capacity remains
-positive; the one-shot API defaults it to one for an all-empty bounded rank.
+For interleave size I and CP size C, a global prefix n contains
+`n//(I*C)*I + clamp(n%(I*C)-cp_rank*I, 0, I)` tokens on this rank. Dense
+attention maps the full global length G. Bottom-right causal attention maps
+`G-actual_Q+i+1` for logical query token i; packed Q obtains actual_Q from
+`qo_indptr`, not the planned maximum. All heads of a token share its bound.
+The same conversion governs producer domains, split ownership, and row masks.
+No per-query bounds tensor or bounds-materialization launch is required.
 
-Per-query prefixes add no scratch and do not alter the public return type.
-Sparse/NVFP4 entry points remain outside this option's scope. The bounds
-specialization is independent of optional LSE output.
+`plan(zero_empty_rows=True)` (the default) initializes empty local rows to zero
+O and optional LSE `-inf`, including requests whose ordinary main schedule
+skips all local work. `zero_empty_rows=False` omits this neutral writer.
+Empty-row results are then unspecified, not guaranteed preserved; initialize
+them or exclude them from merging. A rank with no local tokens does not need
+valid page IDs. Static local K/V capacity remains positive; the one-shot API
+uses a minimum capacity of one for an all-empty rank.
+
+CP=1 preserves ordinary non-CP behavior and has no neutral-writer launch.
+Sparse/NVFP4 entry points remain outside this option's scope. CP adds no
+workspace and does not alter the public return type or optional-LSE contract.

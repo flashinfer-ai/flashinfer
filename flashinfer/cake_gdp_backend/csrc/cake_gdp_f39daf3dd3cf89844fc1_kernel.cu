@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -2756,6 +2756,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                         float v_val = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes + (m_col * 128 + v_row * 2 ^ (m_col * 128 + v_row * 2 >> 7 & 7) << 4)))[0];
                         nv[j_4] = nv[j_4] - v_val;
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                     v_stage_cg1 += 1;
                     if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
@@ -3189,7 +3190,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("barrier.sync 14, 128;" ::: "memory");
                     int tid_cg1 = warp_id_0 * 32 + lane;
                     int o_chunk = tid_cg1 & 7;
-                    #pragma unroll
+                    #pragma unroll 1
                     for (int o_round = 0; o_round < 4; o_round++) {
                         int o_row = o_round * 16 + tid_cg1 / 8;
                         if (o_row < cnt_1 && batch_end_1 > t0_1 + o_row) {
@@ -3798,6 +3799,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                         float v_val_1 = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes_0 + (m_col_1 * 128 + v_row_1 * 2 ^ (m_col_1 * 128 + v_row_1 * 2 >> 7 & 7) << 4)))[0];
                         nv[j_7] = nv[j_7] - v_val_1;
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                     v_stage_cg1 += 1;
                     if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
@@ -4231,7 +4233,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("barrier.sync 14, 128;" ::: "memory");
                     int tid_cg1_0 = warp_id_1_1 * 32 + lane;
                     int o_chunk_0 = tid_cg1_0 & 7;
-                    #pragma unroll
+                    #pragma unroll 1
                     for (int o_round_1 = 0; o_round_1 < 4; o_round_1++) {
                         int o_row_1 = o_round_1 * 16 + tid_cg1_0 / 8;
                         if (o_row_1 < cnt_1_1 && batch_end_1 > t0_1_1 + o_row_1) {
@@ -4842,6 +4844,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                             float v_val_2 = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes_1 + (m_col_2 * 128 + v_row_2 * 2 ^ (m_col_2 * 128 + v_row_2 * 2 >> 7 & 7) << 4)))[0];
                             nv[j_10] = nv[j_10] - v_val_2;
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                         v_stage_cg1 += 1;
                         if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
@@ -5275,7 +5278,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("barrier.sync 14, 128;" ::: "memory");
                         int tid_cg1_1 = warp_id_2_1 * 32 + lane;
                         int o_chunk_1 = tid_cg1_1 & 7;
-                        #pragma unroll
+                        #pragma unroll 1
                         for (int o_round_2 = 0; o_round_2 < 4; o_round_2++) {
                             int o_row_2 = o_round_2 * 16 + tid_cg1_1 / 8;
                             if (o_row_2 < cnt_2 && batch_end_1 > t0_2 + o_row_2) {
@@ -5884,6 +5887,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                             float v_val_3 = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes_2 + (m_col_3 * 128 + v_row_3 * 2 ^ (m_col_3 * 128 + v_row_3 * 2 >> 7 & 7) << 4)))[0];
                             nv[j_13] = nv[j_13] - v_val_3;
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                         v_stage_cg1 += 1;
                         if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
@@ -6317,7 +6321,7 @@ kernel_cake_gdp_f39daf3dd3cf89844fc1(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("barrier.sync 14, 128;" ::: "memory");
                         int tid_cg1_2 = warp_id_3 * 32 + lane;
                         int o_chunk_2 = tid_cg1_2 & 7;
-                        #pragma unroll
+                        #pragma unroll 1
                         for (int o_round_3 = 0; o_round_3 < 4; o_round_3++) {
                             int o_row_3 = o_round_3 * 16 + tid_cg1_2 / 8;
                             if (o_row_3 < cnt_3 && batch_end_1 > t0_3 + o_row_3) {

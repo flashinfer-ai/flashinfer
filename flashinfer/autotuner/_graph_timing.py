@@ -7,6 +7,23 @@ from typing import Callable, Optional
 
 import torch
 
+_PROFILE_GRAPH_POOLS: dict[int, tuple[int, int]] = {}
+
+
+def profile_graph_pool() -> tuple[int, int]:
+    """Return one CUDA graph memory pool per device for profiling captures.
+
+    A capture without ``pool=`` creates a new private pool, and PyTorch keeps a
+    per-pool entry in ``torch.cuda.memory_stats()`` after the pool is released.
+    Sharing one pool keeps that map bounded.
+    Profiling graphs on a device must not be captured or replayed concurrently.
+    """
+    device = torch.cuda.current_device()
+    pool = _PROFILE_GRAPH_POOLS.get(device)
+    if pool is None:
+        pool = _PROFILE_GRAPH_POOLS[device] = torch.cuda.graph_pool_handle()
+    return pool
+
 
 def profile_individual_graph_calls(
     run_once: Callable[[int], object],
@@ -67,7 +84,7 @@ def profile_individual_graph_calls(
             return [start.elapsed_time(end) for start, end in intervals]
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, pool=profile_graph_pool()):
         for index in range(repeat):
             record_start(index)
             run_once(index)

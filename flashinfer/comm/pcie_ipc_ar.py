@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 import hashlib
 import os
 import warnings
@@ -58,9 +59,46 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
 
+def _spin_timeout_ns() -> int:
+    """``FLASHINFER_PCIE_IPC_TIMEOUT_S``: seconds a rank may wait for a peer.
+
+    Unset or 0 keeps the unbounded wait. Past the deadline the kernel reports
+    where it was waiting and traps, so a peer that died fails the step instead
+    of hanging it. The value does not change the protocol, so ranks that read
+    different values still interoperate.
+    """
+    raw = os.environ.get("FLASHINFER_PCIE_IPC_TIMEOUT_S", "0")
+    try:
+        seconds = float(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"FLASHINFER_PCIE_IPC_TIMEOUT_S must be a number of seconds, got {raw!r}"
+        ) from e
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(
+            "FLASHINFER_PCIE_IPC_TIMEOUT_S must be a finite number of seconds >= 0, "
+            f"got {raw!r}"
+        )
+    # Round up, so a tiny positive value never turns the guard off.
+    ns = math.ceil(seconds * 1e9)
+    if ns >= 2**64:
+        raise ValueError(
+            f"FLASHINFER_PCIE_IPC_TIMEOUT_S={raw!r} does not fit in 64-bit nanoseconds"
+        )
+    return ns
+
+
 @functools.cache
 def get_pcie_ipc_comm_module():
-    module = gen_pcie_ipc_comm_module().build_and_load()
+    timeout_ns = _spin_timeout_ns()
+    # Without a timeout, call the generator with no argument: benchmarks and
+    # tests swap it for zero-argument debug generators.
+    spec = (
+        gen_pcie_ipc_comm_module(timeout_ns)
+        if timeout_ns
+        else gen_pcie_ipc_comm_module()
+    )
+    module = spec.build_and_load()
 
     @register_custom_op("flashinfer::pcie_ipc_workspace_size", mutates_args=[])
     def workspace_size(

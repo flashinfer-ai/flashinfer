@@ -111,7 +111,9 @@ def _redact_credentials(text, secrets=()):
 def _public_prose(text, secrets=(), limit=500):
     """Sanitize untrusted explanations without changing generated command examples."""
     text = _redact_credentials(text, secrets)
-    text = re.sub(r"@flashinfer-bot", "flashinfer-bot", text, flags=re.I)
+    # Drop every "@" directly before the handle: removing a single one would turn
+    # "@@flashinfer-bot run" into a live command on the reason line of a note.
+    text = re.sub(r"@+(?=flashinfer-bot)", "", text, flags=re.I)
     return html.escape(" ".join(text.split()), quote=False)[:limit]
 
 
@@ -524,6 +526,14 @@ class PytestTargetSelector:
             ".github/workflows/pr-test.yml",
             "scripts/infra/pr_checks/targeted_lane_scope.py",
         ):
+            text = self.read_ci_file(path)
+            if not text:
+                raise TargetSelectionError("CI routing evidence is unavailable")
+            ci_files[path] = text
+        # Historical replay reads routing at its selected CI revision. Older
+        # monolithic workflows need no dispatcher; split workflows must supply it.
+        if "# CI_BOT_PR_TEST_DISPATCH_V1:" in ci_files[".github/workflows/pr-test.yml"]:
+            path = ".github/workflows/pr-test-dispatch.yml"
             text = self.read_ci_file(path)
             if not text:
                 raise TargetSelectionError("CI routing evidence is unavailable")

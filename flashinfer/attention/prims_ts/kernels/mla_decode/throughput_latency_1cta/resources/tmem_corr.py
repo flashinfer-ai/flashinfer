@@ -1536,6 +1536,7 @@ class TmemCorrResource(MlaResource):
             cta_idx_q_for_stage(self.cta_idx_q, stage_info),
             self.cu_seqlens_q,
             batch,
+            cp_rank=self.cp_rank,
         )
         tile = global_kv_tile_idx(
             cfg, local_tile, length, cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
@@ -1961,6 +1962,18 @@ class TmemCorrResource(MlaResource):
             # Match the TMEM load shape and extent to the selected layout.
             lane_columns = 128 if cfg.ws_pv else cfg.head_dim_per_stage_v // 2
             width = min(self.output_quant.block_size, lane_columns)
+            # A WS lane's four block scales of its 128 channels leave as one store_scales word.
+            batch_scales = cutlass.const_expr(
+                cfg.ws_pv
+                and width == 32
+                and lane_columns == 128
+                and hasattr(self.output_quant, "store_scales")
+            )
+            quant_store = (global_head_idx < Int32(cfg.num_heads_q)) & valid_output_row
+            quant_row = public_query_flat_row(
+                cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
+            )
+            scale_word = Uint32(0)
             for stripe in cutlass.range_constexpr(0, lane_columns, width):
                 values = cutlass.Array(Float32, width, space=cutlass.AddressSpace.rmem)
                 if cutlass.const_expr(cfg.ws_pv):
@@ -1979,23 +1992,47 @@ class TmemCorrResource(MlaResource):
                 cute.arch.fence_view_async_tmem_load()
                 for i in cutlass.range_constexpr(width):
                     values[i] = loaded[i] * store_scale
-                if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-                    row = public_query_flat_row(
-                        cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
-                    )
-                    self.output_quant.store(
+                if quant_store:
+                    if cutlass.const_expr(batch_scales):
+                        exponent = self.output_quant.store(
+                            self.output_quant_args,
+                            values,
+                            quant_row,
+                            head_dim_offset
+                            + v_stage_idx * cfg.head_dim_per_stage_v
+                            + half_warp_col_offset
+                            + stripe,
+                            lane_stride=1,
+                            rotary=v_stage_idx + 2 == cfg.v_head_dim_stages,
+                            scale_out=True,
+                        )
+                        scale_word = scale_word | (
+                            Uint32(exponent) << Uint32(8 * (stripe // width))
+                        )
+                    else:
+                        self.output_quant.store(
+                            self.output_quant_args,
+                            values,
+                            quant_row,
+                            head_dim_offset
+                            + v_stage_idx * cfg.head_dim_per_stage_v
+                            + half_warp_col_offset
+                            + stripe,
+                            lane_stride=1 if cfg.ws_pv else 16,
+                            # WS consumes two D128 descriptor slices per PV pass;
+                            # its last even stage owns the final64 rotary channels.
+                            rotary=v_stage_idx + (2 if cfg.ws_pv else 1)
+                            == cfg.v_head_dim_stages,
+                        )
+            if cutlass.const_expr(batch_scales):
+                if quant_store:
+                    self.output_quant.store_scales(
                         self.output_quant_args,
-                        values,
-                        row,
+                        quant_row,
                         head_dim_offset
                         + v_stage_idx * cfg.head_dim_per_stage_v
-                        + half_warp_col_offset
-                        + stripe,
-                        lane_stride=1 if cfg.ws_pv else 16,
-                        # WS consumes two D128 descriptor slices per PV pass;
-                        # its last even stage owns the final64 rotary channels.
-                        rotary=v_stage_idx + (2 if cfg.ws_pv else 1)
-                        == cfg.v_head_dim_stages,
+                        + half_warp_col_offset,
+                        scale_word,
                     )
             return
 

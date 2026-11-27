@@ -178,19 +178,35 @@ class TestErrorMapping:
 
 
 class TestNativeFirst:
-    """The migration hook: a native Group method wins over ctypes."""
+    """Use Python methods only when their arguments match the pointer adapter."""
 
     @pytest.mark.cpu_only
-    def test_native_query_preferred(self):
+    def test_raw_query_with_tensor_api_available(self):
         lib = _fake_lib()
         group = _FakeGroup()
         seen = {}
-        group.mask_query = lambda dev_ptr, stream: seen.update(
-            dev=dev_ptr, stream=stream
-        )
+
+        def query(mask_status, *, stream):
+            seen["shape"] = mask_status.sizes
+
+        group.mask_query = query
         _MaskFfi(lib=lib).mask_query(group, dev_ptr=0x7, stream=0x8)
-        assert seen == {"dev": 0x7, "stream": 0x8}
-        assert lib.ncclEpMaskQuery.calls == []  # ctypes path untouched
+        assert seen == {}
+        (args,) = lib.ncclEpMaskQuery.calls
+        assert [a.value for a in args] == [group.ptr, 0x7, 0x8]
+
+    @pytest.mark.cpu_only
+    def test_raw_update_with_array_api_available(self):
+        lib = _fake_lib()
+        group = _FakeGroup()
+
+        def update(mask, *, stream):
+            assert hasattr(mask, "ctypes"), "mask_update requires a NumPy array"
+
+        group.mask_update = update
+        _MaskFfi(lib=lib).mask_update(group, host_ptr=0x9, stream=0x8)
+        (args,) = lib.ncclEpMaskUpdate.calls
+        assert [a.value for a in args] == [group.ptr, 0x9, 0x8]
 
     @pytest.mark.cpu_only
     def test_native_async_error_preferred(self):

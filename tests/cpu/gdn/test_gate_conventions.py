@@ -99,6 +99,7 @@ def test_transformed_trace_preserves_default_definition_and_runs_standalone():
     assert transformed.name_prefix == "gdn_prefill_gates"
     assert gdn_prefill_trace(gate_domain="log") is transformed
     assert gdn_prefill_trace(beta_is_logit=True) is transformed
+    assert gdn_prefill_trace(gate_domain="log", batch_invariant=True) is None
     args = transformed.init(
         total_seq_len=4,
         num_seqs=2,

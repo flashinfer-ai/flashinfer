@@ -32,10 +32,16 @@ New cache adopters (other CuTe-DSL op families) should replicate this
 pattern for their own name functions.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 import inspect
+import multiprocessing
+from pathlib import Path
 import re
+from threading import Event
 
 import pytest
+from filelock import FileLock, Timeout
 
 pytest.importorskip("cutlass")
 
@@ -441,17 +447,229 @@ def test_mm_fp4_kernel_name_varies_with_every_argument(param):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
 
 
+class _ExportedKernel:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def export_to_c(self, path, function_name):
+        Path(path).write_bytes(self.payload)
+
+
+@pytest.fixture
+def cute_dsl_cache(monkeypatch, tmp_path):
+    from flashinfer.jit import cute_dsl_core
+
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(cute_dsl_core, "get_tmpdir", lambda: tmp_path)
+    monkeypatch.setattr(
+        cute_dsl_core.JitSpecCuteDsl,
+        "_load_from_disk",
+        lambda spec: spec.object_path.read_bytes(),
+    )
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_80")
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    return cute_dsl_core
+
+
+def _compile_in_worker(tmp_path, name, compiling):
+    from flashinfer.jit import cute_dsl_core as cache
+
+    cache.jit_env.FLASHINFER_JIT_DIR = tmp_path
+
+    def compile_kernel():
+        compiling.wait(timeout=30)
+        return _ExportedKernel(b"kernel")
+
+    spec = cache.JitSpecCuteDsl("shared", name, compile_kernel, "source")
+    spec.compile_and_persist()
+
+
+@pytest.mark.cpu_only
+def test_different_kernels_compile_concurrently(cute_dsl_cache, tmp_path):
+    cache = cute_dsl_cache
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    workers = [
+        ctx.Process(target=_compile_in_worker, args=(tmp_path, name, barrier))
+        for name in ("a", "b")
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=90)
+            assert worker.exitcode == 0
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+                worker.join()
+    for name in ("a", "b"):
+        spec = cache.JitSpecCuteDsl(
+            "shared", name, lambda: pytest.fail("cache miss"), "source"
+        )
+        assert spec.build_and_load() == b"kernel"
+
+
+@pytest.mark.cpu_only
+def test_compiler_options_are_isolated_between_threads(cute_dsl_cache):
+    cache = cute_dsl_cache
+    entered, release, attempted = Event(), Event(), Event()
+    options = []
+
+    def compile_first():
+        options.append("first")
+        entered.set()
+        assert release.wait(timeout=10)
+        assert options.pop() == "first"
+        return _ExportedKernel(b"first")
+
+    def compile_second():
+        assert options == []
+        return _ExportedKernel(b"second")
+
+    def second_build():
+        attempted.set()
+        return cache.build_and_load_cute_dsl_kernel("shared", "second", compile_second)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            cache.build_and_load_cute_dsl_kernel, "shared", "first", compile_first
+        )
+        try:
+            assert entered.wait(timeout=10)
+            second = pool.submit(second_build)
+            assert attempted.wait(timeout=10)
+            with pytest.raises(FuturesTimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release.set()
+        assert first.result(timeout=10) == b"first"
+        assert second.result(timeout=10) == b"second"
+
+
+@pytest.mark.cpu_only
+def test_cache_read_discards_a_replaced_generation(cute_dsl_cache, monkeypatch):
+    cache = cute_dsl_cache
+
+    def make(key):
+        return cache.JitSpecCuteDsl(
+            "shared", "a", lambda: _ExportedKernel(b"kernel"), key
+        )
+
+    first, replacement = make("one"), make("two")
+    first.compile_and_persist()
+
+    def load_then_replace():
+        value = first.object_path.read_bytes()
+        replacement.compile_and_persist()
+        return value
+
+    monkeypatch.setattr(first, "_load_from_disk", load_then_replace)
+    assert first.try_load() is None
+    assert not first.is_compiled and replacement.is_compiled
+
+    def deny_read(*args, **kwargs):
+        raise PermissionError("cache read denied")
+
+    with monkeypatch.context() as denied:
+        denied.setattr(Path, "open", deny_read)
+        assert not replacement.is_compiled
+    monkeypatch.setattr(replacement, "_load_from_disk", deny_read)
+    with pytest.raises(PermissionError, match="cache read denied"):
+        replacement.load()
+
+    rmtree = cache.shutil.rmtree
+
+    def remove_retired_directory(path):
+        assert not replacement.meta_path.exists()
+        rmtree(path)
+
+    monkeypatch.setattr(cache.shutil, "rmtree", remove_retired_directory)
+
+    def invalidate_during_load():
+        make("three").compile_and_persist()
+        raise FileNotFoundError("sibling invalidated the object")
+
+    monkeypatch.setattr(replacement, "_load_from_disk", invalidate_during_load)
+    assert replacement.load() is replacement._compiled_kernel
+
+
+@pytest.mark.cpu_only
+def test_same_kernel_lock_is_held_until_publication(cute_dsl_cache, monkeypatch):
+    cache = cute_dsl_cache
+    exporting, release = Event(), Event()
+    builds = []
+
+    def compile_kernel():
+        builds.append(1)
+        return _ExportedKernel(b"kernel")
+
+    def spec(kernel_name="same"):
+        return cache.JitSpecCuteDsl("shared", kernel_name, compile_kernel, "source")
+
+    first_spec = spec()
+    export = first_spec._export_object
+
+    def blocked_export(path):
+        exporting.set()
+        assert release.wait(timeout=5)
+        export(path)
+
+    monkeypatch.setattr(first_spec, "_export_object", blocked_export)
+    missed = Event()
+
+    class CacheFillingSpec(cache.JitSpecCuteDsl):
+        @property
+        def is_compiled(self):
+            hit = super().is_compiled
+            if not hit:
+                missed.set()
+            return hit
+
+    waiter = CacheFillingSpec("shared", "same", compile_kernel, "source")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(first_spec.build_and_load)
+        try:
+            assert exporting.wait(timeout=5)
+            with pytest.raises(Timeout), FileLock(spec().lock_path, timeout=0):
+                pytest.fail("the publishing worker must still hold the kernel lock")
+            second = pool.submit(spec().build_and_load)
+            filling = pool.submit(waiter.compile_and_persist, force=False)
+            assert missed.wait(timeout=5)
+        finally:
+            release.set()
+        assert filling.result(timeout=10) is None
+        assert first.result(timeout=10) == second.result(timeout=10) == b"kernel"
+    assert len(builds) == 1
+    spec().compile_and_persist()
+    assert len(builds) == 2  # Explicit unconditional rebuild.
+
+    # A read-only deployment can load a cached sibling after a miss.
+    monkeypatch.setattr(
+        cache, "get_tmpdir", lambda: pytest.fail("read-only cache requested a lock")
+    )
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    missing = spec("missing")
+    with pytest.raises(cache.MissingJITCacheError) as exc:
+        missing.build_and_load()
+    assert exc.value.spec is missing
+    assert spec().is_compiled and spec().build_and_load() == b"kernel"
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("change", ["policy", "layout", "tactic"])
-def test_sm12x_disk_cache_tracks_codegen_changes(monkeypatch, tmp_path, change):
+def test_sm12x_disk_cache_tracks_codegen_changes(
+    cute_dsl_cache, monkeypatch, tmp_path, change
+):
     """Policy selection may change without rebuilding an unchanged specialization."""
-    from pathlib import Path
-
     from flashinfer.cute_dsl import utils as cute_dsl_utils
     from flashinfer.gemm import gemm_mm_fp4_cute_dsl as helpers
     from flashinfer.gemm.kernels.sm12x_cute import policy, runner
-    from flashinfer.jit import cute_dsl_core
+    from flashinfer.jit import MissingJITCacheError
 
+    cute_dsl_core = cute_dsl_cache
     policy_file = tmp_path / "policy.py"
     layout_file = tmp_path / "layout.py"
     policy_file.write_text("PREFERRED_TILE_K = 256\n")
@@ -459,33 +677,24 @@ def test_sm12x_disk_cache_tracks_codegen_changes(monkeypatch, tmp_path, change):
     monkeypatch.setattr(policy, "__file__", str(policy_file))
     monkeypatch.setattr(cute_dsl_utils, "__file__", str(layout_file))
     monkeypatch.setattr(cute_dsl_utils, "get_max_active_clusters", lambda _: 48)
-    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
-    monkeypatch.setattr(cute_dsl_core, "get_tmpdir", lambda: tmp_path)
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_121a")
-    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
-    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
     builds = []
-
-    class ExportedKernel:
-        def __init__(self, payload):
-            self.payload = payload
-
-        def export_to_c(self, path, function_name):
-            Path(path).write_bytes(self.payload)
 
     def make_compile_fn(kernel, *args):
         def compile_kernel():
             builds.append(kernel)
-            return ExportedKernel(str(len(builds)).encode())
+            return _ExportedKernel(str(len(builds)).encode())
 
         return compile_kernel
 
     monkeypatch.setattr(helpers, "_make_blockscaled_gemm_compile_fn", make_compile_fn)
-    monkeypatch.setattr(
-        cute_dsl_core.JitSpecCuteDsl,
-        "_load_from_disk",
-        lambda spec: spec.object_path.read_bytes(),
-    )
+    loaded = []
+
+    def load_from_disk(spec):
+        loaded.append(spec)
+        return spec.object_path.read_bytes()
+
+    monkeypatch.setattr(cute_dsl_core.JitSpecCuteDsl, "_load_from_disk", load_from_disk)
     tactic = policy.RAW_TACTICS[0]
 
     def load(choice):
@@ -493,7 +702,10 @@ def test_sm12x_disk_cache_tracks_codegen_changes(monkeypatch, tmp_path, change):
         return runner._compile(128, 34816, 5120, choice, compute_capability=(12, 1))
 
     first = load(tactic)
-    assert load(tactic) == first
+    with monkeypatch.context() as patch:
+        patch.setenv("FLASHINFER_DISABLE_JIT", "1")
+        assert load(tactic) == first
+    cached_spec = loaded[-1]
     assert len(builds) == 1
     choice = tactic
     if change == "policy":
@@ -503,7 +715,15 @@ def test_sm12x_disk_cache_tracks_codegen_changes(monkeypatch, tmp_path, change):
     else:
         choice = policy.RAW_TACTICS[1]
 
+    if change != "policy":
+        with monkeypatch.context() as patch:
+            patch.setenv("FLASHINFER_DISABLE_JIT", "1")
+            with pytest.raises(MissingJITCacheError):
+                load(choice)
     updated = load(choice)
+    if change == "layout":
+        with pytest.raises(RuntimeError, match="No valid cached"):
+            cached_spec.load()
     if change == "policy":
         assert updated == first
         assert len(builds) == 1

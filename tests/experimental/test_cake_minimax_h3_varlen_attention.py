@@ -2357,12 +2357,31 @@ def test_nvfp4_rejects_a_misaligned_workspace_tensor(pv_mode):
     )
 
 
+# One 14-head segment whose plan is tail-first on a grid of that many 2-CTA
+# clusters: its tail round holds Q-split halves of head 13 alone and at least
+# NVFP4_TFS_IDLE_MIN of the clusters idle.  74 (148 SMs): 54 cluster tiles,
+# 756 units, 16 halved into 32 tail units (idle 0.57); 76 (152 SMs): 55
+# cluster tiles, 770 units, 10 halved into 20 tail units (idle 0.74).
+TFS_SEGMENT_TOKENS = {74: 27488, 76: 28000}
+
+
+def _tfs_cu(cu, arch):
+    """``cu`` off the tail-first architectures, else the device grid's
+    tail-first segment (skips a grid without one)."""
+    if arch not in cake_backend.NVFP4_TFS_ARCHES:
+        return cu
+    capacity = cake_backend.bf16_grid_clusters(torch.device("cuda"))
+    if capacity not in TFS_SEGMENT_TOKENS:
+        pytest.skip(f"no tail-first segment recorded for {capacity} clusters")
+    return [0, TFS_SEGMENT_TOKENS[capacity]]
+
+
 @pytest.mark.parametrize(
     "route,cu,heads",
     [
-        ("bf16", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on B200
-        ("fp8", [0, 27488], 14),  # center_15s_p4: a tail-first plan on B200
-        ("fp4", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on B200
+        ("bf16", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on 74 clusters
+        ("fp8", [0, 27488], 14),  # center_15s_p4: a tail-first plan on 74 clusters
+        ("fp4", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on 74 clusters
     ],
 )
 def test_one_shot_side_streams_follow_the_caller_stream(route, cu, heads):
@@ -2381,6 +2400,9 @@ def test_one_shot_side_streams_follow_the_caller_stream(route, cu, heads):
         if route == "bf16"
         else cake_backend.NVFP4_TFS_ARCHES
     )
+    if route == "fp8":
+        # Only a tail-first plan takes two launches on the fp8 route.
+        cu = _tfs_cu(cu, arch)
     q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=16)
 
     def call():
@@ -2460,9 +2482,19 @@ def _stream_recording_parts(runner, launches, delayed=None):
 @pytest.mark.parametrize(
     "pv_mode,cu,heads,schedule",
     [
-        ("fp4", [0, 19296], 28, "ptg"),  # center_5s_p2: a tail-grid plan on B200
-        ("fp4", [0, 27488], 14, "tfs"),  # center_15s_p4: a tail-first plan on B200
-        ("fp8", [0, 27488], 14, "tfs"),  # center_15s_p4: a tail-first plan on B200
+        ("fp4", [0, 19296], 28, "ptg"),  # center_5s_p2: a tail-grid plan on 74 clusters
+        (
+            "fp4",
+            [0, 27488],
+            14,
+            "tfs",
+        ),  # center_15s_p4: a tail-first plan on 74 clusters
+        (
+            "fp8",
+            [0, 27488],
+            14,
+            "tfs",
+        ),  # center_15s_p4: a tail-first plan on 74 clusters
     ],
 )
 def test_nvfp4_two_launch_schedules_follow_the_caller_stream_order(
@@ -2479,6 +2511,8 @@ def test_nvfp4_two_launch_schedules_follow_the_caller_stream_order(
     the plan is single-stream and the same checks hold on the caller's
     stream."""
     arch = _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
+    if schedule == "tfs":
+        cu = _tfs_cu(cu, arch)
     q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=21)
     out = torch.empty_like(q)
     runner = prepare_minimax_h3_varlen_nvfp4_attention(
