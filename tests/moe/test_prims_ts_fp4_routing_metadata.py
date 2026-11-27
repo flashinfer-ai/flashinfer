@@ -7,15 +7,18 @@ the call then runs only the expert GEMMs and must match the ordinary call bitwis
 import pytest
 import torch
 
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
     QuantConfig,
     QuantFormat,
     TrtllmFp4Config,
     populate_trtllm_moe_routing_metadata_,
     prims_ts_fp4_block_scale_moe_partitioned,
+    prims_ts_fp4_block_scale_moe_routing_tile_n,
     prims_ts_fp4_block_scale_routed_moe,
     trtllm_moe_allocate_routing_metadata_multi_tile,
 )
+from flashinfer.fused_moe.backends.prims_ts import fp4_op
 from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
 from flashinfer.utils import get_compute_capability
@@ -230,6 +233,61 @@ def test_graph_replay_follows_new_routing(experts):
         assert torch.equal(captured[0], want)
 
 
+def _run_tile_slot(monkeypatch, call, routing, tile_n, **metadata_kwargs):
+    """Run with one slot of tile_n; the tactic must not fall back to another tile."""
+    slot = _metadata(routing, tile_ns=(tile_n,), **metadata_kwargs).slots[0]
+    kept, pick = [], fp4_op._routing_metadata_tactic
+
+    def spy(runner, moe_inputs, tactic, *args):
+        picked = pick(runner, moe_inputs, tactic, *args)
+        kept.append(picked[0] == tactic)
+        return picked
+
+    monkeypatch.setattr(fp4_op, "_routing_metadata_tactic", spy)
+    out = call(routing_metadata=slot)
+    assert kept == [True]
+    return out
+
+
+@pytest.mark.parametrize("num_tokens", [8, 512])
+@pytest.mark.parametrize("tuned", [False, True])
+def test_routing_tile_n_single_slot(experts, monkeypatch, num_tokens, tuned):
+    """The queried tile's single slot matches the ordinary call bitwise, tuned or not."""
+    AutoTuner.get().clear_cache()
+    quant, view = experts
+    hidden_states, scale = _activations(quant, num_tokens, seed=num_tokens)
+    routing = _routing(num_tokens, seed=num_tokens)
+    tune = dict(tune_max_num_tokens=num_tokens)
+
+    def tile_n():  # Shape-only activations, as a caller routing before quantization has.
+        return prims_ts_fp4_block_scale_moe_routing_tile_n(
+            routing,
+            hidden_states.to("meta"),
+            scale.to("meta"),
+            view["gemm1_weights"],
+            view["gemm1_weights_scale"],
+            NUM_EXPERTS,
+            TOP_K,
+            INTERMEDIATE,
+            LOCAL,
+            **tune,
+        )
+
+    if tuned:
+        default = tile_n()
+        with autotune(True):
+            assert tile_n() == default  # Lookup only: the default tile.
+            _call(view, hidden_states, scale, routing, True, **tune)
+    want = _call(view, hidden_states, scale, routing, True, **tune)[0]
+    out = _run_tile_slot(
+        monkeypatch,
+        lambda **kw: _call(view, hidden_states, scale, routing, True, **tune, **kw),
+        routing,
+        tile_n(),
+    )
+    assert torch.equal(out[0], want)
+
+
 def _partitioned_call(num_tokens: int):
     """The partitioned op on the partition tests' NVFP4 workload, with packed routing."""
     from tests.prims_ts.test_moe_partition_execution import (
@@ -265,6 +323,7 @@ def _partitioned_call(num_tokens: int):
     # Keep the green-context resources alive with the call.
     call.green_resources = green_resources
     call.num_experts, call.top_k = _NUM_EXPERTS, _TOP_K
+    call.kwargs = kwargs
     return call, kwargs["topk_ids"]
 
 
@@ -300,3 +359,65 @@ def test_partitioned_rejects_logits():
     logits = torch.randn(8, call.num_experts, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="requires precomputed topk_ids"):
         call(True, routing_logits=logits, topk_ids=None, routing_metadata=metadata)
+
+
+def test_partitioned_routing_tile_n_single_slot(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    AutoTuner.get().clear_cache()
+    call, routing = _partitioned_call(64)
+    kw = call.kwargs
+    want = call(True)[0].clone()
+    tile_n = prims_ts_fp4_block_scale_moe_routing_tile_n(
+        routing,
+        kw["hidden_states"].to("meta"),
+        kw["hidden_states_scale"].to("meta"),
+        kw["gemm1_weights"],
+        kw["gemm1_weights_scale"],
+        call.num_experts,
+        call.top_k,
+        kw["intermediate_size"],
+        kw["local_num_experts"],
+        **{
+            k: kw[k]
+            for k in ("activation_type", "tune_max_num_tokens", "weight_layout")
+        },
+        enable_pdl=kw["enable_pdl"],
+        gemm2_weights=kw["gemm2_weights"],
+        partition_resources=kw["partition_resources"],
+        partition_strategy=kw["partition_strategy"],
+    )
+    out = _run_tile_slot(
+        monkeypatch,
+        lambda **o: call(True, **o),
+        routing,
+        tile_n,
+        num_experts=call.num_experts,
+        local_expert_offset=0,
+        num_local_experts=call.num_experts,
+    )
+    assert torch.equal(out[0], want)
+
+
+def test_partitioned_routing_tile_n_per_token_scale_is_none():
+    """The partitioned call refuses per_token_scale, so the query returns None."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    call, routing = _partitioned_call(8)
+    kw = call.kwargs
+    tile_n = prims_ts_fp4_block_scale_moe_routing_tile_n(
+        routing,
+        kw["hidden_states"],
+        kw["hidden_states_scale"],
+        kw["gemm1_weights"],
+        kw["gemm1_weights_scale"],
+        call.num_experts,
+        call.top_k,
+        kw["intermediate_size"],
+        kw["local_num_experts"],
+        per_token_scale=torch.ones(8, device="cuda"),
+        gemm2_weights=kw["gemm2_weights"],
+        partition_resources=kw["partition_resources"],
+        partition_strategy=kw["partition_strategy"],
+    )
+    assert tile_n is None

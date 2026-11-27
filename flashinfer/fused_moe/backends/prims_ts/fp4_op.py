@@ -49,7 +49,7 @@ from flashinfer.prims_ts.moe.support import (
     is_prims_ts_mxfp4_mxfp8_supported,
     is_prims_ts_nvfp4_supported,
 )
-from flashinfer.tllm_enums import ActivationType
+from flashinfer.tllm_enums import ActivationType, is_gated_activation
 from flashinfer.trace.templates.moe import (
     prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch,
     trtllm_fp4_block_scale_moe_trace_dispatch,
@@ -58,6 +58,7 @@ from flashinfer.trace.templates.moe import (
 from flashinfer.utils import (
     check_shape_dtype_device,
     device_support_pdl,
+    get_compute_capability,
     register_custom_op,
     register_fake_op,
 )
@@ -159,6 +160,17 @@ def _check_routing_metadata_args(
         )
 
 
+def _tactic_tile_n(runner, moe_inputs: MoeRunnerInputs, tactic, kwargs: dict) -> int:
+    """The tile forward() runs for this tactic, default included."""
+    if tactic == -1 and runner._is_partitioned:
+        tactic = runner.get_valid_tactics(moe_inputs.to_list(), None)[0]
+    return int(
+        runner._map_tactic(
+            [-1, -1] if tactic == -1 else tactic, moe_inputs, kwargs
+        ).tile_n
+    )
+
+
 def _routing_metadata_tactic(
     runner,
     moe_inputs: MoeRunnerInputs,
@@ -168,15 +180,7 @@ def _routing_metadata_tactic(
 ):
     """Pick the tactic and the metadata slot it runs with."""
     inputs = moe_inputs.to_list()
-    resolved = tactic
-    if resolved == -1 and runner._is_partitioned:
-        resolved = runner.get_valid_tactics(inputs, None)[0]
-    # The tile forward() runs for this tactic, default included.
-    tile_n = int(
-        runner._map_tactic(
-            [-1, -1] if resolved == -1 else resolved, moe_inputs, kwargs
-        ).tile_n
-    )
+    tile_n = _tactic_tile_n(runner, moe_inputs, tactic, kwargs)
     slots = getattr(routing_metadata, "slots", None) or (routing_metadata,)
     slot_by_tile = {int(slot.tile_n): slot for slot in slots}
     if tile_n in slot_by_tile:
@@ -187,6 +191,245 @@ def _routing_metadata_tactic(
         if candidate != -1 and int(candidate[0]) == tile_n:
             return list(candidate), slots[0]
     raise ValueError(f"No Prims-TS tactic runs routing_metadata tile_n={tile_n}")
+
+
+def _fp4_moe_setup(
+    partitioned: bool,
+    *,
+    routing_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: Union[torch.Tensor, Sequence[torch.Tensor]],
+    gemm1_weights_scale: Union[torch.Tensor, Sequence[torch.Tensor]],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    gemm2_weights: Union[torch.Tensor, Sequence[torch.Tensor]],
+    gemm2_weights_scale: Union[torch.Tensor, Sequence[torch.Tensor]],
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    weight_layout: int,
+    do_finalize: bool,
+    enable_pdl: Optional[bool],
+    activation_type: int,
+    per_token_scale: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    tune_max_num_tokens: int,
+    norm_topk_prob: bool,
+    routing_replay_out: Optional[torch.Tensor],
+    routing_metadata=None,
+    gemm1_bias: Optional[torch.Tensor] = None,
+    gemm2_bias: Optional[torch.Tensor] = None,
+    routing_input_mode: int = RoutingInputMode.FromLogits,
+    num_fused_shared_experts: Optional[int] = None,
+    partition_resources: Optional[MoePartitionResources] = None,
+    partition_strategy: Optional[PartitionStrategy] = None,
+):
+    """The runner, inputs, tuning config and kwargs of the FP4 call (``partitioned``: the
+    partitioned call), with the inputs the key of its tactic, and ``(ok, reason)`` of its
+    support check: ``reason`` is the call's error message when not ok."""
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(hidden_states.device)
+    if partitioned and per_token_scale is not None:
+        raise NotImplementedError(
+            "Partitioned FP4 MoE does not support per-token FC1-output requantization"
+        )
+    if hidden_states.dtype == torch.uint8:
+        runners = (PrimsTsNvfp4MoERunner, PrimsTsPartitionedNvfp4MoERunner)
+        support_fn = is_prims_ts_nvfp4_supported
+        mode_name = "NVFP4xNVFP4"
+        hidden_size = hidden_states.shape[-1] * 2
+        scale_k_group_size = 16
+        if hidden_states_scale is None:
+            raise ValueError("hidden_states_scale is required for NVFP4 activations")
+        if hidden_states_scale.dtype != torch.float8_e4m3fn:
+            raise ValueError("hidden_states_scale must be float8_e4m3fn for NVFP4")
+    elif hidden_states.dtype == torch.float8_e4m3fn:
+        runners = (PrimsTsMxfp4Mxfp8MoERunner, PrimsTsPartitionedMxfp4Mxfp8MoERunner)
+        support_fn = is_prims_ts_mxfp4_mxfp8_supported
+        mode_name = "MXFP4xMXFP8"
+        hidden_size = hidden_states.shape[-1]
+        scale_k_group_size = 32
+        if hidden_states_scale is None:
+            raise ValueError("hidden_states_scale is required for MXFP8 activations")
+    elif hidden_states.dtype == torch.bfloat16:
+        runners = (PrimsTsMxfp4Bf16MoERunner, PrimsTsPartitionedMxfp4Bf16MoERunner)
+        support_fn = is_prims_ts_mxfp4_bf16_supported
+        mode_name = "MXFP4xBF16"
+        hidden_size = hidden_states.shape[-1]
+        scale_k_group_size = 32
+        if hidden_states_scale is not None:
+            raise ValueError("hidden_states_scale must be None for BF16 activations")
+    else:
+        raise ValueError(
+            "Partitioned FP4 MoE supports NVFP4, MXFP8, or BF16 activations"
+            if partitioned
+            else "Prims-TS FP4 path supports packed NVFP4 uint8, MXFP8 float8_e4m3fn, "
+            "or BF16 activations"
+        )
+    runner_extras: dict = {}
+    if partitioned:
+        if partition_resources is None or partition_strategy is None:
+            raise ValueError(
+                "Partitioned FP4 MoE requires partition_resources and partition_strategy"
+            )
+        require_partition_pair("gemm1_weights", gemm1_weights)
+        require_partition_pair("gemm1_weights_scale", gemm1_weights_scale)
+        require_partition_pair("gemm2_weights", gemm2_weights)
+        require_partition_pair("gemm2_weights_scale", gemm2_weights_scale)
+        validate_partition_arch(gemm1_weights[0])
+        routing_input_mode = (
+            RoutingInputMode.FromLogits
+            if routing_logits is not None
+            else (
+                RoutingInputMode.UnpackedPrecomputed
+                if topk_weights is not None
+                else RoutingInputMode.PackedPrecomputed
+            )
+        )
+        if routing_metadata is not None:
+            _check_routing_metadata_args(
+                routing_metadata=routing_metadata,
+                hidden_states=hidden_states,
+                routing_input_mode=routing_input_mode,
+                routing_replay_out=routing_replay_out,
+                num_fused_shared_experts=None,
+                num_experts=num_experts,
+                top_k=top_k,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=local_num_experts,
+            )
+        fc1_layout, fc2_layout = prepared_weight_layouts(
+            weight_dtype=torch.uint8,
+            weight_layout=weight_layout,
+            use_shuffled_weight=True,
+            scale_k_group_size=scale_k_group_size,
+            scale_dtype=torch.float8_e4m3fn,
+            fc1_block_major_k_bytes=prepared_block_major_k_bytes(
+                gemm1_weights[0], weight_layout
+            ),
+            fc2_block_major_k_bytes=prepared_block_major_k_bytes(
+                gemm2_weights[0], weight_layout
+            ),
+        )
+        runner_extras = dict(
+            partition_strategy=partition_strategy,
+            partition_fc1_layout=fc1_layout,
+            partition_fc2_layout=fc2_layout,
+            partition_resources=partition_resources,
+        )
+    routing_logits, topk_ids, expert_weights = _resolve_routing_inputs(
+        routing_input_mode=routing_input_mode,
+        routing_logits=routing_logits,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        hidden_states=hidden_states,
+    )
+    num_tokens = hidden_states.shape[0]
+    if output is None:
+        output = alloc_trtllm_moe_output(
+            num_tokens, hidden_size, do_finalize, hidden_states.device
+        )
+    elif do_finalize:
+        check_shape_dtype_device(
+            output,
+            (num_tokens, hidden_size),
+            torch.bfloat16,
+            hidden_states.device,
+            "output",
+        )
+    runner = runners[partitioned](
+        _get_moe_op(),
+        top_k=top_k,
+        num_local_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation_type=activation_type,
+        use_shuffled_weight=True,
+        weight_layout=weight_layout,
+        use_per_token_scaling=per_token_scale is not None,
+        num_experts=num_experts,
+        **runner_extras,
+    )
+    moe_inputs = MoeRunnerInputs(
+        output=output,
+        routing_logits=routing_logits,
+        topk_ids=topk_ids,
+        expert_weights=expert_weights,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_lora_delta=None,
+        per_token_scale=per_token_scale,
+    )
+    common_kwargs = dict(
+        routing_bias=routing_bias,
+        gemm1_weights=gemm1_weights[0] if partitioned else gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale[0]
+        if partitioned
+        else gemm1_weights_scale,
+        gemm1_bias=gemm1_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        gemm2_weights=gemm2_weights[0] if partitioned else gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale[0]
+        if partitioned
+        else gemm2_weights_scale,
+        gemm2_bias=gemm2_bias,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        per_token_scale=per_token_scale,
+        num_experts=num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+        use_shuffled_weight=True,
+        weight_layout=weight_layout,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+        routing_replay_out=routing_replay_out,
+        routing_input_mode=routing_input_mode,
+        num_fused_shared_experts=num_fused_shared_experts,
+    )
+    if partitioned:
+        common_kwargs.update(
+            partition_resources=partition_resources,
+            partition_fc1_weights=gemm1_weights,
+            partition_fc2_weights=gemm2_weights,
+            partition_fc1_scales=gemm1_weights_scale,
+            partition_fc2_scales=gemm2_weights_scale,
+        )
+    runner.set_cache_key_static_extras(**common_kwargs)
+    tuning_config = runner._make_tuning_config(
+        moe_inputs,
+        tune_max_num_tokens=tune_max_num_tokens,
+        routing_input_mode=RoutingInputMode(routing_input_mode),
+        use_cuda_graph=True,
+        use_cold_l2_cache=not partitioned,
+    )
+    ok, reason = support_fn(runner, moe_inputs, [-1, -1], **common_kwargs)
+    kernel = f"{'partitioned ' if partitioned else ''}Prims-TS {mode_name} kernel"
+    reason = f"Config not supported by {kernel} ({reason})"
+    return runner, moe_inputs, tuning_config, common_kwargs, ok, reason
 
 
 @register_custom_op(
@@ -362,149 +605,71 @@ def prims_ts_fp4_block_scale_moe(
             local_expert_offset=local_expert_offset,
             local_num_experts=local_num_experts,
         )
-    if hidden_states.dtype == torch.uint8:
-        runner_cls = PrimsTsNvfp4MoERunner
-        support_fn = is_prims_ts_nvfp4_supported
-        mode_name = "NVFP4xNVFP4"
-        hidden_size = hidden_states.shape[-1] * 2
-        if hidden_states_scale is None:
-            raise ValueError("hidden_states_scale is required for NVFP4 activations")
-        if hidden_states_scale.dtype != torch.float8_e4m3fn:
-            raise ValueError("hidden_states_scale must be float8_e4m3fn for NVFP4")
-    elif hidden_states.dtype == torch.float8_e4m3fn:
-        runner_cls = PrimsTsMxfp4Mxfp8MoERunner
-        support_fn = is_prims_ts_mxfp4_mxfp8_supported
-        mode_name = "MXFP4xMXFP8"
-        hidden_size = hidden_states.shape[-1]
-        if hidden_states_scale is None:
-            raise ValueError("hidden_states_scale is required for MXFP8 activations")
-    elif hidden_states.dtype == torch.bfloat16:
-        runner_cls = PrimsTsMxfp4Bf16MoERunner
-        support_fn = is_prims_ts_mxfp4_bf16_supported
-        mode_name = "MXFP4xBF16"
-        hidden_size = hidden_states.shape[-1]
-        if hidden_states_scale is not None:
-            raise ValueError("hidden_states_scale must be None for BF16 activations")
-    else:
-        raise ValueError(
-            "Prims-TS FP4 path supports packed NVFP4 uint8, MXFP8 float8_e4m3fn, "
-            "or BF16 activations"
-        )
-
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
-
-    num_tokens = hidden_states.shape[0]
-    if output is None:
-        output = alloc_trtllm_moe_output(
-            num_tokens, hidden_size, do_finalize, hidden_states.device
-        )
-    elif do_finalize:
-        check_shape_dtype_device(
-            output,
-            (num_tokens, hidden_size),
-            torch.bfloat16,
-            hidden_states.device,
-            "output",
-        )
-
-    routing_logits, topk_ids, expert_weights = _resolve_routing_inputs(
-        routing_input_mode=routing_input_mode,
+    runner, moe_inputs, tuning_config, common_kwargs, ok, reason = _fp4_moe_setup(
+        False,
         routing_logits=routing_logits,
+        routing_bias=routing_bias,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         hidden_states=hidden_states,
-    )
-
-    moe_op = _get_moe_op()
-    moe_runner = runner_cls(
-        moe_op,
-        top_k=top_k,
-        num_local_experts=local_num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        activation_type=activation_type,
-        use_shuffled_weight=True,
-        weight_layout=weight_layout,
-        use_per_token_scaling=per_token_scale is not None,
-        num_experts=num_experts,
-    )
-    moe_inputs = MoeRunnerInputs(
-        output=output,
-        routing_logits=routing_logits,
-        topk_ids=topk_ids,
-        expert_weights=expert_weights,
-        hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
-        gemm1_lora_delta=None,
-        per_token_scale=per_token_scale,
-    )
-    tuning_config = moe_runner._make_tuning_config(
-        moe_inputs,
-        tune_max_num_tokens=tune_max_num_tokens,
-        routing_input_mode=RoutingInputMode(routing_input_mode),
-        use_cuda_graph=True,
-        use_cold_l2_cache=True,
-    )
-
-    common_kwargs = dict(
-        routing_bias=routing_bias,
         gemm1_weights=gemm1_weights,
         gemm1_weights_scale=gemm1_weights_scale,
-        gemm1_bias=gemm1_bias,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
         gemm2_weights=gemm2_weights,
         gemm2_weights_scale=gemm2_weights_scale,
-        gemm2_bias=gemm2_bias,
         output1_scale_scalar=output1_scale_scalar,
         output1_scale_gate_scalar=output1_scale_gate_scalar,
         output2_scale_scalar=output2_scale_scalar,
-        per_token_scale=per_token_scale,
         num_experts=num_experts,
+        top_k=top_k,
         n_group=n_group,
         topk_group=topk_group,
+        intermediate_size=intermediate_size,
         local_expert_offset=local_expert_offset,
         local_num_experts=local_num_experts,
         routed_scaling_factor=routed_scaling_factor,
         routing_method_type=routing_method_type,
-        use_shuffled_weight=True,
         weight_layout=weight_layout,
         do_finalize=do_finalize,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
+        per_token_scale=per_token_scale,
+        output=output,
+        tune_max_num_tokens=tune_max_num_tokens,
         norm_topk_prob=norm_topk_prob,
         routing_replay_out=routing_replay_out,
+        gemm1_bias=gemm1_bias,
+        gemm2_bias=gemm2_bias,
         routing_input_mode=routing_input_mode,
         num_fused_shared_experts=num_fused_shared_experts,
     )
-    moe_runner.set_cache_key_static_extras(**common_kwargs)
-    ok, reason = support_fn(moe_runner, moe_inputs, [-1, -1], **common_kwargs)
     if not ok:
-        raise RuntimeError(
-            f"Config not supported by Prims-TS {mode_name} kernel ({reason})"
-        )
+        raise RuntimeError(reason)
 
     _, tactic = AutoTuner.get().choose_one(
         "flashinfer::prims_ts_fp4_block_scale_moe",
-        [moe_runner],
+        [runner],
         tuning_config,
         moe_inputs.to_list(),
         **common_kwargs,
     )
     if routing_metadata is not None:
         tactic, routing_metadata = _routing_metadata_tactic(
-            moe_runner, moe_inputs, tactic, routing_metadata, common_kwargs
+            runner, moe_inputs, tactic, routing_metadata, common_kwargs
         )
 
-    intermediate_output = moe_runner.forward(
+    intermediate_output = runner.forward(
         moe_inputs.to_list(),
         tactic=tactic,
         routing_metadata=routing_metadata,
         **common_kwargs,
     )
-    return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+    return unpack_trtllm_moe_output(
+        intermediate_output, moe_inputs.output, do_finalize, None
+    )
 
 
 @flashinfer_api(trace=prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch)
@@ -649,175 +814,48 @@ def prims_ts_fp4_block_scale_moe_partitioned(
         :func:`~flashinfer.fused_moe.prims_ts_fp4_block_scale_moe`.
     """
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
-    if per_token_scale is not None:
-        raise NotImplementedError(
-            "Partitioned FP4 MoE does not support per-token FC1-output requantization"
-        )
-    if hidden_states.dtype == torch.uint8:
-        runner_cls = PrimsTsPartitionedNvfp4MoERunner
-        support_fn = is_prims_ts_nvfp4_supported
-        mode_name = "NVFP4xNVFP4"
-        hidden_size = hidden_states.shape[-1] * 2
-        scale_k_group_size = 16
-    elif hidden_states.dtype == torch.float8_e4m3fn:
-        runner_cls = PrimsTsPartitionedMxfp4Mxfp8MoERunner
-        support_fn = is_prims_ts_mxfp4_mxfp8_supported
-        mode_name = "MXFP4xMXFP8"
-        hidden_size = hidden_states.shape[-1]
-        scale_k_group_size = 32
-    elif hidden_states.dtype == torch.bfloat16:
-        runner_cls = PrimsTsPartitionedMxfp4Bf16MoERunner
-        support_fn = is_prims_ts_mxfp4_bf16_supported
-        mode_name = "MXFP4xBF16"
-        hidden_size = hidden_states.shape[-1]
-        scale_k_group_size = 32
-    else:
-        raise ValueError(
-            "Partitioned FP4 MoE supports NVFP4, MXFP8, or BF16 activations"
-        )
-    if partition_resources is None or partition_strategy is None:
-        raise ValueError(
-            "Partitioned FP4 MoE requires partition_resources and partition_strategy"
-        )
-    require_partition_pair("gemm1_weights", gemm1_weights)
-    require_partition_pair("gemm1_weights_scale", gemm1_weights_scale)
-    require_partition_pair("gemm2_weights", gemm2_weights)
-    require_partition_pair("gemm2_weights_scale", gemm2_weights_scale)
-    validate_partition_arch(gemm1_weights[0])
-
-    routing_mode = (
-        RoutingInputMode.FromLogits
-        if routing_logits is not None
-        else (
-            RoutingInputMode.UnpackedPrecomputed
-            if topk_weights is not None
-            else RoutingInputMode.PackedPrecomputed
-        )
-    )
-    if routing_metadata is not None:
-        _check_routing_metadata_args(
-            routing_metadata=routing_metadata,
-            hidden_states=hidden_states,
-            routing_input_mode=routing_mode,
-            routing_replay_out=routing_replay_out,
-            num_fused_shared_experts=None,
-            num_experts=num_experts,
-            top_k=top_k,
-            local_expert_offset=local_expert_offset,
-            local_num_experts=local_num_experts,
-        )
-    routing_logits, resolved_topk_ids, expert_weights = _resolve_routing_inputs(
-        routing_input_mode=routing_mode,
+    runner, moe_inputs, tuning_config, common_kwargs, ok, reason = _fp4_moe_setup(
+        True,
         routing_logits=routing_logits,
+        routing_bias=routing_bias,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         hidden_states=hidden_states,
-    )
-    num_tokens = hidden_states.shape[0]
-    if output is None:
-        output = alloc_trtllm_moe_output(
-            num_tokens, hidden_size, do_finalize, hidden_states.device
-        )
-    elif do_finalize:
-        check_shape_dtype_device(
-            output,
-            (num_tokens, hidden_size),
-            torch.bfloat16,
-            hidden_states.device,
-            "output",
-        )
-
-    fc1_layout, fc2_layout = prepared_weight_layouts(
-        weight_dtype=torch.uint8,
-        weight_layout=weight_layout,
-        use_shuffled_weight=True,
-        scale_k_group_size=scale_k_group_size,
-        scale_dtype=torch.float8_e4m3fn,
-        fc1_block_major_k_bytes=prepared_block_major_k_bytes(
-            gemm1_weights[0], weight_layout
-        ),
-        fc2_block_major_k_bytes=prepared_block_major_k_bytes(
-            gemm2_weights[0], weight_layout
-        ),
-    )
-    runner = runner_cls(
-        _get_moe_op(),
-        top_k=top_k,
-        num_local_experts=local_num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        activation_type=activation_type,
-        use_shuffled_weight=True,
-        weight_layout=weight_layout,
-        use_per_token_scaling=per_token_scale is not None,
-        num_experts=num_experts,
-        partition_strategy=partition_strategy,
-        partition_fc1_layout=fc1_layout,
-        partition_fc2_layout=fc2_layout,
-        partition_resources=partition_resources,
-    )
-    moe_inputs = MoeRunnerInputs(
-        output=output,
-        routing_logits=routing_logits,
-        topk_ids=resolved_topk_ids,
-        expert_weights=expert_weights,
-        hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
-        gemm1_lora_delta=None,
-        per_token_scale=per_token_scale,
-    )
-    common_kwargs = dict(
-        routing_bias=routing_bias,
-        gemm1_weights=gemm1_weights[0],
-        gemm1_weights_scale=gemm1_weights_scale[0],
-        gemm1_bias=None,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
-        gemm2_weights=gemm2_weights[0],
-        gemm2_weights_scale=gemm2_weights_scale[0],
-        gemm2_bias=None,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
         output1_scale_scalar=output1_scale_scalar,
         output1_scale_gate_scalar=output1_scale_gate_scalar,
         output2_scale_scalar=output2_scale_scalar,
-        per_token_scale=per_token_scale,
         num_experts=num_experts,
+        top_k=top_k,
         n_group=n_group,
         topk_group=topk_group,
+        intermediate_size=intermediate_size,
         local_expert_offset=local_expert_offset,
         local_num_experts=local_num_experts,
         routed_scaling_factor=routed_scaling_factor,
         routing_method_type=routing_method_type,
-        use_shuffled_weight=True,
         weight_layout=weight_layout,
         do_finalize=do_finalize,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
+        per_token_scale=per_token_scale,
+        output=output,
+        tune_max_num_tokens=tune_max_num_tokens,
         norm_topk_prob=norm_topk_prob,
         routing_replay_out=routing_replay_out,
-        routing_input_mode=routing_mode,
-        num_fused_shared_experts=None,
+        routing_metadata=routing_metadata,
         partition_resources=partition_resources,
-        partition_fc1_weights=gemm1_weights,
-        partition_fc2_weights=gemm2_weights,
-        partition_fc1_scales=gemm1_weights_scale,
-        partition_fc2_scales=gemm2_weights_scale,
+        partition_strategy=partition_strategy,
     )
-    runner.set_cache_key_static_extras(**common_kwargs)
-    tuning_config = runner._make_tuning_config(
-        moe_inputs,
-        tune_max_num_tokens=tune_max_num_tokens,
-        routing_input_mode=routing_mode,
-        use_cuda_graph=True,
-        use_cold_l2_cache=False,
-    )
-    ok, reason = support_fn(runner, moe_inputs, [-1, -1], **common_kwargs)
     if not ok:
-        raise RuntimeError(
-            f"Config not supported by partitioned Prims-TS {mode_name} kernel ({reason})"
-        )
+        raise RuntimeError(reason)
     _, tactic = AutoTuner.get().choose_one(
         "flashinfer::prims_ts_fp4_block_scale_moe_partitioned",
         [runner],
@@ -835,7 +873,9 @@ def prims_ts_fp4_block_scale_moe_partitioned(
         routing_metadata=routing_metadata,
         **common_kwargs,
     )
-    return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+    return unpack_trtllm_moe_output(
+        intermediate_output, moe_inputs.output, do_finalize, None
+    )
 
 
 @register_fake_op("flashinfer::prims_ts_fp4_block_scale_moe")
@@ -1098,3 +1138,130 @@ def prims_ts_fp4_block_scale_routed_moe(
         topk_weights=topk_weights,
         routing_metadata=routing_metadata,
     )
+
+
+@flashinfer_api
+def prims_ts_fp4_block_scale_moe_routing_tile_n(
+    topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: Union[torch.Tensor, Sequence[torch.Tensor]],
+    gemm1_weights_scale: Union[torch.Tensor, Sequence[torch.Tensor]],
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    local_num_experts: int,
+    *,
+    do_finalize: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    per_token_scale: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 8192,
+    output: Optional[torch.Tensor] = None,
+    weight_layout: int = 0,
+    enable_pdl: Optional[bool] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
+    gemm2_weights: Optional[Sequence[torch.Tensor]] = None,
+    partition_resources: Optional[MoePartitionResources] = None,
+    partition_strategy: Optional[PartitionStrategy] = None,
+) -> Optional[int]:
+    """The tile_N :func:`prims_ts_fp4_block_scale_routed_moe` (no biases) runs with the same
+    arguments, or with ``partition_strategy`` :func:`prims_ts_fp4_block_scale_moe_partitioned`
+    (shards in ``gemm1_weights``, ``gemm1_weights_scale`` and ``gemm2_weights``): the
+    autotuned tile if the tactic cache has one, else the default tile. ``None`` when the
+    call does not support the config, so route inside the call instead.
+
+    Same contract as :func:`~flashinfer.fused_moe.trtllm_fp4_block_scale_moe_routing_tile_n`:
+    it only looks the cache up (inside a tuning context it returns the default tile), and the
+    activation tensors and ``output`` may be ``meta`` tensors.
+    """
+    topk_ids, topk_weights = (
+        topk_ids if isinstance(topk_ids, tuple) else (topk_ids, None)
+    )
+    shards = partition_strategy is not None
+    if output is None:
+        packed = 2 if hidden_states.dtype == torch.uint8 else 1
+        hidden_size = hidden_states.shape[-1] * packed
+        output = alloc_trtllm_moe_output(
+            hidden_states.shape[0], hidden_size, do_finalize, torch.device("meta")
+        )
+    # Shape-only stand-ins on the call's device, which keys the tactics.
+    hidden_states, hidden_states_scale, per_token_scale, output = (
+        t
+        if t is None or not t.is_meta
+        else torch.empty((), dtype=t.dtype, device=topk_ids.device).expand(t.shape)
+        for t in (hidden_states, hidden_states_scale, per_token_scale, output)
+    )
+    # Checked only for presence before the tactic is chosen; nothing launches.
+    present = torch.empty(0, device=topk_ids.device)
+    # The partitioned call raises NotImplementedError for these configs.
+    if shards and (
+        per_token_scale is not None
+        or not is_gated_activation(activation_type)
+        or get_compute_capability(topk_ids.device) != (10, 7)
+    ):
+        return None
+    runner, moe_inputs, tuning_config, kwargs, ok, _ = _fp4_moe_setup(
+        shards,
+        routing_logits=None,
+        routing_bias=None,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=(present, present) if shards else present,
+        output1_scale_scalar=present,
+        output1_scale_gate_scalar=present,
+        output2_scale_scalar=present,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=0,
+        weight_layout=weight_layout,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        per_token_scale=per_token_scale,
+        output=output,
+        tune_max_num_tokens=tune_max_num_tokens,
+        norm_topk_prob=True,
+        routing_replay_out=None,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed
+        if topk_weights is None
+        else RoutingInputMode.UnpackedPrecomputed,
+        partition_resources=partition_resources,
+        partition_strategy=partition_strategy,
+    )
+    if not ok:
+        return None
+    tactic = -1
+    tuner = AutoTuner.get()
+    # Outside tuning mode choose_one is the call's own cache lookup; it never profiles.
+    if not tuner.is_tuning_mode:
+        _, tactic = tuner.choose_one(
+            "flashinfer::prims_ts_fp4_block_scale_moe_partitioned"
+            if shards
+            else "flashinfer::prims_ts_fp4_block_scale_moe",
+            [runner],
+            tuning_config,
+            moe_inputs.to_list(),
+            **kwargs,
+        )
+    if tactic == -1 and shards:
+        try:  # forward() runs the first tactic the partition geometry allows.
+            tactic = runner.get_valid_tactics(moe_inputs.to_list(), None)[0]
+        except RuntimeError:  # No tactic fits this geometry: the call raises.
+            return None
+    return _tactic_tile_n(runner, moe_inputs, tactic, kwargs)
