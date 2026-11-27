@@ -912,6 +912,37 @@ def test_the_pool_layout_is_checked():
         )
 
 
+def test_a_seed_never_copies_a_per_sequence_state():
+    """A per-sequence BF16 ``initial_state`` the pool program cannot read in place (a slot stride of ``H x 8192 + 2``
+    elements, not a multiple of 4) is copied once without ``rand_seed`` and runs as its contiguous copy; with a seed
+    it is refused, since the stochastic rounding counts from the base of the caller's tensor and a copy would change
+    the random bits."""
+    inputs, _, _ = _small()
+    initial = _pool(2, 4, torch.bfloat16, pad=2, seed=27)
+    assert initial.stride(0) == 4 * HEAD + 2
+    seed = torch.tensor([1], dtype=torch.int64, device=_device())
+    output = torch.empty(2, 4, V, K, dtype=torch.bfloat16, device=_device())
+    with pytest.raises(ValueError, match="never copied"):
+        _call(
+            inputs,
+            initial_state=initial,
+            output_state=output,
+            output_final_state=True,
+            rand_seed=seed,
+        )
+    out, state = _call(
+        inputs, initial_state=initial, output_state=output, output_final_state=True
+    )
+    ref_out, ref_state = _call(
+        inputs,
+        initial_state=initial.contiguous(),
+        output_state=torch.empty_like(output),
+        output_final_state=True,
+    )
+    assert state is output
+    assert _equal_bits(out, ref_out) and _equal_bits(state, ref_state)
+
+
 def test_the_seed_contract():
     inputs, pool, slots = _small()
     call = dict(

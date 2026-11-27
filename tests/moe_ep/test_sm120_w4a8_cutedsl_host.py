@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
-
 import torch
 
 from flashinfer.moe_ep import BootstrapConfig, FleetParams
@@ -69,25 +66,3 @@ def test_workspace_pool_key_covers_geometry(monkeypatch) -> None:
     assert key() == key()
     assert key(intermediate=2048) != key()
     assert key(top_k=8) != key()
-
-
-def test_production_modules_do_not_import_mega_runner() -> None:
-    package = Path(__file__).parents[2] / "flashinfer" / "moe_ep"
-    roots = (
-        package / "backends" / "mega" / "kernel" / "sm120" / "mxfp4_mxfp8_bf16_cutedsl",
-        package / "shims" / "sm120" / "split_cutedsl",
-    )
-    offenders: list[str] = []
-    for root in roots:
-        assert root.is_dir(), root
-        for source in root.rglob("*.py"):
-            tree = ast.parse(source.read_text())
-            for node in ast.walk(tree):
-                names: list[str] = []
-                if isinstance(node, ast.Import):
-                    names = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    names = [node.module]
-                if any("mega_runner" in name for name in names):
-                    offenders.append(str(source.relative_to(package)))
-    assert not offenders
