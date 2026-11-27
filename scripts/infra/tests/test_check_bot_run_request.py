@@ -235,6 +235,54 @@ class ImpactTests(unittest.TestCase):
         self.assertEqual("gpu_required", result.gpu_impact["classification"])
         self.assertEqual(1, len(result.paths))
 
+    def test_gate_keeps_valid_targets_when_other_targets_are_invalid(self):
+        result = self.select(
+            analysis(), "selected", [target("tests/missing.py"), target()]
+        )
+        self.assertEqual([target()["path"]], result.paths)
+        self.assertEqual("gpu_required", result.gpu_impact["classification"])
+        summary = gate.evaluate([], lambda: result.gpu_impact).summary
+        self.assertIn("Warnings", summary)
+        self.assertIn("tests/missing.py", summary)
+
+    def test_gate_keeps_impact_when_no_target_survives(self):
+        result = self.select(analysis(), "selected", [target("tests/missing.py")])
+        self.assertEqual([], result.paths)
+        self.assertEqual("gpu_required", result.gpu_impact["classification"])
+        self.assertTrue(result.gpu_impact["evidence_warnings"])
+
+    def test_gate_can_classify_when_ci_routing_file_is_unavailable(self):
+        self.fixture.selector.read_ci_file = Mock(side_effect=FileNotFoundError)
+        result = self.select(analysis())
+        self.assertEqual("gpu_required", result.gpu_impact["classification"])
+        self.assertIn(
+            ".github/workflows/pr-test.yml",
+            " ".join(result.gpu_impact["evidence_warnings"]),
+        )
+
+    def test_gate_can_classify_when_supplemental_blob_cannot_be_read(self):
+        f = self.fixture
+        path = "scripts/another_runner.sh"
+        f.github.get_repository_tree.return_value["tree"].append(
+            {"path": path, "sha": "runner", "mode": "100644", "type": "blob"}
+        )
+        read_blob = f.github.get_repository_blob.side_effect
+
+        def read(repo, sha, limit):
+            if sha == "runner":
+                raise ValueError("Blob unavailable")
+            return read_blob(repo, sha, limit)
+
+        f.github.get_repository_blob.side_effect = read
+        f.inference.outputs[0] = {"read_paths": [path]}
+        result = self.select(analysis())
+        self.assertEqual("gpu_required", result.gpu_impact["classification"])
+        self.assertIn(path, " ".join(result.gpu_impact["evidence_warnings"]))
+        self.assertEqual(
+            "file could not be read",
+            f.inference.calls[1][0]["unavailable_evidence"][path],
+        )
+
     def test_added_gpu_test_is_inspected_before_the_model_request(self):
         f = self.fixture
         path = "tests/new/test_gpu.py"
@@ -284,6 +332,10 @@ class TransportTests(unittest.TestCase):
         ]
         self.client.get_pr_files_at.side_effect = (
             lambda pr, base: self.client.get_pr_files(pr["number"])
+        )
+        self.client.python_sources_at.return_value = {}
+        self.client.python_sources_at.side_effect = lambda *_: (
+            item for item in self.client.python_sources_at.return_value.items()
         )
 
         self.publisher = gate.Client("upstream/flashinfer")
@@ -497,6 +549,41 @@ class TransportTests(unittest.TestCase):
                 self.assertNotIn("Declare the test scope", result.summary)
                 analyze.assert_not_called()
 
+    def test_python_documentation_takes_priority_over_experimental_paths(self):
+        from unittest.mock import patch
+
+        path = "flashinfer/experimental/a/feature.py"
+        self.pr["changed_files"] = 2
+        self.client.get_pr_files.return_value = [
+            {"filename": path, "status": "modified"},
+            {"filename": "README.md", "status": "modified"},
+        ]
+        self.client.python_sources_at.return_value = {
+            path: (
+                'def kernel():\n    """Old documentation."""\n    return launch()\n',
+                'def kernel():\n    """New documentation."""\n    # Explain the launch.\n    return launch()\n',
+            ),
+        }
+        with patch.object(gate, "analyze_gpu_impact") as analyze:
+            result = gate.run_pr(self.client, 42)
+        self.assertEqual(("success", "docs_only"), (result.conclusion, result.reason))
+        analyze.assert_not_called()
+
+    def test_python_code_or_directive_changes_are_not_documentation(self):
+        from unittest.mock import patch
+
+        path = "flashinfer/experimental/a/feature.py"
+        self.client.get_pr_files.return_value = [
+            {"filename": path, "status": "modified"},
+        ]
+        for after in ("launch(2)\n", "launch(1)  # type: ignore\n"):
+            with self.subTest(after=after), patch.object(gate, "analyze_gpu_impact"):
+                self.client.python_sources_at.return_value = {
+                    path: ("launch(1)\n", after),
+                }
+                result = gate.run_pr(self.client, 42)
+                self.assertEqual("experimental_only", result.reason)
+
     def test_experimental_with_documentation_also_passes_without_inference(self):
         from unittest.mock import patch
 
@@ -689,7 +776,9 @@ class TransportTests(unittest.TestCase):
     def test_documentation_rename_from_gpu_source_is_not_exempt(self):
         self.assertFalse(
             gate.docs_only(
-                [{"filename": "docs/new.md", "previous_filename": "kernel.cu"}], 1
+                [{"filename": "docs/new.md", "previous_filename": "kernel.cu"}],
+                1,
+                Mock(side_effect=AssertionError("Unexpected source lookup")),
             )
         )
         self.assertFalse(gate.docs_only([{"filename": "docs/new.md"}], 2))
@@ -762,16 +851,16 @@ class RetryAnalysisTests(unittest.TestCase):
         self.assertEqual(model.calls[1][0], model.calls[2][0])
         self.assertEqual("Incomplete JSON", impact["analysis_attempts"][0]["error"])
 
-    def test_invalid_evidence_is_rerequested_before_minimal_final(self):
+    def test_invalid_optional_evidence_does_not_interrupt_classification(self):
         impact, model = self.run_outputs(
             [
-                {"read_paths": ["invented.py"]},
-                {"read_paths": []},
+                {"read_paths": ["invented.py", None]},
                 self.selection("cpu_only"),
             ]
         )
         self.assertEqual("cpu_only", impact["classification"])
-        self.assertEqual([None, "minimal", "minimal"], model.efforts)
+        self.assertEqual([None, None], model.efforts)
+        self.assertEqual(2, len(impact["evidence_warnings"]))
 
     def test_unknown_retries_once_and_requires_bot(self):
         impact, model = self.run_outputs(

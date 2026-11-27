@@ -228,8 +228,10 @@ Finding a qualifying response skips base SHA lookup, source inspection and
 inference. The gate still verifies that the PR head and target branch are current.
 
 Without a reply, the gate exempts documentation-only, CPU-only and
-experimental-only changes. Changes confined to the experimental source/test
-trees and documentation can be classified without inference. An experimental
+experimental-only changes. It checks for documentation first, including
+Python comment and docstring edits verified against both versions of the file.
+Changes confined to the experimental source/test trees and documentation can
+also be classified without inference. An experimental
 opt-in in core can qualify if the diff establishes that stable GPU behavior is
 unchanged. Mixed changes that affect stable GPU behavior still require a bot
 response. Experimental tests run in their own lane. To run a specific
@@ -244,12 +246,15 @@ launchers, bindings, dispatch, shapes/dtypes/layouts, workspace, JIT/AOT, CUDA
 graphs, synchronization and communication generally need GPU validation. New
 PR tests are included even if they are not among the recommended targets.
 Stable GPU changes still require a bot response when no test case was selected.
-The check reports the gap in test selection.
+The gate skips missing or invalid supplemental file requests and drops invalid
+test suggestions. Check Details lists warnings alongside the impact result.
+The gate can read requested regular files from the pinned PR tree. Ordinary
+bot commands use the model's bounded file inventory.
 The GPU-impact response uses compact JSON with default reasoning. If analysis
 fails validation or returns `unknown`, the gate retries once with
 `reasoning_effort=minimal`. A validated evidence-file request is reused only
-when its context is unchanged; invalid file requests are retried too. If the
-second analysis is still uncertain or invalid, the check fails and requires
+when its context is unchanged. If the second impact analysis is still
+uncertain or invalid, the check fails and requires
 `/bot run` and an internal bot response. A known stable GPU change requires a
 reply immediately, without a model retry.
 

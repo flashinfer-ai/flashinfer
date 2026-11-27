@@ -2,9 +2,14 @@
 """Publish a response-only internal /bot run gate without posting PR comments."""
 
 import argparse
+import ast
+import base64
+from contextlib import closing
 import copy
 from dataclasses import dataclass
+import hashlib
 import html
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +17,7 @@ import re
 import subprocess
 import sys
 import time
+import tokenize
 
 from ai_test_scope import (
     EVIDENCE_PROMPT,
@@ -33,6 +39,8 @@ CHECK_NAME = "Bot Run Request Check"
 BOT_ID = 236526959  # Stable GitHub account ID; never rely on copied display text.
 PUBLIC_NOTE = "<!-- flashinfer-bot:ci-bot-commands-note -->"
 VERSION = "bot-run-request-v1"
+# Python source is compared locally and does not consume model context.
+MAX_PYTHON_DOC_SOURCE_BYTES = 1_000_000
 
 
 class PinnedPRSource:
@@ -99,6 +107,7 @@ def analyze_gpu_impact(client, pr, read_ci_file, inference=None):
     wrapped = RetryingImpactInference(model)
     deadline = client.deadline
     attempts = []
+    warnings = []
     secrets = (model.api_key, os.getenv("GH_TOKEN"), os.getenv("GITHUB_TOKEN"))
     for index, effort in enumerate((None, "minimal")):
         model.reasoning_effort = effort
@@ -112,6 +121,7 @@ def analyze_gpu_impact(client, pr, read_ci_file, inference=None):
             selector.timeout = min(selector.timeout, available / (2 - index))
             selection = selector.select(pr, include_gpu_impact=True)
             impact = {**selection.gpu_impact, "targets": selection.paths}
+            warnings.extend(impact.get("evidence_warnings", []))
             if impact["classification"] == "unknown":
                 raise TargetSelectionError(impact["reason"])
         except (TargetSelectionError, ValueError) as error:
@@ -133,6 +143,7 @@ def analyze_gpu_impact(client, pr, read_ci_file, inference=None):
         "targets": [],
         "case_gap": "",
         "analysis_attempts": attempts,
+        "evidence_warnings": list(dict.fromkeys(warnings)),
     }
 
 
@@ -253,6 +264,16 @@ def evaluate_impact(comments, analyze):
         details += "\n\nTest selection gap: " + _public_prose(
             impact["case_gap"], limit=1000
         )
+    if impact.get("evidence_warnings"):
+        details += "\n\nWarnings:\n" + "\n".join(
+            "- "
+            + _public_prose(
+                warning,
+                (os.getenv("GH_TOKEN"), os.getenv("INFERENCE_API_KEY")),
+                limit=300,
+            )
+            for warning in impact["evidence_warnings"]
+        )
     if len(impact.get("analysis_attempts", [])) > 1:
         details += "\n\nAnalysis attempts:\n" + "\n".join(
             "- " + item["effort"] + ": " + item.get("error", "succeeded")
@@ -317,7 +338,74 @@ class Client(GitHub):
             # GitHub's immutable compare response contains at most 300 files.
             # Never use a partial list to grant a documentation/CPU exemption.
             raise TargetSelectionError("Pinned changed-file comparison is incomplete")
+        merge_base = comparison.get("merge_base_commit")
+        self._comparison = (
+            base_sha,
+            head_sha,
+            merge_base.get("sha") if isinstance(merge_base, dict) else None,
+        )
         return files
+
+    def python_sources_at(self, pr, base_sha, paths):
+        head_sha = pr["head"]["sha"]
+        comparison = getattr(self, "_comparison", None)
+        if not comparison or comparison[:2] != (base_sha, head_sha):
+            return
+        merge_base = comparison[2]
+        if not isinstance(merge_base, str) or not re.fullmatch(
+            r"[0-9a-f]{40}", merge_base
+        ):
+            return
+
+        deadline = self.deadline
+        self.deadline = min(deadline, time.monotonic() + 25)
+        try:
+            entries = []
+            for sha in (merge_base, head_sha):
+                response = self.request(
+                    f"repos/{self.repository}/git/trees/{sha}?recursive=1"
+                )
+                if not isinstance(response, dict) or response.get("truncated"):
+                    return
+                entries.append(
+                    {
+                        entry["path"]: entry
+                        for entry in response["tree"]
+                        if entry["path"] in paths and entry["type"] == "blob"
+                    }
+                )
+            for path in sorted(paths):
+                before, after = (tree.get(path, {}) for tree in entries)
+                if before.get("mode") not in ("100644", "100755") or (
+                    before["mode"] != after.get("mode")
+                ):
+                    return
+                texts = []
+                for entry in (before, after):
+                    if (
+                        entry.get("size", MAX_PYTHON_DOC_SOURCE_BYTES + 1)
+                        > MAX_PYTHON_DOC_SOURCE_BYTES
+                    ):
+                        return
+                    blob = self.request(
+                        f"repos/{self.repository}/git/blobs/{entry['sha']}"
+                    )
+                    if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+                        return
+                    text = base64.b64decode(blob["content"])
+                    git_blob = f"blob {len(text)}\0".encode() + text
+                    if (
+                        len(text) > MAX_PYTHON_DOC_SOURCE_BYTES
+                        or hashlib.sha1(git_blob).hexdigest() != entry["sha"]
+                    ):
+                        return
+                    texts.append(text)
+                yield path, texts
+        except (TargetSelectionError, KeyError, TypeError, ValueError):
+            # This shortcut requires both complete versions. Continue with normal analysis.
+            return
+        finally:
+            self.deadline = deadline
 
     def request(self, endpoint, method="GET", data=None):
         args = ["gh", "api", "--method", method, endpoint]
@@ -432,8 +520,6 @@ class Client(GitHub):
 
 
 def analysis_version():
-    import hashlib
-
     digest = hashlib.sha256()
     for name in (
         "ai_test_scope.py",
@@ -468,14 +554,68 @@ def cached_analysis(checks, pr, base_sha):
     return None
 
 
-def docs_only(changed, expected_count):
-    return (
-        bool(changed)
-        and len(changed) == expected_count
-        and all(
-            is_documentation(path) for item in changed for path in changed_paths(item)
+def python_documentation_change(before, after):
+    def comparable(source):
+        tree = ast.parse(source, type_comments=True)
+        docstring_containers = (
+            ast.Module,
+            ast.ClassDef,
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
         )
-    )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, docstring_containers)
+                and ast.get_docstring(node) is not None
+            ):
+                node.body.pop(0)
+        if isinstance(source, str):
+            source = source.encode()
+        directives = [
+            token.string
+            for token in tokenize.tokenize(io.BytesIO(source).readline)
+            if token.type == tokenize.COMMENT
+            and re.match(
+                r"#\s*(?:!|///|.*coding[:=]|(?:type|noqa|ruff|fmt|pragma|cython|pyright|mypy|doctest)\b)",
+                token.string,
+                re.IGNORECASE,
+            )
+        ]
+        return ast.dump(tree), directives
+
+    try:
+        return comparable(before) == comparable(after)
+    except (SyntaxError, UnicodeError, ValueError, tokenize.TokenError):
+        return False
+
+
+def docs_only(changed, expected_count, read_python_sources=None):
+    if not changed or len(changed) != expected_count:
+        return False
+    python_paths = set()
+    for item in changed:
+        if all(is_documentation(path) for path in changed_paths(item)):
+            continue
+        path = item["filename"]
+        if (
+            not path.endswith(".py")
+            or item.get("status") != "modified"
+            or item.get("previous_filename")
+        ):
+            return False
+        python_paths.add(path)
+    if not python_paths:
+        return True
+    if read_python_sources is None:
+        return False
+    matched = set()
+    # Close the generator on an executable change so its temporary read budget is restored.
+    with closing(read_python_sources(python_paths)) as sources:
+        for path, (before, after) in sources:
+            if not python_documentation_change(before, after):
+                return False
+            matched.add(path)
+    return matched == python_paths
 
 
 def experimental_only(changed, expected_count):
@@ -539,9 +679,13 @@ def run_pr(client, number):
                         return saved
                     changed = client.get_pr_files_at(pr, base_sha)
                     kind = None
-                    if docs_only(changed, pr.get("changed_files")):
+                    if docs_only(
+                        changed,
+                        pr.get("changed_files"),
+                        lambda paths: client.python_sources_at(pr, base_sha, paths),
+                    ):
                         kind = "docs_only"
-                        reason = "Only Markdown/RST documentation changed."
+                        reason = "Only documentation, comments, or docstrings changed."
                     elif experimental_only(changed, pr.get("changed_files")):
                         kind = "experimental_only"
                         reason = "Changes are confined to experimental paths and documentation."

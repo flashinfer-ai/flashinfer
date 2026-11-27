@@ -246,7 +246,7 @@ class EvidenceInventoryTests(unittest.TestCase):
         self.inference = fixture.inference
         self.selector = fixture.selector
 
-    def test_regular_file_outside_trimmed_inventory_can_be_read(self):
+    def test_regular_file_outside_trimmed_inventory_is_gate_only(self):
         path = "include/flashinfer/nested/private_kernel.cuh"
         self.github.get_repository_tree.return_value["tree"].append(
             {"path": path, "sha": "kernel", "mode": "100644", "type": "blob", "size": 7}
@@ -258,7 +258,25 @@ class EvidenceInventoryTests(unittest.TestCase):
             else original(repo, sha, limit)
         )
         self.inference.outputs[0]["read_paths"].append(path)
-        self.selector.select(fixtures.PR)
+        with self.assertRaises(scope.TargetSelectionError):
+            self.selector.select(fixtures.PR)
+        self.setUp()
+        self.github.get_repository_tree.return_value["tree"].append(
+            {"path": path, "sha": "kernel", "mode": "100644", "type": "blob", "size": 7}
+        )
+        self.github.get_repository_blob.side_effect = (
+            lambda repo, sha, limit: "// CUDA"
+            if sha == "kernel"
+            else original(repo, sha, limit)
+        )
+        self.inference.outputs[0]["read_paths"].append(path)
+        self.inference.outputs[1]["gpu_impact"] = {
+            "classification": "gpu_required",
+            "reason": "Kernel behavior changed",
+            "evidence_paths": [path],
+            "case_gap": "",
+        }
+        self.selector.select(fixtures.PR, include_gpu_impact=True)
         self.assertNotIn(path, self.inference.calls[0][0]["inventory_at_merged_tree"])
         self.assertIn(path, self.inference.calls[1][0]["source_files"])
 
