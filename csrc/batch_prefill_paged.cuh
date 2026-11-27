@@ -148,7 +148,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         // Preprocessor directives inside macro arguments are not portable to nvcc/MSVC.
         if constexpr (PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_RUNTIME) {
           DISPATCH_BOOL(kv_strides_are_identical, SAME_KV_STRIDES, [&] {
-            DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+            DISPATCH_FA2_CTA_TILE_Q(plan_info.cta_tile_q, HEAD_DIM_QK, HEAD_DIM_VO, CTA_TILE_Q, {
               status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
                   /*SAME_KV_STRIDES=*/SAME_KV_STRIDES, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
                   POS_ENCODING_MODE, /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE,
@@ -162,14 +162,14 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
               << "The equal-stride FA2 batch-prefill primary requires paged K/V cache data "
                  "tensors to have identical strides in every dimension; route unequal layouts "
                  "through the independent paged module.";
-          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+          DISPATCH_FA2_CTA_TILE_Q(plan_info.cta_tile_q, HEAD_DIM_QK, HEAD_DIM_VO, CTA_TILE_Q, {
             status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
                 /*SAME_KV_STRIDES=*/true, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
                 /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_TOKEN_HEAD_SF,
                 AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
           });
         } else if constexpr (PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_INDEPENDENT) {
-          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+          DISPATCH_FA2_CTA_TILE_Q(plan_info.cta_tile_q, HEAD_DIM_QK, HEAD_DIM_VO, CTA_TILE_Q, {
             status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
                 /*SAME_KV_STRIDES=*/false, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
                 /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_TOKEN_HEAD_SF,
