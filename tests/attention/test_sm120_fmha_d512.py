@@ -856,6 +856,7 @@ def test_sm120_d512_scale_upper_bound(bound):
 
     The softmax subtracts the row max after scaling in FP32; far above the bound (for example
     sm_scale=1e8) that rounding makes every weight underflow and the output silently zero.
+    The bound does not cover FP8 P saturation; see the large-logit xfail below.
     """
     max_scale = sm120_fmha_mod._max_scale_log2(512) / math.log2(math.e)
     sm_scale = max_scale * (1 - 1e-6 if bound == "at" else 1 + 1e-6)
@@ -880,6 +881,39 @@ def test_sm120_d512_scale_upper_bound(bound):
     torch.testing.assert_close(
         lse, torch.full_like(lse, 511 * sm_scale * math.log2(math.e)), atol=0, rtol=1e-5
     )
+
+
+@_requires_sm120
+@pytest.mark.parametrize("page_size", [None, 16])
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known limitation shared with the D<=256 SM120 FP8 kernels: the softmax "
+    "subtracts the unscaled row max after scaling in FP32, so for |max logit| * scale * "
+    "log2(e) far above 2^23 the rescaled maximum saturates FP8 P (here O = 0.219, not 1).",
+)
+def test_sm120_d512_large_logit_saturates_fp8_p(page_size):
+    """Document that a single key with every Q/K component 384 (logit 75,497,472) at
+    sm_scale=1 does not return V."""
+    h, d = 4, 512
+    q = torch.full((1, h, d), 384.0, device="cuda").to(torch.float8_e4m3fn)
+    v = torch.ones((1, h, d), device="cuda").to(torch.float8_e4m3fn)
+    o = torch.empty((1, h, d), dtype=torch.bfloat16, device="cuda")
+    cu = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    if page_size is None:
+        sm120_fmha_fp8_ragged_prefill(q, q, v, o, cu, cu, sm_scale=1.0)
+    else:
+        k_pool, v_pool, _, block_tables, *_ = _make_varlen_paged_kv([q], [v], page_size)
+        sm120_fmha_fp8_paged_prefill(
+            q,
+            k_pool,
+            v_pool,
+            o,
+            block_tables,
+            torch.tensor([1], dtype=torch.int32, device="cuda"),
+            cu,
+            sm_scale=1.0,
+        )
+    torch.testing.assert_close(o.float(), v.float(), atol=1e-2, rtol=1e-2)
 
 
 @_requires_sm120

@@ -61,11 +61,16 @@ def test_merge_states_full_buffer_past_uint32_boundary(seq_len, num_chunks, num_
 
 
 def test_merge_states_rejects_head_tiles_past_grid_y_limit():
-    """Verify more than 65,535 * 32 heads at D=512 (2.1 GiB of V) fail with a launch error."""
+    """Verify more than 65,535 * 32 heads at D=512 fail with a launch error.
+
+    V and the merged output take 2.1 GiB each.
+    """
     num_heads = 65_535 * 32 + 1
-    if torch.cuda.mem_get_info()[0] < (3 << 30):
-        pytest.skip("needs 3 GiB of free GPU memory")
+    if torch.cuda.mem_get_info()[0] < (5 << 30):
+        pytest.skip("needs 5 GiB of free GPU memory")
     v = torch.empty((1, 1, num_heads, 512), dtype=torch.bfloat16, device="cuda")
     s = torch.zeros((1, 1, num_heads), device="cuda")
-    with pytest.raises(RuntimeError, match="MergeStates kernel launch failed"):
+    with pytest.raises(
+        RuntimeError, match="MergeStates kernel launch failed: invalid argument"
+    ):
         flashinfer.merge_states(v, s)
