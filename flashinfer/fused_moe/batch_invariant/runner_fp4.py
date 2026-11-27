@@ -22,6 +22,7 @@ raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instea
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -199,13 +200,19 @@ class BatchInvariantFp4Runner(MoERunner):
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
 
+    @functools.cached_property
+    def _pair(self) -> Optional[Fp4Pair]:
+        """The configuration's pair, or ``None`` for an unserved pair (the layer's filter never constructs this case).
+        Read from ``config`` alone, so ``check_support`` needs no state set by ``__init__``; cached because ``pair`` is
+        read several times per forward call."""
+        return PAIRS.get(self.config.quant.pair)
+
     @property
     def pair(self) -> Fp4Pair:
         """The configured quantization pair."""
-        pair = PAIRS.get(self.config.quant.pair)
-        if pair is None:
+        if self._pair is None:
             raise unsupported_pair(self.config.quant)
-        return pair
+        return self._pair
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
@@ -228,7 +235,7 @@ class BatchInvariantFp4Runner(MoERunner):
             )
 
     def _check_support(self) -> None:
-        if self.config.quant.pair not in PAIRS:
+        if self._pair is None:
             raise unsupported_pair(self.config.quant)
         # the class's shard refusal first, then the layer's generic rules, then the pair's
         self._check_experts()
