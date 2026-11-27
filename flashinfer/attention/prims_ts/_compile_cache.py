@@ -72,6 +72,67 @@ def _kernel_source_files() -> tuple[str, ...]:
     return tuple(sorted(str(path) for path in root.rglob("*.py")))
 
 
+@functools.cache
+def _kernel_source_sha256(paths: tuple[str, ...], strict: bool) -> str:
+    # Loaded PrimTS sources are fixed for the lifetime of this process. Strict
+    # mode includes imported helpers, so it needs a separate digest.
+    from flashinfer.jit.cute_dsl_core import _hash_source_files
+
+    return _hash_source_files(paths)
+
+
+def _attention_kernel_identity(
+    kind: str, spec: object, options: str, extra: tuple
+) -> tuple[str, str] | None:
+    from flashinfer.jit.core import logger
+    from flashinfer.jit.cute_dsl_core import (
+        cute_dsl_cache_disabled,
+        cute_dsl_strict_cache_key,
+    )
+
+    if cute_dsl_cache_disabled():
+        return None
+    key = _compile_cache_key(spec, options, extra)
+    if key is None:
+        return None
+    import torch
+
+    # A family target such as sm100f can cover physical GPUs with different
+    # host-selected tuning defaults. The module metadata keys the target;
+    # the specialization must also distinguish the physical capability.
+    major, minor = torch.cuda.get_device_capability()
+    try:
+        source_hash = _kernel_source_sha256(
+            _kernel_source_files(), cute_dsl_strict_cache_key()
+        )
+    except (OSError, TypeError, SyntaxError, ValueError) as exc:
+        logger.warning(
+            f"Cannot hash PrimTS attention sources ({exc}); bypassing the disk cache."
+        )
+        return None
+    return f"{kind}_sm{major}{minor}_{key}", source_hash
+
+
+def is_attention_kernel_cached(
+    family: str,
+    kind: str,
+    spec: object,
+    options: str,
+    compile_fn: Callable[[], Any],
+    *,
+    extra: tuple = (),
+) -> bool:
+    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl
+
+    identity = _attention_kernel_identity(kind, spec, options, extra)
+    if identity is None:
+        return False
+    name, source_hash = identity
+    return JitSpecCuteDsl(
+        f"prims_ts_{family}", name, compile_fn, source_hash
+    ).is_compiled
+
+
 def build_and_load_attention_kernel(
     family: str,
     kind: str,
@@ -83,25 +144,17 @@ def build_and_load_attention_kernel(
 ) -> Any:
     """Build or load under the caller's selected CUDA device context."""
     from ...jit.cute_dsl_core import (
+        _compile_in_process,
         build_and_load_cute_dsl_kernel,
-        cute_dsl_cache_disabled,
     )
 
-    if cute_dsl_cache_disabled():
-        return compile_fn()
-
-    key = _compile_cache_key(spec, options, extra)
-    if key is None:
-        return compile_fn()
-    import torch
-
-    # A family target such as sm100f can cover physical GPUs with different
-    # host-selected tuning defaults. The module metadata keys the target;
-    # the specialization must also distinguish the physical capability.
-    major, minor = torch.cuda.get_device_capability()
+    identity = _attention_kernel_identity(kind, spec, options, extra)
+    if identity is None:
+        return _compile_in_process(compile_fn)
+    name, source_hash = identity
     return build_and_load_cute_dsl_kernel(
         f"prims_ts_{family}",
-        f"{kind}_sm{major}{minor}_{key}",
+        name,
         compile_fn,
-        extra_key_files=_kernel_source_files(),
+        source_sha256=source_hash,
     )

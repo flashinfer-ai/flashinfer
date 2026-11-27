@@ -810,6 +810,7 @@ Run the numerical, graph, scheduler/resource, and public-surface contracts:
 pytest -q \
   tests/attention/test_attention_ts_context.py \
   tests/attention/test_attention_ts_decode.py \
+  tests/attention/test_attention_ts_decode_mixed_precision.py \
   tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_features.py \

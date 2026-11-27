@@ -5724,8 +5724,13 @@ def test_kv256_explicit_ring_depth_beyond_smem_capacity_is_rejected() -> None:
     schedule is built, and that is where an explicit ``kv_stages`` past the
     capacity has to fail.
     """
+    from flashinfer.attention.prims_ts._hardware import is_sm107_compile_target
     from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
         _validate_kv256_static_config,
+    )
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+        BYTES_PER_KIB,
+        TOTAL_SMEM_BUDGET_KIB,
     )
     from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
         _build_decode_gen_schedule,
@@ -5752,8 +5757,15 @@ def test_kv256_explicit_ring_depth_beyond_smem_capacity_is_rejected() -> None:
         sparse_format="bitmask",
         sage=prims_ts.SageAttentionConfig(k_block_size=16),
     )
-    cfg = replace(block_sparse_config._make_block_sparse_config(key), kv_stages=6)
+    base = block_sparse_config._make_block_sparse_config(key)
+    # Deepest ring the static Q + K/V pipeline budget admits.
+    kv_stages = (
+        TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - base.q_stages * base.smem_q_tile_bytes
+    ) // base.smem_kv_tile_bytes
+    cfg = replace(base, kv_stages=kv_stages)
     _validate_kv256_static_config(cfg)
+    if is_sm107_compile_target():
+        pytest.skip("SM107's 327-KiB SMEM holds every statically legal KV256 ring")
     cfg.total_kv_tiles = 16
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)

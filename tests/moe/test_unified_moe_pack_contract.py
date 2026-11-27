@@ -31,8 +31,12 @@ from flashinfer.fused_moe.runners import (
     TrtllmFp4RoutedRunner,
 )
 
-# CakeStepFunRunner dispatches to its NVFP4 family, whose kernels read the scale.
+from flashinfer.fused_moe.batch_invariant.runner_fp4 import BatchInvariantFp4Runner
+
+# CakeStepFunRunner dispatches to its NVFP4 family, whose kernels read the scale; the batch-invariant fp4 backend's
+# NVFP4 runner reads it too.
 _PER_TOKEN_RUNNERS = {
+    BatchInvariantFp4Runner,
     CakeStepFunRunner,
     CuteDslRunner,
     PrimsTsRunner,

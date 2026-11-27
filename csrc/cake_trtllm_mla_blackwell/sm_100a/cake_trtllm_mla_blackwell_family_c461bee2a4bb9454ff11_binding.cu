@@ -19,6 +19,12 @@
 // built with the compile definitions below, for the sm_103a family of the same domain
 // ('cake_trtllm_mla_blackwell_family_5a587bd20f8138cb26c9'): one binding source per domain, compiled
 // once per family with that family's own tokens.
+// It links two builds of the split reducer that write the same O and LSE bits. The head build
+// (CAKE_VARIANT_NS_2) spreads each query row's 128 heads over up to 128 CTAs and stages every partial
+// row of a CTA once in shared memory by bulk copies; the binding launches it for at most
+// CAKE_FP8_HEAD_REDUCE_MAX_ROWS query rows split at least CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW
+// ways per row when that stage holds all of a CTA's partial rows, and the eight-head-slice build
+// (CAKE_VARIANT_NS_1) otherwise.
 // dispatch-policy-revision: unpinned
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -44,8 +50,28 @@
 #ifndef CAKE_VARIANT_NS_1
 #define CAKE_VARIANT_NS_1 variant_cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29_sm_100a_475cfbbf5b57
 #endif
+#ifndef CAKE_VARIANT_NS_2
+#define CAKE_VARIANT_NS_2 variant_cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835_sm_100a_475cfbbf5b57
+#endif
 #ifndef CAKE_PROGRAM_KERNEL_1
 #define CAKE_PROGRAM_KERNEL_1 kernel_cake_trtllm_mla_blackwell_9b61e7b02cfb810aec3e
+#endif
+// Most query rows the head reducer (CAKE_VARIANT_NS_2) serves; the default is B200's (sm_100a), a module sets its own.
+#ifndef CAKE_FP8_HEAD_REDUCE_MAX_ROWS
+#define CAKE_FP8_HEAD_REDUCE_MAX_ROWS 2
+#endif
+// Fewest splits the head reducer merges, per query row (num_split >= this x num_queries); below
+// it the slice build is faster.
+#ifndef CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW
+#define CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW 8
+#endif
+// Most head-reducer CTAs per query row (num_reduce_ctas): one head each at 128.
+#ifndef CAKE_FP8_HEAD_REDUCE_MAX_CTAS
+#define CAKE_FP8_HEAD_REDUCE_MAX_CTAS 128
+#endif
+// Partial rows a head-reducer CTA stages, ceil(128 / num_reduce_ctas) heads x num_split splits, at most.
+#ifndef CAKE_FP8_HEAD_REDUCE_MAX_ITEMS
+#define CAKE_FP8_HEAD_REDUCE_MAX_ITEMS 112
 #endif
 // Stringise the expansion of a macro argument: the dispatch (and launch) messages
 // name the family (and the kernel).
@@ -53,6 +79,7 @@
 #define CAKE_STR(x) CAKE_STR_(x)
 
 extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_stats, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int num_split, int num_reduce_ctas, int num_queries, float bmm2_scale);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_stats, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int num_split, int num_reduce_ctas, int num_queries, float bmm2_scale);
 extern "C" __global__ void CAKE_PROGRAM_KERNEL_1(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_stats, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ seq_lens_kv, int* __restrict__ work_batch_indices, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_split, int num_queries, int max_pages_per_seq, int q_len);
 
 namespace CAKE_PROGRAM_SHIM {
@@ -395,6 +422,90 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_
 }
 }  // namespace CAKE_VARIANT_NS_1
 
+namespace CAKE_VARIANT_NS_2 {
+
+void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_O, TensorView arg_LSE, int64_t arg_num_split, int64_t arg_num_reduce_ctas, int64_t arg_num_queries, double arg_bmm2_scale, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
+  DLDevice dev = arg_partial_O.device();
+  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
+  check_cuda_tensor(arg_partial_O, "partial_O");
+  check_dtype(arg_partial_O, DLDataType{kDLBfloat, 16, 1}, "partial_O");
+  check_contiguous(arg_partial_O, "partial_O");
+  check_cuda_tensor(arg_partial_stats, "partial_stats");
+  check_dtype(arg_partial_stats, DLDataType{kDLFloat, 32, 1}, "partial_stats");
+  check_contiguous(arg_partial_stats, "partial_stats");
+  check_cuda_tensor(arg_O, "O");
+  check_dtype(arg_O, DLDataType{kDLBfloat, 16, 1}, "O");
+  check_contiguous(arg_O, "O");
+  check_cuda_tensor(arg_LSE, "LSE");
+  check_dtype(arg_LSE, DLDataType{kDLFloat, 32, 1}, "LSE");
+  check_contiguous(arg_LSE, "LSE");
+  TVM_FFI_CHECK(arg_num_split >= -2147483648LL && arg_num_split <= 2147483647LL, ValueError)
+      << "scalar 'num_split' value " << arg_num_split
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_num_reduce_ctas >= -2147483648LL && arg_num_reduce_ctas <= 2147483647LL, ValueError)
+      << "scalar 'num_reduce_ctas' value " << arg_num_reduce_ctas
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_num_queries >= -2147483648LL && arg_num_queries <= 2147483647LL, ValueError)
+      << "scalar 'num_queries' value " << arg_num_queries
+      << " is outside i32 range [-2147483648, 2147483647]";
+  check_same_device(arg_partial_stats, arg_partial_O, "partial_stats", "partial_O");
+  check_same_device(arg_O, arg_partial_O, "O", "partial_O");
+  check_same_device(arg_LSE, arg_partial_O, "LSE", "partial_O");
+  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
+      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+      << ", " << grid_z << ")";
+  // A CTA stages each of its partial rows once: ceil(128 / num_reduce_ctas) heads x num_split
+  // splits, at most CAKE_FP8_HEAD_REDUCE_MAX_ITEMS rows.
+  TVM_FFI_CHECK(arg_num_split >= 1 && arg_num_reduce_ctas >= 1 &&
+                    arg_num_reduce_ctas <= CAKE_FP8_HEAD_REDUCE_MAX_CTAS &&
+                    ((128 + arg_num_reduce_ctas - 1) / arg_num_reduce_ctas) * arg_num_split <=
+                        CAKE_FP8_HEAD_REDUCE_MAX_ITEMS,
+                ValueError)
+      << "the head reducer stages at most " << CAKE_FP8_HEAD_REDUCE_MAX_ITEMS
+      << " partial rows per CTA with 1 to " << CAKE_FP8_HEAD_REDUCE_MAX_CTAS
+      << " CTAs per query row, got num_reduce_ctas=" << arg_num_reduce_ctas
+      << ", num_split=" << arg_num_split;
+
+
+  __nv_bfloat16* p_partial_O = static_cast<__nv_bfloat16*>(arg_partial_O.data_ptr());
+  float* p_partial_stats = static_cast<float*>(arg_partial_stats.data_ptr());
+  __nv_bfloat16* p_O = static_cast<__nv_bfloat16*>(arg_O.data_ptr());
+  float* p_LSE = static_cast<float*>(arg_LSE.data_ptr());
+  int32_t v_num_split = (int32_t)arg_num_split;
+  int32_t v_num_reduce_ctas = (int32_t)arg_num_reduce_ctas;
+  int32_t v_num_queries = (int32_t)arg_num_queries;
+  float v_bmm2_scale = (float)arg_bmm2_scale;
+  void* kargs[] = {&p_partial_O, &p_partial_stats, &p_O, &p_LSE, &v_num_split, &v_num_reduce_ctas, &v_num_queries, &v_bmm2_scale};
+
+  // Barriers, the per-head statistics and a stage of 14 slots of eight 1 KiB partial rows: one
+  // resident CTA per SM.
+  static const bool smem_ready = CakeSetMaxDynamicSmem(
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835), 118784);
+  (void)smem_ready;
+  dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
+  dim3 block(128u, 1u, 1u);
+
+  // Extended direct-source launch for a linked CUDA kernel symbol.
+  cudaLaunchAttribute attrs[1]{};
+  int n = 0;
+  attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[n].val.programmaticStreamSerializationAllowed = 1;
+  ++n;
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 118784u;
+  config.stream = stream;
+  config.attrs = attrs;
+  config.numAttrs = n;
+  cudaError_t launch_status = cudaLaunchKernelExC(
+      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835), kargs);
+  TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
+      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835 failed: "
+      << cudaGetErrorString(launch_status);
+}
+}  // namespace CAKE_VARIANT_NS_2
+
 void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::ffi::TensorView arg_output, tvm::ffi::TensorView arg_lse, tvm::ffi::TensorView arg_seq_lens, tvm::ffi::TensorView arg_page_table, tvm::ffi::TensorView arg_ws_partial_output, tvm::ffi::TensorView arg_ws_partial_stats, float softmax_scale_log2, float bmm2_scale, int32_t num_split, int32_t num_queries, int32_t max_pages_per_seq, int32_t num_reduce_ctas, int32_t q_len, int64_t cuda_stream_ptr) {
   check_cuda_tensor(arg_query, "query");
   check_cuda_tensor(arg_kv, "kv");
@@ -427,10 +538,23 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
   // One split: the producer writes the normalized output and the LSE itself,
   // so the reducer is not launched.
   if (num_split > 1) {
-    int64_t gx = num_reduce_ctas;
-    int64_t gy = 2;
-    int64_t gz = num_queries;
-    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_1::Run(arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, num_split, num_reduce_ctas, num_queries, bmm2_scale, gx, gy, gz, stream);
+    // Both reducer builds write the same O and LSE bits; num_reduce_ctas is the head build's CTA count
+    // per query row (grid (num_reduce_ctas, num_queries)) or the other build's per eight-head slice
+    // group (grid (num_reduce_ctas, 2, num_queries)).
+    if (num_queries <= CAKE_FP8_HEAD_REDUCE_MAX_ROWS &&
+        num_split >= (int64_t)CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * num_queries &&
+        num_reduce_ctas >= 1 && num_reduce_ctas <= CAKE_FP8_HEAD_REDUCE_MAX_CTAS &&
+        ((128 + (int64_t)num_reduce_ctas - 1) / num_reduce_ctas) * num_split <= CAKE_FP8_HEAD_REDUCE_MAX_ITEMS) {
+      int64_t gx = num_reduce_ctas;
+      int64_t gy = num_queries;
+      int64_t gz = 1;
+      CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_2::Run(arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, num_split, num_reduce_ctas, num_queries, bmm2_scale, gx, gy, gz, stream);
+    } else {
+      int64_t gx = num_reduce_ctas;
+      int64_t gy = 2;
+      int64_t gz = num_queries;
+      CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_1::Run(arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, num_split, num_reduce_ctas, num_queries, bmm2_scale, gx, gy, gz, stream);
+    }
   }
 }
 

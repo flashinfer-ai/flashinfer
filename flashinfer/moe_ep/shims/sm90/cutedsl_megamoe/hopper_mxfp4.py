@@ -247,11 +247,12 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
         }
         base_kwargs["fp8_scale_mode"] = "blockwise"
         tile_m, tile_n, tile_k = self.mma_tiler_mnk
-        # Packed FP4 adds swap-AB token tiles N72/N80: one task holds an
-        # expert's 65-80 rows where N64 needs a second, nearly empty tile.
-        # FP8 keeps its own widths; the proxy only checks the whitelist on N.
-        if tile_n in (72, 80):
-            base_kwargs["mma_tiler_mnk"] = (tile_m, 64, tile_k)
+        # The packed FP4 constraints below check the actual N and K geometry.
+        base_kwargs["mma_tiler_mnk"] = (
+            tile_m,
+            64 if tile_n in (72, 80) else tile_n,
+            128,
+        )
         MegaMoEHopperFp8Config(**base_kwargs)
         from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.mxfp4_optimization import (
             _normalize_pull_fields,

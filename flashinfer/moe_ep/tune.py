@@ -8,8 +8,10 @@ wired for SM107.
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
     torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
-        --dtype nvfp4 --implementation next --hidden 7168 --intermediate 2048 \
+        --arch sm100 --dtype nvfp4 --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
+
+Use ``--implementation legacy`` to tune the retained SM100 NVFP4 kernel.
 
 Hopper Humming MXFP4 fused (the scale ABI is selected automatically)::
 
@@ -98,9 +100,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--implementation",
-        choices=("default", "next"),
+        choices=("default", "legacy", "next"),
         default="default",
-        help="SM100 standard kernel implementation; next uses managed autotune v2",
+        help="SM100 NVFP4 Standard uses the serving kernel by default. "
+        "Select legacy for the retained NVFP4 kernel. "
+        "The next option remains an alias for default on SM100 block-scaled kernels.",
     )
     parser.add_argument(
         "--shared-expert",
@@ -149,7 +153,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--activation",
         choices=("swiglu", "situ"),
         default="swiglu",
-        help="SM107 activation; SiTU requires both beta arguments",
+        help="SM100 Standard or SM107 activation. SiTU requires --situ-beta "
+        "and also --situ-linear-beta on SM107.",
     )
     parser.add_argument("--situ-beta", type=float)
     parser.add_argument("--situ-linear-beta", type=float)
@@ -346,7 +351,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dtype == "sm120_mxfp4_mxfp8":
         if args.implementation != "default":
-            print("--implementation next requires SM100", file=sys.stderr)
+            print(
+                f"--implementation {args.implementation} requires SM100",
+                file=sys.stderr,
+            )
             return 2
         if args.arch != "auto":
             print("sm120_mxfp4_mxfp8 requires --arch auto", file=sys.stderr)
@@ -403,19 +411,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("--kernel-variant auto requires SM107", file=sys.stderr)
         return 2
 
-    requested_next = args.implementation == "next"
-    if requested_next and (
-        family != "sm100"
-        or args.dtype not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
-    ):
+    sm100_block_scaled = family == "sm100" and args.dtype in (
+        "nvfp4",
+        "mxfp8_e4m3",
+        "mxfp8_e5m2",
+        "mxfp4_mxfp8",
+    )
+    if args.implementation == "next" and not sm100_block_scaled:
         print(
             "--implementation next requires SM100 block-scaled inference",
             file=sys.stderr,
         )
         return 2
-    next_standard = requested_next or (
-        family == "sm100" and args.dtype in ("mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
-    )
+    if args.implementation == "legacy" and not (
+        family == "sm100"
+        and args.dtype == "nvfp4"
+        and args.kernel_variant == "inference"
+    ):
+        print(
+            "--implementation legacy requires SM100 NVFP4 with --kernel-variant inference",
+            file=sys.stderr,
+        )
+        return 2
+    use_sm100_native = sm100_block_scaled and args.implementation != "legacy"
 
     if not args.do_finalize or (
         not args.apply_routing_weights_before_fc2
@@ -424,11 +442,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         if family != "sm100" or not (
             args.dtype == "nvfp4"
-            or (next_standard and args.kernel_variant == "inference")
+            or (use_sm100_native and args.kernel_variant == "inference")
         ):
             print(
                 "caller finalization and routing-weight placement require SM100 "
-                "NVFP4 or the next standard implementation",
+                "NVFP4 or the standard block-scaled implementation",
                 file=sys.stderr,
             )
             return 2
@@ -446,7 +464,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         family != "sm107"
         and args.combine_dtype != "bf16"
         and args.dtype != "nvfp4"
-        and not next_standard
+        and not use_sm100_native
     ):
         print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)
         return 2
@@ -460,11 +478,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if (
         args.kernel_variant == "genphase"
         and family != "sm107"
-        and not (
-            family == "sm100"
-            and args.dtype in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
-            and not args.allow_nondeterministic
-        )
+        and not (sm100_block_scaled and not args.allow_nondeterministic)
     ):
         print(
             "GenPhase requires SM107 or SM100 block-scaled quantization with deterministic reduction",
@@ -483,7 +497,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if (
         family != "sm107"
-        and not (next_standard and args.kernel_variant == "inference")
+        and not (use_sm100_native and args.kernel_variant == "inference")
         and not (
             family == "sm100"
             and args.kernel_variant == "genphase"
@@ -493,7 +507,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         and (activation_requested or scaling_requested)
     ):
         print(
-            "activation and normalization options require SM107 or the next "
+            "activation and normalization options require SM107 or the "
             "standard SM100 implementation",
             file=sys.stderr,
         )
@@ -505,8 +519,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     tuner = importlib.import_module(
         (
             ".backends.mega.kernel.sm100.next_tuning"
-            if next_standard
-            or (family == "sm100" and args.kernel_variant == "genphase")
+            if use_sm100_native
             else f".backends.mega.kernel.{family}.{backend}.tuner"
         ),
         __package__,
