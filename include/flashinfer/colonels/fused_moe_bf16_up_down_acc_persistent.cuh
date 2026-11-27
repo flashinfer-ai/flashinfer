@@ -513,6 +513,12 @@ __launch_bounds__(WN * 32 + PRODUCER_THREADS, 1) void fused_moe_bf16_wgmma_up_do
         token_scale[t] = topk_w.x * scaling_factor;
         token_scale[t + 1] = topk_w.y * scaling_factor;
       }
+      if constexpr (sizeof(s_d.x) >= sizeof(s.x) && !OVERLAPPED) {
+        // Let UP overlap the previous reduction, then drain its reads before reusing out.
+        if (local_block > block_start) {
+          asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+        }
+      }
       consumer_sync();
 
       constexpr int TND = BN2 / 64;
