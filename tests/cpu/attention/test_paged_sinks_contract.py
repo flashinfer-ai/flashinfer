@@ -85,5 +85,29 @@ def test_trtllm_paged_adapter_forwards_sinks(monkeypatch):
     assert calls[0][1]["sinks"] is sinks
 
 
+def test_has_sinks_is_refused_outside_the_batch_invariant_plan():
+    from flashinfer.utils import check_has_sinks_undeclared
+
+    check_has_sinks_undeclared(None)
+    for declared in (True, False):
+        with pytest.raises(
+            ValueError, match=f"has_sinks={declared}.*backends that support them"
+        ):
+            check_has_sinks_undeclared(declared)
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        fp.BatchPrefillWithPagedKVCacheWrapper.plan,
+        fp.BatchPrefillWithRaggedKVCacheWrapper.plan,
+    ],
+)
+def test_has_sinks_is_a_trailing_keyword_of_prefill_plan(plan):
+    last = list(inspect.signature(plan).parameters.values())[-1]
+    assert last.name == "has_sinks" and last.default is None
+    assert last.kind is inspect.Parameter.KEYWORD_ONLY
+
+
 def test_no_cuda_initialization():
     assert not torch.cuda.is_initialized()

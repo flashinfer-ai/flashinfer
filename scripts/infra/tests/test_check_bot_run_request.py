@@ -260,6 +260,20 @@ class ImpactTests(unittest.TestCase):
             " ".join(result.gpu_impact["evidence_warnings"]),
         )
 
+    def test_gate_can_classify_when_dispatcher_is_unavailable(self):
+        from ai_test_scope import TargetSelectionError
+
+        read_ci = self.fixture.selector.read_ci_file
+        path = ".github/workflows/pr-test-dispatch.yml"
+        self.fixture.selector.read_ci_file = lambda name: (
+            "" if name == path else read_ci(name)
+        )
+        with self.assertRaises(TargetSelectionError):
+            self.fixture.selector.select(fixtures.PR)
+        result = self.select(analysis())
+        self.assertEqual("gpu_required", result.gpu_impact["classification"])
+        self.assertIn(path, " ".join(result.gpu_impact["evidence_warnings"]))
+
     def test_gate_can_classify_when_supplemental_blob_cannot_be_read(self):
         f = self.fixture
         path = "scripts/another_runner.sh"

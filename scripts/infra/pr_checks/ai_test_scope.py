@@ -541,10 +541,8 @@ class PytestTargetSelector:
             warnings.append(message)
 
         ci_files = {}
-        for path in (
-            ".github/workflows/pr-test.yml",
-            "scripts/infra/pr_checks/targeted_lane_scope.py",
-        ):
+
+        def read_routing(path):
             try:
                 text = self.read_ci_file(path)
             except OSError:
@@ -553,8 +551,16 @@ class PytestTargetSelector:
                 text = None
             if not text:
                 optional_error("CI routing evidence is unavailable", path)
-                continue
-            ci_files[path] = text
+            else:
+                ci_files[path] = text
+
+        pr_test = ".github/workflows/pr-test.yml"
+        read_routing(pr_test)
+        read_routing("scripts/infra/pr_checks/targeted_lane_scope.py")
+        # Historical replay reads routing at its selected CI revision. Older
+        # monolithic workflows need no dispatcher.
+        if "# CI_BOT_PR_TEST_DISPATCH_V1:" in ci_files.get(pr_test, ""):
+            read_routing(".github/workflows/pr-test-dispatch.yml")
         candidates = [path for path in inventory if _TEST_FILE.fullmatch(path)]
         candidate_set = set(candidates)
         try:

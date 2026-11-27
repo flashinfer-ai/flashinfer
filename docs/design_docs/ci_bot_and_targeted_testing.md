@@ -29,6 +29,70 @@ Both now take a scope, and the policy is that **a scoped run is the default**:
 The full matrix is the exception — a final pre-merge check of a cross-cutting change — because
 an unscoped run is the most expensive thing a PR comment can do.
 
+## Runner workflow identity
+
+`pr-test-dispatch.yml` owns PR, scheduled and manual triggers, authorization,
+scope selection, and result reporting. Its authorized test job calls
+`flashinfer-ai/flashinfer/.github/workflows/pr-test.yml@main`. The existing
+runner-group entry remains unchanged:
+
+```text
+flashinfer-ai/flashinfer/.github/workflows/pr-test.yml@refs/heads/main
+```
+
+`pr-test.yml` exposes only `workflow_call` and directly defines the self-hosted
+test matrix and provider-spec lint. The job definitions come from `main`; the
+checkout SHA, optional merge snapshot, Docker tag, and matrices come from the
+caller's setup job. The test matrix retains PR fail-fast and scheduled-run
+coverage. The caller passes only the two sccache secrets; the reusable jobs
+retain their existing token permissions. The reusable workflow independently
+authorizes the GitHub-supplied triggering event on a GitHub-hosted runner before
+either self-hosted job can start. It accepts only `run-ci`/`run-ci-focused` label events on PRs targeting this
+repository's `main`, or scheduled/manual events on this repository's `main`.
+Caller inputs cannot grant admission. For `run-ci-focused`, the trusted check
+requires both snapshot fields, binds checkout to the event's PR head, reads the
+published commit statuses independently, and verifies the base, tree, and scope
+digest. Runner jobs consume its verified outputs. Ordinary `run-ci` and main
+scheduled/manual runs retain their no-snapshot path. This check is necessary
+because the PR-editable dispatcher cannot enforce the runner boundary.
+
+Runner cleanup removes only Docker containers with a mount source exactly
+matching the current checkout. It applies the same ownership check on every
+host because callers can change both the lane kind and requested runner labels;
+cleanup must not stop neighboring jobs on shared GPU hosts.
+
+Keep the remote `@main` reference: a local `./.github/workflows/pr-test.yml`
+reference resolves to the caller's commit and would lose the allowed workflow
+identity on pull requests. Deployment requires the reusable `workflow_call`
+interface to exist on `main` before the new dispatcher is enabled. The repository
+requires `Test Results Summary`, so this PR cannot validate its pinned call
+against the old `main`. Land a compatible interface first while preserving the
+existing entry workflow, then deploy the dispatcher, or obtain an authorized
+merge exception for the cutover. Do not weaken the runner allowlist or branch
+protection to make the call validate. No runner allowlist change is needed.
+Manual dispatches and workflow-specific API queries now use `pr-test-dispatch.yml`; the workflow name
+and required `Test Results Summary` job name remain unchanged. API consumers of
+individual lane names must account for the reusable call's `Self-hosted checks / `
+prefix. GPU execution and runner admission must be verified after deployment.
+
+PR result lookups consult both dispatcher and legacy workflow history for the
+same head SHA, but reuse requires an artifact recording the same head, base,
+and merge tree as the event merge, with the base still at the target branch tip.
+The trusted authorization job records this source for each run attempt, for both
+full and focused runs. Partial reruns inherit the latest successful authorization
+record from the same run when that dependency is not rerun. Legacy runs without
+that record, expired records (14 days), and stale event merges require a fresh
+CI request. Active runs without a record
+are followed until authorization publishes one or the run finishes. Only older
+runs are followed, preventing summary jobs from waiting on each other. History
+refreshes every five minutes, caches source records per attempt, and backs off
+on API errors; an unreadable history remains unknown and cannot fail the check
+on its own (the GitHub job timeout still applies). Offline scope replay recognizes
+the split routing marker and requires dispatcher evidence only for revisions using the split layout.
+Avoid rerunning legacy scheduled runs after cutover: their original issue-report
+code cannot see the new workflow history and may reopen the shared tracking
+issue. If a legacy scheduled run is rerun, verify the tracking issue afterward.
+
 ## The command vocabulary
 
 The bot answers a comment in one of four ways, and this vocabulary is load-bearing —
@@ -192,7 +256,7 @@ existing `run-ci-focused` label, whose event requires snapshot metadata. Explici
 paths and `run all` clear that marker and use `run-ci`. Status reads, writes and
 clears must succeed before labeling. Head and current target tip are rechecked.
 
-`pr-test.yml` verifies the scope fingerprint (including an empty full-suite scope),
+`pr-test-dispatch.yml` verifies the scope fingerprint (including an empty full-suite scope),
 reconstructs the pinned base/head merge, and checks its tree before scheduling.
 GPU jobs reconstruct the same source before initializing submodules. A stale
 GitHub merge ref is not authoritative. Missing metadata, changed scope, conflicts
