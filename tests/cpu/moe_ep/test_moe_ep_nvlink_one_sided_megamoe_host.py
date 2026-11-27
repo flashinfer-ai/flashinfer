@@ -49,8 +49,8 @@ FENCE = {"sync_protocol": "fence"}
 SENTINEL_ENGINE = {"dispatch_protocol": "sentinel", "combine_protocol": "sentinel"}
 FENCE_ENGINE = {"dispatch_protocol": "pull", "combine_protocol": "counter"}
 POOL = {"fc1_token_pool": True}
-JIT = {"just_in_time_claims": True}
-NO_JIT = {"just_in_time_claims": False}
+LAZY = {"lazy_claims": True}
+EAGER = {"lazy_claims": False}
 NO_HEAD = {"shared_expert_entry": False}
 DIE_LOCAL = {"die_local_weights": True}
 IN_KERNEL = {"reduce_topk_in_kernel": True}
@@ -182,10 +182,10 @@ def test_config_validation(fields, message):
         (1024, {"token_tile_choice": "alternate"}, {}, "token_tile_choice must be"),
         (256, {"entry_prefetch_bytes": -1}, {}, "entry_prefetch_bytes must be"),
         (1024, {"work_id_mode": "grid_stride"}, DIE_LOCAL, "die_local_weights req"),
-        # Just-in-time claims and their lead.
-        (128, {"just_in_time_claims": 1}, {}, "Python bool"),
-        (128, {**JIT, "claim_lead_k_tiles": 0}, {}, "positive Python integer"),
-        (128, {**NO_JIT, "claim_lead_k_tiles": 8}, {}, "only to just-in-time claims"),
+        # Lazy claims and their lead.
+        (128, {"lazy_claims": 1}, {}, "Python bool"),
+        (128, {**LAZY, "claim_lead_k_tiles": 0}, {}, "positive Python integer"),
+        (128, {**EAGER, "claim_lead_k_tiles": 8}, {}, "only to lazy claims"),
         # Combine-slot knobs belong to the Fence combine's slots.
         (256, {"discard_combine_slots": True}, SENTINEL, "protocol='counter'"),
         (256, {"combine_warp_stores": True}, SENTINEL, "protocol='counter'"),
@@ -290,18 +290,18 @@ def test_sync_protocol(dist_not_initialized, capacity, world):
     "sentinel" runs the Sentinel dispatch and combine and "fence" the pull
     dispatch and the Fence (counter) combine at every capacity; "auto" resolves
     to the one of them the dispatch rule picks, field for field. The pull
-    dispatch's pipelined groups and just-in-time claims, and the in-kernel
+    dispatch's pipelined groups and lazy claims, and the in-kernel
     top-k reduce, follow the protocol, not the capacity alone.
     """
     from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend import (
         dispatch_protocol,
     )
     from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
-        JUST_IN_TIME_CLAIMS_MAX_TOKENS,
+        LAZY_CLAIMS_MAX_TOKENS,
     )
     from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
         PIPELINED_GROUPS_MIN_TOKENS,
-        PULL_JUST_IN_TIME_MIN_TOKENS,
+        PULL_LAZY_CLAIMS_MIN_TOKENS,
         SINGLE_GROUP_MAX_TOKENS,
     )
 
@@ -323,8 +323,8 @@ def test_sync_protocol(dist_not_initialized, capacity, world):
         assert getattr(sentinel, name) == getattr(fence, name)
     # Up to SINGLE_GROUP_MAX_TOKENS one schedule group holds every FC1 tile;
     # above it groups of 256 FC1 tiles, which the pull dispatch halves once they
-    # are pipelined. Just-in-time claims: the pull dispatch's from
-    # PULL_JUST_IN_TIME_MIN_TOKENS, the Sentinel dispatch's at the smallest
+    # are pipelined. Lazy claims: the pull dispatch's from
+    # PULL_LAZY_CLAIMS_MIN_TOKENS, the Sentinel dispatch's at the smallest
     # capacities.
     single = capacity <= SINGLE_GROUP_MAX_TOKENS
     pipelined = capacity >= PIPELINED_GROUPS_MIN_TOKENS
@@ -334,12 +334,8 @@ def test_sync_protocol(dist_not_initialized, capacity, world):
         "grouped",
         4096 if single else 128 if pipelined else 256,
     )
-    assert fence.resolved_just_in_time_claims == (
-        capacity >= PULL_JUST_IN_TIME_MIN_TOKENS
-    )
-    assert sentinel.resolved_just_in_time_claims == (
-        capacity <= JUST_IN_TIME_CLAIMS_MAX_TOKENS
-    )
+    assert fence.resolved_lazy_claims == (capacity >= PULL_LAZY_CLAIMS_MIN_TOKENS)
+    assert sentinel.resolved_lazy_claims == (capacity <= LAZY_CLAIMS_MAX_TOKENS)
     # The in-kernel top-k reduce takes effect under the Fence combine only.
     for protocol, config in configs.items():
         inplace = _engine_config(capacity, world, sync_protocol=protocol, **IN_KERNEL)

@@ -47,7 +47,7 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     ``max_tokens_per_rank``, the EP size and the routing shape (experts and
     ``top_k``), because the plan, the landing layout and the compiled kernels
     depend on it: every batch of the layer runs it, whatever its token count.
-    The schedule (group size, just-in-time claims) follows the protocol chosen.
+    The schedule (group size, lazy claims) follows the protocol chosen.
     It must be the same on every EP rank, as the whole engine configuration
     must.
     The Sentinel dispatch stages a rank's whole top-k plane in one CTA's shared

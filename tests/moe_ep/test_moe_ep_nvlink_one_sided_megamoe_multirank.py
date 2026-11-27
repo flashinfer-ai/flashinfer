@@ -27,7 +27,7 @@ local experts in two numerics:
 
 Each case resolves to a different engine configuration: capacity 128 per rank
 runs the Sentinel (data-as-flag) dispatch and combine, capacity 16 the same with
-just-in-time work claims, capacity 256 the pull dispatch with the counter
+lazy work claims, capacity 256 the pull dispatch with the counter
 (Fence) combine at EP2 and EP4 and the Sentinel protocols at EP8, and, under
 ``sync_protocol="fence"``, the pull dispatch at every EP size; capacity 288 runs
 the pull dispatch by default at every EP size on N64 token tiles, whose FC1
@@ -151,10 +151,10 @@ EXACT_TOLERANCE = 6e-2
 # separate reduce's.
 IN_KERNEL_REDUCE_VS_SEPARATE_TOLERANCE = 1e-2
 SENTINEL_CAPACITY = 128
-# The largest capacity at which the Sentinel dispatch compiles just-in-time work
-# claims by default (``JUST_IN_TIME_CLAIMS_MAX_TOKENS``, an even capacity, so
+# The largest capacity at which the Sentinel dispatch compiles lazy work
+# claims by default (``LAZY_CLAIMS_MAX_TOKENS``, an even capacity, so
 # padding for top-6 leaves it unchanged).
-JUST_IN_TIME_CAPACITY = 16
+LAZY_CLAIMS_CAPACITY = 16
 # The pull dispatch by default at EP2 and EP4; the Sentinel dispatch at EP8, where
 # a reached rank takes at most 1.5 routes per token.
 CAPACITY_256 = 256
@@ -806,7 +806,7 @@ EP_SIZES = (2, 4, 8)
 # The engine path every case resolves to at EP2, EP4 and EP8 (None where the
 # case skips), keyed by test and case id, as ``_path`` spells it: dispatch/combine
 # protocols, token tile N (and its N128 alternate), schedule policy and hint
-# (with pipelined groups), then just-in-time work claims, the pull dispatch's
+# (with pipelined groups), then lazy work claims, the pull dispatch's
 # fetchers (walking CTAs or main-kernel pull warps), its per-expert FC1 gate and
 # FC1's token pool where they apply.
 
@@ -817,7 +817,7 @@ def _same(path: str) -> tuple[str, str, str]:
 
 # Up to 256 tokens per rank one schedule group holds every FC1 tile.
 SENTINEL_PATH = _same("sentinel/sentinel N64 grouped4096")
-JIT_PATH = _same("sentinel/sentinel N64 grouped4096 jit")
+LAZY_PATH = _same("sentinel/sentinel N64 grouped4096 lazy")
 # The pull dispatch on N64 token tiles gates FC1 per expert (up to 256 tokens
 # per rank, one schedule group).
 PULL_256_PATH = _same("pull/counter N64 grouped4096 walkers expertgate")
@@ -831,19 +831,19 @@ N240_PATH = (
     "sentinel/sentinel N240|N128 grouped4096",
 )
 # The Sentinel protocols forced above 256 tokens per rank: groups of 256 FC1
-# tiles, pipelined from 1024 tokens per rank, without just-in-time claims.
+# tiles, pipelined from 1024 tokens per rank, without lazy claims.
 SENTINEL_512_PATH = (
     "sentinel/sentinel N64 grouped256",
     "sentinel/sentinel N64 grouped256",
     "sentinel/sentinel N128 grouped256",
 )
 # 1024 tokens per rank: the pull dispatch with pipelined groups of 128 FC1 tiles
-# and just-in-time claims, on a token tile that grows with the EP size (N240 and
+# and lazy claims, on a token tile that grows with the EP size (N240 and
 # its N128 alternate at EP8).
 PULL_PATH = (
-    "pull/counter N64 grouped128+pipelined jit walkers expertgate",
-    "pull/counter N128 grouped128+pipelined jit walkers",
-    "pull/counter N240|N128 grouped128+pipelined jit walkers",
+    "pull/counter N64 grouped128+pipelined lazy walkers expertgate",
+    "pull/counter N128 grouped128+pipelined lazy walkers",
+    "pull/counter N240|N128 grouped128+pipelined lazy walkers",
 )
 GROUPED_PATH = PULL_PATH
 SENTINEL_1024_PATH = (
@@ -854,31 +854,31 @@ SENTINEL_1024_PATH = (
 # Main-kernel pull warps, and walking CTAs pinned to the per-expert gate, gate
 # FC1 per expert on every token tile.
 PULL_WARPS_PATH = (
-    "pull/counter N64 grouped128+pipelined jit pull_warps4 expertgate",
-    "pull/counter N128 grouped128+pipelined jit pull_warps4 expertgate",
-    "pull/counter N240|N128 grouped128+pipelined jit pull_warps4 expertgate",
+    "pull/counter N64 grouped128+pipelined lazy pull_warps4 expertgate",
+    "pull/counter N128 grouped128+pipelined lazy pull_warps4 expertgate",
+    "pull/counter N240|N128 grouped128+pipelined lazy pull_warps4 expertgate",
 )
 PULL_EXPERT_GATE_PATH = (
-    "pull/counter N64 grouped128+pipelined jit walkers expertgate",
-    "pull/counter N128 grouped128+pipelined jit walkers expertgate",
-    "pull/counter N240|N128 grouped128+pipelined jit walkers expertgate",
+    "pull/counter N64 grouped128+pipelined lazy walkers expertgate",
+    "pull/counter N128 grouped128+pipelined lazy walkers expertgate",
+    "pull/counter N240|N128 grouped128+pipelined lazy walkers expertgate",
 )
 PULL_POOL_PATH = tuple(f"{path} pool" for path in PULL_PATH)
-PULL_N240_PATH = _same("pull/counter N240|N128 grouped128+pipelined jit walkers")
+PULL_N240_PATH = _same("pull/counter N240|N128 grouped128+pipelined lazy walkers")
 PULL_POOL_N240_PATH = tuple(f"{path} pool" for path in PULL_N240_PATH)
 # Kimi-K3 runs at EP8 only. Its top-16 reaches a rank with about 2.26 routes:
 # the Sentinel protocols up to 192 tokens per rank, then the pull dispatch on
 # token tiles that grow with the load, from 256 expected routes per local expert
 # into the token pool.
 KIMI_K3_PATHS = {
-    1: (None, None, "sentinel/sentinel N64 grouped4096 jit"),
-    16: (None, None, "sentinel/sentinel N64 grouped4096 jit"),
+    1: (None, None, "sentinel/sentinel N64 grouped4096 lazy"),
+    16: (None, None, "sentinel/sentinel N64 grouped4096 lazy"),
     256: (None, None, "pull/counter N64 grouped4096 walkers expertgate"),
-    1024: (None, None, "pull/counter N192|N128 grouped128+pipelined jit walkers"),
+    1024: (None, None, "pull/counter N192|N128 grouped128+pipelined lazy walkers"),
     4096: (
         None,
         None,
-        "pull/counter N240|N128 grouped128+pipelined jit walkers pool",
+        "pull/counter N240|N128 grouped128+pipelined lazy walkers pool",
     ),
 }
 KIMI_K3_ROUTINGS = ("perfect", "random")
@@ -899,14 +899,14 @@ SITU_CASES = {
 SITU_PATHS = {
     "v41_t128": SENTINEL_PATH,
     "v41_t1024_pull": (
-        "pull/counter N64 grouped128+pipelined jit walkers expertgate",
-        "pull/counter N128 grouped128+pipelined jit walkers",
-        "pull/counter N192|N128 grouped128+pipelined jit walkers",
+        "pull/counter N64 grouped128+pipelined lazy walkers expertgate",
+        "pull/counter N128 grouped128+pipelined lazy walkers",
+        "pull/counter N192|N128 grouped128+pipelined lazy walkers",
     ),
     "v41_t4096": (
-        "pull/counter N192|N128 grouped128+pipelined jit walkers",
-        "pull/counter N192|N128 grouped128+pipelined jit walkers pool",
-        "pull/counter N192|N128 grouped128+pipelined jit walkers pool",
+        "pull/counter N192|N128 grouped128+pipelined lazy walkers",
+        "pull/counter N192|N128 grouped128+pipelined lazy walkers pool",
+        "pull/counter N192|N128 grouped128+pipelined lazy walkers pool",
     ),
     "k3_t16": KIMI_K3_PATHS[16],
     "k3_t1024_pull": KIMI_K3_PATHS[1024],
@@ -916,7 +916,7 @@ SITU_PATHS = {
 PATHS: dict[str, dict[str, tuple[Optional[str], ...]]] = {
     "test_layer_vs_oracle": {
         "sentinel_protocols": SENTINEL_PATH,
-        "just_in_time_claims": JIT_PATH,
+        "lazy_claims": LAZY_PATH,
         "capacity_256": CAPACITY_256_PATH,
         "pull_256": PULL_256_PATH,
         "pull_n64": PULL_N64_PATH,
@@ -946,7 +946,7 @@ PATHS: dict[str, dict[str, tuple[Optional[str], ...]]] = {
     },
     "test_layer_on_ep_subgroup": {"": (SENTINEL_PATH[0], None, None)},
     "test_shared_expert": {
-        "just_in_time_claims": JIT_PATH,
+        "lazy_claims": LAZY_PATH,
         "sentinel_protocols": SENTINEL_PATH,
         "sentinel_bf16_rounding": SENTINEL_PATH,
         "capacity_256": CAPACITY_256_PATH,
@@ -990,8 +990,8 @@ def _path(config) -> str:
         + (f"|N{alternate}" if alternate else ""),
         f"{mode}{hint}" + ("+pipelined" if config.pipelined_groups else ""),
     ]
-    if config.resolved_just_in_time_claims:
-        parts.append("jit")
+    if config.resolved_lazy_claims:
+        parts.append("lazy")
     if config.dispatch_protocol == "pull":
         parts.append(
             f"pull_warps{config.pull_warps}" if config.pull_warps else "walkers"
@@ -1177,7 +1177,7 @@ def test_init_builds_engine(dist_not_initialized):
     "capacity, sync_protocol, knobs",
     [
         (SENTINEL_CAPACITY, "auto", None),
-        (JUST_IN_TIME_CAPACITY, "auto", None),
+        (LAZY_CLAIMS_CAPACITY, "auto", None),
         (CAPACITY_256, "auto", None),
         (CAPACITY_256, "fence", None),
         (PULL_N64_CAPACITY, "auto", None),
@@ -1194,7 +1194,7 @@ def test_init_builds_engine(dist_not_initialized):
     ],
     ids=[
         "sentinel_protocols",
-        "just_in_time_claims",
+        "lazy_claims",
         "capacity_256",
         "pull_256",
         "pull_n64",
@@ -1225,10 +1225,10 @@ def test_layer_vs_oracle(request, capacity, sync_protocol, knobs):
         nvlink_one_sided_tiling,
     )
     from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
-        JUST_IN_TIME_CLAIMS_MAX_TOKENS,
+        LAZY_CLAIMS_MAX_TOKENS,
     )
     from flashinfer.moe_ep.kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
-        PULL_JUST_IN_TIME_MIN_TOKENS,
+        PULL_LAZY_CLAIMS_MIN_TOKENS,
     )
 
     arm = dict(sync_protocol=sync_protocol, knobs=knobs)
@@ -1299,20 +1299,18 @@ def test_layer_vs_oracle(request, capacity, sync_protocol, knobs):
             capacity, world, EXPERTS, TOPK, sync_protocol=sync_protocol
         ) | (knobs or {})
         assert all(getattr(workspace.config, k) == v for k, v in expected.items())
-        # The capacity-16 case compiles just-in-time claims for the Sentinel
-        # dispatch, the capacities from PULL_JUST_IN_TIME_MIN_TOKENS for the pull
+        # The capacity-16 case compiles lazy claims for the Sentinel
+        # dispatch, the capacities from PULL_LAZY_CLAIMS_MIN_TOKENS for the pull
         # dispatch, which the Sentinel protocols forced there do not run.
-        assert (
-            JUST_IN_TIME_CAPACITY <= JUST_IN_TIME_CLAIMS_MAX_TOKENS < SENTINEL_CAPACITY
-        )
-        assert CAPACITY_256 < PULL_JUST_IN_TIME_MIN_TOKENS <= GROUPED_CAPACITY
-        just_in_time = capacity == JUST_IN_TIME_CAPACITY or (
+        assert LAZY_CLAIMS_CAPACITY <= LAZY_CLAIMS_MAX_TOKENS < SENTINEL_CAPACITY
+        assert CAPACITY_256 < PULL_LAZY_CLAIMS_MIN_TOKENS <= GROUPED_CAPACITY
+        lazy = capacity == LAZY_CLAIMS_CAPACITY or (
             workspace.config.dispatch_protocol == "pull"
-            and capacity >= PULL_JUST_IN_TIME_MIN_TOKENS
+            and capacity >= PULL_LAZY_CLAIMS_MIN_TOKENS
         )
-        assert workspace.config.resolved_just_in_time_claims == just_in_time
-        assert workspace.kernel.just_in_time_claims == just_in_time
-        assert ("_claimlead" in workspace.kernel.name()) == just_in_time
+        assert workspace.config.resolved_lazy_claims == lazy
+        assert workspace.kernel.lazy_claims == lazy
+        assert ("_claimlazy" in workspace.kernel.name()) == lazy
 
         # Every rank sees every token count once, at a different step than its
         # peers, so empty and full ranks meet in the same launch.
@@ -1859,7 +1857,7 @@ def test_layer_on_ep_subgroup(request):
 @pytest.mark.parametrize(
     "capacity, knobs, fields",
     [
-        (JUST_IN_TIME_CAPACITY, None, {}),
+        (LAZY_CLAIMS_CAPACITY, None, {}),
         (SENTINEL_CAPACITY, None, {}),
         (SENTINEL_CAPACITY, None, {"shared_bf16_rounding": True}),
         (CAPACITY_256, None, {}),
@@ -1886,7 +1884,7 @@ def test_layer_on_ep_subgroup(request):
         (GROUPED_CAPACITY, {"shared_head_token_tiles": 1}, FENCE),
     ],
     ids=[
-        "just_in_time_claims",
+        "lazy_claims",
         "sentinel_protocols",
         "sentinel_bf16_rounding",
         "capacity_256",

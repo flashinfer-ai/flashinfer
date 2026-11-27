@@ -99,7 +99,7 @@ PIPELINED_GROUPS_MIN_TOKENS = 1024
 # (see ``nvlink_one_sided_tiling``).
 SCHEDULE_GROUP_FC1_TILES = 256
 PULL_PIPELINED_GROUP_FC1_TILES = 128
-PULL_JUST_IN_TIME_MIN_TOKENS = 512
+PULL_LAZY_CLAIMS_MIN_TOKENS = 512
 # The window model of a fused shared expert's entry head (``shared_head_token_tiles``
 # "window"), measured on B300 at EP8 (DeepSeek-V4.1-Flash, H=5120, one shared expert,
 # before the power cap engages): the pull dispatch's window before its first routed
@@ -301,7 +301,7 @@ def nvlink_one_sided_tiling(
     of the group before. There the FC2 epilogue also pushes with warp-wide stores
     (``combine_warp_stores``): bulk copies into peers' slots drain at the link's
     pace through the TMA unit that also issues the mainloop's loads. From
-    ``PULL_JUST_IN_TIME_MIN_TOKENS`` the pull dispatch claims work just in time: a
+    ``PULL_LAZY_CLAIMS_MIN_TOKENS`` the pull dispatch claims work lazily: a
     cluster takes its next tile only once the current one has passed its readiness
     gate, so FC2 tiles are not claimed long before their FC1 tiles finish and the
     last tiles go to the clusters that free up first.
@@ -333,10 +333,9 @@ def nvlink_one_sided_tiling(
         fc2_tma_stages=None if tile_n == 64 else 1,
         schedule_policy=("grouped", 4096 if single_group else group_fc1_tiles),
         pipelined_groups=pipelined,
-        just_in_time_claims=(
+        lazy_claims=(
             True
-            if dispatch == "pull"
-            and max_tokens_per_rank >= PULL_JUST_IN_TIME_MIN_TOKENS
+            if dispatch == "pull" and max_tokens_per_rank >= PULL_LAZY_CLAIMS_MIN_TOKENS
             else None
         ),
         work_id_mode="atomic_counter",
@@ -381,7 +380,7 @@ TUNING_FIELDS = frozenset(
         "fc1_token_pool_fallback",
         "gather_padding_spread",
         "max_sm_count",
-        "just_in_time_claims",
+        "lazy_claims",
         "claim_lead_k_tiles",
         "discard_combine_slots",
         "combine_warp_stores",

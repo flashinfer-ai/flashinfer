@@ -91,10 +91,10 @@ def _cu_stream(stream: torch.cuda.Stream):
 _MAX_ACTIVE_CLUSTERS_CACHE: dict = {}
 
 # Padded capacity (tokens per rank) up to which the Sentinel dispatch compiles
-# just-in-time work claims by default. Every launch of such a kernel picks eager
-# or just-in-time claims from its own tile counts; past this capacity the kernel
+# lazy work claims by default. Every launch of such a kernel picks eager
+# or lazy claims from its own tile counts; past this capacity the kernel
 # keeps eager claims and no runtime choice.
-JUST_IN_TIME_CLAIMS_MAX_TOKENS = 16
+LAZY_CLAIMS_MAX_TOKENS = 16
 
 # Under the counter combine the end-of-round reduce drops every combine slot line
 # it has consumed from L2 by default once a round's combine slots take at least
@@ -386,12 +386,12 @@ class BlockScaledMoeConfig:
     # the configuration admits it (``_admits_die_local_weights``) and the current
     # device has two locality domains.
     die_local_weights: Optional[bool] = None
-    # Compile just-in-time work claims, under which a launch whose tile counts
+    # Compile lazy work claims, under which a launch whose tile counts
     # favour them claims a cluster's next tile only once the current one has passed
     # its readiness gate (None: the Sentinel dispatch up to
-    # JUST_IN_TIME_CLAIMS_MAX_TOKENS padded tokens per rank).
-    just_in_time_claims: Optional[bool] = None
-    # Just-in-time claims only: weight K tiles a work tile still has to issue when
+    # LAZY_CLAIMS_MAX_TOKENS padded tokens per rank).
+    lazy_claims: Optional[bool] = None
+    # Lazy claims only: weight K tiles a work tile still has to issue when
     # its cluster claims the next one (None: the kernel default). A lead shorter
     # than a claim, about 1.3 us at the median while the SM streams weights, idles
     # every SM's weight stream between tiles.
@@ -548,12 +548,9 @@ class BlockScaledMoeConfig:
                 f"num_total_experts ({self.num_total_experts}) must divide evenly "
                 f"across world_size ({self.world_size})."
             )
-        if (
-            self.just_in_time_claims is not None
-            and type(self.just_in_time_claims) is not bool
-        ):
+        if self.lazy_claims is not None and type(self.lazy_claims) is not bool:
             raise ValueError(
-                f"just_in_time_claims must be None or a Python bool, got {self.just_in_time_claims!r}."
+                f"lazy_claims must be None or a Python bool, got {self.lazy_claims!r}."
             )
         if self.claim_lead_k_tiles is not None and (
             type(self.claim_lead_k_tiles) is not int or self.claim_lead_k_tiles < 1
@@ -561,13 +558,10 @@ class BlockScaledMoeConfig:
             raise ValueError(
                 f"claim_lead_k_tiles must be None or a positive Python integer, got {self.claim_lead_k_tiles!r}."
             )
-        if (
-            self.claim_lead_k_tiles is not None
-            and not self.resolved_just_in_time_claims
-        ):
+        if self.claim_lead_k_tiles is not None and not self.resolved_lazy_claims:
             raise ValueError(
-                "claim_lead_k_tiles applies only to just-in-time claims: the Sentinel dispatch at "
-                f"up to {JUST_IN_TIME_CLAIMS_MAX_TOKENS} padded tokens per rank or just_in_time_claims=True."
+                "claim_lead_k_tiles applies only to lazy claims: the Sentinel dispatch at "
+                f"up to {LAZY_CLAIMS_MAX_TOKENS} padded tokens per rank or lazy_claims=True."
             )
         if (
             self.discard_combine_slots is not None
@@ -1177,12 +1171,12 @@ class BlockScaledMoeConfig:
         return tiles, balanced_token_tile_rows(tokens, bound)
 
     @property
-    def resolved_just_in_time_claims(self) -> bool:
-        if self.just_in_time_claims is not None:
-            return self.just_in_time_claims
+    def resolved_lazy_claims(self) -> bool:
+        if self.lazy_claims is not None:
+            return self.lazy_claims
         return (
             self.dispatch_protocol == "sentinel"
-            and self.padded_tokens_per_rank <= JUST_IN_TIME_CLAIMS_MAX_TOKENS
+            and self.padded_tokens_per_rank <= LAZY_CLAIMS_MAX_TOKENS
         )
 
     @property
@@ -1796,8 +1790,8 @@ class BlockScaledSymmBuffer:
                 impl_fields["fc1_token_pool_fallback"] = cfg.fc1_token_pool_fallback
         if cfg.comm_stamps:
             impl_fields["stamps"] = True
-        if cfg.resolved_just_in_time_claims:
-            impl_fields["just_in_time_claims"] = True
+        if cfg.resolved_lazy_claims:
+            impl_fields["lazy_claims"] = True
         if cfg.claim_lead_k_tiles is not None:
             impl_fields["claim_lead_k_tiles"] = cfg.claim_lead_k_tiles
         if cfg.resolved_discard_combine_slots:

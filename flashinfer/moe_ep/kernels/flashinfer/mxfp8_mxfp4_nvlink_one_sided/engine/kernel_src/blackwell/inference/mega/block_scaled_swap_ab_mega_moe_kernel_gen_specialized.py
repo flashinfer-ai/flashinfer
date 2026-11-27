@@ -54,18 +54,18 @@ to every rank, and every epilogue acquires all ranks' zeroed outputs before its
 first tile (``_zero_output``). The tail barrier then publishes the sums, and the
 end-of-round kernel only keeps house.
 
-Under the Sentinel dispatch at small capacities work claims can be just in time.
+Under the Sentinel dispatch at small capacities work claims can be lazy.
 The clusters whose SMs the communication grid holds start only when it exits,
 shortly before the first FC1 tile can, and a scheduler warp that claims as soon
 as its queue has room holds several tiles per cluster by then. When a launch has
 more tiles than those early claims cover, the late clusters find every FC1 tile
-taken and the last experts' FC2 tiles pile up on them. A just-in-time cluster
-instead claims its next tile only once the current one has passed its readiness
-gate and has ``claim_lead_k_tiles`` K tiles of weights left to issue: it holds
-one tile until its first FC1 tile starts, and a tile it cannot start yet never
-pulls another one behind it. Each launch picks its claim timing at sizes_ready
-from its tile counts. Claims are just in time when the early claims cannot hold
-every tile or when the late clusters save a round of FC1 tiles. Otherwise the
+taken and the last experts' FC2 tiles pile up on them. Under lazy claims a
+cluster instead claims its next tile only once the current one has passed its
+readiness gate and has ``claim_lead_k_tiles`` K tiles of weights left to issue:
+it holds one tile until its first FC1 tile starts, and a tile it cannot start
+yet never pulls another one behind it. Each launch picks its claim timing at
+sizes_ready from its tile counts. Claims are lazy when the early claims cannot
+hold every tile or when the late clusters save a round of FC1 tiles. Otherwise the
 clusters that start with the kernel hold all the work at no more FC1 tiles each
 than all clusters would, and late clusters taking FC1 tiles would only slow
 every SM's weight stream, so claims stay eager.
@@ -74,8 +74,8 @@ The same claims serve the pull dispatch at large capacities. With eager claims
 every cluster holds several tiles beyond the one it runs: the last tiles are
 bound to clusters before it is known which ones free up first, and an FC2 tile
 can wait at the head of its cluster's queue for FC1 tiles that a later claim
-would have found finished. Just-in-time claims hand each tile to a cluster that
-is about to run it.
+would have found finished. Lazy claims hand each tile to a cluster that is
+about to run it.
 
 The token tile a launch runs follows its routing. A strided plan (N192, N240)
 sizes its tiles for the largest expert the capacity allows, but an expert of at
@@ -276,7 +276,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     other_warp_register_count: ClassVar[int] = 80
     tail_barrier_id: ClassVar[int] = 8
     # Weight K tiles a work tile still has to issue when the scheduler claims the
-    # next one under just-in-time claims, so the next tile goes to a cluster whose
+    # next one under lazy claims, so the next tile goes to a cluster whose
     # stream is about to end. A load another warp issues while the SM streams
     # weights waits behind the weight loads, so claims map their tiles from
     # register copies of the token counts and the processing order; what remains
@@ -376,7 +376,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             "pull_walk_dedup": OptionalRequirement(bool),
             "pull_tile_ready": OptionalRequirement(bool),
             "stamps": OptionalRequirement(bool),
-            "just_in_time_claims": OptionalRequirement(bool),
+            "lazy_claims": OptionalRequirement(bool),
             "claim_lead_k_tiles": OptionalRequirement(int),
             "discard_combine_slots": OptionalRequirement(bool),
             "combine_warp_stores": OptionalRequirement(bool),
@@ -538,16 +538,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             raise ValueError(
                 "The in-kernel top-k reduce has no combine slots to discard."
             )
-        # Compiled in, just-in-time claims still leave each launch to pick its claim
-        # timing from its tile counts (``_claims_pay_just_in_time``).
-        self.just_in_time_claims = impl_desc.get("just_in_time_claims", False)
-        if not isinstance(self.just_in_time_claims, bool):
-            raise ValueError(
-                f"just_in_time_claims must be a bool, got {self.just_in_time_claims!r}."
-            )
+        # Compiled in, lazy claims still leave each launch to pick its claim
+        # timing from its tile counts (``_lazy_claims_pay``).
+        self.lazy_claims = impl_desc.get("lazy_claims", False)
+        if not isinstance(self.lazy_claims, bool):
+            raise ValueError(f"lazy_claims must be a bool, got {self.lazy_claims!r}.")
         claim_lead_k_tiles = impl_desc.get("claim_lead_k_tiles")
-        if claim_lead_k_tiles is not None and not self.just_in_time_claims:
-            raise ValueError("claim_lead_k_tiles applies only to just-in-time claims.")
+        if claim_lead_k_tiles is not None and not self.lazy_claims:
+            raise ValueError("claim_lead_k_tiles applies only to lazy claims.")
         self.claim_lead_k_tiles = (
             type(self).claim_lead_k_tiles
             if claim_lead_k_tiles is None
@@ -647,10 +645,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.cta_tile_n = self.mma_tiler_mnk[1]
 
         self._configure_shared_expert(problem_desc, impl_desc)
-        # The claim gate (``claim_gate_region``) paces just-in-time claims and a
+        # The claim gate (``claim_gate_region``) paces lazy claims and a
         # shared expert's entry head, which every cluster claims one tile at a time.
         self.shared_entry_head = bool(self.shared_expert and self.shared_expert_entry)
-        self.claim_gate_compiled = self.just_in_time_claims or self.shared_entry_head
+        self.claim_gate_compiled = self.lazy_claims or self.shared_entry_head
         token_comm_impl_desc = ImplDesc(
             {
                 **impl_desc,
@@ -1506,7 +1504,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}_"
             f"weightevict{self._mainloop.weight_evict}_weights{self.weight_layout}{self.weight_block_rows}_"
             f"entryprefetch{self.entry_prefetch_bytes}_dispatch{self.dispatch_protocol}_"
-            f"{f'claimlead{self.claim_lead_k_tiles}' if self.just_in_time_claims else 'claimeager'}_"
+            f"{f'claimlazy{self.claim_lead_k_tiles}' if self.lazy_claims else 'claimeager'}_"
             f"combine{self.combine_protocol}{'discard' if self.discard_combine_slots else ''}"
             f"{'warpstores' if self.combine_warp_stores else ''}"
             f"{self.token_comm.variant_suffix()}{alternate}"
@@ -2274,14 +2272,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         )
 
     @cute.jit
-    def _claims_pay_just_in_time(
-        self, fc1_tile_count: Int32, fc2_tile_count: Int32
-    ) -> Boolean:
-        """Whether a launch with these FC1 and FC2 cluster tile counts claims just in time.
+    def _lazy_claims_pay(self, fc1_tile_count: Int32, fc2_tile_count: Int32) -> Boolean:
+        """Whether a launch with these FC1 and FC2 cluster tile counts claims lazily.
 
         The clusters whose SMs the communication grid holds start late; with eager
         claims each of the others holds ``eager_claims_before_first_fc1`` tiles by
-        the first FC1 tile. Just-in-time claims pay when the launch has more tiles
+        the first FC1 tile. Lazy claims pay when the launch has more tiles
         than that, which would reach the late clusters as FC2 tiles only, or when
         spreading the FC1 tiles over every cluster gives each fewer of them.
         """
@@ -3296,7 +3292,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             smem_workspace=config.smem_workspace,
             smem_base=smem_base,
             device_workspace=self._device_workspace,
-            cache_token_counts=self.just_in_time_claims,
+            cache_token_counts=self.lazy_claims,
         )
         scheduler = self.scheduler
 
@@ -3424,7 +3420,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             # tiles from register copies of the sizes and the expert order, which
             # are final now.
             expert_order_cache = None
-            if cutlass.const_expr(self.just_in_time_claims):
+            if cutlass.const_expr(self.lazy_claims):
                 scheduler.load_token_count_cache()
                 expert_order_cache = kernel_extension.load_expert_order_cache(
                     self.local_expert_count
@@ -3434,12 +3430,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
             iket.range_pop()
-            claims_just_in_time = Boolean(False)
-            if cutlass.const_expr(self.just_in_time_claims):
+            claims_lazily = Boolean(False)
+            if cutlass.const_expr(self.lazy_claims):
                 fc1_tile_count, fc2_tile_count = scheduler.count_work_tiles()
-                claims_just_in_time = self._claims_pay_just_in_time(
-                    fc1_tile_count, fc2_tile_count
-                )
+                claims_lazily = self._lazy_claims_pay(fc1_tile_count, fc2_tile_count)
             if cutlass.const_expr(not self.shared_entry_head):
                 claim_gate_phase = Int32(0)
             while work_tile.is_valid_tile:
@@ -3448,14 +3442,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                     kernel_extension.prepare_work_tile(work_tile, expert_order_cache)
                 )
                 iket.range_pop()
-                if cutlass.const_expr(self.just_in_time_claims):
+                if cutlass.const_expr(self.lazy_claims):
                     # The tile just published completes this phase. Neither arrival
                     # waits on a later claim of this cluster: a tile's gate depends
                     # only on FC1 tiles of lower work IDs, whose clusters complete and
                     # release them (after any FC1 tiles batched with them) without
                     # waiting on this claim. A launch with eager claims never waits,
                     # and the arrivals complete phases nobody observes.
-                    if claims_just_in_time:
+                    if claims_lazily:
                         iket.range_push("scheduler.wait_claim_gate")
                         cute.arch.mbarrier_wait(claim_gate, claim_gate_phase)
                         claim_gate_phase = claim_gate_phase ^ Int32(1)

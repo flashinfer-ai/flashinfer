@@ -1643,7 +1643,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
     ) -> None:
         """Run the TMA-A warp that loads weights and their scale factors.
 
-        ``claim_gate``, when given, is the scheduler's just-in-time claim barrier:
+        ``claim_gate``, when given, is the scheduler's lazy-claim barrier:
         this warp arrives on it once per work tile, when ``claim_lead_k_tiles`` of
         the tile's K tiles are left to issue (at the tile's start if it has no
         more), so the next claim lands while the stream still has work queued.
@@ -2276,7 +2276,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         ``first_fc1_stamp``, when given, receives the %globaltimer at which this
         CTA's first FC1 tile passed that gate.
 
-        ``claim_gate``, when given, is the scheduler's just-in-time claim barrier:
+        ``claim_gate``, when given, is the scheduler's lazy-claim barrier:
         this warp arrives on it once per work tile, when the tile has passed its
         gate (the FC1 scale factors or the FC2 ``fc1_done`` count).
 
