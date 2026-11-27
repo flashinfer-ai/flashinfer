@@ -25,6 +25,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -34,7 +35,7 @@ from flashinfer.attention.prims_ts._compile_cache import (
     _kernel_source_files,
     build_and_load_attention_kernel,
 )
-from flashinfer.attention.prims_ts import _hardware
+from flashinfer.attention.prims_ts import _compile_cache, _hardware
 
 pytestmark = pytest.mark.arch_blackwell
 
@@ -100,19 +101,35 @@ def test_unknown_compile_values_bypass_persistence(monkeypatch):
     )
 
 
-def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch):
+def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch, tmp_path):
     from flashinfer.jit import cute_dsl_core
 
     names = []
     capability = [(10, 0)]
+    source = tmp_path / "kernel.py"
+    source.write_text("pass")
+    monkeypatch.setattr(_compile_cache, "_kernel_source_files", lambda: (str(source),))
+    hash_sources = Mock(wraps=cute_dsl_core._hash_source_files)
+    monkeypatch.setattr(cute_dsl_core, "_hash_source_files", hash_sources)
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", raising=False)
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100f")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability[0])
     monkeypatch.setattr(
         cute_dsl_core,
         "build_and_load_cute_dsl_kernel",
-        lambda module, name, *a, **kw: names.append((module, name)),
+        lambda module, name, fn, *, source_sha256: names.append(
+            (module, name, source_sha256)
+        ),
     )
+
+    def probe():
+        return _compile_cache.is_attention_kernel_cached(
+            "context", "main", _Spec(), "", lambda: None
+        )
+
+    assert not probe()
     build_and_load_attention_kernel("context", "main", _Spec(), "", lambda: None)
     build_and_load_attention_kernel(
         "context", "main", _Spec(device_index=1), "", lambda: None
@@ -121,6 +138,10 @@ def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch):
     build_and_load_attention_kernel("context", "main", _Spec(), "", lambda: None)
     assert names[0] == names[1]
     assert names[0] != names[2]
+    hash_sources.assert_called_once_with((str(source),))
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
+    assert not probe()
+    assert hash_sources.call_count == 2
 
 
 def test_source_dependencies_include_shared_attention_code():

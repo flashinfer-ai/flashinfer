@@ -75,6 +75,7 @@ from .utils import (
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
+    check_has_sinks_undeclared,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
@@ -1519,8 +1520,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             causal class (bottom-right aligned, optional ``window_left``) or, with ``is_causal=False``, the non-causal class (every
             token sees its request's whole key range; no window); a single token per request is the causal class either way.
             Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window with
-            ``is_causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            ``is_causal=False``, logits soft cap, custom masks, RoPE, scales) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
+            the class's LSE member (fp32; the output bits are the same with and without it). ``run(..., sinks=)`` with an
+            fp32 ``[num_qo_heads]`` tensor runs the class's sink member (one virtual key per head in the softmax
+            denominator, merged once after the row's last chunk; the LSE includes it). Both members exist in both mask
+            modes, with their own receipts per mode. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -2289,6 +2294,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (``run(..., sinks=)``): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2365,6 +2380,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -2409,6 +2425,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._batch_size = len(indptr) - 1
             self._num_qo_heads = num_qo_heads
@@ -2423,6 +2440,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             return
+        check_has_sinks_undeclared(has_sinks)
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
         indptr = indptr.contiguous()
@@ -4061,6 +4079,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
         if self._batch_invariant is not None:
+            self._batch_invariant.validate_forward_options(
+                sm_scale=sm_scale,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                window_left=window_left,
+            )
             return self.run_return_lse(
                 q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
             )

@@ -27,6 +27,7 @@ from __future__ import annotations
 import inspect
 import itertools
 import re
+from typing import Any
 
 import pytest
 
@@ -46,18 +47,18 @@ PERF_HEADS = (80, 10, 24)
 PERF_NL = ((1, 1024), (1, 8192), (1, 32768), (4, 4096), (16, 1024), (64, 256))
 MERGED_ROWS = {(10, 1, 8192), (10, 1, 32768), (24, 1, 8192), (24, 1, 32768)}
 HEADS = (1, 2, 3, 6, 10, 12, 20, 24, 40, 80)
-# The logical names only the Blackwell body's records take (its item table, workspace, flags word and counts; the
-# write slot table and the rounding seed and rounds of its pool forms).
+# The logical names only the Blackwell body's records take (its item table, workspace, flags word and counts).
 BLACKWELL_ONLY_LOGICAL = {
     "items",
     "split_workspace",
     "state_stride_slot",
     "num_items",
     "flags",
-    "output_state_indices",
-    "rand_seed",
-    "philox_rounds",
 }
+# The logical names the pool programs with the write slot table append (the Blackwell pool forms and the SM90 V6 pool
+# programs): the write slot table, and for a BF16 / FP16 pool the rounding seed and rounds.
+POOL_LOGICAL = ("output_state_indices",)
+ROUNDING_LOGICAL = ("rand_seed", "philox_rounds")
 SM_COUNTS = (132, 114, 148, 152)
 # The sm_90a prefill route: the three V6 programs (plain, initial state, initial state + slot pool), the two unit
 # programs and the three split programs of the merged body, in route order.
@@ -77,6 +78,19 @@ V6_SPLIT_NAMES = (
     "cake_gdp_5acbda2bd1002fd68a95",
     "cake_gdp_edfb71d95c7a9c2a133d",
     "cake_gdp_446ecf26f72f95aacf84",
+)
+# The V6 pool programs with the write slot table (ABI v2.3: P-C with ``use_output_state_indices`` for an FP32, a BF16
+# and an FP16 pool), then their warm-up split twins, in route order.
+V6_POOL_DTYPES = ("f32", "bf16", "f16")
+V6_POOL_NAMES = (
+    "cake_gdp_6108f3bb9a5231a2ccab",
+    "cake_gdp_31952c28b9b7f7594e32",
+    "cake_gdp_90c40c9a853e217d9464",
+)
+V6_SPLIT_POOL_NAMES = (
+    "cake_gdp_d8969198c1f1eb037c80",
+    "cake_gdp_334cfa42025043287dfa",
+    "cake_gdp_1e2a7c403e001992a9ab",
 )
 # (use_initial_state, use_state_indices, store_final_state, unit_gates, unit_beta) per program group.
 V6_FLAGS = (
@@ -109,7 +123,7 @@ def _classes(
     return loader.prefill_body_classes(_offsets(lens), n, H, sm_count, **flags)
 
 
-def _select(body: str, flags: tuple[bool, ...], **extra: bool) -> str:
+def _select(body: str, flags: tuple[bool, ...], **extra: Any) -> str:
     use_initial, use_indices, store, unit_g, unit_beta = flags
     return loader.selected_prefill_module(
         ARCH,
@@ -565,9 +579,16 @@ def test_v6_split_plan_rules() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_sm90_prefill_route_lists_the_eleven_programs() -> None:
+def test_sm90_prefill_route_lists_the_seventeen_programs() -> None:
     route = loader.ROUTES[ARCH][loader.PREFILL_ROUTE]
-    assert route == [*V6_NAMES, *UNIT_NAMES, *SPLIT_NAMES, *V6_SPLIT_NAMES]
+    assert route == [
+        *V6_NAMES,
+        *UNIT_NAMES,
+        *SPLIT_NAMES,
+        *V6_SPLIT_NAMES,
+        *V6_POOL_NAMES,
+        *V6_SPLIT_POOL_NAMES,
+    ]
     assert loader.prefill_route_modules(ARCH) == tuple(route)
     for name in V6_NAMES:
         assert loader.MODULES[name]["body"] == V6
@@ -586,6 +607,15 @@ def test_sm90_prefill_route_lists_the_eleven_programs() -> None:
         assert record["body"] == V6
         assert record["build"][loader.PREFILL_SPLIT_FLAG] is True
         assert record["build"]["csr"] is True and record["build"]["plan_guard"] is True
+    for names, split in ((V6_POOL_NAMES, False), (V6_SPLIT_POOL_NAMES, True)):
+        for dtype, name in zip(V6_POOL_DTYPES, names, strict=True):
+            record = loader.MODULES[name]
+            assert (
+                record["body"] == V6
+                and record["select_rule"]["use_output_state_indices"] is True
+            )
+            assert record["build"].get("state_dtype", "f32") == dtype
+            assert bool(record["build"].get(loader.PREFILL_SPLIT_FLAG)) is split
     # no other record of the prefill role is delivered for sm_90a
     assert {
         name
@@ -609,6 +639,23 @@ def test_selected_prefill_module_filters_by_body() -> None:
     for flags in REMOVED_FLAGS:
         with pytest.raises(ValueError, match="0 programs of the 'prefill' route"):
             _select(P3, flags)
+    # the pool programs: the write slot table flag and the state dtype select them (P-C and the f32 pool program
+    # spell one flag set)
+    for split, names in ((False, V6_POOL_NAMES), (True, V6_SPLIT_POOL_NAMES)):
+        extra = {loader.PREFILL_SPLIT_FLAG: True} if split else {}
+        for dtype, name in zip(V6_POOL_DTYPES, names, strict=True):
+            assert (
+                _select(
+                    V6,
+                    V6_FLAGS[2],
+                    use_output_state_indices=True,
+                    state_dtype=dtype,
+                    **extra,
+                )
+                == name
+            )
+        with pytest.raises(ValueError, match="0 programs of the 'prefill' route"):
+            _select(V6, V6_FLAGS[2], state_dtype="bf16", **extra)
     # no body (None) searches every body of the route: the plain flags resolve to the V6 plain program alone
     assert (
         loader.selected_prefill_module(
@@ -631,7 +678,7 @@ def test_v6_record_names_are_the_kernel_digests() -> None:
     library and symbol carry that name, the three names differ, and the build manifest lists each library for
     sm_90a."""
     libraries = cake_build.libraries_by_name()
-    names = (*V6_NAMES, *V6_SPLIT_NAMES)
+    names = (*V6_NAMES, *V6_SPLIT_NAMES, *V6_POOL_NAMES, *V6_SPLIT_POOL_NAMES)
     assert len(set(names)) == len(names)
     for name in names:
         record = loader.MODULES[name]
@@ -643,29 +690,40 @@ def test_v6_record_names_are_the_kernel_digests() -> None:
 
 def test_v6_records_share_the_merged_launch_contract() -> None:
     """A V6 record launches 384 threads per CTA under the ``tiles`` grid rule and takes the merged body's 23
-    formals in the merged body's order, so the backend binds one ``values`` dict for every launch."""
+    formals in the merged body's order, so the backend binds one ``values`` dict for every launch; a pool program
+    with the write slot table appends ``output_state_indices`` (and a BF16 / FP16 pool ``rand_seed`` and
+    ``philox_rounds``) after them, each under its own name."""
     merged = loader.MODULES[UNIT_NAMES[0]]
-    for name in (*V6_NAMES, *V6_SPLIT_NAMES):
-        split = name in V6_SPLIT_NAMES
+    for name in (*V6_NAMES, *V6_SPLIT_NAMES, *V6_POOL_NAMES, *V6_SPLIT_POOL_NAMES):
+        split = name in (*V6_SPLIT_NAMES, *V6_SPLIT_POOL_NAMES)
         record = loader.MODULES[name]
+        # a pool program appends the write slot table (and a BF16 / FP16 pool the seed and rounds) to the formals
+        appended: tuple[str, ...] = ()
+        if name in (*V6_POOL_NAMES, *V6_SPLIT_POOL_NAMES):
+            appended = POOL_LOGICAL
+            if record["build"].get("state_dtype", "f32") != "f32":
+                appended += ROUNDING_LOGICAL
         assert record["body"] == V6 and record["arches"] == [ARCH]
         assert record["launch"]["block"] == (384, 1, 1)
         assert record["grid_rule"] == {"kind": "tiles"}
-        assert record["arg_plan"] == merged["arg_plan"]
-        assert record["logical"] == merged["logical"]
-        assert (
-            set(record["logical"].values())
-            == (
-                set(loader.PREFILL_LOGICAL_TENSORS)
-                | set(loader.PREFILL_LOGICAL_SCALARS)
-            )
-            - BLACKWELL_ONLY_LOGICAL
+        assert [
+            pair for pair in record["arg_plan"] if pair[1] not in appended
+        ] == merged["arg_plan"]
+        assert [
+            pair[1] for pair in record["arg_plan"][-3 - len(appended) : -3]
+        ] == list(appended)
+        assert record["logical"] == {**merged["logical"], **{n: n for n in appended}}
+        assert set(record["logical"].values()) == (
+            set(loader.PREFILL_LOGICAL_TENSORS) | set(loader.PREFILL_LOGICAL_SCALARS)
+        ) - BLACKWELL_ONLY_LOGICAL - (
+            set(POOL_LOGICAL + ROUNDING_LOGICAL) - set(appended)
         )
         assert record["select_rule"]["kind"] == "prefill_flags"
         assert set(record["select_rule"]) == {
             "kind",
             *loader.PREFILL_FLAGS,
             *((loader.PREFILL_SPLIT_FLAG,) if split else ()),
+            *(("use_output_state_indices",) if appended else ()),
         }
         assert record["select_rule"]["store_final_state"] is True
         assert {flag: record["build"][flag] for flag in loader.PREFILL_FLAGS} == {

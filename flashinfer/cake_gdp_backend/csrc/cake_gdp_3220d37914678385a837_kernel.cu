@@ -1868,1644 +1868,98 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     state[61] = 0.0f;
                     state[62] = 0.0f;
                     state[63] = 0.0f;
-                    int warp_id_0 = warp_id_in_role_1;
-                    int lane_quad_1 = lane & 3;
-                    int lane_row_1 = lane >> 2;
-                    unsigned int v_stage_c = v_stage_cg1;
-                    unsigned int q_stage_c = q_stage_cg1;
-                    unsigned int k_stage_c = k_stage_cg1;
-                    unsigned int gate_stage = gate_cg1_stage;
-                    mbarrier_wait(load_gate_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
-                    mbarrier_wait(load_beta_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
-                    gate_cg1_stage += 1;
-                    if (gate_cg1_stage == 4) { gate_cg1_stage = 0; _phase_load_gate_full_1 ^= 1; }
-                    int gate_elem_base = gate_stage * 64;
-                    float chunk_decay = smem_cumprod[gate_elem_base + 64 - 1];
-                    int exp_off_1 = chunk_lo_1 * 64;
-                    int tok_off_1 = exp_off_1 / num_householder;
-                    int rem_1 = exp_off_1 - tok_off_1 * num_householder;
-                    int t0_1 = batch_start_1 + tok_off_1;
-                    int b_1 = num_householder - 1 - rem_1;
-                    int cnt_1 = (63 - b_1) / num_householder + 1;
-                    int cg1_first = ((warp_id_0 == 0 && lane == 0) ? 1 : 0);
-                    unsigned int acc_w_bf16_9[32];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 32; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state[_lp*2 + 0], state[_lp*2+1 + 0]));
-                        acc_w_bf16_9[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    state[0] = state[0] * chunk_decay;
-                    state[1] = state[1] * chunk_decay;
-                    state[2] = state[2] * chunk_decay;
-                    state[3] = state[3] * chunk_decay;
-                    state[4] = state[4] * chunk_decay;
-                    state[5] = state[5] * chunk_decay;
-                    state[6] = state[6] * chunk_decay;
-                    state[7] = state[7] * chunk_decay;
-                    state[8] = state[8] * chunk_decay;
-                    state[9] = state[9] * chunk_decay;
-                    state[10] = state[10] * chunk_decay;
-                    state[11] = state[11] * chunk_decay;
-                    state[12] = state[12] * chunk_decay;
-                    state[13] = state[13] * chunk_decay;
-                    state[14] = state[14] * chunk_decay;
-                    state[15] = state[15] * chunk_decay;
-                    state[16] = state[16] * chunk_decay;
-                    state[17] = state[17] * chunk_decay;
-                    state[18] = state[18] * chunk_decay;
-                    state[19] = state[19] * chunk_decay;
-                    state[20] = state[20] * chunk_decay;
-                    state[21] = state[21] * chunk_decay;
-                    state[22] = state[22] * chunk_decay;
-                    state[23] = state[23] * chunk_decay;
-                    state[24] = state[24] * chunk_decay;
-                    state[25] = state[25] * chunk_decay;
-                    state[26] = state[26] * chunk_decay;
-                    state[27] = state[27] * chunk_decay;
-                    state[28] = state[28] * chunk_decay;
-                    state[29] = state[29] * chunk_decay;
-                    state[30] = state[30] * chunk_decay;
-                    state[31] = state[31] * chunk_decay;
-                    state[32] = state[32] * chunk_decay;
-                    state[33] = state[33] * chunk_decay;
-                    state[34] = state[34] * chunk_decay;
-                    state[35] = state[35] * chunk_decay;
-                    state[36] = state[36] * chunk_decay;
-                    state[37] = state[37] * chunk_decay;
-                    state[38] = state[38] * chunk_decay;
-                    state[39] = state[39] * chunk_decay;
-                    state[40] = state[40] * chunk_decay;
-                    state[41] = state[41] * chunk_decay;
-                    state[42] = state[42] * chunk_decay;
-                    state[43] = state[43] * chunk_decay;
-                    state[44] = state[44] * chunk_decay;
-                    state[45] = state[45] * chunk_decay;
-                    state[46] = state[46] * chunk_decay;
-                    state[47] = state[47] * chunk_decay;
-                    state[48] = state[48] * chunk_decay;
-                    state[49] = state[49] * chunk_decay;
-                    state[50] = state[50] * chunk_decay;
-                    state[51] = state[51] * chunk_decay;
-                    state[52] = state[52] * chunk_decay;
-                    state[53] = state[53] * chunk_decay;
-                    state[54] = state[54] * chunk_decay;
-                    state[55] = state[55] * chunk_decay;
-                    state[56] = state[56] * chunk_decay;
-                    state[57] = state[57] * chunk_decay;
-                    state[58] = state[58] * chunk_decay;
-                    state[59] = state[59] * chunk_decay;
-                    state[60] = state[60] * chunk_decay;
-                    state[61] = state[61] * chunk_decay;
-                    state[62] = state[62] * chunk_decay;
-                    state[63] = state[63] * chunk_decay;
-                    mbarrier_wait(ainv_ready_addr, _phase_ainv_ready_0_1);
-                    _phase_ainv_ready_0_1 ^= 1;
-                    mbarrier_wait(load_v_full_addr + (v_stage_cg1) * 8, _phase_load_v_full);
-                    mbarrier_wait(w_ready_addr, _phase_w_ready_0);
-                    _phase_w_ready_0 ^= 1;
-                    asm volatile("" : "+f"(nv[0]) :: "memory");
-                    asm volatile("" : "+f"(nv[1]) :: "memory");
-                    asm volatile("" : "+f"(nv[2]) :: "memory");
-                    asm volatile("" : "+f"(nv[3]) :: "memory");
-                    asm volatile("" : "+f"(nv[4]) :: "memory");
-                    asm volatile("" : "+f"(nv[5]) :: "memory");
-                    asm volatile("" : "+f"(nv[6]) :: "memory");
-                    asm volatile("" : "+f"(nv[7]) :: "memory");
-                    asm volatile("" : "+f"(nv[8]) :: "memory");
-                    asm volatile("" : "+f"(nv[9]) :: "memory");
-                    asm volatile("" : "+f"(nv[10]) :: "memory");
-                    asm volatile("" : "+f"(nv[11]) :: "memory");
-                    asm volatile("" : "+f"(nv[12]) :: "memory");
-                    asm volatile("" : "+f"(nv[13]) :: "memory");
-                    asm volatile("" : "+f"(nv[14]) :: "memory");
-                    asm volatile("" : "+f"(nv[15]) :: "memory");
-                    asm volatile("" : "+f"(nv[16]) :: "memory");
-                    asm volatile("" : "+f"(nv[17]) :: "memory");
-                    asm volatile("" : "+f"(nv[18]) :: "memory");
-                    asm volatile("" : "+f"(nv[19]) :: "memory");
-                    asm volatile("" : "+f"(nv[20]) :: "memory");
-                    asm volatile("" : "+f"(nv[21]) :: "memory");
-                    asm volatile("" : "+f"(nv[22]) :: "memory");
-                    asm volatile("" : "+f"(nv[23]) :: "memory");
-                    asm volatile("" : "+f"(nv[24]) :: "memory");
-                    asm volatile("" : "+f"(nv[25]) :: "memory");
-                    asm volatile("" : "+f"(nv[26]) :: "memory");
-                    asm volatile("" : "+f"(nv[27]) :: "memory");
-                    asm volatile("" : "+f"(nv[28]) :: "memory");
-                    asm volatile("" : "+f"(nv[29]) :: "memory");
-                    asm volatile("" : "+f"(nv[30]) :: "memory");
-                    asm volatile("" : "+f"(nv[31]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[15]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[16]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[17]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[18]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[19]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[20]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[21]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[22]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[23]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[24]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[25]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[26]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[27]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[28]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[29]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[30]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9[31]) :: "memory");
-                    asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                    uint64_t _wgmma_desc_8 = (((uint64_t)(((smem_v_mn_addr + v_stage_c * 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_a_5 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_8 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_8);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 0, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5), "l"(_wgmma_b_2)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5 + 128ull), "l"(_wgmma_b_2 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5 + 256ull), "l"(_wgmma_b_2 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5 + 384ull), "l"(_wgmma_b_2 + 6ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[0]), "r"(acc_w_bf16_9[1]), "r"(acc_w_bf16_9[2]), "r"(acc_w_bf16_9[3]), "l"(_wgmma_b_3)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[4]), "r"(acc_w_bf16_9[(4) + 1]), "r"(acc_w_bf16_9[(4) + 2]), "r"(acc_w_bf16_9[(4) + 3]), "l"(_wgmma_b_3 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[8]), "r"(acc_w_bf16_9[(8) + 1]), "r"(acc_w_bf16_9[(8) + 2]), "r"(acc_w_bf16_9[(8) + 3]), "l"(_wgmma_b_3 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[12]), "r"(acc_w_bf16_9[(12) + 1]), "r"(acc_w_bf16_9[(12) + 2]), "r"(acc_w_bf16_9[(12) + 3]), "l"(_wgmma_b_3 + 6ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[16]), "r"(acc_w_bf16_9[(16) + 1]), "r"(acc_w_bf16_9[(16) + 2]), "r"(acc_w_bf16_9[(16) + 3]), "l"(_wgmma_b_4)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[20]), "r"(acc_w_bf16_9[(20) + 1]), "r"(acc_w_bf16_9[(20) + 2]), "r"(acc_w_bf16_9[(20) + 3]), "l"(_wgmma_b_4 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[24]), "r"(acc_w_bf16_9[(24) + 1]), "r"(acc_w_bf16_9[(24) + 2]), "r"(acc_w_bf16_9[(24) + 3]), "l"(_wgmma_b_4 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_9[28]), "r"(acc_w_bf16_9[(28) + 1]), "r"(acc_w_bf16_9[(28) + 2]), "r"(acc_w_bf16_9[(28) + 3]), "l"(_wgmma_b_4 + 6ull)
-                        : "memory");
-                    asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-                    mbarrier_wait(load_q_full_addr + (q_stage_cg1) * 8, _phase_load_q_full_1);
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    uint64_t _wgmma_desc_9 = (((uint64_t)(((smem_q_addr + q_stage_c * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_b_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_9 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_9);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 0, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[0]), "r"(acc_w_bf16_9[1]), "r"(acc_w_bf16_9[2]), "r"(acc_w_bf16_9[3]), "l"(wgmma_b_1)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[4]), "r"(acc_w_bf16_9[(4) + 1]), "r"(acc_w_bf16_9[(4) + 2]), "r"(acc_w_bf16_9[(4) + 3]), "l"(wgmma_b_1 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[8]), "r"(acc_w_bf16_9[(8) + 1]), "r"(acc_w_bf16_9[(8) + 2]), "r"(acc_w_bf16_9[(8) + 3]), "l"(wgmma_b_1 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[12]), "r"(acc_w_bf16_9[(12) + 1]), "r"(acc_w_bf16_9[(12) + 2]), "r"(acc_w_bf16_9[(12) + 3]), "l"(wgmma_b_1 + 6ull)
-                        : "memory");
-                    uint64_t _wgmma_desc_10 = (((uint64_t)(((smem_q_addr + q_stage_c * 16384 + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_b_1_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_10 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_10);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[16]), "r"(acc_w_bf16_9[(16) + 1]), "r"(acc_w_bf16_9[(16) + 2]), "r"(acc_w_bf16_9[(16) + 3]), "l"(wgmma_b_1_1)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[20]), "r"(acc_w_bf16_9[(20) + 1]), "r"(acc_w_bf16_9[(20) + 2]), "r"(acc_w_bf16_9[(20) + 3]), "l"(wgmma_b_1_1 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[24]), "r"(acc_w_bf16_9[(24) + 1]), "r"(acc_w_bf16_9[(24) + 2]), "r"(acc_w_bf16_9[(24) + 3]), "l"(wgmma_b_1_1 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9[28]), "r"(acc_w_bf16_9[(28) + 1]), "r"(acc_w_bf16_9[(28) + 2]), "r"(acc_w_bf16_9[(28) + 3]), "l"(wgmma_b_1_1 + 6ull)
-                        : "memory");
-                    asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-                    asm volatile("" : "+f"(nv[0]) :: "memory");
-                    asm volatile("" : "+f"(nv[1]) :: "memory");
-                    asm volatile("" : "+f"(nv[2]) :: "memory");
-                    asm volatile("" : "+f"(nv[3]) :: "memory");
-                    asm volatile("" : "+f"(nv[4]) :: "memory");
-                    asm volatile("" : "+f"(nv[5]) :: "memory");
-                    asm volatile("" : "+f"(nv[6]) :: "memory");
-                    asm volatile("" : "+f"(nv[7]) :: "memory");
-                    asm volatile("" : "+f"(nv[8]) :: "memory");
-                    asm volatile("" : "+f"(nv[9]) :: "memory");
-                    asm volatile("" : "+f"(nv[10]) :: "memory");
-                    asm volatile("" : "+f"(nv[11]) :: "memory");
-                    asm volatile("" : "+f"(nv[12]) :: "memory");
-                    asm volatile("" : "+f"(nv[13]) :: "memory");
-                    asm volatile("" : "+f"(nv[14]) :: "memory");
-                    asm volatile("" : "+f"(nv[15]) :: "memory");
-                    asm volatile("" : "+f"(nv[16]) :: "memory");
-                    asm volatile("" : "+f"(nv[17]) :: "memory");
-                    asm volatile("" : "+f"(nv[18]) :: "memory");
-                    asm volatile("" : "+f"(nv[19]) :: "memory");
-                    asm volatile("" : "+f"(nv[20]) :: "memory");
-                    asm volatile("" : "+f"(nv[21]) :: "memory");
-                    asm volatile("" : "+f"(nv[22]) :: "memory");
-                    asm volatile("" : "+f"(nv[23]) :: "memory");
-                    asm volatile("" : "+f"(nv[24]) :: "memory");
-                    asm volatile("" : "+f"(nv[25]) :: "memory");
-                    asm volatile("" : "+f"(nv[26]) :: "memory");
-                    asm volatile("" : "+f"(nv[27]) :: "memory");
-                    asm volatile("" : "+f"(nv[28]) :: "memory");
-                    asm volatile("" : "+f"(nv[29]) :: "memory");
-                    asm volatile("" : "+f"(nv[30]) :: "memory");
-                    asm volatile("" : "+f"(nv[31]) :: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
-                    mbarrier_arrive(w_empty_addr);
-                    mbarrier_arrive(ainv_empty_addr);
-                    int v_stage_bytes = (int)v_stage_cg1 * 8192;
-                    #pragma unroll
-                    for (int j_4 = 0; j_4 < 32; j_4++) {
-                        int m_col = j_4 / 4 * 8 + lane_quad_1 * 2 + (j_4 & 3 & 1);
-                        int v_row = warp_id_0 * 16 + lane_row_1 + (j_4 & 3) / 2 * 8;
-                        float v_val = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes + (m_col * 128 + v_row * 2 ^ (m_col * 128 + v_row * 2 >> 7 & 7) << 4)))[0];
-                        float beta_m = smem_beta[gate_elem_base + m_col];
-                        nv[j_4] = __fmaf_rn(-beta_m, v_val, nv[j_4]);
-                    }
-                    mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
-                    v_stage_cg1 += 1;
-                    if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
-                    mbarrier_arrive(beta_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
-                    unsigned int acc_w_bf16_9_1[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                        acc_w_bf16_9_1[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    float last_cumsumlog = smem_cumsumlog[gate_elem_base + 64 - 1];
-                    #pragma unroll
-                    for (int j_5 = 0; j_5 < 32; j_5++) {
-                        int col_4 = j_5 / 4 * 8 + lane_quad_1 * 2 + (j_5 & 3 & 1);
-                        float _exp2_11 = approx_exp2(last_cumsumlog - smem_cumsumlog[gate_elem_base + col_4]);
-                        nv[j_5] = nv[j_5] * (-_exp2_11);
-                    }
-                    unsigned int acc_w_bf16_10[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                        acc_w_bf16_10[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    float unpack_bf16[32];
-                    #pragma unroll
-                    for (int _pair = 0; _pair < 16; _pair++) {
-                        (&unpack_bf16[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_10[_pair]) << 16);
-                        (&unpack_bf16[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_10[_pair]) & 0xffff0000u);
-                    }
-                    nv[0] = nv[0] - unpack_bf16[0];
-                    nv[1] = nv[1] - unpack_bf16[1];
-                    nv[2] = nv[2] - unpack_bf16[2];
-                    nv[3] = nv[3] - unpack_bf16[3];
-                    nv[4] = nv[4] - unpack_bf16[4];
-                    nv[5] = nv[5] - unpack_bf16[5];
-                    nv[6] = nv[6] - unpack_bf16[6];
-                    nv[7] = nv[7] - unpack_bf16[7];
-                    nv[8] = nv[8] - unpack_bf16[8];
-                    nv[9] = nv[9] - unpack_bf16[9];
-                    nv[10] = nv[10] - unpack_bf16[10];
-                    nv[11] = nv[11] - unpack_bf16[11];
-                    nv[12] = nv[12] - unpack_bf16[12];
-                    nv[13] = nv[13] - unpack_bf16[13];
-                    nv[14] = nv[14] - unpack_bf16[14];
-                    nv[15] = nv[15] - unpack_bf16[15];
-                    nv[16] = nv[16] - unpack_bf16[16];
-                    nv[17] = nv[17] - unpack_bf16[17];
-                    nv[18] = nv[18] - unpack_bf16[18];
-                    nv[19] = nv[19] - unpack_bf16[19];
-                    nv[20] = nv[20] - unpack_bf16[20];
-                    nv[21] = nv[21] - unpack_bf16[21];
-                    nv[22] = nv[22] - unpack_bf16[22];
-                    nv[23] = nv[23] - unpack_bf16[23];
-                    nv[24] = nv[24] - unpack_bf16[24];
-                    nv[25] = nv[25] - unpack_bf16[25];
-                    nv[26] = nv[26] - unpack_bf16[26];
-                    nv[27] = nv[27] - unpack_bf16[27];
-                    nv[28] = nv[28] - unpack_bf16[28];
-                    nv[29] = nv[29] - unpack_bf16[29];
-                    nv[30] = nv[30] - unpack_bf16[30];
-                    nv[31] = nv[31] - unpack_bf16[31];
-                    unsigned int acc_w_bf16_11[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                        acc_w_bf16_11[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-                    mbarrier_arrive(q_smem_empty_addr + (q_stage_cg1) * 8);
-                    q_stage_cg1 += 1;
-                    if (q_stage_cg1 == 2) { q_stage_cg1 = 0; _phase_load_q_full_1 ^= 1; }
-                    #pragma unroll
-                    for (int j_6 = 0; j_6 < 32; j_6++) {
-                        int col_5 = j_6 / 4 * 8 + lane_quad_1 * 2 + (j_6 & 3 & 1);
-                        int r_col = b_1 + col_5 * num_householder;
-                        int r_clamped_2 = ((col_5 < cnt_1) ? r_col : 0);
-                        float qs_scale = ((col_5 < cnt_1) ? smem_cumprod[gate_elem_base + r_clamped_2] * scale_eff_1 : 0.0f);
-                        q_state[j_6] = q_state[j_6] * qs_scale;
-                    }
-                    mbarrier_arrive(gate_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
-                    mbarrier_wait(load_k_full_addr + (k_stage_cg1) * 8, _phase_load_k_full_1);
-                    mbarrier_wait(qk_ready_addr, _phase_qk_ready_0);
-                    _phase_qk_ready_0 ^= 1;
-                    asm volatile("" : "+f"(state[0]) :: "memory");
-                    asm volatile("" : "+f"(state[1]) :: "memory");
-                    asm volatile("" : "+f"(state[2]) :: "memory");
-                    asm volatile("" : "+f"(state[3]) :: "memory");
-                    asm volatile("" : "+f"(state[4]) :: "memory");
-                    asm volatile("" : "+f"(state[5]) :: "memory");
-                    asm volatile("" : "+f"(state[6]) :: "memory");
-                    asm volatile("" : "+f"(state[7]) :: "memory");
-                    asm volatile("" : "+f"(state[8]) :: "memory");
-                    asm volatile("" : "+f"(state[9]) :: "memory");
-                    asm volatile("" : "+f"(state[10]) :: "memory");
-                    asm volatile("" : "+f"(state[11]) :: "memory");
-                    asm volatile("" : "+f"(state[12]) :: "memory");
-                    asm volatile("" : "+f"(state[13]) :: "memory");
-                    asm volatile("" : "+f"(state[14]) :: "memory");
-                    asm volatile("" : "+f"(state[15]) :: "memory");
-                    asm volatile("" : "+f"(state[16]) :: "memory");
-                    asm volatile("" : "+f"(state[17]) :: "memory");
-                    asm volatile("" : "+f"(state[18]) :: "memory");
-                    asm volatile("" : "+f"(state[19]) :: "memory");
-                    asm volatile("" : "+f"(state[20]) :: "memory");
-                    asm volatile("" : "+f"(state[21]) :: "memory");
-                    asm volatile("" : "+f"(state[22]) :: "memory");
-                    asm volatile("" : "+f"(state[23]) :: "memory");
-                    asm volatile("" : "+f"(state[24]) :: "memory");
-                    asm volatile("" : "+f"(state[25]) :: "memory");
-                    asm volatile("" : "+f"(state[26]) :: "memory");
-                    asm volatile("" : "+f"(state[27]) :: "memory");
-                    asm volatile("" : "+f"(state[28]) :: "memory");
-                    asm volatile("" : "+f"(state[29]) :: "memory");
-                    asm volatile("" : "+f"(state[30]) :: "memory");
-                    asm volatile("" : "+f"(state[31]) :: "memory");
-                    asm volatile("" : "+f"(state[32]) :: "memory");
-                    asm volatile("" : "+f"(state[33]) :: "memory");
-                    asm volatile("" : "+f"(state[34]) :: "memory");
-                    asm volatile("" : "+f"(state[35]) :: "memory");
-                    asm volatile("" : "+f"(state[36]) :: "memory");
-                    asm volatile("" : "+f"(state[37]) :: "memory");
-                    asm volatile("" : "+f"(state[38]) :: "memory");
-                    asm volatile("" : "+f"(state[39]) :: "memory");
-                    asm volatile("" : "+f"(state[40]) :: "memory");
-                    asm volatile("" : "+f"(state[41]) :: "memory");
-                    asm volatile("" : "+f"(state[42]) :: "memory");
-                    asm volatile("" : "+f"(state[43]) :: "memory");
-                    asm volatile("" : "+f"(state[44]) :: "memory");
-                    asm volatile("" : "+f"(state[45]) :: "memory");
-                    asm volatile("" : "+f"(state[46]) :: "memory");
-                    asm volatile("" : "+f"(state[47]) :: "memory");
-                    asm volatile("" : "+f"(state[48]) :: "memory");
-                    asm volatile("" : "+f"(state[49]) :: "memory");
-                    asm volatile("" : "+f"(state[50]) :: "memory");
-                    asm volatile("" : "+f"(state[51]) :: "memory");
-                    asm volatile("" : "+f"(state[52]) :: "memory");
-                    asm volatile("" : "+f"(state[53]) :: "memory");
-                    asm volatile("" : "+f"(state[54]) :: "memory");
-                    asm volatile("" : "+f"(state[55]) :: "memory");
-                    asm volatile("" : "+f"(state[56]) :: "memory");
-                    asm volatile("" : "+f"(state[57]) :: "memory");
-                    asm volatile("" : "+f"(state[58]) :: "memory");
-                    asm volatile("" : "+f"(state[59]) :: "memory");
-                    asm volatile("" : "+f"(state[60]) :: "memory");
-                    asm volatile("" : "+f"(state[61]) :: "memory");
-                    asm volatile("" : "+f"(state[62]) :: "memory");
-                    asm volatile("" : "+f"(state[63]) :: "memory");
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_9_1[15]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_10[15]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_11[15]) :: "memory");
-                    asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                    uint64_t _wgmma_desc_12 = (((uint64_t)(((smem_k_mn_addr + k_stage_c * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_b_2 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_12 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_12);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_10[0]), "r"(acc_w_bf16_10[1]), "r"(acc_w_bf16_10[2]), "r"(acc_w_bf16_10[3]), "l"(wgmma_b_2)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_10[4]), "r"(acc_w_bf16_10[(4) + 1]), "r"(acc_w_bf16_10[(4) + 2]), "r"(acc_w_bf16_10[(4) + 3]), "l"(wgmma_b_2 + 128ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_10[8]), "r"(acc_w_bf16_10[(8) + 1]), "r"(acc_w_bf16_10[(8) + 2]), "r"(acc_w_bf16_10[(8) + 3]), "l"(wgmma_b_2 + 256ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_10[12]), "r"(acc_w_bf16_10[(12) + 1]), "r"(acc_w_bf16_10[(12) + 2]), "r"(acc_w_bf16_10[(12) + 3]), "l"(wgmma_b_2 + 384ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_11[0]), "r"(acc_w_bf16_11[1]), "r"(acc_w_bf16_11[2]), "r"(acc_w_bf16_11[3]), "l"(wgmma_b_2)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_11[4]), "r"(acc_w_bf16_11[(4) + 1]), "r"(acc_w_bf16_11[(4) + 2]), "r"(acc_w_bf16_11[(4) + 3]), "l"(wgmma_b_2 + 128ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_11[8]), "r"(acc_w_bf16_11[(8) + 1]), "r"(acc_w_bf16_11[(8) + 2]), "r"(acc_w_bf16_11[(8) + 3]), "l"(wgmma_b_2 + 256ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_11[12]), "r"(acc_w_bf16_11[(12) + 1]), "r"(acc_w_bf16_11[(12) + 2]), "r"(acc_w_bf16_11[(12) + 3]), "l"(wgmma_b_2 + 384ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9_1[0]), "r"(acc_w_bf16_9_1[1]), "r"(acc_w_bf16_9_1[2]), "r"(acc_w_bf16_9_1[3]), "l"(_wgmma_b_5)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9_1[4]), "r"(acc_w_bf16_9_1[(4) + 1]), "r"(acc_w_bf16_9_1[(4) + 2]), "r"(acc_w_bf16_9_1[(4) + 3]), "l"(_wgmma_b_5 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9_1[8]), "r"(acc_w_bf16_9_1[(8) + 1]), "r"(acc_w_bf16_9_1[(8) + 2]), "r"(acc_w_bf16_9_1[(8) + 3]), "l"(_wgmma_b_5 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_9_1[12]), "r"(acc_w_bf16_9_1[(12) + 1]), "r"(acc_w_bf16_9_1[(12) + 2]), "r"(acc_w_bf16_9_1[(12) + 3]), "l"(_wgmma_b_5 + 6ull)
-                        : "memory");
-                    asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-                    asm volatile("" : "+f"(state[0]) :: "memory");
-                    asm volatile("" : "+f"(state[1]) :: "memory");
-                    asm volatile("" : "+f"(state[2]) :: "memory");
-                    asm volatile("" : "+f"(state[3]) :: "memory");
-                    asm volatile("" : "+f"(state[4]) :: "memory");
-                    asm volatile("" : "+f"(state[5]) :: "memory");
-                    asm volatile("" : "+f"(state[6]) :: "memory");
-                    asm volatile("" : "+f"(state[7]) :: "memory");
-                    asm volatile("" : "+f"(state[8]) :: "memory");
-                    asm volatile("" : "+f"(state[9]) :: "memory");
-                    asm volatile("" : "+f"(state[10]) :: "memory");
-                    asm volatile("" : "+f"(state[11]) :: "memory");
-                    asm volatile("" : "+f"(state[12]) :: "memory");
-                    asm volatile("" : "+f"(state[13]) :: "memory");
-                    asm volatile("" : "+f"(state[14]) :: "memory");
-                    asm volatile("" : "+f"(state[15]) :: "memory");
-                    asm volatile("" : "+f"(state[16]) :: "memory");
-                    asm volatile("" : "+f"(state[17]) :: "memory");
-                    asm volatile("" : "+f"(state[18]) :: "memory");
-                    asm volatile("" : "+f"(state[19]) :: "memory");
-                    asm volatile("" : "+f"(state[20]) :: "memory");
-                    asm volatile("" : "+f"(state[21]) :: "memory");
-                    asm volatile("" : "+f"(state[22]) :: "memory");
-                    asm volatile("" : "+f"(state[23]) :: "memory");
-                    asm volatile("" : "+f"(state[24]) :: "memory");
-                    asm volatile("" : "+f"(state[25]) :: "memory");
-                    asm volatile("" : "+f"(state[26]) :: "memory");
-                    asm volatile("" : "+f"(state[27]) :: "memory");
-                    asm volatile("" : "+f"(state[28]) :: "memory");
-                    asm volatile("" : "+f"(state[29]) :: "memory");
-                    asm volatile("" : "+f"(state[30]) :: "memory");
-                    asm volatile("" : "+f"(state[31]) :: "memory");
-                    asm volatile("" : "+f"(state[32]) :: "memory");
-                    asm volatile("" : "+f"(state[33]) :: "memory");
-                    asm volatile("" : "+f"(state[34]) :: "memory");
-                    asm volatile("" : "+f"(state[35]) :: "memory");
-                    asm volatile("" : "+f"(state[36]) :: "memory");
-                    asm volatile("" : "+f"(state[37]) :: "memory");
-                    asm volatile("" : "+f"(state[38]) :: "memory");
-                    asm volatile("" : "+f"(state[39]) :: "memory");
-                    asm volatile("" : "+f"(state[40]) :: "memory");
-                    asm volatile("" : "+f"(state[41]) :: "memory");
-                    asm volatile("" : "+f"(state[42]) :: "memory");
-                    asm volatile("" : "+f"(state[43]) :: "memory");
-                    asm volatile("" : "+f"(state[44]) :: "memory");
-                    asm volatile("" : "+f"(state[45]) :: "memory");
-                    asm volatile("" : "+f"(state[46]) :: "memory");
-                    asm volatile("" : "+f"(state[47]) :: "memory");
-                    asm volatile("" : "+f"(state[48]) :: "memory");
-                    asm volatile("" : "+f"(state[49]) :: "memory");
-                    asm volatile("" : "+f"(state[50]) :: "memory");
-                    asm volatile("" : "+f"(state[51]) :: "memory");
-                    asm volatile("" : "+f"(state[52]) :: "memory");
-                    asm volatile("" : "+f"(state[53]) :: "memory");
-                    asm volatile("" : "+f"(state[54]) :: "memory");
-                    asm volatile("" : "+f"(state[55]) :: "memory");
-                    asm volatile("" : "+f"(state[56]) :: "memory");
-                    asm volatile("" : "+f"(state[57]) :: "memory");
-                    asm volatile("" : "+f"(state[58]) :: "memory");
-                    asm volatile("" : "+f"(state[59]) :: "memory");
-                    asm volatile("" : "+f"(state[60]) :: "memory");
-                    asm volatile("" : "+f"(state[61]) :: "memory");
-                    asm volatile("" : "+f"(state[62]) :: "memory");
-                    asm volatile("" : "+f"(state[63]) :: "memory");
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-                    mbarrier_arrive(load_k_empty_addr + (k_stage_cg1) * 8);
-                    k_stage_cg1 += 1;
-                    if (k_stage_cg1 == 3) { k_stage_cg1 = 0; _phase_load_k_full_1 ^= 1; }
-                    mbarrier_arrive(qk_empty_addr);
-                    unsigned int acc_w_bf16_12[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(q_state[_lp*2 + 0], q_state[_lp*2+1 + 0]));
-                        acc_w_bf16_12[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    unsigned int o_base = smem_o_addr;
-                    int mtx = lane / 8;
-                    int row_in_mtx = lane & 7;
-                    #pragma unroll
-                    for (int tok_group = 0; tok_group < 4; tok_group++) {
-                        int v_base = warp_id_0 * 16 + (mtx & 1) * 8;
-                        int tok = tok_group * 16 + mtx / 2 * 8 + row_in_mtx;
-                        unsigned int st_addr_23 = o_base + (unsigned int)(tok * 128 + v_base * 2 ^ (tok * 128 + v_base * 2 >> 7 & 7) << 4);
-                        uint32_t _stmatrix_addr_13 = static_cast<uint32_t>((unsigned long long)st_addr_23);
-                        asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                            :: "r"(_stmatrix_addr_13), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4 + 3]))
-                            : "memory");
-                    }
-                    asm volatile("barrier.sync 14, 128;" ::: "memory");
-                    int tid_cg1 = warp_id_0 * 32 + lane;
-                    int o_chunk = tid_cg1 & 7;
-                    int chunk_writes = ((chunk_lo_1 >= write_lo_1 && chunk_lo_1 < write_end) ? 1 : 0);
-                    #pragma unroll
-                    for (int o_round = 0; o_round < 4; o_round++) {
-                        int o_row = o_round * 16 + tid_cg1 / 8;
-                        if (o_row < cnt_1 && batch_end_1 > t0_1 + o_row && chunk_writes != 0) {
-                            unsigned int o_words[4];
-                            unsigned int o_src = o_base + (unsigned int)(o_row * 128 + ((o_chunk ^ o_row & 7) << 4));
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&o_words[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_words[(0) + 3]))
-                                : "r"(o_src));
-                            long long o_index = ((long long)(t0_1 + o_row) * (long long)num_heads + (long long)head_idx_1) * 64ll + (long long)(o_chunk * 8);
-                            reinterpret_cast<int4*>(O + o_index)[0] = reinterpret_cast<int4*>(o_words)[0];
-                        }
-                    }
-                    int warp_id_1_1 = warp_id_in_role_1;
-                    int lane_quad_0 = lane & 3;
-                    int lane_row_0 = lane >> 2;
-                    unsigned int v_stage_c_0 = v_stage_cg1;
-                    unsigned int q_stage_c_0 = q_stage_cg1;
-                    unsigned int k_stage_c_0 = k_stage_cg1;
-                    unsigned int gate_stage_0 = gate_cg1_stage;
-                    mbarrier_wait(load_gate_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
-                    mbarrier_wait(load_beta_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
-                    gate_cg1_stage += 1;
-                    if (gate_cg1_stage == 4) { gate_cg1_stage = 0; _phase_load_gate_full_1 ^= 1; }
-                    int gate_elem_base_0 = gate_stage_0 * 64;
-                    float chunk_decay_0 = smem_cumprod[gate_elem_base_0 + 64 - 1];
-                    int exp_off_1_1 = (chunk_lo_1 + 1) * 64;
-                    int tok_off_1_1 = exp_off_1_1 / num_householder;
-                    int rem_1_1 = exp_off_1_1 - tok_off_1_1 * num_householder;
-                    int t0_1_1 = batch_start_1 + tok_off_1_1;
-                    int b_1_1 = num_householder - 1 - rem_1_1;
-                    int cnt_1_1 = (63 - b_1_1) / num_householder + 1;
-                    int cg1_first_0 = ((warp_id_1_1 == 0 && lane == 0) ? 1 : 0);
-                    unsigned int acc_w_bf16_13[32];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 32; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state[_lp*2 + 0], state[_lp*2+1 + 0]));
-                        acc_w_bf16_13[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    state[0] = state[0] * chunk_decay_0;
-                    state[1] = state[1] * chunk_decay_0;
-                    state[2] = state[2] * chunk_decay_0;
-                    state[3] = state[3] * chunk_decay_0;
-                    state[4] = state[4] * chunk_decay_0;
-                    state[5] = state[5] * chunk_decay_0;
-                    state[6] = state[6] * chunk_decay_0;
-                    state[7] = state[7] * chunk_decay_0;
-                    state[8] = state[8] * chunk_decay_0;
-                    state[9] = state[9] * chunk_decay_0;
-                    state[10] = state[10] * chunk_decay_0;
-                    state[11] = state[11] * chunk_decay_0;
-                    state[12] = state[12] * chunk_decay_0;
-                    state[13] = state[13] * chunk_decay_0;
-                    state[14] = state[14] * chunk_decay_0;
-                    state[15] = state[15] * chunk_decay_0;
-                    state[16] = state[16] * chunk_decay_0;
-                    state[17] = state[17] * chunk_decay_0;
-                    state[18] = state[18] * chunk_decay_0;
-                    state[19] = state[19] * chunk_decay_0;
-                    state[20] = state[20] * chunk_decay_0;
-                    state[21] = state[21] * chunk_decay_0;
-                    state[22] = state[22] * chunk_decay_0;
-                    state[23] = state[23] * chunk_decay_0;
-                    state[24] = state[24] * chunk_decay_0;
-                    state[25] = state[25] * chunk_decay_0;
-                    state[26] = state[26] * chunk_decay_0;
-                    state[27] = state[27] * chunk_decay_0;
-                    state[28] = state[28] * chunk_decay_0;
-                    state[29] = state[29] * chunk_decay_0;
-                    state[30] = state[30] * chunk_decay_0;
-                    state[31] = state[31] * chunk_decay_0;
-                    state[32] = state[32] * chunk_decay_0;
-                    state[33] = state[33] * chunk_decay_0;
-                    state[34] = state[34] * chunk_decay_0;
-                    state[35] = state[35] * chunk_decay_0;
-                    state[36] = state[36] * chunk_decay_0;
-                    state[37] = state[37] * chunk_decay_0;
-                    state[38] = state[38] * chunk_decay_0;
-                    state[39] = state[39] * chunk_decay_0;
-                    state[40] = state[40] * chunk_decay_0;
-                    state[41] = state[41] * chunk_decay_0;
-                    state[42] = state[42] * chunk_decay_0;
-                    state[43] = state[43] * chunk_decay_0;
-                    state[44] = state[44] * chunk_decay_0;
-                    state[45] = state[45] * chunk_decay_0;
-                    state[46] = state[46] * chunk_decay_0;
-                    state[47] = state[47] * chunk_decay_0;
-                    state[48] = state[48] * chunk_decay_0;
-                    state[49] = state[49] * chunk_decay_0;
-                    state[50] = state[50] * chunk_decay_0;
-                    state[51] = state[51] * chunk_decay_0;
-                    state[52] = state[52] * chunk_decay_0;
-                    state[53] = state[53] * chunk_decay_0;
-                    state[54] = state[54] * chunk_decay_0;
-                    state[55] = state[55] * chunk_decay_0;
-                    state[56] = state[56] * chunk_decay_0;
-                    state[57] = state[57] * chunk_decay_0;
-                    state[58] = state[58] * chunk_decay_0;
-                    state[59] = state[59] * chunk_decay_0;
-                    state[60] = state[60] * chunk_decay_0;
-                    state[61] = state[61] * chunk_decay_0;
-                    state[62] = state[62] * chunk_decay_0;
-                    state[63] = state[63] * chunk_decay_0;
-                    mbarrier_wait(ainv_ready_addr + 8, _phase_ainv_ready_1_1);
-                    _phase_ainv_ready_1_1 ^= 1;
-                    mbarrier_wait(load_v_full_addr + (v_stage_cg1) * 8, _phase_load_v_full);
-                    mbarrier_wait(w_ready_addr + 8, _phase_w_ready_1);
-                    _phase_w_ready_1 ^= 1;
-                    asm volatile("" : "+f"(nv[0]) :: "memory");
-                    asm volatile("" : "+f"(nv[1]) :: "memory");
-                    asm volatile("" : "+f"(nv[2]) :: "memory");
-                    asm volatile("" : "+f"(nv[3]) :: "memory");
-                    asm volatile("" : "+f"(nv[4]) :: "memory");
-                    asm volatile("" : "+f"(nv[5]) :: "memory");
-                    asm volatile("" : "+f"(nv[6]) :: "memory");
-                    asm volatile("" : "+f"(nv[7]) :: "memory");
-                    asm volatile("" : "+f"(nv[8]) :: "memory");
-                    asm volatile("" : "+f"(nv[9]) :: "memory");
-                    asm volatile("" : "+f"(nv[10]) :: "memory");
-                    asm volatile("" : "+f"(nv[11]) :: "memory");
-                    asm volatile("" : "+f"(nv[12]) :: "memory");
-                    asm volatile("" : "+f"(nv[13]) :: "memory");
-                    asm volatile("" : "+f"(nv[14]) :: "memory");
-                    asm volatile("" : "+f"(nv[15]) :: "memory");
-                    asm volatile("" : "+f"(nv[16]) :: "memory");
-                    asm volatile("" : "+f"(nv[17]) :: "memory");
-                    asm volatile("" : "+f"(nv[18]) :: "memory");
-                    asm volatile("" : "+f"(nv[19]) :: "memory");
-                    asm volatile("" : "+f"(nv[20]) :: "memory");
-                    asm volatile("" : "+f"(nv[21]) :: "memory");
-                    asm volatile("" : "+f"(nv[22]) :: "memory");
-                    asm volatile("" : "+f"(nv[23]) :: "memory");
-                    asm volatile("" : "+f"(nv[24]) :: "memory");
-                    asm volatile("" : "+f"(nv[25]) :: "memory");
-                    asm volatile("" : "+f"(nv[26]) :: "memory");
-                    asm volatile("" : "+f"(nv[27]) :: "memory");
-                    asm volatile("" : "+f"(nv[28]) :: "memory");
-                    asm volatile("" : "+f"(nv[29]) :: "memory");
-                    asm volatile("" : "+f"(nv[30]) :: "memory");
-                    asm volatile("" : "+f"(nv[31]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[15]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[16]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[17]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[18]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[19]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[20]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[21]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[22]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[23]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[24]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[25]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[26]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[27]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[28]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[29]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[30]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_13[31]) :: "memory");
-                    asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                    uint64_t _wgmma_desc_14 = (((uint64_t)(((smem_v_mn_addr + v_stage_c_0 * 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_a_5_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_14 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_14);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 0, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5_1), "l"(_wgmma_b_6)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5_1 + 128ull), "l"(_wgmma_b_6 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5_1 + 256ull), "l"(_wgmma_b_6 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "l"(wgmma_a_5_1 + 384ull), "l"(_wgmma_b_6 + 6ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[0]), "r"(acc_w_bf16_13[1]), "r"(acc_w_bf16_13[2]), "r"(acc_w_bf16_13[3]), "l"(_wgmma_b_7)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[4]), "r"(acc_w_bf16_13[(4) + 1]), "r"(acc_w_bf16_13[(4) + 2]), "r"(acc_w_bf16_13[(4) + 3]), "l"(_wgmma_b_7 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[8]), "r"(acc_w_bf16_13[(8) + 1]), "r"(acc_w_bf16_13[(8) + 2]), "r"(acc_w_bf16_13[(8) + 3]), "l"(_wgmma_b_7 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[12]), "r"(acc_w_bf16_13[(12) + 1]), "r"(acc_w_bf16_13[(12) + 2]), "r"(acc_w_bf16_13[(12) + 3]), "l"(_wgmma_b_7 + 6ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[16]), "r"(acc_w_bf16_13[(16) + 1]), "r"(acc_w_bf16_13[(16) + 2]), "r"(acc_w_bf16_13[(16) + 3]), "l"(_wgmma_b_8)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[20]), "r"(acc_w_bf16_13[(20) + 1]), "r"(acc_w_bf16_13[(20) + 2]), "r"(acc_w_bf16_13[(20) + 3]), "l"(_wgmma_b_8 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[24]), "r"(acc_w_bf16_13[(24) + 1]), "r"(acc_w_bf16_13[(24) + 2]), "r"(acc_w_bf16_13[(24) + 3]), "l"(_wgmma_b_8 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                        : "r"(acc_w_bf16_13[28]), "r"(acc_w_bf16_13[(28) + 1]), "r"(acc_w_bf16_13[(28) + 2]), "r"(acc_w_bf16_13[(28) + 3]), "l"(_wgmma_b_8 + 6ull)
-                        : "memory");
-                    asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-                    mbarrier_wait(load_q_full_addr + (q_stage_cg1) * 8, _phase_load_q_full_1);
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    uint64_t _wgmma_desc_15 = (((uint64_t)(((smem_q_addr + q_stage_c_0 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_b_3 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_15 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_15);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 0, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[0]), "r"(acc_w_bf16_13[1]), "r"(acc_w_bf16_13[2]), "r"(acc_w_bf16_13[3]), "l"(wgmma_b_3)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[4]), "r"(acc_w_bf16_13[(4) + 1]), "r"(acc_w_bf16_13[(4) + 2]), "r"(acc_w_bf16_13[(4) + 3]), "l"(wgmma_b_3 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[8]), "r"(acc_w_bf16_13[(8) + 1]), "r"(acc_w_bf16_13[(8) + 2]), "r"(acc_w_bf16_13[(8) + 3]), "l"(wgmma_b_3 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[12]), "r"(acc_w_bf16_13[(12) + 1]), "r"(acc_w_bf16_13[(12) + 2]), "r"(acc_w_bf16_13[(12) + 3]), "l"(wgmma_b_3 + 6ull)
-                        : "memory");
-                    uint64_t _wgmma_desc_16 = (((uint64_t)(((smem_q_addr + q_stage_c_0 * 16384 + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_b_1_0 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_16 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_16);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[16]), "r"(acc_w_bf16_13[(16) + 1]), "r"(acc_w_bf16_13[(16) + 2]), "r"(acc_w_bf16_13[(16) + 3]), "l"(wgmma_b_1_0)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[20]), "r"(acc_w_bf16_13[(20) + 1]), "r"(acc_w_bf16_13[(20) + 2]), "r"(acc_w_bf16_13[(20) + 3]), "l"(wgmma_b_1_0 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[24]), "r"(acc_w_bf16_13[(24) + 1]), "r"(acc_w_bf16_13[(24) + 2]), "r"(acc_w_bf16_13[(24) + 3]), "l"(wgmma_b_1_0 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_13[28]), "r"(acc_w_bf16_13[(28) + 1]), "r"(acc_w_bf16_13[(28) + 2]), "r"(acc_w_bf16_13[(28) + 3]), "l"(wgmma_b_1_0 + 6ull)
-                        : "memory");
-                    asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-                    asm volatile("" : "+f"(nv[0]) :: "memory");
-                    asm volatile("" : "+f"(nv[1]) :: "memory");
-                    asm volatile("" : "+f"(nv[2]) :: "memory");
-                    asm volatile("" : "+f"(nv[3]) :: "memory");
-                    asm volatile("" : "+f"(nv[4]) :: "memory");
-                    asm volatile("" : "+f"(nv[5]) :: "memory");
-                    asm volatile("" : "+f"(nv[6]) :: "memory");
-                    asm volatile("" : "+f"(nv[7]) :: "memory");
-                    asm volatile("" : "+f"(nv[8]) :: "memory");
-                    asm volatile("" : "+f"(nv[9]) :: "memory");
-                    asm volatile("" : "+f"(nv[10]) :: "memory");
-                    asm volatile("" : "+f"(nv[11]) :: "memory");
-                    asm volatile("" : "+f"(nv[12]) :: "memory");
-                    asm volatile("" : "+f"(nv[13]) :: "memory");
-                    asm volatile("" : "+f"(nv[14]) :: "memory");
-                    asm volatile("" : "+f"(nv[15]) :: "memory");
-                    asm volatile("" : "+f"(nv[16]) :: "memory");
-                    asm volatile("" : "+f"(nv[17]) :: "memory");
-                    asm volatile("" : "+f"(nv[18]) :: "memory");
-                    asm volatile("" : "+f"(nv[19]) :: "memory");
-                    asm volatile("" : "+f"(nv[20]) :: "memory");
-                    asm volatile("" : "+f"(nv[21]) :: "memory");
-                    asm volatile("" : "+f"(nv[22]) :: "memory");
-                    asm volatile("" : "+f"(nv[23]) :: "memory");
-                    asm volatile("" : "+f"(nv[24]) :: "memory");
-                    asm volatile("" : "+f"(nv[25]) :: "memory");
-                    asm volatile("" : "+f"(nv[26]) :: "memory");
-                    asm volatile("" : "+f"(nv[27]) :: "memory");
-                    asm volatile("" : "+f"(nv[28]) :: "memory");
-                    asm volatile("" : "+f"(nv[29]) :: "memory");
-                    asm volatile("" : "+f"(nv[30]) :: "memory");
-                    asm volatile("" : "+f"(nv[31]) :: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
-                    mbarrier_arrive(w_empty_addr + 8);
-                    mbarrier_arrive(ainv_empty_addr + 8);
-                    int v_stage_bytes_0 = (int)v_stage_cg1 * 8192;
-                    #pragma unroll
-                    for (int j_7 = 0; j_7 < 32; j_7++) {
-                        int m_col_1 = j_7 / 4 * 8 + lane_quad_0 * 2 + (j_7 & 3 & 1);
-                        int v_row_1 = warp_id_1_1 * 16 + lane_row_0 + (j_7 & 3) / 2 * 8;
-                        float v_val_1 = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes_0 + (m_col_1 * 128 + v_row_1 * 2 ^ (m_col_1 * 128 + v_row_1 * 2 >> 7 & 7) << 4)))[0];
-                        float beta_m_1 = smem_beta[gate_elem_base_0 + m_col_1];
-                        nv[j_7] = __fmaf_rn(-beta_m_1, v_val_1, nv[j_7]);
-                    }
-                    mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
-                    v_stage_cg1 += 1;
-                    if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
-                    mbarrier_arrive(beta_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
-                    unsigned int acc_w_bf16_14[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                        acc_w_bf16_14[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    float last_cumsumlog_0 = smem_cumsumlog[gate_elem_base_0 + 64 - 1];
-                    #pragma unroll
-                    for (int j_8 = 0; j_8 < 32; j_8++) {
-                        int col_6 = j_8 / 4 * 8 + lane_quad_0 * 2 + (j_8 & 3 & 1);
-                        float _exp2_17 = approx_exp2(last_cumsumlog_0 - smem_cumsumlog[gate_elem_base_0 + col_6]);
-                        nv[j_8] = nv[j_8] * (-_exp2_17);
-                    }
-                    unsigned int acc_w_bf16_15[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                        acc_w_bf16_15[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    float unpack_bf16_0[32];
-                    #pragma unroll
-                    for (int _pair = 0; _pair < 16; _pair++) {
-                        (&unpack_bf16_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_15[_pair]) << 16);
-                        (&unpack_bf16_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_15[_pair]) & 0xffff0000u);
-                    }
-                    nv[0] = nv[0] - unpack_bf16_0[0];
-                    nv[1] = nv[1] - unpack_bf16_0[1];
-                    nv[2] = nv[2] - unpack_bf16_0[2];
-                    nv[3] = nv[3] - unpack_bf16_0[3];
-                    nv[4] = nv[4] - unpack_bf16_0[4];
-                    nv[5] = nv[5] - unpack_bf16_0[5];
-                    nv[6] = nv[6] - unpack_bf16_0[6];
-                    nv[7] = nv[7] - unpack_bf16_0[7];
-                    nv[8] = nv[8] - unpack_bf16_0[8];
-                    nv[9] = nv[9] - unpack_bf16_0[9];
-                    nv[10] = nv[10] - unpack_bf16_0[10];
-                    nv[11] = nv[11] - unpack_bf16_0[11];
-                    nv[12] = nv[12] - unpack_bf16_0[12];
-                    nv[13] = nv[13] - unpack_bf16_0[13];
-                    nv[14] = nv[14] - unpack_bf16_0[14];
-                    nv[15] = nv[15] - unpack_bf16_0[15];
-                    nv[16] = nv[16] - unpack_bf16_0[16];
-                    nv[17] = nv[17] - unpack_bf16_0[17];
-                    nv[18] = nv[18] - unpack_bf16_0[18];
-                    nv[19] = nv[19] - unpack_bf16_0[19];
-                    nv[20] = nv[20] - unpack_bf16_0[20];
-                    nv[21] = nv[21] - unpack_bf16_0[21];
-                    nv[22] = nv[22] - unpack_bf16_0[22];
-                    nv[23] = nv[23] - unpack_bf16_0[23];
-                    nv[24] = nv[24] - unpack_bf16_0[24];
-                    nv[25] = nv[25] - unpack_bf16_0[25];
-                    nv[26] = nv[26] - unpack_bf16_0[26];
-                    nv[27] = nv[27] - unpack_bf16_0[27];
-                    nv[28] = nv[28] - unpack_bf16_0[28];
-                    nv[29] = nv[29] - unpack_bf16_0[29];
-                    nv[30] = nv[30] - unpack_bf16_0[30];
-                    nv[31] = nv[31] - unpack_bf16_0[31];
-                    unsigned int acc_w_bf16_16[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                        acc_w_bf16_16[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-                    mbarrier_arrive(q_smem_empty_addr + (q_stage_cg1) * 8);
-                    q_stage_cg1 += 1;
-                    if (q_stage_cg1 == 2) { q_stage_cg1 = 0; _phase_load_q_full_1 ^= 1; }
-                    #pragma unroll
-                    for (int j_9 = 0; j_9 < 32; j_9++) {
-                        int col_7 = j_9 / 4 * 8 + lane_quad_0 * 2 + (j_9 & 3 & 1);
-                        int r_col_1 = b_1_1 + col_7 * num_householder;
-                        int r_clamped_3 = ((col_7 < cnt_1_1) ? r_col_1 : 0);
-                        float qs_scale_1 = ((col_7 < cnt_1_1) ? smem_cumprod[gate_elem_base_0 + r_clamped_3] * scale_eff_1 : 0.0f);
-                        q_state[j_9] = q_state[j_9] * qs_scale_1;
-                    }
-                    mbarrier_arrive(gate_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
-                    mbarrier_wait(load_k_full_addr + (k_stage_cg1) * 8, _phase_load_k_full_1);
-                    mbarrier_wait(qk_ready_addr + 8, _phase_qk_ready_1);
-                    _phase_qk_ready_1 ^= 1;
-                    asm volatile("" : "+f"(state[0]) :: "memory");
-                    asm volatile("" : "+f"(state[1]) :: "memory");
-                    asm volatile("" : "+f"(state[2]) :: "memory");
-                    asm volatile("" : "+f"(state[3]) :: "memory");
-                    asm volatile("" : "+f"(state[4]) :: "memory");
-                    asm volatile("" : "+f"(state[5]) :: "memory");
-                    asm volatile("" : "+f"(state[6]) :: "memory");
-                    asm volatile("" : "+f"(state[7]) :: "memory");
-                    asm volatile("" : "+f"(state[8]) :: "memory");
-                    asm volatile("" : "+f"(state[9]) :: "memory");
-                    asm volatile("" : "+f"(state[10]) :: "memory");
-                    asm volatile("" : "+f"(state[11]) :: "memory");
-                    asm volatile("" : "+f"(state[12]) :: "memory");
-                    asm volatile("" : "+f"(state[13]) :: "memory");
-                    asm volatile("" : "+f"(state[14]) :: "memory");
-                    asm volatile("" : "+f"(state[15]) :: "memory");
-                    asm volatile("" : "+f"(state[16]) :: "memory");
-                    asm volatile("" : "+f"(state[17]) :: "memory");
-                    asm volatile("" : "+f"(state[18]) :: "memory");
-                    asm volatile("" : "+f"(state[19]) :: "memory");
-                    asm volatile("" : "+f"(state[20]) :: "memory");
-                    asm volatile("" : "+f"(state[21]) :: "memory");
-                    asm volatile("" : "+f"(state[22]) :: "memory");
-                    asm volatile("" : "+f"(state[23]) :: "memory");
-                    asm volatile("" : "+f"(state[24]) :: "memory");
-                    asm volatile("" : "+f"(state[25]) :: "memory");
-                    asm volatile("" : "+f"(state[26]) :: "memory");
-                    asm volatile("" : "+f"(state[27]) :: "memory");
-                    asm volatile("" : "+f"(state[28]) :: "memory");
-                    asm volatile("" : "+f"(state[29]) :: "memory");
-                    asm volatile("" : "+f"(state[30]) :: "memory");
-                    asm volatile("" : "+f"(state[31]) :: "memory");
-                    asm volatile("" : "+f"(state[32]) :: "memory");
-                    asm volatile("" : "+f"(state[33]) :: "memory");
-                    asm volatile("" : "+f"(state[34]) :: "memory");
-                    asm volatile("" : "+f"(state[35]) :: "memory");
-                    asm volatile("" : "+f"(state[36]) :: "memory");
-                    asm volatile("" : "+f"(state[37]) :: "memory");
-                    asm volatile("" : "+f"(state[38]) :: "memory");
-                    asm volatile("" : "+f"(state[39]) :: "memory");
-                    asm volatile("" : "+f"(state[40]) :: "memory");
-                    asm volatile("" : "+f"(state[41]) :: "memory");
-                    asm volatile("" : "+f"(state[42]) :: "memory");
-                    asm volatile("" : "+f"(state[43]) :: "memory");
-                    asm volatile("" : "+f"(state[44]) :: "memory");
-                    asm volatile("" : "+f"(state[45]) :: "memory");
-                    asm volatile("" : "+f"(state[46]) :: "memory");
-                    asm volatile("" : "+f"(state[47]) :: "memory");
-                    asm volatile("" : "+f"(state[48]) :: "memory");
-                    asm volatile("" : "+f"(state[49]) :: "memory");
-                    asm volatile("" : "+f"(state[50]) :: "memory");
-                    asm volatile("" : "+f"(state[51]) :: "memory");
-                    asm volatile("" : "+f"(state[52]) :: "memory");
-                    asm volatile("" : "+f"(state[53]) :: "memory");
-                    asm volatile("" : "+f"(state[54]) :: "memory");
-                    asm volatile("" : "+f"(state[55]) :: "memory");
-                    asm volatile("" : "+f"(state[56]) :: "memory");
-                    asm volatile("" : "+f"(state[57]) :: "memory");
-                    asm volatile("" : "+f"(state[58]) :: "memory");
-                    asm volatile("" : "+f"(state[59]) :: "memory");
-                    asm volatile("" : "+f"(state[60]) :: "memory");
-                    asm volatile("" : "+f"(state[61]) :: "memory");
-                    asm volatile("" : "+f"(state[62]) :: "memory");
-                    asm volatile("" : "+f"(state[63]) :: "memory");
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_14[15]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_15[15]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[0]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[1]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[2]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[3]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[4]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[5]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[6]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[7]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[8]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[9]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[10]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[11]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[12]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[13]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[14]) :: "memory");
-                    asm volatile("" : "+r"(acc_w_bf16_16[15]) :: "memory");
-                    asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                    uint64_t _wgmma_desc_18 = (((uint64_t)(((smem_k_mn_addr + k_stage_c_0 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                    uint64_t wgmma_b_2_0 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_18 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_18);
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_15[0]), "r"(acc_w_bf16_15[1]), "r"(acc_w_bf16_15[2]), "r"(acc_w_bf16_15[3]), "l"(wgmma_b_2_0)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_15[4]), "r"(acc_w_bf16_15[(4) + 1]), "r"(acc_w_bf16_15[(4) + 2]), "r"(acc_w_bf16_15[(4) + 3]), "l"(wgmma_b_2_0 + 128ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_15[8]), "r"(acc_w_bf16_15[(8) + 1]), "r"(acc_w_bf16_15[(8) + 2]), "r"(acc_w_bf16_15[(8) + 3]), "l"(wgmma_b_2_0 + 256ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_15[12]), "r"(acc_w_bf16_15[(12) + 1]), "r"(acc_w_bf16_15[(12) + 2]), "r"(acc_w_bf16_15[(12) + 3]), "l"(wgmma_b_2_0 + 384ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_16[0]), "r"(acc_w_bf16_16[1]), "r"(acc_w_bf16_16[2]), "r"(acc_w_bf16_16[3]), "l"(wgmma_b_2_0)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_16[4]), "r"(acc_w_bf16_16[(4) + 1]), "r"(acc_w_bf16_16[(4) + 2]), "r"(acc_w_bf16_16[(4) + 3]), "l"(wgmma_b_2_0 + 128ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_16[8]), "r"(acc_w_bf16_16[(8) + 1]), "r"(acc_w_bf16_16[(8) + 2]), "r"(acc_w_bf16_16[(8) + 3]), "l"(wgmma_b_2_0 + 256ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
-                        : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(acc_w_bf16_16[12]), "r"(acc_w_bf16_16[(12) + 1]), "r"(acc_w_bf16_16[(12) + 2]), "r"(acc_w_bf16_16[(12) + 3]), "l"(wgmma_b_2_0 + 384ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_14[0]), "r"(acc_w_bf16_14[1]), "r"(acc_w_bf16_14[2]), "r"(acc_w_bf16_14[3]), "l"(_wgmma_b_9)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_14[4]), "r"(acc_w_bf16_14[(4) + 1]), "r"(acc_w_bf16_14[(4) + 2]), "r"(acc_w_bf16_14[(4) + 3]), "l"(_wgmma_b_9 + 2ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_14[8]), "r"(acc_w_bf16_14[(8) + 1]), "r"(acc_w_bf16_14[(8) + 2]), "r"(acc_w_bf16_14[(8) + 3]), "l"(_wgmma_b_9 + 4ull)
-                        : "memory");
-                    asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                        : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(acc_w_bf16_14[12]), "r"(acc_w_bf16_14[(12) + 1]), "r"(acc_w_bf16_14[(12) + 2]), "r"(acc_w_bf16_14[(12) + 3]), "l"(_wgmma_b_9 + 6ull)
-                        : "memory");
-                    asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-                    asm volatile("" : "+f"(state[0]) :: "memory");
-                    asm volatile("" : "+f"(state[1]) :: "memory");
-                    asm volatile("" : "+f"(state[2]) :: "memory");
-                    asm volatile("" : "+f"(state[3]) :: "memory");
-                    asm volatile("" : "+f"(state[4]) :: "memory");
-                    asm volatile("" : "+f"(state[5]) :: "memory");
-                    asm volatile("" : "+f"(state[6]) :: "memory");
-                    asm volatile("" : "+f"(state[7]) :: "memory");
-                    asm volatile("" : "+f"(state[8]) :: "memory");
-                    asm volatile("" : "+f"(state[9]) :: "memory");
-                    asm volatile("" : "+f"(state[10]) :: "memory");
-                    asm volatile("" : "+f"(state[11]) :: "memory");
-                    asm volatile("" : "+f"(state[12]) :: "memory");
-                    asm volatile("" : "+f"(state[13]) :: "memory");
-                    asm volatile("" : "+f"(state[14]) :: "memory");
-                    asm volatile("" : "+f"(state[15]) :: "memory");
-                    asm volatile("" : "+f"(state[16]) :: "memory");
-                    asm volatile("" : "+f"(state[17]) :: "memory");
-                    asm volatile("" : "+f"(state[18]) :: "memory");
-                    asm volatile("" : "+f"(state[19]) :: "memory");
-                    asm volatile("" : "+f"(state[20]) :: "memory");
-                    asm volatile("" : "+f"(state[21]) :: "memory");
-                    asm volatile("" : "+f"(state[22]) :: "memory");
-                    asm volatile("" : "+f"(state[23]) :: "memory");
-                    asm volatile("" : "+f"(state[24]) :: "memory");
-                    asm volatile("" : "+f"(state[25]) :: "memory");
-                    asm volatile("" : "+f"(state[26]) :: "memory");
-                    asm volatile("" : "+f"(state[27]) :: "memory");
-                    asm volatile("" : "+f"(state[28]) :: "memory");
-                    asm volatile("" : "+f"(state[29]) :: "memory");
-                    asm volatile("" : "+f"(state[30]) :: "memory");
-                    asm volatile("" : "+f"(state[31]) :: "memory");
-                    asm volatile("" : "+f"(state[32]) :: "memory");
-                    asm volatile("" : "+f"(state[33]) :: "memory");
-                    asm volatile("" : "+f"(state[34]) :: "memory");
-                    asm volatile("" : "+f"(state[35]) :: "memory");
-                    asm volatile("" : "+f"(state[36]) :: "memory");
-                    asm volatile("" : "+f"(state[37]) :: "memory");
-                    asm volatile("" : "+f"(state[38]) :: "memory");
-                    asm volatile("" : "+f"(state[39]) :: "memory");
-                    asm volatile("" : "+f"(state[40]) :: "memory");
-                    asm volatile("" : "+f"(state[41]) :: "memory");
-                    asm volatile("" : "+f"(state[42]) :: "memory");
-                    asm volatile("" : "+f"(state[43]) :: "memory");
-                    asm volatile("" : "+f"(state[44]) :: "memory");
-                    asm volatile("" : "+f"(state[45]) :: "memory");
-                    asm volatile("" : "+f"(state[46]) :: "memory");
-                    asm volatile("" : "+f"(state[47]) :: "memory");
-                    asm volatile("" : "+f"(state[48]) :: "memory");
-                    asm volatile("" : "+f"(state[49]) :: "memory");
-                    asm volatile("" : "+f"(state[50]) :: "memory");
-                    asm volatile("" : "+f"(state[51]) :: "memory");
-                    asm volatile("" : "+f"(state[52]) :: "memory");
-                    asm volatile("" : "+f"(state[53]) :: "memory");
-                    asm volatile("" : "+f"(state[54]) :: "memory");
-                    asm volatile("" : "+f"(state[55]) :: "memory");
-                    asm volatile("" : "+f"(state[56]) :: "memory");
-                    asm volatile("" : "+f"(state[57]) :: "memory");
-                    asm volatile("" : "+f"(state[58]) :: "memory");
-                    asm volatile("" : "+f"(state[59]) :: "memory");
-                    asm volatile("" : "+f"(state[60]) :: "memory");
-                    asm volatile("" : "+f"(state[61]) :: "memory");
-                    asm volatile("" : "+f"(state[62]) :: "memory");
-                    asm volatile("" : "+f"(state[63]) :: "memory");
-                    asm volatile("" : "+f"(q_state[0]) :: "memory");
-                    asm volatile("" : "+f"(q_state[1]) :: "memory");
-                    asm volatile("" : "+f"(q_state[2]) :: "memory");
-                    asm volatile("" : "+f"(q_state[3]) :: "memory");
-                    asm volatile("" : "+f"(q_state[4]) :: "memory");
-                    asm volatile("" : "+f"(q_state[5]) :: "memory");
-                    asm volatile("" : "+f"(q_state[6]) :: "memory");
-                    asm volatile("" : "+f"(q_state[7]) :: "memory");
-                    asm volatile("" : "+f"(q_state[8]) :: "memory");
-                    asm volatile("" : "+f"(q_state[9]) :: "memory");
-                    asm volatile("" : "+f"(q_state[10]) :: "memory");
-                    asm volatile("" : "+f"(q_state[11]) :: "memory");
-                    asm volatile("" : "+f"(q_state[12]) :: "memory");
-                    asm volatile("" : "+f"(q_state[13]) :: "memory");
-                    asm volatile("" : "+f"(q_state[14]) :: "memory");
-                    asm volatile("" : "+f"(q_state[15]) :: "memory");
-                    asm volatile("" : "+f"(q_state[16]) :: "memory");
-                    asm volatile("" : "+f"(q_state[17]) :: "memory");
-                    asm volatile("" : "+f"(q_state[18]) :: "memory");
-                    asm volatile("" : "+f"(q_state[19]) :: "memory");
-                    asm volatile("" : "+f"(q_state[20]) :: "memory");
-                    asm volatile("" : "+f"(q_state[21]) :: "memory");
-                    asm volatile("" : "+f"(q_state[22]) :: "memory");
-                    asm volatile("" : "+f"(q_state[23]) :: "memory");
-                    asm volatile("" : "+f"(q_state[24]) :: "memory");
-                    asm volatile("" : "+f"(q_state[25]) :: "memory");
-                    asm volatile("" : "+f"(q_state[26]) :: "memory");
-                    asm volatile("" : "+f"(q_state[27]) :: "memory");
-                    asm volatile("" : "+f"(q_state[28]) :: "memory");
-                    asm volatile("" : "+f"(q_state[29]) :: "memory");
-                    asm volatile("" : "+f"(q_state[30]) :: "memory");
-                    asm volatile("" : "+f"(q_state[31]) :: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-                    mbarrier_arrive(load_k_empty_addr + (k_stage_cg1) * 8);
-                    k_stage_cg1 += 1;
-                    if (k_stage_cg1 == 3) { k_stage_cg1 = 0; _phase_load_k_full_1 ^= 1; }
-                    mbarrier_arrive(qk_empty_addr + 8);
-                    unsigned int acc_w_bf16_17[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(q_state[_lp*2 + 0], q_state[_lp*2+1 + 0]));
-                        acc_w_bf16_17[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    unsigned int o_base_0 = smem_o_addr + 8192;
-                    int mtx_0 = lane / 8;
-                    int row_in_mtx_0 = lane & 7;
-                    #pragma unroll
-                    for (int tok_group_1 = 0; tok_group_1 < 4; tok_group_1++) {
-                        int v_base_1 = warp_id_1_1 * 16 + (mtx_0 & 1) * 8;
-                        int tok_1 = tok_group_1 * 16 + mtx_0 / 2 * 8 + row_in_mtx_0;
-                        unsigned int st_addr_24 = o_base_0 + (unsigned int)(tok_1 * 128 + v_base_1 * 2 ^ (tok_1 * 128 + v_base_1 * 2 >> 7 & 7) << 4);
-                        uint32_t _stmatrix_addr_19 = static_cast<uint32_t>((unsigned long long)st_addr_24);
-                        asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                            :: "r"(_stmatrix_addr_19), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4 + 3]))
-                            : "memory");
-                    }
-                    asm volatile("barrier.sync 14, 128;" ::: "memory");
-                    int tid_cg1_0 = warp_id_1_1 * 32 + lane;
-                    int o_chunk_0 = tid_cg1_0 & 7;
-                    int chunk_writes_0 = ((write_lo_1 <= chunk_lo_1 + 1 && write_end > chunk_lo_1 + 1) ? 1 : 0);
-                    #pragma unroll
-                    for (int o_round_1 = 0; o_round_1 < 4; o_round_1++) {
-                        int o_row_1 = o_round_1 * 16 + tid_cg1_0 / 8;
-                        if (o_row_1 < cnt_1_1 && batch_end_1 > t0_1_1 + o_row_1 && chunk_writes_0 != 0) {
-                            unsigned int o_words_1[4];
-                            unsigned int o_src_1 = o_base_0 + (unsigned int)(o_row_1 * 128 + ((o_chunk_0 ^ o_row_1 & 7) << 4));
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[(0) + 3]))
-                                : "r"(o_src_1));
-                            long long o_index_1 = ((long long)(t0_1_1 + o_row_1) * (long long)num_heads + (long long)head_idx_1) * 64ll + (long long)(o_chunk_0 * 8);
-                            reinterpret_cast<int4*>(O + o_index_1)[0] = reinterpret_cast<int4*>(o_words_1)[0];
-                        }
-                    }
                     #pragma unroll 1
-                    for (int chunk_idx_1 = chunk_lo_1 + 2; chunk_idx_1 < chunk_lo_1 + num_chunks_t_1; chunk_idx_1 += 2) {
-                        int warp_id_2_1 = warp_id_in_role_1;
-                        int lane_quad_1_1 = lane & 3;
-                        int lane_row_1_1 = lane >> 2;
-                        unsigned int v_stage_c_1 = v_stage_cg1;
-                        unsigned int q_stage_c_1 = q_stage_cg1;
-                        unsigned int k_stage_c_1 = k_stage_cg1;
-                        unsigned int gate_stage_1 = gate_cg1_stage;
+                    for (int chunk_idx_1 = chunk_lo_1; chunk_idx_1 < chunk_lo_1 + num_chunks_t_1; chunk_idx_1 += 2) {
+                        int warp_id_0 = warp_id_in_role_1;
+                        int lane_quad_1 = lane & 3;
+                        int lane_row_1 = lane >> 2;
+                        unsigned int v_stage_c = v_stage_cg1;
+                        unsigned int q_stage_c = q_stage_cg1;
+                        unsigned int k_stage_c = k_stage_cg1;
+                        unsigned int gate_stage = gate_cg1_stage;
                         mbarrier_wait(load_gate_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
                         mbarrier_wait(load_beta_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
                         gate_cg1_stage += 1;
                         if (gate_cg1_stage == 4) { gate_cg1_stage = 0; _phase_load_gate_full_1 ^= 1; }
-                        int gate_elem_base_1 = gate_stage_1 * 64;
-                        float chunk_decay_1 = smem_cumprod[gate_elem_base_1 + 64 - 1];
-                        int exp_off_2 = chunk_idx_1 * 64;
-                        int tok_off_2 = exp_off_2 / num_householder;
-                        int rem_2 = exp_off_2 - tok_off_2 * num_householder;
-                        int t0_2 = batch_start_1 + tok_off_2;
-                        int b_2 = num_householder - 1 - rem_2;
-                        int cnt_2 = (63 - b_2) / num_householder + 1;
-                        int cg1_first_1 = ((warp_id_2_1 == 0 && lane == 0) ? 1 : 0);
-                        unsigned int acc_w_bf16_18[32];
+                        int gate_elem_base = gate_stage * 64;
+                        float chunk_decay = smem_cumprod[gate_elem_base + 64 - 1];
+                        int exp_off_1 = chunk_idx_1 * 64;
+                        int tok_off_1 = exp_off_1 / num_householder;
+                        int rem_1 = exp_off_1 - tok_off_1 * num_householder;
+                        int t0_1 = batch_start_1 + tok_off_1;
+                        int b_1 = num_householder - 1 - rem_1;
+                        int cnt_1 = (63 - b_1) / num_householder + 1;
+                        int cg1_first = ((warp_id_0 == 0 && lane == 0) ? 1 : 0);
+                        unsigned int acc_w_bf16_9[32];
                         #pragma unroll
                         for (int _lp = 0; _lp < 32; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state[_lp*2 + 0], state[_lp*2+1 + 0]));
-                            acc_w_bf16_18[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_9[_lp] = *(uint32_t*)&_bf2;
                         }
-                        state[0] = state[0] * chunk_decay_1;
-                        state[1] = state[1] * chunk_decay_1;
-                        state[2] = state[2] * chunk_decay_1;
-                        state[3] = state[3] * chunk_decay_1;
-                        state[4] = state[4] * chunk_decay_1;
-                        state[5] = state[5] * chunk_decay_1;
-                        state[6] = state[6] * chunk_decay_1;
-                        state[7] = state[7] * chunk_decay_1;
-                        state[8] = state[8] * chunk_decay_1;
-                        state[9] = state[9] * chunk_decay_1;
-                        state[10] = state[10] * chunk_decay_1;
-                        state[11] = state[11] * chunk_decay_1;
-                        state[12] = state[12] * chunk_decay_1;
-                        state[13] = state[13] * chunk_decay_1;
-                        state[14] = state[14] * chunk_decay_1;
-                        state[15] = state[15] * chunk_decay_1;
-                        state[16] = state[16] * chunk_decay_1;
-                        state[17] = state[17] * chunk_decay_1;
-                        state[18] = state[18] * chunk_decay_1;
-                        state[19] = state[19] * chunk_decay_1;
-                        state[20] = state[20] * chunk_decay_1;
-                        state[21] = state[21] * chunk_decay_1;
-                        state[22] = state[22] * chunk_decay_1;
-                        state[23] = state[23] * chunk_decay_1;
-                        state[24] = state[24] * chunk_decay_1;
-                        state[25] = state[25] * chunk_decay_1;
-                        state[26] = state[26] * chunk_decay_1;
-                        state[27] = state[27] * chunk_decay_1;
-                        state[28] = state[28] * chunk_decay_1;
-                        state[29] = state[29] * chunk_decay_1;
-                        state[30] = state[30] * chunk_decay_1;
-                        state[31] = state[31] * chunk_decay_1;
-                        state[32] = state[32] * chunk_decay_1;
-                        state[33] = state[33] * chunk_decay_1;
-                        state[34] = state[34] * chunk_decay_1;
-                        state[35] = state[35] * chunk_decay_1;
-                        state[36] = state[36] * chunk_decay_1;
-                        state[37] = state[37] * chunk_decay_1;
-                        state[38] = state[38] * chunk_decay_1;
-                        state[39] = state[39] * chunk_decay_1;
-                        state[40] = state[40] * chunk_decay_1;
-                        state[41] = state[41] * chunk_decay_1;
-                        state[42] = state[42] * chunk_decay_1;
-                        state[43] = state[43] * chunk_decay_1;
-                        state[44] = state[44] * chunk_decay_1;
-                        state[45] = state[45] * chunk_decay_1;
-                        state[46] = state[46] * chunk_decay_1;
-                        state[47] = state[47] * chunk_decay_1;
-                        state[48] = state[48] * chunk_decay_1;
-                        state[49] = state[49] * chunk_decay_1;
-                        state[50] = state[50] * chunk_decay_1;
-                        state[51] = state[51] * chunk_decay_1;
-                        state[52] = state[52] * chunk_decay_1;
-                        state[53] = state[53] * chunk_decay_1;
-                        state[54] = state[54] * chunk_decay_1;
-                        state[55] = state[55] * chunk_decay_1;
-                        state[56] = state[56] * chunk_decay_1;
-                        state[57] = state[57] * chunk_decay_1;
-                        state[58] = state[58] * chunk_decay_1;
-                        state[59] = state[59] * chunk_decay_1;
-                        state[60] = state[60] * chunk_decay_1;
-                        state[61] = state[61] * chunk_decay_1;
-                        state[62] = state[62] * chunk_decay_1;
-                        state[63] = state[63] * chunk_decay_1;
+                        state[0] = state[0] * chunk_decay;
+                        state[1] = state[1] * chunk_decay;
+                        state[2] = state[2] * chunk_decay;
+                        state[3] = state[3] * chunk_decay;
+                        state[4] = state[4] * chunk_decay;
+                        state[5] = state[5] * chunk_decay;
+                        state[6] = state[6] * chunk_decay;
+                        state[7] = state[7] * chunk_decay;
+                        state[8] = state[8] * chunk_decay;
+                        state[9] = state[9] * chunk_decay;
+                        state[10] = state[10] * chunk_decay;
+                        state[11] = state[11] * chunk_decay;
+                        state[12] = state[12] * chunk_decay;
+                        state[13] = state[13] * chunk_decay;
+                        state[14] = state[14] * chunk_decay;
+                        state[15] = state[15] * chunk_decay;
+                        state[16] = state[16] * chunk_decay;
+                        state[17] = state[17] * chunk_decay;
+                        state[18] = state[18] * chunk_decay;
+                        state[19] = state[19] * chunk_decay;
+                        state[20] = state[20] * chunk_decay;
+                        state[21] = state[21] * chunk_decay;
+                        state[22] = state[22] * chunk_decay;
+                        state[23] = state[23] * chunk_decay;
+                        state[24] = state[24] * chunk_decay;
+                        state[25] = state[25] * chunk_decay;
+                        state[26] = state[26] * chunk_decay;
+                        state[27] = state[27] * chunk_decay;
+                        state[28] = state[28] * chunk_decay;
+                        state[29] = state[29] * chunk_decay;
+                        state[30] = state[30] * chunk_decay;
+                        state[31] = state[31] * chunk_decay;
+                        state[32] = state[32] * chunk_decay;
+                        state[33] = state[33] * chunk_decay;
+                        state[34] = state[34] * chunk_decay;
+                        state[35] = state[35] * chunk_decay;
+                        state[36] = state[36] * chunk_decay;
+                        state[37] = state[37] * chunk_decay;
+                        state[38] = state[38] * chunk_decay;
+                        state[39] = state[39] * chunk_decay;
+                        state[40] = state[40] * chunk_decay;
+                        state[41] = state[41] * chunk_decay;
+                        state[42] = state[42] * chunk_decay;
+                        state[43] = state[43] * chunk_decay;
+                        state[44] = state[44] * chunk_decay;
+                        state[45] = state[45] * chunk_decay;
+                        state[46] = state[46] * chunk_decay;
+                        state[47] = state[47] * chunk_decay;
+                        state[48] = state[48] * chunk_decay;
+                        state[49] = state[49] * chunk_decay;
+                        state[50] = state[50] * chunk_decay;
+                        state[51] = state[51] * chunk_decay;
+                        state[52] = state[52] * chunk_decay;
+                        state[53] = state[53] * chunk_decay;
+                        state[54] = state[54] * chunk_decay;
+                        state[55] = state[55] * chunk_decay;
+                        state[56] = state[56] * chunk_decay;
+                        state[57] = state[57] * chunk_decay;
+                        state[58] = state[58] * chunk_decay;
+                        state[59] = state[59] * chunk_decay;
+                        state[60] = state[60] * chunk_decay;
+                        state[61] = state[61] * chunk_decay;
+                        state[62] = state[62] * chunk_decay;
+                        state[63] = state[63] * chunk_decay;
                         mbarrier_wait(ainv_ready_addr, _phase_ainv_ready_0_1);
                         _phase_ainv_ready_0_1 ^= 1;
                         mbarrier_wait(load_v_full_addr + (v_stage_cg1) * 8, _phase_load_v_full);
@@ -3543,88 +1997,88 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("" : "+f"(nv[29]) :: "memory");
                         asm volatile("" : "+f"(nv[30]) :: "memory");
                         asm volatile("" : "+f"(nv[31]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[15]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[16]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[17]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[18]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[19]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[20]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[21]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[22]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[23]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[24]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[25]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[26]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[27]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[28]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[29]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[30]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_18[31]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[16]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[17]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[18]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[19]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[20]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[21]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[22]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[23]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[24]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[25]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[26]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[27]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[28]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[29]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[30]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9[31]) :: "memory");
                         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                        uint64_t _wgmma_desc_20 = (((uint64_t)(((smem_v_mn_addr + v_stage_c_1 * 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_a_6 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_20 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_20);
+                        uint64_t _wgmma_desc_8 = (((uint64_t)(((smem_v_mn_addr + v_stage_c * 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_a_5 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_8 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_8);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 0, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_6), "l"(_wgmma_b_2)
+                            : "l"(wgmma_a_5), "l"(_wgmma_b_2)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_6 + 128ull), "l"(_wgmma_b_2 + 2ull)
+                            : "l"(wgmma_a_5 + 128ull), "l"(_wgmma_b_2 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_6 + 256ull), "l"(_wgmma_b_2 + 4ull)
+                            : "l"(wgmma_a_5 + 256ull), "l"(_wgmma_b_2 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_6 + 384ull), "l"(_wgmma_b_2 + 6ull)
+                            : "l"(wgmma_a_5 + 384ull), "l"(_wgmma_b_2 + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[0]), "r"(acc_w_bf16_18[1]), "r"(acc_w_bf16_18[2]), "r"(acc_w_bf16_18[3]), "l"(_wgmma_b_3)
+                            : "r"(acc_w_bf16_9[0]), "r"(acc_w_bf16_9[1]), "r"(acc_w_bf16_9[2]), "r"(acc_w_bf16_9[3]), "l"(_wgmma_b_3)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[4]), "r"(acc_w_bf16_18[(4) + 1]), "r"(acc_w_bf16_18[(4) + 2]), "r"(acc_w_bf16_18[(4) + 3]), "l"(_wgmma_b_3 + 2ull)
+                            : "r"(acc_w_bf16_9[4]), "r"(acc_w_bf16_9[(4) + 1]), "r"(acc_w_bf16_9[(4) + 2]), "r"(acc_w_bf16_9[(4) + 3]), "l"(_wgmma_b_3 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[8]), "r"(acc_w_bf16_18[(8) + 1]), "r"(acc_w_bf16_18[(8) + 2]), "r"(acc_w_bf16_18[(8) + 3]), "l"(_wgmma_b_3 + 4ull)
+                            : "r"(acc_w_bf16_9[8]), "r"(acc_w_bf16_9[(8) + 1]), "r"(acc_w_bf16_9[(8) + 2]), "r"(acc_w_bf16_9[(8) + 3]), "l"(_wgmma_b_3 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[12]), "r"(acc_w_bf16_18[(12) + 1]), "r"(acc_w_bf16_18[(12) + 2]), "r"(acc_w_bf16_18[(12) + 3]), "l"(_wgmma_b_3 + 6ull)
+                            : "r"(acc_w_bf16_9[12]), "r"(acc_w_bf16_9[(12) + 1]), "r"(acc_w_bf16_9[(12) + 2]), "r"(acc_w_bf16_9[(12) + 3]), "l"(_wgmma_b_3 + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[16]), "r"(acc_w_bf16_18[(16) + 1]), "r"(acc_w_bf16_18[(16) + 2]), "r"(acc_w_bf16_18[(16) + 3]), "l"(_wgmma_b_4)
+                            : "r"(acc_w_bf16_9[16]), "r"(acc_w_bf16_9[(16) + 1]), "r"(acc_w_bf16_9[(16) + 2]), "r"(acc_w_bf16_9[(16) + 3]), "l"(_wgmma_b_4)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[20]), "r"(acc_w_bf16_18[(20) + 1]), "r"(acc_w_bf16_18[(20) + 2]), "r"(acc_w_bf16_18[(20) + 3]), "l"(_wgmma_b_4 + 2ull)
+                            : "r"(acc_w_bf16_9[20]), "r"(acc_w_bf16_9[(20) + 1]), "r"(acc_w_bf16_9[(20) + 2]), "r"(acc_w_bf16_9[(20) + 3]), "l"(_wgmma_b_4 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[24]), "r"(acc_w_bf16_18[(24) + 1]), "r"(acc_w_bf16_18[(24) + 2]), "r"(acc_w_bf16_18[(24) + 3]), "l"(_wgmma_b_4 + 4ull)
+                            : "r"(acc_w_bf16_9[24]), "r"(acc_w_bf16_9[(24) + 1]), "r"(acc_w_bf16_9[(24) + 2]), "r"(acc_w_bf16_9[(24) + 3]), "l"(_wgmma_b_4 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_18[28]), "r"(acc_w_bf16_18[(28) + 1]), "r"(acc_w_bf16_18[(28) + 2]), "r"(acc_w_bf16_18[(28) + 3]), "l"(_wgmma_b_4 + 6ull)
+                            : "r"(acc_w_bf16_9[28]), "r"(acc_w_bf16_9[(28) + 1]), "r"(acc_w_bf16_9[(28) + 2]), "r"(acc_w_bf16_9[(28) + 3]), "l"(_wgmma_b_4 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         mbarrier_wait(load_q_full_addr + (q_stage_cg1) * 8, _phase_load_q_full_1);
@@ -3660,41 +2114,41 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("" : "+f"(q_state[29]) :: "memory");
                         asm volatile("" : "+f"(q_state[30]) :: "memory");
                         asm volatile("" : "+f"(q_state[31]) :: "memory");
-                        uint64_t _wgmma_desc_21 = (((uint64_t)(((smem_q_addr + q_stage_c_1 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_b_4 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_21 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_21);
+                        uint64_t _wgmma_desc_9 = (((uint64_t)(((smem_q_addr + q_stage_c * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_b_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_9 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_9);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 0, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[0]), "r"(acc_w_bf16_18[1]), "r"(acc_w_bf16_18[2]), "r"(acc_w_bf16_18[3]), "l"(wgmma_b_4)
+                            : "r"(acc_w_bf16_9[0]), "r"(acc_w_bf16_9[1]), "r"(acc_w_bf16_9[2]), "r"(acc_w_bf16_9[3]), "l"(wgmma_b_1)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[4]), "r"(acc_w_bf16_18[(4) + 1]), "r"(acc_w_bf16_18[(4) + 2]), "r"(acc_w_bf16_18[(4) + 3]), "l"(wgmma_b_4 + 2ull)
+                            : "r"(acc_w_bf16_9[4]), "r"(acc_w_bf16_9[(4) + 1]), "r"(acc_w_bf16_9[(4) + 2]), "r"(acc_w_bf16_9[(4) + 3]), "l"(wgmma_b_1 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[8]), "r"(acc_w_bf16_18[(8) + 1]), "r"(acc_w_bf16_18[(8) + 2]), "r"(acc_w_bf16_18[(8) + 3]), "l"(wgmma_b_4 + 4ull)
+                            : "r"(acc_w_bf16_9[8]), "r"(acc_w_bf16_9[(8) + 1]), "r"(acc_w_bf16_9[(8) + 2]), "r"(acc_w_bf16_9[(8) + 3]), "l"(wgmma_b_1 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[12]), "r"(acc_w_bf16_18[(12) + 1]), "r"(acc_w_bf16_18[(12) + 2]), "r"(acc_w_bf16_18[(12) + 3]), "l"(wgmma_b_4 + 6ull)
+                            : "r"(acc_w_bf16_9[12]), "r"(acc_w_bf16_9[(12) + 1]), "r"(acc_w_bf16_9[(12) + 2]), "r"(acc_w_bf16_9[(12) + 3]), "l"(wgmma_b_1 + 6ull)
                             : "memory");
-                        uint64_t _wgmma_desc_22 = (((uint64_t)(((smem_q_addr + q_stage_c_1 * 16384 + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_b_1_1_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_22 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_22);
+                        uint64_t _wgmma_desc_10 = (((uint64_t)(((smem_q_addr + q_stage_c * 16384 + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_b_1_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_10 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_10);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[16]), "r"(acc_w_bf16_18[(16) + 1]), "r"(acc_w_bf16_18[(16) + 2]), "r"(acc_w_bf16_18[(16) + 3]), "l"(wgmma_b_1_1_1)
-                            : "memory");
-                        asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                            : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[20]), "r"(acc_w_bf16_18[(20) + 1]), "r"(acc_w_bf16_18[(20) + 2]), "r"(acc_w_bf16_18[(20) + 3]), "l"(wgmma_b_1_1_1 + 2ull)
+                            : "r"(acc_w_bf16_9[16]), "r"(acc_w_bf16_9[(16) + 1]), "r"(acc_w_bf16_9[(16) + 2]), "r"(acc_w_bf16_9[(16) + 3]), "l"(wgmma_b_1_1)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[24]), "r"(acc_w_bf16_18[(24) + 1]), "r"(acc_w_bf16_18[(24) + 2]), "r"(acc_w_bf16_18[(24) + 3]), "l"(wgmma_b_1_1_1 + 4ull)
+                            : "r"(acc_w_bf16_9[20]), "r"(acc_w_bf16_9[(20) + 1]), "r"(acc_w_bf16_9[(20) + 2]), "r"(acc_w_bf16_9[(20) + 3]), "l"(wgmma_b_1_1 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_18[28]), "r"(acc_w_bf16_18[(28) + 1]), "r"(acc_w_bf16_18[(28) + 2]), "r"(acc_w_bf16_18[(28) + 3]), "l"(wgmma_b_1_1_1 + 6ull)
+                            : "r"(acc_w_bf16_9[24]), "r"(acc_w_bf16_9[(24) + 1]), "r"(acc_w_bf16_9[(24) + 2]), "r"(acc_w_bf16_9[(24) + 3]), "l"(wgmma_b_1_1 + 4ull)
+                            : "memory");
+                        asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
+                            : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
+                            : "r"(acc_w_bf16_9[28]), "r"(acc_w_bf16_9[(28) + 1]), "r"(acc_w_bf16_9[(28) + 2]), "r"(acc_w_bf16_9[(28) + 3]), "l"(wgmma_b_1_1 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("" : "+f"(nv[0]) :: "memory");
@@ -3732,81 +2186,82 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
                         mbarrier_arrive(w_empty_addr);
                         mbarrier_arrive(ainv_empty_addr);
-                        int v_stage_bytes_1 = (int)v_stage_cg1 * 8192;
+                        int v_stage_bytes = (int)v_stage_cg1 * 8192;
                         #pragma unroll
-                        for (int j_10 = 0; j_10 < 32; j_10++) {
-                            int m_col_2 = j_10 / 4 * 8 + lane_quad_1_1 * 2 + (j_10 & 3 & 1);
-                            int v_row_2 = warp_id_2_1 * 16 + lane_row_1_1 + (j_10 & 3) / 2 * 8;
-                            float v_val_2 = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes_1 + (m_col_2 * 128 + v_row_2 * 2 ^ (m_col_2 * 128 + v_row_2 * 2 >> 7 & 7) << 4)))[0];
-                            float beta_m_2 = smem_beta[gate_elem_base_1 + m_col_2];
-                            nv[j_10] = __fmaf_rn(-beta_m_2, v_val_2, nv[j_10]);
+                        for (int j_4 = 0; j_4 < 32; j_4++) {
+                            int m_col = j_4 / 4 * 8 + lane_quad_1 * 2 + (j_4 & 3 & 1);
+                            int v_row = warp_id_0 * 16 + lane_row_1 + (j_4 & 3) / 2 * 8;
+                            float v_val = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes + (m_col * 128 + v_row * 2 ^ (m_col * 128 + v_row * 2 >> 7 & 7) << 4)))[0];
+                            float beta_m = smem_beta[gate_elem_base + m_col];
+                            nv[j_4] = __fmaf_rn(-beta_m, v_val, nv[j_4]);
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                         v_stage_cg1 += 1;
                         if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
                         mbarrier_arrive(beta_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
-                        unsigned int acc_w_bf16_19[16];
+                        unsigned int acc_w_bf16_9_1[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                            acc_w_bf16_19[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_9_1[_lp] = *(uint32_t*)&_bf2;
                         }
-                        float last_cumsumlog_1 = smem_cumsumlog[gate_elem_base_1 + 64 - 1];
+                        float last_cumsumlog = smem_cumsumlog[gate_elem_base + 64 - 1];
                         #pragma unroll
-                        for (int j_11 = 0; j_11 < 32; j_11++) {
-                            int col_8 = j_11 / 4 * 8 + lane_quad_1_1 * 2 + (j_11 & 3 & 1);
-                            float _exp2_23 = approx_exp2(last_cumsumlog_1 - smem_cumsumlog[gate_elem_base_1 + col_8]);
-                            nv[j_11] = nv[j_11] * (-_exp2_23);
+                        for (int j_5 = 0; j_5 < 32; j_5++) {
+                            int col_4 = j_5 / 4 * 8 + lane_quad_1 * 2 + (j_5 & 3 & 1);
+                            float _exp2_11 = approx_exp2(last_cumsumlog - smem_cumsumlog[gate_elem_base + col_4]);
+                            nv[j_5] = nv[j_5] * (-_exp2_11);
                         }
-                        unsigned int acc_w_bf16_20[16];
+                        unsigned int acc_w_bf16_10[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                            acc_w_bf16_20[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_10[_lp] = *(uint32_t*)&_bf2;
                         }
-                        float unpack_bf16_1[32];
+                        float unpack_bf16[32];
                         #pragma unroll
                         for (int _pair = 0; _pair < 16; _pair++) {
-                            (&unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_20[_pair]) << 16);
-                            (&unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_20[_pair]) & 0xffff0000u);
+                            (&unpack_bf16[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_10[_pair]) << 16);
+                            (&unpack_bf16[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_10[_pair]) & 0xffff0000u);
                         }
-                        nv[0] = nv[0] - unpack_bf16_1[0];
-                        nv[1] = nv[1] - unpack_bf16_1[1];
-                        nv[2] = nv[2] - unpack_bf16_1[2];
-                        nv[3] = nv[3] - unpack_bf16_1[3];
-                        nv[4] = nv[4] - unpack_bf16_1[4];
-                        nv[5] = nv[5] - unpack_bf16_1[5];
-                        nv[6] = nv[6] - unpack_bf16_1[6];
-                        nv[7] = nv[7] - unpack_bf16_1[7];
-                        nv[8] = nv[8] - unpack_bf16_1[8];
-                        nv[9] = nv[9] - unpack_bf16_1[9];
-                        nv[10] = nv[10] - unpack_bf16_1[10];
-                        nv[11] = nv[11] - unpack_bf16_1[11];
-                        nv[12] = nv[12] - unpack_bf16_1[12];
-                        nv[13] = nv[13] - unpack_bf16_1[13];
-                        nv[14] = nv[14] - unpack_bf16_1[14];
-                        nv[15] = nv[15] - unpack_bf16_1[15];
-                        nv[16] = nv[16] - unpack_bf16_1[16];
-                        nv[17] = nv[17] - unpack_bf16_1[17];
-                        nv[18] = nv[18] - unpack_bf16_1[18];
-                        nv[19] = nv[19] - unpack_bf16_1[19];
-                        nv[20] = nv[20] - unpack_bf16_1[20];
-                        nv[21] = nv[21] - unpack_bf16_1[21];
-                        nv[22] = nv[22] - unpack_bf16_1[22];
-                        nv[23] = nv[23] - unpack_bf16_1[23];
-                        nv[24] = nv[24] - unpack_bf16_1[24];
-                        nv[25] = nv[25] - unpack_bf16_1[25];
-                        nv[26] = nv[26] - unpack_bf16_1[26];
-                        nv[27] = nv[27] - unpack_bf16_1[27];
-                        nv[28] = nv[28] - unpack_bf16_1[28];
-                        nv[29] = nv[29] - unpack_bf16_1[29];
-                        nv[30] = nv[30] - unpack_bf16_1[30];
-                        nv[31] = nv[31] - unpack_bf16_1[31];
-                        unsigned int acc_w_bf16_21[16];
+                        nv[0] = nv[0] - unpack_bf16[0];
+                        nv[1] = nv[1] - unpack_bf16[1];
+                        nv[2] = nv[2] - unpack_bf16[2];
+                        nv[3] = nv[3] - unpack_bf16[3];
+                        nv[4] = nv[4] - unpack_bf16[4];
+                        nv[5] = nv[5] - unpack_bf16[5];
+                        nv[6] = nv[6] - unpack_bf16[6];
+                        nv[7] = nv[7] - unpack_bf16[7];
+                        nv[8] = nv[8] - unpack_bf16[8];
+                        nv[9] = nv[9] - unpack_bf16[9];
+                        nv[10] = nv[10] - unpack_bf16[10];
+                        nv[11] = nv[11] - unpack_bf16[11];
+                        nv[12] = nv[12] - unpack_bf16[12];
+                        nv[13] = nv[13] - unpack_bf16[13];
+                        nv[14] = nv[14] - unpack_bf16[14];
+                        nv[15] = nv[15] - unpack_bf16[15];
+                        nv[16] = nv[16] - unpack_bf16[16];
+                        nv[17] = nv[17] - unpack_bf16[17];
+                        nv[18] = nv[18] - unpack_bf16[18];
+                        nv[19] = nv[19] - unpack_bf16[19];
+                        nv[20] = nv[20] - unpack_bf16[20];
+                        nv[21] = nv[21] - unpack_bf16[21];
+                        nv[22] = nv[22] - unpack_bf16[22];
+                        nv[23] = nv[23] - unpack_bf16[23];
+                        nv[24] = nv[24] - unpack_bf16[24];
+                        nv[25] = nv[25] - unpack_bf16[25];
+                        nv[26] = nv[26] - unpack_bf16[26];
+                        nv[27] = nv[27] - unpack_bf16[27];
+                        nv[28] = nv[28] - unpack_bf16[28];
+                        nv[29] = nv[29] - unpack_bf16[29];
+                        nv[30] = nv[30] - unpack_bf16[30];
+                        nv[31] = nv[31] - unpack_bf16[31];
+                        unsigned int acc_w_bf16_11[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                            acc_w_bf16_21[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_11[_lp] = *(uint32_t*)&_bf2;
                         }
                         asm volatile("" : "+f"(q_state[0]) :: "memory");
                         asm volatile("" : "+f"(q_state[1]) :: "memory");
@@ -3845,12 +2300,12 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         q_stage_cg1 += 1;
                         if (q_stage_cg1 == 2) { q_stage_cg1 = 0; _phase_load_q_full_1 ^= 1; }
                         #pragma unroll
-                        for (int j_12 = 0; j_12 < 32; j_12++) {
-                            int col_9 = j_12 / 4 * 8 + lane_quad_1_1 * 2 + (j_12 & 3 & 1);
-                            int r_col_2 = b_2 + col_9 * num_householder;
-                            int r_clamped_4 = ((col_9 < cnt_2) ? r_col_2 : 0);
-                            float qs_scale_2 = ((col_9 < cnt_2) ? smem_cumprod[gate_elem_base_1 + r_clamped_4] * scale_eff_1 : 0.0f);
-                            q_state[j_12] = q_state[j_12] * qs_scale_2;
+                        for (int j_6 = 0; j_6 < 32; j_6++) {
+                            int col_5 = j_6 / 4 * 8 + lane_quad_1 * 2 + (j_6 & 3 & 1);
+                            int r_col = b_1 + col_5 * num_householder;
+                            int r_clamped_2 = ((col_5 < cnt_1) ? r_col : 0);
+                            float qs_scale = ((col_5 < cnt_1) ? smem_cumprod[gate_elem_base + r_clamped_2] * scale_eff_1 : 0.0f);
+                            q_state[j_6] = q_state[j_6] * qs_scale;
                         }
                         mbarrier_arrive(gate_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
                         mbarrier_wait(load_k_full_addr + (k_stage_cg1) * 8, _phase_load_k_full_1);
@@ -3952,104 +2407,104 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("" : "+f"(q_state[29]) :: "memory");
                         asm volatile("" : "+f"(q_state[30]) :: "memory");
                         asm volatile("" : "+f"(q_state[31]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_19[15]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_20[15]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_21[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_9_1[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_10[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_11[15]) :: "memory");
                         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                        uint64_t _wgmma_desc_24 = (((uint64_t)(((smem_k_mn_addr + k_stage_c_1 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_b_2_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_24 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_24);
+                        uint64_t _wgmma_desc_12 = (((uint64_t)(((smem_k_mn_addr + k_stage_c * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_b_2 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_12 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_12);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_20[0]), "r"(acc_w_bf16_20[1]), "r"(acc_w_bf16_20[2]), "r"(acc_w_bf16_20[3]), "l"(wgmma_b_2_1)
+                            : "r"(acc_w_bf16_10[0]), "r"(acc_w_bf16_10[1]), "r"(acc_w_bf16_10[2]), "r"(acc_w_bf16_10[3]), "l"(wgmma_b_2)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_20[4]), "r"(acc_w_bf16_20[(4) + 1]), "r"(acc_w_bf16_20[(4) + 2]), "r"(acc_w_bf16_20[(4) + 3]), "l"(wgmma_b_2_1 + 128ull)
+                            : "r"(acc_w_bf16_10[4]), "r"(acc_w_bf16_10[(4) + 1]), "r"(acc_w_bf16_10[(4) + 2]), "r"(acc_w_bf16_10[(4) + 3]), "l"(wgmma_b_2 + 128ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_20[8]), "r"(acc_w_bf16_20[(8) + 1]), "r"(acc_w_bf16_20[(8) + 2]), "r"(acc_w_bf16_20[(8) + 3]), "l"(wgmma_b_2_1 + 256ull)
+                            : "r"(acc_w_bf16_10[8]), "r"(acc_w_bf16_10[(8) + 1]), "r"(acc_w_bf16_10[(8) + 2]), "r"(acc_w_bf16_10[(8) + 3]), "l"(wgmma_b_2 + 256ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_20[12]), "r"(acc_w_bf16_20[(12) + 1]), "r"(acc_w_bf16_20[(12) + 2]), "r"(acc_w_bf16_20[(12) + 3]), "l"(wgmma_b_2_1 + 384ull)
+                            : "r"(acc_w_bf16_10[12]), "r"(acc_w_bf16_10[(12) + 1]), "r"(acc_w_bf16_10[(12) + 2]), "r"(acc_w_bf16_10[(12) + 3]), "l"(wgmma_b_2 + 384ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_21[0]), "r"(acc_w_bf16_21[1]), "r"(acc_w_bf16_21[2]), "r"(acc_w_bf16_21[3]), "l"(wgmma_b_2_1)
+                            : "r"(acc_w_bf16_11[0]), "r"(acc_w_bf16_11[1]), "r"(acc_w_bf16_11[2]), "r"(acc_w_bf16_11[3]), "l"(wgmma_b_2)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_21[4]), "r"(acc_w_bf16_21[(4) + 1]), "r"(acc_w_bf16_21[(4) + 2]), "r"(acc_w_bf16_21[(4) + 3]), "l"(wgmma_b_2_1 + 128ull)
+                            : "r"(acc_w_bf16_11[4]), "r"(acc_w_bf16_11[(4) + 1]), "r"(acc_w_bf16_11[(4) + 2]), "r"(acc_w_bf16_11[(4) + 3]), "l"(wgmma_b_2 + 128ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_21[8]), "r"(acc_w_bf16_21[(8) + 1]), "r"(acc_w_bf16_21[(8) + 2]), "r"(acc_w_bf16_21[(8) + 3]), "l"(wgmma_b_2_1 + 256ull)
+                            : "r"(acc_w_bf16_11[8]), "r"(acc_w_bf16_11[(8) + 1]), "r"(acc_w_bf16_11[(8) + 2]), "r"(acc_w_bf16_11[(8) + 3]), "l"(wgmma_b_2 + 256ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_21[12]), "r"(acc_w_bf16_21[(12) + 1]), "r"(acc_w_bf16_21[(12) + 2]), "r"(acc_w_bf16_21[(12) + 3]), "l"(wgmma_b_2_1 + 384ull)
+                            : "r"(acc_w_bf16_11[12]), "r"(acc_w_bf16_11[(12) + 1]), "r"(acc_w_bf16_11[(12) + 2]), "r"(acc_w_bf16_11[(12) + 3]), "l"(wgmma_b_2 + 384ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_19[0]), "r"(acc_w_bf16_19[1]), "r"(acc_w_bf16_19[2]), "r"(acc_w_bf16_19[3]), "l"(_wgmma_b_5)
+                            : "r"(acc_w_bf16_9_1[0]), "r"(acc_w_bf16_9_1[1]), "r"(acc_w_bf16_9_1[2]), "r"(acc_w_bf16_9_1[3]), "l"(_wgmma_b_5)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_19[4]), "r"(acc_w_bf16_19[(4) + 1]), "r"(acc_w_bf16_19[(4) + 2]), "r"(acc_w_bf16_19[(4) + 3]), "l"(_wgmma_b_5 + 2ull)
+                            : "r"(acc_w_bf16_9_1[4]), "r"(acc_w_bf16_9_1[(4) + 1]), "r"(acc_w_bf16_9_1[(4) + 2]), "r"(acc_w_bf16_9_1[(4) + 3]), "l"(_wgmma_b_5 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_19[8]), "r"(acc_w_bf16_19[(8) + 1]), "r"(acc_w_bf16_19[(8) + 2]), "r"(acc_w_bf16_19[(8) + 3]), "l"(_wgmma_b_5 + 4ull)
+                            : "r"(acc_w_bf16_9_1[8]), "r"(acc_w_bf16_9_1[(8) + 1]), "r"(acc_w_bf16_9_1[(8) + 2]), "r"(acc_w_bf16_9_1[(8) + 3]), "l"(_wgmma_b_5 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_19[12]), "r"(acc_w_bf16_19[(12) + 1]), "r"(acc_w_bf16_19[(12) + 2]), "r"(acc_w_bf16_19[(12) + 3]), "l"(_wgmma_b_5 + 6ull)
+                            : "r"(acc_w_bf16_9_1[12]), "r"(acc_w_bf16_9_1[(12) + 1]), "r"(acc_w_bf16_9_1[(12) + 2]), "r"(acc_w_bf16_9_1[(12) + 3]), "l"(_wgmma_b_5 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("" : "+f"(state[0]) :: "memory");
@@ -4153,132 +2608,132 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         k_stage_cg1 += 1;
                         if (k_stage_cg1 == 3) { k_stage_cg1 = 0; _phase_load_k_full_1 ^= 1; }
                         mbarrier_arrive(qk_empty_addr);
-                        unsigned int acc_w_bf16_22[16];
+                        unsigned int acc_w_bf16_12[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(q_state[_lp*2 + 0], q_state[_lp*2+1 + 0]));
-                            acc_w_bf16_22[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_12[_lp] = *(uint32_t*)&_bf2;
                         }
-                        unsigned int o_base_1 = smem_o_addr;
-                        int mtx_1 = lane / 8;
-                        int row_in_mtx_1 = lane & 7;
+                        unsigned int o_base = smem_o_addr;
+                        int mtx = lane / 8;
+                        int row_in_mtx = lane & 7;
                         #pragma unroll
-                        for (int tok_group_2 = 0; tok_group_2 < 4; tok_group_2++) {
-                            int v_base_2 = warp_id_2_1 * 16 + (mtx_1 & 1) * 8;
-                            int tok_2 = tok_group_2 * 16 + mtx_1 / 2 * 8 + row_in_mtx_1;
-                            unsigned int st_addr_25 = o_base_1 + (unsigned int)(tok_2 * 128 + v_base_2 * 2 ^ (tok_2 * 128 + v_base_2 * 2 >> 7 & 7) << 4);
-                            uint32_t _stmatrix_addr_25 = static_cast<uint32_t>((unsigned long long)st_addr_25);
+                        for (int tok_group = 0; tok_group < 4; tok_group++) {
+                            int v_base = warp_id_0 * 16 + (mtx & 1) * 8;
+                            int tok = tok_group * 16 + mtx / 2 * 8 + row_in_mtx;
+                            unsigned int st_addr_23 = o_base + (unsigned int)(tok * 128 + v_base * 2 ^ (tok * 128 + v_base * 2 >> 7 & 7) << 4);
+                            uint32_t _stmatrix_addr_13 = static_cast<uint32_t>((unsigned long long)st_addr_23);
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                :: "r"(_stmatrix_addr_25), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_22[tok_group_2 * 4])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_22[tok_group_2 * 4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_22[tok_group_2 * 4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_22[tok_group_2 * 4 + 3]))
+                                :: "r"(_stmatrix_addr_13), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_12[tok_group * 4 + 3]))
                                 : "memory");
                         }
                         asm volatile("barrier.sync 14, 128;" ::: "memory");
-                        int tid_cg1_1 = warp_id_2_1 * 32 + lane;
-                        int o_chunk_1 = tid_cg1_1 & 7;
-                        int chunk_writes_1 = ((write_lo_1 <= chunk_idx_1 && write_end > chunk_idx_1) ? 1 : 0);
+                        int tid_cg1 = warp_id_0 * 32 + lane;
+                        int o_chunk = tid_cg1 & 7;
+                        int chunk_writes = ((write_lo_1 <= chunk_idx_1 && write_end > chunk_idx_1) ? 1 : 0);
                         #pragma unroll
-                        for (int o_round_2 = 0; o_round_2 < 4; o_round_2++) {
-                            int o_row_2 = o_round_2 * 16 + tid_cg1_1 / 8;
-                            if (o_row_2 < cnt_2 && batch_end_1 > t0_2 + o_row_2 && chunk_writes_1 != 0) {
-                                unsigned int o_words_2[4];
-                                unsigned int o_src_2 = o_base_1 + (unsigned int)(o_row_2 * 128 + ((o_chunk_1 ^ o_row_2 & 7) << 4));
+                        for (int o_round = 0; o_round < 4; o_round++) {
+                            int o_row = o_round * 16 + tid_cg1 / 8;
+                            if (o_row < cnt_1 && batch_end_1 > t0_1 + o_row && chunk_writes != 0) {
+                                unsigned int o_words[4];
+                                unsigned int o_src = o_base + (unsigned int)(o_row * 128 + ((o_chunk ^ o_row & 7) << 4));
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_words_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_2[(0) + 3]))
-                                    : "r"(o_src_2));
-                                long long o_index_2 = ((long long)(t0_2 + o_row_2) * (long long)num_heads + (long long)head_idx_1) * 64ll + (long long)(o_chunk_1 * 8);
-                                reinterpret_cast<int4*>(O + o_index_2)[0] = reinterpret_cast<int4*>(o_words_2)[0];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_words[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_words[(0) + 3]))
+                                    : "r"(o_src));
+                                long long o_index = ((long long)(t0_1 + o_row) * (long long)num_heads + (long long)head_idx_1) * 64ll + (long long)(o_chunk * 8);
+                                reinterpret_cast<int4*>(O + o_index)[0] = reinterpret_cast<int4*>(o_words)[0];
                             }
                         }
-                        int warp_id_3 = warp_id_in_role_1;
-                        int lane_quad_2 = lane & 3;
-                        int lane_row_2 = lane >> 2;
-                        unsigned int v_stage_c_2 = v_stage_cg1;
-                        unsigned int q_stage_c_2 = q_stage_cg1;
-                        unsigned int k_stage_c_2 = k_stage_cg1;
-                        unsigned int gate_stage_2 = gate_cg1_stage;
+                        int warp_id_1_1 = warp_id_in_role_1;
+                        int lane_quad_0 = lane & 3;
+                        int lane_row_0 = lane >> 2;
+                        unsigned int v_stage_c_0 = v_stage_cg1;
+                        unsigned int q_stage_c_0 = q_stage_cg1;
+                        unsigned int k_stage_c_0 = k_stage_cg1;
+                        unsigned int gate_stage_0 = gate_cg1_stage;
                         mbarrier_wait(load_gate_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
                         mbarrier_wait(load_beta_full_addr + (gate_cg1_stage) * 8, _phase_load_gate_full_1);
                         gate_cg1_stage += 1;
                         if (gate_cg1_stage == 4) { gate_cg1_stage = 0; _phase_load_gate_full_1 ^= 1; }
-                        int gate_elem_base_2 = gate_stage_2 * 64;
-                        float chunk_decay_2 = smem_cumprod[gate_elem_base_2 + 64 - 1];
-                        int exp_off_3 = (chunk_idx_1 + 1) * 64;
-                        int tok_off_3 = exp_off_3 / num_householder;
-                        int rem_3 = exp_off_3 - tok_off_3 * num_householder;
-                        int t0_3 = batch_start_1 + tok_off_3;
-                        int b_3 = num_householder - 1 - rem_3;
-                        int cnt_3 = (63 - b_3) / num_householder + 1;
-                        int cg1_first_2 = ((warp_id_3 == 0 && lane == 0) ? 1 : 0);
-                        unsigned int acc_w_bf16_23[32];
+                        int gate_elem_base_0 = gate_stage_0 * 64;
+                        float chunk_decay_0 = smem_cumprod[gate_elem_base_0 + 64 - 1];
+                        int exp_off_1_1 = (chunk_idx_1 + 1) * 64;
+                        int tok_off_1_1 = exp_off_1_1 / num_householder;
+                        int rem_1_1 = exp_off_1_1 - tok_off_1_1 * num_householder;
+                        int t0_1_1 = batch_start_1 + tok_off_1_1;
+                        int b_1_1 = num_householder - 1 - rem_1_1;
+                        int cnt_1_1 = (63 - b_1_1) / num_householder + 1;
+                        int cg1_first_0 = ((warp_id_1_1 == 0 && lane == 0) ? 1 : 0);
+                        unsigned int acc_w_bf16_13[32];
                         #pragma unroll
                         for (int _lp = 0; _lp < 32; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state[_lp*2 + 0], state[_lp*2+1 + 0]));
-                            acc_w_bf16_23[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_13[_lp] = *(uint32_t*)&_bf2;
                         }
-                        state[0] = state[0] * chunk_decay_2;
-                        state[1] = state[1] * chunk_decay_2;
-                        state[2] = state[2] * chunk_decay_2;
-                        state[3] = state[3] * chunk_decay_2;
-                        state[4] = state[4] * chunk_decay_2;
-                        state[5] = state[5] * chunk_decay_2;
-                        state[6] = state[6] * chunk_decay_2;
-                        state[7] = state[7] * chunk_decay_2;
-                        state[8] = state[8] * chunk_decay_2;
-                        state[9] = state[9] * chunk_decay_2;
-                        state[10] = state[10] * chunk_decay_2;
-                        state[11] = state[11] * chunk_decay_2;
-                        state[12] = state[12] * chunk_decay_2;
-                        state[13] = state[13] * chunk_decay_2;
-                        state[14] = state[14] * chunk_decay_2;
-                        state[15] = state[15] * chunk_decay_2;
-                        state[16] = state[16] * chunk_decay_2;
-                        state[17] = state[17] * chunk_decay_2;
-                        state[18] = state[18] * chunk_decay_2;
-                        state[19] = state[19] * chunk_decay_2;
-                        state[20] = state[20] * chunk_decay_2;
-                        state[21] = state[21] * chunk_decay_2;
-                        state[22] = state[22] * chunk_decay_2;
-                        state[23] = state[23] * chunk_decay_2;
-                        state[24] = state[24] * chunk_decay_2;
-                        state[25] = state[25] * chunk_decay_2;
-                        state[26] = state[26] * chunk_decay_2;
-                        state[27] = state[27] * chunk_decay_2;
-                        state[28] = state[28] * chunk_decay_2;
-                        state[29] = state[29] * chunk_decay_2;
-                        state[30] = state[30] * chunk_decay_2;
-                        state[31] = state[31] * chunk_decay_2;
-                        state[32] = state[32] * chunk_decay_2;
-                        state[33] = state[33] * chunk_decay_2;
-                        state[34] = state[34] * chunk_decay_2;
-                        state[35] = state[35] * chunk_decay_2;
-                        state[36] = state[36] * chunk_decay_2;
-                        state[37] = state[37] * chunk_decay_2;
-                        state[38] = state[38] * chunk_decay_2;
-                        state[39] = state[39] * chunk_decay_2;
-                        state[40] = state[40] * chunk_decay_2;
-                        state[41] = state[41] * chunk_decay_2;
-                        state[42] = state[42] * chunk_decay_2;
-                        state[43] = state[43] * chunk_decay_2;
-                        state[44] = state[44] * chunk_decay_2;
-                        state[45] = state[45] * chunk_decay_2;
-                        state[46] = state[46] * chunk_decay_2;
-                        state[47] = state[47] * chunk_decay_2;
-                        state[48] = state[48] * chunk_decay_2;
-                        state[49] = state[49] * chunk_decay_2;
-                        state[50] = state[50] * chunk_decay_2;
-                        state[51] = state[51] * chunk_decay_2;
-                        state[52] = state[52] * chunk_decay_2;
-                        state[53] = state[53] * chunk_decay_2;
-                        state[54] = state[54] * chunk_decay_2;
-                        state[55] = state[55] * chunk_decay_2;
-                        state[56] = state[56] * chunk_decay_2;
-                        state[57] = state[57] * chunk_decay_2;
-                        state[58] = state[58] * chunk_decay_2;
-                        state[59] = state[59] * chunk_decay_2;
-                        state[60] = state[60] * chunk_decay_2;
-                        state[61] = state[61] * chunk_decay_2;
-                        state[62] = state[62] * chunk_decay_2;
-                        state[63] = state[63] * chunk_decay_2;
+                        state[0] = state[0] * chunk_decay_0;
+                        state[1] = state[1] * chunk_decay_0;
+                        state[2] = state[2] * chunk_decay_0;
+                        state[3] = state[3] * chunk_decay_0;
+                        state[4] = state[4] * chunk_decay_0;
+                        state[5] = state[5] * chunk_decay_0;
+                        state[6] = state[6] * chunk_decay_0;
+                        state[7] = state[7] * chunk_decay_0;
+                        state[8] = state[8] * chunk_decay_0;
+                        state[9] = state[9] * chunk_decay_0;
+                        state[10] = state[10] * chunk_decay_0;
+                        state[11] = state[11] * chunk_decay_0;
+                        state[12] = state[12] * chunk_decay_0;
+                        state[13] = state[13] * chunk_decay_0;
+                        state[14] = state[14] * chunk_decay_0;
+                        state[15] = state[15] * chunk_decay_0;
+                        state[16] = state[16] * chunk_decay_0;
+                        state[17] = state[17] * chunk_decay_0;
+                        state[18] = state[18] * chunk_decay_0;
+                        state[19] = state[19] * chunk_decay_0;
+                        state[20] = state[20] * chunk_decay_0;
+                        state[21] = state[21] * chunk_decay_0;
+                        state[22] = state[22] * chunk_decay_0;
+                        state[23] = state[23] * chunk_decay_0;
+                        state[24] = state[24] * chunk_decay_0;
+                        state[25] = state[25] * chunk_decay_0;
+                        state[26] = state[26] * chunk_decay_0;
+                        state[27] = state[27] * chunk_decay_0;
+                        state[28] = state[28] * chunk_decay_0;
+                        state[29] = state[29] * chunk_decay_0;
+                        state[30] = state[30] * chunk_decay_0;
+                        state[31] = state[31] * chunk_decay_0;
+                        state[32] = state[32] * chunk_decay_0;
+                        state[33] = state[33] * chunk_decay_0;
+                        state[34] = state[34] * chunk_decay_0;
+                        state[35] = state[35] * chunk_decay_0;
+                        state[36] = state[36] * chunk_decay_0;
+                        state[37] = state[37] * chunk_decay_0;
+                        state[38] = state[38] * chunk_decay_0;
+                        state[39] = state[39] * chunk_decay_0;
+                        state[40] = state[40] * chunk_decay_0;
+                        state[41] = state[41] * chunk_decay_0;
+                        state[42] = state[42] * chunk_decay_0;
+                        state[43] = state[43] * chunk_decay_0;
+                        state[44] = state[44] * chunk_decay_0;
+                        state[45] = state[45] * chunk_decay_0;
+                        state[46] = state[46] * chunk_decay_0;
+                        state[47] = state[47] * chunk_decay_0;
+                        state[48] = state[48] * chunk_decay_0;
+                        state[49] = state[49] * chunk_decay_0;
+                        state[50] = state[50] * chunk_decay_0;
+                        state[51] = state[51] * chunk_decay_0;
+                        state[52] = state[52] * chunk_decay_0;
+                        state[53] = state[53] * chunk_decay_0;
+                        state[54] = state[54] * chunk_decay_0;
+                        state[55] = state[55] * chunk_decay_0;
+                        state[56] = state[56] * chunk_decay_0;
+                        state[57] = state[57] * chunk_decay_0;
+                        state[58] = state[58] * chunk_decay_0;
+                        state[59] = state[59] * chunk_decay_0;
+                        state[60] = state[60] * chunk_decay_0;
+                        state[61] = state[61] * chunk_decay_0;
+                        state[62] = state[62] * chunk_decay_0;
+                        state[63] = state[63] * chunk_decay_0;
                         mbarrier_wait(ainv_ready_addr + 8, _phase_ainv_ready_1_1);
                         _phase_ainv_ready_1_1 ^= 1;
                         mbarrier_wait(load_v_full_addr + (v_stage_cg1) * 8, _phase_load_v_full);
@@ -4316,88 +2771,88 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("" : "+f"(nv[29]) :: "memory");
                         asm volatile("" : "+f"(nv[30]) :: "memory");
                         asm volatile("" : "+f"(nv[31]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[15]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[16]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[17]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[18]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[19]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[20]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[21]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[22]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[23]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[24]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[25]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[26]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[27]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[28]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[29]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[30]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_23[31]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[16]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[17]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[18]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[19]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[20]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[21]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[22]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[23]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[24]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[25]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[26]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[27]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[28]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[29]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[30]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_13[31]) :: "memory");
                         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                        uint64_t _wgmma_desc_26 = (((uint64_t)(((smem_v_mn_addr + v_stage_c_2 * 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_a_7 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_26 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_26);
+                        uint64_t _wgmma_desc_14 = (((uint64_t)(((smem_v_mn_addr + v_stage_c_0 * 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_a_5_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_14 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_14);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 0, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_7), "l"(_wgmma_b_6)
+                            : "l"(wgmma_a_5_1), "l"(_wgmma_b_6)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_7 + 128ull), "l"(_wgmma_b_6 + 2ull)
+                            : "l"(wgmma_a_5_1 + 128ull), "l"(_wgmma_b_6 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_7 + 256ull), "l"(_wgmma_b_6 + 4ull)
+                            : "l"(wgmma_a_5_1 + 256ull), "l"(_wgmma_b_6 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "l"(wgmma_a_7 + 384ull), "l"(_wgmma_b_6 + 6ull)
+                            : "l"(wgmma_a_5_1 + 384ull), "l"(_wgmma_b_6 + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[0]), "r"(acc_w_bf16_23[1]), "r"(acc_w_bf16_23[2]), "r"(acc_w_bf16_23[3]), "l"(_wgmma_b_7)
+                            : "r"(acc_w_bf16_13[0]), "r"(acc_w_bf16_13[1]), "r"(acc_w_bf16_13[2]), "r"(acc_w_bf16_13[3]), "l"(_wgmma_b_7)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[4]), "r"(acc_w_bf16_23[(4) + 1]), "r"(acc_w_bf16_23[(4) + 2]), "r"(acc_w_bf16_23[(4) + 3]), "l"(_wgmma_b_7 + 2ull)
+                            : "r"(acc_w_bf16_13[4]), "r"(acc_w_bf16_13[(4) + 1]), "r"(acc_w_bf16_13[(4) + 2]), "r"(acc_w_bf16_13[(4) + 3]), "l"(_wgmma_b_7 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[8]), "r"(acc_w_bf16_23[(8) + 1]), "r"(acc_w_bf16_23[(8) + 2]), "r"(acc_w_bf16_23[(8) + 3]), "l"(_wgmma_b_7 + 4ull)
+                            : "r"(acc_w_bf16_13[8]), "r"(acc_w_bf16_13[(8) + 1]), "r"(acc_w_bf16_13[(8) + 2]), "r"(acc_w_bf16_13[(8) + 3]), "l"(_wgmma_b_7 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[12]), "r"(acc_w_bf16_23[(12) + 1]), "r"(acc_w_bf16_23[(12) + 2]), "r"(acc_w_bf16_23[(12) + 3]), "l"(_wgmma_b_7 + 6ull)
+                            : "r"(acc_w_bf16_13[12]), "r"(acc_w_bf16_13[(12) + 1]), "r"(acc_w_bf16_13[(12) + 2]), "r"(acc_w_bf16_13[(12) + 3]), "l"(_wgmma_b_7 + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[16]), "r"(acc_w_bf16_23[(16) + 1]), "r"(acc_w_bf16_23[(16) + 2]), "r"(acc_w_bf16_23[(16) + 3]), "l"(_wgmma_b_8)
+                            : "r"(acc_w_bf16_13[16]), "r"(acc_w_bf16_13[(16) + 1]), "r"(acc_w_bf16_13[(16) + 2]), "r"(acc_w_bf16_13[(16) + 3]), "l"(_wgmma_b_8)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[20]), "r"(acc_w_bf16_23[(20) + 1]), "r"(acc_w_bf16_23[(20) + 2]), "r"(acc_w_bf16_23[(20) + 3]), "l"(_wgmma_b_8 + 2ull)
+                            : "r"(acc_w_bf16_13[20]), "r"(acc_w_bf16_13[(20) + 1]), "r"(acc_w_bf16_13[(20) + 2]), "r"(acc_w_bf16_13[(20) + 3]), "l"(_wgmma_b_8 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[24]), "r"(acc_w_bf16_23[(24) + 1]), "r"(acc_w_bf16_23[(24) + 2]), "r"(acc_w_bf16_23[(24) + 3]), "l"(_wgmma_b_8 + 4ull)
+                            : "r"(acc_w_bf16_13[24]), "r"(acc_w_bf16_13[(24) + 1]), "r"(acc_w_bf16_13[(24) + 2]), "r"(acc_w_bf16_13[(24) + 3]), "l"(_wgmma_b_8 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(nv[0]), "+f"(nv[1]), "+f"(nv[2]), "+f"(nv[3]), "+f"(nv[4]), "+f"(nv[5]), "+f"(nv[6]), "+f"(nv[7]), "+f"(nv[8]), "+f"(nv[9]), "+f"(nv[10]), "+f"(nv[11]), "+f"(nv[12]), "+f"(nv[13]), "+f"(nv[14]), "+f"(nv[15]), "+f"(nv[16]), "+f"(nv[17]), "+f"(nv[18]), "+f"(nv[19]), "+f"(nv[20]), "+f"(nv[21]), "+f"(nv[22]), "+f"(nv[23]), "+f"(nv[24]), "+f"(nv[25]), "+f"(nv[26]), "+f"(nv[27]), "+f"(nv[28]), "+f"(nv[29]), "+f"(nv[30]), "+f"(nv[31])
-                            : "r"(acc_w_bf16_23[28]), "r"(acc_w_bf16_23[(28) + 1]), "r"(acc_w_bf16_23[(28) + 2]), "r"(acc_w_bf16_23[(28) + 3]), "l"(_wgmma_b_8 + 6ull)
+                            : "r"(acc_w_bf16_13[28]), "r"(acc_w_bf16_13[(28) + 1]), "r"(acc_w_bf16_13[(28) + 2]), "r"(acc_w_bf16_13[(28) + 3]), "l"(_wgmma_b_8 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         mbarrier_wait(load_q_full_addr + (q_stage_cg1) * 8, _phase_load_q_full_1);
@@ -4433,41 +2888,41 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("" : "+f"(q_state[29]) :: "memory");
                         asm volatile("" : "+f"(q_state[30]) :: "memory");
                         asm volatile("" : "+f"(q_state[31]) :: "memory");
-                        uint64_t _wgmma_desc_27 = (((uint64_t)(((smem_q_addr + q_stage_c_2 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_b_5 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_27 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_27);
+                        uint64_t _wgmma_desc_15 = (((uint64_t)(((smem_q_addr + q_stage_c_0 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_b_3 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_15 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_15);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 0, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[0]), "r"(acc_w_bf16_23[1]), "r"(acc_w_bf16_23[2]), "r"(acc_w_bf16_23[3]), "l"(wgmma_b_5)
+                            : "r"(acc_w_bf16_13[0]), "r"(acc_w_bf16_13[1]), "r"(acc_w_bf16_13[2]), "r"(acc_w_bf16_13[3]), "l"(wgmma_b_3)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[4]), "r"(acc_w_bf16_23[(4) + 1]), "r"(acc_w_bf16_23[(4) + 2]), "r"(acc_w_bf16_23[(4) + 3]), "l"(wgmma_b_5 + 2ull)
+                            : "r"(acc_w_bf16_13[4]), "r"(acc_w_bf16_13[(4) + 1]), "r"(acc_w_bf16_13[(4) + 2]), "r"(acc_w_bf16_13[(4) + 3]), "l"(wgmma_b_3 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[8]), "r"(acc_w_bf16_23[(8) + 1]), "r"(acc_w_bf16_23[(8) + 2]), "r"(acc_w_bf16_23[(8) + 3]), "l"(wgmma_b_5 + 4ull)
+                            : "r"(acc_w_bf16_13[8]), "r"(acc_w_bf16_13[(8) + 1]), "r"(acc_w_bf16_13[(8) + 2]), "r"(acc_w_bf16_13[(8) + 3]), "l"(wgmma_b_3 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[12]), "r"(acc_w_bf16_23[(12) + 1]), "r"(acc_w_bf16_23[(12) + 2]), "r"(acc_w_bf16_23[(12) + 3]), "l"(wgmma_b_5 + 6ull)
+                            : "r"(acc_w_bf16_13[12]), "r"(acc_w_bf16_13[(12) + 1]), "r"(acc_w_bf16_13[(12) + 2]), "r"(acc_w_bf16_13[(12) + 3]), "l"(wgmma_b_3 + 6ull)
                             : "memory");
-                        uint64_t _wgmma_desc_28 = (((uint64_t)(((smem_q_addr + q_stage_c_2 * 16384 + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_b_1_2 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_28 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_28);
+                        uint64_t _wgmma_desc_16 = (((uint64_t)(((smem_q_addr + q_stage_c_0 * 16384 + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_b_1_0 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_16 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_16);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[16]), "r"(acc_w_bf16_23[(16) + 1]), "r"(acc_w_bf16_23[(16) + 2]), "r"(acc_w_bf16_23[(16) + 3]), "l"(wgmma_b_1_2)
-                            : "memory");
-                        asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
-                            : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[20]), "r"(acc_w_bf16_23[(20) + 1]), "r"(acc_w_bf16_23[(20) + 2]), "r"(acc_w_bf16_23[(20) + 3]), "l"(wgmma_b_1_2 + 2ull)
+                            : "r"(acc_w_bf16_13[16]), "r"(acc_w_bf16_13[(16) + 1]), "r"(acc_w_bf16_13[(16) + 2]), "r"(acc_w_bf16_13[(16) + 3]), "l"(wgmma_b_1_0)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[24]), "r"(acc_w_bf16_23[(24) + 1]), "r"(acc_w_bf16_23[(24) + 2]), "r"(acc_w_bf16_23[(24) + 3]), "l"(wgmma_b_1_2 + 4ull)
+                            : "r"(acc_w_bf16_13[20]), "r"(acc_w_bf16_13[(20) + 1]), "r"(acc_w_bf16_13[(20) + 2]), "r"(acc_w_bf16_13[(20) + 3]), "l"(wgmma_b_1_0 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_23[28]), "r"(acc_w_bf16_23[(28) + 1]), "r"(acc_w_bf16_23[(28) + 2]), "r"(acc_w_bf16_23[(28) + 3]), "l"(wgmma_b_1_2 + 6ull)
+                            : "r"(acc_w_bf16_13[24]), "r"(acc_w_bf16_13[(24) + 1]), "r"(acc_w_bf16_13[(24) + 2]), "r"(acc_w_bf16_13[(24) + 3]), "l"(wgmma_b_1_0 + 4ull)
+                            : "memory");
+                        asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
+                            : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
+                            : "r"(acc_w_bf16_13[28]), "r"(acc_w_bf16_13[(28) + 1]), "r"(acc_w_bf16_13[(28) + 2]), "r"(acc_w_bf16_13[(28) + 3]), "l"(wgmma_b_1_0 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("" : "+f"(nv[0]) :: "memory");
@@ -4505,81 +2960,82 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
                         mbarrier_arrive(w_empty_addr + 8);
                         mbarrier_arrive(ainv_empty_addr + 8);
-                        int v_stage_bytes_2 = (int)v_stage_cg1 * 8192;
+                        int v_stage_bytes_0 = (int)v_stage_cg1 * 8192;
                         #pragma unroll
-                        for (int j_13 = 0; j_13 < 32; j_13++) {
-                            int m_col_3 = j_13 / 4 * 8 + lane_quad_2 * 2 + (j_13 & 3 & 1);
-                            int v_row_3 = warp_id_3 * 16 + lane_row_2 + (j_13 & 3) / 2 * 8;
-                            float v_val_3 = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes_2 + (m_col_3 * 128 + v_row_3 * 2 ^ (m_col_3 * 128 + v_row_3 * 2 >> 7 & 7) << 4)))[0];
-                            float beta_m_3 = smem_beta[gate_elem_base_2 + m_col_3];
-                            nv[j_13] = __fmaf_rn(-beta_m_3, v_val_3, nv[j_13]);
+                        for (int j_7 = 0; j_7 < 32; j_7++) {
+                            int m_col_1 = j_7 / 4 * 8 + lane_quad_0 * 2 + (j_7 & 3 & 1);
+                            int v_row_1 = warp_id_1_1 * 16 + lane_row_0 + (j_7 & 3) / 2 * 8;
+                            float v_val_1 = (float)reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const uint8_t*>(smem_v_mn) + (v_stage_bytes_0 + (m_col_1 * 128 + v_row_1 * 2 ^ (m_col_1 * 128 + v_row_1 * 2 >> 7 & 7) << 4)))[0];
+                            float beta_m_1 = smem_beta[gate_elem_base_0 + m_col_1];
+                            nv[j_7] = __fmaf_rn(-beta_m_1, v_val_1, nv[j_7]);
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(v_smem_empty_addr + (v_stage_cg1) * 8);
                         v_stage_cg1 += 1;
                         if (v_stage_cg1 == 3) { v_stage_cg1 = 0; _phase_load_v_full ^= 1; }
                         mbarrier_arrive(beta_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
-                        unsigned int acc_w_bf16_24[16];
+                        unsigned int acc_w_bf16_14[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                            acc_w_bf16_24[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_14[_lp] = *(uint32_t*)&_bf2;
                         }
-                        float last_cumsumlog_2 = smem_cumsumlog[gate_elem_base_2 + 64 - 1];
+                        float last_cumsumlog_0 = smem_cumsumlog[gate_elem_base_0 + 64 - 1];
                         #pragma unroll
-                        for (int j_14 = 0; j_14 < 32; j_14++) {
-                            int col_10 = j_14 / 4 * 8 + lane_quad_2 * 2 + (j_14 & 3 & 1);
-                            float _exp2_29 = approx_exp2(last_cumsumlog_2 - smem_cumsumlog[gate_elem_base_2 + col_10]);
-                            nv[j_14] = nv[j_14] * (-_exp2_29);
+                        for (int j_8 = 0; j_8 < 32; j_8++) {
+                            int col_6 = j_8 / 4 * 8 + lane_quad_0 * 2 + (j_8 & 3 & 1);
+                            float _exp2_17 = approx_exp2(last_cumsumlog_0 - smem_cumsumlog[gate_elem_base_0 + col_6]);
+                            nv[j_8] = nv[j_8] * (-_exp2_17);
                         }
-                        unsigned int acc_w_bf16_25[16];
+                        unsigned int acc_w_bf16_15[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                            acc_w_bf16_25[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_15[_lp] = *(uint32_t*)&_bf2;
                         }
-                        float unpack_bf16_2[32];
+                        float unpack_bf16_0[32];
                         #pragma unroll
                         for (int _pair = 0; _pair < 16; _pair++) {
-                            (&unpack_bf16_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_25[_pair]) << 16);
-                            (&unpack_bf16_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_25[_pair]) & 0xffff0000u);
+                            (&unpack_bf16_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_15[_pair]) << 16);
+                            (&unpack_bf16_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_15[_pair]) & 0xffff0000u);
                         }
-                        nv[0] = nv[0] - unpack_bf16_2[0];
-                        nv[1] = nv[1] - unpack_bf16_2[1];
-                        nv[2] = nv[2] - unpack_bf16_2[2];
-                        nv[3] = nv[3] - unpack_bf16_2[3];
-                        nv[4] = nv[4] - unpack_bf16_2[4];
-                        nv[5] = nv[5] - unpack_bf16_2[5];
-                        nv[6] = nv[6] - unpack_bf16_2[6];
-                        nv[7] = nv[7] - unpack_bf16_2[7];
-                        nv[8] = nv[8] - unpack_bf16_2[8];
-                        nv[9] = nv[9] - unpack_bf16_2[9];
-                        nv[10] = nv[10] - unpack_bf16_2[10];
-                        nv[11] = nv[11] - unpack_bf16_2[11];
-                        nv[12] = nv[12] - unpack_bf16_2[12];
-                        nv[13] = nv[13] - unpack_bf16_2[13];
-                        nv[14] = nv[14] - unpack_bf16_2[14];
-                        nv[15] = nv[15] - unpack_bf16_2[15];
-                        nv[16] = nv[16] - unpack_bf16_2[16];
-                        nv[17] = nv[17] - unpack_bf16_2[17];
-                        nv[18] = nv[18] - unpack_bf16_2[18];
-                        nv[19] = nv[19] - unpack_bf16_2[19];
-                        nv[20] = nv[20] - unpack_bf16_2[20];
-                        nv[21] = nv[21] - unpack_bf16_2[21];
-                        nv[22] = nv[22] - unpack_bf16_2[22];
-                        nv[23] = nv[23] - unpack_bf16_2[23];
-                        nv[24] = nv[24] - unpack_bf16_2[24];
-                        nv[25] = nv[25] - unpack_bf16_2[25];
-                        nv[26] = nv[26] - unpack_bf16_2[26];
-                        nv[27] = nv[27] - unpack_bf16_2[27];
-                        nv[28] = nv[28] - unpack_bf16_2[28];
-                        nv[29] = nv[29] - unpack_bf16_2[29];
-                        nv[30] = nv[30] - unpack_bf16_2[30];
-                        nv[31] = nv[31] - unpack_bf16_2[31];
-                        unsigned int acc_w_bf16_26[16];
+                        nv[0] = nv[0] - unpack_bf16_0[0];
+                        nv[1] = nv[1] - unpack_bf16_0[1];
+                        nv[2] = nv[2] - unpack_bf16_0[2];
+                        nv[3] = nv[3] - unpack_bf16_0[3];
+                        nv[4] = nv[4] - unpack_bf16_0[4];
+                        nv[5] = nv[5] - unpack_bf16_0[5];
+                        nv[6] = nv[6] - unpack_bf16_0[6];
+                        nv[7] = nv[7] - unpack_bf16_0[7];
+                        nv[8] = nv[8] - unpack_bf16_0[8];
+                        nv[9] = nv[9] - unpack_bf16_0[9];
+                        nv[10] = nv[10] - unpack_bf16_0[10];
+                        nv[11] = nv[11] - unpack_bf16_0[11];
+                        nv[12] = nv[12] - unpack_bf16_0[12];
+                        nv[13] = nv[13] - unpack_bf16_0[13];
+                        nv[14] = nv[14] - unpack_bf16_0[14];
+                        nv[15] = nv[15] - unpack_bf16_0[15];
+                        nv[16] = nv[16] - unpack_bf16_0[16];
+                        nv[17] = nv[17] - unpack_bf16_0[17];
+                        nv[18] = nv[18] - unpack_bf16_0[18];
+                        nv[19] = nv[19] - unpack_bf16_0[19];
+                        nv[20] = nv[20] - unpack_bf16_0[20];
+                        nv[21] = nv[21] - unpack_bf16_0[21];
+                        nv[22] = nv[22] - unpack_bf16_0[22];
+                        nv[23] = nv[23] - unpack_bf16_0[23];
+                        nv[24] = nv[24] - unpack_bf16_0[24];
+                        nv[25] = nv[25] - unpack_bf16_0[25];
+                        nv[26] = nv[26] - unpack_bf16_0[26];
+                        nv[27] = nv[27] - unpack_bf16_0[27];
+                        nv[28] = nv[28] - unpack_bf16_0[28];
+                        nv[29] = nv[29] - unpack_bf16_0[29];
+                        nv[30] = nv[30] - unpack_bf16_0[30];
+                        nv[31] = nv[31] - unpack_bf16_0[31];
+                        unsigned int acc_w_bf16_16[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv[_lp*2 + 0], nv[_lp*2+1 + 0]));
-                            acc_w_bf16_26[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_16[_lp] = *(uint32_t*)&_bf2;
                         }
                         asm volatile("" : "+f"(q_state[0]) :: "memory");
                         asm volatile("" : "+f"(q_state[1]) :: "memory");
@@ -4618,12 +3074,12 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         q_stage_cg1 += 1;
                         if (q_stage_cg1 == 2) { q_stage_cg1 = 0; _phase_load_q_full_1 ^= 1; }
                         #pragma unroll
-                        for (int j_15 = 0; j_15 < 32; j_15++) {
-                            int col_11 = j_15 / 4 * 8 + lane_quad_2 * 2 + (j_15 & 3 & 1);
-                            int r_col_3 = b_3 + col_11 * num_householder;
-                            int r_clamped_5 = ((col_11 < cnt_3) ? r_col_3 : 0);
-                            float qs_scale_3 = ((col_11 < cnt_3) ? smem_cumprod[gate_elem_base_2 + r_clamped_5] * scale_eff_1 : 0.0f);
-                            q_state[j_15] = q_state[j_15] * qs_scale_3;
+                        for (int j_9 = 0; j_9 < 32; j_9++) {
+                            int col_7 = j_9 / 4 * 8 + lane_quad_0 * 2 + (j_9 & 3 & 1);
+                            int r_col_1 = b_1_1 + col_7 * num_householder;
+                            int r_clamped_3 = ((col_7 < cnt_1_1) ? r_col_1 : 0);
+                            float qs_scale_1 = ((col_7 < cnt_1_1) ? smem_cumprod[gate_elem_base_0 + r_clamped_3] * scale_eff_1 : 0.0f);
+                            q_state[j_9] = q_state[j_9] * qs_scale_1;
                         }
                         mbarrier_arrive(gate_cg1_empty_addr + (((gate_cg1_stage + 3 >= 4) ? gate_cg1_stage + 3 - 4 : gate_cg1_stage + 3)) * 8);
                         mbarrier_wait(load_k_full_addr + (k_stage_cg1) * 8, _phase_load_k_full_1);
@@ -4725,104 +3181,104 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         asm volatile("" : "+f"(q_state[29]) :: "memory");
                         asm volatile("" : "+f"(q_state[30]) :: "memory");
                         asm volatile("" : "+f"(q_state[31]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_24[15]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_25[15]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[0]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[1]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[2]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[3]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[4]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[5]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[6]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[7]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[8]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[9]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[10]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[11]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[12]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[13]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[14]) :: "memory");
-                        asm volatile("" : "+r"(acc_w_bf16_26[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_14[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_15[15]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[0]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[1]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[2]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[3]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[4]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[5]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[6]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[7]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[8]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[9]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[10]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[11]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[12]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[13]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[14]) :: "memory");
+                        asm volatile("" : "+r"(acc_w_bf16_16[15]) :: "memory");
                         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
-                        uint64_t _wgmma_desc_30 = (((uint64_t)(((smem_k_mn_addr + k_stage_c_2 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-                        uint64_t wgmma_b_2_2 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_30 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_30);
+                        uint64_t _wgmma_desc_18 = (((uint64_t)(((smem_k_mn_addr + k_stage_c_0 * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
+                        uint64_t wgmma_b_2_0 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_18 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_18);
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_25[0]), "r"(acc_w_bf16_25[1]), "r"(acc_w_bf16_25[2]), "r"(acc_w_bf16_25[3]), "l"(wgmma_b_2_2)
+                            : "r"(acc_w_bf16_15[0]), "r"(acc_w_bf16_15[1]), "r"(acc_w_bf16_15[2]), "r"(acc_w_bf16_15[3]), "l"(wgmma_b_2_0)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_25[4]), "r"(acc_w_bf16_25[(4) + 1]), "r"(acc_w_bf16_25[(4) + 2]), "r"(acc_w_bf16_25[(4) + 3]), "l"(wgmma_b_2_2 + 128ull)
+                            : "r"(acc_w_bf16_15[4]), "r"(acc_w_bf16_15[(4) + 1]), "r"(acc_w_bf16_15[(4) + 2]), "r"(acc_w_bf16_15[(4) + 3]), "l"(wgmma_b_2_0 + 128ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_25[8]), "r"(acc_w_bf16_25[(8) + 1]), "r"(acc_w_bf16_25[(8) + 2]), "r"(acc_w_bf16_25[(8) + 3]), "l"(wgmma_b_2_2 + 256ull)
+                            : "r"(acc_w_bf16_15[8]), "r"(acc_w_bf16_15[(8) + 1]), "r"(acc_w_bf16_15[(8) + 2]), "r"(acc_w_bf16_15[(8) + 3]), "l"(wgmma_b_2_0 + 256ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_25[12]), "r"(acc_w_bf16_25[(12) + 1]), "r"(acc_w_bf16_25[(12) + 2]), "r"(acc_w_bf16_25[(12) + 3]), "l"(wgmma_b_2_2 + 384ull)
+                            : "r"(acc_w_bf16_15[12]), "r"(acc_w_bf16_15[(12) + 1]), "r"(acc_w_bf16_15[(12) + 2]), "r"(acc_w_bf16_15[(12) + 3]), "l"(wgmma_b_2_0 + 384ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_26[0]), "r"(acc_w_bf16_26[1]), "r"(acc_w_bf16_26[2]), "r"(acc_w_bf16_26[3]), "l"(wgmma_b_2_2)
+                            : "r"(acc_w_bf16_16[0]), "r"(acc_w_bf16_16[1]), "r"(acc_w_bf16_16[2]), "r"(acc_w_bf16_16[3]), "l"(wgmma_b_2_0)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_26[4]), "r"(acc_w_bf16_26[(4) + 1]), "r"(acc_w_bf16_26[(4) + 2]), "r"(acc_w_bf16_26[(4) + 3]), "l"(wgmma_b_2_2 + 128ull)
+                            : "r"(acc_w_bf16_16[4]), "r"(acc_w_bf16_16[(4) + 1]), "r"(acc_w_bf16_16[(4) + 2]), "r"(acc_w_bf16_16[(4) + 3]), "l"(wgmma_b_2_0 + 128ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_26[8]), "r"(acc_w_bf16_26[(8) + 1]), "r"(acc_w_bf16_26[(8) + 2]), "r"(acc_w_bf16_26[(8) + 3]), "l"(wgmma_b_2_2 + 256ull)
+                            : "r"(acc_w_bf16_16[8]), "r"(acc_w_bf16_16[(8) + 1]), "r"(acc_w_bf16_16[(8) + 2]), "r"(acc_w_bf16_16[(8) + 3]), "l"(wgmma_b_2_0 + 256ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                             : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                            : "r"(acc_w_bf16_26[12]), "r"(acc_w_bf16_26[(12) + 1]), "r"(acc_w_bf16_26[(12) + 2]), "r"(acc_w_bf16_26[(12) + 3]), "l"(wgmma_b_2_2 + 384ull)
+                            : "r"(acc_w_bf16_16[12]), "r"(acc_w_bf16_16[(12) + 1]), "r"(acc_w_bf16_16[(12) + 2]), "r"(acc_w_bf16_16[(12) + 3]), "l"(wgmma_b_2_0 + 384ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_24[0]), "r"(acc_w_bf16_24[1]), "r"(acc_w_bf16_24[2]), "r"(acc_w_bf16_24[3]), "l"(_wgmma_b_9)
+                            : "r"(acc_w_bf16_14[0]), "r"(acc_w_bf16_14[1]), "r"(acc_w_bf16_14[2]), "r"(acc_w_bf16_14[3]), "l"(_wgmma_b_9)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_24[4]), "r"(acc_w_bf16_24[(4) + 1]), "r"(acc_w_bf16_24[(4) + 2]), "r"(acc_w_bf16_24[(4) + 3]), "l"(_wgmma_b_9 + 2ull)
+                            : "r"(acc_w_bf16_14[4]), "r"(acc_w_bf16_14[(4) + 1]), "r"(acc_w_bf16_14[(4) + 2]), "r"(acc_w_bf16_14[(4) + 3]), "l"(_wgmma_b_9 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_24[8]), "r"(acc_w_bf16_24[(8) + 1]), "r"(acc_w_bf16_24[(8) + 2]), "r"(acc_w_bf16_24[(8) + 3]), "l"(_wgmma_b_9 + 4ull)
+                            : "r"(acc_w_bf16_14[8]), "r"(acc_w_bf16_14[(8) + 1]), "r"(acc_w_bf16_14[(8) + 2]), "r"(acc_w_bf16_14[(8) + 3]), "l"(_wgmma_b_9 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(acc_w_bf16_24[12]), "r"(acc_w_bf16_24[(12) + 1]), "r"(acc_w_bf16_24[(12) + 2]), "r"(acc_w_bf16_24[(12) + 3]), "l"(_wgmma_b_9 + 6ull)
+                            : "r"(acc_w_bf16_14[12]), "r"(acc_w_bf16_14[(12) + 1]), "r"(acc_w_bf16_14[(12) + 2]), "r"(acc_w_bf16_14[(12) + 3]), "l"(_wgmma_b_9 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("" : "+f"(state[0]) :: "memory");
@@ -4926,47 +3382,47 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         k_stage_cg1 += 1;
                         if (k_stage_cg1 == 3) { k_stage_cg1 = 0; _phase_load_k_full_1 ^= 1; }
                         mbarrier_arrive(qk_empty_addr + 8);
-                        unsigned int acc_w_bf16_27[16];
+                        unsigned int acc_w_bf16_17[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(q_state[_lp*2 + 0], q_state[_lp*2+1 + 0]));
-                            acc_w_bf16_27[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_17[_lp] = *(uint32_t*)&_bf2;
                         }
-                        unsigned int o_base_2 = smem_o_addr + 8192;
-                        int mtx_2 = lane / 8;
-                        int row_in_mtx_2 = lane & 7;
+                        unsigned int o_base_0 = smem_o_addr + 8192;
+                        int mtx_0 = lane / 8;
+                        int row_in_mtx_0 = lane & 7;
                         #pragma unroll
-                        for (int tok_group_3 = 0; tok_group_3 < 4; tok_group_3++) {
-                            int v_base_3 = warp_id_3 * 16 + (mtx_2 & 1) * 8;
-                            int tok_3 = tok_group_3 * 16 + mtx_2 / 2 * 8 + row_in_mtx_2;
-                            unsigned int st_addr_26 = o_base_2 + (unsigned int)(tok_3 * 128 + v_base_3 * 2 ^ (tok_3 * 128 + v_base_3 * 2 >> 7 & 7) << 4);
-                            uint32_t _stmatrix_addr_31 = static_cast<uint32_t>((unsigned long long)st_addr_26);
+                        for (int tok_group_1 = 0; tok_group_1 < 4; tok_group_1++) {
+                            int v_base_1 = warp_id_1_1 * 16 + (mtx_0 & 1) * 8;
+                            int tok_1 = tok_group_1 * 16 + mtx_0 / 2 * 8 + row_in_mtx_0;
+                            unsigned int st_addr_24 = o_base_0 + (unsigned int)(tok_1 * 128 + v_base_1 * 2 ^ (tok_1 * 128 + v_base_1 * 2 >> 7 & 7) << 4);
+                            uint32_t _stmatrix_addr_19 = static_cast<uint32_t>((unsigned long long)st_addr_24);
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                :: "r"(_stmatrix_addr_31), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_27[tok_group_3 * 4])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_27[tok_group_3 * 4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_27[tok_group_3 * 4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_27[tok_group_3 * 4 + 3]))
+                                :: "r"(_stmatrix_addr_19), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&acc_w_bf16_17[tok_group_1 * 4 + 3]))
                                 : "memory");
                         }
                         asm volatile("barrier.sync 14, 128;" ::: "memory");
-                        int tid_cg1_2 = warp_id_3 * 32 + lane;
-                        int o_chunk_2 = tid_cg1_2 & 7;
-                        int chunk_writes_2 = ((write_lo_1 <= chunk_idx_1 + 1 && write_end > chunk_idx_1 + 1) ? 1 : 0);
+                        int tid_cg1_0 = warp_id_1_1 * 32 + lane;
+                        int o_chunk_0 = tid_cg1_0 & 7;
+                        int chunk_writes_0 = ((write_lo_1 <= chunk_idx_1 + 1 && write_end > chunk_idx_1 + 1) ? 1 : 0);
                         #pragma unroll
-                        for (int o_round_3 = 0; o_round_3 < 4; o_round_3++) {
-                            int o_row_3 = o_round_3 * 16 + tid_cg1_2 / 8;
-                            if (o_row_3 < cnt_3 && batch_end_1 > t0_3 + o_row_3 && chunk_writes_2 != 0) {
-                                unsigned int o_words_3[4];
-                                unsigned int o_src_3 = o_base_2 + (unsigned int)(o_row_3 * 128 + ((o_chunk_2 ^ o_row_3 & 7) << 4));
+                        for (int o_round_1 = 0; o_round_1 < 4; o_round_1++) {
+                            int o_row_1 = o_round_1 * 16 + tid_cg1_0 / 8;
+                            if (o_row_1 < cnt_1_1 && batch_end_1 > t0_1_1 + o_row_1 && chunk_writes_0 != 0) {
+                                unsigned int o_words_1[4];
+                                unsigned int o_src_1 = o_base_0 + (unsigned int)(o_row_1 * 128 + ((o_chunk_0 ^ o_row_1 & 7) << 4));
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_words_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_3[(0) + 3]))
-                                    : "r"(o_src_3));
-                                long long o_index_3 = ((long long)(t0_3 + o_row_3) * (long long)num_heads + (long long)head_idx_1) * 64ll + (long long)(o_chunk_2 * 8);
-                                reinterpret_cast<int4*>(O + o_index_3)[0] = reinterpret_cast<int4*>(o_words_3)[0];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_words_1[(0) + 3]))
+                                    : "r"(o_src_1));
+                                long long o_index_1 = ((long long)(t0_1_1 + o_row_1) * (long long)num_heads + (long long)head_idx_1) * 64ll + (long long)(o_chunk_0 * 8);
+                                reinterpret_cast<int4*>(O + o_index_1)[0] = reinterpret_cast<int4*>(o_words_1)[0];
                             }
                         }
                     }
                     int cg1_tile_first = ((warp_id_in_role_1 == 0 && lane == 0) ? 1 : 0);
                     if (is_last_1 != 0) {
-                        int warp_id_4 = warp_id_in_role_1;
-                        int row_top_0 = warp_id_4 * 16 + (lane >> 2);
+                        int warp_id_2_1 = warp_id_in_role_1;
+                        int row_top_0 = warp_id_2_1 * 16 + (lane >> 2);
                         long long base_top = output_head_base + (long long)row_top_0 * 128ll;
                         long long base_bot = base_top + 1024ll;
                         if (slot_valid != 0) {
@@ -5117,13 +3573,13 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         }
                     }
                 } else if (is_last_1 != 0) {
-                    int warp_id_5 = warp_id_in_role_1;
-                    int row_top_1 = warp_id_5 * 16 + lane / 4;
+                    int warp_id_3 = warp_id_in_role_1;
+                    int row_top_1 = warp_id_3 * 16 + lane / 4;
                     int col_lane = (lane & 3) * 4;
                     if (slot_valid != 0) {
                         #pragma unroll
                         for (int group = 0; group < 8; group++) {
-                            int col_12 = group * 16 + col_lane;
+                            int col_8 = group * 16 + col_lane;
                             #pragma unroll
                             for (int row_half = 0; row_half < 2; row_half++) {
                                 int row_4 = row_top_1 + row_half * 8;
@@ -5134,7 +3590,7 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                                 vec[3] = 0.0f;
                                 {
                                     float4 _v4 = make_float4(vec[0 + 0], vec[0 + 1], vec[0 + 2], vec[0 + 3]);
-                                    *reinterpret_cast<float4*>((output_state + (output_head_base + (long long)row_4 * 128ll + (long long)col_12)) + 0) = _v4;
+                                    *reinterpret_cast<float4*>((output_state + (output_head_base + (long long)row_4 * 128ll + (long long)col_8)) + 0) = _v4;
                                 }
                             }
                         }
@@ -5237,18 +3693,18 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     #pragma unroll
                     for (int chunk_in_pair_1 = 0; chunk_in_pair_1 < 2; chunk_in_pair_1++) {
                         int chunk_idx_3 = chunk_lo_2 + pair_idx * 2 + chunk_in_pair_1;
-                        int exp_off_4 = chunk_idx_3 * 64;
-                        int tok_off_4 = exp_off_4 / num_householder;
-                        int rem_4 = exp_off_4 - tok_off_4 * num_householder;
-                        int t0_4 = batch_start_2 + tok_off_4;
-                        int b_4 = num_householder - 1 - rem_4;
-                        int cnt_4 = (63 - b_4) / num_householder + 1;
+                        int exp_off_2 = chunk_idx_3 * 64;
+                        int tok_off_2 = exp_off_2 / num_householder;
+                        int rem_2 = exp_off_2 - tok_off_2 * num_householder;
+                        int t0_2 = batch_start_2 + tok_off_2;
+                        int b_2 = num_householder - 1 - rem_2;
+                        int cnt_2 = (63 - b_2) / num_householder + 1;
                         if (elect_sync()) {
                             mbarrier_wait(q_smem_empty_addr + (q_stage_tma) * 8, _phase_q_smem_empty);
                             mbarrier_arrive_expect_tx(load_q_full_addr + (q_stage_tma) * 8, 16384);
                             #pragma unroll
                             for (int dim_half_1 = 0; dim_half_1 < 2; dim_half_1++) {
-                                tma_3d_gmem2smem(smem_q_addr + q_stage_tma * 16384 + (unsigned int)(dim_half_1 * 8192), tensormap_workspace + cta_slot_base, dim_half_1 * 64, t0_4, head_idx_2, load_q_full_addr + (q_stage_tma) * 8);
+                                tma_3d_gmem2smem(smem_q_addr + q_stage_tma * 16384 + (unsigned int)(dim_half_1 * 8192), tensormap_workspace + cta_slot_base, dim_half_1 * 64, t0_2, head_idx_2, load_q_full_addr + (q_stage_tma) * 8);
                             }
                         }
                         q_stage_tma += 1;
@@ -6049,7 +4505,7 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     mbarrier_wait(beta_cg2_empty_addr + (gate_prod_stage) * 8, _phase_gate_cg0_empty);
                     mbarrier_wait(beta_cg1_empty_addr + (gate_prod_stage) * 8, _phase_gate_cg0_empty);
                     int gb_lane = lane;
-                    int gate_elem_base_3 = gate_prod_stage * 64;
+                    int gate_elem_base_1 = gate_prod_stage * 64;
                     int m_0 = exp_offset_2 + gb_lane;
                     int m_1 = m_0 + 32;
                     int valid_0 = ((m_0 < exp_end_99) ? 1 : 0);
@@ -6115,12 +4571,12 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     float _shfl_sync_130;
                     asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xFFFFFFFF;" : "=f"(_shfl_sync_130) : "f"(gate_log_0), "r"(31));
                     gate_log_1 = gate_log_1 + _shfl_sync_130;
-                    smem_cumsumlog[gate_elem_base_3 + gb_lane] = gate_log_0;
-                    smem_cumsumlog[gate_elem_base_3 + gb_lane + 32] = gate_log_1;
+                    smem_cumsumlog[gate_elem_base_1 + gb_lane] = gate_log_0;
+                    smem_cumsumlog[gate_elem_base_1 + gb_lane + 32] = gate_log_1;
                     float _exp2_131 = approx_exp2(gate_log_0);
-                    smem_cumprod[gate_elem_base_3 + gb_lane] = _exp2_131;
+                    smem_cumprod[gate_elem_base_1 + gb_lane] = _exp2_131;
                     float _exp2_132 = approx_exp2(gate_log_1);
-                    smem_cumprod[gate_elem_base_3 + gb_lane + 32] = _exp2_132;
+                    smem_cumprod[gate_elem_base_1 + gb_lane + 32] = _exp2_132;
                     mbarrier_arrive(load_gate_full_addr + (gate_prod_stage) * 8);
                     int beta_stage_addr = smem_beta_addr + gate_prod_stage * 256;
                     int beta_dst_0 = beta_stage_addr + gb_lane * 4;
@@ -6151,17 +4607,17 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
             unsigned int gate_cg2_stage = 0;
             unsigned int beta_cg2_stage = 0;
             uint64_t _wgmma_desc_0 = (((uint64_t)(((smem_ainv_addr)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-            uint64_t wgmma_a_8 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_0 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_0);
+            uint64_t wgmma_a_6 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_0 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_0);
             uint64_t _wgmma_desc_1 = (((uint64_t)(((smem_ainvc_addr)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-            uint64_t wgmma_b_6 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_1 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_1);
+            uint64_t wgmma_b_4 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_1 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_1);
             uint64_t _wgmma_desc_2 = (((uint64_t)(((smem_ainvc_addr + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-            uint64_t wgmma_b_1_3 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_2 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_2);
+            uint64_t wgmma_b_1_2 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_2 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_2);
             uint64_t _wgmma_desc_3 = (((uint64_t)(((smem_ainv_addr + 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-            uint64_t wgmma_a_8_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_3 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_3);
+            uint64_t wgmma_a_6_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_3 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_3);
             uint64_t _wgmma_desc_4 = (((uint64_t)(((smem_ainvc_addr + 4096)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-            uint64_t wgmma_b_6_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_4 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_4);
+            uint64_t wgmma_b_4_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_4 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_4);
             uint64_t _wgmma_desc_5 = (((uint64_t)(((smem_ainvc_addr + 8192 + 4096)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
-            uint64_t wgmma_b_1_3_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_5 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_5);
+            uint64_t wgmma_b_1_1_1 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_5 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_5);
             unsigned int _phase_tile_rec_full_3 = 0;
             unsigned int _phase_load_gate_full_2 = 0;
             unsigned int _phase_load_beta_full_1 = 0;
@@ -6185,10 +4641,10 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                 #pragma unroll 1
                 for (int chunk_idx_6 = chunk_lo_4; chunk_idx_6 < chunk_lo_4 + num_chunks_t_4; chunk_idx_6 += 2) {
                     int warp_id_in_role_2 = warp - 12;
-                    int warp_id_6 = warp_id_in_role_2;
-                    int cg2_first = ((warp_id_6 == 0 && lane == 0) ? 1 : 0);
-                    int my_stage = warp_id_6 / 2;
-                    int col_j = (warp_id_6 & 1) * 32 + lane;
+                    int warp_id_4 = warp_id_in_role_2;
+                    int cg2_first = ((warp_id_4 == 0 && lane == 0) ? 1 : 0);
+                    int my_stage = warp_id_4 / 2;
+                    int col_j = (warp_id_4 & 1) * 32 + lane;
                     unsigned int gate0_stage_1 = gate_cg2_stage;
                     mbarrier_wait(load_gate_full_addr + (gate_cg2_stage) * 8, _phase_load_gate_full_2);
                     gate_cg2_stage += 1;
@@ -6207,11 +4663,11 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     if (beta_cg2_stage == 4) { beta_cg2_stage = 0; _phase_load_beta_full_1 ^= 1; }
                     unsigned int my_gate_stage = ((my_stage == 0) ? gate0_stage_1 : gate1_stage_1);
                     unsigned int my_beta_stage = ((my_stage == 0) ? beta0_stage_1 : beta1_stage_1);
-                    int gate_elem_base_4 = my_gate_stage * 64;
+                    int gate_elem_base_2 = my_gate_stage * 64;
                     int beta_elem_base = my_beta_stage * 64;
                     mbarrier_wait(l_ready_addr + (warp_id_in_role_2 / 2) * 8, _phase_l_ready);
                     _phase_l_ready ^= 1;
-                    int blk_half = warp_id_6 & 1;
+                    int blk_half = warp_id_4 & 1;
                     int blk_lcol = lane;
                     unsigned int blk_l_base = smem_l_addr + (unsigned int)(my_stage * 8448);
                     float blk_xh[32];
@@ -8454,11 +6910,11 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         blk_acc_2_11 = __fmaf_rn(-blk_ld_2_13[2], blk_xh[30], blk_acc_2_11);
                         blk_xh[31] = blk_xh[31] + blk_acc_2_11;
                     }
-                    unsigned int acc_w_bf16_28[16];
+                    unsigned int acc_w_bf16_18[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_xh[_lp*2 + 0], blk_xh[_lp*2+1 + 0]));
-                        acc_w_bf16_28[_lp] = *(uint32_t*)&_bf2;
+                        acc_w_bf16_18[_lp] = *(uint32_t*)&_bf2;
                     }
                     mbarrier_wait(ainv_empty_addr + (warp_id_in_role_2 / 2) * 8, _phase_ainv_empty);
                     _phase_ainv_empty ^= 1;
@@ -8485,12 +6941,12 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         unsigned int blk_gb_4 = blk_b1_row + (unsigned int)((blk_lsw ^ 5) << 4);
                         unsigned int blk_gb_5 = blk_b1_row + (unsigned int)((blk_lsw ^ 6) << 4);
                         unsigned int blk_gb_6 = blk_b1_row + (unsigned int)((blk_lsw ^ 7) << 4);
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb), "r"(acc_w_bf16_28[0]), "r"(acc_w_bf16_28[1]), "r"(acc_w_bf16_28[2]), "r"(acc_w_bf16_28[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb), "r"(acc_w_bf16_18[0]), "r"(acc_w_bf16_18[1]), "r"(acc_w_bf16_18[2]), "r"(acc_w_bf16_18[3]) : "memory");
                         float _unpack_bf16_4[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[_pair]) << 16);
-                            (&_unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[_pair]) & 0xffff0000u);
+                            (&_unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[_pair]) << 16);
+                            (&_unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[_pair]) & 0xffff0000u);
                         }
                         float blk_lo8[8];
                         blk_lo8[0] = blk_xh[0] - _unpack_bf16_4[0];
@@ -8501,19 +6957,19 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         blk_lo8[5] = blk_xh[5] - _unpack_bf16_4[5];
                         blk_lo8[6] = blk_xh[6] - _unpack_bf16_4[6];
                         blk_lo8[7] = blk_xh[7] - _unpack_bf16_4[7];
-                        unsigned int acc_w_bf16_28_1[4];
+                        unsigned int acc_w_bf16_18_1[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lo8[_lp*2 + 0], blk_lo8[_lp*2+1 + 0]));
-                            acc_w_bf16_28_1[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_18_1[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_3), "r"(acc_w_bf16_28_1[0]), "r"(acc_w_bf16_28_1[1]), "r"(acc_w_bf16_28_1[2]), "r"(acc_w_bf16_28_1[3]) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_0), "r"(acc_w_bf16_28[4]), "r"(acc_w_bf16_28[5]), "r"(acc_w_bf16_28[6]), "r"(acc_w_bf16_28[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_3), "r"(acc_w_bf16_18_1[0]), "r"(acc_w_bf16_18_1[1]), "r"(acc_w_bf16_18_1[2]), "r"(acc_w_bf16_18_1[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_0), "r"(acc_w_bf16_18[4]), "r"(acc_w_bf16_18[5]), "r"(acc_w_bf16_18[6]), "r"(acc_w_bf16_18[7]) : "memory");
                         float _unpack_bf16_5[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_unpack_bf16_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[4 + _pair]) << 16);
-                            (&_unpack_bf16_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[4 + _pair]) & 0xffff0000u);
+                            (&_unpack_bf16_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[4 + _pair]) << 16);
+                            (&_unpack_bf16_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[4 + _pair]) & 0xffff0000u);
                         }
                         float blk_lo8_7[8];
                         blk_lo8_7[0] = blk_xh[8] - _unpack_bf16_5[0];
@@ -8524,19 +6980,19 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         blk_lo8_7[5] = blk_xh[13] - _unpack_bf16_5[5];
                         blk_lo8_7[6] = blk_xh[14] - _unpack_bf16_5[6];
                         blk_lo8_7[7] = blk_xh[15] - _unpack_bf16_5[7];
-                        unsigned int acc_w_bf16_29[4];
+                        unsigned int acc_w_bf16_19[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lo8_7[_lp*2 + 0], blk_lo8_7[_lp*2+1 + 0]));
-                            acc_w_bf16_29[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_19[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_4), "r"(acc_w_bf16_29[0]), "r"(acc_w_bf16_29[1]), "r"(acc_w_bf16_29[2]), "r"(acc_w_bf16_29[3]) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_1), "r"(acc_w_bf16_28[8]), "r"(acc_w_bf16_28[9]), "r"(acc_w_bf16_28[10]), "r"(acc_w_bf16_28[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_4), "r"(acc_w_bf16_19[0]), "r"(acc_w_bf16_19[1]), "r"(acc_w_bf16_19[2]), "r"(acc_w_bf16_19[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_1), "r"(acc_w_bf16_18[8]), "r"(acc_w_bf16_18[9]), "r"(acc_w_bf16_18[10]), "r"(acc_w_bf16_18[11]) : "memory");
                         float _unpack_bf16_6[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_unpack_bf16_6[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[8 + _pair]) << 16);
-                            (&_unpack_bf16_6[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[8 + _pair]) & 0xffff0000u);
+                            (&_unpack_bf16_6[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[8 + _pair]) << 16);
+                            (&_unpack_bf16_6[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[8 + _pair]) & 0xffff0000u);
                         }
                         float blk_lo8_8[8];
                         blk_lo8_8[0] = blk_xh[16] - _unpack_bf16_6[0];
@@ -8547,19 +7003,19 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         blk_lo8_8[5] = blk_xh[21] - _unpack_bf16_6[5];
                         blk_lo8_8[6] = blk_xh[22] - _unpack_bf16_6[6];
                         blk_lo8_8[7] = blk_xh[23] - _unpack_bf16_6[7];
-                        unsigned int acc_w_bf16_30[4];
+                        unsigned int acc_w_bf16_20[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lo8_8[_lp*2 + 0], blk_lo8_8[_lp*2+1 + 0]));
-                            acc_w_bf16_30[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_20[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_5), "r"(acc_w_bf16_30[0]), "r"(acc_w_bf16_30[1]), "r"(acc_w_bf16_30[2]), "r"(acc_w_bf16_30[3]) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_2), "r"(acc_w_bf16_28[12]), "r"(acc_w_bf16_28[13]), "r"(acc_w_bf16_28[14]), "r"(acc_w_bf16_28[15]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_5), "r"(acc_w_bf16_20[0]), "r"(acc_w_bf16_20[1]), "r"(acc_w_bf16_20[2]), "r"(acc_w_bf16_20[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_2), "r"(acc_w_bf16_18[12]), "r"(acc_w_bf16_18[13]), "r"(acc_w_bf16_18[14]), "r"(acc_w_bf16_18[15]) : "memory");
                         float _unpack_bf16_7[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_unpack_bf16_7[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[12 + _pair]) << 16);
-                            (&_unpack_bf16_7[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[12 + _pair]) & 0xffff0000u);
+                            (&_unpack_bf16_7[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[12 + _pair]) << 16);
+                            (&_unpack_bf16_7[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[12 + _pair]) & 0xffff0000u);
                         }
                         float blk_lo8_9[8];
                         blk_lo8_9[0] = blk_xh[24] - _unpack_bf16_7[0];
@@ -8570,13 +7026,13 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         blk_lo8_9[5] = blk_xh[29] - _unpack_bf16_7[5];
                         blk_lo8_9[6] = blk_xh[30] - _unpack_bf16_7[6];
                         blk_lo8_9[7] = blk_xh[31] - _unpack_bf16_7[7];
-                        unsigned int acc_w_bf16_31[4];
+                        unsigned int acc_w_bf16_21[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lo8_9[_lp*2 + 0], blk_lo8_9[_lp*2+1 + 0]));
-                            acc_w_bf16_31[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_21[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_6), "r"(acc_w_bf16_31[0]), "r"(acc_w_bf16_31[1]), "r"(acc_w_bf16_31[2]), "r"(acc_w_bf16_31[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_gb_6), "r"(acc_w_bf16_21[0]), "r"(acc_w_bf16_21[1]), "r"(acc_w_bf16_21[2]), "r"(acc_w_bf16_21[3]) : "memory");
                     }
                     if (blk_half == 1) {
                         unsigned int blk_fa = blk_hb + (unsigned int)((1 - my_stage) * 4096);
@@ -8585,8 +7041,8 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         float _unpack_bf16_8[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_unpack_bf16_8[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[_pair]) << 16);
-                            (&_unpack_bf16_8[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[_pair]) & 0xffff0000u);
+                            (&_unpack_bf16_8[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[_pair]) << 16);
+                            (&_unpack_bf16_8[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[_pair]) & 0xffff0000u);
                         }
                         {
                             __nv_bfloat16 _bval_6 = __float2bfloat16_rn(_unpack_bf16_8[0]);
@@ -8687,8 +7143,8 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         float unpack_bf16_r_r_r_r_r_r_r_0[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&unpack_bf16_r_r_r_r_r_r_r_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[4 + _pair]) << 16);
-                            (&unpack_bf16_r_r_r_r_r_r_r_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[4 + _pair]) & 0xffff0000u);
+                            (&unpack_bf16_r_r_r_r_r_r_r_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[4 + _pair]) << 16);
+                            (&unpack_bf16_r_r_r_r_r_r_r_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[4 + _pair]) & 0xffff0000u);
                         }
                         {
                             __nv_bfloat16 _bval_22 = __float2bfloat16_rn(unpack_bf16_r_r_r_r_r_r_r_0[0]);
@@ -8789,8 +7245,8 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         float unpack_bf16_r_r_r_r_r_r_r_1[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&unpack_bf16_r_r_r_r_r_r_r_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[8 + _pair]) << 16);
-                            (&unpack_bf16_r_r_r_r_r_r_r_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[8 + _pair]) & 0xffff0000u);
+                            (&unpack_bf16_r_r_r_r_r_r_r_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[8 + _pair]) << 16);
+                            (&unpack_bf16_r_r_r_r_r_r_r_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[8 + _pair]) & 0xffff0000u);
                         }
                         {
                             __nv_bfloat16 _bval_38 = __float2bfloat16_rn(unpack_bf16_r_r_r_r_r_r_r_1[0]);
@@ -8891,8 +7347,8 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         float unpack_bf16_r_r_r_r_r_r_r_2[8];
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&unpack_bf16_r_r_r_r_r_r_r_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[12 + _pair]) << 16);
-                            (&unpack_bf16_r_r_r_r_r_r_r_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_28[12 + _pair]) & 0xffff0000u);
+                            (&unpack_bf16_r_r_r_r_r_r_r_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[12 + _pair]) << 16);
+                            (&unpack_bf16_r_r_r_r_r_r_r_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_18[12 + _pair]) & 0xffff0000u);
                         }
                         {
                             __nv_bfloat16 _bval_54 = __float2bfloat16_rn(unpack_bf16_r_r_r_r_r_r_r_2[0]);
@@ -9011,18 +7467,18 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8[4])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8[(4) + 3]))
                         : "r"(blk_rb21 + 16));
-                    unsigned int acc_w_bf16_32[4];
+                    unsigned int acc_w_bf16_22[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lv8[_lp*2 + 0], blk_lv8[_lp*2+1 + 0]));
-                        acc_w_bf16_32[_lp] = *(uint32_t*)&_bf2;
+                        acc_w_bf16_22[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga), "r"(acc_w_bf16_32[0]), "r"(acc_w_bf16_32[1]), "r"(acc_w_bf16_32[2]), "r"(acc_w_bf16_32[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga), "r"(acc_w_bf16_22[0]), "r"(acc_w_bf16_22[1]), "r"(acc_w_bf16_22[2]), "r"(acc_w_bf16_22[3]) : "memory");
                     float _unpack_bf16_12[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_unpack_bf16_12[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_32[_pair]) << 16);
-                        (&_unpack_bf16_12[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_32[_pair]) & 0xffff0000u);
+                        (&_unpack_bf16_12[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_22[_pair]) << 16);
+                        (&_unpack_bf16_12[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_22[_pair]) & 0xffff0000u);
                     }
                     float blk_lo8a[8];
                     blk_lo8a[0] = blk_lv8[0] - _unpack_bf16_12[0];
@@ -9033,13 +7489,13 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     blk_lo8a[5] = blk_lv8[5] - _unpack_bf16_12[5];
                     blk_lo8a[6] = blk_lv8[6] - _unpack_bf16_12[6];
                     blk_lo8a[7] = blk_lv8[7] - _unpack_bf16_12[7];
-                    unsigned int acc_w_bf16_33[4];
+                    unsigned int acc_w_bf16_23[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lo8a[_lp*2 + 0], blk_lo8a[_lp*2+1 + 0]));
-                        acc_w_bf16_33[_lp] = *(uint32_t*)&_bf2;
+                        acc_w_bf16_23[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga_8), "r"(acc_w_bf16_33[0]), "r"(acc_w_bf16_33[1]), "r"(acc_w_bf16_33[2]), "r"(acc_w_bf16_33[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga_8), "r"(acc_w_bf16_23[0]), "r"(acc_w_bf16_23[1]), "r"(acc_w_bf16_23[2]), "r"(acc_w_bf16_23[3]) : "memory");
                     float blk_lv8_10[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[(0) + 3]))
@@ -9047,18 +7503,18 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[4])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&blk_lv8_10[(4) + 3]))
                         : "r"(blk_rb21 + 32 + 16));
-                    unsigned int acc_w_bf16_34[4];
+                    unsigned int acc_w_bf16_24[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lv8_10[_lp*2 + 0], blk_lv8_10[_lp*2+1 + 0]));
-                        acc_w_bf16_34[_lp] = *(uint32_t*)&_bf2;
+                        acc_w_bf16_24[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga_7), "r"(acc_w_bf16_34[0]), "r"(acc_w_bf16_34[1]), "r"(acc_w_bf16_34[2]), "r"(acc_w_bf16_34[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga_7), "r"(acc_w_bf16_24[0]), "r"(acc_w_bf16_24[1]), "r"(acc_w_bf16_24[2]), "r"(acc_w_bf16_24[3]) : "memory");
                     float _unpack_bf16_13[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_unpack_bf16_13[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_34[_pair]) << 16);
-                        (&_unpack_bf16_13[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_34[_pair]) & 0xffff0000u);
+                        (&_unpack_bf16_13[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_24[_pair]) << 16);
+                        (&_unpack_bf16_13[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_24[_pair]) & 0xffff0000u);
                     }
                     float blk_lo8a_11[8];
                     blk_lo8a_11[0] = blk_lv8_10[0] - _unpack_bf16_13[0];
@@ -9069,13 +7525,13 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     blk_lo8a_11[5] = blk_lv8_10[5] - _unpack_bf16_13[5];
                     blk_lo8a_11[6] = blk_lv8_10[6] - _unpack_bf16_13[6];
                     blk_lo8a_11[7] = blk_lv8_10[7] - _unpack_bf16_13[7];
-                    unsigned int acc_w_bf16_35[4];
+                    unsigned int acc_w_bf16_25[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_lo8a_11[_lp*2 + 0], blk_lo8a_11[_lp*2+1 + 0]));
-                        acc_w_bf16_35[_lp] = *(uint32_t*)&_bf2;
+                        acc_w_bf16_25[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga_9), "r"(acc_w_bf16_35[0]), "r"(acc_w_bf16_35[1]), "r"(acc_w_bf16_35[2]), "r"(acc_w_bf16_35[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(blk_ga_9), "r"(acc_w_bf16_25[0]), "r"(acc_w_bf16_25[1]), "r"(acc_w_bf16_25[2]), "r"(acc_w_bf16_25[3]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 12, 128;" ::: "memory");
                     mbarrier_arrive(l_empty_addr);
@@ -9116,51 +7572,51 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 0, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t0[0]), "+f"(blk_acc_t0[1]), "+f"(blk_acc_t0[2]), "+f"(blk_acc_t0[3]), "+f"(blk_acc_t0[4]), "+f"(blk_acc_t0[5]), "+f"(blk_acc_t0[6]), "+f"(blk_acc_t0[7]), "+f"(blk_acc_t0[8]), "+f"(blk_acc_t0[9]), "+f"(blk_acc_t0[10]), "+f"(blk_acc_t0[11]), "+f"(blk_acc_t0[12]), "+f"(blk_acc_t0[13]), "+f"(blk_acc_t0[14]), "+f"(blk_acc_t0[15])
-                        : "l"(wgmma_a_8), "l"(wgmma_b_6)
+                        : "l"(wgmma_a_6), "l"(wgmma_b_4)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t0[0]), "+f"(blk_acc_t0[1]), "+f"(blk_acc_t0[2]), "+f"(blk_acc_t0[3]), "+f"(blk_acc_t0[4]), "+f"(blk_acc_t0[5]), "+f"(blk_acc_t0[6]), "+f"(blk_acc_t0[7]), "+f"(blk_acc_t0[8]), "+f"(blk_acc_t0[9]), "+f"(blk_acc_t0[10]), "+f"(blk_acc_t0[11]), "+f"(blk_acc_t0[12]), "+f"(blk_acc_t0[13]), "+f"(blk_acc_t0[14]), "+f"(blk_acc_t0[15])
-                        : "l"(wgmma_a_8 + 2ull), "l"(wgmma_b_6 + 2ull)
+                        : "l"(wgmma_a_6 + 2ull), "l"(wgmma_b_4 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t0[0]), "+f"(blk_acc_t0[1]), "+f"(blk_acc_t0[2]), "+f"(blk_acc_t0[3]), "+f"(blk_acc_t0[4]), "+f"(blk_acc_t0[5]), "+f"(blk_acc_t0[6]), "+f"(blk_acc_t0[7]), "+f"(blk_acc_t0[8]), "+f"(blk_acc_t0[9]), "+f"(blk_acc_t0[10]), "+f"(blk_acc_t0[11]), "+f"(blk_acc_t0[12]), "+f"(blk_acc_t0[13]), "+f"(blk_acc_t0[14]), "+f"(blk_acc_t0[15])
-                        : "l"(wgmma_a_8), "l"(wgmma_b_6 + 4ull)
+                        : "l"(wgmma_a_6), "l"(wgmma_b_4 + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t0[0]), "+f"(blk_acc_t0[1]), "+f"(blk_acc_t0[2]), "+f"(blk_acc_t0[3]), "+f"(blk_acc_t0[4]), "+f"(blk_acc_t0[5]), "+f"(blk_acc_t0[6]), "+f"(blk_acc_t0[7]), "+f"(blk_acc_t0[8]), "+f"(blk_acc_t0[9]), "+f"(blk_acc_t0[10]), "+f"(blk_acc_t0[11]), "+f"(blk_acc_t0[12]), "+f"(blk_acc_t0[13]), "+f"(blk_acc_t0[14]), "+f"(blk_acc_t0[15])
-                        : "l"(wgmma_a_8 + 2ull), "l"(wgmma_b_6 + 6ull)
+                        : "l"(wgmma_a_6 + 2ull), "l"(wgmma_b_4 + 6ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t0[0]), "+f"(blk_acc_t0[1]), "+f"(blk_acc_t0[2]), "+f"(blk_acc_t0[3]), "+f"(blk_acc_t0[4]), "+f"(blk_acc_t0[5]), "+f"(blk_acc_t0[6]), "+f"(blk_acc_t0[7]), "+f"(blk_acc_t0[8]), "+f"(blk_acc_t0[9]), "+f"(blk_acc_t0[10]), "+f"(blk_acc_t0[11]), "+f"(blk_acc_t0[12]), "+f"(blk_acc_t0[13]), "+f"(blk_acc_t0[14]), "+f"(blk_acc_t0[15])
-                        : "l"(wgmma_a_8 + 4ull), "l"(wgmma_b_6)
+                        : "l"(wgmma_a_6 + 4ull), "l"(wgmma_b_4)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t0[0]), "+f"(blk_acc_t0[1]), "+f"(blk_acc_t0[2]), "+f"(blk_acc_t0[3]), "+f"(blk_acc_t0[4]), "+f"(blk_acc_t0[5]), "+f"(blk_acc_t0[6]), "+f"(blk_acc_t0[7]), "+f"(blk_acc_t0[8]), "+f"(blk_acc_t0[9]), "+f"(blk_acc_t0[10]), "+f"(blk_acc_t0[11]), "+f"(blk_acc_t0[12]), "+f"(blk_acc_t0[13]), "+f"(blk_acc_t0[14]), "+f"(blk_acc_t0[15])
-                        : "l"(wgmma_a_8 + 6ull), "l"(wgmma_b_6 + 2ull)
+                        : "l"(wgmma_a_6 + 6ull), "l"(wgmma_b_4 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 0, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t1[0]), "+f"(blk_acc_t1[1]), "+f"(blk_acc_t1[2]), "+f"(blk_acc_t1[3]), "+f"(blk_acc_t1[4]), "+f"(blk_acc_t1[5]), "+f"(blk_acc_t1[6]), "+f"(blk_acc_t1[7]), "+f"(blk_acc_t1[8]), "+f"(blk_acc_t1[9]), "+f"(blk_acc_t1[10]), "+f"(blk_acc_t1[11]), "+f"(blk_acc_t1[12]), "+f"(blk_acc_t1[13]), "+f"(blk_acc_t1[14]), "+f"(blk_acc_t1[15])
-                        : "l"(wgmma_a_8), "l"(wgmma_b_1_3)
+                        : "l"(wgmma_a_6), "l"(wgmma_b_1_2)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t1[0]), "+f"(blk_acc_t1[1]), "+f"(blk_acc_t1[2]), "+f"(blk_acc_t1[3]), "+f"(blk_acc_t1[4]), "+f"(blk_acc_t1[5]), "+f"(blk_acc_t1[6]), "+f"(blk_acc_t1[7]), "+f"(blk_acc_t1[8]), "+f"(blk_acc_t1[9]), "+f"(blk_acc_t1[10]), "+f"(blk_acc_t1[11]), "+f"(blk_acc_t1[12]), "+f"(blk_acc_t1[13]), "+f"(blk_acc_t1[14]), "+f"(blk_acc_t1[15])
-                        : "l"(wgmma_a_8 + 2ull), "l"(wgmma_b_1_3 + 2ull)
+                        : "l"(wgmma_a_6 + 2ull), "l"(wgmma_b_1_2 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t1[0]), "+f"(blk_acc_t1[1]), "+f"(blk_acc_t1[2]), "+f"(blk_acc_t1[3]), "+f"(blk_acc_t1[4]), "+f"(blk_acc_t1[5]), "+f"(blk_acc_t1[6]), "+f"(blk_acc_t1[7]), "+f"(blk_acc_t1[8]), "+f"(blk_acc_t1[9]), "+f"(blk_acc_t1[10]), "+f"(blk_acc_t1[11]), "+f"(blk_acc_t1[12]), "+f"(blk_acc_t1[13]), "+f"(blk_acc_t1[14]), "+f"(blk_acc_t1[15])
-                        : "l"(wgmma_a_8), "l"(wgmma_b_1_3 + 4ull)
+                        : "l"(wgmma_a_6), "l"(wgmma_b_1_2 + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t1[0]), "+f"(blk_acc_t1[1]), "+f"(blk_acc_t1[2]), "+f"(blk_acc_t1[3]), "+f"(blk_acc_t1[4]), "+f"(blk_acc_t1[5]), "+f"(blk_acc_t1[6]), "+f"(blk_acc_t1[7]), "+f"(blk_acc_t1[8]), "+f"(blk_acc_t1[9]), "+f"(blk_acc_t1[10]), "+f"(blk_acc_t1[11]), "+f"(blk_acc_t1[12]), "+f"(blk_acc_t1[13]), "+f"(blk_acc_t1[14]), "+f"(blk_acc_t1[15])
-                        : "l"(wgmma_a_8 + 2ull), "l"(wgmma_b_1_3 + 6ull)
+                        : "l"(wgmma_a_6 + 2ull), "l"(wgmma_b_1_2 + 6ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t1[0]), "+f"(blk_acc_t1[1]), "+f"(blk_acc_t1[2]), "+f"(blk_acc_t1[3]), "+f"(blk_acc_t1[4]), "+f"(blk_acc_t1[5]), "+f"(blk_acc_t1[6]), "+f"(blk_acc_t1[7]), "+f"(blk_acc_t1[8]), "+f"(blk_acc_t1[9]), "+f"(blk_acc_t1[10]), "+f"(blk_acc_t1[11]), "+f"(blk_acc_t1[12]), "+f"(blk_acc_t1[13]), "+f"(blk_acc_t1[14]), "+f"(blk_acc_t1[15])
-                        : "l"(wgmma_a_8 + 4ull), "l"(wgmma_b_1_3)
+                        : "l"(wgmma_a_6 + 4ull), "l"(wgmma_b_1_2)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_t1[0]), "+f"(blk_acc_t1[1]), "+f"(blk_acc_t1[2]), "+f"(blk_acc_t1[3]), "+f"(blk_acc_t1[4]), "+f"(blk_acc_t1[5]), "+f"(blk_acc_t1[6]), "+f"(blk_acc_t1[7]), "+f"(blk_acc_t1[8]), "+f"(blk_acc_t1[9]), "+f"(blk_acc_t1[10]), "+f"(blk_acc_t1[11]), "+f"(blk_acc_t1[12]), "+f"(blk_acc_t1[13]), "+f"(blk_acc_t1[14]), "+f"(blk_acc_t1[15])
-                        : "l"(wgmma_a_8 + 6ull), "l"(wgmma_b_1_3 + 2ull)
+                        : "l"(wgmma_a_6 + 6ull), "l"(wgmma_b_1_2 + 2ull)
                         : "memory");
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     asm volatile("" : "+f"(blk_acc_t0[0]) :: "memory");
@@ -9201,62 +7657,62 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     unsigned int blk_tb = blk_ainv_base + (unsigned int)(20480 + blk_q4 * 256 + blk_r7 * 2 + ((blk_half ^ blk_q4 & 1) << 5) + (blk_q4 >> 1 << 6));
                     unsigned int blk_tb_lo = blk_tb ^ 64;
                     if (my_stage == 0) {
-                        unsigned int acc_w_bf16_36[2];
+                        unsigned int acc_w_bf16_26[2];
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_acc_t0[_lp*2 + 0], blk_acc_t0[_lp*2+1 + 0]));
-                            acc_w_bf16_36[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_26[_lp] = *(uint32_t*)&_bf2;
                         }
-                        float unpack_bf16_3[4];
+                        float unpack_bf16_1[4];
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
-                            (&unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_36[_pair]) << 16);
-                            (&unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_36[_pair]) & 0xffff0000u);
+                            (&unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_26[_pair]) << 16);
+                            (&unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_26[_pair]) & 0xffff0000u);
                         }
                         {
-                            __nv_bfloat16 _bval_70 = __float2bfloat16_rn(unpack_bf16_3[0]);
+                            __nv_bfloat16 _bval_70 = __float2bfloat16_rn(unpack_bf16_1[0]);
                             uint16_t _bits_70 = *(uint16_t*)&_bval_70;
                             uint32_t _addr_70 = static_cast<uint32_t>(blk_tb);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_70), "h"(_bits_70) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_71 = __float2bfloat16_rn(blk_acc_t0[0] - unpack_bf16_3[0]);
+                            __nv_bfloat16 _bval_71 = __float2bfloat16_rn(blk_acc_t0[0] - unpack_bf16_1[0]);
                             uint16_t _bits_71 = *(uint16_t*)&_bval_71;
                             uint32_t _addr_71 = static_cast<uint32_t>(blk_tb_lo);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_71), "h"(_bits_71) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_72 = __float2bfloat16_rn(unpack_bf16_3[1]);
+                            __nv_bfloat16 _bval_72 = __float2bfloat16_rn(unpack_bf16_1[1]);
                             uint16_t _bits_72 = *(uint16_t*)&_bval_72;
                             uint32_t _addr_72 = static_cast<uint32_t>(blk_tb + 144);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_72), "h"(_bits_72) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_73 = __float2bfloat16_rn(blk_acc_t0[1] - unpack_bf16_3[1]);
+                            __nv_bfloat16 _bval_73 = __float2bfloat16_rn(blk_acc_t0[1] - unpack_bf16_1[1]);
                             uint16_t _bits_73 = *(uint16_t*)&_bval_73;
                             uint32_t _addr_73 = static_cast<uint32_t>(blk_tb_lo + 144);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_73), "h"(_bits_73) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_74 = __float2bfloat16_rn(unpack_bf16_3[2]);
+                            __nv_bfloat16 _bval_74 = __float2bfloat16_rn(unpack_bf16_1[2]);
                             uint16_t _bits_74 = *(uint16_t*)&_bval_74;
                             uint32_t _addr_74 = static_cast<uint32_t>(blk_tb + 16);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_74), "h"(_bits_74) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_75 = __float2bfloat16_rn(blk_acc_t0[2] - unpack_bf16_3[2]);
+                            __nv_bfloat16 _bval_75 = __float2bfloat16_rn(blk_acc_t0[2] - unpack_bf16_1[2]);
                             uint16_t _bits_75 = *(uint16_t*)&_bval_75;
                             uint32_t _addr_75 = static_cast<uint32_t>(blk_tb_lo + 16);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_75), "h"(_bits_75) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_76 = __float2bfloat16_rn(unpack_bf16_3[3]);
+                            __nv_bfloat16 _bval_76 = __float2bfloat16_rn(unpack_bf16_1[3]);
                             uint16_t _bits_76 = *(uint16_t*)&_bval_76;
                             uint32_t _addr_76 = static_cast<uint32_t>(blk_tb + 128);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_76), "h"(_bits_76) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_77 = __float2bfloat16_rn(blk_acc_t0[3] - unpack_bf16_3[3]);
+                            __nv_bfloat16 _bval_77 = __float2bfloat16_rn(blk_acc_t0[3] - unpack_bf16_1[3]);
                             uint16_t _bits_77 = *(uint16_t*)&_bval_77;
                             uint32_t _addr_77 = static_cast<uint32_t>(blk_tb_lo + 128);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_77), "h"(_bits_77) : "memory");
@@ -9442,62 +7898,62 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_101), "h"(_bits_101) : "memory");
                         }
                     } else {
-                        unsigned int acc_w_bf16_37[2];
+                        unsigned int acc_w_bf16_27[2];
                         #pragma unroll
                         for (int _lp = 0; _lp < 2; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_acc_t1[_lp*2 + 0], blk_acc_t1[_lp*2+1 + 0]));
-                            acc_w_bf16_37[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_27[_lp] = *(uint32_t*)&_bf2;
                         }
-                        float unpack_bf16_4[4];
+                        float unpack_bf16_2[4];
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
-                            (&unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_37[_pair]) << 16);
-                            (&unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_37[_pair]) & 0xffff0000u);
+                            (&unpack_bf16_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_27[_pair]) << 16);
+                            (&unpack_bf16_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(acc_w_bf16_27[_pair]) & 0xffff0000u);
                         }
                         {
-                            __nv_bfloat16 _bval_102 = __float2bfloat16_rn(unpack_bf16_4[0]);
+                            __nv_bfloat16 _bval_102 = __float2bfloat16_rn(unpack_bf16_2[0]);
                             uint16_t _bits_102 = *(uint16_t*)&_bval_102;
                             uint32_t _addr_102 = static_cast<uint32_t>(blk_tb);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_102), "h"(_bits_102) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_103 = __float2bfloat16_rn(blk_acc_t1[0] - unpack_bf16_4[0]);
+                            __nv_bfloat16 _bval_103 = __float2bfloat16_rn(blk_acc_t1[0] - unpack_bf16_2[0]);
                             uint16_t _bits_103 = *(uint16_t*)&_bval_103;
                             uint32_t _addr_103 = static_cast<uint32_t>(blk_tb_lo);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_103), "h"(_bits_103) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_104 = __float2bfloat16_rn(unpack_bf16_4[1]);
+                            __nv_bfloat16 _bval_104 = __float2bfloat16_rn(unpack_bf16_2[1]);
                             uint16_t _bits_104 = *(uint16_t*)&_bval_104;
                             uint32_t _addr_104 = static_cast<uint32_t>(blk_tb + 144);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_104), "h"(_bits_104) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_105 = __float2bfloat16_rn(blk_acc_t1[1] - unpack_bf16_4[1]);
+                            __nv_bfloat16 _bval_105 = __float2bfloat16_rn(blk_acc_t1[1] - unpack_bf16_2[1]);
                             uint16_t _bits_105 = *(uint16_t*)&_bval_105;
                             uint32_t _addr_105 = static_cast<uint32_t>(blk_tb_lo + 144);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_105), "h"(_bits_105) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_106 = __float2bfloat16_rn(unpack_bf16_4[2]);
+                            __nv_bfloat16 _bval_106 = __float2bfloat16_rn(unpack_bf16_2[2]);
                             uint16_t _bits_106 = *(uint16_t*)&_bval_106;
                             uint32_t _addr_106 = static_cast<uint32_t>(blk_tb + 16);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_106), "h"(_bits_106) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_107 = __float2bfloat16_rn(blk_acc_t1[2] - unpack_bf16_4[2]);
+                            __nv_bfloat16 _bval_107 = __float2bfloat16_rn(blk_acc_t1[2] - unpack_bf16_2[2]);
                             uint16_t _bits_107 = *(uint16_t*)&_bval_107;
                             uint32_t _addr_107 = static_cast<uint32_t>(blk_tb_lo + 16);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_107), "h"(_bits_107) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_108 = __float2bfloat16_rn(unpack_bf16_4[3]);
+                            __nv_bfloat16 _bval_108 = __float2bfloat16_rn(unpack_bf16_2[3]);
                             uint16_t _bits_108 = *(uint16_t*)&_bval_108;
                             uint32_t _addr_108 = static_cast<uint32_t>(blk_tb + 128);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_108), "h"(_bits_108) : "memory");
                         }
                         {
-                            __nv_bfloat16 _bval_109 = __float2bfloat16_rn(blk_acc_t1[3] - unpack_bf16_4[3]);
+                            __nv_bfloat16 _bval_109 = __float2bfloat16_rn(blk_acc_t1[3] - unpack_bf16_2[3]);
                             uint16_t _bits_109 = *(uint16_t*)&_bval_109;
                             uint32_t _addr_109 = static_cast<uint32_t>(blk_tb_lo + 128);
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_109), "h"(_bits_109) : "memory");
@@ -9722,51 +8178,51 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 0, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y0[0]), "+f"(blk_acc_y0[1]), "+f"(blk_acc_y0[2]), "+f"(blk_acc_y0[3]), "+f"(blk_acc_y0[4]), "+f"(blk_acc_y0[5]), "+f"(blk_acc_y0[6]), "+f"(blk_acc_y0[7]), "+f"(blk_acc_y0[8]), "+f"(blk_acc_y0[9]), "+f"(blk_acc_y0[10]), "+f"(blk_acc_y0[11]), "+f"(blk_acc_y0[12]), "+f"(blk_acc_y0[13]), "+f"(blk_acc_y0[14]), "+f"(blk_acc_y0[15])
-                        : "l"(wgmma_a_8_1), "l"(wgmma_b_6_1)
+                        : "l"(wgmma_a_6_1), "l"(wgmma_b_4_1)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y0[0]), "+f"(blk_acc_y0[1]), "+f"(blk_acc_y0[2]), "+f"(blk_acc_y0[3]), "+f"(blk_acc_y0[4]), "+f"(blk_acc_y0[5]), "+f"(blk_acc_y0[6]), "+f"(blk_acc_y0[7]), "+f"(blk_acc_y0[8]), "+f"(blk_acc_y0[9]), "+f"(blk_acc_y0[10]), "+f"(blk_acc_y0[11]), "+f"(blk_acc_y0[12]), "+f"(blk_acc_y0[13]), "+f"(blk_acc_y0[14]), "+f"(blk_acc_y0[15])
-                        : "l"(wgmma_a_8_1 + 2ull), "l"(wgmma_b_6_1 + 2ull)
+                        : "l"(wgmma_a_6_1 + 2ull), "l"(wgmma_b_4_1 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y0[0]), "+f"(blk_acc_y0[1]), "+f"(blk_acc_y0[2]), "+f"(blk_acc_y0[3]), "+f"(blk_acc_y0[4]), "+f"(blk_acc_y0[5]), "+f"(blk_acc_y0[6]), "+f"(blk_acc_y0[7]), "+f"(blk_acc_y0[8]), "+f"(blk_acc_y0[9]), "+f"(blk_acc_y0[10]), "+f"(blk_acc_y0[11]), "+f"(blk_acc_y0[12]), "+f"(blk_acc_y0[13]), "+f"(blk_acc_y0[14]), "+f"(blk_acc_y0[15])
-                        : "l"(wgmma_a_8_1), "l"(wgmma_b_6_1 + 4ull)
+                        : "l"(wgmma_a_6_1), "l"(wgmma_b_4_1 + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y0[0]), "+f"(blk_acc_y0[1]), "+f"(blk_acc_y0[2]), "+f"(blk_acc_y0[3]), "+f"(blk_acc_y0[4]), "+f"(blk_acc_y0[5]), "+f"(blk_acc_y0[6]), "+f"(blk_acc_y0[7]), "+f"(blk_acc_y0[8]), "+f"(blk_acc_y0[9]), "+f"(blk_acc_y0[10]), "+f"(blk_acc_y0[11]), "+f"(blk_acc_y0[12]), "+f"(blk_acc_y0[13]), "+f"(blk_acc_y0[14]), "+f"(blk_acc_y0[15])
-                        : "l"(wgmma_a_8_1 + 2ull), "l"(wgmma_b_6_1 + 6ull)
+                        : "l"(wgmma_a_6_1 + 2ull), "l"(wgmma_b_4_1 + 6ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y0[0]), "+f"(blk_acc_y0[1]), "+f"(blk_acc_y0[2]), "+f"(blk_acc_y0[3]), "+f"(blk_acc_y0[4]), "+f"(blk_acc_y0[5]), "+f"(blk_acc_y0[6]), "+f"(blk_acc_y0[7]), "+f"(blk_acc_y0[8]), "+f"(blk_acc_y0[9]), "+f"(blk_acc_y0[10]), "+f"(blk_acc_y0[11]), "+f"(blk_acc_y0[12]), "+f"(blk_acc_y0[13]), "+f"(blk_acc_y0[14]), "+f"(blk_acc_y0[15])
-                        : "l"(wgmma_a_8_1 + 4ull), "l"(wgmma_b_6_1)
+                        : "l"(wgmma_a_6_1 + 4ull), "l"(wgmma_b_4_1)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y0[0]), "+f"(blk_acc_y0[1]), "+f"(blk_acc_y0[2]), "+f"(blk_acc_y0[3]), "+f"(blk_acc_y0[4]), "+f"(blk_acc_y0[5]), "+f"(blk_acc_y0[6]), "+f"(blk_acc_y0[7]), "+f"(blk_acc_y0[8]), "+f"(blk_acc_y0[9]), "+f"(blk_acc_y0[10]), "+f"(blk_acc_y0[11]), "+f"(blk_acc_y0[12]), "+f"(blk_acc_y0[13]), "+f"(blk_acc_y0[14]), "+f"(blk_acc_y0[15])
-                        : "l"(wgmma_a_8_1 + 6ull), "l"(wgmma_b_6_1 + 2ull)
+                        : "l"(wgmma_a_6_1 + 6ull), "l"(wgmma_b_4_1 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 0, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y1[0]), "+f"(blk_acc_y1[1]), "+f"(blk_acc_y1[2]), "+f"(blk_acc_y1[3]), "+f"(blk_acc_y1[4]), "+f"(blk_acc_y1[5]), "+f"(blk_acc_y1[6]), "+f"(blk_acc_y1[7]), "+f"(blk_acc_y1[8]), "+f"(blk_acc_y1[9]), "+f"(blk_acc_y1[10]), "+f"(blk_acc_y1[11]), "+f"(blk_acc_y1[12]), "+f"(blk_acc_y1[13]), "+f"(blk_acc_y1[14]), "+f"(blk_acc_y1[15])
-                        : "l"(wgmma_a_8_1), "l"(wgmma_b_1_3_1)
+                        : "l"(wgmma_a_6_1), "l"(wgmma_b_1_1_1)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y1[0]), "+f"(blk_acc_y1[1]), "+f"(blk_acc_y1[2]), "+f"(blk_acc_y1[3]), "+f"(blk_acc_y1[4]), "+f"(blk_acc_y1[5]), "+f"(blk_acc_y1[6]), "+f"(blk_acc_y1[7]), "+f"(blk_acc_y1[8]), "+f"(blk_acc_y1[9]), "+f"(blk_acc_y1[10]), "+f"(blk_acc_y1[11]), "+f"(blk_acc_y1[12]), "+f"(blk_acc_y1[13]), "+f"(blk_acc_y1[14]), "+f"(blk_acc_y1[15])
-                        : "l"(wgmma_a_8_1 + 2ull), "l"(wgmma_b_1_3_1 + 2ull)
+                        : "l"(wgmma_a_6_1 + 2ull), "l"(wgmma_b_1_1_1 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y1[0]), "+f"(blk_acc_y1[1]), "+f"(blk_acc_y1[2]), "+f"(blk_acc_y1[3]), "+f"(blk_acc_y1[4]), "+f"(blk_acc_y1[5]), "+f"(blk_acc_y1[6]), "+f"(blk_acc_y1[7]), "+f"(blk_acc_y1[8]), "+f"(blk_acc_y1[9]), "+f"(blk_acc_y1[10]), "+f"(blk_acc_y1[11]), "+f"(blk_acc_y1[12]), "+f"(blk_acc_y1[13]), "+f"(blk_acc_y1[14]), "+f"(blk_acc_y1[15])
-                        : "l"(wgmma_a_8_1), "l"(wgmma_b_1_3_1 + 4ull)
+                        : "l"(wgmma_a_6_1), "l"(wgmma_b_1_1_1 + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y1[0]), "+f"(blk_acc_y1[1]), "+f"(blk_acc_y1[2]), "+f"(blk_acc_y1[3]), "+f"(blk_acc_y1[4]), "+f"(blk_acc_y1[5]), "+f"(blk_acc_y1[6]), "+f"(blk_acc_y1[7]), "+f"(blk_acc_y1[8]), "+f"(blk_acc_y1[9]), "+f"(blk_acc_y1[10]), "+f"(blk_acc_y1[11]), "+f"(blk_acc_y1[12]), "+f"(blk_acc_y1[13]), "+f"(blk_acc_y1[14]), "+f"(blk_acc_y1[15])
-                        : "l"(wgmma_a_8_1 + 2ull), "l"(wgmma_b_1_3_1 + 6ull)
+                        : "l"(wgmma_a_6_1 + 2ull), "l"(wgmma_b_1_1_1 + 6ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y1[0]), "+f"(blk_acc_y1[1]), "+f"(blk_acc_y1[2]), "+f"(blk_acc_y1[3]), "+f"(blk_acc_y1[4]), "+f"(blk_acc_y1[5]), "+f"(blk_acc_y1[6]), "+f"(blk_acc_y1[7]), "+f"(blk_acc_y1[8]), "+f"(blk_acc_y1[9]), "+f"(blk_acc_y1[10]), "+f"(blk_acc_y1[11]), "+f"(blk_acc_y1[12]), "+f"(blk_acc_y1[13]), "+f"(blk_acc_y1[14]), "+f"(blk_acc_y1[15])
-                        : "l"(wgmma_a_8_1 + 4ull), "l"(wgmma_b_1_3_1)
+                        : "l"(wgmma_a_6_1 + 4ull), "l"(wgmma_b_1_1_1)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(blk_acc_y1[0]), "+f"(blk_acc_y1[1]), "+f"(blk_acc_y1[2]), "+f"(blk_acc_y1[3]), "+f"(blk_acc_y1[4]), "+f"(blk_acc_y1[5]), "+f"(blk_acc_y1[6]), "+f"(blk_acc_y1[7]), "+f"(blk_acc_y1[8]), "+f"(blk_acc_y1[9]), "+f"(blk_acc_y1[10]), "+f"(blk_acc_y1[11]), "+f"(blk_acc_y1[12]), "+f"(blk_acc_y1[13]), "+f"(blk_acc_y1[14]), "+f"(blk_acc_y1[15])
-                        : "l"(wgmma_a_8_1 + 6ull), "l"(wgmma_b_1_3_1 + 2ull)
+                        : "l"(wgmma_a_6_1 + 6ull), "l"(wgmma_b_1_1_1 + 2ull)
                         : "memory");
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     asm volatile("" : "+f"(blk_acc_y0[0]) :: "memory");
@@ -9804,7 +8260,7 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                     asm volatile("barrier.sync 12, 128;" ::: "memory");
                     float blk_beta_j = smem_beta[beta_elem_base + col_j];
-                    float _exp2_134 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + col_j]);
+                    float _exp2_134 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + col_j]);
                     float blk_betac_j = blk_beta_j * _exp2_134;
                     float blk_a_val = ((blk_lcol == 0) ? 0.0f : __fmaf_rn(-blk_xh[0], blk_beta_j, 0.0f));
                     {
@@ -10617,380 +9073,380 @@ kernel_cake_gdp_3220d37914678385a837(const __grid_constant__ CUtensorMap Q, cons
                         int blk_n0 = 2 * blk_q4;
                         float blk_bn0 = smem_beta[beta_elem_base + blk_n0];
                         float blk_bn1 = smem_beta[beta_elem_base + blk_n0 + 1];
-                        float _exp2_263 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0]);
+                        float _exp2_263 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0]);
                         float blk_bcn0 = blk_bn0 * _exp2_263;
-                        float _exp2_264 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0 + 1]);
+                        float _exp2_264 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0 + 1]);
                         float blk_bcn1 = blk_bn1 * _exp2_264;
                         float blk_pa_1_0[2];
                         blk_pa_1_0[0] = blk_acc_y0[0] * blk_bn0;
                         blk_pa_1_0[1] = blk_acc_y0[1] * blk_bn1;
-                        unsigned int acc_w_bf16_38[1];
+                        unsigned int acc_w_bf16_28[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_0[_lp*2 + 0], blk_pa_1_0[_lp*2+1 + 0]));
-                            acc_w_bf16_38[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_28[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg), "r"(acc_w_bf16_38[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg), "r"(acc_w_bf16_28[0]) : "memory");
                         float blk_pc_2_0[2];
                         blk_pc_2_0[0] = __fmaf_rn(-blk_acc_y0[0], blk_bcn0, 0.0f);
                         blk_pc_2_0[1] = __fmaf_rn(-blk_acc_y0[1], blk_bcn1, 0.0f);
-                        unsigned int acc_w_bf16_39[1];
+                        unsigned int acc_w_bf16_29[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_0[_lp*2 + 0], blk_pc_2_0[_lp*2+1 + 0]));
-                            acc_w_bf16_39[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_29[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 16384), "r"(acc_w_bf16_39[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 16384), "r"(acc_w_bf16_29[0]) : "memory");
                         float blk_pa_1_1[2];
                         blk_pa_1_1[0] = blk_acc_y0[2] * blk_bn0;
                         blk_pa_1_1[1] = blk_acc_y0[3] * blk_bn1;
-                        unsigned int acc_w_bf16_40[1];
+                        unsigned int acc_w_bf16_30[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_1[_lp*2 + 0], blk_pa_1_1[_lp*2+1 + 0]));
-                            acc_w_bf16_40[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_30[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 1024), "r"(acc_w_bf16_40[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 1024), "r"(acc_w_bf16_30[0]) : "memory");
                         float blk_pc_2_1[2];
                         blk_pc_2_1[0] = __fmaf_rn(-blk_acc_y0[2], blk_bcn0, 0.0f);
                         blk_pc_2_1[1] = __fmaf_rn(-blk_acc_y0[3], blk_bcn1, 0.0f);
-                        unsigned int acc_w_bf16_41[1];
+                        unsigned int acc_w_bf16_31[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_1[_lp*2 + 0], blk_pc_2_1[_lp*2+1 + 0]));
-                            acc_w_bf16_41[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_31[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 17408), "r"(acc_w_bf16_41[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 17408), "r"(acc_w_bf16_31[0]) : "memory");
                         int blk_n0_r_0 = 8 + 2 * blk_q4;
                         float blk_bn0_r_0 = smem_beta[beta_elem_base + blk_n0_r_0];
                         float blk_bn1_r_0 = smem_beta[beta_elem_base + blk_n0_r_0 + 1];
-                        float _exp2_265 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_0]);
+                        float _exp2_265 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_0]);
                         float blk_bcn0_r_0 = blk_bn0_r_0 * _exp2_265;
-                        float _exp2_266 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_0 + 1]);
+                        float _exp2_266 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_0 + 1]);
                         float blk_bcn1_r_0 = blk_bn1_r_0 * _exp2_266;
                         float blk_pa_1_2[2];
                         blk_pa_1_2[0] = blk_acc_y0[4] * blk_bn0_r_0;
                         blk_pa_1_2[1] = blk_acc_y0[5] * blk_bn1_r_0;
-                        unsigned int acc_w_bf16_42[1];
+                        unsigned int acc_w_bf16_32[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_2[_lp*2 + 0], blk_pa_1_2[_lp*2+1 + 0]));
-                            acc_w_bf16_42[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_32[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43), "r"(acc_w_bf16_42[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43), "r"(acc_w_bf16_32[0]) : "memory");
                         float blk_pc_2_2[2];
                         blk_pc_2_2[0] = __fmaf_rn(-blk_acc_y0[4], blk_bcn0_r_0, 0.0f);
                         blk_pc_2_2[1] = __fmaf_rn(-blk_acc_y0[5], blk_bcn1_r_0, 0.0f);
-                        unsigned int acc_w_bf16_43[1];
+                        unsigned int acc_w_bf16_33[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_2[_lp*2 + 0], blk_pc_2_2[_lp*2+1 + 0]));
-                            acc_w_bf16_43[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_33[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 16384), "r"(acc_w_bf16_43[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 16384), "r"(acc_w_bf16_33[0]) : "memory");
                         float blk_pa_1_3[2];
                         blk_pa_1_3[0] = blk_acc_y0[6] * blk_bn0_r_0;
                         blk_pa_1_3[1] = blk_acc_y0[7] * blk_bn1_r_0;
-                        unsigned int acc_w_bf16_44[1];
+                        unsigned int acc_w_bf16_34[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_3[_lp*2 + 0], blk_pa_1_3[_lp*2+1 + 0]));
-                            acc_w_bf16_44[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_34[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 1024), "r"(acc_w_bf16_44[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 1024), "r"(acc_w_bf16_34[0]) : "memory");
                         float blk_pc_2_3[2];
                         blk_pc_2_3[0] = __fmaf_rn(-blk_acc_y0[6], blk_bcn0_r_0, 0.0f);
                         blk_pc_2_3[1] = __fmaf_rn(-blk_acc_y0[7], blk_bcn1_r_0, 0.0f);
-                        unsigned int acc_w_bf16_45[1];
+                        unsigned int acc_w_bf16_35[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_3[_lp*2 + 0], blk_pc_2_3[_lp*2+1 + 0]));
-                            acc_w_bf16_45[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_35[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 17408), "r"(acc_w_bf16_45[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 17408), "r"(acc_w_bf16_35[0]) : "memory");
                         int blk_n0_r_1 = 16 + 2 * blk_q4;
                         float blk_bn0_r_1 = smem_beta[beta_elem_base + blk_n0_r_1];
                         float blk_bn1_r_1 = smem_beta[beta_elem_base + blk_n0_r_1 + 1];
-                        float _exp2_267 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_1]);
+                        float _exp2_267 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_1]);
                         float blk_bcn0_r_1 = blk_bn0_r_1 * _exp2_267;
-                        float _exp2_268 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_1 + 1]);
+                        float _exp2_268 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_1 + 1]);
                         float blk_bcn1_r_1 = blk_bn1_r_1 * _exp2_268;
                         float blk_pa_1_4[2];
                         blk_pa_1_4[0] = blk_acc_y0[8] * blk_bn0_r_1;
                         blk_pa_1_4[1] = blk_acc_y0[9] * blk_bn1_r_1;
-                        unsigned int acc_w_bf16_46[1];
+                        unsigned int acc_w_bf16_36[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_4[_lp*2 + 0], blk_pa_1_4[_lp*2+1 + 0]));
-                            acc_w_bf16_46[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_36[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44), "r"(acc_w_bf16_46[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44), "r"(acc_w_bf16_36[0]) : "memory");
                         float blk_pc_2_4[2];
                         blk_pc_2_4[0] = __fmaf_rn(-blk_acc_y0[8], blk_bcn0_r_1, 0.0f);
                         blk_pc_2_4[1] = __fmaf_rn(-blk_acc_y0[9], blk_bcn1_r_1, 0.0f);
-                        unsigned int acc_w_bf16_47[1];
+                        unsigned int acc_w_bf16_37[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_4[_lp*2 + 0], blk_pc_2_4[_lp*2+1 + 0]));
-                            acc_w_bf16_47[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_37[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 16384), "r"(acc_w_bf16_47[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 16384), "r"(acc_w_bf16_37[0]) : "memory");
                         float blk_pa_1_5[2];
                         blk_pa_1_5[0] = blk_acc_y0[10] * blk_bn0_r_1;
                         blk_pa_1_5[1] = blk_acc_y0[11] * blk_bn1_r_1;
-                        unsigned int acc_w_bf16_48[1];
+                        unsigned int acc_w_bf16_38[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_5[_lp*2 + 0], blk_pa_1_5[_lp*2+1 + 0]));
-                            acc_w_bf16_48[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_38[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 1024), "r"(acc_w_bf16_48[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 1024), "r"(acc_w_bf16_38[0]) : "memory");
                         float blk_pc_2_5[2];
                         blk_pc_2_5[0] = __fmaf_rn(-blk_acc_y0[10], blk_bcn0_r_1, 0.0f);
                         blk_pc_2_5[1] = __fmaf_rn(-blk_acc_y0[11], blk_bcn1_r_1, 0.0f);
-                        unsigned int acc_w_bf16_49[1];
+                        unsigned int acc_w_bf16_39[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_5[_lp*2 + 0], blk_pc_2_5[_lp*2+1 + 0]));
-                            acc_w_bf16_49[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_39[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 17408), "r"(acc_w_bf16_49[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 17408), "r"(acc_w_bf16_39[0]) : "memory");
                         int blk_n0_r_2 = 24 + 2 * blk_q4;
                         float blk_bn0_r_2 = smem_beta[beta_elem_base + blk_n0_r_2];
                         float blk_bn1_r_2 = smem_beta[beta_elem_base + blk_n0_r_2 + 1];
-                        float _exp2_269 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_2]);
+                        float _exp2_269 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_2]);
                         float blk_bcn0_r_2 = blk_bn0_r_2 * _exp2_269;
-                        float _exp2_270 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_2 + 1]);
+                        float _exp2_270 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_2 + 1]);
                         float blk_bcn1_r_2 = blk_bn1_r_2 * _exp2_270;
                         float blk_pa_1_6[2];
                         blk_pa_1_6[0] = blk_acc_y0[12] * blk_bn0_r_2;
                         blk_pa_1_6[1] = blk_acc_y0[13] * blk_bn1_r_2;
-                        unsigned int acc_w_bf16_50[1];
+                        unsigned int acc_w_bf16_40[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_6[_lp*2 + 0], blk_pa_1_6[_lp*2+1 + 0]));
-                            acc_w_bf16_50[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_40[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45), "r"(acc_w_bf16_50[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45), "r"(acc_w_bf16_40[0]) : "memory");
                         float blk_pc_2_6[2];
                         blk_pc_2_6[0] = __fmaf_rn(-blk_acc_y0[12], blk_bcn0_r_2, 0.0f);
                         blk_pc_2_6[1] = __fmaf_rn(-blk_acc_y0[13], blk_bcn1_r_2, 0.0f);
-                        unsigned int acc_w_bf16_51[1];
+                        unsigned int acc_w_bf16_41[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_6[_lp*2 + 0], blk_pc_2_6[_lp*2+1 + 0]));
-                            acc_w_bf16_51[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_41[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 16384), "r"(acc_w_bf16_51[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 16384), "r"(acc_w_bf16_41[0]) : "memory");
                         float blk_pa_1_7[2];
                         blk_pa_1_7[0] = blk_acc_y0[14] * blk_bn0_r_2;
                         blk_pa_1_7[1] = blk_acc_y0[15] * blk_bn1_r_2;
-                        unsigned int acc_w_bf16_52[1];
+                        unsigned int acc_w_bf16_42[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_7[_lp*2 + 0], blk_pa_1_7[_lp*2+1 + 0]));
-                            acc_w_bf16_52[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_42[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 1024), "r"(acc_w_bf16_52[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 1024), "r"(acc_w_bf16_42[0]) : "memory");
                         float blk_pc_2_7[2];
                         blk_pc_2_7[0] = __fmaf_rn(-blk_acc_y0[14], blk_bcn0_r_2, 0.0f);
                         blk_pc_2_7[1] = __fmaf_rn(-blk_acc_y0[15], blk_bcn1_r_2, 0.0f);
-                        unsigned int acc_w_bf16_53[1];
+                        unsigned int acc_w_bf16_43[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_7[_lp*2 + 0], blk_pc_2_7[_lp*2+1 + 0]));
-                            acc_w_bf16_53[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_43[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 17408), "r"(acc_w_bf16_53[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 17408), "r"(acc_w_bf16_43[0]) : "memory");
                     } else {
                         int blk_n0_1 = 2 * blk_q4;
                         float blk_bn0_1 = smem_beta[beta_elem_base + blk_n0_1];
                         float blk_bn1_1 = smem_beta[beta_elem_base + blk_n0_1 + 1];
-                        float _exp2_271 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_1]);
+                        float _exp2_271 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_1]);
                         float blk_bcn0_1 = blk_bn0_1 * _exp2_271;
-                        float _exp2_272 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_1 + 1]);
+                        float _exp2_272 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_1 + 1]);
                         float blk_bcn1_1 = blk_bn1_1 * _exp2_272;
                         float blk_pa_1_8[2];
                         blk_pa_1_8[0] = blk_acc_y1[0] * blk_bn0_1;
                         blk_pa_1_8[1] = blk_acc_y1[1] * blk_bn1_1;
-                        unsigned int acc_w_bf16_54[1];
+                        unsigned int acc_w_bf16_44[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_8[_lp*2 + 0], blk_pa_1_8[_lp*2+1 + 0]));
-                            acc_w_bf16_54[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_44[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg), "r"(acc_w_bf16_54[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg), "r"(acc_w_bf16_44[0]) : "memory");
                         float blk_pc_2_8[2];
                         blk_pc_2_8[0] = __fmaf_rn(-blk_acc_y1[0], blk_bcn0_1, 0.0f);
                         blk_pc_2_8[1] = __fmaf_rn(-blk_acc_y1[1], blk_bcn1_1, 0.0f);
-                        unsigned int acc_w_bf16_55[1];
+                        unsigned int acc_w_bf16_45[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_8[_lp*2 + 0], blk_pc_2_8[_lp*2+1 + 0]));
-                            acc_w_bf16_55[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_45[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 16384), "r"(acc_w_bf16_55[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 16384), "r"(acc_w_bf16_45[0]) : "memory");
                         float blk_pa_1_9[2];
                         blk_pa_1_9[0] = blk_acc_y1[2] * blk_bn0_1;
                         blk_pa_1_9[1] = blk_acc_y1[3] * blk_bn1_1;
-                        unsigned int acc_w_bf16_56[1];
+                        unsigned int acc_w_bf16_46[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_9[_lp*2 + 0], blk_pa_1_9[_lp*2+1 + 0]));
-                            acc_w_bf16_56[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_46[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 1024), "r"(acc_w_bf16_56[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 1024), "r"(acc_w_bf16_46[0]) : "memory");
                         float blk_pc_2_9[2];
                         blk_pc_2_9[0] = __fmaf_rn(-blk_acc_y1[2], blk_bcn0_1, 0.0f);
                         blk_pc_2_9[1] = __fmaf_rn(-blk_acc_y1[3], blk_bcn1_1, 0.0f);
-                        unsigned int acc_w_bf16_57[1];
+                        unsigned int acc_w_bf16_47[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_9[_lp*2 + 0], blk_pc_2_9[_lp*2+1 + 0]));
-                            acc_w_bf16_57[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_47[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 17408), "r"(acc_w_bf16_57[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg + 17408), "r"(acc_w_bf16_47[0]) : "memory");
                         int blk_n0_r_3 = 8 + 2 * blk_q4;
                         float blk_bn0_r_3 = smem_beta[beta_elem_base + blk_n0_r_3];
                         float blk_bn1_r_3 = smem_beta[beta_elem_base + blk_n0_r_3 + 1];
-                        float _exp2_273 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_3]);
+                        float _exp2_273 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_3]);
                         float blk_bcn0_r_3 = blk_bn0_r_3 * _exp2_273;
-                        float _exp2_274 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_3 + 1]);
+                        float _exp2_274 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_3 + 1]);
                         float blk_bcn1_r_3 = blk_bn1_r_3 * _exp2_274;
                         float blk_pa_1_10[2];
                         blk_pa_1_10[0] = blk_acc_y1[4] * blk_bn0_r_3;
                         blk_pa_1_10[1] = blk_acc_y1[5] * blk_bn1_r_3;
-                        unsigned int acc_w_bf16_58[1];
+                        unsigned int acc_w_bf16_48[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_10[_lp*2 + 0], blk_pa_1_10[_lp*2+1 + 0]));
-                            acc_w_bf16_58[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_48[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43), "r"(acc_w_bf16_58[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43), "r"(acc_w_bf16_48[0]) : "memory");
                         float blk_pc_2_10[2];
                         blk_pc_2_10[0] = __fmaf_rn(-blk_acc_y1[4], blk_bcn0_r_3, 0.0f);
                         blk_pc_2_10[1] = __fmaf_rn(-blk_acc_y1[5], blk_bcn1_r_3, 0.0f);
-                        unsigned int acc_w_bf16_59[1];
+                        unsigned int acc_w_bf16_49[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_10[_lp*2 + 0], blk_pc_2_10[_lp*2+1 + 0]));
-                            acc_w_bf16_59[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_49[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 16384), "r"(acc_w_bf16_59[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 16384), "r"(acc_w_bf16_49[0]) : "memory");
                         float blk_pa_1_11[2];
                         blk_pa_1_11[0] = blk_acc_y1[6] * blk_bn0_r_3;
                         blk_pa_1_11[1] = blk_acc_y1[7] * blk_bn1_r_3;
-                        unsigned int acc_w_bf16_60[1];
+                        unsigned int acc_w_bf16_50[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_11[_lp*2 + 0], blk_pa_1_11[_lp*2+1 + 0]));
-                            acc_w_bf16_60[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_50[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 1024), "r"(acc_w_bf16_60[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 1024), "r"(acc_w_bf16_50[0]) : "memory");
                         float blk_pc_2_11[2];
                         blk_pc_2_11[0] = __fmaf_rn(-blk_acc_y1[6], blk_bcn0_r_3, 0.0f);
                         blk_pc_2_11[1] = __fmaf_rn(-blk_acc_y1[7], blk_bcn1_r_3, 0.0f);
-                        unsigned int acc_w_bf16_61[1];
+                        unsigned int acc_w_bf16_51[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_11[_lp*2 + 0], blk_pc_2_11[_lp*2+1 + 0]));
-                            acc_w_bf16_61[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_51[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 17408), "r"(acc_w_bf16_61[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_43 + 17408), "r"(acc_w_bf16_51[0]) : "memory");
                         int blk_n0_r_4 = 16 + 2 * blk_q4;
                         float blk_bn0_r_4 = smem_beta[beta_elem_base + blk_n0_r_4];
                         float blk_bn1_r_4 = smem_beta[beta_elem_base + blk_n0_r_4 + 1];
-                        float _exp2_275 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_4]);
+                        float _exp2_275 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_4]);
                         float blk_bcn0_r_4 = blk_bn0_r_4 * _exp2_275;
-                        float _exp2_276 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_4 + 1]);
+                        float _exp2_276 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_4 + 1]);
                         float blk_bcn1_r_4 = blk_bn1_r_4 * _exp2_276;
                         float blk_pa_1_12[2];
                         blk_pa_1_12[0] = blk_acc_y1[8] * blk_bn0_r_4;
                         blk_pa_1_12[1] = blk_acc_y1[9] * blk_bn1_r_4;
-                        unsigned int acc_w_bf16_62[1];
+                        unsigned int acc_w_bf16_52[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_12[_lp*2 + 0], blk_pa_1_12[_lp*2+1 + 0]));
-                            acc_w_bf16_62[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_52[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44), "r"(acc_w_bf16_62[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44), "r"(acc_w_bf16_52[0]) : "memory");
                         float blk_pc_2_12[2];
                         blk_pc_2_12[0] = __fmaf_rn(-blk_acc_y1[8], blk_bcn0_r_4, 0.0f);
                         blk_pc_2_12[1] = __fmaf_rn(-blk_acc_y1[9], blk_bcn1_r_4, 0.0f);
-                        unsigned int acc_w_bf16_63[1];
+                        unsigned int acc_w_bf16_53[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_12[_lp*2 + 0], blk_pc_2_12[_lp*2+1 + 0]));
-                            acc_w_bf16_63[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_53[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 16384), "r"(acc_w_bf16_63[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 16384), "r"(acc_w_bf16_53[0]) : "memory");
                         float blk_pa_1_13[2];
                         blk_pa_1_13[0] = blk_acc_y1[10] * blk_bn0_r_4;
                         blk_pa_1_13[1] = blk_acc_y1[11] * blk_bn1_r_4;
-                        unsigned int acc_w_bf16_64[1];
+                        unsigned int acc_w_bf16_54[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_13[_lp*2 + 0], blk_pa_1_13[_lp*2+1 + 0]));
-                            acc_w_bf16_64[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_54[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 1024), "r"(acc_w_bf16_64[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 1024), "r"(acc_w_bf16_54[0]) : "memory");
                         float blk_pc_2_13[2];
                         blk_pc_2_13[0] = __fmaf_rn(-blk_acc_y1[10], blk_bcn0_r_4, 0.0f);
                         blk_pc_2_13[1] = __fmaf_rn(-blk_acc_y1[11], blk_bcn1_r_4, 0.0f);
-                        unsigned int acc_w_bf16_65[1];
+                        unsigned int acc_w_bf16_55[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_13[_lp*2 + 0], blk_pc_2_13[_lp*2+1 + 0]));
-                            acc_w_bf16_65[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_55[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 17408), "r"(acc_w_bf16_65[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_44 + 17408), "r"(acc_w_bf16_55[0]) : "memory");
                         int blk_n0_r_5 = 24 + 2 * blk_q4;
                         float blk_bn0_r_5 = smem_beta[beta_elem_base + blk_n0_r_5];
                         float blk_bn1_r_5 = smem_beta[beta_elem_base + blk_n0_r_5 + 1];
-                        float _exp2_277 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_5]);
+                        float _exp2_277 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_5]);
                         float blk_bcn0_r_5 = blk_bn0_r_5 * _exp2_277;
-                        float _exp2_278 = approx_exp2(smem_cumsumlog[gate_elem_base_4 + blk_n0_r_5 + 1]);
+                        float _exp2_278 = approx_exp2(smem_cumsumlog[gate_elem_base_2 + blk_n0_r_5 + 1]);
                         float blk_bcn1_r_5 = blk_bn1_r_5 * _exp2_278;
                         float blk_pa_1_14[2];
                         blk_pa_1_14[0] = blk_acc_y1[12] * blk_bn0_r_5;
                         blk_pa_1_14[1] = blk_acc_y1[13] * blk_bn1_r_5;
-                        unsigned int acc_w_bf16_66[1];
+                        unsigned int acc_w_bf16_56[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_14[_lp*2 + 0], blk_pa_1_14[_lp*2+1 + 0]));
-                            acc_w_bf16_66[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_56[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45), "r"(acc_w_bf16_66[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45), "r"(acc_w_bf16_56[0]) : "memory");
                         float blk_pc_2_14[2];
                         blk_pc_2_14[0] = __fmaf_rn(-blk_acc_y1[12], blk_bcn0_r_5, 0.0f);
                         blk_pc_2_14[1] = __fmaf_rn(-blk_acc_y1[13], blk_bcn1_r_5, 0.0f);
-                        unsigned int acc_w_bf16_67[1];
+                        unsigned int acc_w_bf16_57[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_14[_lp*2 + 0], blk_pc_2_14[_lp*2+1 + 0]));
-                            acc_w_bf16_67[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_57[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 16384), "r"(acc_w_bf16_67[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 16384), "r"(acc_w_bf16_57[0]) : "memory");
                         float blk_pa_1_15[2];
                         blk_pa_1_15[0] = blk_acc_y1[14] * blk_bn0_r_5;
                         blk_pa_1_15[1] = blk_acc_y1[15] * blk_bn1_r_5;
-                        unsigned int acc_w_bf16_68[1];
+                        unsigned int acc_w_bf16_58[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pa_1_15[_lp*2 + 0], blk_pa_1_15[_lp*2+1 + 0]));
-                            acc_w_bf16_68[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_58[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 1024), "r"(acc_w_bf16_68[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 1024), "r"(acc_w_bf16_58[0]) : "memory");
                         float blk_pc_2_15[2];
                         blk_pc_2_15[0] = __fmaf_rn(-blk_acc_y1[14], blk_bcn0_r_5, 0.0f);
                         blk_pc_2_15[1] = __fmaf_rn(-blk_acc_y1[15], blk_bcn1_r_5, 0.0f);
-                        unsigned int acc_w_bf16_69[1];
+                        unsigned int acc_w_bf16_59[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(blk_pc_2_15[_lp*2 + 0], blk_pc_2_15[_lp*2+1 + 0]));
-                            acc_w_bf16_69[_lp] = *(uint32_t*)&_bf2;
+                            acc_w_bf16_59[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 17408), "r"(acc_w_bf16_69[0]) : "memory");
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(blk_ybg_45 + 17408), "r"(acc_w_bf16_59[0]) : "memory");
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(ainv_ready_addr + (warp_id_in_role_2 / 2) * 8);

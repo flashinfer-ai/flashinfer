@@ -20,6 +20,10 @@ import BIKernels.SamplingCases
 import BIKernels.MoE
 import BIKernels.MoEFp8
 import BIKernels.MoECases
+import BIKernels.MoENvfp4
+import BIKernels.MoENvfp4Cases
+import BIKernels.MoEMxfp4
+import BIKernels.MoEMxfp4Cases
 import BIKernels.MegaMoE
 import BIKernels.MegaMoECases
 import BIKernels.NVFP4MegaMoE
