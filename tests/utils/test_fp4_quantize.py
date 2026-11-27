@@ -2961,6 +2961,29 @@ def test_nvfp4_per_token_cuda_graph_tensor_global_scale(dtype, sf_layout, shape)
         assert torch.equal(got.view(torch.uint8), exp.view(torch.uint8))
     assert not torch.equal(out_pts, ref_1[2])
 
+    # Single-element CPU tensor scale remains CUDA-graph capturable without H2D copy.
+    cpu_sf = torch.tensor([scale_1], dtype=torch.float32, device="cpu")
+    cpu_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cpu_graph):
+        cpu_out = nvfp4_quantize(
+            x,
+            cpu_sf,
+            sfLayout=sf_layout,
+            backend="cuda",
+            per_token_activation=True,
+        )
+    cpu_graph.replay()
+    torch.cuda.synchronize()
+    ref_cpu = nvfp4_quantize(
+        x,
+        scale_1,
+        sfLayout=sf_layout,
+        backend="cuda",
+        per_token_activation=True,
+    )
+    for got, exp in zip(cpu_out, ref_cpu, strict=True):
+        assert torch.equal(got.view(torch.uint8), exp.view(torch.uint8))
+
 
 @pytest.mark.parametrize("disable_fast_math", [False, True])
 @pytest.mark.parametrize("nvfp4_4over6", [None, NVFP44Over6Config()])
@@ -2989,10 +3012,19 @@ def test_nvfp4_per_token_cuda_tensor_scale_variants(
         nvfp4_4over6=nvfp4_4over6,
     )
 
+    lazy_neg_scale = (
+        torch.tensor([complex(0.0, -scale_val)], dtype=torch.complex64, device=device)
+        .conj()
+        .imag
+    )
+    assert lazy_neg_scale.is_neg()
+
     for scale_tensor in (
         torch.tensor([scale_val], dtype=torch.float32, device=device),
         torch.tensor(scale_val, dtype=torch.float32, device=device),
         torch.tensor([[scale_val]], dtype=torch.float64, device=device),
+        lazy_neg_scale,
+        torch.tensor([scale_val], dtype=torch.float32, device="cpu"),
     ):
         got = nvfp4_quantize(
             x,
@@ -3004,6 +3036,17 @@ def test_nvfp4_per_token_cuda_tensor_scale_variants(
         )
         for a, b in zip(got, ref, strict=True):
             assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+    # Mismatched CPU tensor still validates the explicit 4over6 recipe.
+    with pytest.raises(ValueError, match="does not match the requested NVFP4"):
+        nvfp4_quantize(
+            x,
+            torch.tensor([scale_val], dtype=torch.float32, device="cpu"),
+            sfLayout=SfLayout.layout_128x4,
+            backend="cuda",
+            per_token_activation=True,
+            nvfp4_4over6=NVFP44Over6Config(e4m3_max=256),
+        )
 
     # Row-remapping path with unmapped (-1) rows.
     perm = torch.arange(m, dtype=torch.int32, device=device)
@@ -3031,10 +3074,11 @@ def test_nvfp4_per_token_cuda_tensor_scale_variants(
     assert torch.equal(got_perm[1].view(torch.uint8), ref_perm[1].view(torch.uint8))
     assert torch.equal(got_perm[2][1:], ref_perm[2][1:])
 
-    # Reject non-scalar tensors.
+    # Reject non-scalar tensors (CUDA and CPU).
     for bad_scale in (
         torch.ones(2, dtype=torch.float32, device=device),
         torch.empty(0, dtype=torch.float32, device=device),
+        torch.ones(2, dtype=torch.float32, device="cpu"),
     ):
         with pytest.raises(ValueError, match="exactly 1 element"):
             nvfp4_quantize(

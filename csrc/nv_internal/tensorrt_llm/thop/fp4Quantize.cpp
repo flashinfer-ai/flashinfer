@@ -269,11 +269,14 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   }
 }
 
-void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, TensorView output,
-                                     TensorView output_scale, TensorView output_per_token_scale,
-                                     Optional<TensorView> expanded_idx_to_permuted_idx,
-                                     int64_t sfLayout_, int64_t nvfp44Over6Code,
-                                     Optional<TensorView> scale_inv_tensor) {
+namespace {
+
+void nvfp4_quant_and_per_token_scale_impl(TensorView const input, double scale_inv_,
+                                          float const* scale_inv_ptr, TensorView output,
+                                          TensorView output_scale,
+                                          TensorView output_per_token_scale,
+                                          Optional<TensorView> expanded_idx_to_permuted_idx,
+                                          int64_t sfLayout_, int64_t nvfp44Over6Code) {
   auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp44Over6Code);
   CHECK_CUDA(input);
   CHECK_CONTIGUOUS(input);
@@ -321,15 +324,6 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
   const float scale_inv = static_cast<float>(scale_inv_);
   auto const in_dtype = input.dtype();
 
-  float const* scale_inv_ptr = nullptr;
-  if (scale_inv_tensor.has_value()) {
-    auto const& scale_t = scale_inv_tensor.value();
-    CHECK_INPUT_AND_TYPE(scale_t, dl_float32);
-    CHECK_DEVICE(scale_t, input);
-    TVM_FFI_ICHECK_EQ(scale_t.numel(), 1) << "scale_inv_tensor must have exactly 1 element";
-    scale_inv_ptr = static_cast<float const*>(scale_t.data_ptr());
-  }
-
   int32_t* expanded_idx_to_permuted_idx_ptr = nullptr;
   if (expanded_idx_to_permuted_idx.has_value()) {
     CHECK_CUDA(expanded_idx_to_permuted_idx.value());
@@ -367,8 +361,36 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
   }
 }
 
+}  // namespace
+
+void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, TensorView output,
+                                     TensorView output_scale, TensorView output_per_token_scale,
+                                     Optional<TensorView> expanded_idx_to_permuted_idx,
+                                     int64_t sfLayout_, int64_t nvfp44Over6Code) {
+  nvfp4_quant_and_per_token_scale_impl(input, scale_inv_, /*scale_inv_ptr=*/nullptr, output,
+                                       output_scale, output_per_token_scale,
+                                       expanded_idx_to_permuted_idx, sfLayout_, nvfp44Over6Code);
+}
+
+void nvfp4_quant_and_per_token_scale_tensor(TensorView const input,
+                                            TensorView const scale_inv_tensor, TensorView output,
+                                            TensorView output_scale,
+                                            TensorView output_per_token_scale,
+                                            Optional<TensorView> expanded_idx_to_permuted_idx,
+                                            int64_t sfLayout_, int64_t nvfp44Over6Code) {
+  CHECK_INPUT_AND_TYPE(scale_inv_tensor, dl_float32);
+  CHECK_DEVICE(scale_inv_tensor, input);
+  TVM_FFI_ICHECK_EQ(scale_inv_tensor.numel(), 1) << "scale_inv_tensor must have exactly 1 element";
+  nvfp4_quant_and_per_token_scale_impl(input, /*scale_inv_=*/0.0,
+                                       static_cast<float const*>(scale_inv_tensor.data_ptr()),
+                                       output, output_scale, output_per_token_scale,
+                                       expanded_idx_to_permuted_idx, sfLayout_, nvfp44Over6Code);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_quantize, fp4_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_batched_quantize, fp4_batched_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_scaled_nvfp4_experts_quantize,
                               silu_and_mul_scaled_nvfp4_experts_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quant_and_per_token_scale, nvfp4_quant_and_per_token_scale);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quant_and_per_token_scale_tensor,
+                              nvfp4_quant_and_per_token_scale_tensor);
