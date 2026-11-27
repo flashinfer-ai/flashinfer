@@ -1860,6 +1860,7 @@ class _CutlassRunnerBase(MoERunner):
     # product as compound candidates for the outer end-to-end autotuner. N=1
     # preserves the legacy independent-winner behavior.
     _num_top_tactics_per_stage: ClassVar[int] = 2
+    _sm8x: Any = None  # set by check_support; replaces _inner
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -1905,7 +1906,9 @@ class _CutlassRunnerBase(MoERunner):
                 )
         body = self._sm8x_body_class()
         if body is not None and self._device_arch in body._supported_archs:
-            self._sm8x = body(self.config, self.device)
+            # Keep a built pipeline across repeated check_support calls.
+            if type(self._sm8x) is not body:
+                self._sm8x = body(self.config, self.device)
             self._sm8x.check_support()
 
     @staticmethod
@@ -1933,7 +1936,6 @@ class _CutlassRunnerBase(MoERunner):
         self._enable_pdl = enable_pdl
         self._use_fused_finalize = True
         self._inner: Any = None
-        self._sm8x = None  # set by check_support; replaces _inner
 
         # pack_inputs replaces this with the current MoELayer token bucket.
         self.tuning_config = TuningConfig()

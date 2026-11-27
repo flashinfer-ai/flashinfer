@@ -502,8 +502,14 @@ def frost_case(request):
     return _make_frost_case(request.param)
 
 
-def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6)):
+_SM8X = ((8, 0), (8, 6), (8, 7), (8, 9))
+
+
+def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6), frost_kernels=False):
     supported = ((10, 7), (12, 0))
+    if dtype in ("mxfp8", "mxfp8_mxfp4") and not frost_kernels:
+        # SM8x runs these forwards on the CUTLASS SM8x pipeline.
+        supported += _SM8X
     if (
         not torch.cuda.is_available()
         or torch.cuda.get_device_capability() not in supported
@@ -517,7 +523,8 @@ def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6)):
     try:
         if torch.cuda.get_device_capability() == (10, 7):
             require_moe_assembler()
-        require_graph_resource_retention()
+        if torch.cuda.get_device_capability() not in _SM8X:
+            require_graph_resource_retention()
     except NotImplementedError as exc:
         pytest.skip(str(exc))
     cls, canonical, weight, activation = FORMATS[dtype]
@@ -721,7 +728,9 @@ def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
         return snapshot._replace(select_kernels=select)
 
     monkeypatch.setattr(moe, "_capture_selection", capture)
-    _, cls, _, config, layer, view = _make_frost_case(dtype, (e, h, i, k))
+    _, cls, _, config, layer, view = _make_frost_case(
+        dtype, (e, h, i, k), frost_kernels=True
+    )
     stage_calls = set()
     original_forward = tuning._StageRunner.forward
 

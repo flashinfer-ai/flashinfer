@@ -157,6 +157,8 @@ class _Sm8xCutlassMoEBase(_Sm8xMoEBodyBase):
     def __init__(self, config: MoEConfig, device: torch.device) -> None:
         super().__init__(config, device)
         self._activation_params: Dict[str, Optional[torch.Tensor]] = {}
+        # CUTLASS weights every (token, slot) assignment, a repeated expert included.
+        self._repeated_experts = True
 
     def _body_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """This pipeline's packed inputs from the CUTLASS runner's (output first)."""
@@ -215,6 +217,14 @@ class _Sm8xCutlassMoEBase(_Sm8xMoEBodyBase):
     ) -> torch.Tensor:
         """GEMM2's operand from the float32 activation ``y``."""
         return workspace.intermediate.copy_(y)
+
+    def _permute(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[_GroupedGemmLayout, _GroupedGemmWorkspace]:
+        layout, workspace = super()._permute(inputs)
+        if self._repeated_experts:
+            layout = _route_repeated_experts(layout, inputs[1])
+        return layout, workspace
 
 
 class Sm8xCutlassFp8PerTensorMoE(_Sm8xCutlassMoEBase):
@@ -330,6 +340,9 @@ class Sm8xCutlassMxfp8Mxfp4MoE(_Sm8xCutlassMxfp8MoEBase):
     backend_key = "cutlass_mxfp8_mxfp4"
     _weight_dtype = torch.int64
 
+    def _alpha(self, index: Optional[int], inputs: List[torch.Tensor]):
+        return None if index is None else inputs[index]
+
     def _gemm1(self, inputs, layout, workspace, tactic) -> torch.Tensor:
         assert workspace.permuted_hidden_states_scale is not None
         return sm8x_grouped_mm_fp4(
@@ -338,7 +351,7 @@ class Sm8xCutlassMxfp8Mxfp4MoE(_Sm8xCutlassMxfp8MoEBase):
             workspace.permuted_hidden_states_scale,
             inputs[5],
             layout.m_indptr,
-            None,
+            self._alpha(self._gemm1_alpha_input, inputs),
             torch.bfloat16,
             workspace.gemm1_out,
             32,
@@ -354,11 +367,20 @@ class Sm8xCutlassMxfp8Mxfp4MoE(_Sm8xCutlassMxfp8MoEBase):
             scale,
             inputs[6],
             layout.m_indptr,
-            None,
+            self._alpha(self._gemm2_alpha_input, inputs),
             torch.bfloat16,
             None,
             32,
         )
+
+
+class Sm8xFrostMxfp8Mxfp4MoE(Sm8xCutlassMxfp8Mxfp4MoE):
+    """``CudnnFrostMxfp8Mxfp4MoeRunner`` on SM8x: the CUTLASS pipeline's packed
+    inputs, with Frost's per-expert ``fc1_input_scale`` and ``fc2_input_scale``
+    scaling each GEMM's float32 output before its BF16 store."""
+
+    _gemm1_alpha_input = 7
+    _gemm2_alpha_input = 8
 
 
 def _route_repeated_experts(
@@ -543,14 +565,6 @@ class _Sm8xTrtllmFp8MoEBase(_Sm8xCutlassMoEBase):
     ) -> torch.Tensor:
         """The routing weights ``moe_unpermute`` applies (and an unfinalized call returns)."""
         return weights
-
-    def _permute(
-        self, inputs: List[torch.Tensor]
-    ) -> tuple[_GroupedGemmLayout, _GroupedGemmWorkspace]:
-        layout, workspace = super()._permute(inputs)
-        if self._repeated_experts:
-            layout = _route_repeated_experts(layout, inputs[1])
-        return layout, workspace
 
 
 class Sm8xTrtllmMxfp8MoE(_Sm8xTrtllmFp8MoEBase, _CudnnGroupedGemmBlockScaleRunnerBase):

@@ -5,6 +5,8 @@
 # runs them.
 SUPPORTED_ARCHS = ("sm_107a", "sm_120a")
 SUPPORTED_ARCH_NUMBERS = (107, 120)
+# The MXFP8 dtypes run CUTLASS's SM8x pipeline on these instead.
+SM8X_ARCH_NUMBERS = (80, 86, 87, 89)
 
 
 def weight_view(weights, backend_key, canonical_key):

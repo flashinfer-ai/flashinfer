@@ -3236,11 +3236,13 @@ class CudnnFrostMxfp8Config:
     Register prepared weights under ``cudnn_frost_mxfp8``. The canonical
     ``cutlass_mxfp8`` view is also accepted without conversion. H/I must be
     multiples of 128. Pass the layer's quant config to prepare_activations.
+    On SM80/86/87/89 the same forward runs on the SM8x pipeline of the CUTLASS
+    MXFP8 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Config.prepare_activations)
@@ -3270,12 +3272,14 @@ class CudnnFrostMxfp8Mxfp4Config:
     Requires packed precomputed routing and H/I divisible by 128. Register
     prepared weights under ``cudnn_frost_mxfp8_mxfp4``; the canonical
     ``cutlass_mxfp8_mxfp4`` view is also accepted without conversion.
-    Pass the layer's quant config to prepare_activations.
+    Pass the layer's quant config to prepare_activations. On SM80/86/87/89 the
+    same forward, input scales included, runs on the SM8x pipeline of the
+    CUTLASS MXFP8 × MXFP4 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Mxfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
