@@ -110,10 +110,11 @@ def _aligned(t: torch.Tensor, align: int) -> torch.Tensor:
 
 
 def _route_ints(
-    rows: int, groups: int, r: int, max_blocks: int
+    rows: int, prep_groups: int, r: int, max_blocks: int
 ) -> Tuple[int, int, int]:
-    """The int32 sizes of ``_route_rows``' ``meta``, ``rowmap`` and ``workspace``."""
-    return 1 + 2 * max_blocks, max_blocks * r, (-(-rows // 2048) + 1) * groups
+    """The int32 sizes of ``_route_rows``' ``meta``, ``rowmap`` and ``workspace``, the last
+    the W4A16 prep's for routing ``prep_groups`` groups (0: no prep routing)."""
+    return 1 + 2 * max_blocks, max_blocks * r, (-(-rows // 2048) + 1) * prep_groups
 
 
 def _prep_routes(groups: int, r: int, device: torch.device) -> bool:
@@ -270,7 +271,9 @@ def _run_fp8(
         max_blocks = m // r + groups
     elif masked_m is not None:  # the routing's bound, for any batch's rows
         max_blocks = batches + (rows - batches) // r
-    ints = _route_ints(rows, groups, r, max_blocks)
+    # the prep's workspace only when it routes the rows (``_route_rows``)
+    prep = (routed or masked_m is not None) and _prep_routes(groups, r, a.device)
+    ints = _route_ints(rows, groups if prep else 0, r, max_blocks)
     meta, rowmap, workspace = torch.empty(
         sum(ints), dtype=torch.int32, device=a.device
     ).split(ints)
@@ -933,7 +936,10 @@ def _run_rows_fp4(
     if rows == 0 or groups == 0 or n == 0:
         return
     max_blocks = rows // r + groups  # each group's last block partial
-    ints = _route_ints(rows, groups, r, max_blocks)
+    # the prep routes the rows if it can, else restores them (fmt) as one group
+    fits = _prep_routes(groups, r, a.device)
+    prep_groups = groups if fits else (0 if fmt is None else 1)
+    ints = _route_ints(rows, prep_groups, r, max_blocks)
     meta, rowmap, workspace = torch.empty(
         sum(ints), dtype=torch.int32, device=a.device
     ).split(ints)
@@ -941,7 +947,6 @@ def _run_rows_fp4(
     module = _w4a16_moe_sm80_module(None, False, None, False)
     asf = _aligned(a_scale.view(torch.uint8), 4)
     ids = _span_ids(starts, ends, rows)
-    fits = _prep_routes(groups, r, a.device)
     if fmt is not None:
         # restored in token order by the prep, routing the rows if it can
         tok = torch.empty((rows, k), dtype=torch.bfloat16, device=a.device)
