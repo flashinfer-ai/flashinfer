@@ -17,9 +17,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import functools
 import importlib
+import os
 import threading
-from typing import Iterator
+from typing import Any, Iterator
+
+from packaging.version import InvalidVersion, Version
 
 _BOOTSTRAPPED = False
 _BOOTSTRAP_ERROR: BaseException | None = None
@@ -36,6 +40,7 @@ _MISSING = object()
 _ORIGINAL_WORK_TILE_INFO: dict[str, object] | None = None
 _TASK_SCHEDULING_WORK_TILE_INFO: dict[str, object] | None = None
 _TASK_SCHEDULING_SCOPE_DEPTH = 0
+_CLC_EXIT_BARRIER_ENV = "FLASHINFER_PRIMS_TS_CLC_EXIT_BARRIER"
 
 
 def _work_tile_info_class():
@@ -123,6 +128,51 @@ def require_cutlass_dsl_experimental() -> None:
         "Prims-TS requires the CUTLASS DSL wheel. Install the pinned "
         "release-branch wheel before using Prims-TS kernels."
     ) from _BOOTSTRAP_ERROR
+
+
+def _dsl_skips_clc_producer_tail(work_queue_cls: Any, dsl_version: str | None) -> bool:
+    """Whether this DSL needs a cluster-exit barrier around CLC teardown."""
+
+    marker = getattr(work_queue_cls, "CLC_PRODUCER_TAIL_DRAINS", None)
+    if marker is not None:
+        return not bool(marker)
+
+    try:
+        parsed_version = Version(dsl_version) if dsl_version is not None else None
+    except InvalidVersion:
+        parsed_version = None
+
+    # Task scheduling first shipped in 4.7. Internal/source builds can report
+    # placeholder versions such as 0.3.0 or 0.0.0 while carrying newer code,
+    # so only the known-good release window is exempt from the workaround.
+    if parsed_version is None:
+        return True
+    return not (Version("4.7") <= parsed_version < Version("4.9.0.dev0"))
+
+
+@functools.cache
+def _installed_dsl_skips_clc_producer_tail() -> bool:
+    require_cutlass_dsl_experimental()
+
+    import cutlass
+    from cutlass.experimental.task_scheduling.resources import WorkQueue
+
+    return _dsl_skips_clc_producer_tail(
+        WorkQueue, getattr(cutlass, "__version__", None)
+    )
+
+
+def clc_exit_cluster_barrier_required() -> bool:
+    """Whether Prims-TS kernels need the CLC teardown compatibility barrier."""
+
+    override = os.environ.get(_CLC_EXIT_BARRIER_ENV, "auto")
+    if override == "1":
+        return True
+    if override == "0":
+        return False
+    if override != "auto":
+        raise ValueError(f"{_CLC_EXIT_BARRIER_ENV} must be one of auto, 0, or 1")
+    return _installed_dsl_skips_clc_producer_tail()
 
 
 @contextmanager

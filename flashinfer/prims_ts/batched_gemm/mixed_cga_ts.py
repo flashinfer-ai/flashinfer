@@ -303,16 +303,17 @@ def umma_atom_mask() -> Int32:
     Supported wider/flexible shapes always have even X, so clearing bit zero
     never crosses a Y-row boundary and does not require active dimensions.
     """
-    rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-    atom_leader = rank & Int32(~1)
-    return (Int32(1) << atom_leader) | (Int32(1) << (atom_leader + Int32(1)))
+    # No local assignments: TS calls the pipeline ops that use this under a
+    # leader gate that may fold to a compile-time condition, and PyIR rejects
+    # writes under such conditions (UNSUP_META_CONDITIONAL_WRITE).
+    return Int32(3) << umma_atom_leader_rank()
 
 
 @cute.jit
 def umma_atom_leader_rank() -> Int32:
     """Return the even physical rank that owns the current atom's barriers."""
-    rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-    return rank & Int32(~1)
+    # Single expression for the same reason as umma_atom_mask.
+    return cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) & Int32(~1)
 
 
 @dataclass(frozen=True)
@@ -343,7 +344,7 @@ class CgaPipelineAsyncUmma(TSPipelineAsyncUmma):
     """Async-to-UMMA pipeline with an atom-relative UMMA release mask."""
 
     def producer_commit(self, state, *, loc=None, ip=None) -> None:
-        if (
+        if cutlass.const_expr(
             self.producer_op == pipeline.PipelineOp.AsyncThread
             and self.cta_group is cute.nvgpu.tcgen05.CtaGroup.TWO
         ):

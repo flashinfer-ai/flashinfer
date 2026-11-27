@@ -162,12 +162,14 @@ class SmemAResource(MemoryResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def prepare_weight_tile(self, stage_info: StageInfo) -> None:
-        self.weight_l2_cache_hint = make_weight_l2_cache_hint(
-            self.cfg.weight_l2_evict_first,
-            self.weight_tile_idx_view,
-            self.weight_num_token_tiles_view,
-            stage_info.work_tile.tile_idx[1],
-        )
+        # Without a policy the hint stays None; see SmemSfAResource.prepare_sfa_tile.
+        if cutlass.const_expr(self.cfg.weight_l2_evict_first):
+            self.weight_l2_cache_hint = make_weight_l2_cache_hint(
+                self.cfg.weight_l2_evict_first,
+                self.weight_tile_idx_view,
+                self.weight_num_token_tiles_view,
+                stage_info.work_tile.tile_idx[1],
+            )
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit

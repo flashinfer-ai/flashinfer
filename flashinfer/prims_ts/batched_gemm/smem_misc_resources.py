@@ -362,7 +362,7 @@ class BatchedGemmWorkQueue(WorkQueue):
             parity = cutlass.Int32(1) - parity
 
     @cute.jit
-    def _maybe_fast_drain_skipped_tile(self) -> None:
+    def _maybe_fast_drain_skipped_tile(self, work_tile) -> None:
         # Fast-drain cancels every cluster that has not launched yet. Early-exit
         # padding sits on the token axis only, so that is a suffix of the CLC
         # order solely when the token axis is the slow raster axis. Along-N on
@@ -371,8 +371,10 @@ class BatchedGemmWorkQueue(WorkQueue):
         if cutlass.const_expr(
             self._uses_fast_drain() and self.cfg.clc_fast_drain_skip_is_suffix
         ):
-            skip_work_tile = self._get_consumer_var_from_ts("skip_work_tile")
-            if skip_work_tile:
+            # Work methods do not see the work-tile loop's per-tile skip flag,
+            # so re-evaluate its skip_if predicate. fetch_work_tile precedes
+            # get_and_advance_work_tile, so this is the tile the loop tested.
+            if self.should_skip_work_tile(work_tile):
                 self._clc_fast_drain_all()
 
     @cute.jit
@@ -386,7 +388,7 @@ class BatchedGemmWorkQueue(WorkQueue):
                 cute.arch.block_idx_in_cluster()
             )
             if cta_rank_in_cluster == 0:
-                self._maybe_fast_drain_skipped_tile()
+                self._maybe_fast_drain_skipped_tile(stage_info.work_tile)
                 mbarrier_addr = self.pipeline.producer_get_barrier(self.producer_state)
                 stage_response_ptr = self._get_stage_response_ptr(stage_info.stage_idx)
                 with cute.arch.elect_one():

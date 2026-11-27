@@ -93,6 +93,7 @@ from .batched_gemm_config import (
     ActKind,
     DType,
     SfLayout,
+    compute_warp_layout,
     resolve_problem_config,
     make_config,
     resolve_early_exit_max_token_ctas,
@@ -4613,6 +4614,9 @@ def _compile_for_launch(io: dict, stream) -> object:
     if _generate_line_info_enabled():
         compile_entry = cute.compile[cute.GenerateLineInfo(True)]
 
+    # Resolve the cached warp layout as plain Python. Interpreting the packing
+    # code under PyIR segfaults CPython for some routed-SF configurations.
+    compute_warp_layout(io["cfg"])
     with task_scheduling_scope(), BaseDSL.enable_pyir():
         compiled = compile_entry(
             gemm,
