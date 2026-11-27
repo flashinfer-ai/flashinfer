@@ -62,6 +62,13 @@ const DT* get_bias_ptr(const ffi::Optional<TensorView>& bias, const TensorView& 
   return static_cast<const DT*>(tensor.data_ptr());
 }
 
+void check_bmm_fp8_scale(const TensorView& scale, const TensorView& operand, const char* name) {
+  CHECK_CUDA(scale);
+  CHECK_DEVICE(scale, operand);
+  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(scale.dtype()), float32_code) << name << " must be float32";
+  TVM_FFI_ICHECK_EQ(scale.numel(), 1) << name << " must be a scalar (1-element tensorwide float32)";
+}
+
 }  // namespace
 
 void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
@@ -72,6 +79,8 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
   CHECK_DIM(3, A);
   CHECK_DIM(3, B);
   CHECK_DIM(3, D);
+  check_bmm_fp8_scale(A_scale, A, "A_scale");
+  check_bmm_fp8_scale(B_scale, B, "B_scale");
   TVM_FFI_ICHECK(A.size(0) == B.size(0) && A.size(0) == D.size(0)) << "Batch sizes must match";
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))
@@ -120,6 +129,8 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
   CHECK_DIM(3, D);
   CHECK_CPU(algo_buffer);
   CHECK_CONTIGUOUS(algo_buffer);
+  check_bmm_fp8_scale(A_scale, A, "A_scale");
+  check_bmm_fp8_scale(B_scale, B, "B_scale");
   TVM_FFI_ICHECK(A.size(0) == B.size(0) && A.size(0) == D.size(0)) << "Batch sizes must match";
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))
@@ -165,6 +176,8 @@ int64_t bmm_fp8_run_with_descriptor(TensorView A, TensorView B, TensorView D, Te
   CHECK_DIM(3, A);
   CHECK_DIM(3, B);
   CHECK_DIM(3, D);
+  check_bmm_fp8_scale(A_scale, A, "A_scale");
+  check_bmm_fp8_scale(B_scale, B, "B_scale");
   TVM_FFI_ICHECK(A.size(0) == B.size(0) && A.size(0) == D.size(0)) << "Batch sizes must match";
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))

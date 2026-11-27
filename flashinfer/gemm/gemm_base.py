@@ -2815,6 +2815,7 @@ def get_gemm_sm120_module_cutlass_fp8():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                _validate_bmm_fp8_scales(a, b, scale_a, scale_b)
 
                 # Handle both 2D (MM) and 3D (BMM) cases
                 # SM120/SM121 kernel now supports batch operations natively
@@ -11811,7 +11812,7 @@ def _validate_bmm_fp8_scales(
             raise ValueError(
                 f"{scale_name} must be torch.float32, got {scale_tensor.dtype}"
             )
-        if scale_tensor.device != operand.device:
+        if scale_tensor.device != operand.device or scale_tensor.device.type != "cuda":
             raise ValueError(
                 f"{scale_name} must be on the same CUDA device as the operand, "
                 f"got {scale_tensor.device} vs {operand.device}"
@@ -11959,10 +11960,14 @@ def bmm_fp8(
         Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
 
     A_scale: torch.Tensor
-        Scale tensor for A, float.
+        Tensorwide scalar scale tensor for A (1-element ``torch.float32`` on
+        the same CUDA device as ``A``). For groupwise scaling, use
+        :func:`gemm_fp8_nt_groupwise`.
 
     B_scale: torch.Tensor
-        Scale tensor for B, float.
+        Tensorwide scalar scale tensor for B (1-element ``torch.float32`` on
+        the same CUDA device as ``B``). For groupwise scaling, use
+        :func:`gemm_fp8_nt_groupwise`.
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.
@@ -12026,7 +12031,6 @@ def bmm_fp8(
     """
 
     if batch_invariant:
-        _validate_bmm_fp8_scales(A, B, A_scale, B_scale)
         # Here rather than in the problem-size check, which skip_check=True skips.
         if bias is not None:
             raise ValueError(

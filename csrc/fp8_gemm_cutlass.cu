@@ -84,12 +84,19 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView scale_
   }
 }
 
+void check_fp8_gemm_scale(const TensorView& scale, const TensorView& operand, const char* name) {
+  CHECK_INPUT(scale);
+  CHECK_DEVICE(scale, operand);
+  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(scale.dtype()), float32_code) << name << " must be float32";
+  TVM_FFI_ICHECK_EQ(scale.numel(), 1) << name << " must be a scalar (1-element tensorwide float32)";
+}
+
 void fp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView scale_a, TensorView scale_b,
                   TensorView out, TensorView workspace_buffer, int64_t tactic) {
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
-  CHECK_INPUT(scale_a);
-  CHECK_INPUT(scale_b);
+  check_fp8_gemm_scale(scale_a, mat1, "A_scale");
+  check_fp8_gemm_scale(scale_b, mat2, "B_scale");
 
   int mat2_k_scale = 1;
 
