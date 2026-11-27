@@ -300,18 +300,55 @@ def get_fp4_quantization_module(backend: str = "100"):
 
     spec = backend_modules[backend]()
     module = spec.build_and_load()
-    if not hasattr(
-        module, "nvfp4_quant_and_per_token_scale_tensor"
-    ) and not os.environ.get("FLASHINFER_DISABLE_JIT"):
-        from ..jit.core import JitSpecNvcc, logger
+    tensor_scale_fn: Optional[Callable] = None
 
-        if isinstance(spec, JitSpecNvcc):
-            logger.warning(
-                "Prebuilt %s module is missing nvfp4_quant_and_per_token_scale_tensor "
-                "(stale flashinfer-jit-cache); falling back to JIT compilation.",
-                spec.name,
-            )
-            module = spec._build_and_load_jit_fallback()
+    def _get_tensor_scale_fn() -> Callable:
+        nonlocal tensor_scale_fn
+        if tensor_scale_fn is not None:
+            return tensor_scale_fn
+        try:
+            fn = getattr(module, "nvfp4_quant_and_per_token_scale_tensor", None)
+        except Exception as exc:
+            raise RuntimeError(
+                "Loaded fp4_quantization module does not export "
+                "nvfp4_quant_and_per_token_scale_tensor (likely a stale "
+                "flashinfer-jit-cache package), and JIT fallback failed. "
+                "Uninstall flashinfer-jit-cache or upgrade it to match "
+                "this flashinfer version."
+            ) from exc
+        if fn is not None:
+            tensor_scale_fn = fn
+            return fn
+        if not os.environ.get("FLASHINFER_DISABLE_JIT"):
+            from ..jit.core import JitSpecNvcc, logger
+
+            if isinstance(spec, JitSpecNvcc):
+                logger.warning(
+                    "Prebuilt %s module is missing "
+                    "nvfp4_quant_and_per_token_scale_tensor "
+                    "(stale flashinfer-jit-cache); falling back to JIT compilation.",
+                    spec.name,
+                )
+                try:
+                    jit_module = spec._build_and_load_jit_fallback()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Loaded fp4_quantization module does not export "
+                        "nvfp4_quant_and_per_token_scale_tensor (likely a stale "
+                        "flashinfer-jit-cache package), and JIT fallback failed. "
+                        "Uninstall flashinfer-jit-cache or upgrade it to match "
+                        "this flashinfer version."
+                    ) from exc
+                fn = getattr(jit_module, "nvfp4_quant_and_per_token_scale_tensor", None)
+                if fn is not None:
+                    tensor_scale_fn = fn
+                    return fn
+        raise RuntimeError(
+            "Loaded fp4_quantization module does not export "
+            "nvfp4_quant_and_per_token_scale_tensor (likely a stale "
+            "flashinfer-jit-cache package). Uninstall flashinfer-jit-cache "
+            "or upgrade it to match this flashinfer version."
+        )
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",
@@ -620,15 +657,7 @@ def get_fp4_quantization_module(backend: str = "100"):
                 scale_inv_tensor = scale_inv_tensor.reshape(1)
             if not scale_inv_tensor.is_contiguous():
                 scale_inv_tensor = scale_inv_tensor.contiguous()
-            tensor_fn = getattr(module, "nvfp4_quant_and_per_token_scale_tensor", None)
-            if tensor_fn is None:
-                raise RuntimeError(
-                    "Loaded fp4_quantization module does not export "
-                    "nvfp4_quant_and_per_token_scale_tensor (likely a stale "
-                    "flashinfer-jit-cache package). Uninstall flashinfer-jit-cache "
-                    "or upgrade it to match this flashinfer version."
-                )
-            tensor_fn(
+            _get_tensor_scale_fn()(
                 input,
                 scale_inv_tensor,
                 output,

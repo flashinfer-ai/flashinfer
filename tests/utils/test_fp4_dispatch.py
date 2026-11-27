@@ -491,30 +491,65 @@ def test_stale_fp4_aot_module_fallback_and_float_compatibility(monkeypatch):
 
     fp4.get_fp4_quantization_module.cache_clear()
     try:
-        # With JIT enabled, missing tensor symbol triggers fallback JIT build.
+        # Loading a stale module must not eagerly compile; scalar/CPU-tensor
+        # calls keep using the 8-arg export, and JIT fallback runs lazily once
+        # when a device tensor actually requires the new export.
         monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
         mod = fp4.get_fp4_quantization_module("100")
-        fallback_mock.assert_called_once()
+        fallback_mock.assert_not_called()
+
+        mod.nvfp4_quant_and_per_token_scale_out_sm100(x, 1.0, out, sf, pts)
+        mod.nvfp4_quant_and_per_token_scale_out_sm100(
+            x, torch.tensor([1.0], dtype=torch.float32), out, sf, pts
+        )
+        fallback_mock.assert_not_called()
+        assert stale_scalar_fn.call_count == 2
+        assert all(len(c.args) == 8 for c in stale_scalar_fn.call_args_list)
 
         dev_scale = torch.empty((1,), dtype=torch.float32, device="meta")
         mod.nvfp4_quant_and_per_token_scale_out_sm100(x, dev_scale, out, sf, pts)
-        fresh_tensor_fn.assert_called_once()
+        mod.nvfp4_quant_and_per_token_scale_out_sm100(x, dev_scale, out, sf, pts)
+        fallback_mock.assert_called_once()
+        assert fresh_tensor_fn.call_count == 2
         assert len(fresh_tensor_fn.call_args.args) == 8
 
-        # With JIT disabled, stale module stays usable for 8-arg float/CPU scale calls
-        # and raises a clear error if a device tensor is passed.
+        # If lazy JIT fallback fails (e.g. no nvcc), loading and scalar calls
+        # still work while device-tensor calls raise a clear error naming the
+        # missing export.
         fp4.get_fp4_quantization_module.cache_clear()
+        stale_scalar_fn.reset_mock()
+        compile_err = RuntimeError("nvcc not found")
+        failing_fallback = Mock(side_effect=compile_err)
+        monkeypatch.setattr(spec, "_build_and_load_jit_fallback", failing_fallback)
+        stale_mod_no_nvcc = fp4.get_fp4_quantization_module("100")
+        failing_fallback.assert_not_called()
+
+        stale_mod_no_nvcc.nvfp4_quant_and_per_token_scale_out_sm100(
+            x, 1.0, out, sf, pts
+        )
+        stale_scalar_fn.assert_called_once()
+        failing_fallback.assert_not_called()
+
+        with pytest.raises(
+            RuntimeError, match="nvfp4_quant_and_per_token_scale_tensor"
+        ) as excinfo:
+            stale_mod_no_nvcc.nvfp4_quant_and_per_token_scale_out_sm100(
+                x, dev_scale, out, sf, pts
+            )
+        assert excinfo.value.__cause__ is compile_err
+
+        # With JIT disabled, stale module stays usable for 8-arg float/CPU scale
+        # calls and raises a clear error without invoking fallback on device tensors.
+        fp4.get_fp4_quantization_module.cache_clear()
+        stale_scalar_fn.reset_mock()
         fallback_mock.reset_mock()
+        monkeypatch.setattr(spec, "_build_and_load_jit_fallback", fallback_mock)
         monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
         stale_mod = fp4.get_fp4_quantization_module("100")
         fallback_mock.assert_not_called()
 
         stale_mod.nvfp4_quant_and_per_token_scale_out_sm100(x, 1.0, out, sf, pts)
-        stale_mod.nvfp4_quant_and_per_token_scale_out_sm100(
-            x, torch.tensor([1.0], dtype=torch.float32), out, sf, pts
-        )
-        assert stale_scalar_fn.call_count == 2
-        assert all(len(c.args) == 8 for c in stale_scalar_fn.call_args_list)
+        stale_scalar_fn.assert_called_once()
 
         with pytest.raises(
             RuntimeError, match="nvfp4_quant_and_per_token_scale_tensor"
@@ -522,5 +557,6 @@ def test_stale_fp4_aot_module_fallback_and_float_compatibility(monkeypatch):
             stale_mod.nvfp4_quant_and_per_token_scale_out_sm100(
                 x, dev_scale, out, sf, pts
             )
+        fallback_mock.assert_not_called()
     finally:
         fp4.get_fp4_quantization_module.cache_clear()
