@@ -1788,6 +1788,12 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 f"Config not supported by Prims-TS NVFP4 kernel ({reason})"
             )
 
+        routing_metadata = kwargs.get("routing_metadata")
+        if routing_metadata is not None and routing_metadata.tile_n != pair.tile_n:
+            raise ValueError(
+                f"routing_metadata tile_n={routing_metadata.tile_n} does not match "
+                f"the tactic's tile_n={pair.tile_n}"
+            )
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
         topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
@@ -1819,6 +1825,8 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(kwargs.get("weight_layout", self.weight_layout)),
             int(self.activation_type),
             kwargs.get("norm_topk_prob", True),
+            # Prebuilt metadata for the tactic's tile replaces the routing kernel.
+            [] if routing_metadata is None else list(routing_metadata.tensors()),
             kwargs.get("routing_replay_out"),
         )
 

@@ -2413,6 +2413,19 @@ class StagedMoeLauncher : public FusedMoeLauncher {
         norm_topk_prob, replay_ptr, enable_pdl);
   }
 
+  /** Take the routing outputs from caller-built metadata instead of running routing. */
+  void use_routing_metadata(RoutingMetadataBuffers const& metadata) {
+    configure_routing_dtypes();
+    total_num_padded_tokens = metadata.total_num_padded_tokens;
+    expanded_idx_to_permuted_idx = metadata.expanded_idx_to_permuted_idx;
+    permuted_idx_to_token_idx = metadata.permuted_idx_to_token_idx;
+    FusedMoeLauncher::expert_weights = metadata.expert_weights;
+    cta_idx_xy_to_batch_idx = metadata.cta_idx_xy_to_batch_idx;
+    cta_idx_xy_to_mn_limit = metadata.cta_idx_xy_to_mn_limit;
+    num_non_exiting_ctas = metadata.num_non_exiting_ctas;
+    bind_routing_metadata(metadata);
+  }
+
   Optional<Tensor> expert_weights_tensor() const { return FusedMoeLauncher::expert_weights; }
 
   Array<Optional<Tensor>> collect_routing_outputs() const {
@@ -3664,7 +3677,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool enable_pdl, Array<int64_t> moe_tactic, int64_t weight_layout,
-    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t activation_type, bool norm_topk_prob, Array<Tensor> routing_metadata,
+    Optional<TensorView> routing_replay_out) {
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_uint8)
       << "Staged FP4 MoE routing: hidden_states must be packed fp4 uint8.";
   TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float8_e4m3fn)
@@ -3697,8 +3711,16 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
       norm_topk_prob, routing_replay_out);
 
   launcher->check_routing();
-  launcher->prepare_routing();
-  launcher->run_routing_kernel(enable_pdl);
+  if (routing_metadata.empty()) {
+    launcher->prepare_routing();
+    launcher->run_routing_kernel(enable_pdl);
+  } else {
+    // Routing was built earlier into the caller's metadata for this tile: skip the routing kernel.
+    auto const metadata = RoutingMetadataBuffers::from_ffi(routing_metadata);
+    validateRoutingMetadata(metadata, num_tokens, top_k, num_experts, tile_N,
+                            hidden_states.device(), metadata.expert_weights.dtype());
+    launcher->use_routing_metadata(metadata);
+  }
   launcher->check_moe();
   launcher->prepare_external_gemm_buffers();
 

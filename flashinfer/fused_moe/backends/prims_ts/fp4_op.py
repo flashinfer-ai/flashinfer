@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -61,6 +61,12 @@ from flashinfer.utils import (
     register_custom_op,
     register_fake_op,
 )
+
+if TYPE_CHECKING:
+    from flashinfer.fused_moe.core import (
+        TrtllmMoERoutingMetadata,
+        TrtllmMoERoutingMetadataSlot,
+    )
 
 
 def _get_moe_op():
@@ -116,6 +122,53 @@ def _resolve_routing_inputs(
     return None, topk_ids, topk_weights
 
 
+def _check_routing_metadata_args(
+    *,
+    hidden_states: torch.Tensor,
+    routing_input_mode: int,
+    routing_replay_out: Optional[torch.Tensor],
+    num_fused_shared_experts: Optional[int],
+) -> None:
+    if hidden_states.dtype != torch.uint8:
+        raise ValueError("routing_metadata supports NVFP4 activations only")
+    if RoutingInputMode(routing_input_mode) == RoutingInputMode.FromLogits:
+        raise ValueError("routing_metadata requires precomputed topk_ids")
+    if routing_replay_out is not None or num_fused_shared_experts:
+        raise ValueError(
+            "routing_metadata supports neither routing_replay_out nor fused shared experts"
+        )
+
+
+def _routing_metadata_tactic(
+    runner,
+    moe_inputs: MoeRunnerInputs,
+    tactic,
+    routing_metadata: Union["TrtllmMoERoutingMetadataSlot", "TrtllmMoERoutingMetadata"],
+    kwargs: dict,
+):
+    """Pick the tactic and the metadata slot it runs with."""
+    inputs = moe_inputs.to_list()
+    resolved = tactic
+    if resolved == -1 and runner._is_partitioned:
+        resolved = runner.get_valid_tactics(inputs, None)[0]
+    # The tile forward() runs for this tactic, default included.
+    tile_n = int(
+        runner._map_tactic(
+            [-1, -1] if resolved == -1 else resolved, moe_inputs, kwargs
+        ).tile_n
+    )
+    slots = getattr(routing_metadata, "slots", None) or (routing_metadata,)
+    slot_by_tile = {int(slot.tile_n): slot for slot in slots}
+    if tile_n in slot_by_tile:
+        return tactic, slot_by_tile[tile_n]
+    # No slot for this tile: run the first slot's tile with its first valid tactic.
+    tile_n = int(slots[0].tile_n)
+    for candidate in runner.get_valid_tactics(inputs, None):
+        if candidate != -1 and int(candidate[0]) == tile_n:
+            return list(candidate), slots[0]
+    raise ValueError(f"No Prims-TS tactic runs routing_metadata tile_n={tile_n}")
+
+
 @register_custom_op(
     "flashinfer::prims_ts_fp4_block_scale_moe",
     mutates_args=("routing_replay_out",),
@@ -160,6 +213,9 @@ def prims_ts_fp4_block_scale_moe(
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     num_fused_shared_experts: Optional[int] = None,
+    routing_metadata: Optional[
+        Union["TrtllmMoERoutingMetadataSlot", "TrtllmMoERoutingMetadata"]
+    ] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE using the Prims-TS backend on SM100/SM103/SM107.
 
@@ -245,6 +301,17 @@ def prims_ts_fp4_block_scale_moe(
         Precomputed routing weights when not routing from logits.
     num_fused_shared_experts : Optional[int]
         Number of fused shared experts (default ``None`` / ``0``).
+    routing_metadata : Optional[Union[TrtllmMoERoutingMetadataSlot, TrtllmMoERoutingMetadata]]
+        Routing metadata already built from ``topk_ids`` by
+        :func:`~flashinfer.fused_moe.populate_trtllm_moe_routing_metadata_`. When given,
+        the call skips the routing kernel and launches only the expert GEMMs, so the
+        routing can run earlier, for example on another stream. A slot runs its tile.
+        A multi-tile collection runs the slot of the tuned tile, or its first slot's tile
+        when the tuned tile has none. The tuned config is used only when its tile has a
+        slot, otherwise that tile's first valid config runs. Autotuning profiles the call
+        with routing included. NVFP4 activations and precomputed routing only; not
+        supported with ``routing_replay_out`` or fused shared experts (``ValueError``).
+        Default ``None`` (route inside the call).
 
     Returns
     -------
@@ -263,6 +330,13 @@ def prims_ts_fp4_block_scale_moe(
             routing_method_type,
         )
 
+    if routing_metadata is not None:
+        _check_routing_metadata_args(
+            hidden_states=hidden_states,
+            routing_input_mode=routing_input_mode,
+            routing_replay_out=routing_replay_out,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
     if hidden_states.dtype == torch.uint8:
         runner_cls = PrimsTsNvfp4MoERunner
         support_fn = is_prims_ts_nvfp4_supported
@@ -394,10 +468,15 @@ def prims_ts_fp4_block_scale_moe(
         moe_inputs.to_list(),
         **common_kwargs,
     )
+    if routing_metadata is not None:
+        tactic, routing_metadata = _routing_metadata_tactic(
+            moe_runner, moe_inputs, tactic, routing_metadata, common_kwargs
+        )
 
     intermediate_output = moe_runner.forward(
         moe_inputs.to_list(),
         tactic=tactic,
+        routing_metadata=routing_metadata,
         **common_kwargs,
     )
     return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
@@ -441,6 +520,9 @@ def prims_ts_fp4_block_scale_moe_partitioned(
     gemm1_alpha: Optional[torch.Tensor] = None,
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
+    routing_metadata: Optional[
+        Union["TrtllmMoERoutingMetadataSlot", "TrtllmMoERoutingMetadata"]
+    ] = None,
 ) -> List[torch.Tensor]:
     r"""Run two-way FP4 Prims-TS MoE with caller-owned shards and streams.
 
@@ -530,6 +612,10 @@ def prims_ts_fp4_block_scale_moe_partitioned(
         Optional per-expert SwiGLU / SiTU beta.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional per-expert clamp limit.
+    routing_metadata : Optional[Union[TrtllmMoERoutingMetadataSlot, TrtllmMoERoutingMetadata]]
+        Prebuilt routing metadata; see
+        :func:`~flashinfer.fused_moe.prims_ts_fp4_block_scale_moe`. Both partitions
+        read the same metadata. Default ``None`` (route inside the call).
 
     Returns
     -------
@@ -585,6 +671,13 @@ def prims_ts_fp4_block_scale_moe_partitioned(
             else RoutingInputMode.PackedPrecomputed
         )
     )
+    if routing_metadata is not None:
+        _check_routing_metadata_args(
+            hidden_states=hidden_states,
+            routing_input_mode=routing_mode,
+            routing_replay_out=routing_replay_out,
+            num_fused_shared_experts=None,
+        )
     routing_logits, resolved_topk_ids, expert_weights = _resolve_routing_inputs(
         routing_input_mode=routing_mode,
         routing_logits=routing_logits,
@@ -702,8 +795,15 @@ def prims_ts_fp4_block_scale_moe_partitioned(
         moe_inputs.to_list(),
         **common_kwargs,
     )
+    if routing_metadata is not None:
+        tactic, routing_metadata = _routing_metadata_tactic(
+            runner, moe_inputs, tactic, routing_metadata, common_kwargs
+        )
     intermediate_output = runner.forward(
-        moe_inputs.to_list(), tactic=tactic, **common_kwargs
+        moe_inputs.to_list(),
+        tactic=tactic,
+        routing_metadata=routing_metadata,
+        **common_kwargs,
     )
     return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
 
@@ -833,6 +933,9 @@ def prims_ts_fp4_block_scale_routed_moe(
     per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    routing_metadata: Optional[
+        Union["TrtllmMoERoutingMetadataSlot", "TrtllmMoERoutingMetadata"]
+    ] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE with precomputed routing (Prims-TS / SM100).
 
@@ -906,6 +1009,10 @@ def prims_ts_fp4_block_scale_routed_moe(
         Optional in-place output tensor.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
+    routing_metadata : Optional[Union[TrtllmMoERoutingMetadataSlot, TrtllmMoERoutingMetadata]]
+        Prebuilt routing metadata; see
+        :func:`~flashinfer.fused_moe.prims_ts_fp4_block_scale_moe`.
+        Default ``None`` (route inside the call).
 
     Returns
     -------
@@ -959,4 +1066,5 @@ def prims_ts_fp4_block_scale_routed_moe(
         routing_input_mode=routing_mode,
         topk_ids=topk_ids_tensor,
         topk_weights=topk_weights,
+        routing_metadata=routing_metadata,
     )
