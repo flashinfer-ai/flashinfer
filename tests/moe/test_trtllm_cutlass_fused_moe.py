@@ -5076,5 +5076,23 @@ def test_moe_rejects_unsupported_output_dtype(weight_dtype):
         )
 
 
+@_CUTLASS_MOE_ARCH_SKIP
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_moe_workspace_size_default_output_dtype(dtype):
+    """The workspace query's default output dtype is one the runner accepts: FP16 inputs
+    default to an FP16 output, not to BF16 (which the runner refuses for them)."""
+    kw = dict(x_dtype=dtype, weight_dtype=dtype)
+    size = fused_moe.cutlass_fused_moe_workspace_size(16, 256, 128, 8, 2, **kw)
+    assert size > 0
+    assert size == fused_moe.cutlass_fused_moe_workspace_size(
+        16, 256, 128, 8, 2, output_dtype=dtype, **kw
+    )
+    other = torch.bfloat16 if dtype == torch.float16 else torch.float16
+    with pytest.raises(Exception, match="not supported"):
+        fused_moe.cutlass_fused_moe_workspace_size(
+            16, 256, 128, 8, 2, output_dtype=other, **kw
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
