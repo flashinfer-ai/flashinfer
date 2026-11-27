@@ -404,6 +404,8 @@ class MegaMoEHopperFp8Config:
                     f"{_NONSWAP_TILE_M_CHOICES} and N in {_NONSWAP_TILE_N_CHOICES}; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
+        if self.blockwise and k != 128:
+            raise ValueError(f"blockwise Hopper FP8 requires MMA tile K=128, got {k}.")
         if k % _FP8_DISPATCH_SCALE_ATOM_K != 0:
             raise ValueError(
                 f"mma_tiler K ({k}) must be a multiple of the FP8 dispatch "

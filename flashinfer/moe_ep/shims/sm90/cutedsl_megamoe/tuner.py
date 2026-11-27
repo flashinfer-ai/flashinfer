@@ -219,7 +219,7 @@ def is_valid(
             return False
         if pingpong and n != 128:
             return False
-    if k % 128 != 0:
+    if k % 128 != 0 or (fp8_scale_mode == "blockwise" and k != 128):
         return False
     if ck != 1 or (cm, cn) not in ((1, 1), (2, 1), (1, 2), (2, 2)):
         return False

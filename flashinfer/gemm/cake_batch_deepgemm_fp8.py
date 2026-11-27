@@ -306,11 +306,15 @@ def domain_serving_routed(
     groups: int,
 ) -> bool:
     """True when every packed-scale serving problem on weights of ``groups`` x
-    ``(n, k)`` runs a locality-domain twin on a device of ``sm_count`` SMs split
-    ``counts`` over its dies: whatever its ``expected_m``, the serving key it
-    selects has a twin listed in the cell of that ``expected_m``.  Homed weights
-    of any other shape could run a whole-GPU program, which is slower on homed
-    weights than on ordinary ones, so :func:`localize_weights` refuses them."""
+    ``(n, k)`` that the serving program would run (``expected_m`` below the homed
+    low bound of ``PAIR_SERVING_EXPECTED_M``; from it the masked pair program
+    runs) runs a locality-domain twin on a device of ``sm_count`` SMs split
+    ``counts`` over its dies: the serving key each ``expected_m`` selects has a
+    twin listed in the cell of that ``expected_m`` (``DOMAIN_EXPECTED_M_PROBES``
+    reach every key).  Homed weights of any other shape could run a whole-GPU
+    serving program, which is slower on homed weights than on ordinary ones, so
+    :func:`localize_weights` refuses them.  It does not say that homing is
+    faster: see :func:`localize_weights` for the ``expected_m`` where it is not."""
     return _domain_class_routed(
         arch, sm_count, cake_locality.die_class(counts), n, k, groups
     )
@@ -1646,26 +1650,33 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     same bits as on plain weights); the twin's result is the same bits for any
     ``g_cut``.
 
+    Homing is decided once per tensor but pays off only for some ``expected_m``:
+    it makes the decode range faster and larger ``expected_m`` slower (see the
+    measurements below), so home weights whose calls mostly fall in the decode
+    range.
+
     Returns ``b`` itself, unhomed, when the call is under CUDA graph capture, or
-    when homing could make a call slower: ``b`` is not float8_e4m3fn weights of a
-    packed-scale serving shape (``(N, K)`` in ``PACKED_NK``, ``B`` in
+    when no listed twin would serve the decode range: ``b`` is not float8_e4m3fn
+    weights of a packed-scale serving shape (``(N, K)`` in ``PACKED_NK``, ``B`` in
     ``PACKED_GROUPS``) on an SM107a device, no die class of the device's SM count
     routes every ``expected_m`` of that shape to a twin, the device has no SM
     table (:func:`flashinfer.cake_locality.sm_table` is ``None``), its memory
     does not run at its full clock
     (:func:`flashinfer.cake_locality.memory_at_full_clock` is ``False``), some
-    ``expected_m`` of that shape selects a serving program without a twin listed
-    in the cell of the device's dies (:func:`domain_serving_routed`), or the cut
+    ``expected_m`` below the homed low bound of ``PAIR_SERVING_EXPECTED_M``
+    selects a serving program without a twin listed in the cell of the device's
+    dies (:func:`domain_serving_routed`), or the cut
     is not a multiple of the allocation granularity of locality-domain memory.
     The checks that need no device work come first: a refused shape is returned
     before the SM table is probed or anything is built or synchronized.  Raises
     ``ValueError`` for a ``g_cut`` outside ``[0, B]``.
 
     With the cells listed for 212-SM devices, only ``B=64`` weights of
-    ``(N, K) = (4096, 7168)`` are homed: at every ``expected_m`` their serving
-    program has a listed twin, including the ``expected_m >= 16`` cell listed for
-    homed weights only (see ``DOMAIN_SERVING_CELLS``).  ``B=32`` weights of
-    ``(4096, 7168)`` and ``B=32`` and ``B=64`` weights of ``(7168, 2048)`` are
+    ``(N, K) = (4096, 7168)`` are homed: below the homed low bound their serving
+    program has a listed twin at every ``expected_m``, including the
+    ``expected_m >= 16`` cell listed for homed weights only (see
+    ``DOMAIN_SERVING_CELLS``); from that bound the masked pair program runs.
+    ``B=32`` weights of ``(4096, 7168)`` and ``B=32`` and ``B=64`` weights of ``(7168, 2048)`` are
     returned unhomed: their ``expected_m <= 1`` serving program has no twin.
 
     Homing weights also fills the device's reserve of pre-zeroed claim counter
@@ -1674,34 +1685,59 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     captured before any eager call holds no memset node; a failure there does
     not fail this call.
 
+    Measured for ``B=64`` weights of ``(4096, 7168)`` on 212-SM devices with
+    the memory at its full clock (driver 620.70.06; two GPUs, dies of 108/104
+    and 106/106 SMs; CUPTI kernel time of CUDA graph replays after a read
+    flush of twice the L2 size, median of 6 alternating rounds), every group
+    holding ``expected_m`` rows, the time of plain weights over that of homed
+    weights was:
+
+    - 1.32-1.47 at ``expected_m`` 1-32 (the twin against the serving
+      program) and 1.03-1.05 at 36-64; with uneven rows (0.7-1.3x
+      ``expected_m`` in each group) 1.12-1.36 up to 32, 1.03-1.10 at 36-48
+      and 0.97-1.00 at 56 and 64;
+    - 0.75-0.76 at ``expected_m`` 72 and 96, where plain weights run the
+      masked pair program and homed weights the twin (0.66-0.82 with uneven
+      rows);
+    - 0.66-0.80 at ``expected_m`` 128-512, where both run the masked pair
+      program (0.67-0.93 with uneven rows), and 0.97-1.02 at 1024 and 4096.
+
+    The twin's gain also needs each step's rows spread over both dies' groups.
+    With every row in the groups of one die the ratio was 0.63-0.79 at
+    ``expected_m`` 1-64; with 5 or 6 of 6 active groups on one die at
+    ``expected_m`` 1, 0.67-0.79.  Over 100 random masks of a skewed routing
+    (8 of 256 experts per token, this rank holding 64) its median was 0.94 at
+    ``expected_m`` 1, 1.27 at 8, 1.20 at 16, 0.93 at 64 and 0.57 at 128.
+
     Homed weights are meant for ``backend="cake"``.  ``backend="deepgemm"``
     reads them correctly but more slowly: on 212-SM devices it took 1.39-1.50x
-    the time of plain weights at ``expected_m`` 2-64.  The twin's gain comes
-    from die-local memory reads and was measured with the memory at its full
-    clock.  On a device whose memory ran at a lower clock (driver 620.43, 3186
-    of 4752 MHz) the twin route took 1.01-1.08x the time of plain weights at
-    ``expected_m <= 64`` and 0.92-0.95x at 512 and 4096 with plain weights on
-    the reserved grid, and 1.01-1.14x at every measured ``expected_m`` (1 to
-    4096) with plain weights on the full grid from ``expected_m`` 36.  So this
-    returns ``b`` unhomed on a device whose memory clock NVML reads below
+    the time of plain weights at ``expected_m`` 2-64.  Most of the twin's gain
+    comes from die-local memory reads: on ordinary (interleaved) memory the
+    twin took 0.95-0.97x the time of the whole program on the full grid at
+    ``expected_m`` 1-16 and 1.05x at 36 and 64, and homed memory then cut its
+    time 1.34-1.41x and 1.09x; with the SM table's dies swapped (every first
+    claim remote) it took 1.9-2.6x its homed time, with the same bits.
+
+    With the memory at a lower clock (driver 620.43, 3186 of 4752 MHz; homing
+    forced for the measurement, dies of 100/112 SMs) homed weights gained
+    nothing: the ratio was 0.94-0.96 at ``expected_m`` 1-32, 1.00 at 36-64,
+    0.47-0.77 at 72-159 and 0.59-0.68 at 160-512; on that clock the twin took
+    the same time on homed as on interleaved memory at ``expected_m`` 1-16
+    (dies of 106/106 SMs).  So this returns ``b`` unhomed on a device whose
+    memory clock NVML reads below
     :data:`flashinfer.cake_locality.MEMORY_CLOCK_FRACTION` of its maximum, or
     cannot read (:func:`flashinfer.cake_locality.memory_at_full_clock`), and
-    weights homed there take the whole-GPU route.
+    weights homed there take the whole-GPU route; the homed low bound of
+    ``PAIR_SERVING_EXPECTED_M`` does not apply there.
 
-    The masked pair program reads homed weights more slowly than plain ones:
-    for ``B=64`` weights of ``(4096, 7168)`` on a 212-SM device with its memory
-    at the full clock (driver 620.70.06) it took 1.36-1.47x the time of plain
-    weights at ``expected_m`` 160-512 and 1.00x at 4096, yet less time than the
-    twin route: 0.33-0.76x the twin's time at ``expected_m`` 160-512 and 0.29x
-    at 4096.  Below the full clock this returns ``b`` unhomed, so the homed low
-    bound of ``PAIR_SERVING_EXPECTED_M`` does not apply there.
-
-    On 212-SM devices, plain weights run their serving program on the full grid
-    from ``expected_m`` 36; the homed twin is unchanged.  For ``B=64`` weights of
-    ``(4096, 7168)``, plain weights then took 0.95x the time of homed weights at
-    ``expected_m`` 64 and 512 and 0.97x at 4096.  Homed weights stay faster at
-    smaller ``expected_m``: plain weights took 1.04x their time at 36 and
-    1.10-1.35x at 1-32.
+    From the homed low bound (128) the masked pair program serves homed weights
+    (the same bits as on plain weights).  On homed weights it took 1.15-1.16x
+    the twin's time at ``expected_m`` 72 and 96 and 0.76-0.92x at 128-159.  Its
+    slowdown on homed weights is not extra remote traffic: on homed and plain
+    weights at ``expected_m`` 256 it read the dies' memory in equal totals and
+    took the same share of its L2 sectors over the die fabric (0.44 and 0.41);
+    its walk of the weight tiles in group order may read one die's memory at a
+    time, which was not measured.
 
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor

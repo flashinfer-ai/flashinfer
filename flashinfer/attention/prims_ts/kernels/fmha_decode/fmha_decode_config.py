@@ -357,6 +357,14 @@ _GROUPED_KEEPS_PAGED_FP8_PROFILES = {
     for output_dtype in (Float16, BFloat16, Float8E4M3FN)
 }
 
+# FP8-Q/FP8-KV D512 grouped Keeps Q64 runs the D512 NVFP4 profile's four D128
+# head-dim stages and lane-panel O directly on stored FP8 K/V (no converters).
+_GROUPED_KEEPS_PAGED_FP8_D512_PROFILES = {
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, output_dtype, 512, 128, 1, 1)
+    for output_dtype in (Float16, BFloat16)
+}
+_GROUPED_KEEPS_PAGED_FP8_PROFILES.update(_GROUPED_KEEPS_PAGED_FP8_D512_PROFILES)
+
 # FP8-Q/NVFP4-KV Keeps Q64 converts K/V into FP8 SMEM tiles with one converter
 # warp group per KV instance at D128, or separate K and V groups at D256.
 _GROUPED_KEEPS_PAGED_NVFP4_PROFILES = {
@@ -365,6 +373,7 @@ _GROUPED_KEEPS_PAGED_NVFP4_PROFILES = {
     for profile in (
         (Float8E4M3FN, Float4E2M1FN, Float4E2M1FN, output_dtype, 128, 0, 2, 2),
         (Float8E4M3FN, Float4E2M1FN, Float4E2M1FN, output_dtype, 256, 128, 1, 1),
+        (Float8E4M3FN, Float4E2M1FN, Float4E2M1FN, output_dtype, 512, 128, 1, 1),
     )
 }
 
@@ -381,6 +390,7 @@ _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES = {
 _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES.update(
     profile for profile in _D192_GROUPED_KEEPS_PROFILES if profile[0] == Float8E4M3FN
 )
+_AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES.update(_GROUPED_KEEPS_PAGED_FP8_D512_PROFILES)
 
 # FP16/BF16 grouped Keeps Q128 recipes on paged K/V: the contiguous 16-bit Q128
 # resources with the paged FP8 Q128 K/V loads. Paged 16-bit Q64 keeps its own
@@ -870,6 +880,42 @@ class FmhaDecodeConfig:
     # into SmemKv, converted to the Q-side MMA input type, then consumed by MMA.
     # Zero selects the profile-derived stage count.
     transformed_kv_stages: int = 0
+    # Dual SMEM transform only: FP8 V ring depth (``transformed_kv_stages``
+    # then sizes the K ring). Zero uses ``transformed_kv_stages``.
+    transformed_v_stages: int = 0
+    # Head-dim stages per transformed TMEM ring slot. One slot (one converter
+    # commit and one MMA wait/release) covers this many consecutive D128
+    # stages of one operand, so converter/MMA handoffs per KV tile drop by
+    # this factor. ``transformed_kv_stages`` then counts slots.
+    transformed_kv_hd_stages_per_slot: int = 1
+    # Stage the TMEM transform's raw NVFP4 payload as packed 64-byte token
+    # rows (two values per byte, 64B swizzle) instead of the padded
+    # B4X16_P64 unpacking layout; the converters then read half the shared
+    # memory and convert packed bytes in place, one token row per thread.
+    use_packed_nvfp4_raw_payload: bool = False
+    # With the packed payload, stage a whole K or V tile (every head-dim
+    # slice, plus its scale rows once) per raw ring stage: one loader
+    # barrier, one converter wait/release and one scale copy per tile
+    # instead of per D128 slice. Requires use_packed_nvfp4_raw_payload.
+    use_whole_tile_nvfp4_raw_stage: bool = False
+    # Opt-in: convert packed K with the padded multiply, which yields each
+    # 8-value group as even values then odd values, store K in that order and
+    # permute Q's head dim identically once per Q tile (QK^T reduces over the
+    # head dim). The default dense packed multiply already returns values in
+    # order. Requires the packed payload and FP8 Q/K.
+    use_permuted_packed_k_order: bool = False
+    # Opt-in, one-instance Keeps D512 only: the V converter writes the padded
+    # multiply's even-then-odd FP8 rows, so O columns come out permuted within
+    # groups of eight and the epilogue reads them back in logical order.
+    use_permuted_packed_v_order: bool = False
+    # One-instance Keeps D512 only: each raw D128 stage TMAs only the scale
+    # columns it needs (K: the 16 B half row, V: its 32 B per 4-token group)
+    # instead of the complete 32 B scale row; frees SMEM for FP8 ring slots.
+    use_stage_sliced_nvfp4_sf: bool = False
+    # Issue a whole grouped TMEM K/V slot's QK or PV MMAs (every head-dim
+    # stage) from one elected block with operand addresses stepped by
+    # constants, instead of one issue block per D128 stage.
+    use_fused_slot_mma_issue: bool = False
     # Store the transformed NVFP4 K/V operand ring in TMEM (SwapsMmaAb only,
     # where K/V is operand A). The supported FP8-Q Swaps profile defaults to
     # this path; other Swaps mixed modes use SMEM. KeepsMmaAb reads K/V as
@@ -1034,6 +1080,23 @@ class FmhaDecodeConfig:
         if self.share_pattern_across_kv_heads is None:
             return not self.use_block_sparse
         return self.share_pattern_across_kv_heads
+
+    @property
+    def uses_longest_first_route_order(self) -> bool:
+        """Persistent grouped QToken routes take CLC work longest first.
+
+        The metadata kernel then writes ``route_order`` (route IDs by
+        descending KV128 tiles) right after the per-route lengths, and the
+        work queue maps CLC index i to ``route_order[i]``: long routes start
+        in the first wave instead of extending the last.
+        """
+        return (
+            self.balanced_scheduler
+            and self.use_q_token_kv_block_sparse_route
+            and self.use_persistent_scheduler
+            and self.shares_sparse_pattern
+            and not self.fixed_seqlen
+        )
 
     @property
     def widens_sparse_metadata_rows_per_head(self) -> bool:
@@ -1394,6 +1457,10 @@ class FmhaDecodeConfig:
             # Softmax with only 40 registers and forced score spills. Two
             # transform groups each hold only half a stage.
             return 104 if self.transform_kv_num_warps == 4 else 72
+        if self.store_transformed_kv_in_tmem and self.transform_kv_num_warps == 8:
+            # Dense two-group TMEM converter: each group holds half a stage.
+            # 112 measured best on B200 among 72-120.
+            return 112
         if self.num_insts_kv == 1 or self.store_transformed_kv_in_tmem:
             return 184
         if self.headdim == 64:
@@ -1664,7 +1731,11 @@ class FmhaDecodeConfig:
         Interleaved NVFP4 stages whole rows once, and so does a Keeps
         transform target (see ``raw_kv_head_dim_stage``).
         """
-        if self.use_nvfp4_interleaved_kv or self.uses_keeps_transformed_kv:
+        if (
+            self.use_nvfp4_interleaved_kv
+            or self.uses_keeps_transformed_kv
+            or self.use_whole_tile_nvfp4_raw_stage
+        ):
             return 1
         return self.num_head_dim_stages_kv
 
@@ -1677,9 +1748,25 @@ class FmhaDecodeConfig:
         scale row), like its one D256 transformed stage. Other profiles load
         one ``head_dim_kv_stage`` slice per stage; interleaved rows ignore it.
         """
-        if self.uses_keeps_transformed_kv:
+        if self.uses_keeps_transformed_kv or self.use_whole_tile_nvfp4_raw_stage:
             return self.headdim
         return self.head_dim_kv_stage
+
+    @property
+    def raw_nvfp4_slice_row_elems(self) -> int:
+        """SMEM elements of one token row of one D128 slice in a raw stage.
+
+        Packed payload stores two values per byte; the unpacking B4X16_P64
+        layout stores one padded byte per value.
+        """
+        if self.use_packed_nvfp4_raw_payload:
+            return self.head_dim_kv_stage // 2
+        return self.head_dim_kv_stage
+
+    @property
+    def raw_nvfp4_slice_bytes(self) -> int:
+        """SMEM bytes of one D128 slice block (all tile tokens) in a raw stage."""
+        return self.tile_size_kv * self.raw_nvfp4_slice_row_elems
 
     @property
     def uses_sw128_nvfp4_raw_payload(self) -> bool:
@@ -1731,9 +1818,46 @@ class FmhaDecodeConfig:
         Fragments of at least 128 bytes stay dense.
         """
         live_bytes = self.num_tokens_per_page * self.smem_kv_sf_bytes_per_token
-        if not self.use_paged_kv or live_bytes % 128 == 0:
+        if (
+            not self.use_paged_kv
+            or live_bytes % 128 == 0
+            or self.uses_nvfp4_scale_gather4
+        ):
             return live_bytes
         return (live_bytes + 127) // 128 * 128
+
+    @property
+    def uses_nvfp4_scale_gather4(self) -> bool:
+        """Whether the Keeps raw ring gathers four fragments' scales per copy.
+
+        Compact scale tensors make each page fragment's scale rows one
+        contiguous row of a flat 2-D map (D256 four-token fragments: 64
+        bytes), so one TMA gather4 stages four selected fragments back to back
+        where 4-D copies need one instruction per fragment. With separate
+        scale tensors those copies doubled the raw ring's TMA issues, which
+        bound the one-stage Q128 ring (GB300, 16 Q heads per KV head, G8:
+        about 7% of the attention time). Each lane-parallel loader warp
+        stages a multiple of four fragments; gather4 slots are the live 64
+        bytes, 256-byte aligned per copy.
+        """
+        if not (
+            self.flat_nvfp4_scale_num_heads > 0
+            and self.uses_keeps_transformed_kv
+            and self.uses_nvfp4_scale_tensors
+            and self.use_paged_kv
+            and self.sf_tma_reshape_factor == 1
+            and self.load_num_warps > 1
+        ):
+            return False
+        fragments = self.tile_size_kv // self.num_tokens_per_page
+        per_warp = fragments // min(fragments, self.load_num_warps)
+        fragment_bytes = self.num_tokens_per_page * self.smem_kv_sf_bytes_per_token
+        return (
+            per_warp % 4 == 0
+            and per_warp <= 32
+            and fragment_bytes % 32 == 0
+            and fragment_bytes // 4 <= 256
+        )
 
     @property
     def smem_kv_sf_tile_bytes(self) -> int:
@@ -1826,6 +1950,152 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def uses_packed_nvfp4_raw_payload(self) -> bool:
+        """Whether raw NVFP4 payload stages hold packed bytes (two per byte).
+
+        The TMEM transform otherwise stages the padded B4X16_P64 layout.
+        """
+        return self.use_nvfp4_kv and (
+            not self.store_transformed_kv_in_tmem or self.use_packed_nvfp4_raw_payload
+        )
+
+    @property
+    def uses_permuted_packed_k_order(self) -> bool:
+        """Whether packed K and Q both use the even-then-odd head-dim order.
+
+        Requested by ``use_permuted_packed_k_order``; applies only to the
+        packed FP8 TMEM K transform with a non-persistent Swaps schedule,
+        where the MMA warp permutes Q exactly once per Q load (persistent
+        schedules derive Q descriptors on several paths). Both sides key on
+        this property, so they always agree.
+        """
+        swaps_tmem_k = (
+            self.use_packed_nvfp4_raw_payload
+            and self.store_transformed_kv_in_tmem
+            and not self.use_keeps_mma_ab
+        )
+        # One-instance Keeps D512: the SMEM K converter writes even-then-odd
+        # FP8 rows and the MMA warp permutes Q in q_desc, as for Swaps.
+        keeps_smem_k = (
+            self.uses_dual_smem_transform
+            and self.keeps_o_uses_lane_panels
+            and not self.uses_prefetched_smem_nvfp4_transform
+        )
+        return (
+            self.use_permuted_packed_k_order
+            and (swaps_tmem_k or keeps_smem_k)
+            and self.qk_dtype_bytes == 1
+            and not self.use_persistent_scheduler
+        )
+
+    @property
+    def uses_stage_sliced_nvfp4_sf(self) -> bool:
+        """Whether raw K/V stages hold only their D128 slice of the scales.
+
+        K stages copy the 16 B half of each 32 B token scale row that holds
+        their 8 scales (2 KiB per stage); V stages copy the 32 B of each
+        4-token interleaved group that belongs to them (1 KiB per stage).
+        """
+        return (
+            self.use_stage_sliced_nvfp4_sf
+            and self.uses_dual_smem_transform
+            and self.keeps_o_uses_lane_panels
+            and not self.uses_prefetched_smem_nvfp4_transform
+            and self.use_paged_kv
+            and self.uses_nvfp4_scale_tensors
+            and not self.swizzles_v_scale_factors
+            and self.sf_tma_reshape_factor == 4
+            and self.num_tokens_per_page % 16 == 0
+            and self.tile_size_kv % self.num_tokens_per_page == 0
+        )
+
+    def sf_stage_bytes_per_token(self, is_v: bool) -> int:
+        """Staged scale bytes per token of one raw K or V stage."""
+        if self.uses_stage_sliced_nvfp4_sf:
+            return 8 if is_v else 16
+        return self.smem_kv_sf_bytes_per_token
+
+    def sf_stage_fragment_bytes(self, is_v: bool) -> int:
+        """SMEM bytes of one page fragment's staged scales (K or V)."""
+        if self.uses_stage_sliced_nvfp4_sf:
+            return self.num_tokens_per_page * self.sf_stage_bytes_per_token(is_v)
+        return self.smem_kv_sf_fragment_bytes
+
+    def sf_stage_tile_bytes(self, is_v: bool) -> int:
+        """SMEM bytes of one raw K or V stage's scales."""
+        if self.uses_stage_sliced_nvfp4_sf:
+            return self.tile_size_kv * self.sf_stage_bytes_per_token(is_v)
+        return self.smem_kv_sf_tile_bytes
+
+    def sf_stage_tma_column(self, is_v: bool, head_dim_stage_idx: int) -> int:
+        """Scale TMA column of a raw D128 stage (0 for complete rows)."""
+        if not self.uses_stage_sliced_nvfp4_sf:
+            return 0
+        return head_dim_stage_idx * 32 if is_v else head_dim_stage_idx // 2 * 16
+
+    def sf_stage_token_fold(self, is_v: bool) -> int:
+        """Tokens per scale TMA box row (stage-sliced K copies one per row)."""
+        if self.uses_stage_sliced_nvfp4_sf and not is_v:
+            return 1
+        return self.sf_tma_reshape_factor
+
+    def sf_stage_transaction_bytes(self, is_v: bool) -> int:
+        """TMA bytes of one raw K or V stage's scales."""
+        if self.uses_stage_sliced_nvfp4_sf:
+            return self.tile_size_kv * self.sf_stage_bytes_per_token(is_v)
+        return self.smem_kv_sf_tile_transaction_bytes
+
+    @property
+    def uses_permuted_packed_v_order(self) -> bool:
+        """Whether the Keeps SMEM V converter writes even-then-odd FP8 rows.
+
+        PV then produces O with each aligned group of eight columns in the
+        order 0 2 4 6 1 3 5 7; ``_keeps_o_tail_tcgen05_ld`` undoes it.
+        """
+        return (
+            self.use_permuted_packed_v_order
+            and self.uses_dual_smem_transform
+            and self.keeps_o_uses_lane_panels
+            and not self.uses_prefetched_smem_nvfp4_transform
+        )
+
+    @property
+    def uses_fused_slot_mma_issue(self) -> bool:
+        """Whether the MMA warp issues a whole grouped slot per elected block."""
+        return (
+            self.use_fused_slot_mma_issue
+            and self.store_transformed_kv_in_tmem
+            and self.head_dim_per_stage_kv != 0
+            and self.transformed_kv_hd_stages_per_slot == self.num_head_dim_stages_kv
+            and self.qk_dtype_bytes == 1
+            and not self.use_keeps_mma_ab
+            and not self.uses_q_desc_ref
+            and not self.uses_int32_scores
+            and not self.uses_ws_2x2_datapath
+            and not self.uses_tmem_p
+            and not self.streams_tmem_p_fragments
+            and self.tile_size_kv != 256
+        )
+
+    @property
+    def permutes_nvfp4_v_rows(self) -> bool:
+        """Whether the in-place V converter permutes rows inside 16-row blocks.
+
+        Interleaved and packed-payload V store row 2l at lane l and 2l+1 at
+        lane l+8; the correction tail restores natural order once per tile.
+        """
+        return self.use_nvfp4_interleaved_kv or (
+            self.store_transformed_kv_in_tmem and self.use_packed_nvfp4_raw_payload
+        )
+
+    @property
+    def tmem_transformed_kv_slot_cols(self) -> int:
+        """TMEM columns of one transformed ring slot (grouped head-dim stages)."""
+        return (
+            self.tmem_transformed_kv_stage_cols * self.transformed_kv_hd_stages_per_slot
+        )
+
+    @property
     def head_dim_kv_stage(self) -> int:
         """Head-dim slice loaded by one K/V stage."""
         return (
@@ -1855,6 +2125,38 @@ class FmhaDecodeConfig:
                 )
             )
         )
+
+    @property
+    def keeps_o_uses_lane_panels(self) -> bool:
+        """Whether Keeps Q64 O stacks D128 stages in both TMEM lane panels.
+
+        An M64 non-WS accumulator occupies lanes 0-15 of each 32-lane quadrant.
+        D512 O (64 x 512 FP32) then needs 512 columns, so head-dim stages 2/3
+        reuse the columns of stages 0/1 in lanes 16-31 (MLA's non-WS D512
+        layout). Row ownership is unchanged: lanes l and l + 16 hold one row.
+        """
+        return (
+            self.use_keeps_mma_ab
+            and self.tile_size_q == 64
+            and self.tile_size_kv == 128
+            and self.headdim == 512
+            and self.head_dim_per_stage_kv == 128
+            and self.num_insts_kv == 1
+        )
+
+    def keeps_o_head_dim_stage_tmem_offset(self, head_dim_stage_idx: int) -> int:
+        """Return the Keeps O TMEM offset (column plus lane-panel term) of one stage."""
+        if self.keeps_o_uses_lane_panels:
+            return (head_dim_stage_idx % 2) * self.head_dim_kv_stage + (
+                head_dim_stage_idx // 2
+            ) * TMEM_ROW_STRIDE
+        return head_dim_stage_idx * self.head_dim_kv_stage
+
+    def keeps_p_lane_panel_tmem_offset(self, head_dim_stage_idx: int) -> int:
+        """Return the lane-panel term of the P copy read by one staged PV MMA."""
+        if self.keeps_o_uses_lane_panels:
+            return (head_dim_stage_idx // 2) * TMEM_ROW_STRIDE
+        return 0
 
     @property
     def tmem_o_cols_per_head_dim_stage(self) -> int:
@@ -1902,7 +2204,7 @@ class FmhaDecodeConfig:
         if self.head_dim_per_stage_kv == 0:
             return 0
         if self.use_keeps_mma_ab:
-            return head_dim_stage_idx * self.head_dim_kv_stage
+            return self.keeps_o_head_dim_stage_tmem_offset(head_dim_stage_idx)
         return self.swaps_head_dim_stage_tmem_offset(head_dim_stage_idx)
 
     @property
@@ -1941,7 +2243,7 @@ class FmhaDecodeConfig:
             )
         return (
             total_cols
-            + self.tmem_transformed_kv_stage_cols
+            + self.tmem_transformed_kv_slot_cols
             * self.transformed_kv_stages
             * (2 if self.uses_dual_kv_transform else 1)
         )
@@ -2142,6 +2444,10 @@ class FmhaDecodeConfig:
     # Enable persistent scheduling: one physical worker may consume multiple
     # logical work tiles. Mutually exclusive with split-KV mode.
     use_persistent_scheduler: bool = False
+    # Balanced persistent scheduling: CLC hands out work tiles longest first
+    # (QToken routes: the metadata kernel writes their order after seq_lens).
+    # Resolved by the plan; part of the compile signature.
+    balanced_scheduler: bool = False
     # Split-KV: split the K-sequence across several CTAs that produce partial
     # O/stats, with a GMEM reduction epilogue.
     use_split_kv: bool = False
@@ -2171,6 +2477,10 @@ class FmhaDecodeConfig:
     use_flat_native_kv_tma: bool = False
     # Prepared locators count the complete physical head span between pages.
     flat_native_kv_num_heads: int = 1
+    # KV heads of compact NVFP4 scale tensors viewed as one 2-D map of page
+    # fragment rows (FmhaDecodeConfig.uses_nvfp4_scale_gather4); 0 keeps the
+    # 4-D per-fragment scale copies.
+    flat_nvfp4_scale_num_heads: int = 0
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
     max_num_pages_per_seq_kv: int = 1
@@ -2334,22 +2644,34 @@ class FmhaDecodeConfig:
             return (
                 self.tile_size_kv // self.num_tokens_per_page
             ) * self.nvfp4_interleaved_fragment_bytes
-        if self.store_transformed_kv_in_tmem and self.use_nvfp4_kv:
-            return self.tile_size_kv * self.head_dim_kv_stage
+        if (
+            self.store_transformed_kv_in_tmem
+            and self.use_nvfp4_kv
+            and not self.use_packed_nvfp4_raw_payload
+        ):
+            return self.tile_size_kv * self.raw_kv_head_dim_stage
         return self.smem_kv_tile_bytes // self.kv_dtype_bytes
 
     @property
     def smem_k_tile_elements(self) -> int:
         """Return K elements in one staged SMEM tile."""
-        if self.store_transformed_kv_in_tmem and self.k_dtype == Float4E2M1FN:
-            return self.tile_size_kv * self.head_dim_kv_stage
+        if (
+            self.store_transformed_kv_in_tmem
+            and self.k_dtype == Float4E2M1FN
+            and not self.use_packed_nvfp4_raw_payload
+        ):
+            return self.tile_size_kv * self.raw_kv_head_dim_stage
         return self.smem_k_tile_bytes // self.k_dtype_bytes
 
     @property
     def smem_v_tile_elements(self) -> int:
         """Return V elements in one staged SMEM tile."""
-        if self.store_transformed_kv_in_tmem and self.v_dtype == Float4E2M1FN:
-            return self.tile_size_kv * self.head_dim_kv_stage
+        if (
+            self.store_transformed_kv_in_tmem
+            and self.v_dtype == Float4E2M1FN
+            and not self.use_packed_nvfp4_raw_payload
+        ):
+            return self.tile_size_kv * self.raw_kv_head_dim_stage
         return self.smem_v_tile_bytes // self.v_dtype_bytes
 
     @property
@@ -2799,14 +3121,23 @@ class FmhaDecodeConfig:
             # Raw storage and converted operands coexist. When the converted
             # depth is still implicit, budget both rings per stage; otherwise
             # reserve the configured converted ring before sizing raw storage.
+            sf_tile_bytes = self.smem_kv_sf_tile_bytes
+            if self.uses_stage_sliced_nvfp4_sf:
+                sf_tile_bytes = (
+                    self.sf_stage_tile_bytes(False) + self.sf_stage_tile_bytes(True)
+                ) // 2
             kv_tile_bits = (
-                self.smem_kv_storage_tile_bytes + self.smem_kv_sf_tile_bytes
+                self.smem_kv_storage_tile_bytes + sf_tile_bytes
             ) * BITS_PER_BYTE
             if not self.store_transformed_kv_in_tmem:
                 if self.transformed_kv_stages > 0:
-                    fixed_bytes += (
-                        self.transformed_kv_stages * self.smem_transformed_kv_tile_bytes
-                    )
+                    converted_slots = self.transformed_kv_stages
+                    if self.uses_dual_smem_transform:
+                        # Separate K and V rings; V reuses the K depth when unset.
+                        converted_slots += (
+                            self.transformed_v_stages or self.transformed_kv_stages
+                        )
+                    fixed_bytes += converted_slots * self.smem_transformed_kv_tile_bytes
                 else:
                     kv_tile_bits += self.smem_transformed_kv_tile_bytes * BITS_PER_BYTE
 
@@ -2818,6 +3149,11 @@ class FmhaDecodeConfig:
                 MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB, kv_budget_bytes
             )
         inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
+        if self.uses_dual_smem_transform:
+            # The kernel gives each raw K and V ring complete head-dim rounds,
+            # and at least one round each.
+            rounds = 2 * self.num_head_dim_stages_kv
+            inferred_stages = max(rounds, inferred_stages // rounds * rounds)
         return inferred_stages
 
     def validate_dtypes(self) -> None:
@@ -3484,7 +3820,7 @@ class FmhaDecodeConfig:
         """Whether staged wide-head P uses the double-buffered TMEM overlay."""
         return (
             self.use_keeps_mma_ab
-            and self.headdim in (192, 256)
+            and (self.headdim in (192, 256) or self.keeps_o_uses_lane_panels)
             and (
                 self.head_dim_per_stage_kv == 128
                 or (self.headdim == 192 and self.head_dim_per_stage_kv == 192)
@@ -3829,7 +4165,7 @@ class FmhaDecodeConfig:
         assert lane_regs_per_stage % chunk_regs == 0
         return tuple(
             (
-                stage_idx * stage_cols,
+                self.keeps_o_head_dim_stage_tmem_offset(stage_idx),
                 stage_cols // 2,
                 lane_regs_per_stage // chunk_regs,
             )
@@ -4391,7 +4727,7 @@ def _finalize_static_decode_config(
         and cfg.use_transform_kv
         and cfg.use_nvfp4_kv
         and cfg.use_fp8_q
-        and cfg.headdim == 256
+        and cfg.headdim in (256, 512)
     ):
         # One staged Keeps instance leaves warp group 3 free for the K
         # converter; the V converter follows in warp group 4 (20 warps).
@@ -4432,7 +4768,15 @@ def _finalize_static_decode_config(
                 tile_size_kv // 2,
                 explicit_fields,
             )
-            _set_if_implicit(cfg, "tmem_o_cols", cfg.headdim, explicit_fields)
+            _set_if_implicit(
+                cfg,
+                "tmem_o_cols",
+                # D512 Q64 stacks stages 2/3 in lanes 16-31 (lane panels).
+                cfg.headdim // 2
+                if cfg.headdim == 512 and tile_size_q == 64 and tile_size_kv == 128
+                else cfg.headdim,
+                explicit_fields,
+            )
             _set_if_implicit(cfg, "mma_tile_m_bmm1", tile_size_q, explicit_fields)
             _set_if_implicit(cfg, "mma_tile_n_bmm1", tile_size_kv, explicit_fields)
             _set_if_implicit(cfg, "mma_tile_m_bmm2", tile_size_q, explicit_fields)
@@ -4463,14 +4807,8 @@ def _finalize_static_decode_config(
     uses_full_wg_transform = (
         cfg.use_transform_kv and cfg.num_insts_kv == 1 and not cfg.use_keeps_mma_ab
     )
-    if uses_full_wg_transform:
-        _set_if_implicit(cfg, "transform_kv_warp_idx", 4, explicit_fields)
-        _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
-
-    # MmaTask publishes one TMEM O stage per K/V instance in each loop group,
-    # and Correction uses those stage slots as the corresponding accumulators.
-    _set_if_implicit(cfg, "o_stages", cfg.num_insts_kv, explicit_fields)
-
+    # Resolve the converter backend first: the D512 Q8 defaults below apply
+    # only to the TMEM converter.
     _set_if_implicit(
         cfg,
         "store_transformed_kv_in_tmem",
@@ -4483,6 +4821,79 @@ def _finalize_static_decode_config(
         ),
         explicit_fields,
     )
+    if uses_full_wg_transform:
+        # Dense D512 Swaps Q8 NVFP4 converts K and V through one shared TMEM
+        # ring. With per-D128-stage handoffs two converter warp groups
+        # (warps 16-23) helped; with whole-tile raw stages and one TMEM slot
+        # per K or V tile (below) the second group only adds barrier traffic
+        # and issue contention: one group with a 184-register grant measured
+        # 5-7% faster on B200/B300 (output byte-identical).
+        split_stage_transform = (
+            cfg.headdim == 512
+            and cfg.tile_size_q == 8
+            and cfg.tile_size_kv == 128
+            and cfg.use_nvfp4_kv
+            and cfg.use_fp8_q
+            and cfg.use_paged_kv
+            and not cfg.use_q_token_kv_block_sparse_route
+            # An explicit SMEM converter or interleaved NVFP4 layout keeps the
+            # established one-group, per-stage defaults.
+            and cfg.store_transformed_kv_in_tmem
+            and not cfg.use_nvfp4_interleaved_kv
+        )
+        _set_if_implicit(
+            cfg,
+            "transform_kv_warp_idx",
+            16 if split_stage_transform else 4,
+            explicit_fields,
+        )
+        packed_whole_tile = split_stage_transform and cfg.num_tokens_per_page % 8 == 0
+        _set_if_implicit(
+            cfg,
+            "transform_kv_num_warps",
+            8 if split_stage_transform and not packed_whole_tile else 4,
+            explicit_fields,
+        )
+        # The per-D128-stage converter/MMA handoff (acquire, 256-thread
+        # commit, wait, tcgen05.commit release) dominated this profile; one
+        # ring slot per K or V tile (4 head-dim stages, 3 slots) measured
+        # 17-22% faster than per-stage slots on B200/B300. An explicit
+        # positive ``transformed_kv_stages`` keeps counting head-dim stages
+        # unless the slot width is also given.
+        explicit_ring_depth = (
+            "transformed_kv_stages" in explicit_fields and cfg.transformed_kv_stages > 0
+        )
+        _set_if_implicit(
+            cfg,
+            "transformed_kv_hd_stages_per_slot",
+            4 if split_stage_transform and not explicit_ring_depth else 1,
+            explicit_fields,
+        )
+        # Stage each K or V tile once (packed payload, all head-dim slices,
+        # scale rows once) instead of one raw stage per D128 slice: 4x fewer
+        # loader/converter handoffs and scale copies. Measured 9-10% faster
+        # than per-slice raw stages on B200/B300; the packed payload is what
+        # lets four whole-tile stages fit in SMEM.
+        _set_if_implicit(
+            cfg, "use_packed_nvfp4_raw_payload", packed_whole_tile, explicit_fields
+        )
+        _set_if_implicit(
+            cfg, "use_whole_tile_nvfp4_raw_stage", packed_whole_tile, explicit_fields
+        )
+        # K stays in logical order: the dense packed multiply converts eight
+        # values with two instructions and no byte permutes, 2-3% faster on
+        # B200/B300 than the padded multiply with even-then-odd K and Q.
+        # With a single converter group the MMA warp's per-D128-stage issue
+        # blocks become critical; issuing each slot from one elected block
+        # measured a further 2-3% on B200/B300.
+        _set_if_implicit(
+            cfg, "use_fused_slot_mma_issue", packed_whole_tile, explicit_fields
+        )
+
+    # MmaTask publishes one TMEM O stage per K/V instance in each loop group,
+    # and Correction uses those stage slots as the corresponding accumulators.
+    _set_if_implicit(cfg, "o_stages", cfg.num_insts_kv, explicit_fields)
+
     if cfg.store_transformed_kv_in_tmem:
         # Allocate the remaining TMEM columns to transformed K/V eagerly.
         if (
@@ -4490,7 +4901,7 @@ def _finalize_static_decode_config(
             or cfg.transformed_kv_stages == 0
         ):
             rings = 2 if cfg.uses_dual_kv_transform else 1
-            stage_cols = cfg.tmem_transformed_kv_stage_cols * rings
+            stage_cols = cfg.tmem_transformed_kv_slot_cols * rings
             cfg.transformed_kv_stages = (
                 TMEM_MAX_ALLOCATION_COLUMNS
                 - cfg.tmem_total_cols
@@ -4515,14 +4926,17 @@ def _finalize_static_decode_config(
         # with eight stages, Q32 4.09 -> 4.00 ms with six.
         tile_stages = 2 * cfg.num_head_dim_stages_kv
         fitting_stages = cfg.infer_kv_stages(cap_kv_staging=False)
-        _set_if_implicit(
-            cfg,
-            "kv_stages",
-            tile_stages
-            if fitting_stages >= tile_stages
-            else max(2, fitting_stages - fitting_stages % 2),
-            explicit_fields,
-        )
+        if cfg.use_whole_tile_nvfp4_raw_stage:
+            # Whole-tile stages alternate K and V tiles; up to two K/V tile
+            # pairs of lookahead, at least one pair.
+            kv_stages = max(2, min(4, fitting_stages))
+        else:
+            kv_stages = (
+                tile_stages
+                if fitting_stages >= tile_stages
+                else max(2, fitting_stages - fitting_stages % 2)
+            )
+        _set_if_implicit(cfg, "kv_stages", kv_stages, explicit_fields)
     if cfg.uses_second_smem_converter:
         # Keeps uses one Q stage and two FP8 slots per converter ring.
         # Eight raw stages keep K/V loads ahead of conversion.
@@ -4533,6 +4947,37 @@ def _finalize_static_decode_config(
             or cfg.transformed_kv_stages == 0
         ):
             cfg.transformed_kv_stages = 2
+        if cfg.keeps_o_uses_lane_panels:
+            # D512 grouped Keeps (B300/B200, q_len 8, FlashInfer #9602):
+            # - The dense packed multiply converts K/V rows in logical order,
+            #   so neither Q nor O is permuted.
+            # - Stage-sliced scale factors free 20 KiB of SMEM, which holds
+            #   FP8 K/V rings of 4/3 slots (566 -> 464 us at B32 shared).
+            # - Two loader warps: one issuing warp could not keep the raw
+            #   rings full (82% busy at 32 TMAs per tile; 464 -> 432 us).
+            _set_if_implicit(cfg, "use_stage_sliced_nvfp4_sf", True, explicit_fields)
+            if cfg.uses_stage_sliced_nvfp4_sf:
+                # An explicit transformed_v_stages=0 shares the K depth: three
+                # slots per ring fit, four do not.
+                shared_depth = (
+                    "transformed_v_stages" in explicit_fields
+                    and cfg.transformed_v_stages == 0
+                )
+                _set_if_implicit(
+                    cfg,
+                    "transformed_kv_stages",
+                    3 if shared_depth else 4,
+                    explicit_fields,
+                )
+                _set_if_implicit(cfg, "transformed_v_stages", 3, explicit_fields)
+            if (
+                cfg.use_paged_kv
+                and (cfg.tile_size_kv // cfg.num_tokens_per_page) % 2 == 0
+                and not cfg.use_persistent_scheduler
+            ):
+                # Warps 10-11 stay inside warp group 2 (MMA 8, pages 9).
+                _set_if_implicit(cfg, "load_num_warps", 2, explicit_fields)
+                _set_if_implicit(cfg, "load_warp_idx", 10, explicit_fields)
     if cfg.uses_dual_kv_transform:
         # Stage one complete KV tile per operand: every head-dimension stage
         # of K and of V. Each converter then advances a whole tile without
@@ -5379,7 +5824,12 @@ def _try_apply_default_wide_keeps_config(
                 probe,
                 explicit_fields | {"tile_size_q"},
             )
-            if probe.groups_tokens_heads_q and not probe.supports_auto_grouped_keeps:
+            if probe.groups_tokens_heads_q and (
+                not probe.supports_auto_grouped_keeps
+                # D512 grouped Keeps is qualified only at eight Q heads per KV
+                # head; wider ratios keep the ungrouped Q16 Swaps fallback.
+                or probe.headdim == 512
+            ):
                 continue
             _validate_profile_support(
                 cfg=probe,
@@ -5579,8 +6029,12 @@ def _resolve_grouped_q_launch_candidates(
     if probe.use_keeps_mma_ab:
         # A lone resident CTA cannot hide pipeline fills behind another CTA.
         # Keep underfilled grids within one wave unless the native SM107
-        # BF16-output converter qualifies for long extra waves.
-        multi_wave = multi_wave and (fills_wave or sm107_smem_transform)
+        # BF16-output converter qualifies for long extra waves. D512 NVFP4
+        # Keeps Q64 scores the same extra waves as Swaps Q64, so a long
+        # max_kv_len plan keeps Keeps instead of falling back to Swaps.
+        multi_wave = multi_wave and (
+            fills_wave or sm107_smem_transform or probe.headdim == 512
+        )
 
     split_candidates = (
         (cfg.splits_kv if cfg.use_split_kv else 1,)
@@ -5753,9 +6207,19 @@ def _apply_auto_grouped_q_mma_config(
     candidates = enumerate_grouped_q_mma_candidates(
         heads_q_per_kv=num_heads_q // num_heads_kv,
         seq_len_q=seq_len_q,
-        # FP8-Q/NVFP4-KV D128 also has a Keeps Q64 recipe with SMEM converters.
+        # FP8-Q/NVFP4-KV D128/D256 also have Keeps Q64 recipes with SMEM
+        # converters. D512 Keeps Q64 is qualified at eight Q heads per KV head:
+        # it ties Swaps Q64 in this model and precedes it in candidate order
+        # (B300 q_len 8: B32 525 -> 432 us, B16 278 -> 225 us, B8 152 -> 121 us).
         swaps_only=cfg.use_transform_kv
-        and not (cfg.use_nvfp4_kv and cfg.use_fp8_q and cfg.headdim in (128, 256)),
+        and not (
+            cfg.use_nvfp4_kv
+            and cfg.use_fp8_q
+            and (
+                cfg.headdim in (128, 256)
+                or (cfg.headdim == 512 and num_heads_q // num_heads_kv == 8)
+            )
+        ),
         include_nvfp4_tiles=cfg.use_nvfp4_kv and cfg.use_fp8_q,
     )
     if not (cfg.use_transform_kv and cfg.use_fp8_pv):
@@ -6207,21 +6671,27 @@ def _select_auto_split_kv_reduction_mode(
 
 
 def _validate_headdim_512(cfg: FmhaDecodeConfig) -> None:
-    """Reject H512 profiles other than dense paged FP8-Q/NVFP4-KV decode.
+    """Reject H512 profiles other than the qualified dense paged FP8-Q decodes.
 
-    Other H512 combinations can be enabled here as they are qualified.
+    NVFP4 K/V runs on the Swaps and grouped Keeps profiles; stored FP8 K/V runs
+    on grouped Keeps Q64 only. Other H512 combinations can be enabled here as
+    they are qualified.
     """
     if cfg.headdim != 512:
         return
-    if not (
-        cfg.q_dtype == Float8E4M3FN
-        and cfg.use_nvfp4_kv
-        and cfg.use_paged_kv
-        and not cfg.use_block_sparse
-    ):
+    dense_paged_fp8_q = (
+        cfg.q_dtype == Float8E4M3FN and cfg.use_paged_kv and not cfg.use_block_sparse
+    )
+    fp8_kv_grouped_keeps = (
+        cfg.k_dtype == Float8E4M3FN
+        and cfg.v_dtype == Float8E4M3FN
+        and cfg.use_keeps_mma_ab
+        and cfg.groups_tokens_heads_q
+    )
+    if not (dense_paged_fp8_q and (cfg.use_nvfp4_kv or fp8_kv_grouped_keeps)):
         raise ValueError(
             "PrimTS head_dim=512 is currently supported only for dense paged "
-            "FP8-E4M3 Q with NVFP4 K/V"
+            "FP8-E4M3 Q with NVFP4 K/V, or with FP8-E4M3 K/V on grouped Keeps"
         )
 
 
@@ -6261,6 +6731,11 @@ def _validate_profile_support(
     cfg.validate_dtypes()
     _validate_mixed_kv_dtype_profile(cfg)
     _validate_headdim_512(cfg)
+    if headdim == 512 and not cfg.use_nvfp4_kv and num_heads_q != 8 * num_heads_kv:
+        raise ValueError(
+            "PrimTS head_dim=512 with FP8 K/V is qualified only for 8 Q heads "
+            "per KV head"
+        )
     if cfg.o_stages != cfg.num_insts_kv:
         raise ValueError("fmha_decode requires o_stages == num_insts_kv")
     _validate_kv256_static_config(cfg)
@@ -6458,6 +6933,55 @@ def _validate_profile_support(
             "SwapsMmaAb, 128-wide K/V head-dimension stages and KV tiles, "
             "and a TransformKvTask of one or two complete warp groups"
         )
+    if cfg.use_packed_nvfp4_raw_payload and not (
+        cfg.store_transformed_kv_in_tmem
+        and cfg.uses_nvfp4_scale_tensors
+        and not cfg.use_nvfp4_interleaved_kv
+        and cfg.qk_dtype_bytes == 1
+        and cfg.pv_dtype_bytes == 1
+        and cfg.head_dim_kv_stage == 128
+        and cfg.tile_size_kv == 128
+        and cfg.tile_size_q < 32  # unrolled converter: constant head-dim stages
+        and cfg.num_tokens_per_page % 8 == 0
+    ):
+        raise ValueError(
+            "use_packed_nvfp4_raw_payload requires the FP8 TMEM K/V transform "
+            "with separate NVFP4 scale tensors, 128-wide head-dim stages and "
+            "KV tiles, a non-flattened converter, and pages of 8+ tokens"
+        )
+    if cfg.use_whole_tile_nvfp4_raw_stage and not (
+        cfg.store_transformed_kv_in_tmem
+        and cfg.uses_nvfp4_scale_tensors
+        and not cfg.use_nvfp4_interleaved_kv
+        and cfg.use_paged_kv
+        and cfg.head_dim_kv_stage == 128
+        # Each slice box copies a full D128 slice; a partial last slice would
+        # write past the stage.
+        and cfg.headdim % cfg.head_dim_kv_stage == 0
+        and cfg.tile_size_q < 32  # converters need constant head-dim stages
+    ):
+        raise ValueError(
+            "use_whole_tile_nvfp4_raw_stage requires the paged TMEM K/V "
+            "transform with separate NVFP4 scale tensors, a head dim that is a "
+            "multiple of 128, and a non-flattened converter"
+        )
+    slot_stages = cfg.transformed_kv_hd_stages_per_slot
+    if slot_stages != 1 and not (
+        cfg.store_transformed_kv_in_tmem
+        and slot_stages in (2, 4)
+        and cfg.num_head_dim_stages_kv % slot_stages == 0
+        and cfg.num_insts_kv == 1
+        and cfg.tile_size_q
+        < 32  # the flattened converter loop decodes one stage per item
+        and not cfg.uses_dual_kv_transform
+        and not cfg.use_nvfp4_interleaved_kv
+        and not cfg.use_q_token_kv_block_sparse_route
+    ):
+        raise ValueError(
+            "transformed_kv_hd_stages_per_slot > 1 requires the one-instance, "
+            "non-flattened, single-ring TMEM K/V transform with a head-dim "
+            f"stage count divisible by it; got {slot_stages}"
+        )
     if use_keeps_mma_ab:
         if cfg.use_transform_kv and not (
             (
@@ -6486,9 +7010,18 @@ def _validate_profile_support(
                 "or NVFP4 K/V on the QToken sparse route with one KV instance, "
                 "KV128 tiles and head_dim=256 in one D256 stage"
             )
-        if headdim not in (64, 128, 192, 256):
+        if headdim not in (64, 128, 192, 256, 512):
             raise ValueError(
-                "fmha_decode keepsMmaAb supports headdim=64, 128, 192, or 256"
+                "fmha_decode keepsMmaAb supports headdim=64, 128, 192, 256, or 512"
+            )
+        if headdim == 512 and not (
+            cfg.keeps_o_uses_lane_panels
+            and cfg.tmem_o_cols == 256
+            and cfg.uses_staged_one_inst_tmem_p
+        ):
+            raise ValueError(
+                "fmha_decode keepsMmaAb headDim=512 requires Q64/KV128 with D128 "
+                "head-dim stages, one KV instance, and lane-panel O (256 columns)"
             )
         if tile_size_q not in (64, 128):
             raise ValueError("fmha_decode keepsMmaAb supports tile_size_q=64 or 128")
@@ -6505,7 +7038,7 @@ def _validate_profile_support(
             )
         )
         if effective_num_insts_kv == 1 and (
-            headdim not in (192, 256)
+            headdim not in (192, 256, 512)
             or not supported_head_stage
             or effective_o_stages != 1
         ):
@@ -6515,7 +7048,7 @@ def _validate_profile_support(
                 "or full sparse FP8 D256, and "
                 "o_stages=1"
             )
-        if headdim in (192, 256) and (
+        if headdim in (192, 256, 512) and (
             not supported_head_stage
             or effective_num_insts_kv != 1
             or effective_o_stages != 1
@@ -6524,7 +7057,7 @@ def _validate_profile_support(
                 "fmha_decode keepsMmaAb headDim=192/256 requires supported "
                 "head staging, num_insts_kv=1, and o_stages=1"
             )
-        if headdim not in (192, 256) and effective_head_dim_stage != 0:
+        if headdim not in (192, 256, 512) and effective_head_dim_stage != 0:
             raise ValueError(
                 "split head_dim_per_stage_kv keepsMmaAb profiles are enabled "
                 "only for headDim=192 or 256"
@@ -6585,10 +7118,23 @@ def _validate_profile_support(
             and cfg.splits_kv == cfg.max_splits_kv
             and 2 <= cfg.max_splits_kv <= 128
         )
+        # Grouped Keeps D512 (Q64/KV128, four 128-wide head-dim stages, one
+        # instance, one O stage) publishes partial O/LSE through the same staged
+        # path as D192/D256; the standalone reducer is head-dim generic.
+        separate_reduction_d512_grouped_supported = (
+            headdim == 512
+            and use_groups_tokens_heads_q
+            and tile_size_q == 64
+            and cfg.tile_size_kv == 128
+            and effective_head_dim_stage == 128
+            and effective_num_insts_kv == 1
+            and effective_o_stages == 1
+        )
         separate_reduction_profile_supported = (
             separate_reduction_unstaged_supported
             or separate_reduction_staged_supported
             or fixed_fp8_new_keeps_separate_reduction_supported
+            or separate_reduction_d512_grouped_supported
         )
         if use_separate_reduction_kernel and not (
             separate_reduction_profile_supported
@@ -6599,7 +7145,8 @@ def _validate_profile_support(
             raise ValueError(
                 "separate reduction keepsMmaAb profiles require "
                 "the established D128/Q64-Q128 or D192-D256/Q128 profiles, "
-                "D192/Q64-KV128, QToken-KvBlock-Sparse-Attention "
+                "D192/Q64-KV128, grouped D512/Q64-KV128, "
+                "QToken-KvBlock-Sparse-Attention "
                 "D64/D128/D192/D256 Q64/Q128-KV128 profiles, or a "
                 "fixed FP8/paged D64/Q64-Q128 or D256/Q64 profile; valid "
                 "reduction dtypes, Q layout, and static split-KV are required"

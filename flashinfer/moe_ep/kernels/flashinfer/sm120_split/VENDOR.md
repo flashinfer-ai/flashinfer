@@ -8,6 +8,12 @@ and shape-bounded local-combine prefill tuning (`KERNEL_CACHE_ABI=35`).
 FlashInfer-specific child-graph capture and vendored import adaptations are
 preserved when applying upstream kernel changes.
 
+The vendored scalar-scale MMA helper also includes the upstream compatibility
+fix for CuTeDSL releases that removed the intermediate SM120 MMA operation.
+FlashInfer fixes both scalar byte selectors at zero because each E8M0 scale
+occupies the low byte of its register. Both the scalar and packed-scale paths mark the
+warp-collective MMA as side-effecting.
+
 Release preparation adjusts source comments and runner help text without
 changing kernel calculations or launch settings.
 

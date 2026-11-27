@@ -128,7 +128,11 @@ from ..helpers.ops import (
     fmax_f32,
     pack_float4_to_fp8_e4m3,
 )
-from ..helpers.mask import MaskType, mask_visible_k_length
+from ..helpers.mask import (
+    MaskType,
+    mask_visible_k_length,
+    rows_have_distinct_kv_prefix,
+)
 from ..helpers.query import (
     copy_q_fp8_to_tmem,
     flat_query_row_state,
@@ -242,7 +246,9 @@ class MlaTsWorkTileInfo:
     Besides the scheduler coordinate, cache the per-tile K-domain values that
     hot resource paths need. Each persistent warp loop computes the K domain
     once and passes the derived indices to the page-offset, TMA, MMA, and
-    softmax bodies.
+    softmax bodies. ``k_visible_end`` is the rank-local key prefix every query
+    row sees; it is carried only when rows see different prefixes
+    (``rows_have_distinct_kv_prefix``) and is ``None`` otherwise.
     """
 
     @cute.jit
@@ -253,6 +259,7 @@ class MlaTsWorkTileInfo:
         k_len=0,
         k_tile_count=0,
         k_index_base=0,
+        k_visible_end=None,
     ):
         """Initialize the staged tile coordinate and cached K-domain metadata."""
         cluster_idx, seq_q_idx, batch_idx, split_kv_idx = tile_idx
@@ -264,6 +271,9 @@ class MlaTsWorkTileInfo:
         self._k_len = Int32(k_len)
         self._k_tile_count = Int32(k_tile_count)
         self._k_index_base = Int32(k_index_base)
+        self._k_visible_end = None
+        if cutlass.const_expr(k_visible_end is not None):
+            self._k_visible_end = Int32(k_visible_end)
 
     @property
     @cute.jit
@@ -300,6 +310,12 @@ class MlaTsWorkTileInfo:
         """Return the first K tile index owned by this work tile."""
         return self._k_index_base
 
+    @property
+    @cute.jit
+    def k_visible_end(self):
+        """Return the rank-local keys ``[0, end)`` every query row sees."""
+        return self._k_visible_end
+
     @cute.jit
     def update_from(self, other) -> None:
         """Replace this tile info with another tile info object."""
@@ -312,6 +328,8 @@ class MlaTsWorkTileInfo:
         self._k_len = Int32(other.k_len)
         self._k_tile_count = Int32(other.k_tile_count)
         self._k_index_base = Int32(other.k_index_base)
+        if cutlass.const_expr(self._k_visible_end is not None):
+            self._k_visible_end = Int32(other.k_visible_end)
 
     def __extract_mlir_values__(self):
         """Extract scalar MLIR values for value-type lowering."""
@@ -323,6 +341,8 @@ class MlaTsWorkTileInfo:
         values += cutlass.extract_mlir_values(self._k_len)
         values += cutlass.extract_mlir_values(self._k_tile_count)
         values += cutlass.extract_mlir_values(self._k_index_base)
+        if self._k_visible_end is not None:
+            values += cutlass.extract_mlir_values(self._k_visible_end)
         return values
 
     def __new_from_mlir_values__(self, values):
@@ -338,6 +358,9 @@ class MlaTsWorkTileInfo:
             cutlass.new_from_mlir_values(self._k_len, [values[5]]),
             cutlass.new_from_mlir_values(self._k_tile_count, [values[6]]),
             cutlass.new_from_mlir_values(self._k_index_base, [values[7]]),
+            None
+            if self._k_visible_end is None
+            else cutlass.new_from_mlir_values(self._k_visible_end, [values[8]]),
         )
 
 
@@ -428,6 +451,7 @@ class MlaWorkQueue(WorkQueue):
                 Int32(0),
                 Int32(0),
                 Int32(0),
+                Int32(0) if self.caches_visible_k_end else None,
             ),
             docs="Current MLA persistent-scheduler work tile.",
         )
@@ -480,7 +504,18 @@ class MlaWorkQueue(WorkQueue):
 
     @cute.jit
     def wrap_work_tile(self, work_tile):
-        return MlaTsWorkTileInfo(work_tile.tile_idx, work_tile.is_valid_tile)
+        return MlaTsWorkTileInfo(
+            work_tile.tile_idx,
+            work_tile.is_valid_tile,
+            k_visible_end=Int32(0) if self.caches_visible_k_end else None,
+        )
+
+    @property
+    def caches_visible_k_end(self) -> bool:
+        """Return whether work tiles carry the key prefix every row sees."""
+        return self.cfg is not None and rows_have_distinct_kv_prefix(
+            self.cfg.mask_type, self.cu_seqlens_q is not None, self.logical_seq_len_q
+        )
 
     @cute.jit
     def _work_tile_from_clc_tile(self, work_tile):
@@ -555,6 +590,11 @@ class MlaWorkQueue(WorkQueue):
         k_tile_total = (K + Int32(cfg.mma_qk_tiler[1] - 1)) // Int32(
             cfg.mma_qk_tiler[1]
         )
+        k_visible_end = None
+        if cutlass.const_expr(self.caches_visible_k_end):
+            k_visible_end = self._visible_k_end(
+                s_idx, safe_b_idx, sequence_k_len, q_len
+            )
         if cutlass.const_expr(self.static_split_kv == 1):
             # Single-split fixed profiles process the whole K domain in one CTA.
             # Avoid the runtime split-KV ceil-div/min/max sequence in every
@@ -589,6 +629,32 @@ class MlaWorkQueue(WorkQueue):
             sequence_k_len,
             k_tile_count,
             k_index_base,
+            k_visible_end,
+        )
+
+    @cute.jit
+    def _visible_k_end(self, s_idx, b_idx, sequence_k_len, q_len):
+        """Return the rank-local keys ``[0, end)`` every row of a work tile sees.
+
+        Bottom-right causal prefixes, and their rank-local counts under context
+        parallelism, are nondecreasing in the flat query row, so the tile's
+        first row has the shortest prefix. Computed once per work tile; softmax
+        compares each K tile against it.
+        """
+        cfg = self.cfg
+        _, _, first_q_idx, _, _ = flat_query_row_state(
+            Int32(0),
+            s_idx,
+            cfg.mma_qk_tiler[0],
+            self.logical_num_heads_q,
+            self.logical_seq_len_q,
+            self.cu_seqlens_q,
+            b_idx,
+        )
+        return local_kv_length(
+            cfg,
+            mask_visible_k_length(cfg.mask_type, sequence_k_len, first_q_idx, q_len),
+            self.cp_rank,
         )
 
     @cute.jit
@@ -2806,6 +2872,42 @@ class TmemSResource(HighThroughputMlaResource):
         return row_sum, row_sum
 
     @cute.jit
+    def _masked_row_prefix_bounds(
+        self, work_tile, local_tidx, needs_row_causal_mask, needs_cp_causal_mask
+    ):
+        """Load a masked tile's rank-local row bound and the request's Q length.
+
+        Called only on masked tiles, so the metadata loads stay off the
+        unmasked ones.
+        """
+        cfg = self.cfg
+        row_kv_bound = Int32(0)
+        logical_seq_len_q = Int32(0)
+        if cutlass.const_expr(needs_row_causal_mask or needs_cp_causal_mask):
+            batch_idx = Int32(work_tile.tile_idx[2])
+            _, logical_seq_len_q = query_batch_bounds(
+                self.cu_seqlens_q, batch_idx, self.logical_seq_len_q
+            )
+        if cutlass.const_expr(needs_cp_causal_mask):
+            row_in_tile = self.cta_rank * Int32(
+                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
+            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
+            _, _, logical_q_idx, _, _ = flat_query_row_state(
+                row_in_tile,
+                Int32(work_tile.tile_idx[1]),
+                cfg.mma_qk_tiler[0],
+                self.logical_num_heads_q,
+                self.logical_seq_len_q,
+                self.cu_seqlens_q,
+                batch_idx,
+            )
+            global_bound = mask_visible_k_length(
+                cfg.mask_type, Int32(work_tile.k_len), logical_q_idx, logical_seq_len_q
+            )
+            row_kv_bound = local_kv_length(cfg, global_bound, self.cp_rank)
+        return row_kv_bound, logical_seq_len_q
+
+    @cute.jit
     def _load_s_impl(
         self,
         stage_info: StageInfo,
@@ -2838,56 +2940,19 @@ class TmemSResource(HighThroughputMlaResource):
         needs_cp_causal_mask = cutlass.const_expr(
             cfg.cp_world > 1 and cfg.mask_type == MaskType.CAUSAL.value
         )
-        row_kv_bound = Int32(0)
-        if cutlass.const_expr(needs_cp_causal_mask):
-            row_in_tile = self.cta_rank * Int32(
-                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
-            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
-            batch_idx = Int32(work_tile.tile_idx[2])
-            _, logical_seq_len_q = query_batch_bounds(
-                self.cu_seqlens_q, batch_idx, self.logical_seq_len_q
+        # Mask only tiles reaching past the keys every row sees: the request's
+        # K length, or the work tile's cached prefix when rows differ. The
+        # per-row bounds load only in the masked branch below.
+        visible_k_end = K
+        if cutlass.const_expr(
+            rows_have_distinct_kv_prefix(
+                cfg.mask_type, self.cu_seqlens_q is not None, self.logical_seq_len_q
             )
-            _, _, logical_q_idx, _, _ = flat_query_row_state(
-                row_in_tile,
-                Int32(work_tile.tile_idx[1]),
-                cfg.mma_qk_tiler[0],
-                self.logical_num_heads_q,
-                self.logical_seq_len_q,
-                self.cu_seqlens_q,
-                batch_idx,
-            )
-            global_bound = mask_visible_k_length(
-                cfg.mask_type, Int32(work_tile.k_len), logical_q_idx, logical_seq_len_q
-            )
-            row_kv_bound = local_kv_length(cfg, global_bound, self.cp_rank)
-            group_needs_mask = True
-        elif cutlass.const_expr(needs_row_causal_mask):
-            batch_idx = Int32(work_tile.tile_idx[2])
-            _, logical_seq_len_q = query_batch_bounds(
-                self.cu_seqlens_q,
-                batch_idx,
-                self.logical_seq_len_q,
-            )
-            first_flat_query_row = Int32(work_tile.tile_idx[1]) * Int32(
-                cfg.mma_qk_tiler[0]
-            )
-            # A row r sees key k iff H * (k - K + SQ) <= r.  Apply the
-            # equivalent boundary test to the first row in this physical tile
-            # so non-power-of-two H never needs a quotient on the softmax path.
-            first_mask_flat_row = Int32(self.logical_num_heads_q) * (
-                tile_offset_k
-                + Int32(cfg.mma_qk_tiler[1])
-                - K
-                + logical_seq_len_q
-                - Int32(1)
-            )
-            group_needs_mask = first_flat_query_row < first_mask_flat_row
-        else:
-            group_needs_mask = kv_tile_needs_right_mask(
-                tile_offset_k,
-                Int32(cfg.mma_qk_tiler[1]),
-                K,
-            )
+        ):
+            visible_k_end = Int32(work_tile.k_visible_end)
+        group_needs_mask = kv_tile_needs_right_mask(
+            tile_offset_k, Int32(cfg.mma_qk_tiler[1]), visible_k_end
+        )
 
         neg_inf = Float32(-Float32.inf)
         row_max_tile = row_max
@@ -2966,6 +3031,9 @@ class TmemSResource(HighThroughputMlaResource):
             ):
                 group_needs_mask = (mask_routes.low | mask_routes.high) != Int32(0)
         if group_needs_mask:
+            row_kv_bound, logical_seq_len_q = self._masked_row_prefix_bounds(
+                work_tile, local_tidx, needs_row_causal_mask, needs_cp_causal_mask
+            )
             if cutlass.const_expr(needs_row_causal_mask):
                 # Clamp padded physical tail rows to the request's last real
                 # row. Their Q/output accesses remain independently

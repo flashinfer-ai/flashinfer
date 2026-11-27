@@ -881,17 +881,16 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K):
 
 @needs_device
 def test_public_api_skips_backend_selection(monkeypatch):
-    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
-    for it (host cost only): a selecting call rewrites `mm_mxfp8.suitable_auto_backends`, a bypassed one leaves it."""
+    """Batch-invariant calls bypass the ordinary backend heuristic."""
+    from flashinfer.gemm import gemm_base
+
+    def forbidden_heuristic(*args, **kwargs):
+        raise AssertionError("batch-invariant call reached backend selection")
+
+    monkeypatch.setattr(gemm_base, "_heuristic_func_mm_mxfp8", forbidden_heuristic)
     a, sfa = adv_mx(16, 4096, 131)
     b, sfb = weight(4096, 4096, 132)
-    sentinel = ["sentinel"]
-    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
-    monkeypatch.setattr(
-        flashinfer.mm_mxfp8, "suitable_auto_backends", sentinel, raising=False
-    )
     bi_mm(a, b, sfa, sfb)
-    assert flashinfer.mm_mxfp8.suitable_auto_backends is sentinel
 
 
 @needs_device

@@ -41,6 +41,7 @@ from cutlass.experimental.task_scheduling.resources import (
 from ...placeholder_helpers import _placeholder_smem_array
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
+    _warp_broadcast_i32,
     _TASK_CACHE_LANE_IDX,
     _TASK_CACHE_TMEM_BASE_OFFSET,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
@@ -52,6 +53,7 @@ from .helpers_common import (
     _decode_gen_task_cache,
     _keeps_col_base,
     _keeps_row_idx,
+    _keeps_o_tail_tcgen05_ld,
     _keeps_tcgen05_ld,
     _keeps_tcgen05_st,
     _local_head_from_q_output_row,
@@ -506,11 +508,11 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> None:
         """Wait for all peer async cluster partial stores before local reduction."""
         _ = self
-        # Give every correction lane one nonblocking wait attempt. When the
-        # short transaction is already complete this preserves the all-lane
-        # fast path; otherwise only lane 0 continues polling. The existing
-        # correction-group barrier publishes lane 0's ready point before any
-        # reducer lane reads the distributed-SMEM partials.
+        # Every correction thread waits on the transaction mbarrier itself, the
+        # same shape as a pipeline consumer wait. A lane-0-only spin here makes
+        # ptxas compile the MMA warp of the same kernel as possibly divergent
+        # (FlashInfer #9602). The correction-group barrier below still orders
+        # all reducer lanes after the wait.
         # The peers' st.async complete-tx releases at cluster scope, so the
         # wait must observe it at cluster scope; the default CTA scope does
         # not synchronize with a thread of another CTA. The wait itself is
@@ -524,15 +526,14 @@ class TmemCorrResource(DecodeGenResourceBase):
             scope=prims.MBarrierScope.CLUSTER,
             order=prims.MemOrder.RELAXED,
         )
-        if warp_grp_thread_idx == Int32(0):
-            while not cluster_transaction_ready:
-                cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-                    mbarrier,
-                    0,
-                    time_limit=10_000_000,
-                    scope=prims.MBarrierScope.CLUSTER,
-                    order=prims.MemOrder.RELAXED,
-                )
+        while not cluster_transaction_ready:
+            cluster_transaction_ready = prims.mbarrier_try_wait_parity(
+                mbarrier,
+                0,
+                time_limit=10_000_000,
+                scope=prims.MBarrierScope.CLUSTER,
+                order=prims.MemOrder.RELAXED,
+            )
         prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
         prims.barrier_cta_sync(barrier_id, thread_count=barrier_threads)
 
@@ -787,7 +788,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     def restore_permuted_v_rows(
         self, o_vals: cutlass.Array, num_regs: Constexpr[int]
     ) -> None:
-        """Undo the interleaved-NVFP4 V^T row order on loaded 16x256b O regs.
+        """Undo the in-place NVFP4 V^T row order (interleaved or packed payload).
 
         The V transform writes head-dim row 2l to lane l and 2l+1 to lane l+8
         of every 16-lane block (one LDSM byte holds both rows), and PV keeps
@@ -1522,40 +1523,66 @@ class TmemCorrResource(DecodeGenResourceBase):
             mem_space=1,
             dtype=Uint32,
         )
-        if warp_grp_thread_idx == Int32(0):
-            inc_limit = prims.mov_b32(splits_kv - Int32(1), target_type=Uint32)
+        # Warp 0 of the correction group takes the ticket as a whole warp:
+        # lane 0 issues the atomic, the result is shuffled to every lane and
+        # marked uniform, and the wait spins warp-wide on a uniform value.
+        # A single-lane atomic + spin loop + SMEM broadcast here leaves ptxas
+        # unable to prove warp convergence for the rest of the kernel. It then
+        # wraps every tcgen05 MMA of the (unrelated) MMA warp in
+        # BRA.DIV/ELECT/VOTEU/R2UR.BROADCAST, costing ~30% of an MMA-issue-bound
+        # mainloop (FlashInfer #9602).
+        ticket_warp = cute.arch.make_warp_uniform(warp_grp_thread_idx // Int32(32))
+        ticket_lane = warp_grp_thread_idx % Int32(32)
+        if ticket_warp == Int32(0):
+            old_complete = Int32(0)
+            if ticket_lane == Int32(0):
+                inc_limit = prims.mov_b32(splits_kv - Int32(1), target_type=Uint32)
+                old_complete = prims.mov_b32(
+                    prims.atomicrmw(
+                        prims.AtomicOp.INC,
+                        counter_ptr,
+                        inc_limit,
+                        mem_order=prims.MemOrder.ACQ_REL,
+                        syncscope=prims.MemScope.GPU,
+                    ),
+                    target_type=Int32,
+                )
+            old_complete = _warp_broadcast_i32(old_complete, 0)
             # Global wrapping INC counts split-CTA completion. Map arrivals in
             # reverse order so the last publisher becomes owner 0 instead of
             # handing reduction back to a fixed logical CTA. Non-owners can
             # leave immediately. If multiple row-slice owners are needed, only
             # the earlier owner arrivals wait for the last arrival to publish
             # every split and wrap the counter to zero.
-            old_complete_u32 = prims.atomicrmw(
-                prims.AtomicOp.INC,
-                counter_ptr,
-                inc_limit,
-                mem_order=prims.MemOrder.ACQ_REL,
-                syncscope=prims.MemScope.GPU,
-            )
-            old_complete = prims.mov_b32(old_complete_u32, target_type=Int32)
             reducer_cta_idx = splits_kv - Int32(1) - old_complete
             if reducer_cta_idx < Int32(
                 cfg.cluster_reduction_num_owner_ctas
             ) and old_complete < splits_kv - Int32(1):
-                while prims.load_ext(
-                    counter_ptr,
-                    order=prims.MemOrder.ACQUIRE,
-                    scope=prims.MemScope.GPU,
-                ) != Uint32(0):
-                    pass
-            self._gmem_reducer_rank.store(reducer_cta_idx, 0, alignment=4)
+                pending = Int32(1)
+                while pending != Int32(0):
+                    # Lanes may sample the counter on either side of the last
+                    # arrival's wrap, so branch on lane 0's sample only.
+                    pending = _warp_broadcast_i32(
+                        prims.mov_b32(
+                            prims.load_ext(
+                                counter_ptr,
+                                order=prims.MemOrder.ACQUIRE,
+                                scope=prims.MemScope.GPU,
+                            ),
+                            target_type=Int32,
+                        ),
+                        0,
+                    )
+            if ticket_lane == Int32(0):
+                self._gmem_reducer_rank.store(reducer_cta_idx, 0, alignment=4)
+            cute.arch.sync_warp()
         # Broadcast the arrival-ranked owner and, for owner CTAs, make the
         # all-arrived state visible before reading split partials.
         prims.barrier_cta_sync(
             self.store_barrier_id,
             thread_count=cfg.correction_barrier_threads,
         )
-        return self._gmem_reducer_rank.load(0, alignment=4)
+        return cute.arch.make_warp_uniform(self._gmem_reducer_rank.load(0, alignment=4))
 
     @cute.jit
     def _reduce_and_store_gmem_split_o_vec8(
@@ -3451,14 +3478,14 @@ class TmemCorrResource(DecodeGenResourceBase):
                 # Load O0/O1 from the tail TMEM slots, combine with
                 # max-correction scales, then store normalized 16-bit O for
                 # standalone reduction or unnormalized O for fused reduction.
-                o0_vals = _keeps_tcgen05_ld(
+                o0_vals = _keeps_o_tail_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(base_addr0 + Int32(chunk_col), Float32),
                     num=chunk_cols,
                     offset=keeps_o_ldst_offset,
                 )
                 if cutlass.const_expr(cfg.num_insts_kv != 1):
-                    o1_vals = _keeps_tcgen05_ld(
+                    o1_vals = _keeps_o_tail_tcgen05_ld(
                         cfg,
                         prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
                         num=chunk_cols,
@@ -3635,14 +3662,14 @@ class TmemCorrResource(DecodeGenResourceBase):
                 chunk_col = store_idx * 16
                 # FP8 output path: load a wider O chunk, apply final scales,
                 # pack four values per register, and store directly to GMEM.
-                o0_vals = _keeps_tcgen05_ld(
+                o0_vals = _keeps_o_tail_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(base_addr0 + Int32(chunk_col), Float32),
                     num=16,
                     offset=keeps_o_ldst_offset,
                 )
                 if cutlass.const_expr(cfg.num_insts_kv != 1):
-                    o1_vals = _keeps_tcgen05_ld(
+                    o1_vals = _keeps_o_tail_tcgen05_ld(
                         cfg,
                         prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
                         num=16,
@@ -3725,14 +3752,14 @@ class TmemCorrResource(DecodeGenResourceBase):
             chunk_col = store_idx * chunk_cols
             # FP16/BF16 or generic FP8 path: load one output chunk from each
             # tail O stage, combine the two instances, then pack to output type.
-            o0_vals = _keeps_tcgen05_ld(
+            o0_vals = _keeps_o_tail_tcgen05_ld(
                 cfg,
                 prims.make_tmem_ptr(base_addr0 + Int32(chunk_col), Float32),
                 num=chunk_cols,
                 offset=keeps_o_ldst_offset,
             )
             if cutlass.const_expr(cfg.num_insts_kv != 1):
-                o1_vals = _keeps_tcgen05_ld(
+                o1_vals = _keeps_o_tail_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
                     num=chunk_cols,
@@ -4228,7 +4255,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 num_o_chunks=num_o_chunks,
                 output_f32_regs=output_f32_regs,
             )
-        if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+        if cutlass.const_expr(cfg.permutes_nvfp4_v_rows):
             self.restore_permuted_v_rows(o0_vals, output_f32_regs)
             if cutlass.const_expr(cfg.num_insts_kv != 1):
                 self.restore_permuted_v_rows(o1_vals, output_f32_regs)
@@ -4751,7 +4778,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 num_o_chunks=num_o_chunks,
                 output_f32_regs=output_f32_regs,
             )
-        if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+        if cutlass.const_expr(cfg.permutes_nvfp4_v_rows):
             self.restore_permuted_v_rows(o0_vals, output_f32_regs)
             if cutlass.const_expr(cfg.num_insts_kv != 1):
                 self.restore_permuted_v_rows(o1_vals, output_f32_regs)

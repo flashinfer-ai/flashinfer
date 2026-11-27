@@ -26,7 +26,3 @@ from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
 )
-from .utils import (
-    griddepcontrol_launch_dependents,
-    griddepcontrol_wait,
-)

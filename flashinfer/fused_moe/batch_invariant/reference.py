@@ -17,7 +17,22 @@ import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
 from . import spec as S
+from . import mterm
 from .mterm import frexpe_f32, frexpm_f32, rowmax_f32
+
+
+def sfu_tables():
+    """The part's SFU tables behind the fp4 classes' ``ex2`` / ``rcp``: the bound ones (:func:`.mterm.bind_sfu_tables`), else
+    the current CUDA device's, dumped once per process and bound."""
+    if mterm._SFU_TABLES is None:
+        import torch
+
+        from ...batch_invariant.fp_interface import sfu
+
+        if not torch.cuda.is_available():
+            return mterm.sfu_tables()  # the error names the binding
+        mterm.bind_sfu_tables(sfu.tables_for(torch.device("cuda")))
+    return mterm.sfu_tables()
 
 
 class ExactF32:
@@ -45,6 +60,14 @@ class ExactF32:
     )  # the MoE rule: a NaN logit is skipped (the device's max.f32)
 
     @staticmethod
+    def ex2(a: float) -> float:
+        return sfu_tables().eval("ex2", a)
+
+    @staticmethod
+    def rcp(a: float) -> float:
+        return sfu_tables().eval("rcp", a)
+
+    @staticmethod
     def where_nan(x: float, a: float, b: float) -> float:
         return a if x != x else b
 
@@ -52,6 +75,10 @@ class ExactF32:
     def cvt_out(a: float, fmt: str) -> float:
         if fmt in ("e4m3", "e5m2"):
             return fp32.to_fp8(a, fmt)
+        if fmt == "e2m1":
+            return fp32.to_e2m1(
+                a
+            )  # the static class's codes: the quantizer's conversion
         return fp32.to_format(
             a, {"bf16": fp32.BF16, "f16": fp32.F16, "f32": fp32.F32}[fmt]
         )
@@ -126,6 +153,20 @@ class TorchF32:
         return ((n + 127) << 23).view(torch.float32)
 
     @staticmethod
+    def ex2(a: torch.Tensor) -> torch.Tensor:
+        """The part's ``ex2.approx.ftz`` (the fp4 classes' exponential), from its tables."""
+        from ...batch_invariant.fp_interface import sfu
+
+        return sfu.ex2_hw(a.to(torch.float32), sfu_tables())
+
+    @staticmethod
+    def rcp(a: torch.Tensor) -> torch.Tensor:
+        """The part's ``rcp.approx.ftz`` (the fp4 classes' reciprocal), from its tables."""
+        from ...batch_invariant.fp_interface import sfu
+
+        return sfu.rcp_hw(a.to(torch.float32), sfu_tables())
+
+    @staticmethod
     def fabs(a: torch.Tensor) -> torch.Tensor:
         return torch.abs(a)
 
@@ -174,6 +215,11 @@ class TorchF32:
             return e4m3_round(a)
         if fmt == "e5m2":
             return e5m2_round(a)
+        if fmt == "e2m1":
+            # the vectorised cvt.rn.satfinite.e2m1 (values), validated against fp32.to_e2m1 by the quantization suite
+            from ...batch_invariant.quantization.nvfp4_reference import e2m1_round
+
+            return e2m1_round(a)
         return a.to(_TORCH_FMT[fmt])
 
 

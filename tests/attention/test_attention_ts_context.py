@@ -6014,3 +6014,43 @@ def test_attention_ts_context_e4m3_v_keeps_small_probabilities(qk_dtype):
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
     _assert_context_correct(_run_wrapper(wrapper, case), case)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("qk_dtype", [torch.bfloat16, _FP8], ids=["bf16", "e4m3"])
+def test_attention_ts_context_e4m3_v_rescales_after_row_max_rise(qk_dtype):
+    """A later KV tile raises the row max while small weights retain visible mass."""
+    case = _make_context_case(
+        q_lengths=(16384,),
+        k_lengths=(16384,),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        qkv_dtype=qk_dtype,
+        packed_query=False,
+        mask_type="dense",
+        out_dtype=torch.bfloat16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026112401,
+    )
+    q = torch.zeros_like(case.q, dtype=torch.float32)
+    q[..., 0] = 1.0
+    k = torch.zeros_like(case.k, dtype=torch.float32)
+    # The rise is below the old lazy threshold of eight log2 units. Keep the
+    # first maximum high enough that scale-one E4M3 drops the background mass.
+    later_key = 8192
+    k[:, 0, :, 0] = 12.0 * math.log(2.0) / case.softmax_scale
+    k[:, later_key, :, 0] = 16.0 * math.log(2.0) / case.softmax_scale
+    v = torch.ones_like(case.v)
+    v[:, 0] = -1.0
+    v[:, later_key] = -1.0
+    case = replace(case, q=q.to(qk_dtype), k=k.to(qk_dtype), v=v.to(_FP8))
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    actual = _run_wrapper(wrapper, case)
+    # Identical queries and a dense mask share one independent FP32 reference;
+    # still run and check all 16K query rows to retain the long-Q launch shape.
+    reference_case = replace(case, q=case.q[:, :1], q_lengths=(1,))
+    expected = _context_reference(reference_case).expand_as(actual)
+    _assert_context_correct(actual, case, expected=expected)
