@@ -1101,6 +1101,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                     producer_commit_prefetch_depth=(
                         _ldgsts_sfb_producer_commit_prefetch_depth(cfg)
                     ),
+                    num_k_tiles=num_k_tiles,
                     name="SmemSfB",
                 )
             else:
@@ -1896,6 +1897,7 @@ def _batched_gemm_kernel_bf16_body(
                     producer_commit_prefetch_depth=(
                         _ldgsts_sfb_producer_commit_prefetch_depth(cfg)
                     ),
+                    num_k_tiles=k_tile_cnt,
                     name="SmemSfB",
                 )
             else:

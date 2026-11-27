@@ -848,6 +848,9 @@ class SmemSfLdgstsResource(MemoryResource):
     _alloc_sf: Constexpr[Optional[SmemAllocation]] = None
     _operand: Constexpr[str] = "a"
     producer_commit_prefetch_depth: Constexpr[int] = 0
+    # K-tile count of the producer loop: an int, or Int32 for runtime K. Peeled
+    # tail work gets no loop bounds from StageInfo, so drain_tail reads it here.
+    num_k_tiles: Any = None
     desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_sfa_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     desc_b_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -879,33 +882,30 @@ class SmemSfLdgstsResource(MemoryResource):
         """LDGSTS cp.async wait-group depth."""
         return max(0, self.producer_commit_prefetch_depth - 1)
 
-    def _tail_cp_async_wait_group_depth(
-        self, stage_info: StageInfo, prefetch_idx: int
-    ) -> int:
+    def _tail_cp_async_wait_group_depth(self, prefetch_idx: int) -> int:
         """Return the tail drain depth for the groups actually prefetched.
 
         ``prefetch_idx`` is the per-section ordinal of the enclosing ``drain_tail``
         work call, threaded in by the work method from its constexpr work arg.
         """
-        if isinstance(stage_info.loop_end, int):
+        if isinstance(self.num_k_tiles, int):
             active_prefetch = min(
-                stage_info.loop_end,
+                self.num_k_tiles,
                 self.producer_commit_prefetch_depth,
             )
             return max(0, active_prefetch - 1 - prefetch_idx)
         return max(0, self.cp_async_wait_group_depth - prefetch_idx)
 
     @cute.jit
-    def _tail_cp_async_wait_group(
-        self, stage_info: StageInfo, prefetch_idx: int
-    ) -> None:
+    def _tail_cp_async_wait_group(self, prefetch_idx: int) -> None:
         """Drain only the cp.async groups that exist for this runtime K depth.
 
         ``prefetch_idx`` is the per-section ordinal of the enclosing ``drain_tail``
         work call, threaded in by the work method from its constexpr work arg.
         """
-        if isinstance(stage_info.loop_end, int):
-            depth = self._tail_cp_async_wait_group_depth(stage_info, prefetch_idx)
+        num_k_tiles = self.num_k_tiles
+        if cutlass.const_expr(isinstance(num_k_tiles, int)):
+            depth = self._tail_cp_async_wait_group_depth(prefetch_idx)
             if cutlass.const_expr(depth == 0):
                 cute.arch.cp_async_wait_group(0)
             elif cutlass.const_expr(depth == 1):
@@ -925,21 +925,21 @@ class SmemSfLdgstsResource(MemoryResource):
                 if cutlass.const_expr(prefetch_idx > 0):
                     cute.arch.cp_async_wait_group(0)
                 else:
-                    if stage_info.loop_end <= cutlass.Int32(1):
+                    if num_k_tiles <= cutlass.Int32(1):
                         cute.arch.cp_async_wait_group(0)
                     else:
                         cute.arch.cp_async_wait_group(1)
             else:
                 # cp_async_wait_group_depth == 2
                 if cutlass.const_expr(prefetch_idx == 0):
-                    if stage_info.loop_end <= cutlass.Int32(1):
+                    if num_k_tiles <= cutlass.Int32(1):
                         cute.arch.cp_async_wait_group(0)
-                    elif stage_info.loop_end <= cutlass.Int32(2):
+                    elif num_k_tiles <= cutlass.Int32(2):
                         cute.arch.cp_async_wait_group(1)
                     else:
                         cute.arch.cp_async_wait_group(2)
                 elif cutlass.const_expr(prefetch_idx == 1):
-                    if stage_info.loop_end <= cutlass.Int32(2):
+                    if num_k_tiles <= cutlass.Int32(2):
                         cute.arch.cp_async_wait_group(0)
                     else:
                         cute.arch.cp_async_wait_group(1)
@@ -952,7 +952,7 @@ class SmemSfLdgstsResource(MemoryResource):
                 "producer_commit_prefetch_depth must be non-negative, "
                 f"got {self.producer_commit_prefetch_depth}."
             )
-        # The dynamic-`loop_end` path in `_tail_cp_async_wait_group` only
+        # The runtime-`num_k_tiles` path in `_tail_cp_async_wait_group` only
         # hand-rolls cp_async_wait_group_depth in {0, 1, 2}; keep this in
         # lockstep with MAX_PRODUCER_COMMIT_PREFETCH_DEPTH so the chain
         # stays exhaustive.
@@ -969,6 +969,11 @@ class SmemSfLdgstsResource(MemoryResource):
             ):
                 raise ValueError(
                     "producer_commit_prefetch_depth requires advance_on_acquire=True."
+                )
+            if self.num_k_tiles is None:
+                raise ValueError(
+                    "producer_commit_prefetch_depth requires num_k_tiles for the "
+                    "drain_tail cp.async wait depth."
                 )
             if self.producer_commit_prefetch_depth >= self.pipeline_config.num_stages:
                 raise ValueError(
@@ -1264,11 +1269,12 @@ class SmemSfLdgstsResource(MemoryResource):
         self, stage_info: StageInfo, *, prefetch_idx: cutlass.Constexpr[int]
     ) -> None:
         """Drain producer cp.async work before producer_commit (tail phase)."""
+        del stage_info
         if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             if cutlass.const_expr(self.uses_async_load_pipeline):
                 pass
             else:
-                self._tail_cp_async_wait_group(stage_info, prefetch_idx)
+                self._tail_cp_async_wait_group(prefetch_idx)
                 prims.fence_proxy_async_release_sync_restrict()
         else:
             cute.arch.fence_view_async_shared()

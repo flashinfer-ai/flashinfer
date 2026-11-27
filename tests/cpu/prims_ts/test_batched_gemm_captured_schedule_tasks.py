@@ -1241,6 +1241,7 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
         cfg=cfg,
         pipeline_config=_make_pipeline_configs(cfg)["smem_sfb"],
         producer_commit_prefetch_depth=_ldgsts_sfb_producer_commit_prefetch_depth(cfg),
+        num_k_tiles=8,
         name="SmemSfB",
     )
     assert res.cp_async_wait_group_depth == 2
@@ -1260,6 +1261,7 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
         producer_commit_prefetch_depth=_ldgsts_sfb_producer_commit_prefetch_depth(
             two_stage_cfg
         ),
+        num_k_tiles=8,
         name="SmemSfB",
     )
     assert two_stage_res.cp_async_wait_group_depth == 0
@@ -1282,6 +1284,7 @@ def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
         cfg=cfg,
         pipeline_config=_make_pipeline_configs(cfg)["smem_sfb"],
         producer_commit_prefetch_depth=_ldgsts_sfb_producer_commit_prefetch_depth(cfg),
+        num_k_tiles=8,
     )
     load_sfb = create_load_sfb_task(
         cfg,
