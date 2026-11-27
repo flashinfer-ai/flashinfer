@@ -5,6 +5,7 @@
 Examples (run on an otherwise idle allocated GPU):
   python benchmarks/bench_gdp_prefill.py --output gdp.jsonl
   python benchmarks/bench_gdp_prefill.py --families A --heads 80 --lengths 8192 --short 0,1,15
+  python benchmarks/bench_gdp_prefill.py --set union+extras --gates gfi --block 1 --check
 
 The workloads (K = 128, V = 64, n = 3, scale 1/sqrt(128), BF16 q / k / v / o,
 FP32 g / beta / state, q / k L2-normalized beforehand, final state stored to a
@@ -16,6 +17,14 @@ separate buffer):
 * B: one sequence of 65536 tokens with an initial state.
 * C: a sequence of 36864 tokens with an initial state, then one of 28672
   tokens with a zero initial state.
+
+``--set`` replaces that grid by fixed cell sets: ``union`` (147 cells: the
+88 A / B / C workloads above; H 24 L in {8192, 16384, 32768} with d = 0;
+H in {24, 40, 80}, L in {1024, 2048, 4096}, d in {1, 2, 4, 8, 16}; and 17
+reported slow cells, among them H 20 L 1024 / 2048 with up to 64 one-token
+sequences), ``extras`` (the 40 adjacent cells of the H in {20, 24, 40, 80},
+L in {1024, 2048, 4096}, d in {0, 1, 2, 4, 8, 16, 32, 64} grid outside the
+union, e.g. pure 1K-4K prefill) or ``union+extras`` (187 cells).
 
 Each backend's call is captured once into a CUDA graph (outputs into the
 caller's buffers; the initial state is read only, so replays are idempotent)
@@ -39,7 +48,9 @@ within ``c(0) + d max(1% c(0), 2 us)`` (B and C: within cuDNN's time), paired
 per round with that round's cuDNN ``d = 0`` block: within, over, or parity
 (noise) when the interval of bar / Cake contains 1.0.
 ``--gates`` picks the gate distribution: ``gfi`` (FlashInfer's test generator,
-``exp(-softplus(0.5 x - 2))``) or ``gsat`` (fast decay, ``exp(-softplus(x))``).
+``exp(-softplus(0.5 x - 2))``), ``gsat`` (fast decay, ``exp(-softplus(x))``),
+``gmid`` (``exp(-softplus(0.5 x - 4))``) or ``gslow`` (slow decay,
+``exp(-softplus(0.5 x - 6))``).
 ``--check`` compares the Cake output and final state with cuDNN's (Frobenius
 relative error).
 """
@@ -102,9 +113,70 @@ def workloads(families, heads, lengths, short):
             }
 
 
+def workload(family, H, L=None, d=0):
+    """The workload of ``workloads`` for one cell."""
+    return next(workloads(family, [H], [L], [d]))
+
+
+# reported slow cells (GB300, cuDNN 9.28): the third part of the union set
+SLOW_CELLS = {
+    "A_H20_L1024_d1",
+    "A_H20_L1024_d4",
+    "A_H20_L1024_d16",
+    "A_H20_L1024_d32",
+    "A_H20_L1024_d64",
+    "A_H20_L2048_d16",
+    "A_H20_L2048_d32",
+    "A_H24_L1024_d1",
+    "A_H24_L1024_d16",
+    "A_H24_L1024_d32",
+    "A_H24_L1024_d64",
+    "A_H24_L2048_d16",
+    "A_H24_L2048_d32",
+    "A_H40_L1024_d8",
+    "A_H40_L1024_d16",
+    "A_H80_L4096_d0",
+    "A_H80_L65536_d0",
+}
+
+
+def in_union(w):
+    """Whether a cell of ``set_cells`` is one of the 147 union cells (else an extra)."""
+    if w["name"] in SLOW_CELLS or w["family"] != "A":
+        return True
+    H, L, d = w["H"], w["L"], w["d"]
+    if H in (10, 20, 40, 80) and L >= 8192:
+        return True  # the A / B / C grid (H 10-80, L 8K-64K, d in 0, 1, 4, 8, 15)
+    if H in (24, 40, 80):
+        return (L >= 8192 and d == 0) or (L <= 4096 and d in (1, 2, 4, 8, 16))
+    return False
+
+
+def set_cells(spec):
+    """The cells of ``--set``: ``union`` (147), ``extras`` (40) or ``union+extras`` (187), in group order."""
+    cells, seen = [], set()
+    for H in (10, 20, 40, 80):
+        cells += workloads("ABC", [H], [8192, 16384, 32768, 65536], [0, 1, 4, 8, 15])
+    cells += (workload("A", 24, L) for L in (8192, 16384, 32768))
+    for H in (80, 40, 24, 20):
+        for L in (1024, 2048, 4096):
+            cells += (workload("A", H, L, d) for d in (0, 1, 2, 4, 8, 16, 32, 64))
+    out = []
+    for w in cells:
+        if w["name"] in seen:
+            continue
+        seen.add(w["name"])
+        union = in_union(w)
+        if spec == "union+extras" or (spec == "union") == union:
+            out.append(w)
+    return out
+
+
 GATES = {
     "gfi": lambda x: torch.exp(-F.softplus(0.5 * x - 2.0)),
     "gsat": lambda x: torch.exp(-F.softplus(x)),
+    "gmid": lambda x: torch.exp(-F.softplus(0.5 * x - 4.0)),
+    "gslow": lambda x: torch.exp(-F.softplus(0.5 * x - 6.0)),
 }
 
 
@@ -457,6 +529,12 @@ def main(argv=None):
     p.add_argument("--heads", default="10,20,40,80")
     p.add_argument("--lengths", default="8192,16384,32768,65536")
     p.add_argument("--short", default="0,1,4,8,15")
+    p.add_argument(
+        "--set",
+        choices=("grid", "union", "extras", "union+extras"),
+        default="grid",
+        help="grid: --families x --heads x --lengths x --short; else the fixed union / extras cells",
+    )
     p.add_argument("--backends", default="cake,cudnn")
     p.add_argument("--replays", type=int, default=200)
     p.add_argument("--warmup", type=int, default=20)
@@ -499,6 +577,7 @@ def main(argv=None):
         "warmup": args.warmup,
         "cold_l2": args.cold_l2,
         "gates": args.gates,
+        "set": args.set,
         "block": args.block,
         "rounds": max(1, args.replays // args.block),
         "pairing": "per round and variant one block per backend, order alternating per round",
@@ -509,9 +588,17 @@ def main(argv=None):
     if sink:
         sink.write(json.dumps({"header": header}) + "\n")
     groups: dict[tuple, list] = {}
-    for w in workloads(
-        args.families.split(","), ints(args.heads), ints(args.lengths), ints(args.short)
-    ):
+    cells = (
+        workloads(
+            args.families.split(","),
+            ints(args.heads),
+            ints(args.lengths),
+            ints(args.short),
+        )
+        if args.set == "grid"
+        else set_cells(args.set)
+    )
+    for w in cells:
         groups.setdefault((w["family"], w["H"], w.get("L")), []).append(w)
     flush = (
         torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")

@@ -182,9 +182,18 @@ store, ...; the split programs spell ``split_items`` too).
 
 from __future__ import annotations
 
+import array
+import bisect
+import collections
+import ctypes
 import functools
+import hashlib
 import heapq
 import itertools
+import operator
+import struct
+import warnings
+from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
 import torch
@@ -14546,7 +14555,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_f108e105bd1ec635650f": {
+    "cake_gdp_26a79828ab8713b466c5": {
         "arches": [
             "sm_103a",
         ],
@@ -14578,7 +14587,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -14608,8 +14617,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_f108e105bd1ec635650f",
-        "kernel_symbol": "kernel_cake_gdp_f108e105bd1ec635650f",
+        "kernel": "cake_gdp_26a79828ab8713b466c5",
+        "kernel_symbol": "kernel_cake_gdp_26a79828ab8713b466c5",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -14617,7 +14626,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_f108e105bd1ec635650f",
+        "library": "cake_gdp_26a79828ab8713b466c5",
         "logical": {
             "K": "k",
             "O": "o",
@@ -14647,7 +14656,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_88c5777dabbda5e1e5a8": {
+    "cake_gdp_04160875e0e65fe60026": {
         "arches": [
             "sm_103a",
         ],
@@ -14679,7 +14688,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -14709,8 +14718,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_88c5777dabbda5e1e5a8",
-        "kernel_symbol": "kernel_cake_gdp_88c5777dabbda5e1e5a8",
+        "kernel": "cake_gdp_04160875e0e65fe60026",
+        "kernel_symbol": "kernel_cake_gdp_04160875e0e65fe60026",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -14718,7 +14727,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_88c5777dabbda5e1e5a8",
+        "library": "cake_gdp_04160875e0e65fe60026",
         "logical": {
             "K": "k",
             "O": "o",
@@ -14970,7 +14979,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_6f505b4fb9199bf89c96": {
+    "cake_gdp_f40413c9ea5f77600699": {
         "arches": [
             "sm_103a",
         ],
@@ -15006,7 +15015,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -15038,8 +15047,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_6f505b4fb9199bf89c96",
-        "kernel_symbol": "kernel_cake_gdp_6f505b4fb9199bf89c96",
+        "kernel": "cake_gdp_f40413c9ea5f77600699",
+        "kernel_symbol": "kernel_cake_gdp_f40413c9ea5f77600699",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -15047,7 +15056,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_6f505b4fb9199bf89c96",
+        "library": "cake_gdp_f40413c9ea5f77600699",
         "logical": {
             "K": "k",
             "O": "o",
@@ -15081,7 +15090,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_1d27e13364ddfad0595c": {
+    "cake_gdp_c39ce0efb75d6240b1d4": {
         "arches": [
             "sm_103a",
         ],
@@ -15117,7 +15126,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -15149,8 +15158,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_1d27e13364ddfad0595c",
-        "kernel_symbol": "kernel_cake_gdp_1d27e13364ddfad0595c",
+        "kernel": "cake_gdp_c39ce0efb75d6240b1d4",
+        "kernel_symbol": "kernel_cake_gdp_c39ce0efb75d6240b1d4",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -15158,7 +15167,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_1d27e13364ddfad0595c",
+        "library": "cake_gdp_c39ce0efb75d6240b1d4",
         "logical": {
             "K": "k",
             "O": "o",
@@ -15424,7 +15433,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_0ad4bbaf5ef274640c3a": {
+    "cake_gdp_a12e8746d7541ad471ac": {
         "arches": [
             "sm_103a",
         ],
@@ -15462,7 +15471,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -15495,8 +15504,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_0ad4bbaf5ef274640c3a",
-        "kernel_symbol": "kernel_cake_gdp_0ad4bbaf5ef274640c3a",
+        "kernel": "cake_gdp_a12e8746d7541ad471ac",
+        "kernel_symbol": "kernel_cake_gdp_a12e8746d7541ad471ac",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -15504,7 +15513,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_0ad4bbaf5ef274640c3a",
+        "library": "cake_gdp_a12e8746d7541ad471ac",
         "logical": {
             "K": "k",
             "O": "o",
@@ -15540,7 +15549,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_25d81fdd5cf38d846a0d": {
+    "cake_gdp_326b3128513266c6f402": {
         "arches": [
             "sm_103a",
         ],
@@ -15578,7 +15587,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -15611,8 +15620,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_25d81fdd5cf38d846a0d",
-        "kernel_symbol": "kernel_cake_gdp_25d81fdd5cf38d846a0d",
+        "kernel": "cake_gdp_326b3128513266c6f402",
+        "kernel_symbol": "kernel_cake_gdp_326b3128513266c6f402",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -15620,7 +15629,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_25d81fdd5cf38d846a0d",
+        "library": "cake_gdp_326b3128513266c6f402",
         "logical": {
             "K": "k",
             "O": "o",
@@ -15888,7 +15897,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": True,
         },
     },
-    "cake_gdp_2765b8c0ae143504657e": {
+    "cake_gdp_c6c640ba25906f3b851a": {
         "arches": [
             "sm_103a",
         ],
@@ -15926,7 +15935,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag+tailc",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -15959,8 +15968,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_2765b8c0ae143504657e",
-        "kernel_symbol": "kernel_cake_gdp_2765b8c0ae143504657e",
+        "kernel": "cake_gdp_c6c640ba25906f3b851a",
+        "kernel_symbol": "kernel_cake_gdp_c6c640ba25906f3b851a",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -15968,7 +15977,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_2765b8c0ae143504657e",
+        "library": "cake_gdp_c6c640ba25906f3b851a",
         "logical": {
             "K": "k",
             "O": "o",
@@ -16004,7 +16013,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "split_items": False,
         },
     },
-    "cake_gdp_68d934c41a0fbe0fb027": {
+    "cake_gdp_13b07ddf43faaf58b7d1": {
         "arches": [
             "sm_103a",
         ],
@@ -16042,7 +16051,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "body": "prefill_bw_v6",
         "build": {
-            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+bdiag",
             "arm": "full",
             "cg0": "lock",
             "cp": False,
@@ -16075,8 +16084,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "tiles",
         },
-        "kernel": "cake_gdp_68d934c41a0fbe0fb027",
-        "kernel_symbol": "kernel_cake_gdp_68d934c41a0fbe0fb027",
+        "kernel": "cake_gdp_13b07ddf43faaf58b7d1",
+        "kernel_symbol": "kernel_cake_gdp_13b07ddf43faaf58b7d1",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -16084,7 +16093,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223360,
             "use_pdl": False,
         },
-        "library": "cake_gdp_68d934c41a0fbe0fb027",
+        "library": "cake_gdp_13b07ddf43faaf58b7d1",
         "logical": {
             "K": "k",
             "O": "o",
@@ -16331,14 +16340,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_717ce3c684b41c37e673",
         ],
         "prefill": [
-            "cake_gdp_f108e105bd1ec635650f",
-            "cake_gdp_88c5777dabbda5e1e5a8",
-            "cake_gdp_6f505b4fb9199bf89c96",
-            "cake_gdp_1d27e13364ddfad0595c",
-            "cake_gdp_0ad4bbaf5ef274640c3a",
-            "cake_gdp_25d81fdd5cf38d846a0d",
-            "cake_gdp_2765b8c0ae143504657e",
-            "cake_gdp_68d934c41a0fbe0fb027",
+            "cake_gdp_26a79828ab8713b466c5",
+            "cake_gdp_04160875e0e65fe60026",
+            "cake_gdp_f40413c9ea5f77600699",
+            "cake_gdp_c39ce0efb75d6240b1d4",
+            "cake_gdp_a12e8746d7541ad471ac",
+            "cake_gdp_326b3128513266c6f402",
+            "cake_gdp_c6c640ba25906f3b851a",
+            "cake_gdp_13b07ddf43faaf58b7d1",
         ],
     },
     "sm_107a": {
@@ -16952,6 +16961,11 @@ SPLIT_WARMUP_MAX = 8  # a cut's warm-up runs at most 8 chunks from a zero seed
 # sm_103a) -48, a subset of the 2^-24 cuts (the V6 programs' BF16 state images need the deeper decay to keep
 # the split on / off within 1e-6 rel-L2; -32 did not)
 SPLIT_LOG2_THRESHOLD_ARCH = {"sm_90a": -24.0, "sm_100a": -48.0, "sm_103a": -48.0}
+# A cut's warm-up is the fewest chunks before it whose log2 gate decay reaches the threshold, within the build's warm-up
+# cap (SPLIT_WARMUP_MAX, or an inference build's longer cap) and the sequence start; a cut with none is not saturated.
+# A later cut of a saturated item ends its window iff the decay total of its whole warm-up window reaches the threshold
+# (gates lie in (0, 1], so the total reaches it iff a warm-up does). An inference build sums each token's log2 decay in
+# integer units of 2^-16, rounded to nearest: a window's total, and so its cut's decision, is the same in every order.
 # (H above, least span in chunks) per arch: sm_90a H > 24 -> 48, H > 12 -> 24, else 12; Blackwell (sm_100a / sm_103a)
 # H > 12 -> 48, else 12 (its chunk step is shorter, so an item needs more chunks to pay its fill and drain)
 SPLIT_SPAN_MIN_ARCH = {
@@ -17575,15 +17589,17 @@ def v6_sm90_item_words(plan: V6Sm90Plan, cu_seqlens: Sequence[int]) -> tuple[int
 
 # ---- BLACKWELL V6 LAUNCH PLAN (sm_100a / sm_103a prefill) ----
 # The Blackwell prefill body (``prefill_bw_v6``) runs persistent CTAs over a host item table of rows ``(sequence,
-# head, cut, span)``.  A call launches one of two builds of its arch: the ``split_items`` build over the chunk-unit
-# rows of ``split_table`` (when ``launch_split`` holds: some sequence is cut, or the batch holds an empty sequence,
-# whose state copy only the split build runs), else the block build over one block-unit row ``(seq, head, 0, ceil(len
-# / 64))`` per non-empty sequence and head, longest first, CTA ``b`` of a grid of ``G`` running rows ``b, b + G, ...``.
-# The split build runs per-CTA row lists (``inference_csr``: CTA ``b`` runs rows ``offsets[b] .. offsets[b + 1] - 1``,
-# its cut-0 rows first): the long sequences' rows stay where ``split_table`` spreads them and each short row goes to
-# a CTA with room under the current maximum modeled load, else to the least-loaded one.  The split rules read each
-# sequence alone and a short sequence is one row per head, so short sequences added to a long one never change its
-# cuts.  The grid is ``min(SM count, rows of the table)`` and never exceeds the SM count: one CTA fills an SM, so
+# head, cut, span)``.  A call launches the plan the PLAN CHOOSER below picks for its batch: the plan of record
+# (``prefill_v6_record_plan``) or a candidate of the same two builds modeled faster.  The plan of record launches the
+# ``split_items`` build over the chunk-unit rows of ``split_table`` (when ``launch_split`` holds: some sequence is
+# cut, or the batch holds an empty sequence, whose state copy only the split build runs), else the block build over
+# one block-unit row ``(seq, head, 0, ceil(len / 64))`` per non-empty sequence and head, longest first, CTA ``b`` of a
+# grid of ``G`` running rows ``b, b + G, ...``.  The split build runs per-CTA row lists (``inference_csr``: CTA ``b``
+# runs rows ``offsets[b] .. offsets[b + 1] - 1``, its cut-0 rows first): the long sequences' rows stay where the
+# table spreads them and each short row goes to the least-loaded CTA.  The split rules of record read each sequence
+# alone, so in the plan of record short sequences added to a long one never change its cuts; a chosen candidate may
+# cut a sequence differently in another batch.  The grid is ``min(SM count, rows of the table)`` and never exceeds
+# the SM count: one CTA fills an SM, so
 # every CTA of a launch is resident at once, which the split build's seed-done wait needs (an owner waits only on a
 # cut-0 row, which every CTA runs first and which waits on nothing).  Both builds read the planned sequence count and
 # offsets after the rows (``v6_item_words``) and, when they differ from the device offsets, run no item and write NaN
@@ -17693,13 +17709,159 @@ def inference_placement(
     return placed
 
 
+def lpt_rounds(loads, cost: int, k: int):
+    """The one-at-a-time LPT of ``k`` rows of one ``cost`` over the CTAs of ``loads``: row ``i`` goes to the CTA of the
+    least ``(load, index)`` and adds ``cost`` to its load.  Computed in bulk: with ``q = load // cost`` and ``r = load
+    % cost`` a CTA takes a row in round ``q`` and in every later round, and a round's rows go to the CTAs active in it
+    (``q`` at most the round) in ``(r, index)`` order -- each load of a round is below every load of the next one.
+    Returns ``(head, phase, full, tail)``: rows ``0 .. len(head) - 1`` go to CTAs ``head``, then ``full`` rounds of
+    every CTA in the order ``phase`` (row ``len(head) + f G + j`` to ``phase[j]``, ``G`` CTAs), then the remaining
+    rows to CTAs ``tail``.  A zero ``cost`` puts every row on the least-loaded CTA."""
+    G = len(loads)
+    if k <= 0:
+        return [], [], 0, []
+    if cost <= 0:
+        least = min(range(G), key=lambda b: (loads[b], b))
+        return [least] * k, [], 0, []
+    if k <= G:  # enough CTAs at the least load: one row each, lowest index first
+        low = min(loads)
+        idle = [b for b, load in enumerate(loads) if load == low]
+        if len(idle) >= k:
+            return idle[:k], [], 0, []
+    q = [load // cost for load in loads]
+    wake = sorted(range(G), key=q.__getitem__)
+    keys: list[int] = []  # the (r, index) keys of the active CTAs, ascending
+    order: list[int] = []  # their CTAs, in that order
+    head: list[int] = []
+    at, placed, rnd = 0, 0, q[wake[0]]
+    while at < G:
+        woke = []
+        while at < G and q[wake[at]] <= rnd:
+            b = wake[at]
+            woke.append((loads[b] - q[b] * cost) * G + b)
+            at += 1
+        if woke:
+            keys = sorted(keys + woke) if keys else sorted(woke)
+            order = [x % G for x in keys]
+        if at == G:
+            break
+        rounds = min(q[wake[at]] - rnd, (k - placed) // len(order))
+        head.extend(order * rounds)
+        placed += rounds * len(order)
+        rnd += rounds
+        if rnd < q[wake[at]]:  # the last rows end within this round
+            head.extend(order[: k - placed])
+            return head, [], 0, []
+    full, rest = divmod(k - placed, G)
+    return head, order, full, order[:rest]
+
+
+def lpt_counts(loads, cost: int, k: int) -> list[int]:
+    """The rows per CTA of :func:`lpt_rounds`, in ``O(G log G)``: ``t``, the last round the rows reach, is the largest
+    with ``sum(max(0, t - q))`` (the rows of the rounds before it) at most ``k``; the rest of the rows go to the CTAs
+    active in round ``t`` in ``(r, index)`` order."""
+    G = len(loads)
+    if k <= 0:
+        return [0] * G
+    counts = [0] * G
+    if cost <= 0:
+        counts[min(range(G), key=lambda b: (loads[b], b))] = k
+        return counts
+    if k <= G:  # enough CTAs at the least load: one row each, lowest index first
+        low = min(loads)
+        idle = [b for b, load in enumerate(loads) if load == low]
+        if len(idle) >= k:
+            for b in idle[:k]:
+                counts[b] = 1
+            return counts
+    q = [load // cost for load in loads]
+    ordered = sorted(q)
+    total = 0
+    for i in range(1, G + 1):
+        total += ordered[i - 1]
+        t = (k + total) // i
+        if i == G or t < ordered[i]:
+            break
+    counts = [t - x if x < t else 0 for x in q]
+    rest = k - sum(counts)
+    if rest:
+        for x in sorted(
+            (loads[b] - q[b] * cost) * G + b for b in range(G) if q[b] <= t
+        )[:rest]:
+            counts[x % G] += 1
+    return counts
+
+
+def lpt_place(loads, cost: int, rows, lists) -> None:
+    """Append ``rows`` (in order) to the CTA ``lists`` by :func:`lpt_rounds` and add their cost to ``loads``."""
+    G = len(loads)
+    head, phase, full, tail = lpt_rounds(loads, cost, len(rows))
+    for row, b in zip(rows, head, strict=False):
+        lists[b].append(row)
+        loads[b] += cost
+    at = len(head)
+    if full:
+        end = at + full * G
+        for j, b in enumerate(phase):
+            lists[b].extend(rows[at + j : end : G])
+            loads[b] += full * cost
+        at = end
+    for row, b in zip(rows[at:], tail, strict=False):
+        lists[b].append(row)
+        loads[b] += cost
+
+
+def inference_lists(long_rows, long_costs, short_groups, grid: int, flags=None):
+    """The per-CTA row lists of a split launch on ``grid`` CTAs: the long sequences' rows (``long_rows`` in table
+    order, modeled costs ``long_costs``) row ``at`` to CTA ``at % grid``, each CTA's cut-0 rows first (``flags``: 1
+    for a row of cut > 0, by default from the rows); then each ``(cost, rows)`` group of ``short_groups`` (one row per
+    (sequence, head) of the unsplit sequences, groups in placement order, rows in table order), each row on the CTA
+    of least ``(modeled load, index)`` (:func:`lpt_place`)."""
+    count = len(long_rows)
+    if count <= grid:  # at most one long row per CTA
+        lists = [[row] for row in long_rows]
+        lists += [[] for _ in range(grid - count)]
+        loads = list(long_costs) + [0] * (grid - count)
+    else:
+        full, rest = divmod(count, grid)
+        bounds = range(0, full * grid, grid)
+        lists = [
+            list(cta)
+            for cta in zip(*(long_rows[at : at + grid] for at in bounds), strict=False)
+        ]
+        for b in range(rest):
+            lists[b].append(long_rows[full * grid + b])
+        loads = _v6_rr_loads(long_costs, grid)
+        if flags is None:
+            flags = [1 if row[2] else 0 for row in long_rows]
+        # the CTAs holding a cut-0 row after a row of cut > 0: their rows are reordered (stable: cut-0 rows first)
+        seen = fix = 0
+        for at in range(0, count, grid):
+            part = flags[at : at + grid]
+            ones = int("".join(map(str, part))[::-1], 2)
+            fix |= seen & ~ones & ((1 << len(part)) - 1)
+            seen |= ones
+        while fix:
+            b = (fix & -fix).bit_length() - 1
+            fix &= fix - 1
+            cta = lists[b]
+            lists[b] = [row for row in cta if not row[2]] + [
+                row for row in cta if row[2]
+            ]
+    for cost, rows in short_groups:
+        lpt_place(loads, cost, rows, lists)
+    return lists
+
+
 def inference_csr(rows, cu_seqlens, n: int, grid: int, total_tokens: int | None = None):
     """ABI v2.2 (the ``csr`` build): the split_table ``rows`` of ``cu_seqlens`` as per-CTA lists on ``grid`` CTAs,
     returned as the CTA-major table and its ``grid + 1`` offsets (CTA b runs rows ``offsets[b] .. offsets[b + 1] - 1``,
     no pad rows). The long sequences' rows go as in :func:`inference_placement` (row ``at`` of them to CTA ``at %
-    grid``, each CTA's cut-0 rows first); then each unsplit sequence's row, longest first, to the least-loaded CTA
-    among those whose modeled load plus the row's cost stays within the current maximum (several 1-token rows stack on
-    an idle CTA), or, when none has room, to the least-loaded CTA of all."""
+    grid``, each CTA's cut-0 rows first); then each unsplit sequence's row, longest first (table order among equal
+    costs), to the least-loaded CTA, lowest index first (several 1-token rows stack on an idle CTA): the CTA a rule
+    of "the least-loaded CTA among those whose load plus the row's cost stays within the current maximum, else the
+    least-loaded CTA of all" picks too, since the least-loaded CTA has room whenever any CTA has.  Rows of one cost
+    are placed in bulk (:func:`lpt_place`): ``O(R log G)``."""
     raw = [int(x) for x in cu_seqlens]
     total = raw[-1] if total_tokens is None else int(total_tokens)
     chunks = [
@@ -17709,31 +17871,26 @@ def inference_csr(rows, cu_seqlens, n: int, grid: int, total_tokens: int | None 
             for q in range(len(raw) - 1)
         )
     ]
-    per: dict[tuple[int, int], int] = {}
-    for seq, head, _cut, _span in rows:
-        per[(seq, head)] = per.get((seq, head), 0) + 1
+    per = collections.Counter(map(operator.itemgetter(0, 1), rows))
     split_seqs = {seq for (seq, _head), count in per.items() if count > 1}
-    lists: list[list[tuple[int, int, int, int]]] = [[] for _ in range(grid)]
-    load = [0] * grid
-    for at, row in enumerate(r for r in rows if r[0] in split_seqs):
-        lists[at % grid].append(row)
-        load[at % grid] += inference_row_cost(row, chunks[row[0]], n)
-    for b in range(grid):
-        lists[b].sort(
-            key=lambda r: 0 if r[2] == 0 else 1
-        )  # stable: cut-0 rows first, the rounds kept otherwise
-    top = max(load, default=0)
-    short = sorted(
-        (r for r in rows if r[0] not in split_seqs),
-        key=lambda r: -inference_row_cost(r, chunks[r[0]], n),
+    long_rows = [r for r in rows if r[0] in split_seqs]
+    long_costs = [inference_row_cost(r, chunks[r[0]], n) for r in long_rows]
+    groups: dict[int, list] = {}
+    memo: dict[tuple[int, int, int, int], int] = {}
+    for row in rows:
+        if row[0] in split_seqs:
+            continue
+        key = (row[0], row[2], row[3], row[1] if row[3] < 0 else 0)
+        cost = memo.get(key)
+        if cost is None:
+            cost = memo[key] = inference_row_cost(row, chunks[row[0]], n)
+        groups.setdefault(cost, []).append(row)
+    lists = inference_lists(
+        long_rows,
+        long_costs,
+        [(cost, groups[cost]) for cost in sorted(groups, reverse=True)],
+        grid,
     )
-    for row in short:
-        cost = inference_row_cost(row, chunks[row[0]], n)
-        room = [b for b in range(grid) if load[b] + cost <= top]
-        b = min(room or range(grid), key=lambda c: (load[c], c))
-        lists[b].append(row)
-        load[b] += cost
-        top = max(top, load[b])
     offsets = [0, *itertools.accumulate(len(x) for x in lists)]
     return [r for x in lists for r in x], offsets
 
@@ -17767,7 +17924,7 @@ class V6Plan(NamedTuple):
     offsets: tuple[int, ...] | None = None
 
 
-def prefill_v6_plan(
+def prefill_v6_record_plan(
     cu_seqlens: Sequence[int],
     *,
     num_heads: int,
@@ -17776,8 +17933,9 @@ def prefill_v6_plan(
     arch: str,
     total_tokens: int | None = None,
 ) -> V6Plan:
-    """The launch plan of the Blackwell prefill body for the host offsets ``cu_seqlens`` (``N + 1`` integers;
-    ``total_tokens`` defaults to the last) on a device of ``sm_count`` SMs (see the rule above)."""
+    """The plan of record of the Blackwell prefill body for the host offsets ``cu_seqlens`` (``N + 1`` integers;
+    ``total_tokens`` defaults to the last) on a device of ``sm_count`` SMs (see the rule above): the ``main``
+    candidate of the PLAN CHOOSER."""
 
     if arch not in V6_ARCHES:
         raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
@@ -17802,6 +17960,1322 @@ def prefill_v6_plan(
     grid = max(1, min(sm_count, len(rows)))
     assert 1 <= grid <= sm_count, (grid, sm_count)
     return V6Plan(rows=tuple(rows), split=False, grid=grid)
+
+
+# ---- PLAN CHOOSER (sm_100a / sm_103a: the launch plan of one batch) ----
+# A call's plan is the least modeled time among candidate plans of the batch, the plan of record unless another is
+# modeled V6_PLAN_MARGIN_PERCENT faster.  Every candidate is a launch of a shipped build that keeps its device
+# contract (grid at most the SM count, every row of its table once, each CTA's cut-0 rows first):
+#   main      the plan of record (``prefill_v6_record_plan``: the split rules of record, ``inference_csr``)
+#   f<F>      the split build over the split rules with the least span F (V6_PLAN_FLOORS) in place of the
+#             Blackwell floor 48 of a batch of more than 12 heads (``v6_split_count``; V8-BAL as of record), its
+#             unsplit rows by least modeled load (calibrated costs)
+#   f<F>nb    the same without V8-BAL (F of V6_PLAN_FLOORS_UNIFORM)
+#   exact     the split build without a cut
+#   block     the block build (no empty sequence), rows longest first, CTA b running rows b, b + G, ...
+#   blockbal  the block build with the rows above the least cost on the CTAs of fewest stride positions (LPT)
+# Candidates of the same cut decisions are one candidate (the first name).  The model (V6_PLAN_COSTS, per arch,
+# hundredths of a microsecond, fitted to CUDA-graph replays of the shipped programs) is a launch's fixed cost plus its
+# most loaded CTA: an item of k chunks costs ``k chunk + item`` and a cut one ``warmup`` more, a 1-token row
+# ``decode``; a block row of b blocks ``n b block_chunk + block_item`` (``block_decode`` for 1 token).  The plan is
+# a pure function of the host offsets, the head count, n, the SM count, the arch and the token count: it reads no
+# device memory (a CUDA graph captures the plan of its batch), and it is cached (V6_PLAN_CACHE_SIZE plans, least
+# recently used out).  A sequence's cuts may change with its batch: the inference builds agree with the exact
+# recurrence within FlashInfer's tolerance for any cut.
+# The model above is the time with the FI default gates, whose cuts saturate within a few chunks.  A cut saturates
+# only where its gates decay (the device reads them; the host does not), so a candidate is taken only when it is
+# robust: for every warm-up need W -- a cut saturates iff it lies at least W chunks into its sequence and W is at
+# most the split builds' warm-up cap V6_PLAN_WARMUP_CAP; W runs over the cuts of the candidate and of the plan of
+# record up to the cap, and "no cut saturates" -- its modeled time is at most V6_PLAN_ROBUST_PERCENT above the plan
+# of record's (``prefill_v6_plan_scenarios``).  Under a need W a saturated cut's row runs ``max(warmup, W chunk)``
+# of warm-up and its chunks up to the next saturated cut of its (sequence, head), a cut-0 row runs up to the first
+# saturated cut, and an unsaturated cut's row costs ``item`` (its scan); the block build does not depend on W.
+# Candidates are tried in order of modeled time (then the first in order) and the first robust one at least
+# V6_PLAN_MARGIN_PERCENT faster than the plan of record is the plan.
+V6_PLAN_FLOORS = (48, 36, 24, 18, 12)
+V6_PLAN_FLOORS_UNIFORM = (48, 24, 12)
+V6_PLAN_MARGIN_PERCENT = 3
+V6_PLAN_ROBUST_PERCENT = 5
+V6_PLAN_WARMUP_CAP = 128  # chunks: the ``split_warmup`` of the Blackwell split builds
+V6_PLAN_CACHE_SIZE = 256  # plans (and launches) kept per cache
+V6_PLAN_CACHE_ROWS = 1 << 20  # plan rows kept in the ``prefill_v6_plan`` cache
+V6_LAUNCH_CACHE_BYTES = (
+    64 << 20
+)  # item-table bytes kept in the ``prefill_v6_launch`` cache
+V6_PLAN_COSTS = {
+    "sm_100a": {
+        "chunk": 158,
+        "warmup": 846,
+        "item": 423,
+        "decode": 763,
+        "fixed": 882,
+        "block_chunk": 159,
+        "block_item": 305,
+        "block_decode": 482,
+        "block_fixed": 756,
+    },
+    "sm_103a": {
+        "chunk": 147,
+        "warmup": 796,
+        "item": 256,
+        "decode": 714,
+        "fixed": 874,
+        "block_chunk": 146,
+        "block_item": 458,
+        "block_decode": 454,
+        "block_fixed": 458,
+    },
+}
+V6_PLAN_SPLIT_SPECS = (
+    *((f"f{F}", F, True) for F in V6_PLAN_FLOORS),
+    *((f"f{F}nb", F, False) for F in V6_PLAN_FLOORS_UNIFORM),
+    ("exact", None, False),
+)
+V6_PLAN_CANDIDATES = (
+    *(name for name, _F, _bal in V6_PLAN_SPLIT_SPECS),
+    "main",
+    "block",
+    "blockbal",
+)
+
+
+@functools.lru_cache(maxsize=65536)
+def v6_split_count(
+    chunks: int, H: int, n: int, sm_count: int, span_min: int
+) -> tuple[int, int]:
+    """``split_count`` (auto) with the least span ``span_min`` in place of ``split_span_min(H, arch)``."""
+    if chunks <= 0:
+        return 1, 0
+    if chunks < SPLIT_MIN_CHUNKS:
+        return 1, chunks
+    best = None
+    for p in range(1, SPLIT_MAX + 1):
+        span = chunks if p == 1 else split_span(chunks, p, n)
+        if p > 1 and span < span_min:
+            break
+        p_eff = -(-chunks // span)
+        waves = -(-(H * p_eff) // sm_count)
+        cost = waves * ((span + 1) * SPLIT_COST_CHUNK + SPLIT_COST_ITEM)
+        if best is None or cost < best[0]:
+            best = (cost, p_eff, span)
+    return best[1], best[2]
+
+
+@functools.lru_cache(maxsize=65536)
+def v6_split_bal_slot(chunks: int, H: int, n: int, arch: str, span_min: int) -> int:
+    """``split_bal_slot`` (auto) whose uniform-cut comparison takes the least span ``span_min``."""
+    if arch not in SPLIT_BAL_SLOTS or chunks < SPLIT_MIN_CHUNKS:
+        return 0
+    align = split_align(n)
+    padded = align * (-(-chunks // align))
+    slots = SPLIT_BAL_SLOTS[arch]
+    slot = align * (-(-(-(-(H * padded) // slots)) // align))  # noqa: B002
+    if not SPLIT_BAL_MIN_SLOT <= slot < padded <= (SPLIT_MAX - 1) * slot:
+        return 0
+    p, _span = v6_split_count(chunks, H, n, slots, span_min)
+    return slot if 2 * slots <= H * p else 0
+
+
+def _v6_count_scan(chunks, H, n, sm_count, span_min):
+    """``(span, p_eff, cost)`` of ``split_count``'s scan over ``p = 1 ..`` while the span is at least
+    ``span_min``."""
+    out = []
+    for p in range(1, SPLIT_MAX + 1):
+        span = chunks if p == 1 else split_span(chunks, p, n)
+        if p > 1 and span < span_min:
+            break
+        p_eff = -(-chunks // span)
+        out.append(
+            (
+                span,
+                p_eff,
+                -(-(H * p_eff) // sm_count)
+                * ((span + 1) * SPLIT_COST_CHUNK + SPLIT_COST_ITEM),
+            )
+        )
+    return out
+
+
+def _v6_scan_best(scan, span_min):
+    """``split_count``'s pick from a scan: the least cost over the prefix of spans at least ``span_min`` (the
+    first on a tie)."""
+    best = None
+    for at, (span, p_eff, cost) in enumerate(scan):
+        if at and span < span_min:
+            break
+        if best is None or cost < best[2]:
+            best = (span, p_eff, cost)
+    return best[1], best[0]
+
+
+@functools.lru_cache(maxsize=65536)
+def _v6_decisions(chunks, H, n, sm_count, arch):
+    """The cut of a sequence of ``chunks`` chunks under each split candidate (V6_PLAN_SPLIT_SPECS order): ``(0,
+    slot)`` for V8-BAL, else ``(p, span)``.  One scan of ``split_count`` (and one over the V8-BAL slots of the arch)
+    serves every floor."""
+    if chunks < SPLIT_MIN_CHUNKS:
+        return (((1, chunks) if chunks > 0 else (1, 0)),) * len(V6_PLAN_SPLIT_SPECS)
+    record = split_span_min(H, arch)
+    least = min(
+        record,
+        *(floor for _name, floor, _bal in V6_PLAN_SPLIT_SPECS if floor is not None),
+    )
+    scan = _v6_count_scan(chunks, H, n, sm_count, least)
+    slot = 0
+    if arch in SPLIT_BAL_SLOTS:
+        align = split_align(n)
+        padded = align * (-(-chunks // align))
+        slots = SPLIT_BAL_SLOTS[arch]
+        slot = align * (-(-(-(-(H * padded) // slots)) // align))  # noqa: B002
+        if not SPLIT_BAL_MIN_SLOT <= slot < padded <= (SPLIT_MAX - 1) * slot:
+            slot = 0
+    bal_scan = None
+    if slot:
+        slots = SPLIT_BAL_SLOTS[arch]
+        bal_scan = (
+            scan if sm_count == slots else _v6_count_scan(chunks, H, n, slots, least)
+        )
+    out = []
+    for _name, floor, bal in V6_PLAN_SPLIT_SPECS:
+        if floor is None:
+            out.append((1, chunks))
+            continue
+        span_min = min(floor, record)
+        if (
+            bal
+            and slot
+            and 2 * SPLIT_BAL_SLOTS[arch] <= H * _v6_scan_best(bal_scan, span_min)[0]
+        ):
+            out.append((0, slot))
+            continue
+        out.append(_v6_scan_best(scan, span_min))
+    return tuple(out)
+
+
+def _v6_split_row_cost(row, chunks: int, tokens: int, n: int, costs) -> int:
+    """The modeled cost of a split-build row (V6_PLAN_COSTS ``costs``) of a ``tokens``-token sequence."""
+    _seq, head, cut, span = row
+    if span == 0:  # an empty sequence's state copy
+        return costs["item"]
+    if span < 0:
+        if cut >= chunks:  # a pad row
+            return 0
+        align = split_align(n)
+        padded = align * (-(-chunks // align))
+        at = head * padded + cut
+        end = min((at // -span + 1) * -span - head * padded, chunks)
+    else:
+        end = min(cut + span, chunks)
+    if tokens == 1:
+        return costs["decode"]
+    return (
+        max(end - cut, 0) * costs["chunk"]
+        + costs["item"]
+        + (costs["warmup"] if cut > 0 else 0)
+    )
+
+
+def _v6_block_row_cost(tokens: int, n: int, costs) -> int:
+    if tokens == 1:
+        return costs["block_decode"]
+    return n * (-(-tokens // 64)) * costs["block_chunk"] + costs["block_item"]
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_cut_shape(chunks, decision, H, n, arch):
+    """The rows of a sequence (index 0) cut by ``decision`` in table order, and per row its chunk count and kind
+    (0: cut 0, 1: cut > 0, -1: a pad row)."""
+    p, span = decision
+    if p == 0:  # split_bal_rows of sequence 0, with each piece's chunk count
+        slot = span
+        align = split_align(n)
+        padded = align * (-(-chunks // align))
+        top = H * padded
+        first, second = [], []
+        for k in range(SPLIT_BAL_SLOTS[arch]):
+            lo, hi = k * slot, min((k + 1) * slot, top)
+            pieces = []
+            while lo < hi:
+                head, cut = divmod(lo, padded)
+                end = min(hi, (head + 1) * padded)
+                if cut < chunks:
+                    pieces.append(
+                        ((0, head, cut, -slot), min(end - head * padded, chunks) - cut)
+                    )
+                lo = end
+            pad = ((0, min(k * slot // padded, H - 1), chunks, -slot), 0)
+            if len(pieces) == 2 and pieces[1][0][2] == 0:
+                pieces.reverse()
+            first.append(pieces[0] if pieces else pad)
+            second.append(pieces[1] if len(pieces) > 1 else pad)
+        both = first + second
+        rows = tuple(row for row, _k in both)
+        ks = tuple(k for _row, k in both)
+        kinds = tuple(-1 if row[2] >= chunks else 1 if row[2] else 0 for row in rows)
+        return rows, ks, kinds
+    rows = tuple((0, head, j * span, span) for j in range(p) for head in range(H))
+    ks, kinds = [], []
+    for j in range(p):
+        ks += [max(min(span, chunks - j * span), 0)] * H
+        kinds += [1 if j else 0] * H
+    return rows, tuple(ks), tuple(kinds)
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_cut_costs(chunks, decision, H, n, arch, record):
+    """The calibrated (or, ``record``, the record) costs of the rows of :func:`_v6_cut_shape`."""
+    _rows, ks, kinds = _v6_cut_shape(chunks, decision, H, n, arch)
+    if record:
+        a, item, warm = 1, INFERENCE_ITEM_COST, INFERENCE_WARMUP_COST
+    else:
+        c = V6_PLAN_COSTS[arch]
+        a, item, warm = c["chunk"], c["item"], c["warmup"]
+    return tuple(
+        0 if kind < 0 else k * a + item + (warm if kind else 0)
+        for k, kind in zip(ks, kinds, strict=False)
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_cut_stats(chunks, decision, H, n, arch):
+    """(rows, total, largest) calibrated cost of the rows of a cut sequence (a uniform cut from its spans alone)."""
+    p, span = decision
+    if p == 0:
+        costs = _v6_cut_costs(chunks, decision, H, n, arch, False)
+        return len(costs), sum(costs), max(costs)
+    c = V6_PLAN_COSTS[arch]
+    each = [
+        max(min(span, chunks - j * span), 0) * c["chunk"]
+        + c["item"]
+        + (c["warmup"] if j else 0)
+        for j in range(p)
+    ]
+    return H * p, H * sum(each), max(each)
+
+
+def _v6_runs_loads(runs, grid):
+    """Per CTA of ``grid``, the cost of rows laid out round-robin from CTA 0 (row ``i`` on CTA ``i % grid``), given
+    as ``(rows, cost)`` runs in row order."""
+    diff, base, pos = [0] * (grid + 1), 0, 0
+    for rows, cost in runs:
+        rounds, rest = divmod(rows, grid)
+        base += rounds * cost
+        first = pos % grid
+        if rest:
+            last = first + rest
+            diff[first] += cost
+            if last <= grid:
+                diff[last] -= cost
+            else:
+                diff[grid] -= cost
+                diff[0] += cost
+                diff[last - grid] -= cost
+        pos += rows
+    return [base + x for x in itertools.accumulate(diff[:grid])]
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_cut_loads(chunks, decision, H, n, arch, grid, record):
+    """Per CTA of ``grid``, the calibrated (or, ``record``, the record) cost of the cut rows of one sequence placed
+    from CTA 0 (row ``i`` on CTA ``i % grid``)."""
+    p, span = decision
+    if p:  # a uniform cut: H rows of one cost per cut
+        if record:
+            a, item, warm = 1, INFERENCE_ITEM_COST, INFERENCE_WARMUP_COST
+        else:
+            c = V6_PLAN_COSTS[arch]
+            a, item, warm = c["chunk"], c["item"], c["warmup"]
+        runs = [
+            (H, max(min(span, chunks - j * span), 0) * a + item + (warm if j else 0))
+            for j in range(p)
+        ]
+        return _v6_runs_loads(runs, grid)
+    return _v6_rr_loads(_v6_cut_costs(chunks, decision, H, n, arch, record), grid)
+
+
+def _v6_rr_loads(costs, grid):
+    """Per CTA of ``grid``, the sum of ``costs[i]`` over the rows ``i`` it runs round-robin (``i % grid``)."""
+    count = len(costs)
+    if count <= grid:
+        return list(costs) + [0] * (grid - count)
+    full, rest = divmod(count, grid)
+    loads = [
+        sum(cta)
+        for cta in zip(
+            *(costs[at : at + grid] for at in range(0, full * grid, grid)), strict=False
+        )
+    ]
+    for b in range(rest):
+        loads[b] += costs[full * grid + b]
+    return loads
+
+
+def _rotated(values, shift):
+    return values[-shift:] + values[:-shift] if shift else values
+
+
+class _V6Batch:
+    """The host view of one call: lengths, chunks and the sequences of each length (ascending)."""
+
+    __slots__ = (
+        "H",
+        "n",
+        "sm",
+        "arch",
+        "costs",
+        "lens",
+        "chunks",
+        "by_len",
+        "chunk_of",
+        "empty",
+    )
+
+    def __init__(self, cu, H, n, sm, arch, total):
+        self.H, self.n, self.sm, self.arch = H, n, sm, arch
+        self.costs = V6_PLAN_COSTS[arch]
+        self.lens, self.by_len = [], {}
+        start = min(max(int(cu[0]), 0), total)
+        for q in range(len(cu) - 1):
+            raw = int(cu[q + 1])
+            end = min(max(raw, start), total)
+            self.lens.append(end - start)
+            self.by_len.setdefault(end - start, []).append(q)
+            start = min(max(raw, 0), total)
+        self.chunk_of = {length: split_chunks(length, n) for length in self.by_len}
+        self.chunks = [self.chunk_of[length] for length in self.lens]
+        self.empty = 0 in self.by_len
+
+
+class _V6Split:
+    """A split-build candidate: cut decisions per chunk count, rows placed by calibrated or (``record``) record
+    costs.  ``bound()`` is a lower bound of the modeled time; ``cost()`` the modeled time; ``plan()`` the launch."""
+
+    def __init__(self, name, bt, decisions, record=False):
+        self.name, self.bt, self.dec, self.record = name, bt, decisions, record
+        H, costs, n, arch = bt.H, bt.costs, bt.n, bt.arch
+        self.long = []  # cut sequences, ascending
+        self.short = {}  # placement cost -> [(sequences, calibrated cost)]
+        rows = total = top = 0
+        for length, seqs in bt.by_len.items():
+            chunks = bt.chunk_of[length]
+            decision = decisions[chunks]
+            if decision[0] != 1:
+                self.long.extend(seqs)
+                count, sum_, high = _v6_cut_stats(chunks, decision, H, n, arch)
+                rows += count * len(seqs)
+                total += sum_ * len(seqs)
+                top = max(top, high)
+                continue
+            if length == 0:
+                cc = costs["item"]
+            elif length == 1:
+                cc = costs["decode"]
+            else:
+                cc = chunks * costs["chunk"] + costs["item"]
+            pc = chunks + INFERENCE_ITEM_COST if record else cc
+            self.short.setdefault(pc, []).append((seqs, cc))
+            rows += H * len(seqs)
+            total += H * len(seqs) * cc
+            top = max(top, cc)
+        if len(self.long) > 1:
+            self.long.sort()
+        self.items = rows
+        self.grid = max(1, min(bt.sm, rows))
+        self._bound = costs["fixed"] + max(top, -(-total // self.grid))
+
+    def bound(self):
+        return self._bound
+
+    def cost(self):
+        bt, G, H = self.bt, self.grid, self.bt.H
+        cloads = ploads = None
+        at = 0
+        for q in self.long:
+            chunks = bt.chunks[q]
+            decision = self.dec[chunks]
+            shift = at % G
+            vec = _rotated(
+                _v6_cut_loads(chunks, decision, H, bt.n, bt.arch, G, False), shift
+            )
+            cloads = vec if cloads is None else list(map(operator.add, cloads, vec))
+            if self.record:
+                vec = _rotated(
+                    _v6_cut_loads(chunks, decision, H, bt.n, bt.arch, G, True), shift
+                )
+                ploads = vec if ploads is None else list(map(operator.add, ploads, vec))
+            at += _v6_cut_stats(chunks, decision, H, bt.n, bt.arch)[0]
+        if cloads is None:
+            cloads = [0] * G
+            ploads = [0] * G if self.record else None
+        cloads = list(cloads)
+        ploads = list(ploads) if self.record else cloads
+        for pc in sorted(self.short, reverse=True):
+            groups = self.short[pc]
+            k = H * sum(len(seqs) for seqs, _cc in groups)
+            ccs = {cc for _seqs, cc in groups}
+            if len(ccs) == 1:
+                cc = ccs.pop()
+                counts = lpt_counts(ploads, pc, k)
+                if self.record:
+                    ploads = [
+                        load + x * pc for load, x in zip(ploads, counts, strict=False)
+                    ]
+                    cloads = [
+                        load + x * cc for load, x in zip(cloads, counts, strict=False)
+                    ]
+                else:
+                    cloads = ploads = [
+                        load + x * cc for load, x in zip(cloads, counts, strict=False)
+                    ]
+                continue
+            # one placement cost, several calibrated costs: follow the rows
+            per_seq = sorted((q, cc) for seqs, cc in groups for q in seqs)
+            head, phase, full, tail = lpt_rounds(ploads, pc, k)
+            slots = head + phase * full + tail
+            costs = [cc for _q, cc in per_seq for _head in range(H)]
+            for b, cc in zip(slots, costs, strict=False):
+                cloads[b] += cc
+                ploads[b] += pc
+        self.loads = cloads
+        return bt.costs["fixed"] + max(cloads)
+
+    def plan(self):
+        if getattr(self, "_plan", None) is None:
+            self._plan = self._build()
+        return self._plan
+
+    def _build(self):
+        bt, G, H, n, arch = self.bt, self.grid, self.bt.H, self.bt.n, self.bt.arch
+        long_rows, long_costs, flags = [], [], []
+        for q in self.long:
+            chunks = bt.chunks[q]
+            decision = self.dec[chunks]
+            long_rows.extend(_v6_cut_rows(q, chunks, decision, H, n, arch))
+            long_costs.extend(_v6_cut_costs(chunks, decision, H, n, arch, self.record))
+            flags.extend(_v6_cut_flags(chunks, decision, H, n, arch))
+        short = []
+        for pc in sorted(self.short, reverse=True):
+            seqs = [q for group, _cc in self.short[pc] for q in group]
+            if len(self.short[pc]) > 1:
+                seqs.sort()
+            short.append(
+                (
+                    pc,
+                    list(
+                        itertools.chain.from_iterable(
+                            _v6_head_rows(q, bt.chunks[q], H) for q in seqs
+                        )
+                    ),
+                )
+            )
+        lists = inference_lists(long_rows, long_costs, short, G, flags)
+        offsets = (0, *itertools.accumulate(map(len, lists)))
+        return V6Plan(
+            rows=tuple(itertools.chain.from_iterable(lists)),
+            split=True,
+            grid=G,
+            offsets=offsets,
+        )
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_cut_rows(seq, chunks, decision, H, n, arch):
+    """The rows of sequence ``seq`` cut by ``decision``, in table order."""
+    rows = _v6_cut_shape(chunks, decision, H, n, arch)[0]
+    return rows if seq == 0 else tuple((seq, h, c, sp) for _s, h, c, sp in rows)
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_cut_flags(chunks, decision, H, n, arch):
+    """Per row of a cut sequence: 1 for a row of cut > 0 (a pad row included), else 0."""
+    return tuple(
+        1 if kind else 0 for kind in _v6_cut_shape(chunks, decision, H, n, arch)[2]
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_head_rows(seq, span, H):
+    """The rows ``(seq, head, 0, span)`` of an unsplit sequence, heads in order."""
+    return tuple((seq, h, 0, span) for h in range(H))
+
+
+class _V6Block:
+    """A block-build candidate: CTA b runs table positions b, b + G, ...; ``balanced`` moves the rows above the least
+    cost to the CTAs of the fewest positions (LPT over the stride layout's per-CTA capacities)."""
+
+    def __init__(self, name, bt, balanced, layout=None):
+        self.name, self.bt, self.balanced = name, bt, balanced
+        H, n, costs = bt.H, bt.n, bt.costs
+        if layout is None:
+            order = []  # sequences in row order: blocks descending, then index
+            runs = []  # [rows, cost] of equal cost, in row order
+            by_blocks: dict[int, list] = {}
+            for length, seqs in bt.by_len.items():
+                if length > 0:
+                    by_blocks.setdefault(-(-length // 64), []).extend(
+                        (q, length) for q in seqs
+                    )
+            total = top = 0
+            for blocks in sorted(by_blocks, reverse=True):
+                group = by_blocks[blocks]
+                if len(group) > 1:
+                    group.sort()
+                for q, length in group:
+                    order.append(q)
+                    cost = _v6_block_row_cost(length, n, costs)
+                    if runs and runs[-1][1] == cost:
+                        runs[-1][0] += H
+                    else:
+                        runs.append([H, cost])
+                    total += H * cost
+                    top = max(top, cost)
+            layout = (order, runs, total, top)
+        self.layout = layout
+        self.order, self.runs, total, top = layout
+        self.items = len(self.order) * H
+        self.grid = max(1, min(bt.sm, self.items))
+        self._bound = costs["block_fixed"] + max(top, -(-total // self.grid))
+        self.ok = True
+        if balanced:
+            least = min((cost for _rows, cost in self.runs), default=0)
+            big = sum(rows for rows, cost in self.runs if cost > least)
+            # nothing to balance, or many long rows (the stride order is as good)
+            self.ok = 0 < big <= 4 * self.grid
+
+    def bound(self):
+        return self._bound
+
+    def cost(self):
+        G, runs = self.grid, self.runs
+        if not self.balanced:
+            self.loads = _v6_runs_loads(runs, G)
+            return self.bt.costs["block_fixed"] + max(self.loads)
+        R = self.items
+        least = min(cost for _rows, cost in runs)
+        self.cap = [R // G + (1 if b < R % G else 0) for b in range(G)]
+        used, loads = [0] * G, [0] * G
+        heap = [(self.cap[b] * least, b) for b in range(G)]
+        heapq.heapify(heap)
+        self.assign = []  # the CTA of each row above the least cost, rows by cost descending (stable)
+        for rows, cost in sorted(
+            ((r, c) for r, c in runs if c > least), key=lambda rc: -rc[1]
+        ):
+            for _ in range(rows):
+                _key, b = heapq.heappop(heap)
+                used[b] += 1
+                loads[b] += cost
+                self.assign.append(b)
+                if used[b] < self.cap[b]:
+                    heapq.heappush(
+                        heap, (loads[b] + (self.cap[b] - used[b]) * least, b)
+                    )
+        self.loads = [
+            load + (self.cap[b] - used[b]) * least for b, load in enumerate(loads)
+        ]
+        self.least = least
+        return self.bt.costs["block_fixed"] + max(self.loads)
+
+    def plan(self):
+        if getattr(self, "_plan", None) is None:
+            self._plan = self._build()
+        return self._plan
+
+    def _build(self):
+        bt, G, H = self.bt, self.grid, self.bt.H
+        rows = [(q, h, 0, -(-bt.lens[q] // 64)) for q in self.order for h in range(H)]
+        if not self.balanced:
+            return V6Plan(rows=tuple(rows), split=False, grid=G)
+        if not hasattr(self, "assign"):
+            self.cost()
+        n, costs = bt.n, bt.costs
+        cost_of = [_v6_block_row_cost(bt.lens[r[0]], n, costs) for r in rows]
+        big = sorted(
+            (i for i in range(len(rows)) if cost_of[i] > self.least),
+            key=lambda i: -cost_of[i],
+        )
+        lists = [[] for _ in range(G)]
+        for i, b in zip(big, self.assign, strict=False):
+            lists[b].append(rows[i])
+        rest = iter(rows[i] for i in range(len(rows)) if cost_of[i] <= self.least)
+        for b in range(G):
+            while len(lists[b]) < self.cap[b]:
+                lists[b].append(next(rest))
+        rounds = max(len(x) for x in lists)
+        placed = [
+            lists[b][r] for r in range(rounds) for b in range(G) if r < len(lists[b])
+        ]
+        return V6Plan(rows=tuple(placed), split=False, grid=G)
+
+
+def _v6_candidates(bt):
+    """The distinct candidates of a batch in V6_PLAN_CANDIDATES order and ``alias`` (every applicable name -> the
+    name of the distinct candidate of its plan)."""
+    distinct = sorted(set(bt.chunk_of.values()))
+    per = [_v6_decisions(c, bt.H, bt.n, bt.sm, bt.arch) for c in distinct]
+    out, seen, alias = [], {}, {}
+    for at, (name, _floor, _bal) in enumerate(V6_PLAN_SPLIT_SPECS):
+        key = tuple(d[at] for d in per)
+        if key in seen:
+            alias[name] = seen[key]
+            continue
+        seen[key] = alias[name] = name
+        out.append(_V6Split(name, bt, dict(zip(distinct, key, strict=False))))
+    record = next(c for c in out if c.name == alias["f48"]).dec
+    if bt.empty or any(
+        record[c][0] != 1 for c in distinct
+    ):  # launch_split of the table of record
+        out.append(_V6Split("main", bt, record, record=True))
+        alias["main"] = "main"
+    else:
+        alias["main"] = "block"
+    if not bt.empty:  # the block build runs no empty sequence
+        block = _V6Block("block", bt, False)
+        out.append(block)
+        alias["block"] = "block"
+        balanced = _V6Block("blockbal", bt, True, block.layout)
+        if balanced.ok:
+            out.append(balanced)
+        alias["blockbal"] = "blockbal" if balanced.ok else "block"
+    return out, alias
+
+
+def _v6_plan_ctas(plan):
+    """Per CTA of ``plan``, the rows it runs: the split build's row lists, the block build's stride positions."""
+    rows, G = plan.rows, plan.grid
+    if plan.split:
+        o = plan.offsets
+        return [rows[o[b] : o[b + 1]] for b in range(G)]
+    return [rows[b::G] for b in range(G)]
+
+
+def _v6_cut_map(plan, bt):
+    """``(seq, head) -> ascending cuts`` of every (sequence, head) of more than one row of a split plan (pad rows
+    and state copies excluded): the cut sequences."""
+    cuts: dict[tuple[int, int], list[int]] = {}
+    if plan.split:
+        for seq, head, cut, span in plan.rows:
+            if span != 0 and cut < bt.chunks[seq]:
+                cuts.setdefault((seq, head), []).append(cut)
+    return {key: sorted(v) for key, v in cuts.items() if len(v) > 1}
+
+
+def _v6_scenario_time(plan, bt, cut_map, W):
+    """The modeled time of ``plan`` when a cut saturates iff it lies at least ``W`` chunks into its sequence and
+    ``W`` is at most V6_PLAN_WARMUP_CAP (``W`` None: no cut saturates); see the PLAN CHOOSER."""
+    c = bt.costs
+    if not plan.split:
+        loads = [
+            sum(_v6_block_row_cost(bt.lens[r[0]], bt.n, c) for r in cta)
+            for cta in _v6_plan_ctas(plan)
+        ]
+        return c["block_fixed"] + max(loads, default=0)
+    live = W is not None and W <= V6_PLAN_WARMUP_CAP
+    warm = max(c["warmup"], W * c["chunk"]) if live else 0
+    top = 0
+    for cta in _v6_plan_ctas(plan):
+        load = 0
+        for row in cta:
+            seq, head, cut, span = row
+            cuts = cut_map.get((seq, head))
+            chunks = bt.chunks[seq]
+            if cuts is None or span == 0 or cut >= chunks:
+                load += _v6_split_row_cost(row, chunks, bt.lens[seq], bt.n, c)
+                continue
+            if cut and not (live and cut >= W):
+                load += c["item"]  # an unsaturated cut: its scan
+                continue
+            end = chunks
+            if live:
+                at = bisect.bisect_right(cuts, max(cut, W - 1))
+                if at < len(cuts):
+                    end = cuts[at]
+            load += (end - cut) * c["chunk"] + c["item"] + (warm if cut else 0)
+        top = max(top, load)
+    return c["fixed"] + top
+
+
+def _v6_scenarios(plan: V6Plan, ref: V6Plan, bt) -> list[tuple[int | None, int, int]]:
+    """``(W, time of plan, time of ref)`` per warm-up need of the robustness rule (PLAN CHOOSER): every cut of
+    either plan up to V6_PLAN_WARMUP_CAP, then None (no cut saturates); modeled hundredths of a microsecond."""
+    maps = (_v6_cut_map(plan, bt), _v6_cut_map(ref, bt))
+    needs = sorted(
+        {
+            cut
+            for m in maps
+            for cuts in m.values()
+            for cut in cuts
+            if 0 < cut <= V6_PLAN_WARMUP_CAP
+        }
+    )
+    return [
+        (
+            W,
+            _v6_scenario_time(plan, bt, maps[0], W),
+            _v6_scenario_time(ref, bt, maps[1], W),
+        )
+        for W in (*needs, None)
+    ]
+
+
+def _v6_robust(cand, ref, bt) -> bool:
+    return all(
+        100 * mine <= (100 + V6_PLAN_ROBUST_PERCENT) * theirs
+        for _W, mine, theirs in _v6_scenarios(cand.plan(), ref.plan(), bt)
+    )
+
+
+def _v6_choose(bt):
+    """The robust candidate of least modeled time (then the first in order) among those V6_PLAN_MARGIN_PERCENT
+    below the plan of record's time, else the plan of record.  Candidates whose lower bound cannot come below that
+    limit are not modeled, which never changes the pick."""
+    cands, alias = _v6_candidates(bt)
+    ref = next(c for c in cands if c.name == alias["main"])
+    limit = (100 - V6_PLAN_MARGIN_PERCENT) * ref.cost()
+    fast = []
+    for at, cand in enumerate(cands):
+        if cand is ref or 100 * cand.bound() >= limit:
+            continue
+        cost = cand.cost()
+        if 100 * cost < limit:
+            fast.append((cost, at))
+    for _cost, at in sorted(fast):
+        if _v6_robust(cands[at], ref, bt):
+            return cands[at]
+    return ref
+
+
+def _v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens):
+    if arch not in V6_ARCHES:
+        raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
+    sm_count = int(sm_count)
+    if sm_count <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    if type(cu_seqlens) is tuple:
+        cu = cu_seqlens
+    elif isinstance(cu_seqlens, torch.Tensor):
+        cu = tuple(cu_seqlens.tolist())
+    else:
+        cu = tuple(cu_seqlens)
+    total = int(cu[-1]) if total_tokens is None else int(total_tokens)
+    return cu, int(num_heads), int(num_householder), sm_count, arch, total
+
+
+def _v6_check_grid(grid: int, sm_count: int) -> None:
+    # every CTA of the launch is resident at once (one CTA per SM): the seed-done wait of the split build needs it
+    if not 1 <= grid <= sm_count:
+        raise RuntimeError(
+            f"Blackwell prefill plan grid {grid} outside 1..{sm_count} (the SM count)"
+        )
+
+
+def _v6_reference(cu, H, n, sm_count, arch, total):
+    """The PLAN CHOOSER's pick and its plan, in Python."""
+    cand = _v6_choose(_V6Batch(cu, H, n, sm_count, arch, total))
+    plan = cand.plan()
+    _v6_check_grid(plan.grid, sm_count)
+    return cand.name, plan
+
+
+def prefill_v6_plan_reference(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> V6Plan:
+    """The launch plan of the PLAN CHOOSER computed in Python (uncached): the reference of the native chooser."""
+
+    return _v6_reference(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )[1]
+
+
+def prefill_v6_plan(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> V6Plan:
+    """The launch plan of the Blackwell prefill body for the host offsets ``cu_seqlens`` (``N + 1`` integers;
+    ``total_tokens`` defaults to the last) on a device of ``sm_count`` SMs: the candidate the PLAN CHOOSER picks
+    (the native chooser when it builds, else the Python reference; cached, see NATIVE PLAN CHOOSER)."""
+
+    # the key: a tensor's offsets as bytes, a sequence's as a tuple (width 0); a hit with the arguments as given
+    data: bytes | tuple[int, ...]
+    if isinstance(cu_seqlens, torch.Tensor):
+        data, width = _v6_offset_bytes(cu_seqlens)
+    else:
+        data, width = (
+            (cu_seqlens if type(cu_seqlens) is tuple else tuple(cu_seqlens)),
+            0,
+        )
+    key = (data, width, num_heads, num_householder, sm_count, arch, total_tokens)
+    plan = _V6_PLANS.get(key)
+    if plan is not None:
+        _V6_PLANS.move_to_end(key)
+        return plan
+    if width:
+        if total_tokens is None:
+            total_tokens = int.from_bytes(data[-width:], "little", signed=True)
+    elif total_tokens is None:
+        total_tokens = data[-1]
+    key = (
+        data,
+        width,
+        int(num_heads),
+        int(num_householder),
+        int(sm_count),
+        arch,
+        int(total_tokens),
+    )
+    plan = _V6_PLANS.lookup(key)
+    if plan is not None:
+        return plan
+    _data, _width, H, n, sm, _arch, total = key
+    if width == 0:
+        data, width = array.array("q", data).tobytes(), 8
+    if arch not in V6_ARCHES:
+        raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
+    if sm <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm}")
+    native = _v6_native_module()
+    if native is None:
+        cu = tuple(array.array("q" if width == 8 else "i", data))
+        plan = _v6_reference(cu, H, n, sm, arch, total)[1]
+    else:
+        out = native.v6_launch(
+            data, width, H, n, sm, total, _v6_native_params(arch, H), 1
+        )
+        _cand, split, grid, count, _words = _V6_NATIVE_HEADER.unpack_from(out)
+        words = array.array("i", out[4 * V6_NATIVE_HEAD :])
+        it = iter(words[: 4 * count])
+        rows = tuple(zip(it, it, it, it, strict=False))
+        offsets = (
+            tuple(words[4 * max(count, 1) : 4 * max(count, 1) + grid + 1])
+            if split
+            else None
+        )
+        plan = V6Plan(rows=rows, split=bool(split), grid=grid, offsets=offsets)
+    _V6_PLANS.put(key, plan, max(len(plan.rows), 1))
+    return plan
+
+
+def prefill_v6_plan_choice(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> str:
+    """The name of the candidate :func:`prefill_v6_plan` launches for the batch (computed afresh)."""
+
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
+    return _v6_choose(bt).name
+
+
+def prefill_v6_plan_candidates(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> dict[str, tuple[str, int]]:
+    """Every applicable candidate name of the batch -> (the distinct candidate of its plan, its modeled time in
+    hundredths of a microsecond), every candidate modeled."""
+
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
+    cands, alias = _v6_candidates(bt)
+    cost = {c.name: c.cost() for c in cands}
+    return {
+        name: (alias[name], cost[alias[name]])
+        for name in V6_PLAN_CANDIDATES
+        if name in alias
+    }
+
+
+def prefill_v6_plan_scenarios(
+    name: str,
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> list[tuple[int | None, int, int]]:
+    """The robustness scenarios of candidate ``name`` against the plan of record (see the PLAN CHOOSER): ``(W,
+    modeled time of the candidate, modeled time of the plan of record)`` per warm-up need ``W`` (None: no cut
+    saturates), hundredths of a microsecond."""
+
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
+    cands, alias = _v6_candidates(bt)
+    if name not in alias:
+        raise ValueError(
+            f"candidate {name!r} does not apply to the batch; it takes {sorted(alias)}"
+        )
+    cand = next(c for c in cands if c.name == alias[name])
+    ref = next(c for c in cands if c.name == alias["main"])
+    return _v6_scenarios(cand.plan(), ref.plan(), bt)
+
+
+def prefill_v6_candidate_plan(
+    name: str,
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> V6Plan:
+    """The launch plan of candidate ``name`` (V6_PLAN_CANDIDATES) for the batch; ValueError when it does not apply
+    (a block candidate with an empty sequence)."""
+
+    bt = _V6Batch(
+        *_v6_batch(cu_seqlens, num_heads, num_householder, sm_count, arch, total_tokens)
+    )
+    cands, alias = _v6_candidates(bt)
+    if name not in alias:
+        raise ValueError(
+            f"candidate {name!r} does not apply to the batch; it takes {sorted(alias)}"
+        )
+    return next(c for c in cands if c.name == alias[name]).plan()
+
+
+# ---- END PLAN CHOOSER ----
+
+
+# ---- NATIVE PLAN CHOOSER (the host time of an eager call) ----
+# ``csrc/cake_gdp_v6_plan.cpp`` is the PLAN CHOOSER in native code: a line-by-line port of the Python chooser above
+# (the reference, ``prefill_v6_plan_reference``) that takes every constant from this file (``_v6_native_params``)
+# and returns the launch and the int32 words of its item table at once.  FlashInfer's JIT builds it on first use
+# (a host library, no device code); when it cannot be built the Python chooser plans every call (one warning).
+# ``prefill_v6_launch`` is what a call launches: the program of the call's state form, the build, the grid, the row
+# count and the item words, cached by the call's host offsets (their bytes), H, n, the SM count, the arch, the token
+# count and the state form; the cache keeps V6_PLAN_CACHE_SIZE launches and at most V6_LAUNCH_CACHE_BYTES of words
+# (least recently used out), the ``prefill_v6_plan`` cache at most V6_PLAN_CACHE_ROWS rows.  ``clear_plan_caches``
+# empties every planner cache (a batch the process has not planned before).  A cached call is one dictionary lookup
+# of the arguments as given (equal integer values find the same entry) and of the offsets a CPU tensor holds at the
+# call, read through a kept view of its memory (``_v6_offset_bytes``); a miss converts the arguments and looks again.
+V6_NATIVE_SOURCE = "cake_gdp_v6_plan.cpp"
+V6_NATIVE_HEAD = (
+    5  # header words of the native result: candidate, split, grid, rows, item words
+)
+_V6_NATIVE_HEADER = struct.Struct(f"<{V6_NATIVE_HEAD}i")
+_V6_NATIVE: list = []  # [module or None] once loaded
+
+
+class _V6Cache(collections.OrderedDict):
+    """A least-recently-used cache of at most V6_PLAN_CACHE_SIZE entries whose summed weight stays at most
+    ``budget`` (one entry always stays)."""
+
+    def __init__(self, budget: int):
+        super().__init__()
+        self.budget, self.total = budget, 0
+        self.weights: dict[object, int] = {}
+
+    def lookup(self, key):
+        value = self.get(key)
+        if value is not None:
+            self.move_to_end(key)
+        return value
+
+    def put(self, key, value, weight: int) -> None:
+        self[key] = value
+        self.weights[key] = weight
+        self.total += weight
+        while len(self) > 1 and (
+            len(self) > V6_PLAN_CACHE_SIZE or self.total > self.budget
+        ):
+            old, _value = self.popitem(last=False)
+            self.total -= self.weights.pop(old)
+
+    def clear(self) -> None:
+        super().clear()
+        self.weights.clear()
+        self.total = 0
+
+
+_V6_PLANS = _V6Cache(V6_PLAN_CACHE_ROWS)
+_V6_LAUNCHES = _V6Cache(V6_LAUNCH_CACHE_BYTES)
+
+
+class V6Launch(NamedTuple):
+    """One launch of the Blackwell prefill body: the program ``name``, the chooser's candidate, the build (``split``),
+    the grid, the item-table row count and the int32 ``words`` of the ``items`` formal (``v6_item_words``)."""
+
+    name: str
+    candidate: str
+    split: bool
+    grid: int
+    num_items: int
+    words: bytes
+
+
+def clear_plan_caches() -> None:
+    """Empty every cache of the Blackwell launch planner: the launches, the plans and the chooser's memo tables (the
+    native library and the programs of each state form, ``_v6_launch_builds``, stay)."""
+    _V6_PLANS.clear()
+    _V6_LAUNCHES.clear()
+    for fn in (
+        v6_split_count,
+        v6_split_bal_slot,
+        _v6_decisions,
+        _v6_cut_shape,
+        _v6_cut_costs,
+        _v6_cut_stats,
+        _v6_cut_loads,
+        _v6_cut_rows,
+        _v6_cut_flags,
+        _v6_head_rows,
+    ):
+        fn.cache_clear()
+
+
+def _v6_native_path() -> Path | None:
+    """The native chooser's source: the ``csrc`` of the tree this package runs from, else of the installed
+    FlashInfer."""
+    here = Path(__file__).resolve().parents[2] / "csrc" / V6_NATIVE_SOURCE
+    if here.is_file():
+        return here
+    try:
+        from flashinfer.jit import env as jit_env
+    except ImportError:
+        return None
+    path = Path(jit_env.FLASHINFER_CSRC_DIR) / V6_NATIVE_SOURCE
+    return path if path.is_file() else None
+
+
+def _v6_native_module():
+    """The loaded native chooser, or None when it cannot be built (then the Python chooser plans every call)."""
+    if _V6_NATIVE:
+        return _V6_NATIVE[0]
+    module = None
+    try:
+        path = _v6_native_path()
+        if path is None:
+            raise RuntimeError(f"{V6_NATIVE_SOURCE} not found")
+        from flashinfer.jit.core import gen_jit_spec
+
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        module = gen_jit_spec(f"cake_gdp_v6_plan_{digest}", [path]).build_and_load()
+    except Exception as exc:  # noqa: BLE001 -- any build failure keeps the (slower, equal) Python chooser
+        warnings.warn(
+            f"the native Cake GDP prefill planner is not available ({type(exc).__name__}: {exc}); "
+            "the Python chooser plans every call",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    _V6_NATIVE.append(module)
+    return module
+
+
+def _v6_native_param_parts(arch: str) -> tuple[bytes, bytes]:
+    """The int64 parameter words of the native chooser around ``split_span_min`` (the layout of ``Param`` in its
+    source), from this file's constants."""
+    c = V6_PLAN_COSTS[arch]
+    head = [
+        *(c[k] for k in ("chunk", "warmup", "item", "decode", "fixed")),
+        *(c[k] for k in ("block_chunk", "block_item", "block_decode", "block_fixed")),
+        V6_PLAN_MARGIN_PERCENT,
+        V6_PLAN_ROBUST_PERCENT,
+        V6_PLAN_WARMUP_CAP,
+        SPLIT_MIN_CHUNKS,
+        SPLIT_MAX,
+        SPLIT_COST_CHUNK,
+        SPLIT_COST_ITEM,
+        SPLIT_BAL_MIN_SLOT,
+        SPLIT_BAL_SLOTS.get(arch, 0),
+        INFERENCE_ITEM_COST,
+        INFERENCE_WARMUP_COST,
+    ]
+    tail = [len(V6_PLAN_SPLIT_SPECS)]
+    for _name, floor, bal in V6_PLAN_SPLIT_SPECS:
+        tail += [-1 if floor is None else floor, int(bal)]
+    return array.array("q", head).tobytes(), array.array("q", tail).tobytes()
+
+
+_V6_NATIVE_PARAM_PARTS = {arch: _v6_native_param_parts(arch) for arch in V6_PLAN_COSTS}
+_V6_INT64 = struct.Struct("<q")
+
+
+def _v6_native_params(arch: str, H: int) -> bytes:
+    """The int64 parameter words of the native chooser for ``H`` heads on ``arch`` (the parts are computed once,
+    at import, from this file's constants)."""
+    head, tail = _V6_NATIVE_PARAM_PARTS[arch]
+    return head + _V6_INT64.pack(split_span_min(H, arch)) + tail
+
+
+@functools.lru_cache(maxsize=64)
+def _v6_launch_builds(arch: str, state_dtype: str, pool: bool):
+    """``(split -> program, flags)`` of a state form: flags bit 0 / 1 = the split build reads CTA row offsets /
+    the planned offsets (``csr`` / ``plan_guard``), bits 2 / 3 the same for the block build."""
+    builds = v6_route_builds(arch, state_dtype, pool)
+    flags = 0
+    for split, shift in ((True, 0), (False, 2)):
+        if split in builds:
+            build = MODULES[builds[split]]["build"]
+            flags |= (
+                int(bool(build.get("csr"))) | 2 * int(bool(build.get("plan_guard")))
+            ) << shift
+    return builds, flags
+
+
+def _v6_words(flags: int, plan: V6Plan, cu: Sequence[int]) -> list[int]:
+    """``v6_item_words`` for the build flags of ``_v6_launch_builds``."""
+    shift = 0 if plan.split else 2
+    words = [int(w) for row in (plan.rows or ((0, 0, 0, 0),)) for w in row]
+    if flags >> shift & 1:
+        if plan.offsets is None:
+            raise ValueError("the csr build runs a plan with row offsets")
+        words.extend(int(o) for o in plan.offsets)
+    if flags >> shift & 2:
+        words.extend((len(cu) - 1, *(int(c) for c in cu)))
+    return words
+
+
+def v6_launch_of_plan(
+    arch: str,
+    plan: V6Plan,
+    cu_seqlens: Sequence[int],
+    *,
+    state_dtype: str = "f32",
+    pool: bool = False,
+) -> V6Launch:
+    """The launch of a given ``plan`` (a candidate's, the plan of record) for the host offsets ``cu_seqlens``, on the
+    program of a state form: what ``prefill_v6_launch`` returns for the chooser's plan."""
+
+    builds, flags = _v6_launch_builds(arch, state_dtype, bool(pool))
+    if plan.split not in builds:
+        raise ValueError(
+            f"no Blackwell prefill program on {arch} with split_items={plan.split} for that form"
+        )
+    words = array.array(
+        "i", _v6_words(flags, plan, [int(c) for c in cu_seqlens])
+    ).tobytes()
+    return V6Launch(
+        builds[plan.split], "given", plan.split, plan.grid, len(plan.rows), words
+    )
+
+
+# ctypes views of host memory by (address, bytes): ``_v6_offset_bytes`` reads a CPU tensor's offsets through the view
+# of its memory (``raw``), without a foreign-function call or a NumPy array; at most _V6_HOST_VIEWS_MAX views are kept
+# (a view holds no memory, only the address).
+_V6_HOST_VIEWS: dict[tuple[int, int], Any] = {}
+_V6_HOST_VIEWS_MAX = 64
+
+
+def _v6_host_view(at: tuple[int, int]):
+    # the oldest view out (pop: another thread may have taken it)
+    if len(_V6_HOST_VIEWS) >= _V6_HOST_VIEWS_MAX:
+        _V6_HOST_VIEWS.pop(next(iter(_V6_HOST_VIEWS), None), None)
+    view = _V6_HOST_VIEWS[at] = (ctypes.c_char * at[1]).from_address(at[0])
+    return view
+
+
+def _v6_offset_bytes(cu_seqlens) -> tuple[bytes, int]:
+    """The host offsets as (bytes, element width): a CPU int32 / int64 tensor as is, else int64."""
+    if isinstance(cu_seqlens, torch.Tensor):
+        if cu_seqlens.is_cpu and cu_seqlens.is_contiguous():
+            at = (cu_seqlens.data_ptr(), cu_seqlens.nbytes)
+            view = _V6_HOST_VIEWS.get(at)
+            if view is None:
+                view = _v6_host_view(at)
+            return view.raw, cu_seqlens.itemsize
+        return cu_seqlens.numpy().tobytes(), cu_seqlens.itemsize
+    return array.array("q", cu_seqlens).tobytes(), 8
+
+
+def prefill_v6_launch(
+    cu_seqlens,
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+    state_dtype: str = "f32",
+    pool: bool = False,
+) -> V6Launch:
+    """The launch of a call (see NATIVE PLAN CHOOSER): ``cu_seqlens`` the host offsets as a CPU int32 / int64 tensor
+    or a sequence of integers, the state form as in ``selected_v6_module``."""
+
+    data, width = _v6_offset_bytes(cu_seqlens)
+    key = (
+        data,
+        width,
+        num_heads,
+        num_householder,
+        sm_count,
+        arch,
+        total_tokens,
+        state_dtype,
+        pool,
+    )
+    launch = _V6_LAUNCHES.get(key)  # a hit with the arguments as given
+    if launch is not None:
+        _V6_LAUNCHES.move_to_end(key)
+        return launch
+    if total_tokens is None:
+        total_tokens = int.from_bytes(data[-width:], "little", signed=True)
+    H, n, sm, total = (
+        int(num_heads),
+        int(num_householder),
+        int(sm_count),
+        int(total_tokens),
+    )
+    key = (data, width, H, n, sm, arch, total, state_dtype, bool(pool))
+    launch = _V6_LAUNCHES.lookup(key)
+    if launch is not None:
+        return launch
+    if arch not in V6_ARCHES:
+        raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
+    if sm <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm}")
+    builds, flags = _v6_launch_builds(arch, state_dtype, bool(pool))
+    native = _v6_native_module()
+    if native is not None:
+        out = native.v6_launch(
+            data, width, H, n, sm, total, _v6_native_params(arch, H), flags
+        )
+        cand, split, grid, count, _words = _V6_NATIVE_HEADER.unpack_from(out)
+        candidate, split, words = (
+            V6_PLAN_CANDIDATES[cand],
+            bool(split),
+            out[4 * V6_NATIVE_HEAD :],
+        )
+    else:
+        cu = array.array("q" if width == 8 else "i", data).tolist()
+        candidate, plan = _v6_reference(tuple(cu), H, n, sm, arch, total)
+        split, grid, count = plan.split, plan.grid, len(plan.rows)
+        words = array.array("i", _v6_words(flags, plan, cu)).tobytes()
+    _v6_check_grid(grid, sm)
+    if split not in builds:
+        raise ValueError(
+            f"no Blackwell prefill program on {arch} with split_items={split}, state_dtype={state_dtype!r} and "
+            f"pool={bool(pool)}; the route ships the forms {sorted(v6_state_forms(arch))}"
+        )
+    launch = V6Launch(builds[split], candidate, split, grid, count, words)
+    _V6_LAUNCHES.put(key, launch, len(words))
+    return launch
+
+
+# ---- END NATIVE PLAN CHOOSER ----
 
 
 def v6_item_words(
@@ -18080,18 +19554,31 @@ __all__ = [
     "STATE_ALIGNMENT_BYTES",
     "STATE_DTYPES",
     "STATE_STRIDE_ELEMENTS",
+    "V6Launch",
     "V6Plan",
     "V6Sm90Plan",
     "V6_ARCHES",
     "V6_BODY",
+    "V6_PLAN_CANDIDATES",
+    "V6_PLAN_COSTS",
+    "V6_PLAN_FLOORS",
+    "V6_PLAN_MARGIN_PERCENT",
+    "V6_PLAN_ROBUST_PERCENT",
+    "V6_PLAN_WARMUP_CAP",
     "arch_for_capability",
+    "clear_plan_caches",
     "device_arch",
+    "inference_csr",
+    "inference_lists",
     "inference_placement",
     "inference_row_cost",
     "launch_grid",
     "launch_split",
     "library_name",
     "load",
+    "lpt_counts",
+    "lpt_place",
+    "lpt_rounds",
     "max_num_tokens",
     "prefill_batch_body",
     "prefill_batch_costs",
@@ -18102,7 +19589,14 @@ __all__ = [
     "prefill_route_applies",
     "prefill_route_modules",
     "prefill_split_table",
+    "prefill_v6_candidate_plan",
+    "prefill_v6_launch",
     "prefill_v6_plan",
+    "prefill_v6_plan_candidates",
+    "prefill_v6_plan_choice",
+    "prefill_v6_plan_reference",
+    "prefill_v6_plan_scenarios",
+    "prefill_v6_record_plan",
     "prefill_v6_sm90_plan",
     "route_applies",
     "route_chunk_steps",
@@ -18119,8 +19613,11 @@ __all__ = [
     "state_dtype_key",
     "supported_num_householder",
     "v6_householders",
+    "v6_launch_of_plan",
     "v6_sm90_item_words",
     "v6_sm90_serial_load",
+    "v6_split_bal_slot",
+    "v6_split_count",
     "v6_state_form",
     "v6_state_forms",
 ]

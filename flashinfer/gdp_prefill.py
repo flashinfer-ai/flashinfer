@@ -145,9 +145,10 @@ def chunk_gated_delta_product(
         the split programs add a workspace clear and the item-table upload
         (from pinned host memory into a cached device buffer, so the call
         captures into a CUDA graph when ``cu_seqlens_cpu`` is given).  On
-        SM100 / SM103 one launch serves a mixed batch: the long sequences are
-        planned as if alone and the short ones run on the least-loaded CTAs
-        after them.  On SM90 one launch serves a mixed batch too: a long
+        SM100 / SM103 one launch serves a mixed batch: the plan (the cuts of
+        the long sequences and the build) is chosen per batch by a modeled
+        launch time, and the short sequences run on the least-loaded CTAs
+        after the long ones.  On SM90 one launch serves a mixed batch too: a long
         sequence that fills the SMs (when that is the lighter launch) is cut
         into one slot per SM, each piece after a cut starting from a zero
         state a warm-up before it (a cut whose gates do not decay by
