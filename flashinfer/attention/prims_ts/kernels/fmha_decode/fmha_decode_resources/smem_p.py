@@ -909,6 +909,19 @@ class SmemPResource(DecodeGenResourceBase):
                     packed_p.data_ptr().load(count=4, alignment=4),
                     offset=cfg.num_packed_p_regs,
                 )
+                if cutlass.const_expr(cfg.keeps_o_uses_lane_panels):
+                    # D512 lane-panel O: PV for head-dim stages 2/3 writes lanes
+                    # 16-31, and an M64 TMEM A operand is read from the lanes of
+                    # its accumulator rows, so P is duplicated into that panel.
+                    _keeps_tcgen05_st(
+                        cfg,
+                        prims.make_tmem_ptr(
+                            p_tmem_addr + Int32(cfg.keeps_p_lane_panel_tmem_offset(2)),
+                            Int32,
+                        ),
+                        packed_p.data_ptr().load(count=4, alignment=4),
+                        offset=cfg.num_packed_p_regs,
+                    )
             else:
                 logical_col = col_base + Int32(s_base)
                 smem_offset_bytes = _keeps_p_smem_block_offset_bytes(

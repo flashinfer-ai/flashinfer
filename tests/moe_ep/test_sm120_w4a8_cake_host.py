@@ -628,6 +628,46 @@ def test_kernel_abi_is_fully_bound_and_scratch_matches_geometry() -> None:
             )
 
 
+def _result_chunk_count(routes: int) -> int:
+    """Result chunks the device emits for one source -> owner route count: full chunks of
+    32 routes below 768 routes, 128 below 8192 and 64 above, then a tail in 64-route units."""
+
+    q = 32 if routes < 768 else 128 if routes < 8192 else 64
+    full = max((routes + q - 1) // q - 1, 0)
+    return full + (routes - full * q + 63) // 64
+
+
+def test_result_chunk_ids_stay_inside_their_source_stride() -> None:
+    """A result chunk id is ``source * RESULT_CHUNKS + local`` and the consumers recover the
+    source by division, so every local index the schedule can emit for up to
+    ``max_rows * top_k`` routes must stay below the stride.  The chunk count is not monotone
+    in the route count (767 routes -> 24 chunks, 768 -> 7), hence the full sweep."""
+
+    G = _geometry()
+    spot_counts = {0: 0, 416: 13, 417: 14, 767: 24, 768: 7}
+    assert {r: _result_chunk_count(r) for r in spot_counts} == spot_counts
+    for max_rows in (128, 256, 384, 1536):
+        for top_k in range(1, 10):
+            needed = max(_result_chunk_count(r) for r in range(max_rows * top_k + 1))
+            for ep in (2, 4, 16):
+                kernel = G.describe_kernel(
+                    G.KernelParams(ep, 256, top_k, max_rows, 4096, 2048, True)
+                )
+                for name, instance in kernel["instances"].items():
+                    c, buffers = instance["constants"], instance["buffers"]
+                    stride = c["RESULT_CHUNKS"]
+                    assert needed <= stride, (name, ep, max_rows, top_k, stride)
+                    for buffer in (
+                        "result_chunk_total",
+                        "result_chunk_tally",
+                        "result_ovf_cursor",
+                    ):
+                        assert buffers[buffer][1][0] >= ep * stride
+                    assert c["RESULT_COPY_SLOTS"] >= ep * stride
+                    # Queue entries (one per completed chunk) precede the push cursors.
+                    assert c["PUSH_CURSOR_BASE"] >= ep * needed
+
+
 def test_epoch_is_device_resident() -> None:
     """The kernel takes its epoch from a zero-initialised u32[1] scratch word, never a host scalar
     (CUDA-graph capture: a captured launch must not freeze the epoch)."""

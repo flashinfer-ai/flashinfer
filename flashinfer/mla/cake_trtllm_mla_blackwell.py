@@ -39,7 +39,12 @@ limitations under the License.
 # row's KV tiles into ``num_split`` equal ranges (``plan_kv_split``, from host-known
 # sizes and the device only: up to 32 splits, 64 for one query row of long KV) and a
 # reducer program merges the partials in a fixed order; so does the FP8 page-64
-# reducer, whose two builds (``plan_fp8_reduce_ctas``) write the same bits.
+# reducer, whose two builds (``plan_fp8_reduce_ctas``) write the same bits.  The
+# split-KV reducer of more than 32 splits also reads ``seq_lens`` after its
+# dependency wait and merges only the splits that hold KV tiles, with the bits of
+# merging every split; it must see the lengths the mainloop read, so it runs as the
+# mainloop's dependent on one stream or in one CUDA graph, and no other writer of
+# ``seq_lens`` may run in between.
 # Ragged value-split calls, the exact-geometry and native split-KV programs and
 # the generic tails read
 # per-row metadata (row -> request, causal KV length, page rows, work order) that
@@ -184,8 +189,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc_kernel.cu",
+    "cake_trtllm_mla_blackwell_a310b2fcce209bd2556b": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_a310b2fcce209bd2556b_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -325,7 +330,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
             "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
-            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
+            "cake_trtllm_mla_blackwell_a310b2fcce209bd2556b",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_splitkv",
@@ -428,14 +433,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9_sm_103a_32a1975e851a",
             "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_sm_103a_b314ebedc258",
             "-DCAKE_VARIANT_NS_2=variant_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15_sm_103a_b314ebedc258",
-            "-DCAKE_VARIANT_NS_3=variant_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc_sm_103a_b314ebedc258",
+            "-DCAKE_VARIANT_NS_3=variant_cake_trtllm_mla_blackwell_a310b2fcce209bd2556b_sm_103a_b314ebedc258",
             "-DCAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS=7",
         ],
         "dependencies": [
             "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
             "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
-            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
+            "cake_trtllm_mla_blackwell_a310b2fcce209bd2556b",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_splitkv",

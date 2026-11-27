@@ -2890,7 +2890,7 @@ def test_trtllm_mla_blackwell_device_row_bindings() -> None:
         assert order["arch"] == arch and order["domain"] == "mla_bf16_clc_order"
         # The split-KV binding takes the caller's seq_lens and block_tables too and
         # links its mainloop and three reducer builds (prefetch_any, prefetch_all
-        # and the wide build for more than 32 splits).
+        # and the wide build for more than 32 splits, which also reads seq_lens).
         splitkv = FAMILIES[ROUTES[f"mla_bf16_splitkv__{arch}"]]
         assert splitkv["binding"] == _SPLITKV_BINDING
         assert splitkv["arch"] == arch and splitkv["domain"] == "mla_bf16_splitkv"
@@ -2898,7 +2898,7 @@ def test_trtllm_mla_blackwell_device_row_bindings() -> None:
             "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
             "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
-            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
+            "cake_trtllm_mla_blackwell_a310b2fcce209bd2556b",
         ]
     assert _SPLITKV_BINDING != _CLC_BINDING
     assert _SPLITKV_BINDING not in _VALUE_SPLIT_BINDINGS

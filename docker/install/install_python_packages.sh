@@ -134,10 +134,12 @@ fi
 if want_stage deps; then
   # wheel is imported by flashinfer-jit-cache's build backend, which CI builds
   # without isolation. Resolve the remaining image dependencies together once.
+  # cuda-core 1.3 requires newer bindings than the cu129/cu130 images provide.
   pip3 install \
     -r /install/requirements.txt \
     responses pytest scipy build wheel \
     "${CUDA_PYTHON}" \
+    "cuda-core<1.3" \
     "${NVSHMEM4PY}" \
     "${CI_IMAGE_DEPENDENCIES[@]}"
 
