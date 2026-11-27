@@ -63,7 +63,7 @@ def test_merge_states_full_buffer_past_uint32_boundary(seq_len, num_chunks, num_
 def test_merge_states_rejects_head_tiles_past_grid_y_limit():
     """Verify more than 65,535 * 32 heads at D=512 fail with a launch error.
 
-    V and the merged output take 2.1 GiB each.
+    V and the merged output take about 2 GiB each.
     """
     num_heads = 65_535 * 32 + 1
     if torch.cuda.mem_get_info()[0] < (5 << 30):

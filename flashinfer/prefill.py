@@ -3334,8 +3334,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             CUTLASS primitives. Its effective softmax scale, ``sm_scale * q_scale * k_scale``,
             must be positive in FP32 and at most ``2^29 / (448^2 * head_dim) / log2(e)``
             (3.62 for ``head_dim=512``); ``run`` raises ``ValueError`` otherwise. The bound
-            only rules out underflow; very large scaled logits still lose accuracy (see
-            ``flashinfer.attention.cute_dsl.sm120_fmha``).
+            keeps the largest softmax weight from underflowing; very large scaled logits
+            can still lose accuracy (see ``flashinfer.attention.cute_dsl.sm120_fmha``).
 
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
@@ -6130,9 +6130,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend. Its
             effective softmax scale, ``sm_scale * q_scale * k_scale``, must be positive in
             FP32 and at most ``2^29 / (448^2 * head_dim) / log2(e)`` (3.62 for
-            ``head_dim=512``); ``run`` raises ``ValueError`` otherwise. The bound only
-            rules out underflow; very large scaled logits still lose accuracy (see
-            ``flashinfer.attention.cute_dsl.sm120_fmha``).
+            ``head_dim=512``); ``run`` raises ``ValueError`` otherwise. The bound keeps
+            the largest softmax weight from underflowing; very large scaled logits can
+            still lose accuracy (see ``flashinfer.attention.cute_dsl.sm120_fmha``).
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
             opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
 

@@ -887,9 +887,10 @@ def test_sm120_d512_scale_upper_bound(bound):
 @pytest.mark.parametrize("page_size", [None, 16])
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="Known limitation shared with the D<=256 SM120 FP8 kernels: the softmax "
-    "subtracts the unscaled row max after scaling in FP32, so for |max logit| * scale * "
-    "log2(e) far above 2^23 the rescaled maximum saturates FP8 P (here O = 0.219, not 1).",
+    "subtracts the unscaled row max after scaling in FP32, and for this large positive "
+    "logit the rounding pushes the pre-scaled weight past FP8 P's range (O = 0.219, not 1).",
 )
 def test_sm120_d512_large_logit_saturates_fp8_p(page_size):
     """Document that a single key with every Q/K component 384 (logit 75,497,472) at

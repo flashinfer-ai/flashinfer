@@ -34,16 +34,19 @@ disable it.
 Large logits
 ------------
 The softmax of every head dimension takes the row max ``m`` of the unscaled
-logits and subtracts it after scaling in FP32, so FP32 rounding shifts the
-exponent of each weight by up to about ``x * 2^-23``, where
-``x = |m| * scale * log2(e)``. Weights are stored as FP8 E4M3 for the P @ V MMA
-(pre-scaled by 256, saturating at 448), so once ``x`` exceeds about ``2^23`` the
-row maximum can saturate and bias ``O``. With one key and ``V = 1``, ``O``
-depends only on ``x``: ``x = 2.7e7`` and ``1.1e8`` give ``O = 0.965`` and
-``0.219`` for ``D = 128``, ``256`` and ``512`` alike (``x = 1.1e8`` is, for
-example, every Q/K component 384 at ``D = 512`` and ``sm_scale = 1``). The
-``sm_scale`` upper bound only keeps the largest weight from underflowing to
-zero; it does not prevent this.
+logits and subtracts it after scaling in FP32. The signed rounding error of that
+subtraction, up to about ``x * 2^-23`` with ``x = |m| * scale * log2(e)``,
+shifts the exponent of every weight in the row. Weights are pre-scaled by 256
+and stored as FP8 E4M3 (finite up to 448) for the P @ V MMA, while the FP32 row
+sum uses the unclipped weights, so a weight pushed above 448 biases ``O`` low.
+The sign of the error matters, not only ``x``: with one key, a logit of
+``+75,497,472`` (every Q/K component 384 at ``D = 512``, ``sm_scale = 1``)
+pre-scales the weight to 2048 and gives ``O = 0.219``, while ``-75,497,472``
+gives 32 and no saturation. In the measured positive-logit, one-key cases with
+``V = 1``, ``x = 1.7e6``, ``2.7e7`` and ``1.1e8`` gave ``O`` of about ``0.969``,
+``0.965`` and ``0.219`` for ``D = 128``, ``256`` and ``512``. The ``sm_scale``
+upper bound only keeps the largest weight from underflowing to zero; it does not
+prevent this.
 
 Optional dependency
 -------------------
@@ -381,8 +384,8 @@ def sm120_fmha_fp8_ragged_prefill(
     sm_scale : float, optional
         Softmax scale. ``sm_scale * log2(e)`` must be positive in FP32 (subnormals
         allowed) and at most ``2^29 / (448^2 * D)`` (``sm_scale`` <= 3.62 for ``D=512``).
-        Defaults to ``1 / sqrt(D)``. Very large scaled logits lose accuracy; see "Large
-        logits" in the module docstring.
+        Defaults to ``1 / sqrt(D)``. Very large scaled logits can lose accuracy; see
+        "Large logits" in the module docstring.
     kv_tile : int, optional
         K/V tile size (64 or 128). Defaults to 64 for ``D=512`` and 128 for
         other supported head dimensions.
@@ -591,8 +594,8 @@ def sm120_fmha_fp8_paged_prefill(
     sm_scale : float, optional
         Softmax scale. ``sm_scale * log2(e)`` must be positive in FP32 (subnormals
         allowed) and at most ``2^29 / (448^2 * D)`` (``sm_scale`` <= 3.62 for ``D=512``).
-        Defaults to ``1 / sqrt(D)``. Very large scaled logits lose accuracy; see "Large
-        logits" in the module docstring.
+        Defaults to ``1 / sqrt(D)``. Very large scaled logits can lose accuracy; see
+        "Large logits" in the module docstring.
     max_seqlen_q : int, optional
         Runtime launch-grid bound. Derived from ``cu_seqlens_q`` if omitted.
     kv_tile : int, optional
