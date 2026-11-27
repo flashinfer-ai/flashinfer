@@ -705,10 +705,11 @@ class Sm8xTrtllmDeepSeekFp8MoE(_Sm8xTrtllmFp8MoEBase):
 
 class Sm8xTrtllmFp8PerTensorMoE(_Sm8xTrtllmFp8MoEBase):
     """``TrtllmFp8PerTensorRunner`` on SM8x: the shuffled E4M3 weights and three
-    per-expert float32 scales, GEMM1's gated columns ``up, gate, ...``. GEMM1's output
-    times ``output1_scales_gate_scalar`` is the activation's input (for Llama4 routing
-    also times the token's routing weight, which the finalize then skips), the
-    activation times ``output1_scales_scalar`` over it (gated) GEMM2's E4M3 input, and
+    per-expert float32 scales, GEMM1's gated columns ``up, gate, ...``. For Llama4
+    routing GEMM1's output first takes the token's routing weight, which the finalize
+    then skips. ``output1_scales_gate_scalar`` dequantizes the gate half (all of a
+    non-gated output) while the up half stays in accumulator units, its dequant folded
+    into ``output1_scales_scalar``, which times the activation into GEMM2's E4M3 input.
     GEMM2's output times ``output2_scales_scalar``. Inputs: ``[hidden, ids, weights, w1,
     w2, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar]``."""
 
@@ -733,13 +734,15 @@ class Sm8xTrtllmFp8PerTensorMoE(_Sm8xTrtllmFp8MoEBase):
     ) -> Dict[str, Optional[torch.Tensor]]:
         if self.config.activation.type != ActivationType.SwigluStep:
             return {}
-        # A view limit is in accumulator units (prepare divides by the gate scale).
+        # The gate's SiLU clamps at the physical limit, the up half (accumulator units)
+        # at the accumulator-unit one. A view limit is in accumulator units (prepare
+        # divides by the gate scale); without one the kernels use SwiGLUStep.limit.
+        gate_scale = kwargs["output1_scales_gate_scalar"]
         limit = kwargs.get("gemm1_clamp_limit")
-        return dict(
-            swiglu_limit=self._config_limit()
-            if limit is None
-            else limit * kwargs["output1_scales_gate_scalar"]
-        )
+        if limit is None:
+            physical = self._config_limit()
+            return dict(gate_limit=physical, up_limit=physical / gate_scale)
+        return dict(gate_limit=limit * gate_scale, up_limit=limit)
 
     def run(  # type: ignore[override]
         self, inputs: List[Optional[torch.Tensor]], kwargs: Mapping[str, Any]
@@ -770,8 +773,7 @@ class Sm8xTrtllmFp8PerTensorMoE(_Sm8xTrtllmFp8MoEBase):
     def _activate(self, gemm1_out, layout, workspace, inputs) -> torch.Tensor:
         rows = gemm1_out.shape[0]
         row_expert = layout.row_expert(rows)
-        gate_scale = inputs[6].index_select(0, row_expert)
-        x = gemm1_out.mul_(gate_scale[:, None])
+        x = gemm1_out
         if self._input_weights is not None:
             slots = layout.token_to_row.reshape(-1)
             row_weight = x.new_zeros(rows + 1).index_copy_(
@@ -780,18 +782,27 @@ class Sm8xTrtllmFp8PerTensorMoE(_Sm8xTrtllmFp8MoEBase):
                 self._input_weights.reshape(-1).float(),
             )
             x.mul_(row_weight[:rows, None])
-        y = cutlass_activation(
-            x,
-            self.config.activation.type,
-            self._activation_params,
-            row_expert,
-            self._interleaved_gemm1,
-        )
-        scale = inputs[5].index_select(0, row_expert)
-        if self.config.activation.is_gated:
-            scale = scale / gate_scale
+        gate_scale = inputs[6].index_select(0, row_expert)[:, None]
+        activation_type = self.config.activation.type
+        if not self.config.activation.is_gated:
+            y = cutlass_activation(x.mul_(gate_scale), activation_type, {}, row_expert)
+        else:
+            up, gate = x[:, 0::2], x[:, 1::2]
+            y = F.silu(gate.mul_(gate_scale))
+            if activation_type == ActivationType.SwigluStep:
+                params = self._activation_params
+                # fmin: a zero gate scale with an infinite view limit gives NaN here.
+                y = torch.fmin(y, _per_row(params, "gate_limit", row_expert, math.inf))
+                up_limit = _per_row(params, "up_limit", row_expert, math.inf)
+                up = up.clamp(-up_limit, up_limit)
+            elif activation_type != ActivationType.Swiglu:
+                raise NotImplementedError(
+                    f"{type(self).__name__} has no {activation_type!r} activation."
+                )
+            y = y.mul_(up)
+        scale = inputs[5].index_select(0, row_expert)[:, None]
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        return y.mul_(scale[:, None]).clamp_(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        return y.mul_(scale).clamp_(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
 
     def _gemm2(self, inputs, layout, workspace, intermediate, tactic) -> torch.Tensor:
         acc = sm8x_grouped_mm_fp8(
