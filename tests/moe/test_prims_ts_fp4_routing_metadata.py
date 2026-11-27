@@ -187,6 +187,17 @@ def test_slot_runs_its_tile(experts, tile_n):
     torch.testing.assert_close(out[0], want, rtol=1e-2, atol=1e-2)
 
 
+def test_rejects_metadata_for_other_experts(experts):
+    """A collection populated for another local expert interval is refused."""
+    quant, view = experts
+    num_tokens = 64
+    hidden_states, scale = _activations(quant, num_tokens, seed=2)
+    routing = _routing(num_tokens, seed=2)
+    other = _metadata(routing, local_expert_offset=LOCAL - 1)
+    with pytest.raises(ValueError, match="was populated for"):
+        _call(view, hidden_states, scale, routing, True, routing_metadata=other)
+
+
 def test_graph_replay_follows_new_routing(experts):
     """Each replay repopulates the metadata from the live routing."""
     quant, view = experts

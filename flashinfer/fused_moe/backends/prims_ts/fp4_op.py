@@ -124,11 +124,31 @@ def _resolve_routing_inputs(
 
 def _check_routing_metadata_args(
     *,
+    routing_metadata,
     hidden_states: torch.Tensor,
     routing_input_mode: int,
     routing_replay_out: Optional[torch.Tensor],
     num_fused_shared_experts: Optional[int],
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int,
+    local_num_experts: int,
 ) -> None:
+    # A collection records the expert interval it was populated for; a bare slot does not.
+    if not hasattr(routing_metadata, "tile_n"):
+        populated = (
+            routing_metadata.num_experts,
+            routing_metadata.top_k,
+            routing_metadata.local_expert_offset,
+            routing_metadata.num_local_experts,
+        )
+        call = (num_experts, top_k, local_expert_offset, local_num_experts)
+        if populated != call:
+            raise ValueError(
+                "routing_metadata was populated for (num_experts, top_k, "
+                f"local_expert_offset, num_local_experts)={populated}, but the call "
+                f"uses {call}"
+            )
     if hidden_states.dtype != torch.uint8:
         raise ValueError("routing_metadata supports NVFP4 activations only")
     if RoutingInputMode(routing_input_mode) == RoutingInputMode.FromLogits:
@@ -332,10 +352,15 @@ def prims_ts_fp4_block_scale_moe(
 
     if routing_metadata is not None:
         _check_routing_metadata_args(
+            routing_metadata=routing_metadata,
             hidden_states=hidden_states,
             routing_input_mode=routing_input_mode,
             routing_replay_out=routing_replay_out,
             num_fused_shared_experts=num_fused_shared_experts,
+            num_experts=num_experts,
+            top_k=top_k,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
         )
     if hidden_states.dtype == torch.uint8:
         runner_cls = PrimsTsNvfp4MoERunner
@@ -673,10 +698,15 @@ def prims_ts_fp4_block_scale_moe_partitioned(
     )
     if routing_metadata is not None:
         _check_routing_metadata_args(
+            routing_metadata=routing_metadata,
             hidden_states=hidden_states,
             routing_input_mode=routing_mode,
             routing_replay_out=routing_replay_out,
             num_fused_shared_experts=None,
+            num_experts=num_experts,
+            top_k=top_k,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
         )
     routing_logits, resolved_topk_ids, expert_weights = _resolve_routing_inputs(
         routing_input_mode=routing_mode,
