@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""merge_states over partial buffers larger than 2^32 elements.
+"""merge_states over partial buffers past 32-bit offsets and CUDA grid limits.
 
-Each case allocates 8-10 GiB of GPU memory, so this file runs alone on its GPU.
+The cases allocate 2-10 GiB of GPU memory, so this file runs alone on its GPU.
 """
 
 import math
@@ -58,3 +58,14 @@ def test_merge_states_full_buffer_past_uint32_boundary(seq_len, num_chunks, num_
     ref_o, ref_lse = _ref_merge_rows(v, s, rows)
     torch.testing.assert_close(merged_o[rows].float(), ref_o, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(merged_lse[rows], ref_lse, atol=1e-3, rtol=1e-3)
+
+
+def test_merge_states_rejects_head_tiles_past_grid_y_limit():
+    """Verify more than 65,535 * 32 heads at D=512 (2.1 GiB of V) fail with a launch error."""
+    num_heads = 65_535 * 32 + 1
+    if torch.cuda.mem_get_info()[0] < (3 << 30):
+        pytest.skip("needs 3 GiB of free GPU memory")
+    v = torch.empty((1, 1, num_heads, 512), dtype=torch.bfloat16, device="cuda")
+    s = torch.zeros((1, 1, num_heads), device="cuda")
+    with pytest.raises(RuntimeError, match="MergeStates kernel launch failed"):
+        flashinfer.merge_states(v, s)

@@ -842,3 +842,22 @@ def test_public_wrappers_reject_non_finite_positive_effective_scale(kind, q_scal
     out = wrapper.run(*inputs, q_scale=1e-30)
     torch.cuda.synchronize()
     assert bool(torch.isfinite(out.float()).all())
+
+
+@pytest.mark.parametrize("kind", ["ragged", "paged"])
+def test_fa2_empty_batch_plan_still_fails_as_upstream(kind):
+    """Only cute-dsl-prims admits an empty batch; FA2 keeps failing in plan()."""
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    zero = torch.zeros(1, dtype=torch.int32, device="cuda")
+    none = torch.empty(0, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match=r"max\(\): Expected reduction dim"):
+        if kind == "ragged":
+            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                workspace, "NHD", backend="fa2"
+            )
+            wrapper.plan(zero, zero, 8, 2, 128)
+        else:
+            wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                workspace, "NHD", backend="fa2"
+            )
+            wrapper.plan(zero, zero, none, none, 8, 2, 128, 16)

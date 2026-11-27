@@ -139,28 +139,37 @@ def _resolve_balanced_scheduler(
     return balanced_scheduler
 
 
-_FP32_MIN_NORMAL = 2.0**-126
+def _max_scale_log2(head_dim: int) -> float:
+    """Largest supported ``sm_scale * log2(e)`` for FP8 E4M3 inputs at ``head_dim``.
+
+    The softmax takes the row max of the unscaled logits and subtracts it after scaling in
+    FP32. Rounding shifts every exponent in the row by up to ``|max logit| * scale * 2^-23``.
+    With the largest FP8 logit, ``448^2 * head_dim``, this bound keeps that shift at most 64,
+    well inside FP32's ``exp2`` range, so the largest weight cannot underflow to zero.
+    """
+    return 2.0**29 / (448.0**2 * head_dim)
 
 
-def _scale_log2(sm_scale: float) -> float:
+def _scale_log2(sm_scale: float, head_dim: int) -> float:
     """Return ``sm_scale * log2(e)`` rounded to FP32, the scale the kernel receives.
 
-    The online softmax takes the row max of the unscaled logits, which is the max of the
-    scaled logits only for a positive scale; a zero scale also turns masked -inf logits into
-    NaN. The check runs after FP32 rounding so scales that underflow to zero or overflow to
-    infinity are rejected too.
+    It must be positive: the online softmax takes the row max of the unscaled logits, which
+    is the max of the scaled logits only for a positive scale, and a zero scale turns masked
+    -inf logits into NaN. The check runs after FP32 rounding, so scales that underflow to
+    zero are rejected; positive subnormals are kept. See ``_max_scale_log2`` for the bound.
     """
+    max_scale = _max_scale_log2(head_dim) / math.log2(math.e)
     try:
         value = struct.unpack(
             "f", struct.pack("f", float(sm_scale) * math.log2(math.e))
         )[0]
     except OverflowError:
         value = math.inf
-    if not (math.isfinite(value) and value >= _FP32_MIN_NORMAL):
+    if not (0.0 < value <= _max_scale_log2(head_dim)):
         raise ValueError(
             "the effective softmax scale (sm_scale, times q_scale * k_scale in the "
-            "batch-prefill wrappers) must be finite and positive in FP32, got "
-            f"{sm_scale!r}"
+            "batch-prefill wrappers) must be positive in FP32 and at most "
+            f"{max_scale:.4g} for head_dim={head_dim}; got {sm_scale!r}"
         )
     return value
 
@@ -354,7 +363,8 @@ def sm120_fmha_fp8_ragged_prefill(
         scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1`` or the
         Q-tile count exceeds CUDA's ``grid.y`` limit (65,535).
     sm_scale : float, optional
-        Softmax scale. ``sm_scale * log2(e)`` must be finite and positive (normal) in FP32.
+        Softmax scale. ``sm_scale * log2(e)`` must be positive in FP32 (subnormals
+        allowed) and at most ``2^29 / (448^2 * D)`` (``sm_scale`` <= 3.62 for ``D=512``).
         Defaults to ``1 / sqrt(D)``.
     kv_tile : int, optional
         K/V tile size (64 or 128). Defaults to 64 for ``D=512`` and 128 for
@@ -424,7 +434,7 @@ def sm120_fmha_fp8_ragged_prefill(
         )
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
-    scale_log2 = Float32(_scale_log2(sm_scale))
+    scale_log2 = Float32(_scale_log2(sm_scale, D))
     # CUDA tensor maps cannot describe a zero-extent tensor and CUDA rejects an
     # empty grid. Handle an empty batch, zero total Q tokens, or all-empty K/V
     # before TMA descriptor construction; requests with empty K/V inside a
@@ -562,7 +572,8 @@ def sm120_fmha_fp8_paged_prefill(
         scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1`` or the
         Q-tile count exceeds CUDA's ``grid.y`` limit (65,535).
     sm_scale : float, optional
-        Softmax scale. ``sm_scale * log2(e)`` must be finite and positive (normal) in FP32.
+        Softmax scale. ``sm_scale * log2(e)`` must be positive in FP32 (subnormals
+        allowed) and at most ``2^29 / (448^2 * D)`` (``sm_scale`` <= 3.62 for ``D=512``).
         Defaults to ``1 / sqrt(D)``.
     max_seqlen_q : int, optional
         Runtime launch-grid bound. Derived from ``cu_seqlens_q`` if omitted.
@@ -650,7 +661,7 @@ def sm120_fmha_fp8_paged_prefill(
     threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, B)
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
-    scale_log2 = Float32(_scale_log2(sm_scale))
+    scale_log2 = Float32(_scale_log2(sm_scale, D))
     if B == 0:
         o.zero_()
         if lse is not None:
@@ -674,8 +685,12 @@ def sm120_fmha_fp8_paged_prefill(
         raise ValueError(
             f"o must have {num_chunks} row(s) per Q token, got {o.shape[0]} rows for {q.shape[0]} tokens"
         )
-    # CUDA rejects an empty grid; zero total Q tokens leave nothing to write.
-    if q.shape[0] == 0:
+    # CUDA rejects an empty grid and TMA descriptors need a nonzero page count. A pool
+    # without pages holds no K/V, so every row (or partial row) is empty.
+    if q.shape[0] == 0 or k_pool.shape[0] == 0:
+        o.zero_()
+        if lse is not None:
+            lse.fill_(-float("inf"))
         return
 
     in_ct = _cutlass_dtype(q.dtype)
@@ -882,7 +897,8 @@ class SM120PrimsBatchPrefillBackend:
     Runtime LSE specializations are compiled lazily and cached before dispatch.
     PDL is a runtime launch option shared by every compiled kernel.
     ``run_*`` folds ``q_scale * k_scale`` into ``sm_scale``; the effective scale
-    must be finite and positive in FP32, or ``run_*`` raises ``ValueError``.
+    must satisfy the ``sm_scale`` range of the prefill functions, or ``run_*``
+    raises ``ValueError``.
     """
 
     _FP8_DTYPES = (torch.float8_e4m3fn,)

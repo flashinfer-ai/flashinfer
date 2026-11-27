@@ -101,8 +101,8 @@ void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, Tensor
 }
 
 void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_merged) {
-  CHECK_INPUT(v);
-  CHECK_INPUT(s);
+  CHECK_CUDA(v);
+  CHECK_CUDA(s);
   CHECK_DEVICE(s, v);
   CHECK_DIM(4, v);
   CHECK_DIM(3, s);
@@ -113,6 +113,12 @@ void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_
   unsigned int num_index_sets = v.size(1);
   unsigned int num_heads = v.size(2);
   unsigned int head_dim = v.size(3);
+  // An empty output needs no data (MergeStates returns early for it), and zero-size
+  // dimensions make the inputs fail the strict contiguity check.
+  if (seq_len != 0 && num_heads != 0) {
+    CHECK_CONTIGUOUS(v);
+    CHECK_CONTIGUOUS(s);
+  }
 
   ffi::CUDADeviceGuard device_guard(v.device().device_id);
   auto stream = get_stream(v.device());

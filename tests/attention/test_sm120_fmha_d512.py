@@ -751,7 +751,7 @@ def test_paged_metadata_consistency_and_empty_batch(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "sm_scale", [0.0, -0.05, float("nan"), float("inf"), 1e-50, 1e39]
+    "sm_scale", [0.0, -0.05, float("nan"), float("inf"), 1e-50, 3.63, 1e39]
 )
 def test_rejects_non_positive_sm_scale(monkeypatch, sm_scale):
     """Verify sm_scale * log2(e) must be finite and positive in FP32: the online softmax takes
@@ -847,6 +847,102 @@ def _ref_attention(q_b, k_b, v_b, sm_scale, is_causal, v_scale=1.0):
     out = torch.einsum("hqk,hkd->hqd", probs, vf).transpose(0, 1) * v_scale
     lse = torch.logsumexp(scores, dim=-1).transpose(0, 1) * math.log2(math.e)
     return out, lse
+
+
+@_requires_sm120
+@pytest.mark.parametrize("bound", ["at", "above"])
+def test_sm120_d512_scale_upper_bound(bound):
+    """Verify the largest accepted scale still returns V for a single key with logit 511.
+
+    The softmax subtracts the row max after scaling in FP32; far above the bound (for example
+    sm_scale=1e8) that rounding makes every weight underflow and the output silently zero.
+    """
+    max_scale = sm120_fmha_mod._max_scale_log2(512) / math.log2(math.e)
+    sm_scale = max_scale * (1 - 1e-6 if bound == "at" else 1 + 1e-6)
+    h, d = 4, 512
+    q = torch.ones((1, h, d), device="cuda").to(torch.float8_e4m3fn)
+    k = torch.ones((1, h, d), device="cuda")
+    k[..., 0] = 0  # q . k = 511
+    k = k.to(torch.float8_e4m3fn)
+    v = _make_fp8((1, h, d), seed=1)
+    o = torch.empty((1, h, d), dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty((1, h), dtype=torch.float32, device="cuda")
+    cu = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    run = lambda: sm120_fmha_fp8_ragged_prefill(  # noqa: E731
+        q, k, v, o, cu, cu, sm_scale=sm_scale, lse=lse
+    )
+    if bound == "above":
+        with pytest.raises(ValueError, match="at most 3.621 for head_dim=512"):
+            run()
+        return
+    run()
+    torch.testing.assert_close(o.float(), v.float(), atol=0, rtol=0)
+    torch.testing.assert_close(
+        lse, torch.full_like(lse, 511 * sm_scale * math.log2(math.e)), atol=0, rtol=1e-5
+    )
+
+
+@_requires_sm120
+@pytest.mark.parametrize("page_size", [None, 16])
+def test_sm120_d512_subnormal_scale_matches_reference(page_size):
+    """Verify a positive scale that is subnormal in FP32 (1e-39) is accepted and correct."""
+    hq, hkv, d, q_len, kv_len = 8, 2, 512, 4, 100
+    q = _make_fp8((q_len, hq, d), seed=2)
+    k = _make_fp8((kv_len, hkv, d), seed=3)
+    v = _make_fp8((kv_len, hkv, d), seed=4)
+    ref_o, ref_lse = _ref_attention(q, k, v, 1e-39, False)
+    o = torch.empty((q_len, hq, d), dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty((q_len, hq), dtype=torch.float32, device="cuda")
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device="cuda")
+    if page_size is None:
+        cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device="cuda")
+        sm120_fmha_fp8_ragged_prefill(q, k, v, o, cu_q, cu_k, sm_scale=1e-39, lse=lse)
+    else:
+        k_pool, v_pool, _, block_tables, *_ = _make_varlen_paged_kv([k], [v], page_size)
+        sm120_fmha_fp8_paged_prefill(
+            q,
+            k_pool,
+            v_pool,
+            o,
+            block_tables,
+            torch.tensor([kv_len], dtype=torch.int32, device="cuda"),
+            cu_q,
+            sm_scale=1e-39,
+            lse=lse,
+        )
+    torch.testing.assert_close(o.float(), ref_o, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-4, rtol=1e-5)
+
+
+@_requires_sm120
+@pytest.mark.parametrize("num_chunks", [None, 2])
+def test_sm120_d512_paged_zero_page_pool(num_chunks):
+    """Verify a pool without pages (all K/V empty) writes O=0 and LSE=-inf for nonempty Q."""
+    hq, hkv, d, b = 8, 2, 512, 2
+    q = _make_fp8((5, hq, d))
+    pool = torch.empty((0, hkv, 16, d), dtype=torch.float8_e4m3fn, device="cuda")
+    rows = 5 * (num_chunks or 1)
+    o = torch.full((rows, hq, d), 7.0, dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros((rows, hq), dtype=torch.float32, device="cuda")
+    ranges = (
+        None
+        if num_chunks is None
+        else torch.zeros((num_chunks * b, 2), dtype=torch.int32, device="cuda")
+    )
+    sm120_fmha_fp8_paged_prefill(
+        q,
+        pool,
+        pool,
+        o,
+        torch.empty((b, 0), dtype=torch.int32, device="cuda"),
+        torch.zeros(b, dtype=torch.int32, device="cuda"),
+        torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda"),
+        lse=lse,
+        kv_tile_ranges=ranges,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(o, torch.zeros_like(o))
+    assert torch.isneginf(lse).all()
 
 
 def _make_varlen_paged_kv(k_list, v_list, page_size, seed=0):
@@ -1371,14 +1467,8 @@ def _ref_merge_rows(v, s, rows):
 def test_merge_states_empty_output_is_a_no_op(shape):
     """Verify merge_states returns empty outputs for zero tokens or zero heads instead of
     building an empty grid (or dividing by a zero head tile)."""
-
-    def empty(shape, dtype):
-        # Row-major strides over the zero-size dims, which the binding's contiguity check accepts.
-        strides = [math.prod(shape[i + 1 :]) for i in range(len(shape))]
-        return torch.empty(0, dtype=dtype, device="cuda").as_strided(shape, strides)
-
-    v = empty(shape, torch.bfloat16)
-    s = empty(shape[:3], torch.float32)
+    v = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    s = torch.empty(shape[:3], dtype=torch.float32, device="cuda")
     merged_o, merged_lse = flashinfer.merge_states(v, s)
     torch.cuda.synchronize()
     assert merged_o.shape == (shape[0], shape[2], shape[3])

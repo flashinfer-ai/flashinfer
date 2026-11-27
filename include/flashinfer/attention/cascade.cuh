@@ -678,6 +678,9 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
       // Split heads across grid.y once bdx * num_heads exceeds the 1024-thread block limit.
       uint32_t bdy = std::min(num_heads, 1024U / bdx);
       dim3 nblks(seq_len, ceil_div(num_heads, bdy));
+      if (nblks.y > 65535) {
+        return cudaErrorInvalidValue;  // Head tiles exceed CUDA's grid.y limit.
+      }
       dim3 nthrs(bdx, bdy);
       auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeO>;
       void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
