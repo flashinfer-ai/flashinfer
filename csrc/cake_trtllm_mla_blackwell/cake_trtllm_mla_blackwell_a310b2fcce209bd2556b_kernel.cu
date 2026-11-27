@@ -133,10 +133,26 @@ __device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
 
 
 
+
+__device__ __forceinline__ unsigned int __as_u32(float v) {
+    unsigned int u;
+    asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
+    return u;
+}
+__device__ __forceinline__ unsigned int __as_u32(__nv_bfloat162 v) {
+    return *reinterpret_cast<const unsigned int*>(&v);
+}
+__device__ __forceinline__ unsigned int __as_u32(unsigned int v) { return v; }
+__device__ __forceinline__ unsigned int __as_u32(int v) {
+    unsigned int u;
+    asm("mov.b32 %0, %1;" : "=r"(u) : "r"(v));
+    return u;
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ sinks, int num_q_heads, int num_split, float bmm2_scale, int enable_sink)
+kernel_cake_trtllm_mla_blackwell_a310b2fcce209bd2556b(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ sinks, int num_q_heads, int num_split, float bmm2_scale, int enable_sink, int* __restrict__ seq_lens, int q_len, int table_width, int page_shift)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -192,16 +208,28 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
     int stat_base = (batch_idx * num_q_heads + head_idx) * num_split;
+    int live_request = 0;
+    int live_keys = 0;
+    int live = 0;
     {
         asm volatile("griddepcontrol.wait;" ::: "memory");
     }
+    live_request = (int)((unsigned int)batch_idx / (unsigned int)q_len);
+    live_keys = seq_lens[live_request] - q_len + (int)((unsigned int)batch_idx % (unsigned int)q_len) + 1;
+    int _min_1 = ((live_keys) < (table_width << 5 + page_shift) ? (live_keys) : (table_width << 5 + page_shift));
+    int _max_0 = ((_min_1) > (0) ? (_min_1) : (0));
+    live_keys = _max_0;
+    int live_tiles = (live_keys + 128 - 1) / 128;
+    int live_run = (((live_tiles + num_split - 1) / num_split) > (1) ? ((live_tiles + num_split - 1) / num_split) : (1));
+    int _min_2 = (((live_tiles + live_run - 1) / live_run) < (num_split) ? ((live_tiles + live_run - 1) / live_run) : (num_split));
+    live = _min_2;
     if (warp == 1) {
         if (elect_sync()) {
             asm volatile("fence.proxy.async.global;" ::: "memory");
             #pragma unroll
             for (int c = 0; c < 8; c++) {
-                if (c * 8 < num_split) {
-                    int chunk_left = num_split - c * 8;
+                if (c * 8 < live) {
+                    int chunk_left = live - c * 8;
                     int chunk_splits = ((chunk_left >= 8) ? 8 : chunk_left);
                     int chunk_bytes = chunk_splits * 1024;
                     mbarrier_arrive_expect_tx(stage_full_addr + (c) * 8, chunk_bytes);
@@ -220,7 +248,7 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
     }
     float lane_lse = -CUDART_INF_F;
     if (warp == 0) {
-        if (lane < num_split) {
+        if (lane < live) {
             lane_lse = partial_lse[stat_base + lane];
         }
     }
@@ -229,7 +257,7 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
     for (int h = 0; h < 1; h++) {
         lane_lse_hi[h] = -CUDART_INF_F;
         if (warp == 0) {
-            if (lane + (h + 1) * 32 < num_split) {
+            if (lane + (h + 1) * 32 < live) {
                 lane_lse_hi[h] = partial_lse[stat_base + lane + (h + 1) * 32];
             }
         }
@@ -243,7 +271,7 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
             int split_idx = lane + i * 32;
             local_m[i] = -CUDART_INF_F;
             local_w[i] = 0.0f;
-            if (split_idx < num_split) {
+            if (split_idx < live) {
                 local_m[i] = lane_lse;
                 thread_max = max_noftz(thread_max, local_m[i]);
             }
@@ -255,7 +283,7 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
             int split_hi = lane + (h_1 + 1) * 32;
             local_m_hi[h_1] = -CUDART_INF_F;
             local_w_hi[h_1] = 0.0f;
-            if (split_hi < num_split) {
+            if (split_hi < live) {
                 local_m_hi[h_1] = lane_lse_hi[h_1];
                 thread_max = max_noftz(thread_max, local_m_hi[h_1]);
             }
@@ -268,18 +296,18 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
         #pragma unroll
         for (int i_1 = 0; i_1 < 1; i_1++) {
             int split_idx_1 = lane + i_1 * 32;
-            if (split_idx_1 < num_split) {
-                float _exp2_0 = approx_exp2(local_m[i_1] - global_max);
-                local_w[i_1] = ((local_m[i_1] == -CUDART_INF_F) ? 0.0f : _exp2_0);
+            if (split_idx_1 < live) {
+                float _exp2_3 = approx_exp2(local_m[i_1] - global_max);
+                local_w[i_1] = ((local_m[i_1] == -CUDART_INF_F) ? 0.0f : _exp2_3);
                 thread_sum = thread_sum + local_w[i_1];
             }
         }
         #pragma unroll
         for (int h_2 = 0; h_2 < 1; h_2++) {
             int split_hi_1 = lane + (h_2 + 1) * 32;
-            if (split_hi_1 < num_split) {
-                float _exp2_1 = approx_exp2(local_m_hi[h_2] - global_max);
-                local_w_hi[h_2] = ((local_m_hi[h_2] == -CUDART_INF_F) ? 0.0f : _exp2_1);
+            if (split_hi_1 < live) {
+                float _exp2_4 = approx_exp2(local_m_hi[h_2] - global_max);
+                local_w_hi[h_2] = ((local_m_hi[h_2] == -CUDART_INF_F) ? 0.0f : _exp2_4);
                 thread_sum = thread_sum + local_w_hi[h_2];
             }
         }
@@ -287,24 +315,24 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             global_sum += __shfl_xor_sync(0xFFFFFFFF, global_sum, offset);
-        float _rcp_2 = approx_rcp(global_sum);
-        float inv_sum = ((global_sum > 0.0f) ? _rcp_2 : 0.0f);
+        float _rcp_5 = approx_rcp(global_sum);
+        float inv_sum = ((global_sum > 0.0f) ? _rcp_5 : 0.0f);
         if (lane == 0) {
-            float _log2_3;
-            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_3) : "f"(global_sum));
-            merged_lse[0] = global_max + _log2_3;
+            float _log2_6;
+            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_6) : "f"(global_sum));
+            merged_lse[0] = global_max + _log2_6;
         }
         #pragma unroll
         for (int i_2 = 0; i_2 < 1; i_2++) {
             int split_idx_2 = lane + i_2 * 32;
-            if (split_idx_2 < num_split) {
+            if (split_idx_2 < live) {
                 split_weights[split_idx_2] = local_w[i_2] * inv_sum;
             }
         }
         #pragma unroll
         for (int h_3 = 0; h_3 < 1; h_3++) {
             int split_hi_2 = lane + (h_3 + 1) * 32;
-            if (split_hi_2 < num_split) {
+            if (split_hi_2 < live) {
                 split_weights[split_hi_2] = local_w_hi[h_3] * inv_sum;
             }
         }
@@ -313,8 +341,8 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
     float output_scale = bmm2_scale;
     if (enable_sink != 0) {
         float sink_exp = approx_exp2(__fmaf_rn(sink_value, 1.442695f, -merged_lse[0]));
-        float _rcp_4 = approx_rcp(1.0f + sink_exp);
-        output_scale = output_scale * _rcp_4;
+        float _rcp_7 = approx_rcp(1.0f + sink_exp);
+        output_scale = output_scale * _rcp_7;
     }
     int po_head_base = stat_base * 512;
     int o_head_base = (batch_idx * num_q_heads + head_idx) * 512;
@@ -326,11 +354,11 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
     }
     #pragma unroll
     for (int c_1 = 0; c_1 < 8; c_1++) {
-        if (c_1 * 8 < num_split) {
+        if (c_1 * 8 < live) {
             mbarrier_wait(stage_full_addr + (c_1) * 8, 0);
             #pragma unroll
             for (int cs = 0; cs < 8; cs++) {
-                if (c_1 * 8 + cs < num_split) {
+                if (c_1 * 8 + cs < live) {
                     int stage_split = c_1 * 8 + cs;
                     float stage_weight = split_weights[stage_split];
                     unsigned int _stage_words[2];
@@ -351,11 +379,17 @@ kernel_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc(__nv_bfloat16* __restrict_
             }
         }
     }
+    if (live < num_split) {
+        #pragma unroll
+        for (int e_2 = 0; e_2 < 4; e_2++) {
+            acc[e_2] = ((__as_u32(acc[e_2]) << 1 == 0) ? 0.0f : acc[e_2]);
+        }
+    }
     float _scaled_0[4];
-    const float2 _scale2_5 = {output_scale, output_scale};
+    const float2 _scale2_8 = {output_scale, output_scale};
     #pragma unroll
     for (int _ls = 0; _ls < 2; _ls++)
-        reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(acc)[_ls], _scale2_5);
+        reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(acc)[_ls], _scale2_8);
     unsigned int _packed_0[2];
     #pragma unroll
     for (int _lp = 0; _lp < 1; _lp++) {

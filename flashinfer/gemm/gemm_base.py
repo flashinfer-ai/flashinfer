@@ -7850,6 +7850,14 @@ def _sm107_low_m_split_k(
     return 1
 
 
+def _mm_mxfp8_cute_dsl_max_tactics() -> int:
+    """``FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS``; 0 (the default) is full search."""
+    budget = int(os.environ.get("FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS", "0"))
+    if budget < 0:
+        raise ValueError("MXFP8 tactic budget must be nonnegative")
+    return budget
+
+
 @functools.lru_cache(maxsize=64)
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
@@ -7887,6 +7895,14 @@ def _cute_dsl_gemm_mxfp8_runner(
             _, _, _, _, _, out, _ = inputs
             extras = (str(out.dtype), enable_pdl)
             return (*extras, "low_m_only") if low_m_only else extras
+
+        def get_tactic_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+            # The tactic budget trims get_valid_tactics() but is not part of the
+            # runner's identity. Without this, a winner tuned under a budget is
+            # reused after the budget changes, e.g. when returning to the full
+            # search. The default 0 is reported too: a lone runner returning None
+            # opts out of coverage checks, so its budgeted winner would be reused.
+            return ("max_tactics", _mm_mxfp8_cute_dsl_max_tactics())
 
         def get_valid_tactics(
             self,
@@ -7950,11 +7966,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             return self._rank_tactics(valid_tactics, a, n, real_k)
 
         def _rank_tactics(self, tactics, a, n, real_k):
-            budget = int(
-                os.environ.get("FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS", "0")
-            )
-            if budget < 0:
-                raise ValueError("MXFP8 tactic budget must be nonnegative")
+            budget = _mm_mxfp8_cute_dsl_max_tactics()
             if budget == 0:
                 return tactics
             return _rank_mm_mxfp8_autotune_tactics(

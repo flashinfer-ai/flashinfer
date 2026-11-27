@@ -28,8 +28,11 @@ documentation live in those modules; import them.
 
 from __future__ import annotations
 
+import array
 import collections
-from typing import Optional, Union
+import functools
+import threading
+from typing import Any, NamedTuple, Optional, Union
 
 import torch
 
@@ -61,6 +64,7 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
 # as FlashInfer's MTP decode path does.
 _MODEL_DTYPES = (torch.bfloat16, torch.float16)
 _INDEX_DTYPES = (torch.int32, torch.int64)
+_INT32_MAX = (1 << 31) - 1
 _KERNEL_DTYPE = torch.bfloat16
 # Widest vector accesses the kernels make along a tensor's dense last dimension: q and k
 # are read in 8-byte pieces (four BF16 elements); the output is written in 8-byte pieces
@@ -70,8 +74,9 @@ _KERNEL_DTYPE = torch.bfloat16
 # kernel sources.
 _QK_ALIGNMENT_BYTES = 8
 _OUTPUT_ALIGNMENT_BYTES = 8
-# The state pool dtypes: FP32 everywhere, FP16 where the registry ships FP16-pool
-# programs (SM100 / SM103 / SM107: the stores round with the hardware ``cvt.rs``).
+# The state pool dtypes: FP32 and FP16 on every architecture.  An FP16 store rounds
+# with the hardware ``cvt.rs`` on SM100 / SM103 / SM107 and with the same rounding
+# in integer arithmetic on SM90, which has no ``cvt.rs``.
 _STATE_DTYPES = (torch.float32, torch.float16)
 # Stochastic rounding of an FP16 pool: the accepted Philox round counts.
 PHILOX_ROUNDS_MIN = 5
@@ -104,7 +109,7 @@ def is_cake_gdp_supported(
     state_dtype: torch.dtype = torch.float32,
 ) -> bool:
     """Whether ``device`` (and optionally ``num_householder`` / ``num_tokens``) has an exported route for a
-    ``state_dtype`` state pool (``torch.float32``, or ``torch.float16`` on SM100 / SM103 / SM107)."""
+    ``state_dtype`` state pool (``torch.float32`` or ``torch.float16``)."""
 
     device = torch.device(device)
     if device.type != "cuda" or state_dtype not in _STATE_DTYPES:
@@ -225,23 +230,27 @@ def _index_input(
     device: torch.device,
     dtypes: tuple[torch.dtype, ...] = _INDEX_DTYPES,
 ) -> torch.Tensor:
-    """A slot-index tensor as the kernel reads it: int32, contiguous; int64 is converted once."""
+    """A slot-index tensor as the kernel reads it: int32, contiguous; int64 is converted once (an entry outside
+    the int32 range becomes -1)."""
 
     _check_tensor(tensor, name, shape=shape, device=device, dtypes=dtypes)
     if tensor.dtype != torch.int32:
-        return tensor.to(torch.int32)
+        # An int64 slot outside the int32 range would wrap onto a row of the pool: it becomes -1, a slot outside
+        # every pool, on the device (no host synchronization; graph-capturable).  Every other value is kept, and the
+        # kernel checks it against the pool it addresses.
+        in_range = (tensor >= 0) & (tensor <= _INT32_MAX)
+        return torch.where(in_range, tensor, -1).to(
+            torch.int32, memory_format=torch.contiguous_format
+        )
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
-def _state_pool(
-    tensor: torch.Tensor, *, heads: int, device: torch.device, arch: str
-) -> None:
+def _state_pool(tensor: torch.Tensor, *, heads: int, device: torch.device) -> None:
     """The state pool ``[pool_size, HV, V, K]`` is read and written in place: dense rows of ``K`` elements,
     strides that are multiples of :data:`STATE_STRIDE_ELEMENTS` and an aligned base -- FP32:
     :data:`STATE_ALIGNMENT_BYTES` (the kernels stage a head's rows with 16-byte asynchronous copies); FP16:
-    :data:`F16_STATE_ALIGNMENT_BYTES` (8-byte pieces), on an architecture with FP16-pool programs only.  A pool of
-    another dtype or layout is refused: its slots are the caller's state and cannot be copied behind the caller's
-    back."""
+    :data:`F16_STATE_ALIGNMENT_BYTES` (8-byte pieces).  A pool of another dtype or layout is refused: its slots are
+    the caller's state and cannot be copied behind the caller's back."""
 
     if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
         raise ValueError("initial_state must be a [pool_size, HV, 64, 128] tensor")
@@ -250,13 +259,6 @@ def _state_pool(
     if tensor.dtype not in _STATE_DTYPES:
         raise ValueError(
             f"initial_state must be float32 or float16, got {tensor.dtype}"
-        )
-    if tensor.dtype == torch.float16 and not supported_num_householder(
-        arch, state_dtype=torch.float16
-    ):
-        raise ValueError(
-            "a float16 state pool needs the hardware stochastic rounding of SM100 / SM103 / SM107 "
-            f"(cvt.rs); {arch} has no float16-pool program"
         )
     pool_size = int(tensor.shape[0])
     if tuple(tensor.shape[1:]) != (heads, HEAD_SIZE_V, HEAD_SIZE_K):
@@ -301,7 +303,8 @@ def _rounding(
         # of the pool's first four elements relies on the 8-byte base alignment _state_pool has checked; torch
         # also needs the storage offset to be a multiple of four elements, which fails only for a storage whose
         # own base is not 8-byte aligned (an UntypedStorage slice, DLPack): that pool gets a per-call placeholder.
-        if pool.storage_offset() % 4 == 0:
+        # An empty state tensor (a dense call over no sequence) has no element to view: it takes the placeholder.
+        if pool.numel() and pool.storage_offset() % 4 == 0:
             return pool.as_strided((4,), (1,)).view(torch.int64), 0
         return pool.new_empty((1,), dtype=torch.int64), 0
     if not isinstance(rand_seed, torch.Tensor):
@@ -402,7 +405,7 @@ def cake_gated_delta_product_mtp(
     )
     a = _model_input(a, "a", shape=(B, T, HV), device=device, dtype=model_dtype)
     b = _model_input(b, "b", shape=(B, T, n, HV), device=device, dtype=model_dtype)
-    _state_pool(initial_state, heads=HV, device=device, arch=arch)
+    _state_pool(initial_state, heads=HV, device=device)
     state_dtype = initial_state.dtype
     rounds = 0  # the launch class of an FP32 pool: its stores do not round
     if state_dtype == torch.float16:
@@ -505,8 +508,8 @@ def cake_gated_delta_product_mtp(
         use_qk_l2norm=use_qk_l2norm,
         state_dtype=state_dtype,
         # The launch class (host values, so a captured call keeps its program): an FP16 pool's round count and
-        # whether the call stores per-token snapshots pick a program's sibling (snapshot_noise or draw_share)
-        # where it is faster.
+        # whether the call stores per-token snapshots pick a program's sibling (snapshot_noise, draw_share,
+        # stochastic_forms or scaled_rolled), or on SM90 a row-split program, where it is faster.
         philox_rounds=rounds,
         use_ssm_state_indices=bool(use_scatter),
     )
@@ -557,8 +560,15 @@ _PREFILL_IO_DTYPES = (torch.bfloat16, torch.float16)
 _GATE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 # Tensor-map staging the persistent kernel keeps per CTA (four 128-byte slots).
 _TENSORMAP_BYTES_PER_CTA = 512
-# One (sequence, head) state record: V x K FP32 elements.
+# One (sequence, head) state record: V x K elements.
 _STATE_ELEMENTS = HEAD_SIZE_V * HEAD_SIZE_K
+# The longest sequence the SM90 programs run: they divide a chunk index by ``num_householder`` with a 32-bit product
+# that wraps past 4096 64-token blocks (a longer sequence hangs or faults), so a longer one is refused.
+_SM90_MAX_SEQ_LEN = 4096 * 64
+# The prefill state dtypes: FP32 everywhere; BF16 and FP16 on the architectures whose registry ships their programs
+# (the state is read widened exactly and its final value rounded once: with the hardware ``cvt.rs`` on SM100 / SM103,
+# with a software form of it on SM90).
+_PREFILL_STATE_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 # Bits of the kernel's ``metadata_i64_mask``: int64 ``cu_seqlens``, int64 slot indices.
 _CU_SEQLENS_INT64 = 1
 _INDICES_INT64 = 2
@@ -694,11 +704,484 @@ def _state_scratch(
     return maker((max(rows, 1), columns), dtype=torch.float32, device=device)
 
 
+def _prefill_pool(
+    tensor: torch.Tensor,
+    name: str,
+    *,
+    rows: Optional[int],
+    heads: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    writable: bool,
+    stochastic: bool = False,
+) -> torch.Tensor:
+    """A state tensor of the V6 pool programs (SM100 / SM103, and SM90's with the write slot table): ``[rows, H,
+    64, 128]`` (``rows`` ``None``: a pool of any positive size) of ``dtype``, dense ``[V, K]`` records of one head
+    after another (strides ``(.., 8192, 128, 1)``) with a slot stride that is a multiple of :data:`STATE_STRIDE_ELEMENTS` (a padded pool is read and written in
+    place) and an aligned base (16 bytes for FP32, 8 for BF16 / FP16).  Another layout is refused when the kernel
+    writes the tensor (it is the caller's state) and copied once when it only reads a per-sequence state, except
+    in a ``stochastic`` call (``rand_seed``): its rounding counters are element offsets from the base of the
+    caller's ``initial_state``, which a copy would change, so that layout is refused too."""
+
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
+        raise ValueError(
+            f"{name} must be a [{'num_seqs' if rows is not None else 'pool_size'}, H, {HEAD_SIZE_V}, {HEAD_SIZE_K}] tensor"
+        )
+    if tensor.device != device:
+        raise ValueError(f"{name} must live on {device}, got {tensor.device}")
+    if tensor.dtype != dtype:
+        raise ValueError(
+            f"{name} must be {dtype} (the call's state dtype), got {tensor.dtype}"
+        )
+    wanted_rows = int(tensor.shape[0]) if rows is None else int(rows)
+    if tuple(tensor.shape) != (wanted_rows, heads, HEAD_SIZE_V, HEAD_SIZE_K):
+        raise ValueError(
+            f"{name} must have shape [{'pool_size' if rows is None else rows}, {heads}, {HEAD_SIZE_V}, "
+            f"{HEAD_SIZE_K}], got {list(tensor.shape)}"
+        )
+    if rows is None and wanted_rows == 0:
+        raise ValueError(f"{name} must hold at least one slot")
+    strides = tuple(int(x) for x in tensor.stride())
+    alignment = (
+        STATE_ALIGNMENT_BYTES if dtype == torch.float32 else F16_STATE_ALIGNMENT_BYTES
+    )
+    dense_rows = (
+        strides[3] == 1
+        and strides[2] == HEAD_SIZE_K
+        and (heads == 1 or strides[1] == _STATE_ELEMENTS)
+    )
+    slot_stride = (
+        wanted_rows <= 1
+        or strides[0] % STATE_STRIDE_ELEMENTS == 0
+        and strides[0] >= heads * _STATE_ELEMENTS
+    )
+    if dense_rows and slot_stride and tensor.data_ptr() % alignment == 0:
+        return tensor
+    if writable or rows is None:
+        raise ValueError(
+            f"{name} must hold dense [{HEAD_SIZE_V}, {HEAD_SIZE_K}] records of one head after another (strides "
+            f"[slot, {_STATE_ELEMENTS}, {HEAD_SIZE_K}, 1]), a slot stride that is a multiple of "
+            f"{STATE_STRIDE_ELEMENTS} elements and a {alignment}-byte aligned base; got strides {list(strides)} and a "
+            f"base offset of {tensor.data_ptr() % alignment} bytes"
+        )
+    if stochastic:
+        raise ValueError(
+            f"{name} with rand_seed must hold dense [{HEAD_SIZE_V}, {HEAD_SIZE_K}] records of one head after "
+            f"another (strides [slot, {_STATE_ELEMENTS}, {HEAD_SIZE_K}, 1]), a slot stride that is a multiple of "
+            f"{STATE_STRIDE_ELEMENTS} elements and a {alignment}-byte aligned base: the stochastic rounding counts "
+            "from the base of the caller's tensor, so it is read in place and never copied; got strides "
+            f"{list(strides)} and a base offset of {tensor.data_ptr() % alignment} bytes"
+        )
+    return tensor.contiguous() if not tensor.is_contiguous() else tensor.clone()
+
+
+def _slot_stride(tensor: Optional[torch.Tensor], heads: int) -> int:
+    """The slot stride the pool programs take for a state tensor (its ``stride(0)``; a one-slot tensor's is never
+    used, so it takes the dense one; an absent tensor's is never read)."""
+
+    if tensor is None:
+        return 0
+    if int(tensor.shape[0]) <= 1:
+        return heads * _STATE_ELEMENTS
+    return int(tensor.stride(0))
+
+
+# The slot tables of the calls that pass no slots, per device: the identity table of a dense BF16 / FP16 call (its
+# state rows are slots 0 .. N - 1 of the per-sequence tensors) and, on SM90, the table of -1 slots (no slot: the
+# pool programs read no initial state or store no final state for the call).  Each is one complete int32 table,
+# grown on an eager call and sliced per call.  A table made during CUDA Graph capture holds its values only once
+# the graph replays, so it is that call's own and never cached.  A graph captured after an eager call reads the
+# cached table's memory at every replay, so a table that growth replaces is kept in the ``*_SUPERSEDED`` list for
+# the life of the process (doubling bounds them below the current table's size).
+_IDENTITY_SLOTS: dict[int, torch.Tensor] = {}
+_IDENTITY_SLOTS_SUPERSEDED: list[torch.Tensor] = []
+_NO_SLOTS: dict[int, torch.Tensor] = {}
+_NO_SLOTS_SUPERSEDED: list[torch.Tensor] = []
+_SLOTS_LOCK = threading.Lock()
+
+
+def _cached_slots(
+    n: int,
+    device: torch.device,
+    tables: dict[int, torch.Tensor],
+    superseded: list[torch.Tensor],
+    fill: Optional[int],
+) -> torch.Tensor:
+    """``n`` slots of the cached table ``tables`` of ``device``: ``0 .. n - 1`` (``fill`` None) or ``fill``."""
+
+    def make(size: int) -> torch.Tensor:
+        if fill is None:
+            return torch.arange(size, dtype=torch.int32, device=device)
+        return torch.full((size,), fill, dtype=torch.int32, device=device)
+
+    index = _device_index(device)
+    table = tables.get(index)
+    if table is not None and table.numel() >= n:
+        return table[:n]
+    if torch.cuda.is_current_stream_capturing():
+        return make(n)
+    size = max(n, 256, 2 * (table.numel() if table is not None else 0))
+    grown = make(size)
+    torch.cuda.current_stream(
+        device
+    ).synchronize()  # complete before a call on any stream reads it
+    with _SLOTS_LOCK:
+        # The table published now, which another thread may have replaced while this one synchronized.
+        previous = tables.get(index)
+        if previous is not None:
+            superseded.append(previous)
+        tables[index] = grown
+    return grown[:n]
+
+
+def _identity_slots(n: int, device: torch.device) -> torch.Tensor:
+    return _cached_slots(n, device, _IDENTITY_SLOTS, _IDENTITY_SLOTS_SUPERSEDED, None)
+
+
+def _no_slots(n: int, device: torch.device) -> torch.Tensor:
+    return _cached_slots(n, device, _NO_SLOTS, _NO_SLOTS_SUPERSEDED, -1)
+
+
+def _copy_pool_rows(
+    initial_in: Optional[torch.Tensor],
+    output_in: torch.Tensor,
+    slots: torch.Tensor,
+    oslots: torch.Tensor,
+) -> None:
+    """The final state of a batch of empty sequences on the pool programs, on the device: sequence ``n`` stores its
+    initial record (slot ``slots[n]`` of ``initial_in``; zero when that slot is outside the pool or there is no
+    initial state) at slot ``oslots[n]`` of ``output_in``, and stores nothing when that slot is outside the pool.
+    The 16-bit records are copied as they are (rounding a representable value is the identity).  No slot is read on
+    the host: a skipped store becomes a duplicate write of a value that is written anyway (another sequence's record
+    to its own slot, or slot 0 to itself), so the stores stay deterministic and graph-capturable."""
+
+    rows = int(output_in.shape[0])
+    writes = oslots.long()
+    write_ok = (writes >= 0) & (writes < rows)
+    if initial_in is not None:
+        reads = slots.long()
+        read_ok = (reads >= 0) & (reads < int(initial_in.shape[0]))
+        values = initial_in.index_select(0, torch.where(read_ok, reads, 0))
+        values = torch.where(
+            read_ok[:, None, None, None],
+            values,
+            torch.zeros((), dtype=values.dtype, device=values.device),
+        )
+    else:
+        values = torch.zeros(
+            (int(slots.numel()),) + tuple(output_in.shape[1:]),
+            dtype=output_in.dtype,
+            device=output_in.device,
+        )
+    any_ok = write_ok.any()
+    first = torch.argmax(write_ok.to(torch.int32))
+    fallback_slot = torch.where(any_ok, writes[first], 0)
+    fallback_value = torch.where(any_ok, values[first], output_in[0])
+    targets = torch.where(write_ok, writes, fallback_slot)
+    values = torch.where(write_ok[:, None, None, None], values, fallback_value)
+    output_in.index_copy_(0, targets, values)
+
+
+class _V6State(NamedTuple):
+    """The state of one Blackwell call as its program takes it: the form (``dtype`` as the records spell it,
+    ``pool``: a pool program), the initial / output tensors (``None`` when not read / not stored), the read and
+    write slot tables (int32; ``None`` for a dense FP32 program) and the rounding (the seed tensor and the round
+    count of a 16-bit program; ``None`` / 0 otherwise)."""
+
+    dtype: str
+    pool: bool
+    initial: Optional[torch.Tensor]
+    output: Optional[torch.Tensor]
+    slots: Optional[torch.Tensor]
+    oslots: Optional[torch.Tensor]
+    seed: Optional[torch.Tensor]
+    rounds: int
+
+
+def _call_state_dtype(
+    initial_state: Optional[torch.Tensor],
+    stored: Optional[torch.Tensor],
+    output_final_state: bool,
+    pool_mode: bool,
+) -> torch.dtype:
+    """The one state dtype of a call (``stored``: the ``output_state`` it stores, None when it stores none).  With
+    ``state_indices`` both pools are of the dtype of the ones given (FP32 when neither is); a dense call takes the
+    dtype of ``output_state`` when it stores one, else of ``initial_state``.  PR 1's dense call keeps working: a
+    BF16 ``initial_state`` with an FP32 (or internally allocated) final state, or with no final state, is converted
+    to FP32 once (the call's dtype is then FP32)."""
+
+    for tensor, name in ((initial_state, "initial_state"), (stored, "output_state")):
+        if tensor is not None and (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.dtype not in _PREFILL_STATE_DTYPES
+        ):
+            raise ValueError(
+                f"{name} must be a float32, bfloat16 or float16 tensor, got "
+                f"{tensor.dtype if isinstance(tensor, torch.Tensor) else type(tensor).__name__}"
+            )
+    if pool_mode:
+        given = [t.dtype for t in (initial_state, stored) if t is not None]
+        if len(set(given)) > 1:
+            raise ValueError(
+                f"initial_state and output_state pools must share one dtype, got {given[0]} and {given[1]}"
+            )
+        return given[0] if given else torch.float32
+    if stored is not None:
+        compat = (
+            initial_state is not None
+            and initial_state.dtype == torch.bfloat16
+            and stored.dtype == torch.float32
+        )
+        if (
+            initial_state is not None
+            and initial_state.dtype != stored.dtype
+            and not compat
+        ):
+            raise ValueError(
+                f"initial_state and output_state must share one dtype, got {initial_state.dtype} and {stored.dtype} "
+                "(a bfloat16 initial_state with a float32 output_state is converted)"
+            )
+        return stored.dtype
+    if initial_state is not None:
+        if output_final_state and initial_state.dtype == torch.float16:
+            raise ValueError(
+                "a float16 initial_state stores a float16 final state: pass a float16 output_state (the final "
+                "state allocated for you is float32)"
+            )
+        return (
+            torch.float32
+            if initial_state.dtype == torch.bfloat16
+            else initial_state.dtype
+        )
+    return torch.float32
+
+
+def _blackwell_state(
+    arch: str,
+    device: torch.device,
+    initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    state_indices: Optional[torch.Tensor],
+    output_state_indices: Optional[torch.Tensor],
+    rand_seed: Optional[torch.Tensor],
+    philox_rounds: int,
+    N: int,
+    H: int,
+) -> _V6State:
+    """The state form of a Blackwell call and its operands.  One dtype serves the initial and the output state
+    (:func:`_call_state_dtype`).  A dense BF16 / FP16 call runs the pool program on identity slots.  ``rand_seed``
+    (with ``philox_rounds``) rounds a BF16 / FP16 state's stores stochastically and is refused for an FP32 state."""
+
+    pool_mode = state_indices is not None
+    if output_final_state and output_state is None and pool_mode:
+        raise ValueError(
+            "output_final_state with state_indices needs an explicit output_state pool "
+            "(the identical view of initial_state or disjoint memory)"
+        )
+    stored = output_state if output_final_state else None
+    dtype = _call_state_dtype(initial_state, stored, output_final_state, pool_mode)
+    key = _loader.PREFILL_STATE_DTYPES[dtype]
+    pool = pool_mode or dtype != torch.float32
+    if (key, pool) not in _loader.v6_state_forms(arch):
+        raise ValueError(
+            f"no exported Cake GDP prefill program on {arch} for a {dtype} "
+            f"{'pool' if pool_mode else 'state'}; the route ships the state forms "
+            f"{sorted(_loader.v6_state_forms(arch))} (state dtype, slot pool)"
+        )
+    if rand_seed is not None and dtype == torch.float32:
+        raise ValueError(
+            "rand_seed rounds the stores of a bfloat16 / float16 state stochastically; a float32 state is "
+            "stored as it is"
+        )
+    if not pool:
+        # the dense FP32 programs: one [N, H, 64, 128] record per sequence, as PR 1 ships them
+        initial_in = (
+            None
+            if initial_state is None
+            else _state_rows(
+                initial_state,
+                "initial_state",
+                rows=N,
+                heads=H,
+                device=device,
+                writable=False,
+            )
+        )
+        if not output_final_state:
+            output_in = None
+        elif output_state is None:
+            output_in = torch.empty(
+                (N, H, HEAD_SIZE_V, HEAD_SIZE_K), dtype=torch.float32, device=device
+            )
+        else:
+            output_in = _state_rows(
+                output_state,
+                "output_state",
+                rows=N,
+                heads=H,
+                device=device,
+                writable=True,
+            )
+        return _V6State(key, False, initial_in, output_in, None, None, None, 0)
+    rows = None if pool_mode else N
+    initial_in = (
+        None
+        if initial_state is None
+        else _prefill_pool(
+            initial_state,
+            "initial_state",
+            rows=rows,
+            heads=H,
+            device=device,
+            dtype=dtype,
+            writable=pool_mode,
+            stochastic=rand_seed is not None,
+        )
+    )
+    output_in = (
+        None
+        if stored is None
+        else _prefill_pool(
+            stored,
+            "output_state",
+            rows=rows,
+            heads=H,
+            device=device,
+            dtype=dtype,
+            writable=True,
+        )
+    )
+    if pool_mode:
+        slots = _index_input(state_indices, "state_indices", shape=(N,), device=device)
+        oslots = (
+            slots
+            if output_state_indices is None
+            else _index_input(
+                output_state_indices, "output_state_indices", shape=(N,), device=device
+            )
+        )
+    else:
+        slots = oslots = _identity_slots(N, device)
+    seed, rounds = None, 0
+    if dtype != torch.float32:
+        base = initial_in if initial_in is not None else output_in
+        seed, rounds = _rounding(base, rand_seed, philox_rounds)
+    return _V6State(key, True, initial_in, output_in, slots, oslots, seed, rounds)
+
+
+# The SM90 pool programs with the write slot table (``use_output_state_indices``) store an FP32, BF16 or FP16 pool.
+# SM90 has no ``cvt.rs``: a BF16 or FP16 state with ``rand_seed`` rounds stochastically through a software form of it.
+def _hopper_pool_dtypes(arch: str) -> set[str]:
+    """The state dtypes of the V6 pool programs with the write slot table on ``arch``'s prefill route (SM90)."""
+
+    return {
+        str(_loader.MODULES[name]["build"].get("state_dtype", "f32"))
+        for name in _loader.ROUTES.get(arch, {}).get(_loader.PREFILL_ROUTE, ())
+        if _loader.MODULES[name]["select_rule"].get("use_output_state_indices")
+    }
+
+
+def _hopper_state(
+    arch: str,
+    device: torch.device,
+    initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    state_indices: Optional[torch.Tensor],
+    output_state_indices: Optional[torch.Tensor],
+    rand_seed: Optional[torch.Tensor],
+    philox_rounds: int,
+    N: int,
+    H: int,
+) -> Optional[_V6State]:
+    """The state form of an SM90 call on the V6 pool programs with the write slot table, or None for a call the
+    FP32 programs serve (a float32 state without ``output_state_indices``).  One dtype serves the initial and the
+    output state (:func:`_call_state_dtype`).  A BF16 / FP16 state, or ``output_state_indices``, runs the pool
+    program of the call's dtype: on its pools (read slots ``state_indices``, write slots ``output_state_indices``,
+    by default the read slots), or on identity slots for a dense call.  A call without an initial state reads slots
+    -1 (zero states; a stochastic rounding then counts from the write slot) and a call that stores no final state
+    writes slots -1 (nothing stored).  ``rand_seed`` rounds a BF16 / FP16 state's stores stochastically; it is
+    refused for an FP32 state."""
+
+    pool_mode = state_indices is not None
+    if output_final_state and output_state is None and pool_mode:
+        raise ValueError(
+            "output_final_state with state_indices needs an explicit output_state pool "
+            "(the identical view of initial_state or disjoint memory)"
+        )
+    stored = output_state if output_final_state else None
+    dtype = _call_state_dtype(initial_state, stored, output_final_state, pool_mode)
+    if rand_seed is not None and dtype == torch.float32:
+        raise ValueError(
+            "rand_seed rounds the stores of a bfloat16 / float16 state stochastically; a float32 state is "
+            "stored as it is"
+        )
+    if dtype == torch.float32 and output_state_indices is None:
+        return None
+    key = _loader.PREFILL_STATE_DTYPES[dtype]
+    shipped = _hopper_pool_dtypes(arch)
+    if key not in shipped:
+        raise ValueError(
+            f"no exported Cake GDP prefill program on {arch} for a {dtype} "
+            f"{'pool' if pool_mode else 'state'}"
+            f"{' with output_state_indices' if output_state_indices is not None else ''}; the route ships the "
+            f"pool programs with write slots of the state dtypes {sorted(shipped)}"
+        )
+    rows = None if pool_mode else N
+    initial_in = (
+        None
+        if initial_state is None
+        else _prefill_pool(
+            initial_state,
+            "initial_state",
+            rows=rows,
+            heads=H,
+            device=device,
+            dtype=dtype,
+            writable=pool_mode,
+            stochastic=rand_seed is not None,
+        )
+    )
+    output_in = (
+        None
+        if stored is None
+        else _prefill_pool(
+            stored,
+            "output_state",
+            rows=rows,
+            heads=H,
+            device=device,
+            dtype=dtype,
+            writable=True,
+        )
+    )
+    if pool_mode:
+        slots = _index_input(state_indices, "state_indices", shape=(N,), device=device)
+        oslots = (
+            slots
+            if output_state_indices is None
+            else _index_input(
+                output_state_indices, "output_state_indices", shape=(N,), device=device
+            )
+        )
+    else:
+        slots = oslots = _identity_slots(N, device)
+    if initial_in is None:
+        slots = _no_slots(N, device)
+    if output_in is None:
+        oslots = _no_slots(N, device)
+    seed, rounds = None, 0
+    if dtype != torch.float32:
+        base = initial_in if initial_in is not None else output_in
+        seed, rounds = _rounding(base, rand_seed, philox_rounds)
+    return _V6State(key, True, initial_in, output_in, slots, oslots, seed, rounds)
+
+
 def _int32_view(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
     """A contiguous index tensor as the kernel takes it: an int32 tensor as is, an int64 tensor as its int32 byte
     view (the kernel reads it as int64 under the metadata mask bit); no conversion copy. The fork-order (V6) programs
-    read int32 metadata only: ``_run_single_pass`` / ``_run_two_classes`` cast an int64 ``cu_seqlens`` / slot table to
-    int32 for them."""
+    read int32 metadata only: ``_run_single_pass`` casts an int64 ``cu_seqlens`` / slot table to int32 for them."""
 
     tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
     if tensor.dtype == torch.int32:
@@ -730,6 +1213,9 @@ def cake_chunk_gated_delta_product(
     *,
     state_indices: Optional[torch.Tensor] = None,
     cu_seqlens_cpu: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
+    rand_seed: Optional[torch.Tensor] = None,
+    philox_rounds: int = 10,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Chunked varlen Gated DeltaProduct prefill on the Cake kernels.
 
@@ -737,32 +1223,53 @@ def cake_chunk_gated_delta_product(
     the full documentation of the arguments and semantics.  Every check here reads shapes, dtypes, strides and
     Python scalars only.  On SM100 / SM103 the call is one launch of the Blackwell body over the item table of
     ``prefill_v6_plan`` (the split rules read each sequence alone, short sequences' rows go to the least-loaded
-    CTAs; ``num_householder=3``; ``g=None`` / ``beta=None`` filled with ones; a ``state_indices`` pool refused); the
-    plan is built from the host lengths, so a captured graph is valid only for the batch it captured (other lengths
-    need a new capture or an eager call; a replay over changed device offsets runs no item and writes NaN to
-    ``o[0, 0, :2]`` and, with a final state, ``output_state[0, 0, 0, 0]``); the rest of this paragraph is
-    SM90's.  The launches follow the body route of record (``prefill_body_classes`` over the host
-    sequence lengths): every sequence is classed by its own chunk count, ``H``, ``n`` and the SM count -- the V6
-    fork-order body for a sequence under ``ROUTE_MIN_CHUNKS_P3`` (384) chunks (an empty one included) and for a
-    call reading no initial state and keeping no final state, the merged chunked body for a unit-gate / unit-beta
-    call and for a long sequence whose gate-saturation split items are the cheaper.  A uniform batch (every
-    performance row) is one Cake kernel launch: the V6 program of the call's flags over the ``N x H`` (sequence,
-    head) tiles on ``min(SM count, N x H)`` persistent CTAs, or, for the merged class, the exact unit program over
-    those tiles or the split program of the flags over the items of the split rule of record
-    (``prefill_split_table``, which always cuts a merged-class sequence; the item-table upload and a workspace
-    clear added).  A mixed batch is one launch per body present, the merged body first, each on the indexed
-    program of its body over its own sequences alone: their tokens are gathered into compact copies with their own
-    offsets and scattered back afterwards, the dense state tensors are addressed as pools with ``slot =
-    sequence``, and every output row and every state slot is written by exactly one launch (the gather / scatter
-    copies and the split table / workspace prepare added).  With ``cu_seqlens_cpu`` given, no device-to-host
+    CTAs; ``num_householder=3``; ``g=None`` / ``beta=None`` filled with ones) on the program of the call's state
+    form: the dense FP32 programs, or the pool programs of the state dtype (FP32, BF16 or FP16) for a
+    ``state_indices`` pool (``output_state_indices`` its write slots) and for a dense BF16 / FP16 state (identity
+    slots); the plan is built from the host lengths, so a captured graph is valid only for the batch it captured
+    (other lengths need a new capture or an eager call; a replay over changed device offsets runs no item and writes
+    NaN to ``o[0, 0, :2]`` and, with a dense FP32 final state, ``output_state[0, 0, 0, 0]``); the rest of this
+    paragraph is SM90's.  Every call is one Cake kernel launch for the whole batch.  A gated call with a
+    balanced sequence (a long sequence whose head-major chunks fill a slot per SM, ``prefill_v6_sm90_plan``) whose plan is the lighter
+    launch runs the V6 split program of its flags on one persistent CTA per SM over the rows of that plan: each
+    balanced sequence cut into slots at block heads (each piece past a cut starts from a zero state a warm-up before
+    it and writes its output from the cut, a cut whose gates do not decay within the warm-up being run through),
+    every other sequence one row per head, all in the same launch; that program compares the planned offsets with
+    ``cu_seqlens`` on the device and, on a replay over changed offsets, computes nothing and writes NaN to
+    ``o[0, 0, :2]`` (and to ``output_state[0, 0, 0, 0]`` when a final state is stored).  Any other call runs one
+    body for the whole batch (``prefill_batch_body`` over the host sequence lengths): the V6 fork-order body for a
+    unit-free call without a merged-class sequence (the body route of record: a sequence under
+    ``ROUTE_MIN_CHUNKS_P3`` (384) chunks, or one whose split items are not the cheaper) and for a call reading no
+    initial state and keeping no final state; the merged chunked body for
+    a unit-gate / unit-beta call (its exact unit program); otherwise the body of the lesser modeled whole-batch
+    kernel time (``prefill_batch_costs``: the most loaded persistent CTA under each body).  The V6 program of the
+    call's flags runs over the ``N x H`` (sequence, head) tiles on ``min(SM count, N x H)`` persistent CTAs; the
+    merged split program of the flags runs over the items of the split rule of record (``prefill_split_table``)
+    over every sequence of the batch -- short and empty sequences one item per head, in the same launch -- with a
+    workspace clear before it.  No token is gathered or scattered.  The item table is uploaded from pinned host
+    memory into a device buffer cached by content (``_item_table``, shared with SM100 / SM103), so with
+    ``cu_seqlens_cpu`` given the call captures into a CUDA graph; the body and the table are planned from the host
+    lengths, so such a graph is valid only for the batch it captured (other lengths need a new capture or an eager
+    call; outside the V6 split program a replay over changed offsets is not supported and its result is
+    unspecified).  On SM90 a BF16 / FP16 state (a pool or dense per-sequence tensors) or ``output_state_indices``
+    runs the V6 pool program with the write slot table of the call's state dtype (FP32, BF16 or FP16;
+    ``_hopper_state``): its warm-up split twin when the V6 split plan pays, else the program over the ``N x H``
+    tiles, whatever the body route; a dense call takes identity slots, a call without an initial state reads slots
+    -1 and a call without a final state writes slots -1; ``g=None`` / ``beta=None`` are filled with ones (the math
+    of the unit-gate / unit-beta programs, not their bits); a
+    BF16 / FP16 state is read widened exactly and rounded once at the final store, to nearest even, or
+    stochastically with ``rand_seed`` (a software form of ``cvt.rs``); its
+    split twin writes no state marker on a stale replay.  With ``cu_seqlens_cpu`` given, no device-to-host
     synchronization is issued (the route reads the host copy); without it the sequence offsets are copied to the
     host once.  ``cu_seqlens_cpu`` is the host copy of ``cu_seqlens`` (a CPU int32 / int64 tensor of ``N + 1``
     entries, as vLLM keeps ``query_start_loc_cpu`` beside the device tensor); it is checked for its device, rank,
     length and dtype only, never compared value by value with ``cu_seqlens``.  When it is None the call reads
     ``cu_seqlens.cpu()`` -- one device-to-host synchronization, which CUDA Graph capture does not allow -- so a
     graph-captured caller passes the host copy.  A device without an exported prefill route, and a flag set no
-    exported program spells (``g=None`` together with ``beta=None``; on SM90 a unit-gate or unit-beta call with an
-    ``initial_state`` or a ``state_indices`` pool), is refused with ``ValueError`` rather than approximated.
+    exported program spells (``g=None`` together with ``beta=None``; on SM90 a unit-gate or unit-beta call with a
+    float32 ``initial_state`` or a float32 ``state_indices`` pool without ``output_state_indices``), is refused with
+    ``ValueError`` rather than approximated.  On SM90 a sequence longer than 262144 tokens is refused with
+    ``ValueError``.
     """
 
     if not isinstance(q, torch.Tensor) or q.ndim != 3:
@@ -814,14 +1321,12 @@ def cake_chunk_gated_delta_product(
     scale_value = 0.0 if scale is None else float(scale)
     output_final_state = bool(output_final_state)
     pool_mode = state_indices is not None
-    # SM100 / SM103: the Blackwell body (one launch for every flag set over a host item table); it addresses the
-    # state as one dense [N, H, 64, 128] record per sequence, so a slot pool is refused.
+    if output_state_indices is not None and not pool_mode:
+        raise ValueError("output_state_indices needs state_indices (the read slots)")
+    # SM100 / SM103: the Blackwell body (one launch for every flag set over a host item table), dense or on slot
+    # pools, with an FP32, BF16 or FP16 state.  SM90: the FP32 programs, and the V6 pool programs with the write slot
+    # table for a BF16 / FP16 state or ``output_state_indices`` (``_hopper_state``).
     blackwell = arch in _loader.V6_ARCHES
-    if blackwell and pool_mode:
-        raise ValueError(
-            f"no exported Cake GDP prefill program on {arch} reads or writes a state_indices pool; pass dense "
-            "[num_seqs, H, 64, 128] initial_state / output_state tensors"
-        )
 
     # -- the model inputs
     q_in = _tma_operand(q, "q", shape=(T, H, K), device=device, dtype=io_dtype)
@@ -870,7 +1375,36 @@ def cake_chunk_gated_delta_product(
     mask = _CU_SEQLENS_INT64 if cu_int64 else 0
 
     # -- the state
-    if pool_mode:
+    v6_state = (_blackwell_state if blackwell else _hopper_state)(
+        arch,
+        device,
+        initial_state,
+        output_state,
+        output_final_state,
+        state_indices,
+        output_state_indices,
+        rand_seed,
+        philox_rounds,
+        N,
+        H,
+    )
+    if v6_state is not None:
+        slots, initial_in, output_in = (
+            v6_state.slots,
+            v6_state.initial,
+            v6_state.output,
+        )
+        if not blackwell and (unit_gates or unit_beta):
+            # The SM90 pool programs are V6 programs, built for gate and beta tensors: the unit values are
+            # materialized (one fill each), as on SM100 / SM103.  That is the math of the FP32 unit-gate /
+            # unit-beta programs but another program: the gate / beta path runs on the unit values, so the bits
+            # may differ from those programs' (they agree within the prefill tolerance).
+            if unit_gates:
+                gate = torch.ones((T, H), dtype=torch.float32, device=device)
+            if unit_beta:
+                beta_in = torch.ones((T * n, H), dtype=torch.float32, device=device)
+            unit_gates = unit_beta = False
+    elif pool_mode:
         slots = _index_input(
             state_indices,
             "state_indices",
@@ -1009,9 +1543,19 @@ def cake_chunk_gated_delta_product(
             f"cu_seqlens_cpu must hold the {N + 1} entries of cu_seqlens, got {cu_seqlens_cpu.numel()}"
         )
     cu_cpu: tuple[int, ...] = tuple(int(x) for x in cu_seqlens_cpu.tolist())
+    if not blackwell:
+        longest = max(
+            (b - a for a, b in zip(cu_cpu, cu_cpu[1:], strict=False)), default=0
+        )
+        if longest > _SM90_MAX_SEQ_LEN:
+            raise ValueError(
+                f"the Cake GDP prefill on {arch} runs sequences of at most {_SM90_MAX_SEQ_LEN} tokens, got one of "
+                f"{longest}"
+            )
     device_index = _device_index(device)
     sm_count = _loader.sm_count(device_index)
     if blackwell:
+        assert v6_state is not None
         _run_blackwell_v6(
             arch,
             device,
@@ -1025,9 +1569,30 @@ def cake_chunk_gated_delta_product(
             beta_in,
             cu_in,
             mask,
-            initial_in,
-            output_in,
+            v6_state,
             scale_value if scale_value != 0.0 else HEAD_SIZE_K**-0.5,
+            N,
+            T,
+            H,
+            n,
+            cu_cpu,
+        )
+    elif v6_state is not None:
+        _run_hopper_pool(
+            arch,
+            device,
+            device_index,
+            sm_count,
+            q_in,
+            k_in,
+            v_in,
+            kernel_out,
+            gate,
+            beta_in,
+            cu_in,
+            mask,
+            v6_state,
+            scale_value,
             N,
             T,
             H,
@@ -1091,6 +1656,90 @@ def _split_table(arch, cu_cpu, N, T, H, n, sm_count, unit_gates, unit_beta):
     )
 
 
+class _Sm90Plan(NamedTuple):
+    """The launch of one sm_90a call: its body, and for a split program the flat int32 item words, their bytes (the
+    device-table cache key) and the item count; ``v6_grid`` is the persistent grid of a V6 split program (0 for the
+    other programs, which run ``min(SM count, tiles)`` CTAs)."""
+
+    body: str
+    words: Optional[tuple[int, ...]]
+    key: Optional[bytes]
+    items: int
+    v6_grid: int = 0
+
+
+@functools.lru_cache(maxsize=256)
+def _sm90_v6_split(
+    cu_cpu: tuple[int, ...], T: int, H: int, n: int, sm_count: int
+) -> Optional[_Sm90Plan]:
+    """The V6 split launch of a gated sm_90a call when its ``prefill_v6_sm90_plan`` pays (``split``: a long sequence
+    whose head-major chunks fill a slot per SM, the plan's most loaded CTA lighter than the V6 program's): the plan's
+    item words over the whole batch, its rows and grid; else None.  Cached: host arithmetic over the lengths."""
+
+    v6 = _loader.prefill_v6_sm90_plan(
+        cu_cpu, num_heads=H, num_householder=n, sm_count=sm_count, total_tokens=T
+    )
+    if not v6.split:
+        return None
+    words = _loader.v6_sm90_item_words(v6, cu_cpu)
+    return _Sm90Plan(
+        _loader.ROUTE_BODY_V6,
+        words,
+        array.array("i", words).tobytes(),
+        len(v6.rows),
+        v6.grid,
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _sm90_plan(
+    arch: str,
+    cu_cpu: tuple[int, ...],
+    T: int,
+    H: int,
+    n: int,
+    sm_count: int,
+    stores: bool,
+    unit_gates: bool,
+    unit_beta: bool,
+) -> _Sm90Plan:
+    """The launch of the whole call.  A gated call whose ``prefill_v6_sm90_plan`` pays (``split``: a long sequence
+    whose head-major chunks fill a slot per SM, the plan's most loaded CTA lighter than the V6 program's) runs the
+    V6 split program over the rows of that plan, every sequence of the batch in the same launch.  Any other call
+    runs the body of ``prefill_batch_body`` over the host offsets: the V6 program over the ``N x H`` tiles, or, for
+    the merged gated body, its split program over the item table of the split rule of every sequence of the batch.
+    A pure function of its arguments, cached: a model calls every layer with the same batch, and the plan is host
+    arithmetic over the lengths."""
+
+    if not (unit_gates or unit_beta):
+        split = _sm90_v6_split(cu_cpu, T, H, n, sm_count)
+        if split is not None:
+            return split
+    body = _loader.prefill_batch_body(
+        cu_cpu,
+        n,
+        H,
+        sm_count,
+        store_final_state=stores,
+        unit_gates=unit_gates,
+        unit_beta=unit_beta,
+        total_tokens=T,
+    )
+    if body == _loader.ROUTE_BODY_V6 or unit_gates or unit_beta:
+        return _Sm90Plan(body, None, None, 0)
+    table = _split_table(
+        arch, cu_cpu, len(cu_cpu) - 1, T, H, n, sm_count, unit_gates, unit_beta
+    )
+    if table is None:
+        raise ValueError(
+            "Cake GDP prefill body route invariant broken: the batch route chose the merged body, so some sequence "
+            f"is merged-class and the split rule of record cuts it, yet the rule left the batch whole or {arch} "
+            "routes no split program"
+        )
+    words = tuple(word for item in table for word in item)
+    return _Sm90Plan(body, words, array.array("i", words).tobytes(), len(table))
+
+
 def _launch_prefill(
     name: str,
     *,
@@ -1118,11 +1767,15 @@ def _launch_prefill(
     n: int,
     tiles: int,
     mask: int,
+    grid: Optional[int] = None,
+    extra: Optional[dict[str, Any]] = None,
 ) -> None:
-    """One launch of the prefill program ``name`` over the 23 logical arguments of the prefill records; the
-    persistent grid of ``min(sm_count, tiles)`` CTAs sizes the tensor-map staging."""
+    """One launch of the prefill program ``name`` over the 23 logical arguments of the prefill records (and the
+    ``extra`` ones a pool program with the write slot table adds) on ``grid`` persistent CTAs (default
+    ``min(sm_count, tiles)``), which also sizes the tensor-map staging."""
 
-    grid = min(sm_count, tiles)
+    launch = tiles if grid is None else grid
+    grid = min(sm_count, tiles) if grid is None else grid
     values = {
         "q": q,
         "k": k,
@@ -1149,6 +1802,7 @@ def _launch_prefill(
         "metadata_i64_mask": mask,
         "ainv_workspace": ainv_ws,
         "ainv_chunk_stride": 0,
+        **(extra or {}),
     }
     # The loader binds the current torch stream of the *current* device; make that the tensors' device.
     with torch.cuda.device(device):
@@ -1158,24 +1812,9 @@ def _launch_prefill(
             batch=num_seqs,
             heads=H,
             device_index=device_index,
-            tiles=tiles,
+            tiles=launch,
             sm_count=sm_count,
         )
-
-
-def _split_items(
-    table: list, num_seqs: int, H: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """The device inputs of a split program over the item ``table``: the int32 item table (formal 9, four words per
-    item), the A-inverse workspace (the ``num_seqs x H`` seed-done flags and two plan-echo words per item, zero at
-    launch) and the tile count (the items)."""
-
-    items = len(table)
-    table_in = torch.tensor(table, dtype=torch.int32, device=device).reshape(-1)
-    ainv_ws = torch.zeros(
-        (4 * (num_seqs * H + 2 * items),), dtype=torch.uint8, device=device
-    )
-    return table_in, ainv_ws, items
 
 
 def _run_single_pass(
@@ -1203,13 +1842,15 @@ def _run_single_pass(
     unit_beta,
     cu_cpu,
 ) -> None:
-    """The launches of one call under the body route of record: ``prefill_body_classes`` over the host offsets
-    ``cu_cpu`` classes every sequence and ``prefill_launch_plan`` orders the launches.  One class (every performance
-    row) is one launch of the whole batch: the V6 program of the call's flags over the ``N x H`` tiles on
-    ``min(SM count, N x H)`` persistent CTAs (every V6 program stores a final state; a call keeping none gets the
-    discard record), or, for the merged class, the exact unit program over those tiles or the split program of the
-    flags over the items of the split rule (tiles = the items; a merged-class sequence is always cut).  Two classes
-    are two launches on the same stream (``_run_two_classes``)."""
+    """The one launch of an sm_90a call (``_sm90_plan`` over the host offsets ``cu_cpu``): the V6 split program of the
+    call's flags over the rows of ``prefill_v6_sm90_plan`` on one CTA per SM when that plan pays; else the
+    body ``prefill_batch_body`` picks for the whole batch -- the V6 program of the call's flags over the ``N x H``
+    tiles on ``min(SM count, N x H)`` persistent CTAs, or, for the merged body, the exact unit program over those
+    tiles or the split program of the flags over the items of the split rule of every sequence of the batch (tiles =
+    the items; short and empty sequences one item per head).  Every V6 program stores a final state; a call keeping
+    none gets the discard record.  No token is gathered or scattered.  The item table comes from pinned host memory
+    into a cached device buffer (``_item_table``), so the call issues no synchronization and captures into a CUDA
+    graph."""
 
     use_indices = slots is not None
     store_final = output_in is not None
@@ -1223,63 +1864,25 @@ def _run_single_pass(
             initial_in is not None or use_indices
         )  # a write-only pool reads a zero record
     # The shipped flag sets: a program reading an initial state and a unit program store a final state (a call
-    # wanting none gets a discard record); the plain call without a final state is V6-class at every length, and
-    # the V6 plain program stores one too.
+    # wanting none gets a discard record); the plain call without a final state is V6 at every length, and the V6
+    # plain program stores one too.
     stores = store_final or use_initial or unit_gates or unit_beta
-    classes = _loader.prefill_body_classes(
-        cu_cpu,
-        n,
-        H,
-        sm_count,
-        store_final_state=stores,
-        unit_gates=unit_gates,
-        unit_beta=unit_beta,
-        total_tokens=T,
-    )
-    plan = _loader.prefill_launch_plan(classes)
+    plan = _sm90_plan(arch, cu_cpu, T, H, n, sm_count, stores, unit_gates, unit_beta)
+    body = plan.body
     pool_rows = N
     if use_indices:
         pool_rows = max(
             int(initial_in.shape[0]) if initial_in is not None else 0,
             int(output_in.shape[0]) if output_in is not None else 0,
         )
-    launch = dict(
-        device=device,
-        device_index=device_index,
-        sm_count=sm_count,
-        scale_value=scale_value,
-        H=H,
-        n=n,
-    )
-    if len(plan) == 2:
-        _run_two_classes(
-            arch,
-            plan,
-            launch,
-            q_in,
-            k_in,
-            v_in,
-            out,
-            gate,
-            beta_in,
-            slots,
-            initial_in,
-            output_in,
-            store_final,
-            pool_rows,
-            T,
-            cu_cpu,
-        )
-        return
-    body = plan[0][0]
-    flags = dict(
+    flags: dict[str, Any] = dict(
         use_initial_state=use_initial,
         use_state_indices=use_indices,
         store_final_state=stores,
         unit_gates=unit_gates,
         unit_beta=unit_beta,
     )
-    table = None
+    split_flag: dict[str, Any] = {_loader.PREFILL_SPLIT_FLAG: True}
     if body == _loader.ROUTE_BODY_V6:
         # Every V6 program stores a final state: a call keeping none gets the discard record below.
         name = selected_prefill_module(
@@ -1290,6 +1893,7 @@ def _run_single_pass(
             store_final_state=True,
             unit_gates=False,
             unit_beta=False,
+            **(split_flag if plan.v6_grid else {}),
         )
         if mask & _CU_SEQLENS_INT64:
             # Every V6 program reads int32 metadata only (the plain program is the body of record; the i64 select in the
@@ -1310,18 +1914,11 @@ def _run_single_pass(
                 f"beta={'None' if unit_beta else 'tensor'} ({exc})"
             ) from None
     else:
-        table = _split_table(arch, cu_cpu, N, T, H, n, sm_count, unit_gates, unit_beta)
-        if table is None:
-            raise ValueError(
-                "Cake GDP prefill body route invariant broken: a merged-class sequence has at least "
-                f"{_loader.ROUTE_MIN_CHUNKS_P3} chunks and the split rule of record cuts it, yet the rule left the "
-                f"batch whole (classes {classes}) or {arch} routes no split program"
-            )
         name = selected_prefill_module(
             arch,
             body=_loader.ROUTE_BODY_P3,
             **flags,
-            **{_loader.PREFILL_SPLIT_FLAG: True},
+            **split_flag,
         )
     if use_initial:
         if initial_in is not None:
@@ -1347,15 +1944,29 @@ def _run_single_pass(
             mask |= _INDICES_INT64
     else:
         slot_in = torch.empty((1,), dtype=torch.int32, device=device)
-    if table is not None:
-        # The split program: formal 9 carries the item table, the tiles are the items.
-        table_in, ainv_ws, tiles = _split_items(table, N, H, device)
+    if plan.v6_grid:
+        # The V6 split program: formal 9 carries the item table, the tiles are its rows; the A-inverse workspace
+        # holds the N x H seed-done flags, zero at launch (the kernel leaves them zero).
+        table_in = _item_table(plan.words, device, key=plan.key)
+        ainv_ws = torch.zeros((max(16, 4 * N * H),), dtype=torch.uint8, device=device)
+        tiles = plan.items
+    elif plan.words is not None:
+        # The merged split program: formal 9 carries the item table, the tiles are the items; the A-inverse workspace
+        # holds the N x H seed-done flags and two plan-echo words per item, zero at launch.
+        table_in = _item_table(plan.words, device, key=plan.key)
+        ainv_ws = torch.zeros(
+            (4 * (N * H + 2 * plan.items),), dtype=torch.uint8, device=device
+        )
+        tiles = plan.items
     else:
         table_in = slot_in
         ainv_ws = torch.empty((16,), dtype=torch.uint8, device=device)
         tiles = N * H
     _launch_prefill(
         name,
+        device=device,
+        device_index=device_index,
+        sm_count=sm_count,
         q=q_in,
         k=k_in,
         v=v_in,
@@ -1370,209 +1981,178 @@ def _run_single_pass(
         final=final,
         final_stride=final_stride,
         ainv_ws=ainv_ws,
+        scale_value=scale_value,
         num_seqs=N,
         total_tokens=T,
+        H=H,
+        n=n,
         tiles=tiles,
         mask=mask,
-        **launch,
+        grid=plan.v6_grid or None,
     )
 
 
-def _run_two_classes(
+def _run_hopper_pool(
     arch,
-    plan,
-    launch,
+    device,
+    device_index,
+    sm_count,
     q_in,
     k_in,
     v_in,
     out,
     gate,
     beta_in,
-    slots,
-    initial_in,
-    output_in,
-    store_final,
-    pool_rows,
+    cu_in,
+    mask,
+    state: _V6State,
+    scale_value,
+    N,
     T,
+    H,
+    n,
     cu_cpu,
 ) -> None:
-    """The two launches of a mixed-class batch in ``plan`` order (the merged body, then the V6 body), each on the
-    indexed program of its body over its class's sequences alone: the class's tokens are gathered into compact
-    q / k / v / gate / beta copies with their own int32 offsets (one upload of the gather indices, one of the
-    offsets and sequence indices), the state tensors are addressed as pools -- the user pool through the class's
-    slots, a dense ``[N, H, 64, 128]`` tensor with ``slot = sequence``, the zero record / the discard record where
-    the call reads no initial / keeps no final state -- and the launch's output rows are scattered back into
-    ``out`` afterwards.  No output row and no state slot is written by both launches.  A unit call and a call
-    without an initial and a final state are never mixed (the route classes every sequence of such a call alike),
-    so the gates and betas are tensors here."""
+    """The one launch of an sm_90a call on the V6 pool program with the write slot table of the call's state dtype
+    (``state``, :func:`_hopper_state`): its warm-up split twin over the rows of ``prefill_v6_sm90_plan`` on one CTA
+    per SM when that plan pays (:func:`_sm90_v6_split`), else the program over the ``N x H`` (sequence, head) tiles on
+    ``min(SM count, N x H)`` persistent CTAs.  The pools take their own slot strides; an absent initial / final state
+    is a one-element placeholder of the state dtype that the -1 slots keep the kernel from reading / writing.  As
+    the other SM90 programs, the call issues no synchronization and captures into a CUDA graph."""
 
-    device, H, n, sm_count = (
-        launch["device"],
-        launch["H"],
-        launch["n"],
-        launch["sm_count"],
+    split = _sm90_v6_split(cu_cpu, T, H, n, sm_count) if T else None
+    name = selected_prefill_module(
+        arch,
+        body=_loader.ROUTE_BODY_V6,
+        use_initial_state=True,
+        use_state_indices=True,
+        store_final_state=True,
+        unit_gates=False,
+        unit_beta=False,
+        state_dtype=state.dtype,
+        use_output_state_indices=True,
+        **({_loader.PREFILL_SPLIT_FLAG: True} if split is not None else {}),
     )
-    use_indices = slots is not None
-    if initial_in is not None:
-        initial, initial_stride = initial_in, H * _STATE_ELEMENTS
-    else:
-        initial, initial_stride = _state_scratch(pool_rows, H, device, zeros=True), 0
-    if store_final:
-        final, final_stride = output_in, H * _STATE_ELEMENTS
-    else:
-        final, final_stride = _state_scratch(pool_rows, H, device, zeros=False), 0
-    for body, seqs in plan:
-        num_seqs = len(seqs)
-        pieces, cu_b = [], [0]
-        for seq in seqs:
-            start, end = _loader.split_sequence_bounds(cu_cpu[seq], cu_cpu[seq + 1], T)
-            pieces.append(torch.arange(start, end, dtype=torch.int64))
-            cu_b.append(cu_b[-1] + end - start)
-        tok_cpu = torch.cat(pieces)
-        total_tokens = int(tok_cpu.numel())
-        # One upload of the gather indices: the class's tokens, then their ``n`` expanded k / v / beta rows.
-        tok_n_cpu = tok_cpu[:, None] * n + torch.arange(n, dtype=torch.int64)
-        tok_n_cpu = tok_n_cpu.reshape(-1)
-        gather = torch.cat((tok_cpu, tok_n_cpu)).to(device)
-        tok, tok_n = gather[:total_tokens], gather[total_tokens:]
-        # One upload of the int32 metadata: the compact offsets, then the class's sequence indices.
-        meta = torch.tensor([*cu_b, *seqs], dtype=torch.int32).to(device)
-        cu_in, seq_in = meta[: num_seqs + 1], meta[num_seqs + 1 :]
-        # The state slots of the class: the user pool's through its indices; else the dense tensors are pools
-        # whose slot of sequence ``s`` is ``s``.
-        slot_src = slots.index_select(0, seq_in) if use_indices else seq_in
-        if body == _loader.ROUTE_BODY_V6 and slot_src.dtype == torch.int64:
-            # the V6 programs read int32 slots only (the compact offsets are int32 already)
-            slot_in, mask = slot_src.to(torch.int32), 0
-        else:
-            slot_in, slot_int64 = _int32_view(slot_src)
-            mask = _INDICES_INT64 if slot_int64 else 0  # the compact offsets are int32
-        if total_tokens:
-            q_b = q_in.index_select(0, tok)
-            k_b = k_in.index_select(0, tok_n)
-            v_b = v_in.index_select(0, tok_n)
-            gate_b = gate.index_select(0, tok)
-            beta_b = beta_in.index_select(0, tok_n)
-            o_b = torch.empty(
-                (total_tokens, H, HEAD_SIZE_V), dtype=_KERNEL_DTYPE, device=device
-            )
-        else:
-            # Every sequence of the class is empty (the V6 class beside merged-class long sequences): the one-row
-            # placeholders of an empty call; ``total_tokens`` = 0 keeps the kernel from reading them.
-            q_b = torch.empty((1, H, HEAD_SIZE_K), dtype=_KERNEL_DTYPE, device=device)
-            k_b = torch.empty((n, H, HEAD_SIZE_K), dtype=_KERNEL_DTYPE, device=device)
-            v_b = torch.empty((n, H, HEAD_SIZE_V), dtype=_KERNEL_DTYPE, device=device)
-            gate_b = torch.ones((1, H), dtype=torch.float32, device=device)
-            beta_b = torch.ones((n, H), dtype=torch.float32, device=device)
-            o_b = torch.empty((1, H, HEAD_SIZE_V), dtype=_KERNEL_DTYPE, device=device)
-        if body == _loader.ROUTE_BODY_P3:
-            table = _loader.prefill_split_table(
-                tuple(cu_b),
-                num_heads=H,
-                num_householder=n,
-                sm_count=sm_count,
-                total_tokens=total_tokens,
-            )
-            if table is None:
-                raise ValueError(
-                    "Cake GDP prefill body route invariant broken: a merged-class sequence has at least "
-                    f"{_loader.ROUTE_MIN_CHUNKS_P3} chunks and the split rule of record cuts it, yet the rule "
-                    f"left the merged class (sequences {seqs}) whole"
-                )
-            name = selected_prefill_module(
-                arch,
-                body=_loader.ROUTE_BODY_P3,
-                use_initial_state=True,
-                use_state_indices=True,
-                store_final_state=True,
-                **{_loader.PREFILL_SPLIT_FLAG: True},
-            )
-            table_in, ainv_ws, tiles = _split_items(table, num_seqs, H, device)
-        else:
-            name = selected_prefill_module(
-                arch,
-                body=_loader.ROUTE_BODY_V6,
-                use_initial_state=True,
-                use_state_indices=True,
-                store_final_state=True,
-            )
-            table_in = slot_in
-            ainv_ws = torch.empty((16,), dtype=torch.uint8, device=device)
-            tiles = num_seqs * H
-        _launch_prefill(
-            name,
-            q=q_b,
-            k=k_b,
-            v=v_b,
-            o=o_b,
-            gate=gate_b,
-            beta=beta_b,
-            cu=cu_in,
-            slot_in=slot_in,
-            table_in=table_in,
-            initial=initial,
-            initial_stride=initial_stride,
-            final=final,
-            final_stride=final_stride,
-            ainv_ws=ainv_ws,
-            num_seqs=num_seqs,
-            total_tokens=total_tokens,
-            tiles=tiles,
-            mask=mask,
-            **launch,
+    if mask & _CU_SEQLENS_INT64:
+        # the V6 programs read int32 offsets: one small copy of the N + 1 entries
+        cu_in = cu_in.view(torch.int64).to(torch.int32)
+        mask &= ~_CU_SEQLENS_INT64
+    placeholder = None
+    if state.initial is None or state.output is None:
+        dtype = next(
+            d for d, key in _loader.PREFILL_STATE_DTYPES.items() if key == state.dtype
         )
-        if total_tokens:
-            out.index_copy_(0, tok, o_b)
+        placeholder = torch.empty((1,), dtype=dtype, device=device)
+    initial = state.initial if state.initial is not None else placeholder
+    final = state.output if state.output is not None else placeholder
+    extra: dict[str, Any] = {"output_state_indices": state.oslots}
+    if state.dtype != "f32":
+        extra.update(rand_seed=state.seed, philox_rounds=state.rounds)
+    if split is not None:
+        # formal 9 carries the item table, the tiles are its rows; the A-inverse workspace holds the N x H seed-done
+        # flags, zero at launch (the kernel leaves them zero)
+        table_in = _item_table(split.words, device, key=split.key)
+        ainv_ws = torch.zeros((max(16, 4 * N * H),), dtype=torch.uint8, device=device)
+        tiles = split.items
+    else:
+        table_in = state.slots
+        ainv_ws = torch.empty((16,), dtype=torch.uint8, device=device)
+        tiles = N * H
+    _launch_prefill(
+        name,
+        device=device,
+        device_index=device_index,
+        sm_count=sm_count,
+        q=q_in,
+        k=k_in,
+        v=v_in,
+        o=out,
+        gate=gate,
+        beta=beta_in,
+        cu=cu_in,
+        slot_in=state.slots,
+        table_in=table_in,
+        initial=initial,
+        initial_stride=_slot_stride(state.initial, H),
+        final=final,
+        final_stride=_slot_stride(state.output, H),
+        ainv_ws=ainv_ws,
+        scale_value=scale_value,
+        num_seqs=N,
+        total_tokens=T,
+        H=H,
+        n=n,
+        tiles=tiles,
+        mask=mask,
+        grid=split.v6_grid if split is not None else None,
+        extra=extra,
+    )
 
 
-# ---- the Blackwell prefill body (SM100 / SM103) ----
+# ---- the item tables of the persistent programs (the SM90 split items, the Blackwell rows) ----
 
 # Item buffers on the device, by (device, content).  An eager call uploads a new table on a private copy stream and
 # waits for that copy alone (a few KB; the compute stream is not synchronized), then keeps the table in a small LRU;
 # a CUDA graph captured after an eager call of the same batch (the usual warm-up) reuses that complete table, so the
-# graph holds no copy node, and the table is then kept for the life of the process (the graph reads it at every
-# replay).  A table first seen during capture is copied in the graph from a pinned buffer kept as long.
+# graph holds no copy, and the table is then kept for the life of the process (the graph reads it at every replay).
+# A table first seen during capture is copied inside the graph from a pinned buffer; both are kept as long as the
+# process, but that table is never served to another call: its memory holds the table only once the graph has
+# replayed, so a later eager call or another capture of the same batch makes its own complete copy.
 _ITEM_TABLES_EAGER: collections.OrderedDict[tuple[int, bytes], torch.Tensor] = (
     collections.OrderedDict()
 )
 _ITEM_TABLES_EAGER_MAX = 64
 _ITEM_TABLES_CAPTURED: dict[tuple[int, bytes], torch.Tensor] = {}
-_CAPTURED_PINNED: dict[tuple[int, bytes], torch.Tensor] = {}
+_ITEM_TABLES_IN_GRAPHS: list[tuple[torch.Tensor, torch.Tensor]] = []
 _COPY_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
-def _item_table(words: tuple[int, ...], device: torch.device) -> torch.Tensor:
-    """The int32 ``items`` buffer ``words`` (``v6_item_words``) on ``device`` (read only): a cached complete buffer,
-    else an upload from pinned host memory (a pageable copy would synchronize the compute stream, which CUDA Graph
-    capture refuses)."""
+def _item_table(
+    words: tuple[int, ...], device: torch.device, *, key: Optional[bytes] = None
+) -> torch.Tensor:
+    """The int32 ``items`` buffer ``words`` (``v6_item_words`` on SM100 / SM103, the flat split items on SM90) on
+    ``device`` (read only): a cached complete buffer, else an upload from pinned host memory (a pageable copy would
+    synchronize the compute stream, which CUDA Graph capture refuses).  ``key`` is the bytes of ``words`` as int32
+    when the caller has them already."""
 
-    host = torch.tensor(words, dtype=torch.int32)
+    host = None
+    if key is None:
+        host = torch.tensor(words, dtype=torch.int32)
+        key = host.numpy().tobytes()
     index = device.index or 0
-    key = (index, host.numpy().tobytes())
-    table = _ITEM_TABLES_CAPTURED.get(key)
+    cache_key = (index, key)
+    table = _ITEM_TABLES_CAPTURED.get(cache_key)
     if table is not None:
         return table
     if torch.cuda.is_current_stream_capturing():
-        table = _ITEM_TABLES_EAGER.pop(key, None)
-        if table is None:
-            pinned = _CAPTURED_PINNED.setdefault(key, host.pin_memory())
-            table = torch.empty((host.numel(),), dtype=torch.int32, device=device)
-            table.copy_(pinned, non_blocking=True)
-        _ITEM_TABLES_CAPTURED[key] = table
+        table = _ITEM_TABLES_EAGER.pop(cache_key, None)
+        if table is not None:
+            # a complete table: the graph reads it at every replay, so it is kept and served from now on
+            _ITEM_TABLES_CAPTURED[cache_key] = table
+            return table
+        host = torch.tensor(words, dtype=torch.int32) if host is None else host
+        pinned = host.pin_memory()
+        table = torch.empty((len(words),), dtype=torch.int32, device=device)
+        table.copy_(pinned, non_blocking=True)
+        _ITEM_TABLES_IN_GRAPHS.append((pinned, table))
         return table
-    table = _ITEM_TABLES_EAGER.get(key)
+    table = _ITEM_TABLES_EAGER.get(cache_key)
     if table is not None:
-        _ITEM_TABLES_EAGER.move_to_end(key)
+        _ITEM_TABLES_EAGER.move_to_end(cache_key)
         return table
-    table = torch.empty((host.numel(),), dtype=torch.int32, device=device)
+    host = torch.tensor(words, dtype=torch.int32) if host is None else host
+    table = torch.empty((len(words),), dtype=torch.int32, device=device)
     copy = _COPY_STREAMS.setdefault(index, torch.cuda.Stream(device=device))
     with torch.cuda.stream(copy):
         table.copy_(host.pin_memory(), non_blocking=True)
     copy.synchronize()  # the table is complete before any stream reads it
-    _ITEM_TABLES_EAGER[key] = table
+    _ITEM_TABLES_EAGER[cache_key] = table
     if len(_ITEM_TABLES_EAGER) > _ITEM_TABLES_EAGER_MAX:
         _ITEM_TABLES_EAGER.popitem(last=False)
     return table
+
+
+# ---- the Blackwell prefill body (SM100 / SM103) ----
 
 
 def _run_blackwell_v6(
@@ -1588,8 +2168,7 @@ def _run_blackwell_v6(
     beta_in,
     cu_in,
     mask,
-    initial_in,
-    output_in,
+    state: _V6State,
     scale_value,
     N,
     T,
@@ -1598,17 +2177,24 @@ def _run_blackwell_v6(
     cu_cpu,
 ) -> None:
     """One launch of the Blackwell prefill body over the item table of ``prefill_v6_plan``: the split build over the
-    per-CTA lists of the ``split_table`` rows, or the block build (see the BLACKWELL V6 LAUNCH PLAN of the registry).  Every input is prepared on the device or uploaded from pinned memory: the call issues no
-    synchronization and captures into a CUDA graph (the item table cached on the device after an eager call of
-    the same batch, the split build's workspace cleared in the graph, then the kernel)."""
+    per-CTA lists of the ``split_table`` rows, or the block build (see the BLACKWELL V6 LAUNCH PLAN of the
+    registry), of the program of the call's state form (``state``: the dense FP32 programs, or the pool programs of
+    its dtype with the slot tables, the pools' slot strides and the rounding).  Every input is prepared on the
+    device or uploaded from pinned memory: the call issues no synchronization and captures into a CUDA graph (the
+    item table cached on the device after an eager call of the same batch, the split build's workspace cleared in
+    the graph, then the kernel)."""
 
+    initial_in, output_in = state.initial, state.output
     if T == 0:
         # Every sequence is empty: its final state is its initial state (the kernel wants a token).
-        if output_in is not None:
-            if initial_in is not None:
-                output_in.copy_(initial_in)
-            else:
-                output_in.zero_()
+        if output_in is None:
+            return
+        if state.pool:
+            _copy_pool_rows(initial_in, output_in, state.slots, state.oslots)
+        elif initial_in is not None:
+            output_in.copy_(initial_in)
+        else:
+            output_in.zero_()
         return
     plan = _loader.prefill_v6_plan(
         cu_cpu,
@@ -1618,7 +2204,9 @@ def _run_blackwell_v6(
         arch=arch,
         total_tokens=T,
     )
-    name = _loader.selected_v6_module(arch, plan)
+    name = _loader.selected_v6_module(
+        arch, plan, state_dtype=state.dtype, pool=state.pool
+    )
     if mask & _CU_SEQLENS_INT64:
         # the body reads int32 offsets: one small copy of the N + 1 entries
         cu_in = cu_in.view(torch.int64).to(torch.int32)
@@ -1638,7 +2226,12 @@ def _run_blackwell_v6(
     )
     placeholder = None
     if initial_in is None or output_in is None:
-        placeholder = torch.empty((1,), dtype=torch.float32, device=device)
+        # an absent state, which the flags keep the kernel from reading or writing: one element of the program's
+        # state dtype
+        dtype = next(
+            d for d, key in _loader.PREFILL_STATE_DTYPES.items() if key == state.dtype
+        )
+        placeholder = torch.empty((1,), dtype=dtype, device=device)
     values = {
         "q": q_in,
         "k": k_in,
@@ -1663,6 +2256,15 @@ def _run_blackwell_v6(
         "flags": flags,
         "num_seqs": N,
     }
+    if state.pool:
+        values.update(
+            state_indices=state.slots,
+            output_state_indices=state.oslots,
+            initial_state_stride_slot=_slot_stride(initial_in, H),
+            output_state_stride_slot=_slot_stride(output_in, H),
+        )
+    if state.dtype != "f32":
+        values.update(rand_seed=state.seed, philox_rounds=state.rounds)
     with torch.cuda.device(device):
         _loader.run_module(
             name,

@@ -62,6 +62,11 @@ class TermAlgebra(_Base):
         """``max.f32`` (exact, order-preserving like ``fmin``)."""
         return self._mk("fmax", a, b)
 
+    def rcp(self, a: Term) -> Term:
+        """``rcp.approx.ftz.f32``: an opaque hardware primitive, deterministic per architecture (the fp4 classes'
+        reciprocal; ``ex2`` is the base algebra's)."""
+        return self._mk("rcp", a)
+
     def exp2i(self, k: Term) -> Term:
         """The binary32 ``2^k`` for an integer-valued ``k`` in ``[-126, 127]`` (exact; built from the exponent bits on
         the device, ``ldexp`` on the CPU)."""
@@ -101,6 +106,31 @@ class TermAlgebra(_Base):
         """The routing's NaN rule (``a`` where the logit ``x`` is NaN, else ``b``): a row rule outside the term algebra,
         so the symbolic term is ``b`` (the terms and the Lean statements are over non-NaN inputs)."""
         return b
+
+
+_SFU_TABLES = None
+
+
+def bind_sfu_tables(tables) -> None:
+    """Bind the part's SFU tables (:class:`flashinfer.batch_invariant.fp_interface.sfu.SfuTables`) for the evaluation of the
+    fp4 classes' ``ex2`` / ``rcp`` nodes (``None`` unbinds; unbound, the references take the current CUDA device's)."""
+    global _SFU_TABLES
+    _SFU_TABLES = tables
+
+
+def sfu_tables():
+    """The bound tables, or a clear error."""
+    if _SFU_TABLES is None:
+        raise RuntimeError(
+            "no SFU tables bound: the fp4 classes' ex2 / rcp evaluate on a part's tables "
+            "(mterm.bind_sfu_tables(sfu.tables_for(device)))"
+        )
+    return _SFU_TABLES
+
+
+def sfu_eval(op: str, x: float) -> float:
+    """The bound part's ``ex2`` or ``rcp`` of one binary32 value (the tables' own CPU model)."""
+    return sfu_tables().eval(op, x)
 
 
 def rowmax_f32(*vals: float) -> float:
@@ -170,6 +200,8 @@ def evaluate(
             v = fp32.fmaxc(memo[A[0].uid], memo[A[1].uid])
         elif op == "exp2i":
             v = fp32.exp2i(memo[A[0].uid])
+        elif op in ("ex2", "rcp"):
+            v = sfu_eval(op, memo[A[0].uid])
         elif op == "fabs":
             v = fp32.fabs(memo[A[0].uid])
         elif op == "sqrt":
@@ -189,6 +221,10 @@ def evaluate(
             kind = A[1]
             if kind in ("e4m3", "e5m2"):
                 v = fp32.to_fp8(memo[A[0].uid], kind)
+            elif kind == "e2m1":
+                v = fp32.to_e2m1(
+                    memo[A[0].uid]
+                )  # the static class's codes (the quantizer's conversion)
             else:
                 fmt = {"f32": fp32.F32, "bf16": fp32.BF16, "f16": fp32.F16}[kind]
                 v = fp32.to_format(memo[A[0].uid], fmt)
@@ -251,7 +287,7 @@ def sexpr(t: Term) -> str:
         elif op in ("add", "mul", "fmaxc"):
             a, b = sorted(A[:2])
             out = f"({op} {a} {b})"
-        elif op in ("neg", "exp2i", "fabs", "sqrt", "frexpm", "frexpe"):
+        elif op in ("neg", "exp2i", "fabs", "sqrt", "frexpm", "frexpe", "ex2", "rcp"):
             out = f"({op} {A[0]})"
         elif op in ("div", "fmin", "fmax"):
             out = f"({op} {A[0]} {A[1]})"

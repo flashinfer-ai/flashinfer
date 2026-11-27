@@ -21,7 +21,7 @@ prefill request's shapes at reduced lengths: one-token sequences with a state
 ahead of a long fresh sequence, one long sequence with a state, two long
 sequences.  The call issues no synchronization when the host offsets are given,
 so it captures into a CUDA graph; graphs of different offsets replay
-independently.
+independently.  State pools and BF16 / FP16 state: ``test_cake_gdp_prefill_state.py``.
 """
 
 from __future__ import annotations
@@ -320,6 +320,43 @@ def test_a_graph_keeps_its_item_table_after_many_eager_batches():
     assert torch.equal(out, eager_out) and torch.equal(state, eager_state)
 
 
+@needs_cudnn
+@pytest.mark.parametrize(
+    "H,lengths",
+    [(10, [1] * 4 + [8192]), (20, [1] * 15 + [4085])],
+    ids=["H10_d4", "H20_d15"],
+)
+def test_an_eager_call_after_a_cold_capture_of_its_batch(H, lengths):
+    """The first call of a split batch is a CUDA graph capture (no eager warm-up of that batch; the program was
+    loaded by another batch), so its item table is first seen during capture and filled only by a replay.  An
+    eager call of that batch before any replay must not read that table: it matches cuDNN, then the replay and
+    a later eager call equal it bitwise."""
+    with_state = [1] * (len(lengths) - 1) + [0]
+    _call(_inputs([1, 1, 2046], 10, [1, 1, 0], seed=99), "cake")  # another batch
+    inputs = _inputs(lengths, H, with_state, seed=7)
+    assert _plan(lengths, H).split
+    T = sum(lengths)
+    out = torch.empty(T, H, V, dtype=torch.bfloat16, device=_device())
+    state = torch.empty(len(lengths), H, V, K, device=_device())
+    stream = torch.cuda.Stream(device=_device())
+    stream.wait_stream(torch.cuda.current_stream(_device()))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):  # the first call of this batch
+        _call(inputs, "cake", output=out, output_state=state)
+    torch.cuda.synchronize()
+    eager_out, eager_state = _call(inputs, "cake")  # before any replay
+    ref_out, ref_state = _call(inputs, "cudnn")
+    _check_close("eager output before replay", eager_out, ref_out, lengths)
+    _check_close("eager final state before replay", eager_state, ref_state, lengths)
+    out.fill_(float("nan"))
+    state.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager_out) and torch.equal(state, eager_state)
+    again_out, again_state = _call(inputs, "cake")
+    assert torch.equal(again_out, eager_out) and torch.equal(again_state, eager_state)
+
+
 # A graph replayed after the caller rewrote cu_seqlens in place with other lengths (same N and T): the captured
 # plan no longer matches the batch.  The kernel compares the planned offsets with the device ones and then runs no
 # item: it writes NaN to o[0, 0, :2] (one 32-bit word) and final state [0, 0, 0, 0] and leaves every other value as it was,
@@ -462,17 +499,6 @@ def test_empty_sequences():
     empty = _inputs([0, 0], 4, [1, 1], seed=10)
     out, state = _call(empty, "cake")
     assert out.shape[0] == 0 and torch.equal(state, empty["initial_state"])
-
-
-def test_a_state_pool_is_refused():
-    inputs = _inputs([64], 4, [1], seed=2)
-    with pytest.raises(ValueError, match="state_indices"):
-        _call(
-            inputs,
-            "cake",
-            state_indices=torch.zeros(1, dtype=torch.int32, device=_device()),
-            output_state=inputs["initial_state"],
-        )
 
 
 @pytest.mark.parametrize("n", [1, 2, 4])

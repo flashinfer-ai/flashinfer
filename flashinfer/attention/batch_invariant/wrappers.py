@@ -11,6 +11,34 @@ Chunked prefill: under the causal class a request cut into chunks (each later ch
 one-shot bits; under the non-causal class only query chunks planned over the request's full key set do -- a chunk run while the
 KV is still growing is that chunk's view of the keys present at the time, and a different ``kv_len`` is a different term.
 
+``run(..., return_lse=True)`` also returns the class's LSE member (``spec.lse_term``): fp32, ``(total_q, num_qo_heads)``, base 2,
+or -- on the prefill wrappers -- base e (``lse_base="ln"``, the declared in-kernel multiply by ``fp32(ln 2)``) and the
+``(num_qo_heads, total_q)`` layout (``lse_layout="HN"``, a copy of the same bits). It reads the ``(m, l)`` that normalise the
+output: the output bits are the same with and without it, and its receipt is its own
+(``fingerprint(<wrapper>, head_dim=..., causal=..., lse_base=...)``).
+
+``sinks`` (``run(..., sinks=)`` on the paged wrappers, the ``_sinks`` attribute of the ragged one), an fp32 ``(num_qo_heads,)``
+tensor of per-head sink logits, selects the class's sink member (``spec.sink_merge``): head ``h``'s rows get one virtual key
+of logit ``sinks[h]`` (natural-log units of the scaled score, ``sm_scale`` not applied) and zero value, merged once after the
+row's last chunk; the LSE includes it. A call without sinks is the class without the step, bit for bit; the member's receipts
+are ``fingerprint(<wrapper>, head_dim=..., causal=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
+A run with sinks and a run without are two members with different bits, so ``plan(..., has_sinks=True | False)`` declares
+which one the plan's runs are: a ``run()`` that departs from the declaration raises (``None``, the default, leaves the
+choice to each run). The check is made in Python at ``run()``, so capturing ``run()`` into a CUDA graph is unaffected.
+The values are not checked. A ``+inf`` or NaN sink gives NaN on its head's rows and a ``-inf`` sink the bits of the run
+without sinks (``spec.sink_merge``); the step works on the base-2 value ``mul(sinks[h], LOG2E)``, so a finite sink above
+about ``2.36e38`` (the value overflows to ``+inf``) gives NaN as well, and one below about ``-2.36e38`` (``-inf``) the
+bits of the run without sinks.
+
+Both members exist in both mask modes: they read a row's final ``(m, l)``, which the non-causal class forms over the request's
+whole key range. Under ``causal=False`` (``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) every query row of
+a request has the same visible keys, so a row's LSE depends on its request's key count, its head and its own query alone, and
+the sink joins that key set; a window stays refused, ``has_sinks`` and the buffer checks are the same, and the receipts take the
+mode (``fingerprint(<wrapper>, head_dim=..., causal=False, lse_base=... | sinks=True)``: ``attn-bf16-d<D>-nc-lse-<base>-...``,
+``attn-bf16-d<D>-nc-sink-...``, ``attn-bf16-d<D>-nc-sink-lse-<base>-...``). No row of either class is empty (``plan()``
+requires ``kv_len >= q_len`` under the causal class and a key for every request with query tokens under the non-causal one),
+so no stored LSE is that of an empty row.
+
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
 metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
@@ -29,7 +57,7 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, LSE_BASES, scale_log2
 
 CLASS = "attention.bf16"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -393,8 +421,11 @@ class BatchInvariantAttention:
         use_token_head_sf: bool = False,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        has_sinks: Optional[bool] = None,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``has_sinks`` declares
+        whether every ``run()`` of this plan is given sinks (``True`` / ``False``: a run that departs from it raises);
+        ``None`` leaves the choice to each run."""
         D = self._check_head_dim(head_dim_qk)
         if head_dim_vo is not None and int(head_dim_vo) != D:
             raise unsupported(
@@ -530,6 +561,7 @@ class BatchInvariantAttention:
                 self.device,
                 ragged=self.kind == "ragged",
                 causal=causal,
+                has_sinks=has_sinks,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -552,6 +584,7 @@ class BatchInvariantAttention:
                     self.device,
                     ragged=self.kind == "ragged",
                     causal=causal,
+                    has_sinks=has_sinks,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -668,28 +701,41 @@ class BatchInvariantAttention:
         enable_pdl: Optional[bool] = None,
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
-    ) -> torch.Tensor:
-        """Validate changing run-time inputs once, then launch with the fixed plan."""
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
+    ):
+        """Validate changing run-time inputs once, then launch with the fixed plan. ``return_lse``: ``(out, lse)`` with the LSE
+        member in ``lse_base`` (``"log2"`` | ``"ln"``) and ``lse_layout`` (``"NH"`` | ``"HN"``), written to ``lse`` when given (as
+        on the other backends, an ``lse`` buffer without ``return_lse`` is not used). ``sinks``: the fp32 ``(num_qo_heads,)``
+        per-head sink logits of the sink member."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        mismatch = engine.sinks_declaration_mismatch(self._planned.has_sinks, sinks)
+        if mismatch is not None:
+            raise unsupported(
+                CLASS,
+                mismatch,
+                "the same sinks choice at every run() of the plan (a new plan() changes the declaration)",
+            )
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,
                 "use_fp16_softmax / uses_spcompress",
                 "the fp32 softmax of the class",
             )
-        if return_lse or lse is not None:
-            raise unsupported(
-                CLASS,
-                "return_lse",
-                "the attention output alone (the class has no LSE member yet)",
-            )
+        if return_lse:
+            if lse_base not in LSE_BASES:
+                raise unsupported(
+                    CLASS, f"lse_base {lse_base!r}", 'lse_base "log2" or "ln"'
+                )
+            if lse_layout not in ("NH", "HN"):
+                raise unsupported(
+                    CLASS, f"lse_layout {lse_layout!r}", 'lse_layout "NH" or "HN"'
+                )
         if any(s is not None for s in scales):
             raise unsupported(
                 CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
             )
-        if sinks is not None:
-            raise unsupported(CLASS, "attention sinks", "plain softmax")
         if kv_cache_sf is not None:
             raise unsupported(CLASS, "a scaled (fp8 / fp4) KV cache", "a bf16 KV cache")
         if skip_softmax_threshold_scale_factor is not None:
@@ -703,6 +749,8 @@ class BatchInvariantAttention:
                 "the planned window",
             )
         Hq, Hkv, D = self._heads
+        # the caller's tensor: the kernels may run on a reshaped or packed copy of it
+        q_source = q
         if q.dim() == 4:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
         if q.dim() != 3 or q.shape[1] != Hq or q.shape[2] != D:
@@ -772,6 +820,7 @@ class BatchInvariantAttention:
                 "a q whose base address is not 16-byte aligned",
                 "a 16-byte-aligned q (the TMA descriptor's requirement)",
             )
+        storage = engine.plan_storage(self._planned)
         if out is None:
             out = torch.empty_like(q)
         elif (
@@ -792,6 +841,52 @@ class BatchInvariantAttention:
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
+        elif engine._overlaps_any(out, storage):
+            raise unsupported(
+                CLASS,
+                "an output that aliases the float workspace buffer",
+                "an output byte span disjoint from the workspace (the launch stores its split-KV partials there)",
+            )
+        lse_nh = None
+        if return_lse:
+            nh_shape = (q.shape[0], Hq)
+            if lse is not None:
+                shape = nh_shape if lse_layout == "NH" else nh_shape[::-1]
+                # the page table a run reads is the plan's own copy (plan() snapshots kv_indptr and kv_indices)
+                tables = (self._kv_indices, *engine.plan_tables(self._planned))
+                bad = engine.check_lse_buffer(
+                    lse,
+                    q,
+                    out,
+                    k,
+                    v,
+                    shape,
+                    q_source=q_source,
+                    storage=storage,
+                    tables=tables,
+                )
+                if bad is not None:
+                    raise unsupported(
+                        CLASS,
+                        f"an lse buffer {bad}",
+                        f"a contiguous fp32 {shape} buffer on {self.device} that aliases neither q, out, the KV cache nor the float workspace buffer",
+                    )
+            # the kernels write the (total_q, Hq) rows; the HN layout is a copy of them
+            lse_nh = (
+                lse
+                if lse is not None and lse_layout == "NH"
+                else torch.empty(nh_shape, dtype=torch.float32, device=self.device)
+            )
+        if sinks is not None:
+            # the HN layout's copy writes the caller's buffer after the launch
+            written = (out, lse_nh, lse if return_lse else None, *storage)
+            bad = engine.check_sinks(sinks, Hq, self.device, written)
+            if bad is not None:
+                raise unsupported(
+                    CLASS,
+                    f"sinks {bad}",
+                    f"a contiguous fp32 ({Hq},) tensor of per-head sink logits on {self.device} that aliases neither out, lse nor the float workspace buffer",
+                )
         engine._run_attention_validated(
             self._planned,
             q,
@@ -806,5 +901,15 @@ class BatchInvariantAttention:
             self._config,
             ragged=self.kind == "ragged",
             enable_pdl=enable_pdl,
+            lse=lse_nh,
+            lse_mode=engine.LSE_MODES[lse_base] if return_lse else 0,
+            sinks=sinks,
         )
-        return out
+        if not return_lse:
+            return out
+        if lse_layout == "NH":
+            return out, lse_nh
+        if lse is None:
+            lse = torch.empty(nh_shape[::-1], dtype=torch.float32, device=self.device)
+        lse.copy_(lse_nh.t())
+        return out, lse

@@ -61,6 +61,9 @@ PARAMETERS = (
     "backend",
     "state_indices",
     "cu_seqlens_cpu",
+    "output_state_indices",
+    "rand_seed",
+    "philox_rounds",
 )
 
 
@@ -112,6 +115,14 @@ def test_signature_adds_the_cake_backend() -> None:
     host = signature.parameters["cu_seqlens_cpu"]
     assert host.kind is inspect.Parameter.KEYWORD_ONLY and host.default is None
     assert "Tensor" in str(host.annotation)
+    for name, default in (
+        ("output_state_indices", None),
+        ("rand_seed", None),
+        ("philox_rounds", 10),
+    ):
+        parameter = signature.parameters[name]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default == default
     backend_signature = inspect.signature(backend.cake_chunk_gated_delta_product)
     assert tuple(backend_signature.parameters) == tuple(
         p for p in PARAMETERS if p != "backend"
@@ -193,6 +204,121 @@ def test_cake_backend_forwards_the_pool_and_the_scalars(monkeypatch) -> None:
     assert recorded["scale"] == 0.5 and recorded["use_qk_l2norm_in_kernel"] is True
     assert recorded["num_householder"] == 2 and recorded["output_final_state"] is False
     assert recorded["cu_seqlens"] is inputs["cu_seqlens"]
+    assert recorded["output_state_indices"] is None and recorded["rand_seed"] is None
+    assert recorded["philox_rounds"] == 10
+    seed = torch.tensor([3], device=_device(), dtype=torch.int64)
+    chunk_gated_delta_product(
+        **{**inputs, "initial_state": pool, "output_final_state": False},
+        backend="cake",
+        state_indices=slots,
+        output_state_indices=slots.flip(0),
+        rand_seed=seed,
+        philox_rounds=7,
+    )
+    assert torch.equal(recorded["output_state_indices"], slots.flip(0))
+    assert recorded["rand_seed"] is seed and recorded["philox_rounds"] == 7
+
+
+def test_other_backends_refuse_the_cake_arguments() -> None:
+    """``output_state_indices`` and ``rand_seed`` belong to the Cake backend; the cuDNN backends refuse them rather
+    than ignore them."""
+    inputs = _inputs(
+        2, (129, 65), 3, torch.Generator(device=_device()).manual_seed(SEED)
+    )
+    slots = torch.tensor([1, 0], device=_device(), dtype=torch.int32)
+    seed = torch.tensor([3], device=_device(), dtype=torch.int64)
+    for which in ("auto", "cudnn"):
+        for kwargs in ({"output_state_indices": slots}, {"rand_seed": seed}):
+            with pytest.raises(ValueError, match='backend="cake"'):
+                chunk_gated_delta_product(**inputs, backend=which, **kwargs)
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    wide = torch.int32 if a.element_size() == 4 else torch.int16
+    return a.dtype == b.dtype and torch.equal(
+        a.contiguous().view(wide), b.contiguous().view(wide)
+    )
+
+
+def test_sm90_takes_the_pool_state_forms() -> None:
+    """On SM90 the V6 pool programs with the write slot table take ``output_state_indices`` and a bfloat16 /
+    float16 state.  Through the public function and the package alike, an in-place pool call (read slots ``[1,
+    0]``, write slots ``[3, 2]``) returns the output bits of the dense float32 call on the gathered, widened rows (a
+    float32 program, not a pool program) and stores that call's final state, rounded to nearest even, at the write
+    slots, bit for bit: the pool programs are the indexed V6 twins, so a float32 pool is the dense call and a 16-bit
+    pool its rounding.  ``rand_seed`` rounds a bfloat16 / float16 pool stochastically (the public function and
+    the package store the same bits) and is refused for a float32 state; a float16 per-sequence
+    ``initial_state`` needs a float16 ``output_state`` (a bfloat16 one is still converted to the float32 state
+    allocated for the call)."""
+    generator = torch.Generator(device=_device()).manual_seed(SEED)
+    inputs = _inputs(2, (129, 65), 3, generator)
+    reads, writes = [1, 0], [3, 2]
+    slots = torch.tensor(reads, device=_device(), dtype=torch.int32)
+    seed = torch.tensor([3], device=_device(), dtype=torch.int64)
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        initial = (
+            0.1 * torch.randn(4, 3, V, K, device=_device(), generator=generator)
+        ).to(dtype)
+        ref_out, ref_state = backend.cake_chunk_gated_delta_product(
+            **{**inputs, "initial_state": initial[reads].float()}
+        )
+        expected = initial.clone()
+        expected[writes] = ref_state.to(dtype)
+        for function in (
+            lambda **kw: chunk_gated_delta_product(**kw, backend="cake"),
+            backend.cake_chunk_gated_delta_product,
+        ):
+            pool = initial.clone()
+            out, state = function(
+                **{**inputs, "initial_state": pool, "output_state": pool},
+                state_indices=slots,
+                output_state_indices=torch.tensor(
+                    writes, device=_device(), dtype=torch.int64
+                ),
+            )
+            assert state is pool
+            assert _same_bits(out, ref_out) and _same_bits(pool, expected), dtype
+        if dtype == torch.float32:
+            continue
+        stochastic = []
+        for function in (
+            lambda **kw: chunk_gated_delta_product(**kw, backend="cake"),
+            backend.cake_chunk_gated_delta_product,
+        ):
+            pool = initial.clone()
+            out, _ = function(
+                **{**inputs, "initial_state": pool, "output_state": pool},
+                state_indices=slots,
+                output_state_indices=torch.tensor(
+                    writes, device=_device(), dtype=torch.int64
+                ),
+                rand_seed=seed,
+            )
+            assert _same_bits(out, ref_out), dtype
+            stochastic.append(pool)
+        assert _same_bits(stochastic[0], stochastic[1]), dtype
+        assert not _same_bits(stochastic[0], expected), dtype
+    pool = torch.zeros((4, 3, V, K), device=_device())
+    with pytest.raises(ValueError, match="float32 state"):
+        chunk_gated_delta_product(
+            **{**inputs, "initial_state": pool, "output_state": pool},
+            state_indices=slots,
+            rand_seed=seed,
+            backend="cake",
+        )
+    with pytest.raises(ValueError, match="float16 output_state"):
+        chunk_gated_delta_product(
+            **{
+                **inputs,
+                "initial_state": pool[:2].half(),
+                "output_final_state": True,
+            },
+            backend="cake",
+        )
+    out, state = chunk_gated_delta_product(
+        **{**inputs, "initial_state": pool[:2].bfloat16()}, backend="cake"
+    )
+    assert state.dtype == torch.float32
 
 
 def test_unit_gate_calls_dispatch_to_the_unit_programs(monkeypatch) -> None:
@@ -262,9 +388,9 @@ def test_unit_gate_calls_dispatch_to_the_unit_programs(monkeypatch) -> None:
 
 def test_cu_seqlens_cpu_reaches_the_cake_backend(monkeypatch) -> None:
     """``cu_seqlens_cpu`` (the host copy of ``cu_seqlens``) is forwarded to the Cake backend, where the body route
-    and the split rule read it: a merged-class batch (two sequences of 384 chunks over ten heads, the pinned row of
-    the route) selects the split program of the merged body; without it the backend synchronizes the copy and
-    selects the same program; a device tensor is refused."""
+    and the split rule read it: a batch of two sequences of 384 chunks over ten heads (balanced on 132 SMs) selects
+    the warm-up split program of the V6 body; without it the backend synchronizes the copy and selects the same
+    program; a device tensor is refused."""
     inputs = _inputs(
         3, (8192, 8192), 10, torch.Generator(device=_device()).manual_seed(SEED)
     )
@@ -275,7 +401,7 @@ def test_cu_seqlens_cpu_reaches_the_cake_backend(monkeypatch) -> None:
     host = inputs["cu_seqlens"].cpu()
     chunk_gated_delta_product(**inputs, backend="cake", cu_seqlens_cpu=host)
     assert len(launched) == 1
-    assert loader.MODULES[launched[0]]["body"] == loader.ROUTE_BODY_P3
+    assert loader.MODULES[launched[0]]["body"] == loader.ROUTE_BODY_V6
     assert loader.MODULES[launched[0]]["build"].get(loader.PREFILL_SPLIT_FLAG) is True
     chunk_gated_delta_product(**inputs, backend="cake")
     assert launched == [launched[0]] * 2

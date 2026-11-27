@@ -1,0 +1,160 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""Generate ``lean/BIKernels/MoENvfp4Cases.lean`` from the Python side: the NVFP4 MoE classes' conformance cases.
+
+The file couples the Lean model (``lean/BIKernels/MoENvfp4.lean``) to :mod:`.spec_nvfp4` node for node: per case a term
+the Python spec builds (:mod:`.mterm` S-expression) and the Lean expression that must print identically. The row scale,
+the GEMM2 chain, the GEMM1 chains of every gated and ungated activation with its parameter sets and the static class's
+blocks become theorems decided by ``decide +kernel`` when their S-expression is at most
+:data:`.lean_cases.THEOREM_MAX_BYTES`; the larger chains (PowLU's declared log / exp) are compared through the
+``moenvfp4conformance`` executable only (``tests/batch_invariant/test_moe_nvfp4_lean.py``).
+
+    python -m flashinfer.fused_moe.batch_invariant.lean_cases_nvfp4     # rewrite lean/BIKernels/MoENvfp4Cases.lean
+"""
+
+from __future__ import annotations
+
+import os
+from typing import List, Tuple
+
+from . import mterm as term
+from . import spec_nvfp4 as Q
+from .lean_cases import (
+    ACT_CASES,
+    GLU_CASES,
+    LEAN_DIR,
+    THEOREM_MAX_BYTES,
+    _UACT,
+    lean_gact,
+    lean_str,
+)
+
+CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "MoENvfp4Cases.lean")
+
+_S1 = '(MoENvfp4.w4a4RowScale (.leaf "alpha1" [0]) (.leaf "pts1" []))'
+_S2 = '(MoENvfp4.w4a4RowScale (.leaf "alpha2" [0]) (.leaf "pts2" [0]))'
+_G, _U = '(.leaf "g" [0, 0])', '(.leaf "u" [0, 0])'
+
+
+def moe_nvfp4_cases() -> List[Tuple[str, str, str, bool]]:
+    """``(name, python_sexpr, lean_term, as_theorem)``: the W4A4 spec's terms and the Lean model's expressions that must
+    print identically, built as the class builds them (:class:`.spec_nvfp4.MoENvfp4Spec` on slot 0, column 0)."""
+    alg = term.TermAlgebra()
+    out: List[Tuple[str, str, str, bool]] = []
+
+    def chain(name: str, t: term.Term, lean: str) -> None:
+        sx = term.sexpr(t)
+        out.append((name, sx, lean, len(sx) <= THEOREM_MAX_BYTES))
+
+    s0 = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg)
+    chain("row_scale", s0.row_scale(1), _S1)
+    chain("gemm2", s0.gemm2(), f'MoENvfp4.scaledOutT (.leaf "acc2" [0, 0]) {_S2}')
+    # the gated GEMM1 chains of every activation and parameter set
+    for name, act, params in GLU_CASES:
+        s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, params=params)
+        assert s_.gated, (name, act)
+        chain(
+            f"gemm1_{name}",
+            s_.gemm1(),
+            f"MoENvfp4.gluScaledT {lean_gact(act, params)} {_G} {_U} {_S1}",
+        )
+    # the ungated GEMM1 chains
+    for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
+        s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, gated=False)
+        chain(
+            f"gemm1_{name}", s_.gemm1(), f"MoENvfp4.actScaledT {_UACT[act]} {_U} {_S1}"
+        )
+    # the static class (`moe.nvfp4.<act>.static`): GEMM1's block scale and first / last code on the fp32 gated values of columns
+    # 0..15 with the expert's static scale `gs2`, for every gated and ungated chain, and GEMM2 with `inv2 = div(1, gs2)`
+    gs2 = '(.leaf "gs2" [0])'
+    for name, act, params in GLU_CASES:
+        s_ = Q.MoENvfp4Spec(
+            64, 32, 2, 8, alg=alg, act=act, params=params, intermediate="static"
+        )
+        blk = s_.gemm1_block(0, 0)
+        vals = ", ".join(
+            f'MoENvfp4.gluScaledPreT {lean_gact(act, params)} (.leaf "g" [0, {j}]) (.leaf "u" [0, {j}]) {_S1}'
+            for j in range(16)
+        )
+        chain(f"static_sf_{name}", blk["sf"], f"MoENvfp4.staticBlockSfT [{vals}] {gs2}")
+        chain(
+            f"static_code0_{name}",
+            blk["codes"][0],
+            f"MoENvfp4.staticBlockCodeT [{vals}] {gs2} 0",
+        )
+        chain(
+            f"static_code15_{name}",
+            blk["codes"][15],
+            f"MoENvfp4.staticBlockCodeT [{vals}] {gs2} 15",
+        )
+    for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
+        s_ = Q.MoENvfp4Spec(
+            64, 32, 2, 8, alg=alg, act=act, gated=False, intermediate="static"
+        )
+        blk = s_.gemm1_block(0, 0)
+        vals = ", ".join(
+            f'MoENvfp4.actScaledPreT {_UACT[act]} (.leaf "u" [0, {j}]) {_S1}'
+            for j in range(16)
+        )
+        chain(f"static_sf_{name}", blk["sf"], f"MoENvfp4.staticBlockSfT [{vals}] {gs2}")
+        chain(
+            f"static_code0_{name}",
+            blk["codes"][0],
+            f"MoENvfp4.staticBlockCodeT [{vals}] {gs2} 0",
+        )
+    s_st = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, intermediate="static")
+    chain(
+        "static_gemm2",
+        s_st.gemm2(),
+        'MoENvfp4.staticGemm2T (.leaf "acc2" [0, 0]) (.leaf "alpha2" [0]) (.leaf "gs2" [0])',
+    )
+    return out
+
+
+def render() -> str:
+    """The content of ``MoENvfp4Cases.lean``."""
+    L = [
+        "import BIKernels.MoENvfp4",
+        "namespace BIK",
+        "-- GENERATED by flashinfer/fused_moe/batch_invariant/lean_cases_nvfp4.py from the Python spec; do not edit.",
+        "set_option maxRecDepth 8192",
+        "",
+        "/-! The NVFP4 MoE classes (`fused_moe/batch_invariant/spec_nvfp4.py` vs `MoENvfp4.lean`): the W4A4 row scale, the "
+        "GEMM1 chains of every gated and ungated activation on the scaled accumulators and the GEMM2 chain print identically "
+        f"(`mterm.sexpr` vs `MTerm.sexpr`). The chains up to {THEOREM_MAX_BYTES} bytes are kernel-`decide` theorems; every "
+        "case is a `moenvfp4conformance` line. -/",
+    ]
+    mcs = moe_nvfp4_cases()
+    for name, sx, lt, as_thm in mcs:
+        if as_thm:
+            L.append(
+                f"theorem moe_nvfp4_{name} : ({lt}).sexpr = {lean_str(sx)} := by decide +kernel"
+            )
+    L.append(
+        "def moeNvfp4Cases : List (String × MoE.MTerm) := ["
+        + ", ".join(f'("{name}", {lt})' for name, _, lt, _ in mcs)
+        + "]"
+    )
+    L.append("end BIK")
+    return "\n".join(L) + "\n"
+
+
+def summary() -> str:
+    mcs = moe_nvfp4_cases()
+    return (
+        f"moe nvfp4 lean_cases coverage: cases={len(mcs)} theorems={sum(1 for c in mcs if c[3])} "
+        f"conformance-only={sum(1 for c in mcs if not c[3])}"
+    )
+
+
+def main(out_path: str = CASES_PATH) -> str:
+    content = render()
+    with open(out_path, "w") as f:
+        f.write(content)
+    s = summary()
+    print(s)
+    return s
+
+
+if __name__ == "__main__":
+    main()
