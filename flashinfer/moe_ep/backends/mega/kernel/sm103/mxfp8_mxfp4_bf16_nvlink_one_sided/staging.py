@@ -80,75 +80,35 @@ def validate_forward_inputs(t, fleet_params, *, top_k: int, quantize_input: bool
         raise MoEEpConfigError("MegaMoE inputs must be on the current CUDA device")
 
 
-def _fused_prequantized_layouts(t, workspace) -> bool:
-    """Whether the one-launch stager takes these pre-quantized inputs.
-
-    It reads and writes every row at once, so inputs that overlap the
-    workspace's staging planes keep the Torch path, which runs in sequence.
-    """
-    inputs = (t.hidden_states, t.scales, t.topk_ids, t.topk_weights)
-    planes = (workspace.x, workspace.x_sf, workspace.topk_idx, workspace.topk_weights)
-    contiguous = (
-        t.hidden_states,
-        t.topk_ids,
-        t.topk_weights,
-        workspace.x,
-        workspace.topk_idx,
-        workspace.topk_weights,
-    )
-    if not (
-        all(tensor.is_contiguous() for tensor in contiguous)
-        and t.scales.stride(1) == 1
-        and workspace.x_sf.stride(1) == 1
-        and workspace.topk_idx.dtype == torch.int32
-    ):
-        return False
-
-    def extent(tensor):
-        """Byte range of a 2D tensor whose rows have unit column stride."""
-        rows, cols = tensor.shape
-        size = (rows - 1) * tensor.stride(0) + cols if rows else 0
-        return tensor.data_ptr(), tensor.data_ptr() + size * tensor.element_size()
-
-    return not any(
-        max(a[0], b[0]) < min(a[1], b[1])
-        for a in map(extent, inputs)
-        for b in map(extent, planes)
-    )
-
-
 def stage_inputs(t, workspace, *, quantize_input: bool) -> None:
     """Write activations, scales and routing for ``t.num_tokens`` rows.
 
     Rows past the token count are masked (``topk_idx = -1``) so a smaller
     batch never dispatches rows a previous batch left behind. With a shared
-    expert the scales also go to its scale plane. Pre-quantized inputs stage
-    in one launch (``staging_kernel``) where Triton is available and the
-    layouts allow it, which writes the scale plane for the live rows only:
-    the shared expert's outputs past the token count are never read.
+    expert the scales also go to its scale plane. One CuTe DSL launch
+    (``staging_kernel``) quantizes BF16 inputs or copies pre-quantized ones
+    and stages the routing; it writes the shared expert's scale plane for the
+    live rows only, since the shared expert's outputs past the token count
+    are never read. Layouts the kernel does not take stage through the Torch
+    sequence below, with the same bytes.
     """
     from ......cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.kernel_helpers import (
         quantize_mxfp8_block32,
     )
+    from .staging_kernel import stage
 
     num_tokens = t.hidden_states.shape[0]
     sf_cols = workspace.config.hidden // _SF_VEC
-    if not quantize_input and _fused_prequantized_layouts(t, workspace):
-        try:
-            from .staging_kernel import stage_prequantized
-        except ImportError:
-            stage_prequantized = None
-        if stage_prequantized is not None:
-            stage_prequantized(
-                t.hidden_states,
-                t.scales,
-                t.topk_ids,
-                t.topk_weights,
-                workspace,
-                sf_cols,
-            )
-            workspace.note_staged_tokens(num_tokens)
-            return
+    if stage(
+        t.hidden_states,
+        None if quantize_input else t.scales,
+        t.topk_ids,
+        t.topk_weights,
+        workspace,
+        quantize=quantize_input,
+    ):
+        workspace.note_staged_tokens(num_tokens)
+        return
     if num_tokens:
         data = workspace.x[:num_tokens].view(torch.uint8)
         scales = workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8)

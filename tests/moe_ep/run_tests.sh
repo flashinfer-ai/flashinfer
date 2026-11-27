@@ -13,7 +13,7 @@
 #   bash tests/moe_ep/run_tests.sh mega_sm90_nvfp4 # 4-GPU Hopper NVFP4 accuracy + graph replay
 #   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
-#   bash tests/moe_ep/run_tests.sh mega_sm103_nvlink_one_sided # Blackwell (B300 / B200) W4A8 NVLinkOneSided MegaMoE at EP2, EP4 and (8 GPUs) EP8
+#   bash tests/moe_ep/run_tests.sh mega_sm103_nvlink_one_sided # Blackwell (B300 / B200) W4A8 NVLinkOneSided MegaMoE: staging on one GPU, then EP2, EP4 and (8 GPUs) EP8
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
 #   bash tests/moe_ep/run_tests.sh qualify_bi    # strict MegaMoE BI + Lean + EP2/4/8; rejects skips
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
@@ -505,6 +505,9 @@ run_mega_sm103_nvlink_one_sided() {
   local arch
   arch="$(sm103_nvlink_one_sided_cute_dsl_arch)"
   echo "sm103 nvlink_one_sided mega: EP sizes ${sizes}, ${arch}"
+  # The one-launch staging against the Torch staging, on one GPU.
+  CUTE_DSL_ARCH="${arch}" "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_nvlink_one_sided_megamoe_staging.py -v || rc=1
   for nproc in ${sizes}; do
     CUTE_DSL_ARCH="${arch}" "${TORCHRUN}" --standalone --nproc_per_node="${nproc}" -m pytest \
       "${MOE_EP_PYTEST_FLAGS[@]}" \

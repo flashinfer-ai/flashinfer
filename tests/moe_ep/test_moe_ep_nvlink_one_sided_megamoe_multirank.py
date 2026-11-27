@@ -2035,18 +2035,24 @@ def test_shared_expert(request, capacity, knobs, fields):
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("shared", [False, True], ids=["routed", "shared_expert"])
-def test_prequantized_staging(monkeypatch, shared):
-    """Pre-quantized inputs stage in one launch to the bytes of the Torch staging.
+@pytest.mark.parametrize("quantize_input", [True, False], ids=["bf16", "prequantized"])
+def test_one_launch_staging(monkeypatch, quantize_input, shared):
+    """Inputs stage in one launch to the bytes of the Torch staging.
 
-    Covers the sentinel rewrites (E4M3 and UE8M0 ``0xFF``), int64 ids narrowed to
-    the workspace's int32, masked tails after a larger batch and, with a shared
-    expert, its scale plane, from no token to the whole capacity.
+    BF16 inputs quantize as ``quantize_mxfp8_block32`` does, also in blocks
+    with an infinity, a NaN or only zeros; pre-quantized inputs cover the
+    sentinel rewrites (E4M3 and UE8M0 ``0xFF``). Both cover int64 ids
+    narrowed to the workspace's int32, masked tails after a larger batch and,
+    with a shared expert, its scale plane, from no token to the whole
+    capacity. ``test_nvlink_one_sided_megamoe_staging.py`` covers the
+    quantization's edge cases exhaustively on one GPU.
     """
     import torch
     import torch.distributed as dist
 
     from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided import (
         staging,
+        staging_kernel,
     )
 
     rank, world = _init_distributed()
@@ -2064,9 +2070,16 @@ def test_prequantized_staging(monkeypatch, shared):
         pack,
         rank=rank,
         world=world,
-        quantize_input=False,
+        quantize_input=quantize_input,
         **({"shared_expert": "fp8_in_kernel"} if shared else {}),
     )
+    stage = staging_kernel.stage
+    launched = []
+
+    def spy(*args, **kwargs):
+        launched.append(stage(*args, **kwargs))
+        return launched[-1]
+
     try:
         workspace = layer._ensure_workspace()
         planes = [
@@ -2078,23 +2091,32 @@ def test_prequantized_staging(monkeypatch, shared):
         if shared:
             planes.append(workspace.shared_expert_scale_layout()[0])
         # A whole batch first, so every row of the scale plane holds staged scales.
-        full = _tensors(_make_batch(capacity, 6197 + rank), quantize_input=False)
-        staging.stage_inputs(full, workspace, quantize_input=False)
+        full = _tensors(
+            _make_batch(capacity, 6197 + rank), quantize_input=quantize_input
+        )
+        staging.stage_inputs(full, workspace, quantize_input=quantize_input)
         for count in (capacity // 2, 0, 1, 37, capacity):
             batch = _make_batch(count, 6211 + 31 * rank + count, holes=True)
+            batch.x_bf16[::7, ::11] = float("inf")
+            batch.x_bf16[1::9, 3::13] = -float("inf")
+            batch.x_bf16[2::5, 5::17] = float("nan")
+            batch.x_bf16[3::6, 64:96] = 0.0
             batch.x_fp8.view(torch.uint8)[::5, ::7] = 0xFF
             batch.x_sf_codes[::3, ::5] = 0xFF
-            t = _tensors(batch, quantize_input=False)
-            assert staging._fused_prequantized_layouts(t, workspace)
+            t = _tensors(batch, quantize_input=quantize_input)
             before = [plane.clone() for plane in planes]
-            staging.stage_inputs(t, workspace, quantize_input=False)
+            launched.clear()
+            with monkeypatch.context() as patch:
+                patch.setattr(staging_kernel, "stage", spy)
+                staging.stage_inputs(t, workspace, quantize_input=quantize_input)
+            assert launched == [True]
             fused = [plane.clone() for plane in planes]
             assert workspace.staged_tokens() == count
             for plane, saved in zip(planes, before, strict=True):
                 plane.copy_(saved)
             with monkeypatch.context() as patch:
-                patch.setattr(staging, "_fused_prequantized_layouts", lambda *_: False)
-                staging.stage_inputs(t, workspace, quantize_input=False)
+                patch.setattr(staging_kernel, "stage", lambda *_, **__: False)
+                staging.stage_inputs(t, workspace, quantize_input=quantize_input)
             same = all(torch.equal(a, b) for a, b in zip(fused, planes, strict=True))
             _assert_all_ranks(same, group, f"count {count}: one-launch staging differs")
     finally:
