@@ -27,7 +27,7 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          RUNS="/repos/$REPO/actions/workflows/pr-test.yml/runs"
+          RUNS="/repos/$REPO/actions/workflows/pr-test-dispatch.yml/runs"
           QUERY="head_sha=$HEAD_SHA&event=pull_request&per_page=100"
 
           POLL_SECONDS=5
@@ -39,7 +39,7 @@ jobs:
           kind() {
             gh api "/repos/$REPO/actions/runs/$1/jobs?per_page=100" --jq '
               [.jobs[]] as $j
-              | if ($j | map(.name | startswith("AOT Build Import") or startswith("JIT Unittest")) | any)
+              | if ($j | map(.name | split(" / ") | last | startswith("AOT Build Import") or startswith("JIT Unittest")) | any)
                 then "tests"
                 elif ($j | map(.name == "Setup" and .conclusion == "skipped") | any)
                 then "empty"

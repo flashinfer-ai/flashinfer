@@ -94,7 +94,8 @@ __global__ void ce_publish_flag_kernel(int32_t* peer_flag, int32_t* send_counter
 __global__ void ce_wait_flag_kernel(int32_t* self_flag, int32_t* wait_counter) {
   const int32_t expected = load_volatile_i32(wait_counter) + 1;
   store_volatile_i32(wait_counter, expected);
-  while (!generation_reached(load_acquire_i32(self_flag), expected)) {
+  for (SpinGuard spin; !generation_reached(load_acquire_i32(self_flag), expected);
+       spin.tick(__func__)) {
   }
 }
 

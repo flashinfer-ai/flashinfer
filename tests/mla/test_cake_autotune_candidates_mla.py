@@ -2578,14 +2578,22 @@ def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families)
         for key, units in core._CAKE_MLA_AUTO_OFFERS.items():
             if key[:2] != (arch, num_sms):
                 continue
-            _, _, dtype_name, page_size, q_len, _ = key
+            _, _, dtype_name, page_size, q_len, has_sinks = key
             dtype = getattr(torch, dtype_name)
             for bucket in {unit[1] for unit in units}:
                 for max_seq_len in (bucket // 2 + 1, bucket):
+                    # The key's own sinks flag: a key with sinks lists its own
+                    # buckets, which the key without sinks need not list.
                     expected = tuple(
                         (first, last)
                         for _, first, last in core._cake_mla_auto_offer_ranges(
-                            arch, num_sms, dtype, page_size, q_len, False, max_seq_len
+                            arch,
+                            num_sms,
+                            dtype,
+                            page_size,
+                            q_len,
+                            has_sinks,
+                            max_seq_len,
                         )
                     )
                     assert expected
@@ -2595,7 +2603,7 @@ def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families)
                         core._CAKE_MLA_RANGES_MEMO[0] = None
                         assert (
                             core._cake_mla_auto_batch_ranges(
-                                0, dtype, page_size, q_len, False, max_seq_len
+                                0, dtype, page_size, q_len, has_sinks, max_seq_len
                             )
                             == expected
                         ), (key, max_seq_len)

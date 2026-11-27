@@ -15,8 +15,7 @@ limitations under the License.
 
 Tests for the Cake Gated DeltaProduct (GDP) decode / MTP-verification kernels
 (``K = 128``, ``V = 64``, one to four Householder updates per
-token, FP32 state pool; SM90 / SM100 / SM103 / SM107; FP16 state pool on SM100 /
-SM103 / SM107).
+token, FP32 or FP16 state pool; SM90 / SM100 / SM103 / SM107).
 
 Every output row and every pool slot the call may touch is compared with an
 FP64 token-serial reference of the same math (inputs at their BF16 values,
@@ -40,11 +39,22 @@ exact).  The stored elements of at most ``MODEL_MAX_HEADS`` state heads per call
 (all of them in smaller calls, a deterministic sample in larger ones) must also
 equal the rounding of an independent model: round to nearest even, or
 Philox-4x32 random bits added below the FP16 precision and truncated, as PTX
-``cvt.rs`` does (key = the seed; one draw per eight elements of a state row,
+``cvt.rs`` does on SM100 / SM103 / SM107 and the kernels' integer form of it does
+on SM90 (key = the seed; one draw per eight elements of a state row,
 words 0 / 1 for columns k .. k + 3 and words 2 / 3 for k + 64 .. k + 67, k a
 multiple of 4 below 64, 13 bits per element; counter = the element offset, from
 the pool view's base, of column k of the state row in the batch row's read
-slot).  Every FP16 program runs three call kinds in each rounding, at its own
+slot).  On SM90 a call inside the cells of a row-split program (``l8r2h``: an
+FP16-only program with each state head cut over two CTAs) runs that program,
+whose FP32 build the package does not ship: the FP32 pool runs another variant,
+whose dot products sum in another order, so such a call's output and stored
+elements are held to the FP32 call's within ``ATOL`` / ``RTOL`` instead (an
+infinity only where the FP32 element is past 65504), and each such call runs
+twice from the same pool with the same seed and must repeat its output and
+stored bits; the kernel's own tests hold the row-split programs' stores to the
+rounding model bit for bit.
+
+Every FP16 program runs three call kinds in each rounding, at its own
 token count and again at ``T = 1`` when one-token calls select it: a writeback
 to the read slot; a writeback to distinct write slots with one row skipping it
 (``-1``); and per-token snapshots with a ``-1`` before the last token (from
@@ -53,15 +63,19 @@ slot.  A call kind and rounding form a launch class, and a program runs the
 classes it owns: a ``snapshot_noise`` sibling (the same body and variant,
 drawing a launch's random bits once) owns the stochastic snapshot calls of its
 cell, a ``draw_share`` sibling (the same body and variant, computing each draw
-once and sharing it by a lane shuffle) the stochastic calls of its cell, and
-their plain program the other classes.  The test records the program
+once and sharing it by a lane shuffle) the stochastic calls of its cell, an
+SM90 ``stochastic_forms`` or ``scaled_rolled`` sibling (the same body and
+variant, with faster forms of the same integer rounding) the stochastic calls
+of its cells, and their plain program the other classes; on SM90 a row-split
+program takes the calls of its cells from the program of its token count that
+would run them otherwise.  The test records the program
 each call launches and the store paths it takes, and fails unless every
 program took every path of its classes and every class of a band is owned.  These calls use an FP16 pool with one
 guard slot on each side; after each call the slots it must not touch and both
-guard slots must be unchanged bit for bit.  The FP16-pool tests skip on SM90,
-which has no FP16-pool programs; there
-``test_fp16_pool_is_refused_without_fp16_programs`` checks that an FP16 pool is
-refused.
+guard slots must be unchanged bit for bit.  Every architecture ships the FP16
+twin of each of its FP32 programs
+(``test_fp16_records_are_twins_of_the_fp32_records``), so the FP16-pool tests
+run on each of them.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
@@ -75,7 +89,9 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import math
 import re
+from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
@@ -660,6 +676,90 @@ def _check_stored_roundings(
     )
 
 
+# The largest finite float16: an element past it rounds to an infinity of its sign (stochastically, to it or to the
+# infinity).
+F16_MAX = 65504.0
+
+
+def _fp16_program(c16: Case) -> str:
+    """The FP16 program the call of ``c16`` selects on this device, in its launch class (its round count, 0 without a
+    seed, and whether it stores per-token snapshots)."""
+    seeded = getattr(c16, "rand_seed", None) is not None
+    return loader.selected_module(
+        _arch(),
+        c16.n,
+        c16.T,
+        c16.B * c16.H,
+        sm_count=loader.sm_count(_device().index or 0),
+        use_qk_l2norm=c16.use_qk_l2norm,
+        state_dtype=torch.float16,
+        philox_rounds=c16.philox_rounds if seeded else 0,
+        use_ssm_state_indices=c16.ssm is not None,
+    )
+
+
+def _check_row_split_call(
+    c16: Case,
+    out16: torch.Tensor,
+    c32: Case,
+    out32: torch.Tensor,
+    slots: list[int],
+    *,
+    what: str,
+) -> None:
+    """A call that runs a row-split program (:func:`_is_row_split`).  The package ships no FP32 build of it, so the
+    FP32 pool ran another variant, whose dot products sum in another order, and no FP32 twin holds its bits.  The
+    output's active rows must equal the FP32 call's within ``ATOL`` / ``RTOL`` (the FP32 call is itself held to the
+    FP64 reference) and its skipped rows bit for bit; every element stored in ``slots`` must equal the FP32 call's
+    stored element within ``ATOL`` / ``RTOL`` where that element is below 65504 in magnitude, and be 65504 or an
+    infinity of its sign where it is not."""
+
+    active = ~_skipped_rows(c16.read.long())
+    _assert_close(out16[active], out32[active], f"{what}: output (row-split program)")
+    assert _same_bits(out16[~active], out32[~active]), f"{what}: padding rows"
+    for start in range(0, len(slots), CHECK_SLOTS):
+        index = torch.tensor(slots[start : start + CHECK_SLOTS], device=_device())
+        got, x32 = c16.pool[index].float(), c32.pool[index]
+        finite = x32.abs() < F16_MAX
+        _assert_close(
+            got[finite], x32[finite], f"{what}: stored elements (row-split program)"
+        )
+        past, signs = got[~finite], torch.sign(x32[~finite])
+        assert bool(
+            ((past.abs() == F16_MAX) | past.isinf()).all()
+            and (torch.sign(past) == signs).all()
+        ), f"{what}: a stored element past 65504 (row-split program)"
+
+
+def _check_repeated_call(c16: Case, out16: torch.Tensor, *, what: str) -> None:
+    """Run the finished call of ``c16`` (a row-split program's, :func:`_is_row_split`) once more from its pool before
+    the call, with the same seed and round count: the output and the whole FP16 buffer (with its padding and guard
+    slots) must repeat bit for bit.  The FP32 call bounds a row-split program's bits only within ``ATOL`` / ``RTOL``
+    (:func:`_check_row_split_call`), so this pins its run-to-run bits; ``c16`` keeps the second call's state, the
+    same bits as the first's."""
+
+    # the whole FP16 buffer the call writes into
+    buffer = next(b for b in (c16.guards, c16.backing, c16.pool) if b is not None)
+    first_out, first_state = out16.clone(), buffer.clone()
+    if c16.backing is not None:
+        c16.backing.copy_(c16.backing_before)
+    else:
+        c16.pool.copy_(c16.pool_before)
+    again, _ = _run(c16)
+    assert _same_bits(again, first_out), (
+        f"{what}: the same call again changed the output bits (row-split program)"
+    )
+    assert _same_bits(buffer, first_state), (
+        f"{what}: the same call again changed the stored bits (row-split program)"
+    )
+
+
+def _fp16_launches(name: str) -> list[str]:
+    """The FP16 launches :func:`_run_fp16` makes for a call that selects ``name``: one, two for a row-split program
+    (:func:`_check_repeated_call`)."""
+    return [name] * (2 if _is_row_split(loader.MODULES[name]) else 1)
+
+
 def _holes(c: Case) -> list[int]:
     """Put holes into the slot tables of ``c`` (``B >= 2``), name the slots the call must then leave untouched and
     give the call's FP16 pool a guard slot on each side (:func:`_fp16_twins`), so a store through a ``-1`` entry (or
@@ -699,17 +799,25 @@ def _run_fp16(
     FP16 element against the twin's stored element (:func:`_check_stored_roundings`) and the stored elements of at
     most ``MODEL_MAX_HEADS`` state heads (a deterministic sample of larger calls, evaluated ``MODEL_CHUNK_HEADS`` at a
     time) bitwise against the rounding model of the twin's stored state.  Bitwise checks compare same-width integer
-    views (:func:`_same_bits`)."""
+    views (:func:`_same_bits`).  A call that runs a row-split program has no FP32 twin: it runs twice from the same
+    pool and must repeat its bits (:func:`_check_repeated_call`), and its output and stored elements are held to the
+    FP32 call's by :func:`_check_row_split_call` instead (the untouched, padding and guard checks stay bitwise)."""
 
     what = what or f"B={c.B} T={c.T} H={c.H} n={c.n} seed={seed} rounds={rounds}"
     c16, c32 = _fp16_twins(c)
     if seed is not None:
         c16.rand_seed = torch.tensor([seed], dtype=torch.int64, device=_device())
         c16.philox_rounds = rounds
+    row_split = _is_row_split(loader.MODULES[_fp16_program(c16)])
     out16, _ = _run(c16)
+    if row_split:
+        _check_repeated_call(c16, out16, what=what)
     out32, _ = _run(c32)
     _check(c32, out32, what=f"{what}: FP32 twin")
-    assert _same_bits(out16, out32), f"{what}: the output differs from the FP32 twin's"
+    if not row_split:
+        assert _same_bits(out16, out32), (
+            f"{what}: the output differs from the FP32 twin's"
+        )
     stores = _stores(c16)
     stored = sorted({slot for slot, _ in stores})
     untouched = torch.ones(c16.pool.shape[0], dtype=torch.bool, device=_device())
@@ -725,6 +833,9 @@ def _run_fp16(
         assert _same_bits(c16.guards[[0, -1]], c16.guards_before), (
             f"{what}: a guard slot around the FP16 pool changed"
         )
+    if row_split:
+        _check_row_split_call(c16, out16, c32, out32, stored, what=what)
+        return c16, out16, c32, out32
     _check_stored_roundings(c16, c32, stored, stochastic=seed is not None, what=what)
     if len(stores) > MODEL_MAX_HEADS // c.H:
         step = len(stores) / (MODEL_MAX_HEADS // c.H)
@@ -1280,17 +1391,27 @@ def _fp16_store_paths(
     (b) distinct write slots with row 1 skipping its writeback (``B >= 2``, :func:`_holes`); (c) per-token snapshots
     with the holes of :func:`_holes` (``B >= 2``).  A call kind and rounding form a launch class; the program runs
     the classes it owns (:func:`_class_owner`: the first shape of :data:`PROGRAM_SHAPES` and round count that select
-    it), and every class it does not own must select a program with its twin key (its sibling, ``snapshot_noise`` or
-    ``draw_share``, or the sibling's plain program) on some shape.  Each call is checked by :func:`_run_fp16` (FP32
+    it), and every class it does not own must select a program with its twin key (a sibling, one of
+    :data:`SIBLING_FLAGS`, or the siblings' plain program), or the row-split program of its token count, on some
+    shape.
+    Each call is checked by :func:`_run_fp16` (FP32
     twin, rounding model with the read slot's counter, every stored slot, untouched slots, guard slots), must launch
     ``name`` and leave the slots its holes skip unchanged.  Returns the token counts run, one record per call
     (program launched, call kind, ``T``, ``B``, ``H``, rounding, round count and the store paths of its slot tables,
     :func:`_store_paths`) and the store paths of the owned call kinds per (rounding, ``T``)."""
     key = _twin_key(loader.MODULES[name])
+    t_steps = loader.MODULES[name]["build"]["t_steps"]
     partners = [
         other
         for other in _route_names_of(name)
-        if other != name and _twin_key(loader.MODULES[other]) == key
+        if other != name
+        and (
+            _twin_key(loader.MODULES[other]) == key
+            or (
+                _is_row_split(loader.MODULES[other])
+                and loader.MODULES[other]["build"]["t_steps"] == t_steps
+            )
+        )
     ]
     keys = {"writeback": 22, "distinct write": 48, "snapshots": 47}
     owners = {}
@@ -1305,8 +1426,8 @@ def _fp16_store_paths(
                     _class_owner(other, n, t, use_qk_l2norm, kind, rounding)
                     for other in partners
                 ), (
-                    f"neither {name} nor a program with its twin key ({partners}) runs {kind} calls in {rounding} "
-                    f"at T={t}"
+                    f"neither {name} nor a program with its twin key or the row-split program of its token count "
+                    f"({partners}) runs {kind} calls in {rounding} at T={t}"
                 )
     tokens = sorted({t for t, _, _ in owners}, reverse=True)
     owned: dict[tuple[str, int], set[str]] = {}
@@ -1329,7 +1450,7 @@ def _fp16_store_paths(
         what = f"{name} {kind} T={t} B={Bc} H={Hc} seed={seed} rounds={rounds}"
         launched.clear()
         c16, _, _, _ = _run_fp16(call, seed=seed, rounds=rounds, what=what)
-        assert launched == [name], (what, launched)
+        assert launched == _fp16_launches(name), (what, launched)
         assert c16.guards is not None, what
         if skipped:
             assert _same_bits(c16.pool[skipped], c16.pool_before[skipped]), (
@@ -1390,12 +1511,17 @@ def _missing_store_paths(
 def _program_cases() -> list:
     """One (n, T, B, H) selecting each exported program of the local architecture, from the registry alone; an
     FP16-pool program is selected and launched over an FP16 pool, in the first launch class that selects it (round
-    to nearest without snapshots, else stochastic calls with snapshots: a sibling owns stochastic calls only)."""
+    to nearest without snapshots, else stochastic calls with snapshots, else stochastic calls without them: a
+    sibling owns stochastic calls only, some of them those without snapshots only)."""
     if not _supported():
         return []
     arch = _arch()
     sms = loader.sm_count(_device().index or 0)
-    classes = ((0, False), *((rounds, True) for rounds in SR_ROUND_ORDER))
+    classes = (
+        (0, False),
+        *((rounds, True) for rounds in SR_ROUND_ORDER),
+        *((rounds, False) for rounds in SR_ROUND_ORDER),
+    )
     cases = []
     for name, record in sorted(loader.MODULES.items()):
         if arch not in record["arches"] or record["role"] != "decode":
@@ -1457,8 +1583,9 @@ def test_every_program_is_launched(
 ) -> None:
     """Every exported program of the local architecture is selected by some call of the domain and is correct.  An
     FP16-pool program runs every store path of the launch classes it owns (:func:`_fp16_store_paths`), at its ``T``
-    and at ``T = 1`` when one-token calls select it too; a class it does not own selects its sibling
-    (``snapshot_noise`` or ``draw_share``) or the sibling's plain program, whose own case runs it.  The test records
+    and at ``T = 1`` when one-token calls select it too; a class it does not own selects a sibling (one of
+    :data:`SIBLING_FLAGS`), the siblings' plain program or the row-split program of its token count, whose own case
+    runs it.  The test records
     the program each call launches and the store paths of its slot tables, prints the coverage and fails unless the
     program took every path of its classes (:func:`_required_store_paths`) in each rounding at each of those token
     counts."""
@@ -1489,10 +1616,10 @@ def test_every_program_is_launched(
 
 
 def test_fp16_store_paths_are_covered_per_twin_key() -> None:
-    """Per twin key on the local architecture (an FP16 program and its sibling, when it has one),
-    every call kind of :func:`_fp16_store_paths` in both roundings at the programs' token count selects one of them on
-    some shape, so the union of their cases of :func:`test_every_program_is_launched` runs every path of
-    :func:`_required_store_paths` in both roundings."""
+    """Per twin key on the local architecture (an FP16 program and its siblings, when it has any),
+    every call kind of :func:`_fp16_store_paths` in both roundings at the programs' token count selects one of them,
+    or the row-split program of their token count, on some shape, so the union of their cases of
+    :func:`test_every_program_is_launched` runs every path of :func:`_required_store_paths` in both roundings."""
     arch = _arch()
     if not loader.supported_num_householder(arch, state_dtype=torch.float16):
         pytest.skip("no FP16-pool program on this architecture")
@@ -1507,13 +1634,22 @@ def test_fp16_store_paths_are_covered_per_twin_key() -> None:
         build = loader.MODULES[min(names)]["build"]
         n, l2 = build["num_householder"], build.get("use_qk_l2norm", True)
         (T,) = {tokens[name] for name in names}
-        flags = sorted(_is_sibling(loader.MODULES[name]) for name in names)
-        assert flags in ([False], [False, True]), (key, sorted(names))
-        with_sibling += flags == [False, True]
+        flags = [_is_sibling(loader.MODULES[name]) for name in names]
+        assert flags.count(False) == 1, (key, sorted(names))  # one plain program
+        with_sibling += len(flags) > 1
+        t_steps = build["t_steps"]
+        split = sorted(
+            other
+            for other in _route_names_of(min(names))
+            if _is_row_split(loader.MODULES[other])
+            and loader.MODULES[other]["build"]["t_steps"] == t_steps
+            and other not in names
+        )
         for kind, rounding in itertools.product(KIND_PATHS, ("rne", "sr")):
             assert any(
-                _class_owner(name, n, T, l2, kind, rounding) for name in sorted(names)
-            ), (key, kind, rounding, sorted(names))
+                _class_owner(name, n, T, l2, kind, rounding)
+                for name in (*sorted(names), *split)
+            ), (key, kind, rounding, sorted(names), split)
     assert with_sibling > 0, "no FP16 program has a sibling here"
 
 
@@ -1549,31 +1685,86 @@ def test_rounding_model_self_checks() -> None:
 def _fp16_matrix() -> list:
     """Calls over an FP16 pool covering every FP16 body: the T = 1 bands (row partition, one-wave preload, l8r4,
     the many-wave program), static T = 4, 8 and 16 with writeback, distinct write slots, snapshots, holes (skipped
-    snapshots, a skipped writeback: :func:`_holes`), the runtime programs of n = 1, 2, 3 and 4, the two
-    ``snapshot_noise`` siblings (stochastic calls with snapshots at T = 16 above 2 x SM and, on the runtime program of
-    n = 3, from 10 rounds outside (3 x SM, 4 x SM] and from 11 within it; on SM107 from 16 within it and from 11
-    above 124 x SM), a padded pool, padding rows and ``disable_state_update``."""
+    snapshots, a skipped writeback: :func:`_holes`), the runtime programs of n = 1, 2, 3 and 4, the
+    ``snapshot_noise`` siblings (stochastic calls with snapshots at T = 16 above 2 x SM, above 1.5 x SM on SM90; on
+    the runtime program of n = 3, from 10 rounds outside (3 x SM, 4 x SM] and from 11 within it, on SM107 from 16
+    within it and from 11 above 124 x SM, on SM90 from 5 rounds within (2 x SM, 3 x SM]; on SM90 also at T = 6 above
+    2 x SM), SM90's ``stochastic_forms`` siblings (stochastic calls at T = 4 within (3 x SM, 4.5 x SM] and above
+    13.5 x SM without snapshots, within (6 x SM, 13.5 x SM] with 5 to 9 rounds without them and within
+    (2.5 x SM, 4.5 x SM] and above 5 x SM with them; at T = 6 within (2 x SM, 4.5 x SM] and above 12 x SM, and
+    within (10.5 x SM, 12 x SM] with 5 to 9 rounds, without snapshots; at T = 8 within (2 x SM, 4.5 x SM] and
+    above 5 x SM, and on ``l8r2`` within (SM / 2, SM]; at T = 16 above 19 x SM without snapshots; on the T = 1 row
+    partition within (SM, 1.5 x SM] without snapshots) and ``scaled_rolled`` sibling (stochastic calls on the
+    runtime program of n = 4 above 1.5 x SM), SM90's row-split programs (the calls of these rows up to 2.5 x SM
+    state heads, by token count; at T = 4 and 80 state heads the call that rounds to nearest even runs ``l4r2``
+    instead; at T = 6 a call without a state update), a padded pool, padding rows and ``disable_state_update``."""
     rows = [
         # (n, T, H, B, options)
-        (3, 1, 10, 16, {}),  # 160 state heads: the row partition
+        # 160 state heads: the row partition; on SM90 a stochastic call without snapshots runs its stochastic_forms
+        # sibling within (SM, 1.5 x SM] (on 107 to 159 SMs), as at 133, the lowest count of that cell on 132 SMs
+        (3, 1, 10, 16, {}),
+        (3, 1, 19, 7, {}),
         (3, 1, 24, 7, {"padding_row": True}),  # 168: the one-wave preload program
         (3, 1, 20, 64, {"distinct_write": True}),  # 1280: l8r4
         (3, 1, 80, 257, {}),  # 20560 > 64 x SM on up to 320 SMs: the many-wave program
         (3, 4, 12, 16, {"scatter_tokens": True}),
         (3, 4, 12, 16, {"scatter_tokens": True, "holes": True}),
+        # 60 state heads at T = 4: on SM90 the row-split program (on 120 SMs or more, where 60 <= SM / 2; below,
+        # l4r2 when the call rounds to nearest even); the other architectures run l8r4
+        (3, 4, 6, 10, {"scatter_tokens": True}),
+        # 80 state heads at T = 4, within (SM / 2, SM] on 80 to 159 SMs: on SM90 the call that rounds to nearest even
+        # runs l4r2 and a stochastic call the row-split program; the other architectures run l8r4
+        (3, 4, 10, 8, {}),
+        # 70 state heads at T = 8: on SM90 within (SM / 2, SM] (on 70 to 139 SMs) l8r2, whose stochastic_forms sibling
+        # runs a stochastic call there, as at 67 and 132, the lowest and the highest count of that cell on 132 SMs (132
+        # with snapshots; within (SM, 1.5 x SM] on 114 SMs, where it runs the row-split program)
         (3, 8, 10, 7, {"distinct_write": True}),
         (3, 8, 10, 7, {"distinct_write": True, "holes": True}),
+        (3, 8, 1, 67, {}),
+        (3, 8, 12, 11, {"scatter_tokens": True}),
         # 480 > 2 x SM on up to 216 SMs: l8r4; a stochastic call stores snapshots there, so it runs the l8r4
         # snapshot_noise sibling (one draw per launch into shared memory), a call that rounds to nearest even runs l8r4
         (3, 16, 24, 20, {"scatter_tokens": True}),
         (3, 16, 24, 20, {"scatter_tokens": True, "holes": True}),
+        # 480 > 2 x SM at T = 6: l8r4 (on SM90 its own build); on SM90 a stochastic call that stores snapshots runs
+        # that program's snapshot_noise sibling, one without snapshots its stochastic_forms sibling on 132 / 114 SMs
+        # (within (2 x SM, 4.5 x SM]) and the program on 78 (6.15 x SM, within (4.5 x SM, 10.5 x SM]), and a call that
+        # rounds to nearest even the program
+        (3, 6, 24, 20, {"scatter_tokens": True}),
+        (3, 6, 24, 20, {"distinct_write": True}),
+        # 1387 and 1584 state heads at T = 6 (10.5 x SM + 1 and 12 x SM on 132 SMs): on SM90 a stochastic call without
+        # snapshots runs the stochastic_forms sibling with 5 to 9 rounds (within (10.5 x SM, 12 x SM]) and the program
+        # from 10 on 132 SMs, and the sibling with every round count above 12 x SM (on 114 and 78 SMs)
+        (3, 6, 19, 73, {}),
+        (3, 6, 24, 66, {}),
+        # 480 state heads at T = 4, 8 and 16 and on the runtime program of n = 4 (T = 3), and 2688 at T = 16: on SM90
+        # a stochastic call without snapshots runs the program's stochastic_forms sibling where its cells admit the
+        # call (T = 4: within (3 x SM, 4.5 x SM] on 132 / 114 SMs, on 78 at 6.15 x SM within (6 x SM, 13.5 x SM] with
+        # 5 to 9 rounds and the program from 10; T = 8: within (2 x SM, 4.5 x SM] on 132 / 114 SMs and above 5 x SM on
+        # 78; T = 16: above 19 x SM, at 2688 state heads on up to 141 SMs, the program at 480) or, for n = 4, its
+        # scaled_rolled sibling (above 1.5 x SM), and a call that rounds to nearest even the program; the other
+        # architectures run the program in every class
+        (3, 4, 24, 20, {}),
+        (3, 8, 24, 20, {}),
+        (3, 16, 24, 20, {"distinct_write": True}),
+        (3, 16, 24, 112, {"distinct_write": True}),
+        (4, 3, 24, 20, {}),
+        # 793 and 1782 state heads at T = 4 (6 x SM + 1 and 13.5 x SM on 132 SMs): on SM90 a stochastic call without
+        # snapshots runs the stochastic_forms sibling with 5 to 9 rounds (within (6 x SM, 13.5 x SM]) and the program
+        # from 10 (793 on 132, 114 and 78 SMs, 1782 on 132), and the sibling with every round count above 13.5 x SM
+        # (1782 on 114 and 78 SMs)
+        (3, 4, 13, 61, {}),
+        (3, 4, 22, 81, {}),
         (3, 16, 10, 3, {"scatter_tokens": True}),  # l8r2: the shared snapshot noise
         (3, 5, 12, 7, {"padded_pool": True}),
         (3, 2, 6, 5, {"disable_state_update": True}),
+        # 24 state heads at T = 6: on SM90 the row-split program, here without a state update (it fills its shared
+        # noise only for a call that stores the state)
+        (3, 6, 24, 1, {"disable_state_update": True}),
         (1, 3, 6, 5, {}),
         (2, 9, 6, 3, {"scatter_tokens": True}),
-        # the runtime program of n = 3: its snapshot_noise sibling runs the snapshots of 10 rounds or more at
-        # these state heads (below 3 x SM)
+        # the runtime program of n = 3: its snapshot_noise sibling runs the snapshots of 10 rounds or more at these
+        # state heads (below 3 x SM); on SM90 these 18 state heads run the row-split runtime program in every class
         (3, 10, 6, 3, {"scatter_tokens": True}),
         (3, 13, 20, 16, {"scatter_tokens": True, "holes": True}),
         (4, 2, 6, 4, {"padding_row": True}),
@@ -1599,7 +1790,8 @@ def test_fp16_pool_rounds_the_fp32_state(
     """An FP16 pool, rounding to nearest even without a seed or stochastically with 10 (the default), 5 or 16
     Philox rounds: the output equals the FP32 twin's bit for bit, every stored element is a rounding of the twin's
     stored FP32 element, and the stored elements of up to ``MODEL_MAX_HEADS`` state heads (all of them below that)
-    equal the model's rounding of it; the slots a hole skips stay untouched."""
+    equal the model's rounding of it (a call that runs a row-split program repeats its bits and is held to the FP32
+    call within the tolerances instead, :func:`_run_fp16`); the slots a hole skips stay untouched."""
     _skip_unless_route(n, T, state_dtype=torch.float16)
     options = dict(options)
     padding_row = options.pop("padding_row", False)
@@ -1616,22 +1808,26 @@ def test_fp16_pool_rounds_the_fp32_state(
 
 
 @pytest.mark.parametrize("rounding", ("rne", "sr10"))
-@pytest.mark.parametrize("n,H,B", ((1, 6, 3), (3, 10, 4)))
+@pytest.mark.parametrize("n,H,B", ((1, 6, 3), (1, 6, 64), (3, 10, 4)))
 def test_fp16_pool_overflow_is_stored_as_infinity(
     n: int, H: int, B: int, rounding: str
 ) -> None:
     """A state that rounds past the largest float16 (65504) is stored as an infinity of its sign, exactly where the
-    rounding model puts one (every element of these calls is modelled), and the output is unaffected: bit for bit
-    the FP32 twin's.  ``T = 1``; the first sub-step's values are scaled by 2^20, so the state after it is about
+    rounding model puts one (every element of these calls is modelled; on a row-split program, where the FP32
+    call's element is past 2^16), and the output is unaffected: bit for bit the FP32 twin's (within the tolerances
+    on a row-split program).  ``T = 1``; the first sub-step's values are scaled by 2^20, so the state after it is about
     ``beta v k^T``, past 65504 for a share of the elements; later sub-steps get ``beta = sigmoid(-30)`` and leave
-    it.  (n = 1: the runtime program; n = 3 with 40 state heads: the row partition.)"""
+    it.  (n = 1: the runtime program, on SM90 its row-split program at 18 state heads, whose stored elements are
+    held to the FP32 call's within the tolerances (:func:`_check_row_split_call`), and the runtime program itself at
+    384 state heads, above those cells on up to 153 SMs; n = 3 with 40 state heads: the row partition.)"""
     _skip_unless_route(n, 1, state_dtype=torch.float16)
     c = _make(B, 1, H, n, generator=_generator(46, n, H, B))
     c.v[:, :, 0] *= 2.0**20
     c.b[:, :, 1:] = -30.0
     seed = None if rounding == "rne" else SR_SEED
     c16, out16, c32, _ = _run_fp16(c, seed=seed, what=f"overflow n={n} {rounding}")
-    assert B * H <= MODEL_MAX_HEADS  # the model compared every stored element
+    # the model compared every stored element (of a twin program)
+    assert B * H <= MODEL_MAX_HEADS
     slots = c16.read.long()
     stored, x32 = c16.pool[slots].float(), c32.pool[slots]
     assert torch.isfinite(x32).all() and torch.isfinite(out16.float()).all()
@@ -1721,25 +1917,31 @@ def _graph_replay(T: int, H: int, B: int, snapshots: bool, monkeypatch) -> None:
     assert sibling == snapshots, launched
 
 
-def test_fp16_pool_layout() -> None:
+@pytest.mark.parametrize("rounding", ("rne", "sr10"))
+@pytest.mark.parametrize("T,H", ((4, 6), (8, 16)))
+def test_fp16_pool_layout(T: int, H: int, rounding: str) -> None:
     """An FP16 pool view whose base is 8-byte aligned and whose strides are multiples of four elements is used in
-    place (the Philox counter is an element offset from the view's base, not from its storage); a 4-byte aligned
-    base or strides that are not multiples of four elements are refused before anything is launched."""
-    _skip_unless_route(3, 4, state_dtype=torch.float16)
-    c = _make(5, 4, 6, 3, generator=_generator(43), pool_size=9)
+    place (the Philox counter is an element offset from the view's base, not from its storage), rounding to nearest
+    even and with 10 Philox rounds; a 4-byte aligned base or strides that are not multiples of four elements are
+    refused before anything is launched.  On SM90 the 30 state heads of ``T = 4`` run a row-split program
+    (:func:`_check_row_split_call`) and the 80 of ``T = 8`` (within (SM / 2, SM] on 80 to 159 SMs) the FP16 twin of
+    ``l8r2`` (its ``stochastic_forms`` sibling with 10 rounds), whose stores the rounding model checks."""
+    _skip_unless_route(3, T, state_dtype=torch.float16)
+    c = _make(5, T, H, 3, generator=_generator(43, T, H), pool_size=9)
     c16, _ = _fp16_twins(c)
     numel = c16.pool.numel()
     flat = torch.zeros(numel + 8, dtype=torch.float16, device=_device())
     shifted = flat[4 : 4 + numel].view(c16.pool.shape)  # an 8-byte offset
     shifted.copy_(c16.pool_before)
     c.pool, c.pool_before = shifted, shifted.clone()
-    _run_fp16(c, seed=SR_SEED, what="8-byte aligned FP16 pool view")
+    seed = None if rounding == "rne" else SR_SEED
+    _run_fp16(c, seed=seed, what=f"8-byte aligned FP16 pool view seed={seed}")
     assert _same_bits(flat[:4], torch.zeros_like(flat[:4]))
     assert _same_bits(flat[4 + numel :], torch.zeros_like(flat[4 + numel :]))
     misaligned = flat[2 : 2 + numel].view(c16.pool.shape)  # a 4-byte offset
     with pytest.raises(ValueError, match="aligned"):
         _run(Case(**{**c16.__dict__, "pool": misaligned}))
-    wide = torch.zeros(9, 6, V, K + 2, dtype=torch.float16, device=_device())
+    wide = torch.zeros(9, H, V, K + 2, dtype=torch.float16, device=_device())
     with pytest.raises(ValueError, match="multiples"):
         _run(Case(**{**c16.__dict__, "pool": wide[..., :K]}))
 
@@ -1806,24 +2008,12 @@ def test_fp16_rejects_invalid_rounding_arguments() -> None:
     cake_gated_delta_product_mtp(*args, **kwargs, rand_seed=seed.reshape(()))
 
 
-def test_fp16_pool_is_refused_without_fp16_programs() -> None:
-    """On an architecture without FP16-pool programs (SM90: no hardware ``cvt.rs``) an FP16 pool is refused."""
-    if loader.supported_num_householder(_arch(), state_dtype=torch.float16):
-        pytest.skip("this device has FP16-pool programs")
-    _skip_unless_route(3, 2)
-    c = _make(3, 2, 6, 3, generator=_generator(45), pool_size=8)
-    c16, _ = _fp16_twins(c)
-    with pytest.raises(ValueError, match="float16"):
-        _run(c16)
-    c16.rand_seed = torch.tensor([SR_SEED], dtype=torch.int64, device=_device())
-    c16.philox_rounds = SR_ROUNDS
-    with pytest.raises(ValueError, match="float16"):
-        _run(c16)
-    assert _same_bits(c16.pool, c16.pool_before)
-
-
-# The build flags of an FP16 program's siblings: the snapshot-only shared noise and the shared draw.
-SIBLING_FLAGS = ("snapshot_noise", "draw_share")
+# The build flags of an FP16 program's siblings: the snapshot-only shared noise, the shared draw and SM90's faster
+# forms of the integer rounding (the stochastic store forms, and the scaled form with a rolled sequence-end store).
+SIBLING_FLAGS = ("snapshot_noise", "draw_share", "stochastic_forms", "scaled_rolled")
+# The sibling flags whose cells admit stochastic calls of either snapshot use (``rounds_at_least``), the plain
+# program keeping the calls that round to nearest even.
+ROUND_SPLIT_FLAGS = ("draw_share", "stochastic_forms", "scaled_rolled")
 
 
 def _is_sibling(record: dict) -> bool:
@@ -1832,14 +2022,70 @@ def _is_sibling(record: dict) -> bool:
 
 
 def _twin_key(record: dict) -> tuple:
-    """A decode record's identity without its pool dtype and its sibling flags: an FP16 record, its siblings
-    (``snapshot_noise``, ``draw_share``) and their FP32 twin share it."""
+    """A decode record's identity without its pool dtype, its sibling flags and its architecture split (``arch``, on
+    an SM90 build whose program differs from the other architectures'): on one architecture an FP16 record, its
+    siblings (:data:`SIBLING_FLAGS`) and their FP32 twin share it."""
     build = {
         k: v
         for k, v in record["build"].items()
-        if k not in ("state_dtype", *SIBLING_FLAGS)
+        if k not in ("state_dtype", "arch", *SIBLING_FLAGS)
     }
     return (record["body"], tuple(sorted(build.items())))
+
+
+def _is_row_split(record: dict) -> bool:
+    """Whether a decode record is a row-split program: the lane-owns-rows body with each state head cut over several
+    CTAs (grid rule ``ctas_per_state`` above one; SM90's FP16 ``l8r2h`` programs).  No route ships its FP32 build, so
+    it has no FP32 twin; its cells take the calls they admit from the program (or sibling) of its route and token
+    count that would run them otherwise."""
+    return record["body"] == "lanerow" and record["grid_rule"]["ctas_per_state"] > 1
+
+
+def _fp16_partners() -> tuple[dict, dict, dict, dict]:
+    """The FP16 decode records by their part towards the FP32 records, per architecture: ``twins`` maps ``(arch, FP32
+    name)`` to the plain FP16 record of that FP32 record's twin key delivered on ``arch``, ``siblings`` to its
+    siblings there (:data:`SIBLING_FLAGS`), ``row_splits`` maps ``(arch, route)`` to the route's
+    row-split programs by ``t_steps`` (``None``: the runtime program) and ``twin_of`` maps ``(arch, FP16 name)`` to
+    the FP32 twin.  Each FP32 record has at most one plain FP16 record per architecture, each FP16 record but a
+    row-split program has an FP32 twin delivered on each of its architectures, no FP32 record has a row-split
+    program's twin key there, and a route has at most one row-split program per token count."""
+    fp32_on: dict = {}
+    for name, record in loader.MODULES.items():
+        if record["role"] == "decode" and "state_dtype" not in record["build"]:
+            for arch in record["arches"]:
+                key = (arch, _twin_key(record))
+                assert key not in fp32_on, (key, fp32_on.get(key), name)
+                fp32_on[key] = name
+    twins: dict = {}
+    siblings: dict = {}
+    row_splits: dict = {}
+    twin_of: dict = {}
+    for name, record in loader.MODULES.items():
+        if record["role"] != "decode" or "state_dtype" not in record["build"]:
+            continue
+        for arch in record["arches"]:
+            if _is_row_split(record):
+                assert (arch, _twin_key(record)) not in fp32_on, (arch, name)
+                for route, names in loader.ROUTES[arch].items():
+                    if name in names:
+                        split = row_splits.setdefault((arch, route), {})
+                        t_steps = record["build"]["t_steps"]
+                        assert t_steps not in split, (arch, route, split[t_steps], name)
+                        split[t_steps] = name
+                continue
+            other = fp32_on.get((arch, _twin_key(record)))
+            assert other is not None, f"{name} has no FP32 twin on {arch}"
+            twin_of[arch, name] = other
+            if _is_sibling(record):
+                siblings.setdefault((arch, other), []).append(name)
+            else:
+                assert (arch, other) not in twins, (
+                    arch,
+                    name,
+                    twins.get((arch, other)),
+                )
+                twins[arch, other] = name
+    return twins, siblings, row_splits, twin_of
 
 
 # The launch-class keys a select cell of an FP16 record may carry, the wave keys of a cell (``_selects``), and the
@@ -1893,59 +2139,37 @@ def _restricted(rule, arches: list) -> object:
 
 
 def test_fp16_records_are_twins_of_the_fp32_records() -> None:
-    """Every FP16-pool record ships on SM100 / SM103 / SM107 only, in the routes of its FP32 twin (same body and
-    build keywords but ``state_dtype`` and the sibling flags), with the twin's band on each of its architectures
-    (its cells there without their launch-class keys and the wave keys the twin's band lacks, at which a program
-    and its sibling may part their launch classes), the twin's grid rule and the seed and round-count
-    arguments.  Only FP16 cells carry launch-class keys; a ``snapshot_noise`` sibling's cells each admit stochastic
-    calls with snapshots only, a ``draw_share`` sibling's stochastic calls only, and a sibling has a plain FP16
-    record of the same twin key in the same routes.
-    On each of SM100, SM103 and SM107, every FP32 decode record of a route has its plain FP16 twin in that route,
-    delivered for that architecture, so an FP16 pool has a route wherever an FP32 pool has one.  For every probe and every launch class (round count 0 or
-    5 to 16, with or without snapshots) the FP16 dispatch selects a program with the twin key of the FP32
-    dispatch's program: the sibling exactly where one of the sibling's cells admits the call, else the plain twin."""
-    fp32 = {
-        _twin_key(r): name
-        for name, r in loader.MODULES.items()
-        if r["role"] == "decode" and "state_dtype" not in r["build"]
-    }
-    twins: dict[str, str] = {}
-    siblings: dict[str, list[str]] = {}
+    """Every FP16-pool record but a row-split program (:func:`_is_row_split`) ships, on each of its architectures,
+    in the routes there of its FP32 twin on that architecture (same body and build keywords but ``state_dtype``, the
+    sibling flags and ``arch``: :func:`_twin_key`), with the twin's grid rule and the seed and round-count
+    arguments.  Its band there is the twin's (its cells without their launch-class keys and the wave keys the twin's
+    band lacks, at which a program and its sibling may part their launch classes) where its route has no row-split
+    program of its token count; where it has one, at every SM count of :data:`SM_COUNTS`, probe and launch class
+    exactly one of the plain FP16 twin and its siblings admits the call where the FP32 twin admits it and the
+    row-split program does not, and none of them elsewhere.  Only FP16 cells carry launch-class keys; a
+    ``snapshot_noise`` sibling's cells each admit stochastic calls with snapshots only, a ``draw_share``,
+    ``stochastic_forms`` or ``scaled_rolled`` sibling's stochastic calls only, and a sibling has a plain FP16 record
+    of the same twin key in the same routes, delivered on each of the sibling's architectures (SM90's
+    ``stochastic_forms`` and ``scaled_rolled`` siblings ship on SM90 alone).  A row-split program is an FP16 record
+    with cells and the seed and round-count arguments whose FP32 build ships on no route (:func:`_fp16_partners`).
+    On every architecture, every FP32 decode record of a route has its plain FP16 twin in that route, delivered for
+    that architecture, so an FP16 pool has a route wherever an FP32 pool has one.  For every probe and every launch
+    class (round count 0 or 5 to 16, with or without snapshots) the FP16 dispatch selects the row-split program of
+    the FP32 dispatch's token count (static or runtime) exactly where one of its cells admits the call, else a
+    program with the twin key of the FP32 dispatch's program: the sibling exactly where one of the sibling's cells
+    admits the call, else the plain twin."""
+    twins, siblings, row_splits, twin_of = _fp16_partners()
     for name, record in loader.MODULES.items():
         if record["role"] != "decode":
             continue
         rule = record["select_rule"]
-        cells = [] if rule is None else rule if isinstance(rule, list) else [rule]
+        cells = _cells(rule)
         if "state_dtype" not in record["build"]:
             assert not set(SIBLING_FLAGS) & set(record["build"]), name
             assert not any(set(CLASS_KEYS) & set(cell) for cell in cells), name
+            assert not _is_row_split(record), name
             continue
         assert record["build"]["state_dtype"] == "f16", name
-        assert set(record["arches"]) <= {"sm_100a", "sm_103a", "sm_107a"}, name
-        other = fp32[_twin_key(record)]
-        twin = loader.MODULES[other]
-        if record["build"].get("snapshot_noise"):
-            assert record["build"]["snapshot_noise"] is True and cells, name
-            for cell in cells:
-                assert cell["snapshot"] is True, (name, cell)
-                assert cell["rounds_at_least"] >= pkg.PHILOX_ROUNDS_MIN, (name, cell)
-            siblings.setdefault(other, []).append(name)
-        elif record["build"].get("draw_share"):
-            assert record["build"]["draw_share"] is True and cells, name
-            for cell in cells:
-                assert cell["rounds_at_least"] >= pkg.PHILOX_ROUNDS_MIN, (name, cell)
-            siblings.setdefault(other, []).append(name)
-        else:
-            assert other not in twins, (name, twins.get(other))
-            twins[other] = name
-        assert set(record["arches"]) <= set(twin["arches"]), name
-        for arch in record["arches"]:
-            band = _restricted(twin["select_rule"], [arch])
-            spelled = {key for cell in _cells(band) for key in cell}
-            dropped = tuple(key for key in WAVE_KEYS if key not in spelled)
-            cells = _band_cells(_restricted(record["select_rule"], [arch]), dropped)
-            assert cells == _band_cells(band), (name, arch)
-        assert record["grid_rule"] == twin["grid_rule"], name
         assert record["logical"]["rand_seed"] == "rand_seed", name
         assert record["logical"]["philox_rounds"] == "philox_rounds", name
         plan = [tuple(entry) for entry in record["arg_plan"]]
@@ -1953,23 +2177,96 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
             "parameter",
             "philox_rounds",
         ) in plan, name
+        if record["build"].get("snapshot_noise"):
+            assert record["build"]["snapshot_noise"] is True and cells, name
+            for cell in cells:
+                assert cell["snapshot"] is True, (name, cell)
+                assert cell["rounds_at_least"] >= pkg.PHILOX_ROUNDS_MIN, (name, cell)
+        else:
+            for flag in ROUND_SPLIT_FLAGS:
+                if record["build"].get(flag):
+                    assert record["build"][flag] is True and cells, name
+                    for cell in cells:
+                        assert cell["rounds_at_least"] >= pkg.PHILOX_ROUNDS_MIN, (
+                            name,
+                            cell,
+                        )
+        assert sum(bool(record["build"].get(flag)) for flag in SIBLING_FLAGS) <= 1, name
+        if _is_row_split(record):
+            assert not _is_sibling(record) and cells, name
+            continue
         for arch in record["arches"]:
+            other = twin_of[arch, name]
+            twin = loader.MODULES[other]
+            assert arch in twin["arches"], (arch, name)
+            routes = []
             for key, names in loader.ROUTES[arch].items():
                 assert (name in names) == (other in names), (arch, key, name)
-    for other, names in siblings.items():
-        assert other in twins, (other, names)
+                if name in names:
+                    routes.append(key)
+            assert record["grid_rule"] == twin["grid_rule"], name
+            if any(
+                record["build"]["t_steps"] in row_splits.get((arch, key), {})
+                for key in routes
+            ):
+                continue  # the band is split with a row-split program: checked on the probes below
+            band = _restricted(twin["select_rule"], [arch])
+            spelled = {key for cell in _cells(band) for key in cell}
+            dropped = tuple(key for key in WAVE_KEYS if key not in spelled)
+            cells = _band_cells(_restricted(rule, [arch]), dropped)
+            assert cells == _band_cells(band), (name, arch)
+    for (arch, other), names in siblings.items():
+        assert (arch, other) in twins, (arch, other, names)
         for name in names:
-            assert (
-                loader.MODULES[name]["arches"] == loader.MODULES[twins[other]]["arches"]
+            # each architecture of the sibling ships its plain program (an SM90-only sibling of a plain program
+            # shipped on every architecture); the probes below hold the split per architecture
+            assert set(loader.MODULES[name]["arches"]) <= set(
+                loader.MODULES[twins[arch, other]]["arches"]
             ), name
-    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+    for (arch, other), plain in twins.items():
+        members = [plain, *siblings.get((arch, other), [])]
+        t_steps = loader.MODULES[other]["build"]["t_steps"]
+        split = {
+            row_splits.get((arch, key), {}).get(t_steps)
+            for key, names in loader.ROUTES[arch].items()
+            if other in names
+        } - {None}
+        if not split:
+            continue
+        (split_name,) = split
+        for sms, state_heads, (rounds, snapshot) in itertools.product(
+            SM_COUNTS, _STATE_HEAD_PROBES, LAUNCH_CLASSES
+        ):
+
+            def admits(name: str) -> bool:
+                return loader._selects(
+                    loader.MODULES[name]["select_rule"],
+                    state_heads,
+                    sms,
+                    arch,
+                    philox_rounds=rounds,
+                    snapshot=snapshot,
+                )
+
+            inside = admits(other) and not admits(split_name)
+            assert sum(admits(name) for name in members) == int(inside), (
+                arch,
+                other,
+                members,
+                split_name,
+                sms,
+                state_heads,
+                rounds,
+                snapshot,
+            )
+    for arch in loader.ROUTES:
         for key, names in loader.ROUTES[arch].items():
             if key.startswith("decode_nh"):
                 for name in names:
                     if "state_dtype" not in loader.MODULES[name]["build"]:
-                        assert name in twins, (arch, key, name)
-                        assert twins[name] in names, (arch, key, name)
-                        assert arch in loader.MODULES[twins[name]]["arches"], (
+                        assert (arch, name) in twins, (arch, key, name)
+                        assert twins[arch, name] in names, (arch, key, name)
+                        assert arch in loader.MODULES[twins[arch, name]]["arches"], (
                             arch,
                             key,
                             name,
@@ -1988,17 +2285,20 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
                 arch, l2, state_dtype=torch.float16
             ):
                 continue
+            split = row_splits.get((arch, key), {})
             for T in range(1, loader.max_num_tokens(arch, n, l2) + 1):
                 for sms in SM_COUNTS:
                     for state_heads in _STATE_HEAD_PROBES:
                         picked = loader.selected_module(
                             arch, n, T, state_heads, sm_count=sms, use_qk_l2norm=l2
                         )
+                        split_name = split.get(
+                            loader.MODULES[picked]["build"]["t_steps"]
+                        )
                         for rounds, snapshot in LAUNCH_CLASSES:
-                            admitting = [
-                                name
-                                for name in siblings.get(picked, [])
-                                if loader._selects(
+
+                            def admits(name: str) -> bool:
+                                return loader._selects(
                                     loader.MODULES[name]["select_rule"],
                                     state_heads,
                                     sms,
@@ -2006,9 +2306,19 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
                                     philox_rounds=rounds,
                                     snapshot=snapshot,
                                 )
-                            ]
-                            assert len(admitting) <= 1, admitting
-                            expected = admitting[0] if admitting else twins[picked]
+
+                            if split_name is not None and admits(split_name):
+                                expected = split_name
+                            else:
+                                admitting = [
+                                    name
+                                    for name in siblings.get((arch, picked), [])
+                                    if admits(name)
+                                ]
+                                assert len(admitting) <= 1, admitting
+                                expected = (
+                                    admitting[0] if admitting else twins[arch, picked]
+                                )
                             assert expected == loader.selected_module(
                                 arch,
                                 n,
@@ -2020,7 +2330,368 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
                                 philox_rounds=rounds,
                                 use_ssm_state_indices=snapshot,
                             ), (arch, key, T, state_heads, sms, rounds, snapshot)
-    assert siblings, "no sibling (snapshot_noise or draw_share) in the registry"
+    assert siblings, "no sibling (one of SIBLING_FLAGS) in the registry"
+
+
+# The SM counts of :func:`test_fp16_calls_select_exactly_one_program`: the H100 parts (132 SMs; 114 on the PCIe card),
+# the odd counts next to them and a smaller part, so a half-wave edge falls both on a state-head count and between
+# two.
+_PARTITION_SM_COUNTS = (78, 113, 114, 132, 133)
+
+
+def test_fp16_calls_select_exactly_one_program() -> None:
+    """On every architecture that ships a row-split program, for every decode route, every static token count of the
+    route's FP16 programs and the first token count beyond them (the runtime programs'), every SM count of
+    :data:`_PARTITION_SM_COUNTS`, every state-head count from 1 to 20 x SM + 2 (each half-wave edge of the cells, up
+    to the 19 x SM of SM90's 16-token ``stochastic_forms`` sibling, and the counts next to it) and 20480, and every
+    launch class: exactly one FP16 program of that token count admits the call (a static one at a static token
+    count, so the runtime program never serves it; else a runtime one), and it is the row-split program of that
+    token count exactly where one of its cells admits the call, else the sibling or the plain FP16 twin of the FP32
+    pool's program, as :func:`test_fp16_records_are_twins_of_the_fp32_records` requires on its probes."""
+    twins, siblings, row_splits, _ = _fp16_partners()
+    arches = sorted({arch for arch, _ in row_splits})
+    assert arches, "no row-split program in the registry"
+    for arch in arches:
+        for key, names in sorted(loader.ROUTES[arch].items()):
+            if not key.startswith("decode_nh"):
+                continue
+            n, l2 = int(key[len("decode_nh")]), not key.endswith("_raw")
+            f16 = [
+                name
+                for name in names
+                if loader.MODULES[name]["build"].get("state_dtype") == "f16"
+            ]
+            static = sorted(
+                {loader.MODULES[name]["build"]["t_steps"] for name in f16} - {None}
+            )
+            beyond = next(t for t in itertools.count(1) if t not in static)
+            split = row_splits.get((arch, key), {})
+            for T, sms in itertools.product((*static, beyond), _PARTITION_SM_COUNTS):
+                tier = [
+                    name
+                    for name in f16
+                    if loader.MODULES[name]["build"]["t_steps"] == T
+                ] or [
+                    name
+                    for name in f16
+                    if loader.MODULES[name]["build"]["t_steps"] is None
+                    and loader.MODULES[name]["build"]["max_t_steps"] >= T
+                ]
+                for state_heads in (
+                    *range(1, 20 * sms + 3),
+                    20480,
+                ):
+                    picked = loader.selected_module(
+                        arch, n, T, state_heads, sm_count=sms, use_qk_l2norm=l2
+                    )
+                    split_name = split.get(loader.MODULES[picked]["build"]["t_steps"])
+                    for rounds, snapshot in LAUNCH_CLASSES:
+
+                        def admits(name: str) -> bool:
+                            return loader._selects(
+                                loader.MODULES[name]["select_rule"],
+                                state_heads,
+                                sms,
+                                arch,
+                                philox_rounds=rounds,
+                                snapshot=snapshot,
+                            )
+
+                        admitting = [name for name in tier if admits(name)]
+                        if split_name is not None and admits(split_name):
+                            expected = split_name
+                        else:
+                            sibling = [
+                                name
+                                for name in siblings.get((arch, picked), [])
+                                if admits(name)
+                            ]
+                            expected = sibling[0] if sibling else twins[arch, picked]
+                        assert admitting == [expected], (
+                            arch,
+                            key,
+                            T,
+                            sms,
+                            state_heads,
+                            rounds,
+                            snapshot,
+                            admitting,
+                            expected,
+                        )
+
+
+def test_round_split_siblings_take_the_stochastic_calls_of_their_cells() -> None:
+    """A sibling of :data:`ROUND_SPLIT_FLAGS` and its plain FP16 program split the calls of the sibling's cells by
+    the round count alone.  On each architecture of the sibling and every SM count of :data:`SM_COUNTS` and
+    :data:`_PARTITION_SM_COUNTS` (the H100 parts among them), at every state-head count a cell of the sibling admits
+    among the half-wave edges up to 20 x SM, the counts next to them and 20480, a call of the sibling's token count
+    (a runtime sibling: the first token count no static program of its route has) selects the sibling with
+    every round count from the cell's ``rounds_at_least`` to its ``rounds_at_most`` (:data:`PHILOX_ROUNDS_MAX` when
+    it has none) and each snapshot use the cell admits, and its plain program with a round count above that and
+    when it rounds to nearest even.  Every sibling is selected on every one of these SM counts where a cell of it
+    admits a state-head count up to 20 x SM (SM90's ``splitv8_tile8`` sibling, whose cell holds B x HV up to 160
+    above 1 x SM, has none from 160 SMs), and the registry has a sibling of each of these flags (on SM90: the
+    ``l8r4`` programs of 4, 6, 8 and 16 tokens, the ``l8r2`` program of 8 tokens and the one-token
+    ``splitv8_tile8`` program with their ``stochastic_forms`` siblings, the runtime program of n = 4 with its
+    ``scaled_rolled`` sibling)."""
+    twins, _, _, twin_of = _fp16_partners()
+    sm_counts = sorted({*SM_COUNTS, *_PARTITION_SM_COUNTS})
+    flags_seen = set()
+    for name, record in sorted(loader.MODULES.items()):
+        build = record["build"]
+        flags = [flag for flag in ROUND_SPLIT_FLAGS if build.get(flag)]
+        if record["role"] != "decode" or not flags:
+            continue
+        flags_seen.update(flags)
+        n, l2 = build["num_householder"], build.get("use_qk_l2norm", True)
+        for arch in record["arches"]:
+            plain = twins[arch, twin_of[arch, name]]
+            T = build["t_steps"]
+            if T is None:
+                (route,) = [
+                    names for names in loader.ROUTES[arch].values() if name in names
+                ]
+                static = {loader.MODULES[other]["build"]["t_steps"] for other in route}
+                T = next(t for t in itertools.count(1) if t not in static)
+            cells = _cells(_restricted(record["select_rule"], [arch]))
+            for sms in sm_counts:
+                probes = sorted(
+                    {k * sms // 2 + d for k in range(1, 41) for d in (-1, 0, 1)}
+                    | {20480}
+                )
+                inside = 0
+                for state_heads, cell in itertools.product(probes, cells):
+                    low = cell["rounds_at_least"]
+                    high = cell.get("rounds_at_most", pkg.PHILOX_ROUNDS_MAX)
+                    snapshots = (
+                        (cell["snapshot"],) if "snapshot" in cell else (False, True)
+                    )
+                    if not loader._selects(
+                        cell,
+                        state_heads,
+                        sms,
+                        arch,
+                        philox_rounds=low,
+                        snapshot=snapshots[0],
+                    ):
+                        continue
+                    inside += 1
+                    for snapshot in snapshots:
+
+                        def picked(rounds: int) -> str:
+                            return loader.selected_module(
+                                arch,
+                                n,
+                                T,
+                                state_heads,
+                                sm_count=sms,
+                                use_qk_l2norm=l2,
+                                state_dtype=torch.float16,
+                                philox_rounds=rounds,
+                                use_ssm_state_indices=snapshot,
+                            )
+
+                        where = (name, arch, sms, state_heads, snapshot)
+                        assert picked(0) == plain, where
+                        for rounds in range(low, high + 1):
+                            assert picked(rounds) == name, (*where, rounds)
+                        for rounds in range(high + 1, pkg.PHILOX_ROUNDS_MAX + 1):
+                            assert picked(rounds) == plain, (*where, rounds)
+                if not inside:
+                    # no state-head count up to 20 x SM in a cell (one that also bounds B x HV)
+                    assert not any(
+                        loader._selects(
+                            cell,
+                            state_heads,
+                            sms,
+                            arch,
+                            philox_rounds=cell["rounds_at_least"],
+                            snapshot=snapshot,
+                        )
+                        for cell in cells
+                        for state_heads in range(1, 20 * sms + 3)
+                        for snapshot in (False, True)
+                    ), (name, arch, sms)
+    assert flags_seen == set(ROUND_SPLIT_FLAGS), flags_seen
+
+
+def test_half_wave_bounds_compare_exactly() -> None:
+    """A wave bound of a select cell is a positive multiple of 1/2 and compares exactly, 2 x B x HV against 2 k x SM:
+    on an odd SM count a half-wave edge falls between two state-head counts (2.5 x 133 = 332.5: 332 is at most it,
+    333 above it), on an even one on a count (2.5 x 132 = 330), and an integer bound compares as it always did.  A
+    bound that is not a positive multiple of 1/2 (0.3, 0, -1, a bool) is refused."""
+    cell = {"kind": "state_heads_between", "above": 0, "at_most": None}
+
+    def selects(key: str, waves, state_heads: int, sms: int) -> bool:
+        return loader._selects({**cell, key: waves}, state_heads, sms, "sm_90a")
+
+    for waves, sms, last in (
+        (2.5, 133, 332),
+        (2.5, 132, 330),
+        (0.5, 133, 66),
+        (1.5, 113, 169),
+        (2, 133, 266),
+    ):
+        assert selects("ctas_per_sm_at_most", waves, last, sms)
+        assert not selects("ctas_per_sm_at_most", waves, last + 1, sms)
+        assert not selects("ctas_per_sm_above", waves, last, sms)
+        assert selects("ctas_per_sm_above", waves, last + 1, sms)
+    for waves, sms, first in ((2.5, 133, 333), (2.5, 132, 330), (0.5, 133, 67)):
+        assert selects("ctas_per_sm_at_least", waves, first, sms)
+        assert not selects("ctas_per_sm_at_least", waves, first - 1, sms)
+        assert not selects("ctas_per_sm_below", waves, first, sms)
+        assert selects("ctas_per_sm_below", waves, first - 1, sms)
+    for bad in (0.3, 0, -1, True):
+        with pytest.raises(ValueError):
+            selects("ctas_per_sm_at_most", bad, 1, 132)
+
+
+def _row_split_edge_cases() -> list:
+    """The calls of :func:`test_fp16_row_split_band_edges` on this device: for every row-split program of the local
+    architecture (:func:`_is_row_split`), every cell and every wave bound of the cell, the state-head count just
+    inside the bound and the one just outside it (``k x SM`` from the device's SM count, in exact arithmetic), in a
+    launch class the cell admits (its lowest round count, 0 when it has no lower bound, and its snapshot use, none
+    when it names none), at the program's token count (a runtime program: the first token count from 2 that no
+    static program of its route has).  One placeholder case where the architecture ships no row-split program."""
+    if not _supported():
+        return []
+    arch = _arch()
+    sms = loader.sm_count(_device().index or 0)
+    sides = {  # the state heads just inside and just outside a bound, from floor / ceil of k x SM
+        "ctas_per_sm_at_most": lambda low, high: (low, low + 1),
+        "ctas_per_sm_above": lambda low, high: (low + 1, low),
+        "ctas_per_sm_at_least": lambda low, high: (high, high - 1),
+        "ctas_per_sm_below": lambda low, high: (high - 1, high),
+    }
+    cases = []
+    for name, record in sorted(loader.MODULES.items()):
+        if (
+            record["role"] != "decode"
+            or arch not in record["arches"]
+            or not _is_row_split(record)
+        ):
+            continue
+        build = record["build"]
+        n, l2 = build["num_householder"], build.get("use_qk_l2norm", True)
+        T = build["t_steps"]
+        if T is None:
+            static = {
+                loader.MODULES[other]["build"]["t_steps"]
+                for other in loader.route_modules(arch, n, l2)
+            }
+            T = next(t for t in range(2, build["max_t_steps"] + 1) if t not in static)
+        for index, cell in enumerate(
+            _cells(_restricted(record["select_rule"], [arch]))
+        ):
+            rounds = cell.get("rounds_at_least", 0)
+            snapshot = bool(cell.get("snapshot", False))
+            for key in WAVE_KEYS:
+                if key not in cell:
+                    continue
+                edge = Fraction(cell[key]) * sms
+                inside, outside = sides[key](math.floor(edge), math.ceil(edge))
+                for side, state_heads in (("in", inside), ("out", outside)):
+                    if state_heads >= 1:
+                        cases.append(
+                            pytest.param(
+                                name,
+                                index,
+                                key,
+                                n,
+                                T,
+                                state_heads,
+                                rounds,
+                                snapshot,
+                                side == "in",
+                                id=f"{name}-cell{index}-{key}-{cell[key]}-{side}-{state_heads}",
+                            )
+                        )
+    if not cases:
+        cases.append(
+            pytest.param(
+                None, 0, "", 0, 0, 0, 0, False, False, id="no-row-split-program"
+            )
+        )
+    return cases
+
+
+@pytest.mark.parametrize(
+    "name,index,key,n,T,state_heads,rounds,snapshot,inside", _row_split_edge_cases()
+)
+def test_fp16_row_split_band_edges(
+    name: Optional[str],
+    index: int,
+    key: str,
+    n: int,
+    T: int,
+    state_heads: int,
+    rounds: int,
+    snapshot: bool,
+    inside: bool,
+    monkeypatch,
+) -> None:
+    """The half-wave edges of a row-split program's cells on this device's SM count (:func:`_row_split_edge_cases`):
+    the cell admits the count just inside a wave bound and not the count just outside it (the bound compares
+    exactly, 2 x B x HV against 2 k x SM), the call just inside launches the row-split program, the call just outside
+    launches the program ``selected_module`` names, and both calls are correct over a guarded FP16 pool
+    (:func:`_run_fp16`) in the cell's launch class, rounding to nearest even (0 rounds) and with 10 rounds (each call
+    launching the program ``selected_module`` names for its round count).  ``B x HV`` state heads run as ``B`` rows
+    of one head.  The placeholder case of an architecture without row-split programs checks that none of its routes
+    holds one."""
+    arch = _arch()
+    if name is None:
+        assert not any(
+            _is_row_split(loader.MODULES[other])
+            for names in loader.ROUTES[arch].values()
+            for other in names
+        )
+        return
+    record = loader.MODULES[name]
+    cell = _cells(_restricted(record["select_rule"], [arch]))[index]
+    sms = loader.sm_count(_device().index or 0)
+    l2 = record["build"].get("use_qk_l2norm", True)
+    where = (name, index, key, cell.get(key), sms, state_heads, rounds, snapshot)
+    assert (
+        loader._selects(
+            cell, state_heads, sms, arch, philox_rounds=rounds, snapshot=snapshot
+        )
+        == inside
+    ), where
+    side = "inside" if inside else "outside"
+    what = f"{name} cell {index} {key} {side}: B x HV={state_heads} T={T}"
+    launched = _record_fp16_launches(monkeypatch)
+    for call_rounds in dict.fromkeys((rounds, 0, SR_ROUNDS)):
+        picked = loader.selected_module(
+            arch,
+            n,
+            T,
+            state_heads,
+            sm_count=sms,
+            use_qk_l2norm=l2,
+            state_dtype=torch.float16,
+            philox_rounds=call_rounds,
+            use_ssm_state_indices=snapshot,
+        )
+        if inside and call_rounds == rounds:
+            assert picked == name, (where, picked)
+        c = _make(
+            state_heads,
+            T,
+            1,
+            n,
+            generator=_generator(50, n, T, state_heads, call_rounds),
+            use_qk_l2norm=l2,
+            scatter_tokens=snapshot,
+            guard_slots=True,
+        )
+        launched.clear()
+        _run_fp16(
+            c,
+            seed=SR_SEED if call_rounds else None,
+            rounds=call_rounds or SR_ROUNDS,
+            what=f"{what} rounds={call_rounds}",
+        )
+        assert launched == _fp16_launches(picked), (where, call_rounds, launched)
 
 
 def test_every_record_binds_the_logical_vocabulary() -> None:
@@ -2364,6 +3035,18 @@ _STATE_HEAD_PROBES = (
     26289,
     26784,
     26785,
+    # the half-wave edges k x sm / 2 and +1 (k = 1 to 10: up to 5 x sm; k = 12, 21, 24, 27 and 38: the 6, 10.5, 12,
+    # 13.5 and 19 x sm bounds of SM90's stochastic_forms cells) for every SM count of :data:`SM_COUNTS`: the wave
+    # bounds of SM90's row-split programs, of the FP16 cells they split and of SM90's stochastic_forms and
+    # scaled_rolled siblings are multiples of 1/2
+    *sorted(
+        {
+            k * sm // 2 + d
+            for sm in SM_COUNTS
+            for k in (*range(1, 11), 12, 21, 24, 27, 38)
+            for d in (0, 1)
+        }
+    ),
 )
 
 
@@ -2371,7 +3054,8 @@ def test_route_tables_are_consistent() -> None:
     """Every route name lists exported modules of its architecture; per pool dtype and launch class (an FP32 call
     with or without snapshots; an FP16 call rounding to nearest or with 5 to 16 rounds, with or without snapshots)
     exactly one program admits every probe (``selected_module`` raises on a tie and on no program), and the classes
-    of one call select one body and variant; ``ARCH_BY_CAPABILITY`` names the supported capabilities only."""
+    of one call select one body and variant, apart from a row-split program (:func:`_is_row_split`) that takes the
+    classes its cells admit; ``ARCH_BY_CAPABILITY`` names the supported capabilities only."""
 
     # The capability map names the decode capabilities and may name further ones of the prefill role
     # (tests/gdp/test_cake_gdp_prefill.py); exactly the decode capabilities carry a decode route.
@@ -2431,18 +3115,34 @@ def test_route_tables_are_consistent() -> None:
                                 for rounds, snapshot in classes
                             }
                             # one body and variant per call: the classes of a call differ in a
-                            # sibling flag only
-                            assert (
-                                len({_twin_key(loader.MODULES[name]) for name in picks})
-                                == 1
-                            ), (arch, key, T, state_heads, sms, sorted(picks))
+                            # sibling flag only, apart from a row-split program taking some of them
+                            plain = {
+                                _twin_key(loader.MODULES[name])
+                                for name in picks
+                                if not _is_row_split(loader.MODULES[name])
+                            }
+                            split = picks - {
+                                name
+                                for name in picks
+                                if not _is_row_split(loader.MODULES[name])
+                            }
+                            assert len(plain) <= 1 and len(split) <= 1, (
+                                arch,
+                                key,
+                                T,
+                                state_heads,
+                                sms,
+                                sorted(picks),
+                            )
 
 
 # The number of probes of :func:`_default_pick_table` and the SHA-256 of its lines before the launch classes existed
-# (the registry of FlashInfer #9720): a call of the default launch class (no seed, no snapshots) keeps its program.
+# (the registry of FlashInfer #9720: 58880 lines), with the lines of the sm_90a FP16 records added since (11776: each
+# picks the row-split program of the sm_90a FP32 line's token count where one of its cells admits the call, else the
+# FP16 twin of the FP32 line's program): a call of the default launch class (no seed, no snapshots) keeps its program.
 DEFAULT_PICKS_OF_RECORD = (
-    58880,
-    "230aba7391a6d99ab133305bf824fda5d9012556aecb713bc382b6ad13acc784",
+    70656,
+    "a69759bd3ae7473f4b474b18005828869796336cb3223e97c19c1b34db7dcccb",
 )
 # The domain of that table: the architectures and SM counts of #9720 and :data:`_RECORD_STATE_HEAD_PROBES`
 # (sm_107a: :func:`test_sm107a_selects_the_sm100a_programs`).
@@ -2598,6 +3298,7 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
     widths = {
         "uint16_t": 2,
         "unsigned": 4,
+        "uint32_t": 4,
         "__nv_bfloat162": 4,
         "int2": 8,
         "uint2": 8,
