@@ -24,7 +24,7 @@ def _patch_triton_ptxas_blackwell():
         from triton.backends.nvidia.compiler import get_ptxas
 
         bundled_ver = tuple(map(int, get_ptxas(100).version.split(".")[:2]))
-    except (ImportError, RuntimeError):
+    except (ImportError, RuntimeError, TypeError):
         bundled_ver = (0, 0)
     if (int(m.group(1)), int(m.group(2))) > bundled_ver:
         os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = ptxas
