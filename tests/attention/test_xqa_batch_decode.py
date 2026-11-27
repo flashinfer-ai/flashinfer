@@ -1330,6 +1330,133 @@ def test_xqa_batch_decode_mask_mode_deterministic(
     )
 
 
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("random_scores", [False, True])
+@pytest.mark.parametrize("q_len,window_left", [(1, -1), (1, 7), (3, -1), (3, 7)])
+def test_xqa_large_negative_scores(dtype, random_scores, q_len, window_left):
+    # The constant offset and half-integer perturbations are exactly representable
+    # in the FP32 QK accumulator, so the reference isolates softmax accuracy.
+    torch.manual_seed(42)
+    workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=GPU_DEVICE)
+    head_dim, num_heads = 128, 8
+    for seq_len, page_size in [
+        (17, 16),
+        (63, 32),
+        (64, 16),
+        (65, 32),
+        (255, 16),
+        (256, 32),
+        (257, 16),
+        (513, 32),
+    ]:
+        num_pages = (seq_len + page_size - 1) // page_size
+        query = torch.zeros(q_len, num_heads, head_dim, dtype=dtype, device=GPU_DEVICE)
+        query[..., 0] = 1024
+        query[..., 1] = 1
+        key = torch.zeros(
+            num_pages, page_size, 1, head_dim, dtype=dtype, device=GPU_DEVICE
+        )
+        key[..., 0] = -128
+        if random_scores:
+            key[..., 1] = torch.randint(-8, 9, key.shape[:-1], device=GPU_DEVICE) * 0.5
+            value = torch.randn_like(key)
+        else:
+            value = torch.zeros_like(key)
+            value.flatten(0, 1)[:seq_len] = (
+                torch.arange(seq_len, device=GPU_DEVICE) % 17
+            )[:, None, None]
+        # Poison unused slots with finite values to detect masked probability mass.
+        value.flatten(0, 1)[seq_len:] = 100
+        mask = (
+            generate_spec_dec_mask(1, q_len, torch.device(GPU_DEVICE))
+            if q_len > 1
+            else None
+        )
+        output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(key, value),
+            workspace_buffer=workspace,
+            block_tables=torch.arange(num_pages, dtype=torch.int32, device=GPU_DEVICE)[
+                None
+            ],
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=GPU_DEVICE),
+            max_seq_len=seq_len,
+            bmm1_scale=1.0,
+            bmm2_scale=1.0,
+            window_left=window_left,
+            q_len_per_req=q_len,
+            mask=mask,
+            enable_pdl=False,
+            kv_layout="NHD",
+        )
+        keys = key.flatten(0, 1)[:seq_len, 0].double()
+        values = value.flatten(0, 1)[:seq_len, 0].double()
+        scores = torch.einsum("qhd,kd->qhk", query.double(), keys)
+        positions = torch.arange(seq_len, device=GPU_DEVICE)
+        row_positions = seq_len - q_len + torch.arange(q_len, device=GPU_DEVICE)
+        valid = positions[None] <= row_positions[:, None]
+        if window_left >= 0:
+            valid &= positions[None] >= row_positions[:, None] - window_left
+        scores.masked_fill_(~valid[:, None], -torch.inf)
+        expected = torch.einsum("qhk,kd->qhd", scores.softmax(-1), values)
+        torch.testing.assert_close(
+            output.reshape_as(expected).double(), expected, rtol=1e-2, atol=1e-2
+        )
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("seq_len,q_len", [(0, 1), (1, 1), (3, 3), (257, 1)])
+@pytest.mark.parametrize("num_pages", [None, 64])
+def test_xqa_empty_softmax_tiles(dtype, seq_len, q_len, num_pages):
+    # The launch uses one split-KV block per 256 tokens of block-table capacity
+    # (bounded by the SM count), so a 64-page table gives four blocks and leaves
+    # the ones past seq_len empty. The exact-size table covers the short launch.
+    workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=GPU_DEVICE)
+    if num_pages is None:
+        num_pages = max(1, (seq_len + 15) // 16)
+    query = torch.zeros(q_len, 8, 128, dtype=dtype, device=GPU_DEVICE)
+    query[..., 0] = 1024
+    key = torch.zeros(num_pages, 16, 1, 128, dtype=dtype, device=GPU_DEVICE)
+    key[..., 0] = -128
+    value = torch.ones_like(key)
+    # A zero draft mask with no prefix makes every query row empty.
+    mask = (
+        torch.zeros(1, q_len, 2, dtype=torch.uint16, device=GPU_DEVICE)
+        if q_len > 1
+        else None
+    )
+    output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
+        query=query,
+        kv_cache=(key, value),
+        workspace_buffer=workspace,
+        block_tables=torch.arange(num_pages, dtype=torch.int32, device=GPU_DEVICE)[
+            None
+        ],
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=GPU_DEVICE),
+        max_seq_len=num_pages * 16,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+        q_len_per_req=q_len,
+        mask=mask,
+        enable_pdl=False,
+        kv_layout="NHD",
+    )
+    expected = (
+        torch.zeros_like(output)
+        if seq_len == 0 or q_len > 1
+        else torch.ones_like(output)
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     # Run a simple test case
     test_xqa_batch_decode(
