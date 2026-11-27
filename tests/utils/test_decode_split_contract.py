@@ -194,3 +194,28 @@ def test_rejected_replan_preserves_active_cudnn_route(
     kv = torch.zeros(4, 2, 16, 2, 128, dtype=torch.float16)
     wrapper.run(q, kv, enable_pdl=False)
     assert len(cudnn_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "backend,custom,expected",
+    [("fa2", False, []), ("fa2", True, [64]), ("fa3", False, [64])],
+)
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_fast_tensor_core_plan_host_lengths(
+    monkeypatch, backend, custom, expected, use_cuda_graph
+):
+    wrapper, calls = _wrapper(monkeypatch, True, use_cuda_graph, backend)
+    if not custom:
+        wrapper._jit_module = None
+    if not expected:
+
+        def unexpected_lengths(*args):
+            pytest.fail("native FA2 materialized unused host lengths")
+
+        monkeypatch.setattr(decode, "get_seq_lens", unexpected_lengths)
+    _call(wrapper, "fast_decode_plan", False)
+    assert len(calls) == 1
+    host_lengths = calls[0][1][5]
+    assert host_lengths.device.type == "cpu"
+    assert host_lengths.dtype == torch.int32
+    assert host_lengths.tolist() == expected
