@@ -96,7 +96,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_mega_moe_nvfp4_f42279d5d669cde6de3d(int* __restrict__ topk_indices, float* __restrict__ topk_scores, long long* sorted_metadata, float* sorted_scores, int* pool_expert_base, int* expert_counts, int* source_expert_base, int* push_destination_base, int* sorted_metadata_ready, int* push_table_ready, int pool_capacity, int mega_pg_world, int mega_pg_rank, const __grid_constant__ CakePeerPointerTable<unsigned int> mega_pg_flags, int* sizes_by_rank, const __grid_constant__ CakePeerPointerTable<int> sizes_by_rank_peers, int* x_ready, const __grid_constant__ CakePeerPointerTable<int> x_ready_peers, int* sizes, const __grid_constant__ CakePeerPointerTable<int> sizes_peers, int* sizes_ready, const __grid_constant__ CakePeerPointerTable<int> sizes_ready_peers, int* metadata_ready, const __grid_constant__ CakePeerPointerTable<int> metadata_ready_peers, long long* token_src_metadata, const __grid_constant__ CakePeerPointerTable<long long> token_src_metadata_peers, float* fc1_topk_scores, const __grid_constant__ CakePeerPointerTable<float> fc1_topk_scores_peers)
+kernel_cake_mega_moe_nvfp4_d3df11a30bbbc1fbe12d(int* __restrict__ topk_indices, float* __restrict__ topk_scores, long long* sorted_metadata, float* sorted_scores, int* pool_expert_base, int* expert_counts, int* source_expert_base, int* push_destination_base, int* sorted_metadata_ready, int* push_table_ready, int pool_capacity, int mega_pg_world, int mega_pg_rank, const __grid_constant__ CakePeerPointerTable<unsigned int> mega_pg_flags, int* sizes_by_rank, const __grid_constant__ CakePeerPointerTable<int> sizes_by_rank_peers, int* x_ready, const __grid_constant__ CakePeerPointerTable<int> x_ready_peers, int* sizes, const __grid_constant__ CakePeerPointerTable<int> sizes_peers, int* sizes_ready, const __grid_constant__ CakePeerPointerTable<int> sizes_ready_peers, int* metadata_ready, const __grid_constant__ CakePeerPointerTable<int> metadata_ready_peers, long long* token_src_metadata, const __grid_constant__ CakePeerPointerTable<long long> token_src_metadata_peers, float* fc1_topk_scores, const __grid_constant__ CakePeerPointerTable<float> fc1_topk_scores_peers)
 {
     // Grid-dependency payloads: written while the kernel runs, read with coherent loads only.
     asm volatile("" : "+l"(sorted_metadata));
@@ -174,7 +174,7 @@ kernel_cake_mega_moe_nvfp4_f42279d5d669cde6de3d(int* __restrict__ topk_indices, 
     int route_experts[12];
     float route_scores[12];
     int route_ranks[12];
-    if (bid == 2) {
+    if (bid == 11) {
         if (tid == 0) {
             asm volatile("fence.acq_rel.sys;" ::: "memory");
             int x_epoch = metadata_ready[0] + 1;
@@ -617,7 +617,7 @@ kernel_cake_mega_moe_nvfp4_f42279d5d669cde6de3d(int* __restrict__ topk_indices, 
     }
     __syncthreads();
     int routes_total = source_bases[47] + sizes_by_rank[((metadata_ready[0] & 1) * 8 + rank) * 48 + 47];
-    int slice_routes = ((routes_total + 47) / 48 + 31) / 32 * 32;
+    int slice_routes = ((routes_total + 191) / 192 + 31) / 32 * 32;
     int slice_begin = (bid * 16 + warp) * slice_routes;
     int slice_end = ((slice_begin + slice_routes < routes_total) ? slice_begin + slice_routes : routes_total);
     int meta_copy = metadata_ready[0] & 1;
