@@ -283,7 +283,11 @@ def test_grouped_gemm_nt_masked_scheduler_empty_experts():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     dev = torch.device("cuda:0")
-    if not (is_sm100a_supported(dev) or is_sm100f_supported(dev)):
+    if not (
+        is_sm100a_supported(dev)
+        or is_sm100f_supported(dev)
+        or torch.cuda.get_device_capability(dev) in ((8, 0), (8, 6), (8, 7), (8, 9))
+    ):
         pytest.skip("NVFP4 grouped GEMM requires SM100")
 
     sf_vec = 16
@@ -350,7 +354,11 @@ def test_grouped_gemm_nt_masked_output_layout_contract():
         pytest.skip("CUDA required")
     dev = torch.device("cuda:0")
     # cute-dsl grouped GEMM is SM100-only (SM110 is explicitly unsupported).
-    if not (is_sm100a_supported(dev) or is_sm100f_supported(dev)):
+    if not (
+        is_sm100a_supported(dev)
+        or is_sm100f_supported(dev)
+        or torch.cuda.get_device_capability(dev) in ((8, 0), (8, 6), (8, 7), (8, 9))
+    ):
         pytest.skip("NVFP4 grouped GEMM requires SM100")
 
     sf_vec = 16

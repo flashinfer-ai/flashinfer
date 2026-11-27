@@ -19,7 +19,14 @@ def _skip_unless_sm100():
         pytest.skip("Please `pip install nvidia-cutlass-dsl`")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+    if get_compute_capability(torch.device("cuda")) not in (
+        (10, 0),
+        (10, 3),
+        (8, 0),
+        (8, 6),
+        (8, 7),
+        (8, 9),
+    ):
         pytest.skip("Fused masked GEMM epilogues require SM100/SM103")
 
 

@@ -87,7 +87,8 @@ def grouped_gemm_nt_masked(
     r"""Masked, batched, block-scaled GEMM on Blackwell (SM100/SM103) and Rubin (SM107).
 
     Routes to the architecture-specific kernel for the device's compute
-    capability: SM100/SM103 use the Blackwell kernel, SM107 the Rubin one.
+    capability: SM100/SM103 use the Blackwell kernel, SM107 the Rubin one;
+    SM8x runs the Blackwell kernel's checks, then its own GEMMs.
 
     Executes a masked, batched matrix multiplication with scale factors and
     optional per-batch alpha scaling on the output.  ``alpha`` is currently
@@ -356,9 +357,9 @@ def grouped_gemm_nt_masked(
             alpha_dtype=alpha_dtype,
         )
 
-    elif (major, minor) in ((10, 0), (10, 3)):
+    elif (major, minor) in ((10, 0), (10, 3), (8, 0), (8, 6), (8, 7), (8, 9)):
         # ----------------------------------------------------------------
-        # SM100/SM103 (Blackwell)
+        # SM100/SM103 (Blackwell); SM8x past the same checks
         # ----------------------------------------------------------------
         from .grouped_gemm_masked_blackwell import _grouped_gemm_nt_masked_sm100
 
