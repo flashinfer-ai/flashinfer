@@ -186,8 +186,6 @@ class BatchInvariantFp4Runner(MoERunner):
         self.device = torch.device(device)
         if self.device.index is None and self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
-        # an unserved pair is refused by check_support (the layer's filter never constructs this case)
-        self._pair: Optional[Fp4Pair] = PAIRS.get(config.quant.pair)
         # exact shapes: the dispatcher's pick is a function of the token count (every tactic computes the same bits)
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
@@ -204,9 +202,10 @@ class BatchInvariantFp4Runner(MoERunner):
     @property
     def pair(self) -> Fp4Pair:
         """The configured quantization pair."""
-        if self._pair is None:
+        pair = PAIRS.get(self.config.quant.pair)
+        if pair is None:
             raise unsupported_pair(self.config.quant)
-        return self._pair
+        return pair
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
@@ -229,7 +228,7 @@ class BatchInvariantFp4Runner(MoERunner):
             )
 
     def _check_support(self) -> None:
-        if self._pair is None:
+        if self.config.quant.pair not in PAIRS:
             raise unsupported_pair(self.config.quant)
         # the class's shard refusal first, then the layer's generic rules, then the pair's
         self._check_experts()
