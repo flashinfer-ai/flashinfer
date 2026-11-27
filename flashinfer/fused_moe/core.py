@@ -2063,6 +2063,11 @@ def cutlass_fused_moe_workspace_size(
     """
     if use_fused_finalize is None:
         use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
+    if output_dtype is None:
+        # Before the Cake branch, whose helpers check output_dtype (BF16) from these locals.
+        output_dtype = (
+            x_dtype if x_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        )
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_workspace_size
 
@@ -2101,11 +2106,6 @@ def cutlass_fused_moe_workspace_size(
             raise ValueError(f"device must be a CUDA device, got {device}")
         if device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
-
-    if output_dtype is None:
-        output_dtype = (
-            x_dtype if x_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        )
 
     with torch.cuda.device(device):
         major, minor = get_compute_capability(device)
