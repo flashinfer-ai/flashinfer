@@ -2965,6 +2965,13 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 512, 1, 15),
         ("mla_bf16_vquarter", 1024, 8, 15),
     ),
+    ("sm_103a", 152, "bfloat16", 32, 1, True): (
+        ("mla_bf16_splitkv", 4096, 1, 1),
+        ("mla_bf16_splitkv", 8192, 2, 7),
+        ("mla_bf16_splitkv", 16384, 1, 1),
+        ("mla_bf16_splitkv", 32768, 1, 1),
+        ("mla_bf16_vquarter", 1024, 8, 15),
+    ),
     ("sm_103a", 152, "bfloat16", 32, 2, False): (
         ("mla_bf16_clc", 1024, 64, 127),
         ("mla_bf16_clc", 2048, 64, 255),
@@ -2978,6 +2985,10 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 256, 1, 7),
         ("mla_bf16_vquarter", 512, 1, 7),
     ),
+    ("sm_103a", 152, "bfloat16", 32, 2, True): (
+        ("mla_bf16_splitkv", 4096, 2, 3),
+        ("mla_bf16_splitkv", 8192, 2, 3),
+    ),
     ("sm_103a", 152, "bfloat16", 64, 1, False): (
         ("mla_bf16_splitkv", 4096, 1, 1),
         ("mla_bf16_splitkv", 8192, 1, 1),
@@ -2987,6 +2998,13 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 128, 1, 15),
         ("mla_bf16_vquarter", 256, 1, 15),
         ("mla_bf16_vquarter", 512, 1, 15),
+        ("mla_bf16_vquarter", 1024, 8, 15),
+    ),
+    ("sm_103a", 152, "bfloat16", 64, 1, True): (
+        ("mla_bf16_splitkv", 4096, 1, 1),
+        ("mla_bf16_splitkv", 8192, 1, 1),
+        ("mla_bf16_splitkv", 16384, 1, 1),
+        ("mla_bf16_splitkv", 32768, 1, 1),
         ("mla_bf16_vquarter", 1024, 8, 15),
     ),
     ("sm_103a", 152, "bfloat16", 64, 2, False): (
@@ -3000,6 +3018,10 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 256, 1, 7),
         ("mla_bf16_vquarter", 512, 1, 7),
         ("mla_bf16_vquarter", 1024, 4, 7),
+    ),
+    ("sm_103a", 152, "bfloat16", 64, 2, True): (
+        ("mla_bf16_splitkv", 8192, 2, 3),
+        ("mla_bf16_splitkv", 16384, 1, 1),
     ),
     ("sm_103a", 152, "float8_e4m3fn", 64, 1, False): (
         ("mla_fp8_page64_pdl", 128, 16, 63),

@@ -3403,7 +3403,7 @@
 #define MOE_X_17536cae9b ((int)(MOE_RANKS_LL * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))))
 #define MOE_X_1925e14f40 ((int)((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL) + (MOE_RANKS_LL * 8)))
 #define MOE_X_1b3b5beb4f ((int)(((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) % 4))
-#define MOE_X_1b61f2e4e4 ((int)((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + 8))
+#define MOE_X_1b61f2e4e4 ((int)((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + 8))
 #if (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 0))) // moe-select
 #define MOE_X_1d92be5ff8 ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 128) - 1) / 128) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0))
 #define MOE_X_1e6fc64f5a ((int)(MOE_LSA_COPIERS_LL + 2))
@@ -3562,7 +3562,7 @@
 #else // moe-select
 #define MOE_X_8a0532c8c4 ((int)(((8192) < ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024)) ? (8192) : ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024))) - 1))
 #endif // moe-select
-#define MOE_X_8cf8c45164 ((int)(MOE_RANKS_LL * ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1)))
+#define MOE_X_8cf8c45164 ((int)(MOE_RANKS_LL * ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1)))
 #if ((MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 0)))) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 0))))) // moe-select
 #define MOE_X_8eafd1c305 ((int)(((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL))))
 #define MOE_X_91f1f0773e ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + 0))
@@ -3581,9 +3581,9 @@
 #define MOE_X_9dd478aaa1 ((int)((1 * ((16) > ((MOE_RANKS_LL + 3)) ? (16) : ((MOE_RANKS_LL + 3)))) * 4))
 #if ((MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 1 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SHARED_EXPERT == 1)))) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TB_SCR_GLOBAL == 1 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SHARED_EXPERT == 1)))))) // moe-select
 #define MOE_X_9e76039edb ((int)(((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) + (9 * MOE_RANKS_LL)) + ((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL))))
-#define MOE_X_9fc62c3487 ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1))
+#define MOE_X_9fc62c3487 ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1))
 #elif ((MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1))) // moe-select
-#define MOE_X_9fc62c3487 ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1))
+#define MOE_X_9fc62c3487 ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1))
 #elif (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 1 && MOE_SHARED_EXPERT == 1)) // moe-select
 #define MOE_X_9e76039edb ((int)(((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) + (9 * MOE_RANKS_LL)) + ((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL))))
 #else // moe-select
