@@ -862,7 +862,11 @@ __launch_bounds__(WN * 32 + PRODUCER_THREADS, 1) void fused_moe_w8a8_wgmma_up_do
             }
           }
           if constexpr (STAGGER) {
-            arrive(epilogue_bar);
+              // The last store neither waits for its turn nor passes it on: an arrive
+              // without a wait lets this warpgroup complete two phases before the other
+              // one checks its parity, and that one then waits forever.
+              if (compute_stage != n_stages_down - 1)
+                  arrive(epilogue_bar);
           }
         }
       }
