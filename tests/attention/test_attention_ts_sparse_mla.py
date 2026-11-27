@@ -1310,6 +1310,16 @@ def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
     wrapper.run(q, replacement_kv, **metadata, out=result, validate=False)
     assert slots["lse"].views is None and slots["extra_kv_cache"].views is None
 
+    # A hit through a detached alias transfers the cached views' lifetime to it.
+    pool = slots["kv_cache"]
+    cached_rows = weakref.ref(pool.views[0])
+    kv_alias = replacement_kv.detach()
+    replacement_kv.set_(kv)
+    wrapper.run(q, kv_alias, **metadata, out=result, validate=False)
+    assert pool.views[0] is cached_rows()
+    del kv_alias
+    assert cached_rows() is None
+
 
 def test_valid_prefix_eager_contract():
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)

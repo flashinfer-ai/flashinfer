@@ -257,6 +257,8 @@ class _TensorViewCache:
             and key == self.key
             and self.views[0].data_ptr() == pointer
         ):
+            if previous is not tensor:
+                self.source = weakref.ref(tensor, self.source.__callback__)
             return self.views
         self.views = None
         self.key = (
