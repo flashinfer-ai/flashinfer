@@ -616,12 +616,11 @@ __launch_bounds__(WN * 32 + PRODUCER_THREADS, 1) void fused_moe_bf16_wgmma_up_do
             }
             cuda::ptx::cp_async_bulk_commit_group();
           }
-          
+
           // The last store neither waits for its turn nor passes it on: an arrive
           // without a wait lets this warpgroup complete two phases before the other
           // one checks its parity, and that one then waits forever.
-          if (compute_stage != n_stages_down - 1)
-              arrive(epilogue_bar);
+          if (compute_stage != n_stages_down - 1) arrive(epilogue_bar);
         }
       }
       if constexpr (sizeof(s_d.x) < sizeof(s.x)) {
@@ -659,6 +658,8 @@ bool launch_fused_moe_kernel_up_down_acc(
   constexpr int BK = 64;
   constexpr int PRODUCER_THREADS = 128;
   if (K <= 0 || K % (2 * BK) || N <= 0 || N % 256 || N % (BN * WN)) return false;
+  // Persistent iterations prefetch a full stage ring before the consumer releases it.
+  if (STAGES > K / BK) return false;
   int device, num_sms;
   gpuErrchk(cudaGetDevice(&device));
   gpuErrchk(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
