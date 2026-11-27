@@ -1330,8 +1330,10 @@ def nvfp4_quantize_smooth(
         # The SM100 launcher's checks, ahead of its empty-batch return.
         if global_scale.dtype != torch.float32 or not global_scale.is_contiguous():
             raise ValueError("global_scale must be a contiguous float32 tensor")
-        if global_scale.device != x.device:
-            raise ValueError("global_scale must be on the device of x")
+        if pre_quant_scale.device != x.device or global_scale.device != x.device:
+            raise ValueError(
+                "pre_quant_scale and global_scale must be on the device of x"
+            )
         if global_scale.numel() < 1:
             raise ValueError("global_scale must contain at least one element")
         if x.shape[0] == 0:
