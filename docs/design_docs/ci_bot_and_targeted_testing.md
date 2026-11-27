@@ -308,10 +308,14 @@ collection skips this directory.
 
 The optional GPU-impact analysis extends `ai_test_scope.py` with the same
 inspected source/test/CI evidence and an independent impact assessment. File
-extensions and `tests/cpu/` alone cannot establish CPU-only behavior. Kernels,
-launchers, bindings, dispatch, shapes/dtypes/layouts, workspace, JIT/AOT, CUDA
-graphs, synchronization and communication generally need GPU validation. New
-PR tests are included even if they are not among the recommended targets.
+extensions and `tests/cpu/` alone cannot establish CPU-only behavior. CUDA
+compilation can run on the host. CI scheduling, cache population, lint and
+other host-only build checks can qualify as CPU-only if GPU-free validation
+covers the change and runtime behavior stays unchanged. Changes affecting
+device execution, such as emitted device code, runtime dispatch, layouts,
+workspace, CUDA graphs, synchronization and communication, can require GPU
+validation even when a build runs on a CPU runner. New PR tests are included
+even if they are not among the recommended targets.
 Stable GPU changes still require a bot response when no test case was selected.
 The gate skips missing or invalid supplemental file requests and drops invalid
 test suggestions. Check Details lists warnings alongside the impact result.

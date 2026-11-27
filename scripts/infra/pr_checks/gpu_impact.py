@@ -42,10 +42,19 @@ and changes outside the selected target list. Documentation, comments,
 standalone tools and pure Python helpers are exempt only if their changed
 effects are limited to CPU behavior and GPU-free validation is sufficient.
 Extensions (.py/.cu) and directory names alone are not a classification rule.
-Kernels, launchers, bindings, backend selection, tensor shapes/dtypes/layouts,
-workspace allocation, JIT/AOT, CUDA graphs, synchronization and communication
-generally require GPU validation. A numerical/kernel/graph test added by the
-PR is itself GPU-related even if no previous corresponding case exists.
+CUDA compilation can run entirely on the host. If a PR only changes host-only
+CI orchestration such as scheduling, cache population, build-time lint,
+header prefetch or build/import checks, use cpu_only when those changes can
+be validated without a device and leave GPU behavior unchanged. Inspect what
+the diff changes, including which steps actually execute GPU code. CUDA
+sources, toolchains or GPU-targeted artifacts mentioned by a workflow are
+insufficient on their own to require GPU execution.
+For changes that affect device behavior, a CPU runner does not justify an
+exemption. Kernel or launcher behavior, device-code generation or build flags
+that affect runtime behavior, artifact selection, backend dispatch, layouts,
+workspace allocation, CUDA graphs, synchronization and communication can
+require real GPU validation. A numerical/kernel/graph test added by the PR is
+itself GPU-related even if no previous corresponding case exists.
 Use experimental_only when functional effects are confined to experimental APIs,
 backends or tests and stable GPU behavior stays unchanged. Experimental changes
 can require GPU testing while qualifying for this separate bot-request exemption.

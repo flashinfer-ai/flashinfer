@@ -189,6 +189,13 @@ class ImpactTests(unittest.TestCase):
         self.assertEqual([], result.paths)
         self.assertEqual("gpu_required", result.gpu_impact["classification"])
 
+    def test_impact_prompt_distinguishes_host_build_from_device_behavior(self):
+        self.select(analysis("cpu_only"))
+        prompt = " ".join(self.fixture.inference.calls[1][1].split())
+        self.assertIn("CUDA compilation can run entirely on the host", prompt)
+        self.assertIn("host-only CI orchestration", prompt)
+        self.assertIn("a CPU runner does not justify an exemption", prompt)
+
     def test_cpu_and_docs_impacts_allow_missing_patch_with_note(self):
         for kind in ["cpu_only", "docs_only"]:
             self.setUp()
