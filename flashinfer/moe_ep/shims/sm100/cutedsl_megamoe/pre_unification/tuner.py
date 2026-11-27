@@ -455,7 +455,7 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
     # Session configs carry the shape; bare knob dicts check the tiles only.
     dispatch_bytes = 0
     if knobs.get("hidden") is not None and knobs.get("num_total_experts") is not None:
-        from ..src.moe_mxfp8_bf16_glu.megamoe_kernel_mxfp8_bf16 import (
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_mxfp8_bf16_glu.megamoe_kernel_mxfp8_bf16 import (
             Sm100MegaMoEMxfp8Bf16Kernel,
         )
 
