@@ -79,6 +79,7 @@ from .utils import (
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
+    _get_trtllm_gen_workspace_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
     _get_range_buf,
@@ -4661,8 +4662,17 @@ def trtllm_batch_decode_with_kv_cache(
 
     multi_ctas_kv_counter_buffer : Optional[torch.Tensor] = None
         Optional separate counter buffer for ``trtllm-gen`` multi-CTA KV mode.
-        When omitted, FlashInfer creates a fresh zeroed internal buffer. When
-        provided, it must be zero-initialized at allocation (e.g. via
+        For non-DCP calls routed to ``trtllm-gen``, omitting the counter
+        caches a zero-initialized buffer on the supplied ``workspace_buffer``
+        tensor. Reuse the same workspace object and warm up before CUDA graph
+        capture with a call that needs at least as much counter capacity as
+        the captured call. This avoids a counter fill on each replay. A cache
+        miss during capture uses a graph-local buffer. Serialize GPU work that
+        shares a workspace, including graph replays. Use an event or stream
+        wait when switching streams. Keep the workspace tensor alive until
+        the last replay of every graph that uses it has completed.
+        DCP Split-KV requires a caller-provided counter buffer.
+        When provided, it must be zero-initialized at allocation (e.g. via
         ``torch.zeros``); the kernel self-resets the counters at the end of each
         launch, so it does not need to be re-zeroed between calls.
 
@@ -5262,7 +5272,17 @@ def trtllm_batch_decode_with_kv_cache(
             )
             return (out, lse) if return_lse else out
 
-        if backend != "cake" or multi_ctas_kv_counter_buffer is not None:
+        if multi_ctas_kv_counter_buffer is None:
+            if backend == "trtllm-gen":
+                multi_ctas_kv_counter_buffer = _get_trtllm_gen_workspace_counter_buffer(
+                    workspace_buffer,
+                    batch_size,
+                    num_qo_heads,
+                    sm_count,
+                    query.device,
+                )
+            # Cake handles omitted counters after selecting its decode route below.
+        else:
             multi_ctas_kv_counter_buffer = (
                 _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
                     multi_ctas_kv_counter_buffer,
@@ -5449,9 +5469,8 @@ def trtllm_batch_decode_with_kv_cache(
                 if isinstance(bmm2_scale, torch.Tensor):
                     bmm2_scale = float(bmm2_scale.item())
             if multi_ctas_kv_counter_buffer is None:
-                # Same per-call contract as backend="trtllm-gen": a fresh
-                # zero-initialized buffer when the caller passes none. The
-                # Cake on-device load-balanced route keeps its self-resetting
+                # Allocate a fresh zero-initialized buffer when the caller passes
+                # none. Cake's on-device load-balanced route keeps its self-resetting
                 # split-KV counters here too, so size it for the larger of the
                 # two contracts, and allocate it last: the zero-fill is the
                 # first GPU activity of the call, and every host step between
