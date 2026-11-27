@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cuh"

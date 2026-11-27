@@ -17,7 +17,11 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace tensorrt_llm::common {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 std::uintptr_t constexpr kCudaMemAlign = 128;
 
@@ -73,4 +77,6 @@ inline size_t calculateTotalWorkspaceSize(size_t const* workspaces, int count,
   return total;
 }
 
-};  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

@@ -20,9 +20,12 @@
 #include "cutlass/cutlass.h"
 // Order matters here, packed_stride.hpp is missing cute and convolution includes
 #include "cutlass/util/packed_stride.hpp"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type) {
   size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
@@ -179,4 +182,6 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const {
 
   return ss.str();
 }
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

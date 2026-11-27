@@ -17,10 +17,11 @@
 #pragma once
 
 #include "flashInferMetaInfo.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -31,4 +32,4 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

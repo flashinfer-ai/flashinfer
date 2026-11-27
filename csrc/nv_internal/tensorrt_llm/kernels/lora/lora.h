@@ -20,10 +20,13 @@
 #include <cassert>
 #include <vector>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/NvInferRuntime.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 
 using CublasGemmWrapper = tensorrt_llm::common::CublasMMWrapper;
 using CublasGemmWrapperPtr = std::shared_ptr<CublasGemmWrapper>;
@@ -69,4 +72,6 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
              int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
              void* const* outputs, void* workspace, cudaStream_t stream);
 
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END

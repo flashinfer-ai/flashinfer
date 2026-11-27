@@ -18,17 +18,22 @@
 
 #include <string>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 [[noreturn]] inline void throwRuntimeError(char const* const file, int const line,
                                            std::string const& info = "") {
   throw TllmException(file, line,
                       fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
 }
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END
 
 class DebugConfig {
  public:

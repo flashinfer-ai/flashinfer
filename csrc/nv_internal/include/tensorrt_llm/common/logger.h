@@ -21,10 +21,13 @@
 #include <stdexcept>
 #include <string>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 class Logger {
 // On Windows, the file wingdi.h is included which has
@@ -161,4 +164,6 @@ void Logger::log(Logger::Level const level, int const rank, char const* format,
 #define TLLM_LOG_ERROR(...) TLLM_LOG(tensorrt_llm::common::Logger::ERROR, __VA_ARGS__)
 #define TLLM_LOG_EXCEPTION(ex, ...) \
   tensorrt_llm::common::Logger::getLogger()->log(ex, ##__VA_ARGS__)
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

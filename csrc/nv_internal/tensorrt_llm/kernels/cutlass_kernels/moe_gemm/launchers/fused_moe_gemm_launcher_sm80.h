@@ -14,7 +14,11 @@
  * limitations under the License.
  */
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss {
 template <typename ElementType_, typename CutlassWeightType_, int MaxTileM_, int TileN_, int TileK_,
           int Stages_, typename EpilogueTag>
 void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWeightType_ const* B,
@@ -24,4 +28,6 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
                                                 int64_t num_rows, int64_t gemm_n, int64_t gemm_k,
                                                 int num_experts, int multi_processor_count,
                                                 cudaStream_t stream, int* kernel_occupancy);
-}
+}  // namespace kernels::cutlass_kernels_oss
+
+TRTLLM_NAMESPACE_END

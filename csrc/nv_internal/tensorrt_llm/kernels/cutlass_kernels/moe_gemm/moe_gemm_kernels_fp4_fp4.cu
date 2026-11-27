@@ -14,13 +14,18 @@
  * limitations under the License.
  */
 
+#include "flashinfer/trtllm/common/config.h"
 #include "moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 #ifdef ENABLE_FP4
 template class MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half>;
 #ifdef ENABLE_BF16
 template class MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16>;
 #endif
 #endif
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

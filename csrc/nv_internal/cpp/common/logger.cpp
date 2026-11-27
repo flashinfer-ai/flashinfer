@@ -18,11 +18,14 @@
 
 #include <cuda_runtime.h>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 Logger::Logger() {
   char* isFirstRankOnlyChar = std::getenv("TLLM_LOG_FIRST_RANK_ONLY");
@@ -60,4 +63,6 @@ Logger* Logger::getLogger() {
   thread_local Logger instance;
   return &instance;
 }
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

@@ -24,8 +24,9 @@
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "flashinfer/trtllm/common/config.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 // Keep this in sync with the ActType in
@@ -157,4 +158,4 @@ class TrtllmGenBatchedGemmRunner {
   std::vector<int64_t> mPassingConfigIndices;
 };
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

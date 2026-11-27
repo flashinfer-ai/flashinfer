@@ -20,7 +20,11 @@
 #include <algorithm>
 #include <utility>
 
-namespace tensorrt_llm::kernels {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 
 int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input,
              int32_t const* loraRanks, void const* const* loraWeightsPtr, int weightIndex,
@@ -28,4 +32,6 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
   return -1;
 }
 
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END

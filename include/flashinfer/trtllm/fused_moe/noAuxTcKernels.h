@@ -20,9 +20,12 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT>
 void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk_indices,
@@ -31,4 +34,6 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                    bool const launch_with_pdl, cudaStream_t const stream,
                    int16_t* routing_replay_out = nullptr);
 
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END

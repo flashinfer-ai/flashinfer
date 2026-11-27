@@ -28,9 +28,10 @@
 #include "cutlass/float8.h"
 #include "cutlass/float_subbyte.h"
 #include "cutlass/half.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/NvInferRuntime.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -147,4 +148,4 @@ struct CutlassToTllmTypeAdapter<cutlass::float_e2m1_t> {
 
 }  // namespace cutlass_kernels
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

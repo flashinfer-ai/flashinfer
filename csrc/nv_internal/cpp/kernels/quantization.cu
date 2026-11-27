@@ -21,6 +21,7 @@
 #include <cub/cub.cuh>
 #include <type_traits>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -32,7 +33,7 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 template <typename T>
@@ -827,4 +828,4 @@ template void invokeFP4Quantization<__nv_fp8_e4m3, 32>(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

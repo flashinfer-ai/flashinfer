@@ -16,7 +16,11 @@
 
 #pragma once
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 
 // Note update flashinfer/fused_moe/core.py to match
 enum class ActivationType {
@@ -33,4 +37,6 @@ enum class ActivationType {
   InvalidType
 };
 
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

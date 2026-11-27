@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+#include "flashinfer/trtllm/common/config.h"
 #include "moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 #ifdef ENABLE_FP8
 template class MoeGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half>;
 template class MoeGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half, half, true>;
@@ -26,4 +29,6 @@ template class MoeGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16, __nv_b
 #endif
 // template class MoeGemmRunner<__nv_fp8_e5m2, __nv_fp8_e5m2>;
 #endif
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

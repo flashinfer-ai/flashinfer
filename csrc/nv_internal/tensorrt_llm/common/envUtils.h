@@ -20,9 +20,12 @@
 #include <optional>
 #include <string>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 // Useful when you want to inject some debug code controllable with env var.
 std::optional<int32_t> getIntEnv(char const* name);
 
@@ -115,4 +118,6 @@ bool getEnvNVFP44Over6ErrUseFastMath();
 // Use 256 instead of 448 for the NVFP4 4over6 E4M3 scaling convention.
 bool getEnvNVFP44Over6E4M3Use256();
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

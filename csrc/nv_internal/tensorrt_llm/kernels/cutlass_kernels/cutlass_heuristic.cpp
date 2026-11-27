@@ -36,9 +36,11 @@
 #include <set>
 #include <vector>
 
+#include "flashinfer/trtllm/common/config.h"
+
 using namespace tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels {
 
@@ -771,4 +773,4 @@ CutlassGemmConfig estimate_best_config_from_occupancies(
 
 }  // namespace cutlass_kernels
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

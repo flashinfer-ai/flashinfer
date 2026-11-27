@@ -329,8 +329,9 @@ def get_file_content(launcher_inl_files, operations):
     instantiations = "\n".join(insts_list)
 
     file_content = f"""{includes}
-namespace tensorrt_llm
-{{
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {{
 namespace cutlass_kernels_oss
@@ -340,7 +341,7 @@ namespace cutlass_kernels_oss
 
 }} // namespace cutlass_kernels_oss
 }} // namespace kernels
-}} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
 """
     return file_content
 

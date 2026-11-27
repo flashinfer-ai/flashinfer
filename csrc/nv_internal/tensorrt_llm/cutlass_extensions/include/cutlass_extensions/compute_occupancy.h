@@ -18,9 +18,10 @@
 #include <cuda_runtime_api.h>
 
 #include "cutlass/device_kernel.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace cutlass_extensions {
 
 template <typename GemmKernel, bool enable_cutlass_3x = false>
@@ -73,4 +74,4 @@ inline int compute_occupancy_for_kernel() {
 }
 
 }  // namespace cutlass_extensions
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

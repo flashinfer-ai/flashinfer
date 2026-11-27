@@ -32,6 +32,7 @@
 #pragma GCC diagnostic pop
 #endif  // __GNUC__
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -43,7 +44,7 @@
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels {
 using namespace cute;
@@ -590,4 +591,4 @@ size_t CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroTy
 
 }  // namespace cutlass_kernels
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

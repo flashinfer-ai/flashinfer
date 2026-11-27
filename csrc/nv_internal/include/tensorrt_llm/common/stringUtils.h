@@ -28,7 +28,11 @@
 #include <unordered_set>
 #include <vector>
 
-namespace tensorrt_llm::common {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 #if ENABLE_BF16
 static inline std::basic_ostream<char>& operator<<(std::basic_ostream<char>& stream,
                                                    __nv_bfloat16 const& val) {
@@ -165,7 +169,9 @@ inline bool strStartsWith(std::string const& str, std::string const& prefix) {
 /// @brief Split a string into a set of strings using a delimiter
 std::unordered_set<std::string> str2set(std::string const& input, char delimiter);
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END
 
 inline void toLower(std::string& s) {
   for (char& c : s) {

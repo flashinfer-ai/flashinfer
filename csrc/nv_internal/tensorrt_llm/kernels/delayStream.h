@@ -16,8 +16,13 @@
 
 #pragma once
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 void invokeDelayStreamKernel(long long delay_micro_secs, cudaStream_t stream);
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END

@@ -15,9 +15,12 @@
  */
 
 #include "cutlass_fused_moe_kernels.cuh"
+#include "flashinfer/trtllm/common/config.h"
 #include "moe_kernels.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 template class CutlassMoeFCRunner<float, float>;
 
 #ifdef ENABLE_BF16
@@ -65,4 +68,6 @@ INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
 #ifdef ENABLE_BF16
 INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
 #endif
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

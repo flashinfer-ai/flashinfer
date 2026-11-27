@@ -41,13 +41,17 @@
 #include <sys/sysinfo.h>
 #endif  // not WIN32
 #include <vector>
+
+#include "flashinfer/trtllm/common/config.h"
 #ifdef _WIN32  // Windows
 #include <windows.h>
 #undef ERROR  // A Windows header file defines ERROR as 0, but it's used in our logger.h enum.
               // Logging breaks without this undef.
 #endif        // WIN32
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 // workspace for cublas gemm : 32MB
 #define CUBLAS_WORKSPACE_SIZE 33554432
@@ -1214,7 +1218,9 @@ DEFINE_MEMBER_CHECKER(deq)
 DEFINE_MEMBER_CHECKER(qua)
 DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END
 
 /*
  * Macros compliant with TensorRT coding conventions

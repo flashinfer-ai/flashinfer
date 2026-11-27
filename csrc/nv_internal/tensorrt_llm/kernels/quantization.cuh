@@ -20,6 +20,7 @@
 #include <cub/cub.cuh>
 #include <cute/arch/copy_sm90_tma.hpp>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -31,7 +32,7 @@
 using namespace tensorrt_llm::common;
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 // Leverage 256 bit vectorized load
@@ -965,4 +966,4 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
 }
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

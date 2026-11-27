@@ -22,10 +22,13 @@
 #include <cstdio>
 #include <memory>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 class CUDADriverWrapper {
  public:
@@ -149,7 +152,9 @@ void checkDriver(T result, CUDADriverWrapper const& wrap, char const* const func
   }
 }
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END
 
 /*
  * Macros compliant with TensorRT coding conventions

@@ -22,9 +22,12 @@
 #include <iostream>
 #include <string>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args) {
   va_list args0;
@@ -62,4 +65,6 @@ std::unordered_set<std::string> str2set(std::string const& input, char delimiter
   return values;
 };
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

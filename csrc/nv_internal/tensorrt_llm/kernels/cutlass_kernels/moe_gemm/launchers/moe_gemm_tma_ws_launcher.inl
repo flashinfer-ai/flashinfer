@@ -50,7 +50,9 @@
 #include <sstream>
 #include <type_traits>
 
-namespace tensorrt_llm {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels_oss {
 using namespace tensorrt_llm::kernels::cutlass_kernels;
@@ -732,4 +734,4 @@ using namespace cutlass::epilogue;
 
 }  // namespace cutlass_kernels_oss
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

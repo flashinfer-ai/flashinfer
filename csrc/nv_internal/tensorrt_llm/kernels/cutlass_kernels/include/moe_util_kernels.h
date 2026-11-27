@@ -31,9 +31,12 @@
 #include <random>
 #include <utility>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/NvInferRuntime.h"
 
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 
 namespace cutlass_kernels {
 
@@ -78,4 +81,6 @@ void finalizeMoeRoutingKernelLauncher(
     bool const enable_alltoall, bool enable_pdl, cudaStream_t stream);
 
 }  // namespace cutlass_kernels
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END

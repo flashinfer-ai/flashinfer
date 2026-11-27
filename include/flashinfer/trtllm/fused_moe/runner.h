@@ -23,9 +23,10 @@
 // #include "flashinfer/trtllm/common/cudaDriverWrapper.h"
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace trtllmgen_moe {
 
@@ -471,4 +472,4 @@ class Runner {
 
 }  // namespace trtllmgen_moe
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -48,6 +48,7 @@
 #pragma GCC diagnostic pop
 #endif
 
+#include "flashinfer/trtllm/common/config.h"
 #include "moe_kernels.h"
 #include "moe_util_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -71,7 +72,9 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 
 constexpr int CVT_ELTS_PER_THREAD = 8;
 
@@ -5046,4 +5049,6 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
   sync_check_cuda_error(stream);
 }
 
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

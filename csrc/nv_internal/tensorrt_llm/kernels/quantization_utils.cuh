@@ -18,12 +18,13 @@
 
 #include <optional>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1331,4 +1332,4 @@ constexpr size_t get_tma_smem_size() {
 }
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

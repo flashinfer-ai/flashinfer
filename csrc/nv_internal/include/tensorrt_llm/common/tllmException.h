@@ -21,11 +21,15 @@
 #include <stdexcept>
 #include <string>
 
+#include "flashinfer/trtllm/common/config.h"
+
 #define NEW_TLLM_EXCEPTION(...)                           \
   tensorrt_llm::common::TllmException(__FILE__, __LINE__, \
                                       tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str())
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 class TllmException : public std::runtime_error {
  public:
@@ -44,4 +48,6 @@ class TllmException : public std::runtime_error {
   int mNbFrames;
 };
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

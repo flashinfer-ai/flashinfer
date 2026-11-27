@@ -43,6 +43,7 @@
 #include <string>
 
 #include "../../exception.h"
+#include "flashinfer/trtllm/common/config.h"
 
 // #ifndef _WIN32 // Linux
 // #include <sys/sysinfo.h>
@@ -55,7 +56,9 @@
 //                // this undef.
 // #endif         // WIN32
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 // // workspace for cublas gemm : 32MB
 // #define CUBLAS_WORKSPACE_SIZE 33554432
@@ -300,4 +303,6 @@ inline int getMultiProcessorCount() {
   return count;
 }
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

@@ -20,13 +20,14 @@
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace trtllmgen_moe {
 
@@ -885,4 +886,4 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
 }  // namespace trtllmgen_moe
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

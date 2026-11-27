@@ -27,6 +27,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/layout/layout.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
@@ -35,7 +36,9 @@
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 
 template <typename AType, typename BType, typename BScaleType, typename OType>
 struct GroupedGemmInput {
@@ -340,4 +343,6 @@ class MoeGemmRunner {
   size_t calcMaxWorkspaceSize(int num_experts) const;
 };
 
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

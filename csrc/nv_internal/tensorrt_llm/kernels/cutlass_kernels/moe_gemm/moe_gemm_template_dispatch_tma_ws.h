@@ -55,12 +55,15 @@
 #include "../include/moe_gemm_kernels.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
 #include "./moe_tma_warp_specialized_traits.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
@@ -398,7 +401,7 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(
       TLLM_THROW("Unsupported cluster shape config %d for MoE gemm.",
                  (int)gemm_config.cluster_shape);
   }
-}  // namespace tensorrt_llm
+}
 
 template <typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           EpilogueFusion FUSION>
@@ -539,4 +542,6 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(
   return count;
 }
 
-}  // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+}  // namespace kernels::cutlass_kernels_oss
+
+TRTLLM_NAMESPACE_END

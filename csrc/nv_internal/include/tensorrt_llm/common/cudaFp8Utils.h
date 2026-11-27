@@ -29,7 +29,9 @@
 #define USE_QGMMA
 #endif
 
-namespace tensorrt_llm {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace common {
 
 constexpr float FP8_E4M3_MAX = 448.0f;
@@ -277,5 +279,5 @@ void invokeComputeScalesAndQuantizeMatrix(T_OUT* output, T_S* quant_ptr, const T
                                           QuantizeMode quantize_mode, cudaStream_t stream);
 
 }  // namespace common
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
 #endif  // ENABLE_FP8

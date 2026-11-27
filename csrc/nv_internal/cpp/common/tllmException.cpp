@@ -26,7 +26,11 @@
 #endif
 #include <sstream>
 
-namespace tensorrt_llm::common {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 namespace {
 int constexpr VOID_PTR_SZ = 2 + sizeof(void*) * 2;
@@ -92,4 +96,6 @@ std::string TllmException::demangle(char const* name) {
 #endif
 }
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

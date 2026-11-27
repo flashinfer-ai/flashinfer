@@ -20,7 +20,9 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-namespace tensorrt_llm {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -157,4 +159,4 @@ inline __device__ void convertToFloatAndAccumulate<__nv_bfloat16, 8>(float (&out
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

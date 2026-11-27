@@ -20,12 +20,12 @@
 
 /**
  * \def TRTLLM_ABI_NAMESPACE
- * This macro is used to open an implicitly inline namespace block for the ABI version.
- * This macro can be overridden to change the ABI version.
- * The default ABI version is _v1.
+ * Inline ABI namespace nested inside `tensorrt_llm::`. FlashInfer uses its own
+ * default (TensorRT-LLM uses `_v1`) to avoid symbol collisions when both are
+ * loaded in one process. Can be overridden.
  */
 #ifndef TRTLLM_ABI_NAMESPACE
-#define TRTLLM_ABI_NAMESPACE _v1
+#define TRTLLM_ABI_NAMESPACE flashinfer_v1
 #endif
 
 #ifndef TRTLLM_ABI_NAMESPACE_BEGIN

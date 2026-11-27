@@ -21,7 +21,9 @@
 #include <string>
 #include <type_traits>
 
-namespace tensorrt_llm {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace common {
 
 enum class NVFP44Over6ErrMode : std::uint8_t {
@@ -283,4 +285,4 @@ class GroupwiseQuantAlgo {
 };
 
 }  // namespace common
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

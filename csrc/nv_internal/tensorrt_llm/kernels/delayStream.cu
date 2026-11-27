@@ -15,12 +15,15 @@
  */
 
 #include "../../tvm_ffi_utils.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/delayStream.h"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 __global__ void delayStreamKernel(long long delay_micro_secs) {
   for (int i = 0; i < delay_micro_secs; ++i) {
     // The largest delay __nanosleep can do is 1 millisecond, thus we use for loop to achieve longer
@@ -37,6 +40,8 @@ void invokeDelayStreamKernel(long long delay_micro_secs, cudaStream_t stream) {
 void delay_kernel(int64_t delay_micro_secs) {
   tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, get_current_stream());
 }
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(delay_kernel, tensorrt_llm::kernels::delay_kernel);

@@ -19,9 +19,10 @@
 #include <cuda_runtime.h>
 
 #include "flashinfer/fp4_layout.cuh"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 using flashinfer::QuantizationSFLayout;
 
 // This denotes the input and output data types of the block scale quantization.
@@ -92,4 +93,4 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
                              cudaStream_t stream = 0);
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

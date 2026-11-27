@@ -18,13 +18,14 @@
 #include <float.h>
 
 #include "flashinfer/exception.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/fmha/fmhaReduction.h"
 #include "flashinfer/trtllm/fmha/kernelUtils.h"
 #include "flashinfer/utils.cuh"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -421,4 +422,4 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

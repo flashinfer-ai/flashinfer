@@ -61,13 +61,16 @@
 #include "./moe_gemm_template_dispatch_tma_ws.h"
 #include "./moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
 #include "./moe_tma_warp_specialized_traits.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss {
 
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
@@ -527,9 +530,13 @@ void dispatchMoeGemmToCutlass(
   }
 }
 
-}  // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+}  // namespace kernels::cutlass_kernels_oss
 
-namespace tensorrt_llm::kernels::cutlass_kernels {
+TRTLLM_NAMESPACE_END
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels {
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
           bool IsMXFPX>
@@ -1091,4 +1098,6 @@ int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::queryOccup
   return occupancy;
 }
 
-}  // namespace tensorrt_llm::kernels::cutlass_kernels
+}  // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

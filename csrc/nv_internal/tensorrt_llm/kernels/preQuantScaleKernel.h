@@ -29,7 +29,9 @@
 #include <type_traits>
 #include <vector>
 
-namespace tensorrt_llm {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 template <typename T_in, typename T_out = T_in>
@@ -39,4 +41,4 @@ void apply_per_channel_scale_kernel_launcher(T_out* smoothed_act, T_in const* ac
                                              cudaStream_t stream = 0);
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

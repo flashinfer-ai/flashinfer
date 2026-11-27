@@ -18,7 +18,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace tensorrt_llm::kernels::moe_alltoall {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::moe_alltoall {
 
 // Configuration constants
 static constexpr int kMaxTopK = 22;     // Maximum supported top-k experts per token
@@ -194,4 +198,6 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
                                         int32_t invalid_id, int ep_size, int max_tokens_per_rank,
                                         int top_k, cudaStream_t stream);
 
-}  // namespace tensorrt_llm::kernels::moe_alltoall
+}  // namespace kernels::moe_alltoall
+
+TRTLLM_NAMESPACE_END

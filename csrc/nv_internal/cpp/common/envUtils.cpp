@@ -25,11 +25,14 @@
 #include <stdexcept>
 #include <string>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
-namespace tensorrt_llm::common {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common {
 
 std::optional<int32_t> getIntEnv(char const* name) {
   char const* const env = std::getenv(name);
@@ -390,4 +393,6 @@ bool getEnvNVFP44Over6ErrUseFastMath() {
 
 bool getEnvNVFP44Over6E4M3Use256() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"); }
 
-}  // namespace tensorrt_llm::common
+}  // namespace common
+
+TRTLLM_NAMESPACE_END

@@ -29,11 +29,12 @@
 
 #include <type_traits>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 
 namespace cg = cooperative_groups;
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace common {
 
 template <int VPT>
@@ -380,4 +381,4 @@ __device__ __forceinline__ half clamp_inf_for_half(float const input) {
 }
 
 }  // namespace common
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

@@ -20,6 +20,7 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -27,7 +28,7 @@
 #include <cuda_bf16.h>
 #endif
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace common {
 
 template <typename T>
@@ -644,4 +645,4 @@ __device__ inline __nv_fp8_e4m3 cuda_cast<__nv_fp8_e4m3, int8_t>(int8_t val) {
 #endif  // ENABLE_FP8
 
 }  // namespace common
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

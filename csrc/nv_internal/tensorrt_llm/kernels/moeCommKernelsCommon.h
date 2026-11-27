@@ -17,7 +17,7 @@
 
 #include <stdint.h>
 
-#include "tensorrt_llm/common/config.h"
+#include "flashinfer/trtllm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
 

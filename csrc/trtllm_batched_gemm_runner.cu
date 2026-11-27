@@ -24,10 +24,11 @@
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/common.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 
 using namespace batchedGemm::batchedGemm;
@@ -508,4 +509,4 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
 }
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

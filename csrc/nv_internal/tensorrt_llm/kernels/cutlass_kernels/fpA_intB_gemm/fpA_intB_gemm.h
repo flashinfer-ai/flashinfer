@@ -23,10 +23,11 @@
 #include "../include/common.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
+#include "flashinfer/trtllm/common/config.h"
 
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels {
 
@@ -135,4 +136,4 @@ class CutlassFpAIntBGemmRunner : public virtual CutlassFpAIntBGemmRunnerInterfac
 
 }  // namespace cutlass_kernels
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

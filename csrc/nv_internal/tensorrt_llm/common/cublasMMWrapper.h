@@ -24,9 +24,10 @@
 #include <optional>
 #include <string>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace common {
 
 class CublasMMWrapper {
@@ -151,4 +152,4 @@ class CublasMMWrapper {
 
 }  // namespace common
 
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

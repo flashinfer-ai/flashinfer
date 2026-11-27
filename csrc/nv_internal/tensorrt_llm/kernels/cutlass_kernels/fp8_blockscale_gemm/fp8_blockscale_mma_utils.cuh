@@ -19,7 +19,11 @@
 
 #include <cute/arch/util.hpp>
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::fp8_blockscale_gemm {
 
 struct SM90_64x16x32_F32E4M3E4M3_SS {
   __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, float& d00,
@@ -591,4 +595,6 @@ struct Fp8MmaSelector {
   using Type = decltype(select_type());
 };
 
-}  // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+}  // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

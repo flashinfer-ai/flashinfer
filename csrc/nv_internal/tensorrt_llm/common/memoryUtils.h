@@ -18,10 +18,11 @@
 
 #include <cassert>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace common {
 
 // cudaMemcpyAsync with extra check via ASan for D2H copy
@@ -301,4 +302,4 @@ AlignedPointersUnpacker inline calcAlignedPointers(void const* p, std::vector<si
 }
 
 }  // namespace common
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

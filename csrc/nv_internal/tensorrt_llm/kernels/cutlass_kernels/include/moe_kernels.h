@@ -35,8 +35,11 @@
 #include <random>
 #include <utility>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/NvInferRuntime.h"
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 // Change to following declarations must sync with lora.h in public repo
 class LoraImpl;
 
@@ -1130,4 +1133,6 @@ struct GemmProfilerBackend {
 void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
 }  // namespace cutlass_kernels
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END

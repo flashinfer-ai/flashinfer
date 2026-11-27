@@ -19,8 +19,9 @@
 #include "../../include/moe_gemm_kernels.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
+#include "flashinfer/trtllm/common/config.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
@@ -36,4 +37,4 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
 
 }  // namespace cutlass_kernels_oss
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

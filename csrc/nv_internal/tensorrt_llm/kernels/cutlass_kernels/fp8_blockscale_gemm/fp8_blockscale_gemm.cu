@@ -18,9 +18,12 @@
 #ifdef ENABLE_FP8_BLOCK_SCALE
 #include "fp8_blockscale_gemm_kernel.cuh"
 #endif
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::fp8_blockscale_gemm {
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
@@ -346,4 +349,6 @@ template class CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
 
-}  // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+}  // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

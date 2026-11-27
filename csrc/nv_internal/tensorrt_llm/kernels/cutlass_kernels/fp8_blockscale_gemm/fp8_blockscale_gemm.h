@@ -21,8 +21,12 @@
 #include <cstdint>
 #include <vector>
 
+#include "flashinfer/trtllm/common/config.h"
+
 // non-persistent-cooperative GEMM
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::fp8_blockscale_gemm {
 
 class CutlassFp8BlockScaleGemmRunnerInterface {
  public:
@@ -123,4 +127,6 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
   int64_t expected_m_ = 0;
 };
 
-}  // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+}  // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

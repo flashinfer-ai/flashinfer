@@ -3,6 +3,7 @@
 
 #include <cmath>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "flashinfer/trtllm/fused_moe/noAuxTcKernels.h"
 #include "moeTopKFuncs.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
@@ -14,7 +15,9 @@ using tvm::ffi::Optional;
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 static constexpr int WARP_SIZE = 32;
 static constexpr int NumKimiK2Experts = 384;
 static constexpr int NumDeepseekExperts = 256;
@@ -304,7 +307,9 @@ INSTANTIATE_NOAUX_TC(__nv_bfloat16, float, __nv_bfloat16, int32_t);
 INSTANTIATE_NOAUX_TC(__nv_bfloat16, half, __nv_bfloat16, int32_t);
 #endif
 
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END
 
 namespace flashinfer::trtllm_dsv3_fused_routing {
 // th::Tensor const& scores, th::Tensor const& bias, int64_t n_group,

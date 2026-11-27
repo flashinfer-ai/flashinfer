@@ -24,8 +24,11 @@
 #include <cub/cub.cuh>
 
 #include "flashinfer/arch_condition.h"
+#include "flashinfer/trtllm/common/config.h"
 
-namespace tensorrt_llm::kernels {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels {
 
 namespace reduce_topk {
 namespace cg = cooperative_groups;
@@ -264,5 +267,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<kWARP_SIZE> con
 #undef TOPK_SWAP
 
 }  // namespace reduce_topk
-}  // namespace tensorrt_llm::kernels
+}  // namespace kernels
+
+TRTLLM_NAMESPACE_END
 #endif  // TRTLLM_MOETOPKFUNCS_CUH_H

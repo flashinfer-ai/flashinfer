@@ -23,10 +23,11 @@
 #include <type_traits>
 
 #include "cute/tensor.hpp"
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/tllmException.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace cutlass_extensions {
 
 // Note: The shapes are in the format MxNxK. The K shape of the runtime config MUST match the K
@@ -464,4 +465,4 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
 }
 
 }  // namespace cutlass_extensions
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

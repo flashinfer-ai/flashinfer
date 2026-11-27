@@ -52,12 +52,15 @@
 #include <sstream>
 
 #include "../include/moe_gemm_kernels.h"
+#include "flashinfer/trtllm/common/config.h"
 #include "launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss {
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss {
 
 using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
@@ -273,4 +276,6 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
   return count;
 }
 
-}  // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+}  // namespace kernels::cutlass_kernels_oss
+
+TRTLLM_NAMESPACE_END

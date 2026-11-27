@@ -20,12 +20,13 @@
 
 #include <unordered_map>
 
+#include "flashinfer/trtllm/common/config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace common {
 
 #ifdef __has_feature
@@ -960,4 +961,4 @@ void calcAlignedPointers(std::vector<void*>& outPtrs, void const* p,
 }
 
 }  // namespace common
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

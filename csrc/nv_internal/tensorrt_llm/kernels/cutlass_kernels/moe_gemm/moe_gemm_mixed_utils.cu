@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
+#include "flashinfer/trtllm/common/config.h"
 #include "moe_gemm_mixed_utils.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels {
 
@@ -111,4 +112,4 @@ void interleave_int4_weights_for_sm90_mixed_gemm(uint8_t* int4_weight,
 
 }  // namespace cutlass_kernels
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

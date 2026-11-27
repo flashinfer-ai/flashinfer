@@ -20,7 +20,9 @@
 
 #include <cstdint>
 
-namespace tensorrt_llm {
+#include "flashinfer/trtllm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 namespace cutlass_kernels {
 
@@ -32,4 +34,4 @@ void interleave_int4_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weigh
 
 }  // namespace cutlass_kernels
 }  // namespace kernels
-}  // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
