@@ -3,7 +3,7 @@
 
 For the layer over the ``MoEEpCommunication`` transports (NVLink one-sided,
 Cake, NVLink two-sided), timed per stage with CUPTI kernel spans, use
-``benchmarks/moe_ep/bench_moe_ep.py``.
+``benchmarks/moe_ep/bench_moe_ep_split_layer.py``.
 
 Canonical cases mirror the NCCL-EP ``ep_bench`` reference
 (``contrib/nccl_ep/README.md`` in the NCCL repo): **128 tokens/rank, hidden 7168,

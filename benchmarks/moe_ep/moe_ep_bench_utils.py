@@ -1,8 +1,10 @@
 """Shared helpers of the MoE expert-parallel benchmarks.
 
-``bench_moe_ep.py`` (one whole MoE layer) and ``bench_moe_ep_comm.py``
-(dispatch and combine only) share their model profiles, routing, batch-size
-sweep, CUPTI kernel-span timing and per-rank reporting.
+``bench_moe_ep_comm.py`` (dispatch and combine only),
+``bench_moe_ep_split_layer.py`` (a layer of separate kernels) and
+``bench_moe_ep_mega_layer.py`` (a fused MegaMoE layer) share their model
+profiles, routing, batch-size sweep, CUPTI kernel-span timing and per-rank
+reporting; the two layer benchmarks also share their timing loop and report.
 
 Timing model. Each timed iteration is split into named phases that run in a
 fixed order, and the benchmark records a pair of CUDA events around every
@@ -15,9 +17,13 @@ by name.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import json
+import os
+import statistics
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -70,6 +76,15 @@ PROFILES: Dict[str, Profile] = {
         intermediate_size=2048,
         weight_quant="mxfp4",
     ),
+    "deepseek_v4_1_flash": Profile(
+        "deepseek_v4_1_flash",
+        hidden_size=5120,
+        top_k=6,
+        num_experts=384,
+        quant="mxfp8",
+        intermediate_size=2304,
+        weight_quant="mxfp4",
+    ),
     "deepseek_v4_pro": Profile(
         "deepseek_v4_pro",
         hidden_size=7168,
@@ -115,6 +130,71 @@ def add_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--num_experts", type=int, default=None, help="Override the profile."
     )
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {value}")
+    return value
+
+
+def add_layer_args(parser: argparse.ArgumentParser) -> None:
+    """Options shared by the layer benchmarks, after ``add_profile_args``."""
+    parser.add_argument(
+        "--intermediate_size", type=int, default=None, help="Override the profile."
+    )
+    parser.add_argument(
+        "--iters", type=_positive_int, default=200, help="Timed iterations."
+    )
+    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
+    parser.add_argument(
+        "--perfect_router",
+        action="store_true",
+        help="Deterministic balanced routing, removing load imbalance across "
+        "ranks and experts (see make_routing).",
+    )
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=1234,
+        help="Input and weight seed (rank r uses seed + r).",
+    )
+    parser.add_argument(
+        "--no_cuda_graph",
+        action="store_true",
+        help="Run eagerly instead of replaying one CUDA graph.",
+    )
+    parser.add_argument(
+        "--kernel_breakdown",
+        action="store_true",
+        help="Also report the time of every kernel inside each reported span "
+        "(C++ kernel names demangled when the cxxfilt package is installed).",
+    )
+    parser.add_argument(
+        "--iter_stats",
+        action="store_true",
+        help="Report mean/median/stdev/min/max over iterations instead of the mean.",
+    )
+    parser.add_argument("--output_file", default=None, help="Write a JSON report here.")
+
+
+def layer_shape(args: argparse.Namespace, ep_size: int) -> Dict[str, Any]:
+    """The profile's expert shape and formats with the command-line overrides."""
+    profile = PROFILES[args.profile]
+    shape = {
+        "hidden_size": int(args.hidden_size or profile.hidden_size),
+        "top_k": int(args.top_k or profile.top_k),
+        "num_experts": int(args.num_experts or profile.num_experts),
+        "intermediate_size": int(args.intermediate_size or profile.intermediate_size),
+        "quant": getattr(args, "quant", None) or profile.quant,
+        "weight_quant": getattr(args, "weight_quant", None) or profile.weight_quant,
+    }
+    if shape["num_experts"] % ep_size:
+        raise ValueError(
+            f"num_experts ({shape['num_experts']}) must be divisible by EP size ({ep_size})"
+        )
+    return shape
 
 
 # ----------------------------------------------------------------------------
@@ -201,11 +281,18 @@ def make_routing(
     perfect_router: bool,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return int32 ``topk_ids`` and float32 ``topk_weights``, ``[tokens, top_k]``."""
+    """Return int32 ``topk_ids`` and float32 ``topk_weights``, ``[tokens, top_k]``.
+
+    ``perfect_router``: flattened (token, k) slot ``s`` of rank ``r`` goes to
+    rank ``(s + r) % ep_size``, local expert ``((s + r) // ep_size) %
+    experts_per_rank``. Every token reaches ``top_k`` consecutive ranks
+    (distinct while ``top_k <= ep_size``), and every expert receives the same
+    number of routes once ``local_num_tokens * top_k`` is a multiple of
+    ``num_experts``. Without it, each token takes ``top_k`` distinct experts
+    uniformly at random.
+    """
     experts_per_rank = num_experts // ep_size
     if perfect_router:
-        # Balance ranks and experts: walk the flattened (token, k) slots as
-        # rank r expert 0, rank r+1 expert 0, ..., then rank r expert 1, ...
         slots = torch.arange(local_num_tokens * top_k, device=device) + rank()
         target_rank = slots % ep_size
         local_expert = (slots // ep_size) % experts_per_rank
@@ -228,6 +315,27 @@ def l2_flush_buffer(device: torch.device) -> torch.Tensor:
     """A buffer twice the L2 size; zeroing it evicts the previous iteration."""
     l2_size = torch.cuda.get_device_properties(device).L2_cache_size
     return torch.empty(l2_size // 2, dtype=torch.int32, device=device)
+
+
+def random_expert_weights(
+    num_local_experts: int, hidden_size: int, intermediate_size: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """BF16 gate/up ``[E, 2I, H]`` and down ``[E, H, I]`` projections of this rank's experts."""
+    w13 = torch.randn(
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2 = torch.randn(
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    return w13.mul_(hidden_size**-0.5), w2.mul_(intermediate_size**-0.5)
 
 
 # ----------------------------------------------------------------------------
@@ -477,6 +585,181 @@ def start_cupti() -> Tuple[Optional[Any], Optional[str]]:
 
 
 # ----------------------------------------------------------------------------
+# Layer timing loop
+# ----------------------------------------------------------------------------
+
+
+class TimingWindows:
+    """External CUDA events delimiting named windows of every timed iteration.
+
+    ``iteration`` is the timed iteration being recorded; outside one (None)
+    nothing is recorded, so warmup iterations carry no events.
+    """
+
+    def __init__(self, names: Sequence[str], iters: int) -> None:
+        self.names = tuple(names)
+        self._index = {name: k for k, name in enumerate(self.names)}
+        # External events become event-record nodes when captured into a CUDA
+        # graph, so they stay queryable with elapsed_time() after replay.
+        self.events = [
+            [
+                (
+                    torch.cuda.Event(enable_timing=True, external=True),
+                    torch.cuda.Event(enable_timing=True, external=True),
+                )
+                for _ in self.names
+            ]
+            for _ in range(iters)
+        ]
+        # A CUDA event handle is created lazily on its first record().
+        for pairs in self.events:
+            for start, end in pairs:
+                start.record()
+                end.record()
+        torch.cuda.synchronize()
+        self.iteration: Optional[int] = None
+
+    def mark(self, name: str, end: bool) -> None:
+        """Record the start or end of window ``name`` in the current iteration."""
+        if self.iteration is None:
+            return
+        if name not in self._index:
+            raise RuntimeError(f"no timing window {name!r}; windows: {self.names}")
+        self.events[self.iteration][self._index[name]][int(end)].record()
+
+    @contextlib.contextmanager
+    def window(self, name: str):
+        self.mark(name, False)
+        yield
+        self.mark(name, True)
+
+    def cupti_ids(self, cupti) -> List[Tuple[int, ...]]:
+        return [
+            tuple(
+                cupti.get_cuda_event_id(event.cuda_event)
+                for pair in pairs
+                for event in pair
+            )
+            for pairs in self.events
+        ]
+
+    def elapsed_us(self) -> Dict[str, List[float]]:
+        """Per-iteration CUDA-event time of every window."""
+        return {
+            name: [pairs[k][0].elapsed_time(pairs[k][1]) * 1e3 for pairs in self.events]
+            for k, name in enumerate(self.names)
+        }
+
+
+def _merge_kernels(*kernel_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per-kernel statistics of several windows as one list, by kernel name."""
+    times: Dict[str, List[float]] = {}
+    for kernels in kernel_lists:
+        for kernel in kernels:
+            times.setdefault(kernel["name"], []).extend(kernel["_times"])
+    merged = [
+        {"name": name, "count": len(values), "_times": values}
+        for name, values in times.items()
+    ]
+    merged.sort(key=lambda k: sum(k["_times"]) / len(k["_times"]), reverse=True)
+    return merged
+
+
+def time_windows(
+    forward: Callable[[], Any],
+    windows: TimingWindows,
+    reported: Sequence[str],
+    *,
+    l2_buffer: torch.Tensor,
+    warmup: int,
+    use_cuda_graph: bool,
+    cupti_ctx: Optional[Any],
+    optional_windows: Sequence[str] = (),
+) -> Tuple[Dict[str, List[float]], Dict[str, List[float]], Dict[str, Any]]:
+    """Time ``warmup`` untimed and ``len(windows.events)`` timed iterations.
+
+    Every iteration zeroes ``l2_buffer`` and then calls ``forward``, which
+    marks the boundaries of its windows on ``windows`` (a no-op in warmup
+    iterations). With ``use_cuda_graph`` all iterations are captured in one
+    CUDA graph and replayed once, so no host gap separates them. A window in
+    ``optional_windows`` may contain no kernel.
+
+    Returns, for every window in ``reported``, the per-iteration CUDA-event
+    times and CUPTI kernel spans (µs; none without CUPTI) and its per-kernel
+    statistics ``<window>_kernels``, with every other kernel, also those of the
+    unreported windows, in ``other_kernels`` (and ``cupti_error`` when a trace
+    was incomplete).
+    """
+    window_event_ids = windows.cupti_ids(cupti_ctx[0]) if cupti_ctx else []
+
+    def _run_iterations() -> None:
+        for _ in range(warmup):
+            l2_buffer.zero_()
+            forward()
+        for i in range(len(windows.events)):
+            l2_buffer.zero_()
+            windows.iteration = i
+            forward()
+            windows.iteration = None
+
+    graph = None
+    if use_cuda_graph:
+        # One replay covers warmup and timed iterations, so no host gaps remain.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_iterations()
+    if cupti_ctx is not None:
+        cupti, cupti_kernels, cupti_events = cupti_ctx
+        cupti.activity_flush_all(0)
+        cupti_kernels.clear()
+        cupti_events.clear()
+    sync()
+    if graph is not None:
+        graph.replay()
+    else:
+        _run_iterations()
+    sync()
+    stats: Dict[str, Any] = {}
+    if cupti_ctx is not None:
+        cupti.activity_flush_all(0)
+        try:
+            stats = kernel_spans_cupti(
+                cupti_kernels,
+                cupti_events,
+                windows.names,
+                window_event_ids,
+                optional_phases=optional_windows,
+            )
+        except RuntimeError as exc:
+            # Keep every rank on the same collective sequence even if one trace is incomplete.
+            stats["cupti_error"] = str(exc)
+    del graph
+
+    times = windows.elapsed_us()
+    event_times = {name: times[name] for name in reported}
+    span_times = {
+        name: stats[f"{name}_us_kernel_span"]
+        for name in reported
+        if f"{name}_us_kernel_span" in stats
+    }
+    kernels = {
+        f"{name}_kernels": stats[f"{name}_kernels"]
+        for name in reported
+        if f"{name}_kernels" in stats
+    }
+    if "other_kernels" in stats:
+        unreported = [
+            stats.get(f"{window}_kernels", [])
+            for window in windows.names
+            if window not in reported
+        ]
+        kernels["other_kernels"] = _merge_kernels(stats["other_kernels"], *unreported)
+    if "cupti_error" in stats:
+        kernels["cupti_error"] = stats["cupti_error"]
+    return event_times, span_times, kernels
+
+
+# ----------------------------------------------------------------------------
 # Reporting
 # ----------------------------------------------------------------------------
 
@@ -549,3 +832,113 @@ def rank_mean(per_rank: Dict[str, Any]) -> float:
     """Average over ranks of a ``gather_per_rank`` result."""
     values = [v["mean"] if isinstance(v, dict) else v for v in per_rank.values()]
     return sum(values) / len(values)
+
+
+def max_rank_stats(per_rank: Sequence[Sequence[float]]) -> Dict[str, float]:
+    """Median, p10 and p90 over iterations of the slowest rank's time in each.
+
+    ``per_rank[r][i]`` is rank ``r``'s time of iteration ``i``.
+    """
+    slowest = sorted(max(times) for times in zip(*per_rank, strict=True))
+    n = len(slowest)
+    return {
+        "median": statistics.median(slowest),
+        "p10": slowest[min(n - 1, int(0.1 * n))],
+        "p90": slowest[min(n - 1, int(0.9 * n))],
+    }
+
+
+def resolve_times(
+    event_times: Dict[str, List[float]],
+    span_times: Dict[str, List[float]],
+    kernels: Dict[str, Any],
+    metadata: Dict[str, Any],
+    label: str,
+    tag: str,
+) -> Dict[str, List[float]]:
+    """The kernel spans of ``time_windows``, or its event times where they are
+    missing or any rank's trace was incomplete; collective.
+
+    An incomplete trace is warned about and added to ``metadata["warning"]``,
+    so every rank reports the same timing source.
+    """
+    cupti_errors = first_error(kernels.get("cupti_error"))
+    if cupti_errors is None:
+        return span_times or event_times
+    warning = warn_kernel_span_unavailable(f"{label}: {cupti_errors}", tag)
+    metadata["warning"] = (
+        f"{metadata['warning']}\n{warning}" if metadata["warning"] else warning
+    )
+    return event_times
+
+
+def gather_window_results(
+    times: Dict[str, List[float]],
+    kernels: Dict[str, Any],
+    names: Sequence[str],
+    *,
+    iter_stats: bool,
+    kernel_breakdown: bool,
+) -> Dict[str, Any]:
+    """Every rank's time of each window in ``names`` (``<name>_us``), the
+    slowest rank's per iteration (``<name>_max_rank_us``) and, with
+    ``kernel_breakdown``, the per-kernel times; collective."""
+    output: Dict[str, Any] = {}
+    for name in names:
+        per_rank = allgather(times[name])
+        output[f"{name}_us"] = {
+            f"rank{i}": summarize(rank_times, iter_stats)
+            for i, rank_times in enumerate(per_rank)
+        }
+        output[f"{name}_max_rank_us"] = max_rank_stats(per_rank)
+    if kernel_breakdown:
+        output.update(
+            gather_kernel_breakdown(
+                kernels,
+                (*(f"{name}_kernels" for name in names), "other_kernels"),
+                iter_stats,
+            )
+        )
+    return output
+
+
+def layer_metadata(
+    tag: str,
+    args: argparse.Namespace,
+    shape: Dict[str, Any],
+    *,
+    ep_size: int,
+    batch_sizes: List[int],
+    device: torch.device,
+    cupti_enabled: bool,
+    warning: Optional[str],
+) -> Dict[str, Any]:
+    """The report metadata both layer benchmarks record."""
+    return {
+        "bench": tag,
+        "profile": args.profile,
+        "ep_size": ep_size,
+        **shape,
+        "experts_per_rank": shape["num_experts"] // ep_size,
+        "local_batch_size": batch_sizes,
+        "perfect_router": bool(args.perfect_router),
+        "random_seed": int(args.random_seed),
+        "device": torch.cuda.get_device_name(device),
+        "cuda_graph": not args.no_cuda_graph,
+        "warmup": int(args.warmup),
+        "iters": int(args.iters),
+        "cupti_enabled": cupti_enabled,
+        "warning": warning,
+    }
+
+
+def write_report(
+    path: Optional[str], metadata: Dict[str, Any], results: List[Dict[str, Any]]
+) -> None:
+    if not path:
+        return
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"benchmark_metadata": metadata, "results": results}, f, indent=2)

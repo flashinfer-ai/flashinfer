@@ -473,7 +473,7 @@ class MoEEpSplitLayer(nn.Module):
         # manager that forward() enters around each stage, on the current
         # stream. Unlike enable_timing it never synchronizes, so it may record
         # CUDA events while a graph is being captured; the caller reads them
-        # after the replay. Used by benchmarks/moe_ep/bench_moe_ep.py.
+        # after the replay. Used by benchmarks/moe_ep/bench_moe_ep_split_layer.py.
         self.stage_hook: Optional[
             Callable[[str], contextlib.AbstractContextManager[None]]
         ] = None
