@@ -43,6 +43,7 @@ Constraints:
   ``head_dim == 256`` and ``q_tile == kv_tile == 128``, and 2 otherwise
 """
 
+import math
 from functools import partial
 from types import SimpleNamespace
 from typing import Type
@@ -2241,8 +2242,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         lse: cute.Tensor | None,
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
-        softmax_scale_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale_log2: cutlass.Float32 | tuple,
+        output_scale: cutlass.Float32 | cute.Tensor,
         skip_softmax_threshold: cute.Tensor | None,
         seqlens_kv: cute.Tensor | None = None,
         cu_seqlens_q: cute.Tensor | None = None,
@@ -2259,7 +2260,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param lse: Optional packed log2 LSE tensor ``[total_q,Hq]``.
         :param tma_k_desc: Tensor map descriptor for K.
         :param tma_v_desc: Tensor map descriptor for V.
-        :param softmax_scale_log2: ``softmax_scale * log2(e)``, pre-folded host-side.
+        :param softmax_scale_log2: Precomputed log2 softmax factor or the base,
+            Q scale and K scale when either input scale is a device tensor.
         :param output_scale: Scalar V dequantization scale folded into the
             final normalization.
         :param skip_softmax_threshold: Optional e-based skip threshold for
@@ -2312,9 +2314,20 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         causal_q_offset = cutlass.Int32(0)
 
         cute.arch.griddepcontrol_wait()
-        # A dynamic threshold can be produced or updated by an earlier kernel.
-        # Keep its load after the PDL dependency wait so a dependent launch
-        # never observes the predecessor's stale value.
+        # A preceding kernel may produce the scales or threshold. Load them after
+        # the PDL dependency wait so a dependent launch sees the new values.
+        if cutlass.const_expr(isinstance(softmax_scale_log2, tuple)):
+            base, q_scale, k_scale = softmax_scale_log2
+            if cutlass.const_expr(isinstance(q_scale, cute.Tensor)):
+                q_scale = cutlass.Float64(q_scale[0])
+            if cutlass.const_expr(isinstance(k_scale, cute.Tensor)):
+                k_scale = cutlass.Float64(k_scale[0])
+            # Match the host scalar path: round once after applying both scales.
+            softmax_scale_log2 = cutlass.Float32(
+                base * q_scale * k_scale * math.log2(math.e)
+            )
+        if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
+            output_scale = output_scale[0]
         skip_softmax_threshold_log2 = None
         if cutlass.const_expr(skip_softmax_threshold is not None):
             skip_softmax_threshold_log2 = cute.math.log2(
@@ -3043,8 +3056,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         v: cute.Tensor,
         o: cute.Tensor,
         lse: cute.Tensor | None,
-        softmax_scale_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale_log2: cutlass.Float32 | tuple,
+        output_scale: cutlass.Float32 | cute.Tensor,
         skip_softmax_threshold: cute.Tensor | None,
         stream: cuda_driver.CUstream,
         seqlens_kv: cute.Tensor | None = None,
@@ -3065,7 +3078,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             contract as K.
         :param o: Packed output ``(total_q, Hq, D)``.
         :param lse: Optional packed float32 log2 LSE ``(total_q,Hq)``.
-        :param softmax_scale_log2: ``softmax_scale * log2(e)``.
+        :param softmax_scale_log2: Precomputed log2 softmax factor or the base,
+            Q scale and K scale when either input scale is a device tensor.
         :param output_scale: Scalar multiplier applied to normalized output.
         :param skip_softmax_threshold: E-based threshold for omitting tiles
             whose contribution is negligible, one float32 value per request.

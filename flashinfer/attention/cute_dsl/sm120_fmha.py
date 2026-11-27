@@ -45,7 +45,7 @@ from types import SimpleNamespace
 from typing import Optional, Union
 
 import torch
-from cutlass.cute.typing import Float32, Int32
+from cutlass.cute.typing import Float32, Float64, Int32
 from packaging.version import Version
 
 from flashinfer.utils import ceil_div
@@ -227,6 +227,47 @@ def _validate_hnd_paged_pool(name: str, pool: torch.Tensor) -> None:
         )
 
 
+def _prepare_fp8_scales(q, sm_scale, q_scale, k_scale, v_scale):
+    """Fold host scalars into the launch parameters and keep CUDA scalars on device."""
+
+    def normalize(name, scale):
+        if not isinstance(scale, torch.Tensor):
+            try:
+                return 1.0 if scale is None else float(scale)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(f"{name} must be a scalar, got {scale!r}") from exc
+        if (
+            scale.device != q.device
+            or scale.dtype != torch.float32
+            or scale.numel() != 1
+        ):
+            raise ValueError(f"{name} must be a single float32 value on {q.device}")
+        return scale.view(()).view(1)
+
+    q_scale, k_scale, v_scale = (
+        normalize("q_scale", q_scale),
+        normalize("k_scale", k_scale),
+        normalize("v_scale", v_scale),
+    )
+    device_q, device_k, device_v = (
+        isinstance(scale, torch.Tensor) for scale in (q_scale, k_scale, v_scale)
+    )
+    base = 1.0 / math.sqrt(q.shape[-1]) if sm_scale is None else sm_scale
+    if device_q or device_k:
+        softmax_scale = (
+            Float64(base),
+            q_scale if device_q else Float64(q_scale),
+            k_scale if device_k else Float64(k_scale),
+        )
+    else:
+        softmax_scale = Float32(base * q_scale * k_scale * math.log2(math.e))
+    return (
+        softmax_scale,
+        v_scale if device_v else Float32(v_scale),
+        (device_q, device_k, device_v),
+    )
+
+
 def sm120_fmha_fp8_ragged_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -240,9 +281,11 @@ def sm120_fmha_fp8_ragged_prefill(
     kv_tile: Optional[int] = None,
     q_tile: Optional[int] = None,
     lse: Optional[torch.Tensor] = None,
-    v_scale: Optional[float] = None,
+    v_scale: Optional[Union[float, torch.Tensor]] = None,
     enable_pdl: bool = False,
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
+    q_scale: Optional[Union[float, torch.Tensor]] = None,
+    k_scale: Optional[Union[float, torch.Tensor]] = None,
 ) -> None:
     """Run SM120 FP8 FMHA on packed contiguous ragged Q/K/V.
 
@@ -273,8 +316,13 @@ def sm120_fmha_fp8_ragged_prefill(
         Q tile size (64 or 128). Defaults to 128.
     lse : torch.Tensor, optional
         Preallocated float32 log2 LSE output, shape ``(total_q, Hq)``.
-    v_scale : float, optional
-        Scalar multiplier folded into the normalized output. Defaults to 1.
+    q_scale, k_scale : float or torch.Tensor, optional
+        Input dequantization scales may be Python scalars or single-element
+        float32 tensors on the input device. Keep captured tensors alive at a stable
+        address and update their values in place between graph replays.
+    v_scale : float or torch.Tensor, optional
+        Scalar multiplier for the normalized output, with the same device tensor
+        support as ``q_scale``. Defaults to 1.
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch.
     skip_softmax_threshold : float or torch.Tensor, optional
@@ -319,6 +367,9 @@ def sm120_fmha_fp8_ragged_prefill(
         raise ValueError(
             f"k and v must have the same shape, got {k.shape} and {v.shape}"
         )
+    scale_log2, output_scale, tensor_scales = _prepare_fp8_scales(
+        q, sm_scale, q_scale, k_scale, v_scale
+    )
     # CUDA tensor maps cannot describe a zero-extent K/V tensor. Handle the
     # all-empty ragged batch before TMA descriptor construction; requests with
     # empty K/V inside a non-empty batch still use the kernel's empty-KV path.
@@ -359,12 +410,8 @@ def sm120_fmha_fp8_ragged_prefill(
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
         enable_skip_softmax=threshold is not None,
+        tensor_scales=tensor_scales,
     )
-
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-    scale_log2 = Float32(sm_scale * math.log2(math.e))
-    output_scale = Float32(1.0 if v_scale is None else float(v_scale))
 
     kernel_fn(
         q,
@@ -404,11 +451,13 @@ def sm120_fmha_fp8_paged_prefill(
     kv_tile: Optional[int] = None,
     q_tile: Optional[int] = None,
     lse: Optional[torch.Tensor] = None,
-    v_scale: Optional[float] = None,
+    v_scale: Optional[Union[float, torch.Tensor]] = None,
     enable_pdl: bool = False,
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     kv_tile_ranges: Optional[torch.Tensor] = None,
     gqa_pack_size: int = 1,
+    q_scale: Optional[Union[float, torch.Tensor]] = None,
+    k_scale: Optional[Union[float, torch.Tensor]] = None,
 ) -> None:
     """Run SM120 FP8 FMHA prefill with paged K/V cache.
 
@@ -454,8 +503,13 @@ def sm120_fmha_fp8_paged_prefill(
         Q tile size (64 or 128).  Auto-selected if ``None``.
     lse : torch.Tensor, optional
         Preallocated float32 log2 LSE output, shape ``(total_q, Hq)``.
-    v_scale : float, optional
-        Scalar multiplier folded into the normalized output. Defaults to 1.
+    q_scale, k_scale : float or torch.Tensor, optional
+        Input dequantization scales may be Python scalars or single-element
+        float32 tensors on the input device. Keep captured tensors alive at a stable
+        address and update their values in place between graph replays.
+    v_scale : float or torch.Tensor, optional
+        Scalar multiplier for the normalized output, with the same device tensor
+        support as ``q_scale``. Defaults to 1.
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch.
     skip_softmax_threshold : float or torch.Tensor, optional
@@ -561,6 +615,9 @@ def sm120_fmha_fp8_paged_prefill(
             f"gqa_pack_size={gqa_pack_size}"
         )
 
+    scale_log2, output_scale, tensor_scales = _prepare_fp8_scales(
+        q, sm_scale, q_scale, k_scale, v_scale
+    )
     kernel_fn = compile_sm120_fmha_fp8_paged_kernel(
         in_dtype=q.dtype,
         out_dtype=o.dtype,
@@ -575,20 +632,11 @@ def sm120_fmha_fp8_paged_prefill(
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
         enable_skip_softmax=threshold is not None,
+        tensor_scales=tensor_scales,
         **({"with_kv_tile_ranges": True} if kv_tile_ranges is not None else {}),
         **({"gqa_pack_size": gqa_pack_size} if gqa_pack_size > 1 else {}),
     )
 
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-    scale_log2 = Float32(sm_scale * math.log2(math.e))
-    output_scale = Float32(1.0 if v_scale is None else float(v_scale))
-
-    # TVM-FFI ABI (env stream):
-    # kernel_fn(
-    #     q, k_pool, v_pool, o, lse, scale_log2, output_scale,
-    #     seqlens_kv, cu_seqlens_q, block_tables, max_seqlen_q
-    # )
     kernel_fn(
         q,
         k_pool,
@@ -726,23 +774,7 @@ class SM120PrimsBatchPrefillBackend:
         self._split_buffers: dict = {}
         self._gqa_pack_size = 1
         self._mode: Optional[str] = None
-        self._compiled_lse_variants: set[bool] = set()
-
-    @staticmethod
-    def _scalar_scale(name: str, value: Optional[float]) -> float:
-        if value is None:
-            return 1.0
-        if isinstance(value, torch.Tensor):
-            raise NotImplementedError(
-                f"backend='cute-dsl-prims' only supports Python scalar {name}; "
-                f"got tensor with shape {tuple(value.shape)}"
-            )
-        try:
-            return float(value)
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"backend='cute-dsl-prims' requires scalar {name}, got {value!r}"
-            ) from exc
+        self._compiled_variants: set[tuple[bool, tuple[bool, ...]]] = set()
 
     def _validate_config(
         self,
@@ -841,8 +873,9 @@ class SM120PrimsBatchPrefillBackend:
             with_lse=False,
             balanced_scheduler=_use_balanced_scheduler(causal),
             enable_skip_softmax=False,
+            tensor_scales=(False, False, False),
         )
-        self._compiled_lse_variants = {False}
+        self._compiled_variants = {(False, (False, False, False))}
 
     def plan_paged(
         self,
@@ -920,9 +953,10 @@ class SM120PrimsBatchPrefillBackend:
             with_lse=False,
             balanced_scheduler=_use_balanced_scheduler(causal),
             enable_skip_softmax=False,
+            tensor_scales=(False, False, False),
             **self._pack_kwargs(),
         )
-        self._compiled_lse_variants = {False}
+        self._compiled_variants = {(False, (False, False, False))}
         self._plan_kv_split(
             qo_indptr_host=qo_indptr_host,
             seqlens_kv_host=seqlens_kv_host,
@@ -1068,6 +1102,7 @@ class SM120PrimsBatchPrefillBackend:
             with_lse=True,
             balanced_scheduler=_use_balanced_scheduler(self._causal),
             enable_skip_softmax=False,
+            tensor_scales=(False, False, False),
             with_kv_tile_ranges=True,
             **self._pack_kwargs(),
         )
@@ -1120,53 +1155,21 @@ class SM120PrimsBatchPrefillBackend:
                     f"{tuple(k.shape)} and {tuple(v.shape)}"
                 )
 
-    def _ensure_kernel(self, *, with_lse: bool) -> None:
-        if with_lse in self._compiled_lse_variants:
-            return
-        if torch.cuda.is_current_stream_capturing():
+    def _check_capture_variant(self, with_lse, q_scale, k_scale, v_scale):
+        tensor_scales = tuple(
+            isinstance(scale, torch.Tensor) for scale in (q_scale, k_scale, v_scale)
+        )
+        variant = (with_lse, tensor_scales)
+        if (
+            variant not in self._compiled_variants
+            and torch.cuda.is_current_stream_capturing()
+        ):
             raise RuntimeError(
                 "backend='cute-dsl-prims' kernel specialization "
                 f"(return_lse={with_lse}) was not compiled before CUDA Graph "
-                "capture; warm up the same run configuration before capture"
+                "capture; warm up with the same LSE and device scale configuration"
             )
-        from flashinfer.cute_dsl.attention.fmha.sm120 import (
-            compile_sm120_fmha_fp8_paged_kernel,
-            compile_sm120_fmha_fp8_ragged_kernel,
-        )
-
-        if self._mode == "ragged":
-            compile_sm120_fmha_fp8_ragged_kernel(
-                in_dtype=self._q_dtype,
-                out_dtype=self._o_dtype,
-                num_qo_heads=self._num_qo_heads,
-                num_kv_heads=self._num_kv_heads,
-                head_dim=self._head_dim,
-                is_causal=self._causal,
-                kv_tile=128,
-                q_tile=128,
-                device=self.device,
-                with_lse=with_lse,
-                balanced_scheduler=_use_balanced_scheduler(self._causal),
-                enable_skip_softmax=False,
-            )
-        else:
-            compile_sm120_fmha_fp8_paged_kernel(
-                in_dtype=self._q_dtype,
-                out_dtype=self._o_dtype,
-                num_qo_heads=self._num_qo_heads,
-                num_kv_heads=self._num_kv_heads,
-                head_dim=self._head_dim,
-                is_causal=self._causal,
-                kv_tile=128,
-                q_tile=128,
-                num_tokens_per_page=self._page_size,
-                device=self.device,
-                with_lse=with_lse,
-                balanced_scheduler=_use_balanced_scheduler(self._causal),
-                enable_skip_softmax=False,
-                **self._pack_kwargs(),
-            )
-        self._compiled_lse_variants.add(with_lse)
+        return variant
 
     def run_ragged(
         self,
@@ -1177,22 +1180,18 @@ class SM120PrimsBatchPrefillBackend:
         *,
         lse: Optional[torch.Tensor],
         enable_pdl: bool,
-        q_scale: Optional[float],
-        k_scale: Optional[float],
-        v_scale: Optional[float],
+        q_scale: Optional[Union[float, torch.Tensor]],
+        k_scale: Optional[Union[float, torch.Tensor]],
+        v_scale: Optional[Union[float, torch.Tensor]],
     ) -> None:
         self._validate_run(q, k, v, out)
         if self._mode != "ragged":
             raise RuntimeError("SM120 PRIMS backend was not planned for ragged KV")
-        self._ensure_kernel(with_lse=lse is not None)
-        sm_scale = (
-            self._sm_scale
-            if self._sm_scale is not None
-            else 1.0 / math.sqrt(self._head_dim)
-        )
-        sm_scale *= self._scalar_scale("q_scale", q_scale)
-        sm_scale *= self._scalar_scale("k_scale", k_scale)
-        scale_v = self._scalar_scale("v_scale", v_scale)
+        variant = None
+        if k.shape[0]:
+            variant = self._check_capture_variant(
+                lse is not None, q_scale, k_scale, v_scale
+            )
         sm120_fmha_fp8_ragged_prefill(
             q,
             k,
@@ -1202,11 +1201,15 @@ class SM120PrimsBatchPrefillBackend:
             self._kv_indptr,
             max_seqlen_q=self._max_seqlen_q,
             is_causal=self._causal,
-            sm_scale=sm_scale,
-            v_scale=scale_v,
+            sm_scale=self._sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             lse=lse,
             enable_pdl=enable_pdl,
         )
+        if variant is not None:
+            self._compiled_variants.add(variant)
 
     def run_paged(
         self,
@@ -1218,9 +1221,9 @@ class SM120PrimsBatchPrefillBackend:
         return_lse: bool,
         lse: Optional[torch.Tensor],
         enable_pdl: bool,
-        q_scale: Optional[float],
-        k_scale: Optional[float],
-        v_scale: Optional[float],
+        q_scale: Optional[Union[float, torch.Tensor]],
+        k_scale: Optional[Union[float, torch.Tensor]],
+        v_scale: Optional[Union[float, torch.Tensor]],
     ):
         self._validate_run(q, k, v, out)
         if self._mode != "paged":
@@ -1234,15 +1237,7 @@ class SM120PrimsBatchPrefillBackend:
                 )
         else:
             lse = None
-        self._ensure_kernel(with_lse=return_lse)
-        sm_scale = (
-            self._sm_scale
-            if self._sm_scale is not None
-            else 1.0 / math.sqrt(self._head_dim)
-        )
-        sm_scale *= self._scalar_scale("q_scale", q_scale)
-        sm_scale *= self._scalar_scale("k_scale", k_scale)
-        scale_v = self._scalar_scale("v_scale", v_scale)
+        variant = self._check_capture_variant(return_lse, q_scale, k_scale, v_scale)
         split = self._kv_split
         if split is not None:
             from flashinfer.cascade import get_cascade_module
@@ -1256,14 +1251,17 @@ class SM120PrimsBatchPrefillBackend:
                 self._seqlens_kv,
                 self._qo_indptr,
                 is_causal=self._causal,
-                sm_scale=sm_scale,
-                v_scale=scale_v,
+                sm_scale=self._sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 max_seqlen_q=self._max_seqlen_q,
                 lse=split.lse,
                 enable_pdl=enable_pdl,
                 kv_tile_ranges=split.kv_tile_ranges,
                 gqa_pack_size=self._gqa_pack_size,
             )
+            self._compiled_variants.add(variant)
             rows, n = split.total_q, split.num_chunks
             get_cascade_module().merge_states(
                 split.o.view(rows, n, *out.shape[1:]),
@@ -1283,13 +1281,16 @@ class SM120PrimsBatchPrefillBackend:
             self._seqlens_kv,
             self._qo_indptr,
             is_causal=self._causal,
-            sm_scale=sm_scale,
-            v_scale=scale_v,
+            sm_scale=self._sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             max_seqlen_q=self._max_seqlen_q,
             lse=lse,
             enable_pdl=enable_pdl,
             gqa_pack_size=self._gqa_pack_size,
         )
+        self._compiled_variants.add(variant)
         if return_lse:
             return out, lse
         return out

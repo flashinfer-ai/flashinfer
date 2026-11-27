@@ -42,6 +42,22 @@ def _validate_balanced_scheduler(is_causal: bool, balanced_scheduler: bool) -> N
         raise ValueError("balanced_scheduler=True requires is_causal=True")
 
 
+def _fake_scale_args(tensor_scales):
+    q, k, v = (
+        make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
+        if enabled
+        else None
+        for enabled in tensor_scales
+    )
+    one = cutlass.Float64(1.0)
+    softmax_scale = (
+        (one, q if q is not None else one, k if k is not None else one)
+        if q is not None or k is not None
+        else cutlass.Float32(1.0)
+    )
+    return softmax_scale, v if v is not None else cutlass.Float32(1.0)
+
+
 def _compile_sm120_fmha_fp8_ragged_kernel(
     in_dtype: torch.dtype,
     out_dtype: torch.dtype,
@@ -55,6 +71,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
     with_lse: bool = False,
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
+    tensor_scales: tuple[bool, bool, bool] = (False, False, False),
 ):
     """Compile one sequence-length-independent packed ragged kernel."""
 
@@ -130,8 +147,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
         fake_v,
         fake_o,
         fake_lse,
-        cutlass.Float32(1.0),  # softmax_scale_log2 placeholder
-        cutlass.Float32(1.0),  # output_scale placeholder
+        *_fake_scale_args(tensor_scales),
         fake_skip_softmax_threshold,
         stream_fake,
         None,  # seqlens_kv
@@ -160,6 +176,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     enable_skip_softmax: bool = False,
     with_kv_tile_ranges: bool = False,
     gqa_pack_size: int = 1,
+    tensor_scales: tuple[bool, bool, bool] = (False, False, False),
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -273,8 +290,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         fake_v,
         fake_o,
         fake_lse,
-        cutlass.Float32(1.0),  # softmax_scale_log2 placeholder
-        cutlass.Float32(1.0),  # output_scale placeholder
+        *_fake_scale_args(tensor_scales),
         fake_skip_softmax_threshold,
         stream_fake,
         fake_seqlens_kv,
@@ -314,6 +330,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
     with_lse: bool = False,
     balanced_scheduler: bool = False,
     enable_skip_softmax: bool = False,
+    tensor_scales: tuple[bool, bool, bool] = (False, False, False),
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -329,6 +346,10 @@ def compile_sm120_fmha_fp8_ragged_kernel(
         f"_lse{int(with_lse)}_balanced{int(balanced_scheduler)}"
         f"_skip{int(enable_skip_softmax)}"
     )
+    if any(tensor_scales):
+        kernel_name += "_scales" + "".join(
+            str(int(enabled)) for enabled in tensor_scales
+        )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
         kernel_name,
@@ -345,6 +366,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
             with_lse,
             balanced_scheduler,
             enable_skip_softmax,
+            tensor_scales,
         ),
         extra_key_files=_cache_key_files(),
     )
@@ -367,6 +389,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     enable_skip_softmax: bool = False,
     with_kv_tile_ranges: bool = False,
     gqa_pack_size: int = 1,
+    tensor_scales: tuple[bool, bool, bool] = (False, False, False),
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -385,6 +408,10 @@ def compile_sm120_fmha_fp8_paged_kernel(
         + ("_kvsplit" if with_kv_tile_ranges else "")
         + (f"_gqa{gqa_pack_size}" if gqa_pack_size > 1 else "")
     )
+    if any(tensor_scales):
+        kernel_name += "_scales" + "".join(
+            str(int(enabled)) for enabled in tensor_scales
+        )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
         kernel_name,
@@ -404,6 +431,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
             enable_skip_softmax,
             with_kv_tile_ranges,
             gqa_pack_size,
+            tensor_scales,
         ),
         extra_key_files=_cache_key_files(),
     )
