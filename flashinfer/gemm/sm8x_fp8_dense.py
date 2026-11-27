@@ -35,6 +35,7 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..fused_moe.core import _w4a16_moe_sm80_module
+from ..utils import get_shared_bytes_per_block_optin
 from .sm8x_fp4_dense import _ones, _out_module, _pad
 
 _E4M3, _E5M2 = torch.float8_e4m3fn, torch.float8_e5m2
@@ -115,6 +116,46 @@ def _route_ints(
     return 1 + 2 * max_blocks, max_blocks * r, (-(-rows // 2048) + 1) * groups
 
 
+def _prep_routes(groups: int, r: int, device: torch.device) -> bool:
+    """Whether the W4A16 prep's shared table holds ``groups`` groups at row tile ``r``: its
+    ``num_experts`` bound (3 ints a group below a 64-row tile, 2 from it), 64 ints set aside
+    (the prep's own 32, the 64-row one's 64)."""
+    ints = get_shared_bytes_per_block_optin(device) // 4 - 64
+    return (3 if r < 64 else 2) * groups <= ints
+
+
+def _group_rows(
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    rows: int,
+    r: int,
+    max_blocks: int,
+    meta: torch.Tensor,
+    rowmap: torch.Tensor,
+    perm: Optional[torch.Tensor] = None,
+) -> None:
+    """``meta`` and ``rowmap`` of ``gemm_f8`` routing rows ``starts[i] .. ends[i]`` (disjoint,
+    clamped to ``0 .. rows``; ``perm``: rows ``perm[starts[i]] .. perm[ends[i] - 1]``) to batch
+    ``i`` in blocks of ``r`` rows, on the device (no host sync)."""
+    groups = int(starts.shape[0])
+    s = starts.clamp(0, rows)
+    sizes = (ends.clamp(0, rows) - s).clamp_(min=0)
+    nbg = (sizes + r - 1) // r
+    end = nbg.cumsum(0)
+    blk = torch.arange(max_blocks, device=s.device)
+    e = torch.searchsorted(end, blk, right=True).clamp_(max=groups - 1)
+    local = blk - end[e] + nbg[e]
+    cnt = (sizes[e] - local * r).clamp_(0, r)
+    j = torch.arange(r, device=s.device)
+    meta[:1].copy_(end[-1:])
+    meta[1 : 1 + max_blocks].copy_(e)
+    meta[1 + max_blocks :].copy_(cnt)
+    row = s[e, None] + local[:, None] * r + j
+    if perm is not None:
+        row = perm[row.clamp_(max=rows - 1)]
+    rowmap.view(max_blocks, r).copy_(torch.where(j < cnt[:, None], row, -1))
+
+
 def _route_rows(
     ids: torch.Tensor,
     groups: int,
@@ -126,13 +167,21 @@ def _route_rows(
 ) -> None:
     """``meta`` and ``rowmap`` of ``gemm_f8`` / ``gemm_fp4`` routing row ``f`` to group
     ``ids[f]`` (int32; -1 or from ``groups``: nowhere) in blocks of ``r`` rows, the groups in
-    order and a group's rows in theirs: the W4A16 prep's routing, on the device (no host
-    sync). ``max_blocks``: at least ``q + (rows - q) // r``, ``q = min(groups, rows)``; the
-    blocks past the routed ones are left unwritten (the GEMMs stop at ``meta[0]``)."""
-    _w4a16_moe_sm80_module(None, False, None, False).prep(
-        ids, meta, rowmap, workspace, groups, r, max_blocks, None, None, None, False, None,
-        None, 0, None, None, None, None, None,
-    )  # fmt: skip
+    order and a group's rows in theirs, on the device (no host sync): the W4A16 prep's
+    routing, past its shared table (``_prep_routes``) the rows sorted by group. ``max_blocks``:
+    at least ``q + (rows - q) // r``, ``q = min(groups, rows)``; the blocks past the routed
+    ones are left unwritten (the GEMMs stop at ``meta[0]``)."""
+    if _prep_routes(groups, r, ids.device):
+        _w4a16_moe_sm80_module(None, False, None, False).prep(
+            ids, meta, rowmap, workspace, groups, r, max_blocks, None, None, None, False,
+            None, None, 0, None, None, None, None, None,
+        )  # fmt: skip
+        return
+    ids = ids.reshape(-1)
+    keys = torch.where((ids >= 0) & (ids < groups), ids, groups).long()
+    sk, perm = torch.sort(keys, stable=True)
+    ip = torch.searchsorted(sk, torch.arange(groups + 1, device=ids.device))
+    _group_rows(ip[:-1], ip[1:], int(ids.shape[0]), r, max_blocks, meta, rowmap, perm)
 
 
 def _indptr_ids(ip: torch.Tensor, rows: int) -> torch.Tensor:
@@ -892,15 +941,18 @@ def _run_rows_fp4(
     module = _w4a16_moe_sm80_module(None, False, None, False)
     asf = _aligned(a_scale.view(torch.uint8), 4)
     ids = _span_ids(starts, ends, rows)
-    if fmt is None:
-        _route_rows(ids, groups, r, max_blocks, meta, rowmap, workspace)
-    else:  # restored in token order by the prep routing the rows
+    fits = _prep_routes(groups, r, a.device)
+    if fmt is not None:
+        # restored in token order by the prep, routing the rows if it can
         tok = torch.empty((rows, k), dtype=torch.bfloat16, device=a.device)
         module.prep(
-            ids, meta, rowmap, workspace, groups, r, max_blocks,
+            ids if fits else torch.zeros_like(ids), meta, rowmap, workspace,
+            groups if fits else 1, r, max_blocks,
             _aligned(a.view(torch.uint8), 16).view(rows, -1), asf, tok, True, None, None,
             fmt, None, None, None, None, None,
         )  # fmt: skip
+    if fmt is None or not fits:
+        _route_rows(ids, groups, r, max_blocks, meta, rowmap, workspace)
     idx, e5 = rowmap.clamp(min=0), a.dtype == torch.float8_e5m2
     if fmt is None:
         act = a.view(torch.uint8).index_select(0, idx).view(a.dtype)
