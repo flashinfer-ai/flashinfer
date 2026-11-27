@@ -147,6 +147,8 @@ def test_unified_selector_is_not_forwarded_to_other_patterns(
     assert result is output
     assert len(calls) == 1
     assert "backend" not in calls[0]
+    assert calls[0]["allreduce_in"] is input
+    assert calls[0]["allreduce_out"] is output
 
 
 @pytest.mark.cpu_only

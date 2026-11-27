@@ -1306,38 +1306,21 @@ def allreduce_fusion(
         ):
             output = torch.empty_like(input)
 
-        # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
-        # The legacy API expects flattened tensors and explicit token_num/hidden_dim
-        # We require contiguous tensors so that view(-1) creates a view (not a copy),
-        # ensuring writes to the flattened tensors are reflected in the original 2D tensors
-        def _flatten_checked(t, name):
-            if not t.is_contiguous():
+        # The native binding takes data pointers and explicit sizes. Preserve
+        # the layout check without constructing a view of each argument.
+        for name, tensor in (
+            ("input", input),
+            ("output", output),
+            ("residual_in", residual_in),
+            ("residual_out", residual_out),
+            ("norm_out", norm_out),
+            ("quant_out", quant_out),
+        ):
+            if tensor is not None and not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
-            return t.view(-1)
 
-        input_flat = _flatten_checked(input, "input")
-        output_flat = _flatten_checked(output, "output") if output is not None else None
-        residual_in_flat = (
-            _flatten_checked(residual_in, "residual_in")
-            if residual_in is not None
-            else None
-        )
-        residual_out_flat = (
-            _flatten_checked(residual_out, "residual_out")
-            if residual_out is not None
-            else None
-        )
-        norm_out_flat = (
-            _flatten_checked(norm_out, "norm_out") if norm_out is not None else None
-        )
-        quant_out_flat = (
-            _flatten_checked(quant_out, "quant_out") if quant_out is not None else None
-        )
-
-        # Call legacy API with flattened tensors
-        # Note: pattern and layout_code are ints but legacy API uses pseudo-type hints
         trtllm_allreduce_fusion(
-            allreduce_in=input_flat,
+            allreduce_in=input,
             world_size=workspace.world_size,
             world_rank=workspace.rank,
             token_num=token_num,
@@ -1348,11 +1331,11 @@ def allreduce_fusion(
             fp32_acc=fp32_acc,
             pattern_code=pattern,  # type: ignore[arg-type]
             use_oneshot=use_oneshot,
-            allreduce_out=output_flat,
-            residual_in=residual_in_flat,
-            residual_out=residual_out_flat,
-            norm_out=norm_out_flat,
-            quant_out=quant_out_flat,
+            allreduce_out=output,
+            residual_in=residual_in,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            quant_out=quant_out,
             scale_out=scale_out,  # scale_out is not reshaped
             rms_gamma=rms_gamma,  # 1D tensor, no reshape needed
             rms_eps=rms_eps,
