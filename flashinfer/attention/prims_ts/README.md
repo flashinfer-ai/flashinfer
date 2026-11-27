@@ -790,6 +790,73 @@ out8 = wrappers8[ops8.demean].run(ops8.q, ops8.k, ops8.v, vc=ops8.params)
 The one-shot `batch_prefill(..., vc=ops.params)` plans the recipe from the
 operands; `vc_config` without `vc` is rejected.
 
+## Quantized output
+
+Context plans (`BatchPrefillTSWrapper`, `BatchPrefillPagedTSWrapper` and their
+one-shot APIs) and FMHA decode plans (`BatchDecodePagedTSWrapper`,
+`batch_decode_with_paged_kv_cache`) can write a block-scaled output. The
+pair `(out_dtype, out_scale_dtype)` selects the format: wrapper plans take
+`plan(out_dtype=..., out_scale_dtype=...)`, and one-shot calls take the scale
+dtype from their `out_scale` buffer, inferring `out_dtype` from it when
+omitted. `out` keeps the usual output shape, and `out_scale` holds one scale
+per `sf_vec_size` channels of the `[tokens, Hq * Dv]` view of `out`. `tokens`
+is `B * Sq`, `total_q`, or `B` for single-token decode.
+
+| `out_dtype` | `out_scale_dtype` | Format | `sf_vec_size` |
+| --- | --- | --- | --- |
+| `torch.float8_e4m3fn` | `torch.float8_e8m0fnu` or `torch.uint8` | MXFP8 (UE8M0 scales) | 32 |
+
+`uint8` scales hold the same UE8M0 bytes, as `mxfp8_quantize` returns and
+`mm_mxfp8` takes them; both spellings share compiled kernels. The formats are
+listed in `quant_output.py` (host) and `kernels/quant_output.py` (device
+recipes).
+
+MXFP8 follows trtllm-gen's `MxE4m3` FMHA output recipe, the OCP MX shared
+exponent, after `output_scale` and any attention sink apply:
+
+```text
+scale = 2 ** (floor(log2(amax)) - 8)        per 32-channel block
+data  = cvt.rn.satfinite.e4m3(value / scale)
+```
+
+A block's largest value lands in `[256, 512)` and saturates at 448, which
+clips it by up to 12.5%; `mxfp8_quantize` instead rounds the scale up and
+never clips. An all-zero block stores exponent byte 0.
+
+Scales use the 128x4 swizzled layout of
+`mxfp8_quantize(..., is_sf_swizzled_layout=True)`: a buffer of
+`round_up(tokens, 128) * round_up(Hq * Dv / sf_vec_size, 4)` one-byte scales,
+so an MXFP8 attention output feeds `mm_mxfp8` directly:
+
+```python
+mm_mxfp8(
+    out.view(tokens, -1),
+    weight,
+    out_scale.view(torch.uint8).view(-1),
+    weight_scale,
+    ...,
+)
+```
+
+`mm_mxfp8` takes `uint8` scales as a flat swizzled buffer (it reads a rank-2
+scale tensor as the linear layout), while attention returns E8M0 scales and a
+caller's buffer in its original shape, hence the two views. Padding rows and
+columns are not written, and inactive decode requests leave their output rows
+and scale bytes untouched.
+
+`run(..., out_scale=None)` allocates a flat buffer of the planned
+`out_scale_dtype`. A caller buffer is any contiguous tensor of that dtype and
+size (for example the 2-D padded view) and is returned as given. Runs return
+`(out, out_scale)`, or `(out, out_scale, lse)` with `return_lse=True`. Capture
+CUDA graphs with caller `out` and `out_scale` and `validate=False`.
+
+| Kernel | Inputs | Implementation |
+| --- | --- | --- |
+| Context | Every combination with a 16-bit or E4M3 output, except MXFP8 Q/K, Sage and VC plans (16-bit outputs) | The correction epilogue owns one O row per thread: it quantizes each scale block in registers, stages the data for the TMA store, and writes the row's scales. |
+| FMHA decode | Every combination with a 16-bit output | The plan is the FP16 (FP16 Q) or BF16 output plan, with the same policy, workspace and split-KV partials. Only the final stores quantize: Keeps and KV256 tails per lane, the Swaps staged copy, the Q48+ Swaps band drain and the fused, cluster and standalone split-KV reducers per scale block of adjacent 8-channel fragments. `output_scale` applies in FP32 before the block scale is chosen: Swaps stages O in the carrier without it, and standalone split-KV partials are BF16, so an FP16 carrier cannot overflow. Prepared plans (`prepare_prims_ts_batch_decode_with_kv_cache`) keep their 16-bit/E4M3 outputs. |
+
+`fi_trace` templates do not describe quantized outputs yet.
+
 ## Validation
 
 ### Validation scope

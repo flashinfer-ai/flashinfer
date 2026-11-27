@@ -79,6 +79,7 @@ from .fmha_decode_resources.helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _final_output_lse,
 )
+from ..quant_output import fragment_block_amax, quant_store_row_fragment
 from ..separate_reduction import (
     merge_log2_lse,
     unpack_normalized_vec8,
@@ -165,6 +166,8 @@ def _reduce_exact_splits_body(
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     wait_for_pdl_producer: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
+    num_qo_heads: Int32 = 0,
     requested_splits=None,
 ) -> None:
     """Fold every split in one 512-thread CTA over one 8 KiB output slice.
@@ -311,6 +314,14 @@ def _reduce_exact_splits_body(
                     )
                 global_lse = new_lse
 
+    # Invalid rows keep zero values; every lane takes its scale block's
+    # maximum before the row predicate (``group_amax``).
+    quant_raw_amax = None
+    if cutlass.const_expr(cfg.quant_output is not None):
+        quant_raw_amax = fragment_block_amax(
+            output_vals, OUTPUT_VALUES_PER_THREAD, cfg.quant_output
+        )
+    if valid_reduce_row:
         _store_parallel_reduction_output(
             output_vals,
             global_lse,
@@ -324,6 +335,9 @@ def _reduce_exact_splits_body(
             attention_sink_head_idx,
             cfg,
             lse_ptr=lse_ptr,
+            o_sf_ptr=o_sf_ptr,
+            num_qo_heads=num_qo_heads,
+            quant_raw_amax=quant_raw_amax,
         )
 
 
@@ -339,6 +353,8 @@ def decode_gen_separate_reduction_kernel(
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
+    num_qo_heads: Int32 = 0,
     requested_splits=None,
 ) -> None:
     """Run the 512-thread exact-split reference schedule."""
@@ -354,6 +370,8 @@ def decode_gen_separate_reduction_kernel(
         cfg,
         static_full_split_prefix,
         lse_ptr=lse_ptr,
+        o_sf_ptr=o_sf_ptr,
+        num_qo_heads=num_qo_heads,
         requested_splits=requested_splits,
     )
 
@@ -400,12 +418,22 @@ def _store_parallel_reduction_output(
     attention_sink_head_idx: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
+    num_qo_heads: Int32 = 0,
+    lane_stride: cutlass.Constexpr[int] = 1,
+    quant_raw_amax: Float32 | None = None,
 ) -> None:
     """Merge the optional sink and store one normalized output fragment.
 
     Producer CTAs already fold the softmax scale into log2-LSE and, for FP8
     output, fold the output quantization scale into normalized partial O. The
     standalone reducer therefore only merges normalized states here.
+
+    Callers store valid rows only. A quantized output passes
+    ``quant_raw_amax``, the unscaled maximum of the fragment's scale block,
+    combined with the other storing lanes ``lane_stride`` apart. Every lane
+    of the warp computes it with ``fragment_block_amax`` before the row
+    predicate.
     """
 
     split_weight = _final_output_lse(
@@ -417,6 +445,23 @@ def _store_parallel_reduction_output(
         h_k_idx * attention_sink_h_r + attention_sink_head_idx,
         reduce_col_idx == Int32(0),
     )
+
+    if cutlass.const_expr(cfg.quant_output is not None):
+        quant_store_row_fragment(
+            output_vals,
+            split_weight,
+            o_iter.toint(),
+            Int64(output_row_idx) * Int64(cfg.headdim) + Int64(reduce_col_idx),
+            o_sf_ptr.toint(),
+            num_qo_heads,
+            cutlass.Boolean(True),
+            cfg.headdim,
+            OUTPUT_VALUES_PER_THREAD,
+            cfg.quant_output,
+            lane_stride,
+            raw_amax=quant_raw_amax,
+        )
+        return
 
     final_regs = cutlass.Array(
         Int32,
@@ -490,6 +535,8 @@ def decode_gen_parallel_separate_reduction_kernel(
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
+    num_qo_heads: Int32 = 0,
     requested_splits=None,
     compact_schedule: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -517,6 +564,8 @@ def decode_gen_parallel_separate_reduction_kernel(
             static_full_split_prefix,
             cfg.use_parallel_separate_reduction_pdl,
             lse_ptr=lse_ptr,
+            o_sf_ptr=o_sf_ptr,
+            num_qo_heads=num_qo_heads,
             requested_splits=requested_splits,
         )
         return
@@ -781,6 +830,13 @@ def decode_gen_parallel_separate_reduction_kernel(
                         + lane_peer_vals[elem_idx] * lane_peer_weight
                     )
                 global_lse = lane_merged_lse
+        # The storing lanes of a scale block sit ``slot_lanes`` apart; every
+        # lane takes its block maximum before the row/slot predicate.
+        quant_raw_amax = None
+        if cutlass.const_expr(cfg.quant_output is not None):
+            quant_raw_amax = fragment_block_amax(
+                output_vals, OUTPUT_VALUES_PER_THREAD, cfg.quant_output, slot_lanes
+            )
         if valid_reduce_row and lane_slot == Int32(0):
             _store_parallel_reduction_output(
                 output_vals,
@@ -795,6 +851,10 @@ def decode_gen_parallel_separate_reduction_kernel(
                 attention_sink_head_idx,
                 cfg,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
+                num_qo_heads=num_qo_heads,
+                lane_stride=slot_lanes,
+                quant_raw_amax=quant_raw_amax,
             )
         return
 
@@ -907,52 +967,64 @@ def decode_gen_parallel_separate_reduction_kernel(
     if cutlass.const_expr(cfg.parallel_reduction_cluster_size == 16):
         final_input_partials = PARALLEL_REDUCTION_FINAL_REDUCERS
 
-    if (cluster_rank == Int32(0)) & valid_reduce_row:
+    # The rank check is CTA-uniform, so whole warps enter; rows are merged
+    # and stored per lane, with a quantized output's block maximum between.
+    if cluster_rank == Int32(0):
         final_vals = cutlass.Array(
             Float32, OUTPUT_VALUES_PER_THREAD, space=cutlass.AddressSpace.rmem
         )
         for elem_idx in cutlass.range_constexpr(OUTPUT_VALUES_PER_THREAD):
             final_vals[elem_idx] = Float32(0.0)
         final_lse = Float32(-Float32.inf)
-        for peer_rank_i in cutlass.range_constexpr(final_input_partials):
-            peer_rank = Int32(peer_rank_i)
-            if cutlass.const_expr(cfg.parallel_reduction_cluster_size == 16):
-                peer_rank = Int32(peer_rank_i * PARALLEL_REDUCTION_FINAL_REDUCERS)
-            peer_lse = prims.mapa(smem_lse.data_ptr(), peer_rank)
-            peer_partial_o = prims.mapa(smem_partial_o.data_ptr(), peer_rank)
-            local_lse = (peer_lse + stats_smem_offset).load()
-            loaded_partial_regs = (peer_partial_o + partial_o_smem_offset).load(
-                count=PACKED_OUTPUT_REGS_PER_THREAD,
-                alignment=PACKED_OUTPUT_REGS_PER_THREAD * PACKED_REGISTER_BYTES,
-            )
-            new_lse, old_weight, partial_weight = merge_log2_lse(
-                final_lse,
-                local_lse,
-            )
-            partial_vals = unpack_normalized_vec8(
-                loaded_partial_regs, cfg.use_bf16_separate_partial_o
-            )
-            for elem_idx in cutlass.range_constexpr(OUTPUT_VALUES_PER_THREAD):
-                final_vals[elem_idx] = (
-                    final_vals[elem_idx] * old_weight
-                    + partial_vals[elem_idx] * partial_weight
+        if valid_reduce_row:
+            for peer_rank_i in cutlass.range_constexpr(final_input_partials):
+                peer_rank = Int32(peer_rank_i)
+                if cutlass.const_expr(cfg.parallel_reduction_cluster_size == 16):
+                    peer_rank = Int32(peer_rank_i * PARALLEL_REDUCTION_FINAL_REDUCERS)
+                peer_lse = prims.mapa(smem_lse.data_ptr(), peer_rank)
+                peer_partial_o = prims.mapa(smem_partial_o.data_ptr(), peer_rank)
+                local_lse = (peer_lse + stats_smem_offset).load()
+                loaded_partial_regs = (peer_partial_o + partial_o_smem_offset).load(
+                    count=PACKED_OUTPUT_REGS_PER_THREAD,
+                    alignment=PACKED_OUTPUT_REGS_PER_THREAD * PACKED_REGISTER_BYTES,
                 )
-            final_lse = new_lse
+                new_lse, old_weight, partial_weight = merge_log2_lse(
+                    final_lse,
+                    local_lse,
+                )
+                partial_vals = unpack_normalized_vec8(
+                    loaded_partial_regs, cfg.use_bf16_separate_partial_o
+                )
+                for elem_idx in cutlass.range_constexpr(OUTPUT_VALUES_PER_THREAD):
+                    final_vals[elem_idx] = (
+                        final_vals[elem_idx] * old_weight
+                        + partial_vals[elem_idx] * partial_weight
+                    )
+                final_lse = new_lse
 
-        _store_parallel_reduction_output(
-            final_vals,
-            final_lse,
-            o_iter,
-            g_attention_sinks,
-            output_row_idx,
-            reduce_col_idx,
-            h_k_idx,
-            attention_sink_h_r,
-            grid_h_k,
-            attention_sink_head_idx,
-            cfg,
-            lse_ptr=lse_ptr,
-        )
+        final_raw_amax = None
+        if cutlass.const_expr(cfg.quant_output is not None):
+            final_raw_amax = fragment_block_amax(
+                final_vals, OUTPUT_VALUES_PER_THREAD, cfg.quant_output
+            )
+        if valid_reduce_row:
+            _store_parallel_reduction_output(
+                final_vals,
+                final_lse,
+                o_iter,
+                g_attention_sinks,
+                output_row_idx,
+                reduce_col_idx,
+                h_k_idx,
+                attention_sink_h_r,
+                grid_h_k,
+                attention_sink_head_idx,
+                cfg,
+                lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
+                num_qo_heads=num_qo_heads,
+                quant_raw_amax=final_raw_amax,
+            )
 
     # Keep every peer CTA alive until rank zero has finished its DSMEM reads.
     prims.barrier_cluster_arrive_relaxed()
@@ -972,6 +1044,7 @@ def fmha_decode_separate_reduction_launch(
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
     requested_splits=None,
     runtime_q_capacity_rows: Int32 = 0,
 ) -> None:
@@ -987,6 +1060,12 @@ def fmha_decode_separate_reduction_launch(
     """
     b, h_q, h_k, _, _ = problem_shape
     h_r = h_q // h_k
+    num_qo_heads = Int32(0)
+    if cutlass.const_expr(cfg.quant_output is not None):
+        # The row divisor of the public O rows, as the producer's final stores.
+        num_qo_heads = h_q
+        if cutlass.const_expr(cfg.use_variable_seqlens_q or cfg.is_multi_token_q):
+            num_qo_heads = h_k * Int32(cfg.heads_q_per_kv)
     q_output_rows = runtime_q_capacity_rows if not cfg.fixed_seqlen else h_r
     if cutlass.const_expr(cfg.fixed_seqlen and cfg.is_multi_token_q):
         q_output_rows = h_r * Int32(cfg.max_seq_len_q)
@@ -1044,6 +1123,8 @@ def fmha_decode_separate_reduction_launch(
                     cfg,
                     static_full_split_prefix,
                     lse_ptr=lse_ptr,
+                    o_sf_ptr=o_sf_ptr,
+                    num_qo_heads=num_qo_heads,
                     requested_splits=requested_splits,
                     compact_schedule=True,
                 ).launch(
@@ -1065,6 +1146,8 @@ def fmha_decode_separate_reduction_launch(
                     cfg,
                     static_full_split_prefix,
                     lse_ptr=lse_ptr,
+                    o_sf_ptr=o_sf_ptr,
+                    num_qo_heads=num_qo_heads,
                     requested_splits=requested_splits,
                 ).launch(
                     grid=(num_parallel_slices * cluster_size, h_k, b),
@@ -1085,6 +1168,8 @@ def fmha_decode_separate_reduction_launch(
                 cfg,
                 static_full_split_prefix,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
+                num_qo_heads=num_qo_heads,
                 requested_splits=requested_splits,
             ).launch(
                 grid=(num_parallel_slices * cluster_size, h_k, b),
@@ -1105,6 +1190,8 @@ def fmha_decode_separate_reduction_launch(
         cfg,
         static_full_split_prefix,
         lse_ptr=lse_ptr,
+        o_sf_ptr=o_sf_ptr,
+        num_qo_heads=num_qo_heads,
         requested_splits=requested_splits,
     ).launch(
         grid=(num_reduction_slices, h_k, b),

@@ -1277,6 +1277,25 @@ def _fmha_encoded_page_size(kwargs, *, cache_param: str) -> int:
     return semantic_page_size
 
 
+def _reject_prims_ts_quant_output_trace(kwargs, plan_state=None) -> None:
+    """Refuse PrimTS decode calls with a quantized (block-scaled) output.
+
+    The decode schemas describe one 16-bit or E4M3 output. A quantized call
+    writes E4M3 data plus an ``out_scale`` tensor, and its data dtype may be
+    inferred from ``out_scale`` alone, so it would be traced as a plain
+    output without its scales. Reject it until the schemas describe the
+    scale output; the call itself still runs when auto-dump catches this.
+    """
+    if (
+        kwargs.get("out_scale") is not None
+        or getattr(plan_state, "out_scale_dtype", None) is not None
+    ):
+        raise NotImplementedError(
+            "fi_trace does not describe PrimTS quantized decode outputs "
+            "(out_scale / out_scale_dtype) yet"
+        )
+
+
 def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_state=None):
     query = kwargs.get(query_param)
     if kwargs.get("qo_indptr") is not None:
@@ -1475,6 +1494,7 @@ _ATTENTION_TS_DECODE_TRACES = {
 def attention_ts_decode_trace_dispatch(**kwargs):
     """Select one-shot FMHA storage, cache, and output-dtype schema."""
 
+    _reject_prims_ts_quant_output_trace(kwargs)
     combined, out_dtype, q_mode = _fmha_trace_variant(
         kwargs, query_param="q", cache_param="paged_kv_cache"
     )
@@ -1791,6 +1811,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     state = getattr(wrapper, "_plan_state", None)
     if state is None:
         raise RuntimeError("plan() must be called before run()")
+    _reject_prims_ts_quant_output_trace(kwargs, state)
     plan_owns_seq_lens = getattr(state, "planned_seq_lens_kv_device", None) is not None
     run_seq_lens = kwargs.get("seq_lens_kv")
     if plan_owns_seq_lens:
