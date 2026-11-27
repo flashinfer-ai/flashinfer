@@ -648,10 +648,14 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;
 
-  // We introduce this as a separate parameter, so that if we ever remove the above condition we can
-  // decouple BackBoneType and OutputType easily. For now these are required to be equivalent
-  static_assert(std::is_same_v<OutputType, BackBoneType>,
-                "Scale and bias types must match OutputType");
+  // BackBoneType is the GEMMs' output, scale and bias type; OutputType is the final output's. They
+  // differ only for an FP32 final output over a 16-bit backbone: the per-expert GEMM outputs stay
+  // in the backbone type and the (unfused) finalize sums them in FP32 and writes FP32, so a caller
+  // can add partial MoE outputs (e.g. experts run in groups) without rounding each partial sum.
+  static constexpr bool fp32_final_output =
+      std::is_same_v<OutputType, float> && !std::is_same_v<BackBoneType, float>;
+  static_assert(std::is_same_v<OutputType, BackBoneType> || fp32_final_output,
+                "OutputType must match BackBoneType, or be float over a 16-bit backbone");
 
  public:
   CutlassMoeFCRunner();
@@ -721,7 +725,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               cudaStream_t stream) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
-  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+  static void gemm1(MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX,
                                   Sm90Wfp4Afp8Mode>& gemm_runner,
                     // This argument must not be null if fp8 block scaling is being used.
                     // The gemm_runner will be ignored in that case. NOTE: it would
@@ -749,7 +753,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
 
   static void gemm2(
-      MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
+      MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
           gemm_runner,
       DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
       void* const gemm_output, OutputType* const final_output,
@@ -953,13 +957,16 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
   bool mayHaveFinalizeFused() const {
+    // The fused finalize epilogue writes the GEMM's (backbone) type: an FP32 final output takes
+    // the unfused finalize.
     return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() >= 90 &&
-           use_fused_finalize_ && !use_sm90_mixed_input_gemm;
+           use_fused_finalize_ && !use_sm90_mixed_input_gemm && !fp32_final_output;
   }
 
   static bool mayHaveFinalizeFused(int sm) {
     using RunnerType = decltype(moe_gemm_runner_);
-    return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_sm90_mixed_input_gemm;
+    return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_sm90_mixed_input_gemm &&
+           !fp32_final_output;
   }
 
   // TODO: This should eventually take the quant params to give more flexibility
@@ -1018,7 +1025,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                               int64_t const expanded_num_rows, int64_t const seq_len,
                               bool const use_awq, cudaStream_t stream);
 
-  MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>
+  MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>
       moe_gemm_runner_;
   std::unique_ptr<DeepSeekBlockScaleGemmRunner> blockscale_gemm_runner_;
 

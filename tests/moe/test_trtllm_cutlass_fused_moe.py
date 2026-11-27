@@ -4971,5 +4971,110 @@ def test_vectorized_kernel_rejects_misaligned_input():
         )
 
 
+def _torch_moe_fp32(x, w31, w2, b31, b2, weights, experts, activation_type):
+    out = torch.zeros(x.shape[0], w2.shape[1], dtype=torch.float32, device=x.device)
+    for e in range(w31.shape[0]):
+        tok, slot = (experts == e).nonzero(as_tuple=True)
+        if tok.numel() == 0:
+            continue
+        h = x[tok].float() @ w31[e].float().t()
+        if b31 is not None:
+            h = h + b31[e].float()
+        if activation_type == ActivationType.Swiglu:
+            up, gate = h.chunk(2, dim=-1)
+            h = F.silu(gate) * up
+        else:
+            h = F.relu(h) ** 2
+        y = h @ w2[e].float().t()
+        if b2 is not None:
+            y = y + b2[e].float()
+        out.index_add_(0, tok, y * weights[tok, slot, None])
+    return out
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("batch_size", [1, 64, 512])
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.Relu2],
+    ids=["swiglu", "relu2"],
+)
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "bias"])
+def test_moe_fp32_output(dtype, batch_size, activation_type, with_bias):
+    """FP32 output over 16-bit GEMMs: matches a torch reference, equals the 16-bit output once
+    cast, and expert groups' FP32 outputs add up to one call. Relu2 takes another GEMM1 buffer
+    than SwiGLU on the TMA warp-specialized path."""
+    torch.manual_seed(0)
+    num_experts, top_k, group, hidden_size, inter_size = 32, 4, 8, 256, 128
+    fc1_rows = (
+        2 * inter_size if activation_type == ActivationType.Swiglu else inter_size
+    )
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    w31 = torch.randn(num_experts, fc1_rows, hidden_size, dtype=dtype, device="cuda")
+    w2 = torch.randn(num_experts, hidden_size, inter_size, dtype=dtype, device="cuda")
+    w31, w2 = w31 / hidden_size**0.5, w2 / inter_size**0.5
+    b31 = b2 = None
+    if with_bias:
+        b31 = 0.1 * torch.randn(num_experts, fc1_rows, dtype=dtype, device="cuda")
+        b2 = 0.1 * torch.randn(num_experts, hidden_size, dtype=dtype, device="cuda")
+    router_logits = torch.randn(
+        batch_size, num_experts, dtype=torch.float32, device="cuda"
+    )
+    weights, experts = compute_routing(router_logits, top_k)
+    experts = experts.to(torch.int)
+
+    def run(ids, scales, lo, hi, out_dtype):
+        return fused_moe.cutlass_fused_moe(
+            x,
+            ids,
+            scales,
+            w31[lo:hi],
+            w2[lo:hi],
+            out_dtype,
+            quant_scales=None,
+            fc1_expert_biases=None if b31 is None else b31[lo:hi],
+            fc2_expert_biases=None if b2 is None else b2[lo:hi],
+            activation_type=activation_type,
+        )[0]
+
+    out16 = run(experts, weights, 0, num_experts, dtype)
+    out32 = run(experts, weights, 0, num_experts, torch.float32)
+    assert out32.dtype == torch.float32
+    ref = _torch_moe_fp32(x, w31, w2, b31, b2, weights, experts, activation_type)
+    torch.testing.assert_close(out32, ref, rtol=2e-2, atol=2e-2)
+    assert torch.equal(out32.to(dtype), out16)
+
+    acc = torch.zeros(batch_size, hidden_size, dtype=torch.float32, device="cuda")
+    for lo in range(0, num_experts, group):
+        inside = (experts >= lo) & (experts < lo + group)
+        local = torch.where(inside, experts - lo, torch.full_like(experts, group))
+        acc += run(
+            local, weights.masked_fill(~inside, 0), lo, lo + group, torch.float32
+        )
+    torch.testing.assert_close(acc, out32, rtol=1e-5, atol=1e-6)
+    assert (acc.to(dtype) != out16).float().mean().item() < 1e-3
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+@pytest.mark.parametrize(
+    "weight_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16_weights", "fp8_weights"],
+)
+def test_moe_rejects_unsupported_output_dtype(weight_dtype):
+    """An output dtype the runner cannot write raises instead of being ignored. The runner is
+    built before the inputs are used, so the FP8 weights need no scales."""
+    x = torch.randn(2, 256, dtype=torch.bfloat16, device="cuda")
+    w31 = torch.randn(2, 256, 256, device="cuda").to(weight_dtype)
+    w2 = torch.randn(2, 256, 128, device="cuda").to(weight_dtype)
+    ids = torch.zeros(2, 1, dtype=torch.int, device="cuda")
+    scales = torch.ones(2, 1, dtype=torch.float32, device="cuda")
+    with pytest.raises(Exception, match="not supported"):
+        fused_moe.cutlass_fused_moe(
+            x, ids, scales, w31, w2, torch.float16, quant_scales=None
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

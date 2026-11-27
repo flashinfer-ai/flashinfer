@@ -22,11 +22,15 @@ template class CutlassMoeFCRunner<float, float>;
 
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16, float, __nv_bfloat16,
+                                  __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_bfloat16, uint8_t>;
 template class CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>;
 #endif
 
 template class CutlassMoeFCRunner<half, half>;
+// FP32 final output over 16-bit GEMMs (the finalize sums in FP32 and writes FP32).
+template class CutlassMoeFCRunner<half, half, float, half, half>;
 template class CutlassMoeFCRunner<half, uint8_t>;
 template class CutlassMoeFCRunner<half, cutlass::uint4b_t>;
 #ifdef ENABLE_FP8
@@ -67,7 +71,9 @@ template class CutlassMoeFCRunner<__nv_bfloat16, Fp4Type>;
 // symbols are emitted in the JIT library for common data types.
 INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
 INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
+INSTANTIATE_FINALIZE_MOE_ROUTING(float, half, half);
 #ifdef ENABLE_BF16
 INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
+INSTANTIATE_FINALIZE_MOE_ROUTING(float, __nv_bfloat16, __nv_bfloat16);
 #endif
 }  // namespace tensorrt_llm::kernels::cutlass_kernels
