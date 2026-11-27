@@ -11113,6 +11113,1148 @@ MODULES: dict[str, dict[str, Any]] = {
             "use_state_indices": True,
         },
     },
+    "cake_gdp_6108f3bb9a5231a2ccab": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_232_208",
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_6108f3bb9a5231a2ccab",
+        "kernel_symbol": "kernel_cake_gdp_6108f3bb9a5231a2ccab",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 197376,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_6108f3bb9a5231a2ccab",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+    },
+    "cake_gdp_31952c28b9b7f7594e32": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_232_208",
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "state_dtype": "bf16",
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_31952c28b9b7f7594e32",
+        "kernel_symbol": "kernel_cake_gdp_31952c28b9b7f7594e32",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 197376,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_31952c28b9b7f7594e32",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+    },
+    "cake_gdp_90c40c9a853e217d9464": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_232_208",
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "state_dtype": "f16",
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_90c40c9a853e217d9464",
+        "kernel_symbol": "kernel_cake_gdp_90c40c9a853e217d9464",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 197376,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_90c40c9a853e217d9464",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+    },
+    "cake_gdp_d8969198c1f1eb037c80": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_d8969198c1f1eb037c80",
+        "kernel_symbol": "kernel_cake_gdp_d8969198c1f1eb037c80",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_d8969198c1f1eb037c80",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+    },
+    "cake_gdp_334cfa42025043287dfa": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "state_dtype": "bf16",
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_334cfa42025043287dfa",
+        "kernel_symbol": "kernel_cake_gdp_334cfa42025043287dfa",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_334cfa42025043287dfa",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+    },
+    "cake_gdp_1e2a7c403e001992a9ab": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "csr": True,
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_240_232",
+            "plan_guard": True,
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "split_items": True,
+            "state_dtype": "f16",
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_1e2a7c403e001992a9ab",
+        "kernel_symbol": "kernel_cake_gdp_1e2a7c403e001992a9ab",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198528,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_1e2a7c403e001992a9ab",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_indices": "output_state_indices",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "philox_rounds": "philox_rounds",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "split_items": True,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_output_state_indices": True,
+            "use_state_indices": True,
+        },
+    },
     "cake_gdp_ff55032bc5fdf2697d77": {
         "arches": [
             "sm_100a",
@@ -15061,6 +16203,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_5acbda2bd1002fd68a95",
             "cake_gdp_edfb71d95c7a9c2a133d",
             "cake_gdp_446ecf26f72f95aacf84",
+            "cake_gdp_6108f3bb9a5231a2ccab",
+            "cake_gdp_31952c28b9b7f7594e32",
+            "cake_gdp_90c40c9a853e217d9464",
+            "cake_gdp_d8969198c1f1eb037c80",
+            "cake_gdp_334cfa42025043287dfa",
+            "cake_gdp_1e2a7c403e001992a9ab",
         ],
     },
     "sm_100a": {
@@ -15743,6 +16891,7 @@ def selected_prefill_module(
     store_final_state: bool,
     unit_gates: bool = False,
     unit_beta: bool = False,
+    state_dtype: str = "f32",
     **flags: bool,
 ) -> str:
     """The one single-pass program of the ``prefill`` route on ``arch`` whose flags are the call's: the initial
@@ -15753,7 +16902,9 @@ def selected_prefill_module(
     spelling one of them is read as off, and a program whose rule spells a flag on is selected only when it is
     asked for.  ``body`` restricts the search to the programs of one kernel body (``prefill_sm90_v6``, the V6 body,
     or ``prefill_sm90``, the merged body: ``prefill_body_class`` of the BODY ROUTE OF RECORD below picks the body of
-    every sequence); None searches every body of the route.  Exactly one program must match."""
+    every sequence); None searches every body of the route.  ``state_dtype`` is the state dtype the program's build
+    stores (``"f32"``, the default, for a build that spells none; the V6 pool programs with the write slot table,
+    ``use_output_state_indices``, also store ``"bf16"`` and ``"f16"``).  Exactly one program must match."""
 
     wanted = {
         "use_initial_state": bool(use_initial_state),
@@ -15770,6 +16921,8 @@ def selected_prefill_module(
             continue
         if MODULES[name]["select_rule"].get("kind") != "prefill_flags":
             continue  # the Blackwell body's programs: ``selected_v6_module``
+        if str(MODULES[name]["build"].get("state_dtype", "f32")) != state_dtype:
+            continue
         spelled = _prefill_flags(MODULES[name]["select_rule"])
         if all(
             spelled.get(flag, False) == value for flag, value in wanted.items()
@@ -15777,7 +16930,8 @@ def selected_prefill_module(
             matches.append(name)
     if len(matches) != 1:
         raise ValueError(
-            f"{len(matches)} programs of the {PREFILL_ROUTE!r} route on {arch!r} of body {body!r} spell the flags {wanted}: {matches}"
+            f"{len(matches)} programs of the {PREFILL_ROUTE!r} route on {arch!r} of body {body!r} with a "
+            f"{state_dtype} state spell the flags {wanted}: {matches}"
         )
     return matches[0]
 
