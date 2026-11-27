@@ -1,11 +1,11 @@
 import os
+import re
 import shutil
 import subprocess
-import re
 
 
 def _patch_triton_ptxas_blackwell():
-    """Point Triton at the system ptxas for Blackwell (CUDA >= 13)."""
+    """Point Triton at a newer system ptxas for Blackwell (CUDA >= 13)."""
     if os.environ.get("TRITON_PTXAS_BLACKWELL_PATH"):
         return
     ptxas = shutil.which("ptxas")
@@ -15,10 +15,18 @@ def _patch_triton_ptxas_blackwell():
         out = subprocess.check_output(
             [ptxas, "--version"], stderr=subprocess.STDOUT
         ).decode()
-    except subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         return
-    m = re.search(r"release (\d+)\.", out)
-    if m and int(m.group(1)) >= 13:
+    m = re.search(r"release (\d+)\.(\d+)", out)
+    if not m or int(m.group(1)) < 13:
+        return
+    try:
+        from triton.backends.nvidia.compiler import get_ptxas
+
+        bundled_ver = tuple(map(int, get_ptxas(100).version.split(".")[:2]))
+    except (ImportError, RuntimeError):
+        bundled_ver = (0, 0)
+    if (int(m.group(1)), int(m.group(2))) > bundled_ver:
         os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = ptxas
 
 
