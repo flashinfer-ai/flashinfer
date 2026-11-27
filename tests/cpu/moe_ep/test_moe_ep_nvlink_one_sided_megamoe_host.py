@@ -2,6 +2,7 @@
 
 ``sm103_mxfp8_mxfp4_bf16_nvlink_one_sided`` without a GPU and without
 importing the CuTe DSL: registration and exports, config and knob validation,
+``sync_protocol`` and the engine protocols it selects,
 the shapes and devices ``validate_init`` rejects, the CUDA graph capture guard,
 the activation (SwiGLU or SiTU) and its engine configs, the shared expert's
 config and weights, and the host mirror of the main kernel's token tile
@@ -42,9 +43,12 @@ EXPERTS = 256
 TOPK = 6
 CLAMP = 10.0
 SHARED = {"shared_expert": "fp8_in_kernel"}
-SENTINEL = {"dispatch_protocol": "sentinel", "combine_protocol": "sentinel"}
-PULL = {"dispatch_protocol": "pull", "combine_protocol": "counter"}
-POOL = {**PULL, "fc1_token_pool": True}
+# The protocols a config forces, and the engine fields each one resolves to.
+SENTINEL = {"sync_protocol": "sentinel"}
+FENCE = {"sync_protocol": "fence"}
+SENTINEL_ENGINE = {"dispatch_protocol": "sentinel", "combine_protocol": "sentinel"}
+FENCE_ENGINE = {"dispatch_protocol": "pull", "combine_protocol": "counter"}
+POOL = {"fc1_token_pool": True}
 JIT = {"just_in_time_claims": True}
 NO_JIT = {"just_in_time_claims": False}
 NO_HEAD = {"shared_expert_entry": False}
@@ -132,6 +136,17 @@ def test_registration_and_exports():
         ({**SITU, **SHARED}, "shared expert runs SwiGLU only"),
         ({**SITU, **SHARED, "shared_gate_up_clamp": CLAMP}, "SwiGLU only"),
         ({**SITU, "shared_gate_up_clamp": CLAMP}, "need shared_expert"),
+        # One protocol selector, with the all-to-all's values; the engine's
+        # protocol fields are not knobs.
+        ({"sync_protocol": "pull"}, "sync_protocol must be one of"),
+        ({"sync_protocol": "counter"}, "sync_protocol must be one of"),
+        ({"sync_protocol": None}, "sync_protocol must be one of"),
+        ({"knobs": {"dispatch_protocol": "pull"}}, "select the protocols with sync"),
+        ({"knobs": {"combine_protocol": "counter"}}, "select the protocols with sync"),
+        (
+            {**SENTINEL, "knobs": {"dispatch_protocol": "sentinel"}},
+            "cannot set \\['dispatch_protocol'\\]",
+        ),
     ],
 )
 def test_config_validation(fields, message):
@@ -147,20 +162,18 @@ def test_config_validation(fields, message):
         (128, {"weight_layout": "kmajor"}, {}, "unknown"),
         (8200, None, {}, "at most 8192 tokens per rank"),
         (1024, {"dispatch_rounds": 4}, {}, "unknown"),
-        # Two dispatch protocols; "counter" names the Fence combine only.
-        (1024, {"dispatch_protocol": "counter"}, {}, "'sentinel' or 'pull'"),
-        # The pull dispatch needs the counter combine, also where knobs switch
-        # the combine; its knobs need the pull dispatch.
-        (128, {**SENTINEL, "dispatch_protocol": "pull"}, {}, "protocol='counter'"),
-        (1024, {"combine_protocol": "sentinel"}, {}, "protocol='counter'"),
-        (512, {**SENTINEL, "comm_pull_depth": 2}, {}, "comm_pull_depth"),
-        (512, {**SENTINEL, "pull_warps": 4}, {}, "pull_warps"),
-        (512, {**SENTINEL, "comm_exchange_ctas": 8}, {}, "comm_exchange_ctas"),
-        (512, {**PULL, "pull_warps": 5}, {}, "pull_warps"),
+        # The pull dispatch's knobs need the pull dispatch, which the Sentinel
+        # protocols do not run.
+        (512, {"comm_pull_depth": 2}, SENTINEL, "comm_pull_depth"),
+        (512, {"pull_warps": 4}, SENTINEL, "pull_warps"),
+        (512, {"comm_exchange_ctas": 8}, SENTINEL, "comm_exchange_ctas"),
+        (128, {"pull_warps": 4}, {}, "pull_warps"),
+        (512, {"pull_warps": 5}, FENCE, "pull_warps"),
         # FC1's token pool takes the walking CTAs' rows and four Gather-B warps.
-        (2048, {**PULL, "fc1_token_pool": 1}, {}, "fc1_token_pool"),
-        (2048, {**POOL, "pull_warps": 4}, {}, "fc1_token_pool"),
-        (2048, {**POOL, "gather_b_warps": 8}, {}, "fc1_token_pool"),
+        (2048, {"fc1_token_pool": 1}, FENCE, "fc1_token_pool"),
+        (2048, {**POOL, "pull_warps": 4}, FENCE, "fc1_token_pool"),
+        (2048, {**POOL, "gather_b_warps": 8}, FENCE, "fc1_token_pool"),
+        (128, POOL, SENTINEL, "fc1_token_pool"),
         (2048, {"fc1_token_pool_fallback": "expert"}, {}, "fc1_token_pool_fallback"),
         (2048, {"gather_b_warps": 6}, {}, "gather_b_warps must be"),
         # Rings, tiles, prefetch and die-local weights.
@@ -173,10 +186,15 @@ def test_config_validation(fields, message):
         (128, {"just_in_time_claims": 1}, {}, "Python bool"),
         (128, {**JIT, "claim_lead_k_tiles": 0}, {}, "positive Python integer"),
         (128, {**NO_JIT, "claim_lead_k_tiles": 8}, {}, "only to just-in-time claims"),
-        # Combine-slot knobs belong to the counter combine's slots.
-        (256, {**SENTINEL, "discard_combine_slots": True}, {}, "protocol='counter'"),
-        (256, {**SENTINEL, "combine_warp_stores": True}, {}, "protocol='counter'"),
-        (4096, {**PULL, "discard_combine_slots": True}, IN_KERNEL, "no combine slots"),
+        # Combine-slot knobs belong to the Fence combine's slots.
+        (256, {"discard_combine_slots": True}, SENTINEL, "protocol='counter'"),
+        (256, {"combine_warp_stores": True}, SENTINEL, "protocol='counter'"),
+        (
+            4096,
+            {"discard_combine_slots": True},
+            {**FENCE, **IN_KERNEL},
+            "no combine slots",
+        ),
         # Shared-expert knobs need a shared expert, and take only their values.
         (256, {"shared_expert_entry": True}, {}, "need shared_expert"),
         (256, {"shared_fc2_placement": "late"}, SHARED, "shared_fc2_placement must"),
@@ -206,15 +224,20 @@ def test_engine_config_validation():
         quant_kind="mxfp4_mxfp8",
         cluster_shape_mn=(2, 1),
         mma_tiler_mnk=(256, 128, 128),
-        **SENTINEL,
+        **SENTINEL_ENGINE,
     )
     Sm100GenphaseMoeConfig(**SHARED, **common)
+    Sm100GenphaseMoeConfig(**{**common, **FENCE_ENGINE})
     shared_rounding = {**SHARED, "shared_bf16_rounding": True}
     for fields, message in (
+        # Two dispatch protocols; "counter" names the Fence combine only.
         ({"dispatch_protocol": "counter"}, "'sentinel' or 'pull'"),
+        # The pull dispatch needs the Fence combine, whose tail barrier orders
+        # the peers' fetches before the next staging.
+        ({"dispatch_protocol": "pull"}, "requires combine_protocol='counter'"),
         (IN_KERNEL, "only under combine_protocol='counter'"),
         ({**SHARED, "cluster_shape_mn": (4, 1)}, "shared_expert needs GenPhase"),
-        ({**shared_rounding, **IN_KERNEL, **PULL}, "in-kernel top-k reduce"),
+        ({**shared_rounding, **IN_KERNEL, **FENCE_ENGINE}, "in-kernel top-k reduce"),
     ):
         with pytest.raises(ValueError, match=message):
             Sm100GenphaseMoeConfig(**{**common, **fields})
@@ -251,6 +274,123 @@ def test_dispatch_rule(tokens, world, experts, topk, dispatch):
     assert tiling["dispatch_protocol"] == dispatch
     combine = "sentinel" if dispatch == "sentinel" else "counter"
     assert tiling["combine_protocol"] == combine
+    # "auto" is the rule, and forcing the protocol the rule picks changes nothing.
+    chosen = "sentinel" if dispatch == "sentinel" else "fence"
+    for protocol in ("auto", chosen):
+        assert tiling == nvlink_one_sided_tiling(
+            tokens, world, experts, topk, sync_protocol=protocol
+        )
+
+
+@pytest.mark.parametrize("capacity", [1, 16, 128, 256, 288, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("world", [2, 8])
+def test_sync_protocol(dist_not_initialized, capacity, world):
+    """``sync_protocol`` selects the dispatch and combine pair; the schedule follows it.
+
+    "sentinel" runs the Sentinel dispatch and combine and "fence" the pull
+    dispatch and the Fence (counter) combine at every capacity; "auto" resolves
+    to the one of them the dispatch rule picks, field for field. The pull
+    dispatch's pipelined groups and just-in-time claims, and the in-kernel
+    top-k reduce, follow the protocol, not the capacity alone.
+    """
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+        dispatch_protocol,
+    )
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.block_scaled import (
+        JUST_IN_TIME_CLAIMS_MAX_TOKENS,
+    )
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend.genphase import (
+        PIPELINED_GROUPS_MIN_TOKENS,
+        PULL_JUST_IN_TIME_MIN_TOKENS,
+        SINGLE_GROUP_MAX_TOKENS,
+    )
+
+    assert _config().sync_protocol == "auto"
+    configs = {
+        protocol: _engine_config(capacity, world, sync_protocol=protocol)
+        for protocol in ("auto", "sentinel", "fence")
+    }
+    sentinel, fence = configs["sentinel"], configs["fence"]
+    assert (sentinel.dispatch_protocol, sentinel.combine_protocol) == (
+        "sentinel",
+        "sentinel",
+    )
+    assert (fence.dispatch_protocol, fence.combine_protocol) == ("pull", "counter")
+    rule = dispatch_protocol(capacity, world, EXPERTS, TOPK)
+    assert configs["auto"] == (sentinel if rule == "sentinel" else fence)
+    # The token tile and cluster follow the load alone.
+    for name in ("mma_tiler_mnk", "cluster_shape_mn", "fc2_tma_stages"):
+        assert getattr(sentinel, name) == getattr(fence, name)
+    # Up to SINGLE_GROUP_MAX_TOKENS one schedule group holds every FC1 tile;
+    # above it groups of 256 FC1 tiles, which the pull dispatch halves once they
+    # are pipelined. Just-in-time claims: the pull dispatch's from
+    # PULL_JUST_IN_TIME_MIN_TOKENS, the Sentinel dispatch's at the smallest
+    # capacities.
+    single = capacity <= SINGLE_GROUP_MAX_TOKENS
+    pipelined = capacity >= PIPELINED_GROUPS_MIN_TOKENS
+    assert sentinel.pipelined_groups == fence.pipelined_groups == pipelined
+    assert sentinel.schedule_policy == ("grouped", 4096 if single else 256)
+    assert fence.schedule_policy == (
+        "grouped",
+        4096 if single else 128 if pipelined else 256,
+    )
+    assert fence.resolved_just_in_time_claims == (
+        capacity >= PULL_JUST_IN_TIME_MIN_TOKENS
+    )
+    assert sentinel.resolved_just_in_time_claims == (
+        capacity <= JUST_IN_TIME_CLAIMS_MAX_TOKENS
+    )
+    # The in-kernel top-k reduce takes effect under the Fence combine only.
+    for protocol, config in configs.items():
+        inplace = _engine_config(capacity, world, sync_protocol=protocol, **IN_KERNEL)
+        assert inplace.reduce_topk_in_kernel == (config.combine_protocol == "counter")
+        assert inplace == dataclasses.replace(
+            config, reduce_topk_in_kernel=inplace.reduce_topk_in_kernel
+        )
+
+
+def test_sync_protocol_tiling_rejects_other_names():
+    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided.frontend import (
+        nvlink_one_sided_tiling,
+    )
+
+    for protocol in ("pull", "counter", "flag"):
+        with pytest.raises(ValueError, match="sync_protocol must be one of"):
+            nvlink_one_sided_tiling(128, 8, EXPERTS, TOPK, sync_protocol=protocol)
+
+
+def test_forced_sentinel_build_failure_names_sync_protocol(
+    dist_not_initialized, monkeypatch
+):
+    """An engine the forced Sentinel protocols cannot build fails at init and names ``sync_protocol``.
+
+    Where "auto" would run the Fence protocols the message says so; where it
+    would run the Sentinel ones too, or the protocol is not forced, the
+    engine's own error stands.
+    """
+    import torch
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided import (
+        backend,
+    )
+
+    def fail(config):
+        raise MoEEpConfigError("cannot build its engine: SMEM plan needs more")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 3))
+    monkeypatch.setattr(backend, "_build_engine", fail)
+    bootstrap = BootstrapConfig(world_size=8, rank=7, auto_bootstrap=False)
+    for capacity, fields, hint in (
+        (4096, SENTINEL, True),
+        (128, SENTINEL, False),
+        (4096, FENCE, False),
+        (4096, {}, False),
+    ):
+        with pytest.raises(MoEEpConfigError, match="SMEM plan") as error:
+            _kernel(8, **fields).validate_init(bootstrap, _fleet(capacity))
+        named = "sync_protocol='auto' runs the Fence protocols" in str(error.value)
+        assert named == hint, (capacity, fields)
 
 
 def test_init_rejections(dist_not_initialized, monkeypatch):
@@ -378,7 +518,7 @@ def test_situ_engine_config_validation():
         quant_kind="mxfp4_mxfp8",
         cluster_shape_mn=(2, 1),
         mma_tiler_mnk=(256, 128, 128),
-        **SENTINEL,
+        **SENTINEL_ENGINE,
     )
     Sm100GenphaseMoeConfig(**SITU, **common)
     for fields, message in (

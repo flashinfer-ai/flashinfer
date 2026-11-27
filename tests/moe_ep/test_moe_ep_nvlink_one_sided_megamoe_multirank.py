@@ -28,19 +28,21 @@ local experts in two numerics:
 Each case resolves to a different engine configuration: capacity 128 per rank
 runs the Sentinel (data-as-flag) dispatch and combine, capacity 16 the same with
 just-in-time work claims, capacity 256 the pull dispatch with the counter
-(Fence) combine at EP2 and EP4 and the Sentinel protocols at EP8, and, pinned by
-a knob, the pull dispatch at every EP size; capacity 288 runs the pull dispatch
-by default at every EP size on N64 token tiles, whose FC1 tiles wait for their
-whole expert; capacity 1024 runs the pull dispatch with pipelined schedule
-groups of 128 FC1 tiles (at EP4 on the N128 token tile, at EP8 on the N240 one),
-a case pinned to the N240 token tile covers the widest tile at 256 tokens per
-rank, two cases pin the Sentinel protocols at 512 and 1024 tokens per rank,
-where the top-k planners poll and scatter in several passes, and cases pin the
-pull dispatch at 1024 tokens per rank (at EP8 on N240 token tiles, whose routes
-are spread evenly over each expert's tiles), fetched by walking CTAs of the
-communication grid or by the main kernel's pull warps. The walking CTAs store
-the rows into the landing slots that FC1 gathers from, or, in a case pinned by a
-knob, into the token pool that FC1 loads by tiled TMA.
+(Fence) combine at EP2 and EP4 and the Sentinel protocols at EP8, and, under
+``sync_protocol="fence"``, the pull dispatch at every EP size; capacity 288 runs
+the pull dispatch by default at every EP size on N64 token tiles, whose FC1
+tiles wait for their whole expert; capacity 1024 runs the pull dispatch with
+pipelined schedule groups of 128 FC1 tiles (at EP4 on the N128 token tile, at
+EP8 on the N240 one), a case pinned to the N240 token tile covers the widest
+tile at 256 tokens per rank, two cases force the Sentinel protocols
+(``sync_protocol="sentinel"``) at 512 and 1024 tokens per rank, where the top-k
+planners poll and scatter in several passes and the schedule groups hold 256
+FC1 tiles, and cases force the pull dispatch at 1024 tokens per rank (at EP8 on
+N240 token tiles, whose routes are spread evenly over each expert's tiles),
+fetched by walking CTAs of the communication grid or by the main kernel's pull
+warps. The walking CTAs store the rows into the landing slots that FC1 gathers
+from, or, in a case pinned by a knob, into the token pool that FC1 loads by
+tiled TMA.
 
 Die-local weights (each die's half of every weight matrix in its own HBM) are
 on by default from 64 expected routes per local expert on a device with two
@@ -52,12 +54,11 @@ the first launch).
 
 The in-kernel top-k reduce (``reduce_topk_in_kernel``, opt-in) adds every FC2
 partial into its source token's BF16 output row as it is pushed. A separate test
-runs it under the counter combine (pinned at 128 under the Sentinel dispatch, at
-256 under the pull dispatch, and at the grouped capacity under the pull
-dispatch, its walking CTAs storing rows into the landing slots or, pinned by a
-knob, into the token pool) and bounds it against both oracles and
-against the separate reduce's output of the same batch, over launches that
-reuse the output with other token counts.
+runs it under the Fence protocols (forced at 128 and 256 tokens per rank, and at
+the grouped capacity by default and forced, its walking CTAs storing rows into
+the landing slots or, pinned by a knob, into the token pool) and bounds it
+against both oracles and against the separate reduce's output of the same
+batch, over launches that reuse the output with other token counts.
 
 A shared expert (``shared_expert="fp8_in_kernel"``: one MXFP8 E4M3 expert of the
 routed intermediate width that every token runs, fused into the main kernel)
@@ -90,9 +91,9 @@ SiTU (``activation="situ"``: ``beta * tanh(gate / beta) * sigmoid(gate) *
 linear_beta * tanh(up / linear_beta)`` without a clamp, at Kimi-K3's betas 4 and
 25) runs in a separate test with the same checks, against oracles that apply it:
 on DeepSeek-V4.1-Flash's routed experts (hidden 5120, intermediate 2304, 384
-experts, top-6) at every EP size under the Sentinel protocols, the pull dispatch
-and the default at 4096 tokens per rank, and on Kimi-K3's at EP8 under the
-Sentinel protocols and the pull dispatch, on token tiles from N64 to N240
+experts, top-6) at every EP size under the Sentinel protocols, the Fence
+protocols and the default at 4096 tokens per rank, and on Kimi-K3's at EP8 under
+the Sentinel and Fence protocols, on token tiles from N64 to N240
 (``SITU_CASES``). Each output must also miss the SwiGLU oracle.
 At 128 tokens per rank a SwiGLU layer and a SiTU layer with other betas run in
 the same process, on their own workspaces and kernels, interleaved with the
@@ -162,8 +163,6 @@ CAPACITY_256 = 256
 # N128): above 256 tokens per rank, up to an expected load of 56 routes per
 # expert.
 PULL_N64_CAPACITY = 288
-# The counter (Fence) combine under the Sentinel dispatch.
-COUNTER_COMBINE_KNOBS = {"combine_protocol": "counter"}
 # Above 256 tokens per rank FC1 tiles are scheduled in groups of 256. At EP4
 # the expected expert load (96 tokens) also selects the N128 token tile with
 # one FC2 TMA stage.
@@ -171,21 +170,20 @@ GROUPED_CAPACITY = 1024
 # The token tile ``nvlink_one_sided_tiling`` selects while an expert expects about 172
 # to 216 tokens (EP8 at 1024 tokens per rank expects 192).
 N240_KNOBS = {"mma_tiler_mnk": (256, 240, 128), "fc2_tma_stages": 1}
-# The Sentinel protocols above their default capacity. The W id planes of more
-# than 2048 vectors (above about 170 tokens per rank at EP8) are polled in
-# several passes, a score plane of more than 512 vectors is scattered in rounds
-# beyond the ones held in registers, and at EP8 1024 tokens per rank take the
-# N240 token tile, whose slots are strided.
-SENTINEL_KNOBS = {"dispatch_protocol": "sentinel", "combine_protocol": "sentinel"}
+# The Sentinel protocols above their default capacity (``sync_protocol=
+# "sentinel"``). The W id planes of more than 2048 vectors (above about 170
+# tokens per rank at EP8) are polled in several passes, a score plane of more
+# than 512 vectors is scattered in rounds beyond the ones held in registers, and
+# at EP8 1024 tokens per rank take the N240 token tile, whose slots are strided.
 SENTINEL_FORCED_CAPACITY = 512
-# Target ranks fetch their rows from the source ranks' staged activations, under
-# the counter combine: walking CTAs of the communication grid, or the main
-# kernel's pull warps.
-PULL_KNOBS = {"dispatch_protocol": "pull", "combine_protocol": "counter"}
-PULL_WARP_KNOBS = {**PULL_KNOBS, "pull_warps": 4}
+# Under the Fence protocols (``sync_protocol="fence"``) target ranks fetch their
+# rows from the source ranks' staged activations: walking CTAs of the
+# communication grid, or the main kernel's pull warps.
+FENCE = {"sync_protocol": "fence"}
+PULL_WARP_KNOBS = {"pull_warps": 4}
 # The walking CTAs storing rows at their routes' pool rows, which FC1 loads by
 # tiled TMA (the default from 256 expected routes per expert).
-PULL_POOL_KNOBS = {**PULL_KNOBS, "fc1_token_pool": True}
+PULL_POOL_KNOBS = {"fc1_token_pool": True}
 # The token pool under the strided N240 tile at every EP size, where its
 # capacity applies: token tiles whose routes end past it fall back to Gather4
 # from the landing slots. A capacity of one row sends every tile there, about
@@ -196,15 +194,11 @@ TOKEN_POOL_PARTIAL_ROWS = 3000
 # The walking CTAs claiming landing slots, so a token routed to several local
 # experts is fetched about once (at EP2 most tokens are), and the walking CTAs
 # acquiring the expert-id releases themselves instead of the index-copy CTAs.
-PULL_DEDUP_KNOBS = {**PULL_KNOBS, "pull_walk_dedup": True}
-PULL_WALKER_ACQUIRE_KNOBS = {**PULL_KNOBS, "pull_acquire_in_copy": False}
+PULL_DEDUP_KNOBS = {"pull_walk_dedup": True}
+PULL_WALKER_ACQUIRE_KNOBS = {"pull_acquire_in_copy": False}
 # The walking CTAs counting landed routes per expert, with whole claims for the
 # first wave: FC1 tiles wait for their whole expert.
-PULL_EXPERT_GATE_KNOBS = {
-    **PULL_KNOBS,
-    "pull_tile_ready": False,
-    "comm_pull_lead_rows": 8,
-}
+PULL_EXPERT_GATE_KNOBS = {"pull_tile_ready": False, "comm_pull_lead_rows": 8}
 
 
 # ----------------------------------------------------------------------------
@@ -737,6 +731,7 @@ def _layer(
     quantize_input: bool,
     process_group=None,
     transformed=None,
+    sync_protocol="auto",
     knobs=None,
     die_local_weights=None,
     reduce_topk_in_kernel=False,
@@ -774,6 +769,7 @@ def _layer(
                         activation="situ", situ_beta=situ[0], situ_linear_beta=situ[1]
                     )
                 ),
+                sync_protocol=sync_protocol,
                 knobs=knobs,
                 die_local_weights=die_local_weights,
                 reduce_topk_in_kernel=reduce_topk_in_kernel,
@@ -822,8 +818,8 @@ def _same(path: str) -> tuple[str, str, str]:
 # Up to 256 tokens per rank one schedule group holds every FC1 tile.
 SENTINEL_PATH = _same("sentinel/sentinel N64 grouped4096")
 JIT_PATH = _same("sentinel/sentinel N64 grouped4096 jit")
-SENTINEL_DISPATCH_PATH = _same("sentinel/counter N64 grouped4096")
-# The pull dispatch on N64 token tiles gates FC1 per expert.
+# The pull dispatch on N64 token tiles gates FC1 per expert (up to 256 tokens
+# per rank, one schedule group).
 PULL_256_PATH = _same("pull/counter N64 grouped4096 walkers expertgate")
 # 256 tokens per rank: the pull dispatch at EP2 and EP4, the Sentinel one at EP8,
 # where a reached rank takes at most 1.5 routes per token.
@@ -834,10 +830,12 @@ N240_PATH = (
     "pull/counter N240|N128 grouped4096 walkers",
     "sentinel/sentinel N240|N128 grouped4096",
 )
+# The Sentinel protocols forced above 256 tokens per rank: groups of 256 FC1
+# tiles, pipelined from 1024 tokens per rank, without just-in-time claims.
 SENTINEL_512_PATH = (
-    "sentinel/sentinel N64 grouped256 jit",
-    "sentinel/sentinel N64 grouped256 jit",
-    "sentinel/sentinel N128 grouped256 jit",
+    "sentinel/sentinel N64 grouped256",
+    "sentinel/sentinel N64 grouped256",
+    "sentinel/sentinel N128 grouped256",
 )
 # 1024 tokens per rank: the pull dispatch with pipelined groups of 128 FC1 tiles
 # and just-in-time claims, on a token tile that grows with the EP size (N240 and
@@ -849,9 +847,9 @@ PULL_PATH = (
 )
 GROUPED_PATH = PULL_PATH
 SENTINEL_1024_PATH = (
-    "sentinel/sentinel N64 grouped128+pipelined jit",
-    "sentinel/sentinel N128 grouped128+pipelined jit",
-    "sentinel/sentinel N240|N128 grouped128+pipelined jit",
+    "sentinel/sentinel N64 grouped256+pipelined",
+    "sentinel/sentinel N128 grouped256+pipelined",
+    "sentinel/sentinel N240|N128 grouped256+pipelined",
 )
 # Main-kernel pull warps, and walking CTAs pinned to the per-expert gate, gate
 # FC1 per expert on every token tile.
@@ -884,19 +882,19 @@ KIMI_K3_PATHS = {
     ),
 }
 KIMI_K3_ROUTINGS = ("perfect", "random")
-# SiTU cases: (problem, tokens per rank, knobs, routing). V4.1-Flash runs at every
-# EP size: the Sentinel protocols at 128 tokens per rank, the pull dispatch pinned
-# at 1024, and the default at 4096, the pull dispatch on the N192 token tile, from
-# EP4 into the token pool. Kimi-K3 runs at EP8: the Sentinel protocols at 16
-# tokens per rank, the pull dispatch pinned at 1024 and by default at 4096, there
-# on the N240 token tile into the token pool.
+# SiTU cases: (problem, tokens per rank, sync_protocol, routing). V4.1-Flash runs
+# at every EP size: the Sentinel protocols at 128 tokens per rank, the Fence
+# protocols forced at 1024, and the default at 4096, the pull dispatch on the
+# N192 token tile, from EP4 into the token pool. Kimi-K3 runs at EP8: the
+# Sentinel protocols at 16 tokens per rank, the Fence protocols forced at 1024
+# and by default at 4096, there on the N240 token tile into the token pool.
 SITU_CASES = {
-    "v41_t128": (V41_FLASH, SENTINEL_CAPACITY, None, "random"),
-    "v41_t1024_pull": (V41_FLASH, GROUPED_CAPACITY, PULL_KNOBS, "random"),
-    "v41_t4096": (V41_FLASH, 4096, None, "perfect"),
-    "k3_t16": (KIMI_K3, 16, None, "perfect"),
-    "k3_t1024_pull": (KIMI_K3, GROUPED_CAPACITY, PULL_KNOBS, "random"),
-    "k3_t4096": (KIMI_K3, 4096, None, "perfect"),
+    "v41_t128": (V41_FLASH, SENTINEL_CAPACITY, "auto", "random"),
+    "v41_t1024_pull": (V41_FLASH, GROUPED_CAPACITY, "fence", "random"),
+    "v41_t4096": (V41_FLASH, 4096, "auto", "perfect"),
+    "k3_t16": (KIMI_K3, 16, "auto", "perfect"),
+    "k3_t1024_pull": (KIMI_K3, GROUPED_CAPACITY, "fence", "random"),
+    "k3_t4096": (KIMI_K3, 4096, "auto", "perfect"),
 }
 SITU_PATHS = {
     "v41_t128": SENTINEL_PATH,
@@ -935,7 +933,7 @@ PATHS: dict[str, dict[str, tuple[Optional[str], ...]]] = {
     },
     "test_die_local_weights": {"sentinel": SENTINEL_PATH, "grouped": GROUPED_PATH},
     "test_reduce_topk_in_kernel": {
-        "sentinel_dispatch": SENTINEL_DISPATCH_PATH,
+        "fence_128": PULL_256_PATH,
         "pull_256": PULL_256_PATH,
         "grouped": GROUPED_PATH,
         "pull": PULL_PATH,
@@ -1095,7 +1093,13 @@ def _check_and_reproduce(
 
 @pytest.mark.arch_blackwell
 def test_init_builds_engine(dist_not_initialized):
-    """On SM100 / SM103 ``validate_init`` builds the engine, so its limits fail at init."""
+    """On SM100 / SM103 ``validate_init`` builds the engine, so its limits fail at init.
+
+    Among them the capacity of the Sentinel dispatch, which stages a rank's
+    whole top-k plane in shared memory: forced by ``sync_protocol="sentinel"``
+    past it, construction fails and names the field, while ``"auto"`` and
+    ``"fence"`` run the Fence protocols there.
+    """
     import torch
 
     from flashinfer.moe_ep import (
@@ -1139,28 +1143,54 @@ def test_init_builds_engine(dist_not_initialized):
                     token_hidden_size=32768,
                 ),
             )
+    largest = FleetParams(
+        num_experts=EXPERTS, max_tokens_per_rank=8192, token_hidden_size=HIDDEN
+    )
+    forced = {}
+    for protocol in ("auto", "fence", "sentinel"):
+        forced[protocol] = create_mega_kernel(
+            Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig(
+                intermediate_size=INTERMEDIATE,
+                top_k=TOPK,
+                activation_clamp=CLAMP,
+                sync_protocol=protocol,
+            )
+        )
+        forced[protocol].bind_ep_bootstrap(bootstrap)
+    forced["auto"].validate_init(bootstrap, largest)
+    forced["fence"].validate_init(bootstrap, largest)
+    forced["sentinel"].validate_init(
+        bootstrap,
+        FleetParams(
+            num_experts=EXPERTS,
+            max_tokens_per_rank=GROUPED_CAPACITY,
+            token_hidden_size=HIDDEN,
+        ),
+    )
+    with pytest.raises(MoEEpConfigError, match="sync_protocol='sentinel' runs"):
+        forced["sentinel"].validate_init(bootstrap, largest)
 
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "capacity, knobs",
+    "capacity, sync_protocol, knobs",
     [
-        (SENTINEL_CAPACITY, None),
-        (JUST_IN_TIME_CAPACITY, None),
-        (CAPACITY_256, None),
-        (CAPACITY_256, PULL_KNOBS),
-        (PULL_N64_CAPACITY, None),
-        (GROUPED_CAPACITY, None),
-        (CAPACITY_256, N240_KNOBS),
-        (SENTINEL_FORCED_CAPACITY, SENTINEL_KNOBS),
-        (GROUPED_CAPACITY, SENTINEL_KNOBS),
-        (GROUPED_CAPACITY, PULL_KNOBS),
-        (GROUPED_CAPACITY, PULL_WARP_KNOBS),
-        (GROUPED_CAPACITY, PULL_POOL_KNOBS),
-        (GROUPED_CAPACITY, PULL_DEDUP_KNOBS),
-        (GROUPED_CAPACITY, PULL_WALKER_ACQUIRE_KNOBS),
-        (GROUPED_CAPACITY, PULL_EXPERT_GATE_KNOBS),
+        (SENTINEL_CAPACITY, "auto", None),
+        (JUST_IN_TIME_CAPACITY, "auto", None),
+        (CAPACITY_256, "auto", None),
+        (CAPACITY_256, "fence", None),
+        (PULL_N64_CAPACITY, "auto", None),
+        (GROUPED_CAPACITY, "auto", None),
+        (CAPACITY_256, "auto", N240_KNOBS),
+        (SENTINEL_FORCED_CAPACITY, "sentinel", None),
+        (GROUPED_CAPACITY, "sentinel", None),
+        (GROUPED_CAPACITY, "fence", None),
+        (GROUPED_CAPACITY, "fence", PULL_WARP_KNOBS),
+        (GROUPED_CAPACITY, "fence", PULL_POOL_KNOBS),
+        (GROUPED_CAPACITY, "fence", PULL_DEDUP_KNOBS),
+        (GROUPED_CAPACITY, "fence", PULL_WALKER_ACQUIRE_KNOBS),
+        (GROUPED_CAPACITY, "fence", PULL_EXPERT_GATE_KNOBS),
     ],
     ids=[
         "sentinel_protocols",
@@ -1180,7 +1210,7 @@ def test_init_builds_engine(dist_not_initialized):
         "pull_expert_gate_1024",
     ],
 )
-def test_layer_vs_oracle(request, capacity, knobs):
+def test_layer_vs_oracle(request, capacity, sync_protocol, knobs):
     """Weight/input formats, token counts, idle launches, skew, round reuse, views and CUDA graphs."""
     import torch
     import torch.distributed as dist
@@ -1201,6 +1231,7 @@ def test_layer_vs_oracle(request, capacity, knobs):
         PULL_JUST_IN_TIME_MIN_TOKENS,
     )
 
+    arm = dict(sync_protocol=sync_protocol, knobs=knobs)
     rank, world = _init_distributed()
     group = dist.group.WORLD
     weights = _make_weights(EXPERTS // world, seed=1009 * rank + capacity)
@@ -1216,7 +1247,7 @@ def test_layer_vs_oracle(request, capacity, knobs):
             rank=rank,
             world=world,
             quantize_input=False,
-            knobs=knobs,
+            **arm,
         )
         layers.append(packed)
         bf16 = _layer(
@@ -1225,7 +1256,7 @@ def test_layer_vs_oracle(request, capacity, knobs):
             rank=rank,
             world=world,
             quantize_input=True,
-            knobs=knobs,
+            **arm,
         )
         layers.append(bf16)
         weights.w13_bf16 = weights.w2_bf16 = None
@@ -1245,7 +1276,7 @@ def test_layer_vs_oracle(request, capacity, knobs):
             world=world,
             quantize_input=False,
             transformed=kernel_layout,
-            knobs=knobs,
+            **arm,
         )
         layers.append(transformed)
         same = all(
@@ -1264,21 +1295,20 @@ def test_layer_vs_oracle(request, capacity, knobs):
         )
         assert bf16._ensure_workspace() is workspace
         assert transformed._ensure_workspace() is workspace
-        expected = nvlink_one_sided_tiling(capacity, world, EXPERTS, TOPK) | (
-            knobs or {}
-        )
+        expected = nvlink_one_sided_tiling(
+            capacity, world, EXPERTS, TOPK, sync_protocol=sync_protocol
+        ) | (knobs or {})
         assert all(getattr(workspace.config, k) == v for k, v in expected.items())
         # The capacity-16 case compiles just-in-time claims for the Sentinel
-        # dispatch, the capacities from PULL_JUST_IN_TIME_MIN_TOKENS, whose tiling
-        # picks the pull dispatch, for that dispatch (kept when a knob switches
-        # the dispatch to the Sentinel one).
+        # dispatch, the capacities from PULL_JUST_IN_TIME_MIN_TOKENS for the pull
+        # dispatch, which the Sentinel protocols forced there do not run.
         assert (
             JUST_IN_TIME_CAPACITY <= JUST_IN_TIME_CLAIMS_MAX_TOKENS < SENTINEL_CAPACITY
         )
         assert CAPACITY_256 < PULL_JUST_IN_TIME_MIN_TOKENS <= GROUPED_CAPACITY
-        just_in_time = (
-            capacity == JUST_IN_TIME_CAPACITY
-            or capacity >= PULL_JUST_IN_TIME_MIN_TOKENS
+        just_in_time = capacity == JUST_IN_TIME_CAPACITY or (
+            workspace.config.dispatch_protocol == "pull"
+            and capacity >= PULL_JUST_IN_TIME_MIN_TOKENS
         )
         assert workspace.config.resolved_just_in_time_claims == just_in_time
         assert workspace.kernel.just_in_time_claims == just_in_time
@@ -1598,23 +1628,23 @@ def test_die_local_weights(request, capacity):
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "capacity, knobs",
+    "capacity, sync_protocol, knobs",
     [
-        (SENTINEL_CAPACITY, COUNTER_COMBINE_KNOBS),
-        (CAPACITY_256, PULL_KNOBS),
-        (GROUPED_CAPACITY, None),
-        (GROUPED_CAPACITY, PULL_KNOBS),
-        (GROUPED_CAPACITY, PULL_POOL_KNOBS),
+        (SENTINEL_CAPACITY, "fence", None),
+        (CAPACITY_256, "fence", None),
+        (GROUPED_CAPACITY, "auto", None),
+        (GROUPED_CAPACITY, "fence", None),
+        (GROUPED_CAPACITY, "fence", PULL_POOL_KNOBS),
     ],
     ids=[
-        "sentinel_dispatch",
+        "fence_128",
         "pull_256",
         "grouped",
         "pull",
         "pull_token_pool",
     ],
 )
-def test_reduce_topk_in_kernel(request, capacity, knobs):
+def test_reduce_topk_in_kernel(request, capacity, sync_protocol, knobs):
     """The in-kernel top-k reduce against both oracles and the separate reduce."""
     import torch
     import torch.distributed as dist
@@ -1631,6 +1661,7 @@ def test_reduce_topk_in_kernel(request, capacity, knobs):
             rank=rank,
             world=world,
             quantize_input=False,
+            sync_protocol=sync_protocol,
             knobs=knobs,
         )
         layers.append(separate)
@@ -1640,6 +1671,7 @@ def test_reduce_topk_in_kernel(request, capacity, knobs):
             rank=rank,
             world=world,
             quantize_input=False,
+            sync_protocol=sync_protocol,
             knobs=knobs,
             reduce_topk_in_kernel=True,
         )
@@ -1730,6 +1762,7 @@ def test_token_pool_capacity(request, pool_rows, fallback):
             rank=rank,
             world=world,
             quantize_input=False,
+            sync_protocol="fence",
             knobs=PULL_POOL_N240_KNOBS,
             fc1_token_pool_capacity=0,
         )
@@ -1740,6 +1773,7 @@ def test_token_pool_capacity(request, pool_rows, fallback):
             rank=rank,
             world=world,
             quantize_input=False,
+            sync_protocol="fence",
             knobs={**PULL_POOL_N240_KNOBS, "fc1_token_pool_fallback": fallback},
             fc1_token_pool_capacity=pool_rows,
         )
@@ -1831,25 +1865,25 @@ def test_layer_on_ep_subgroup(request):
         (CAPACITY_256, None, {}),
         (CAPACITY_256, N240_KNOBS, {}),
         (GROUPED_CAPACITY, None, {"shared_gate_up_clamp": CLAMP}),
-        (GROUPED_CAPACITY, PULL_KNOBS, {}),
+        (GROUPED_CAPACITY, None, FENCE),
         (
             GROUPED_CAPACITY,
             PULL_POOL_N240_KNOBS,
-            {"fc1_token_pool_capacity": TOKEN_POOL_PARTIAL_ROWS},
+            {**FENCE, "fc1_token_pool_capacity": TOKEN_POOL_PARTIAL_ROWS},
         ),
-        (GROUPED_CAPACITY, PULL_KNOBS, {"reduce_topk_in_kernel": True}),
+        (GROUPED_CAPACITY, None, {**FENCE, "reduce_topk_in_kernel": True}),
         (
             SENTINEL_CAPACITY,
             {"shared_expert_entry": False, "shared_fc2_placement": "auto"},
             {},
         ),
-        (GROUPED_CAPACITY, {**PULL_KNOBS, "shared_fc2_placement": "early"}, {}),
+        (GROUPED_CAPACITY, {"shared_fc2_placement": "early"}, FENCE),
         (
             GROUPED_CAPACITY,
-            {**PULL_KNOBS, **N240_KNOBS, "shared_alternate_token_tile": "always"},
-            {},
+            {**N240_KNOBS, "shared_alternate_token_tile": "always"},
+            FENCE,
         ),
-        (GROUPED_CAPACITY, {**PULL_KNOBS, "shared_head_token_tiles": 1}, {}),
+        (GROUPED_CAPACITY, {"shared_head_token_tiles": 1}, FENCE),
     ],
     ids=[
         "just_in_time_claims",
@@ -2075,21 +2109,21 @@ def test_prequantized_staging(monkeypatch, shared):
     "capacity, knobs, fields",
     [
         (SENTINEL_CAPACITY, None, {}),
-        (CAPACITY_256, PULL_KNOBS, {}),
+        (CAPACITY_256, None, FENCE),
         (GROUPED_CAPACITY, None, {}),
-        (GROUPED_CAPACITY, PULL_KNOBS, {}),
-        (GROUPED_CAPACITY, PULL_POOL_KNOBS, {}),
-        (GROUPED_CAPACITY, PULL_KNOBS, {"reduce_topk_in_kernel": True}),
+        (GROUPED_CAPACITY, None, FENCE),
+        (GROUPED_CAPACITY, PULL_POOL_KNOBS, FENCE),
+        (GROUPED_CAPACITY, None, {**FENCE, "reduce_topk_in_kernel": True}),
         (
             SENTINEL_CAPACITY,
             None,
             {"shared_expert": "fp8_in_kernel", "shared_bf16_rounding": True},
         ),
-        (GROUPED_CAPACITY, PULL_KNOBS, {"shared_expert": "fp8_in_kernel"}),
+        (GROUPED_CAPACITY, None, {**FENCE, "shared_expert": "fp8_in_kernel"}),
         (
             GROUPED_CAPACITY,
-            PULL_KNOBS,
-            {"shared_expert": "fp8_in_kernel", "reduce_topk_in_kernel": True},
+            None,
+            {**FENCE, "shared_expert": "fp8_in_kernel", "reduce_topk_in_kernel": True},
         ),
     ],
     ids=[
@@ -2298,7 +2332,7 @@ def test_situ(request, case):
     import torch
     import torch.distributed as dist
 
-    problem, capacity, knobs, routing = SITU_CASES[case]
+    problem, capacity, sync_protocol, routing = SITU_CASES[case]
     rank, world = _init_distributed()
     if problem is KIMI_K3 and world != 8:
         pytest.skip("Kimi-K3 runs at EP8")
@@ -2314,7 +2348,7 @@ def test_situ(request, case):
             rank=rank,
             world=world,
             quantize_input=False,
-            knobs=knobs,
+            sync_protocol=sync_protocol,
             problem=problem,
             situ=KIMI_K3_SITU,
         )
@@ -2364,7 +2398,7 @@ def test_situ(request, case):
                     rank=rank,
                     world=world,
                     quantize_input=False,
-                    knobs=knobs,
+                    sync_protocol=sync_protocol,
                     problem=problem,
                     situ=situ,
                 )

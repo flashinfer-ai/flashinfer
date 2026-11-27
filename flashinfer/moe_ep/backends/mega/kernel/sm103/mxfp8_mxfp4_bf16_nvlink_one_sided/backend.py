@@ -2,8 +2,9 @@
 
 Wraps ``flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4_nvlink_one_sided``. The engine
 configuration is static: ``nvlink_one_sided_tiling`` picks the token tile, cluster,
-schedule and protocols from the workspace capacity, EP size and routing
-shape, and ``knobs`` may override any of those fields. On an SM100 or SM103
+schedule and protocols from the workspace capacity, EP size, routing shape and
+``sync_protocol``, and ``knobs`` may override any of those fields but the
+protocols. On an SM100 or SM103
 device ``validate_init`` builds the engine for that configuration (no
 allocation, no compile; the CuTe DSL targets the device's own architecture),
 so its geometry and shared-memory checks run at layer construction.
@@ -43,10 +44,10 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 # Landing rows move in warp-wide runs of 32 lanes x 16 bytes of E4M3 data with
-# one 16-byte vector of UE8M0 scales per lane: so the Sentinel dispatch, which
-# every capacity up to 192 tokens per rank runs, verifies them and the
-# end-of-round kernel resets them, and the pull dispatch moves whole scale
-# vectors too. The landing-row reset also checks one route per lane of a warp.
+# one 16-byte vector of UE8M0 scales per lane: so the Sentinel dispatch verifies
+# them and the end-of-round kernel resets them, and the pull dispatch moves
+# whole scale vectors too. The landing-row reset also checks one route per lane
+# of a warp.
 _HIDDEN_ALIGNMENT = 32 * 16
 _MAX_TOP_K = 32
 
@@ -158,6 +159,7 @@ class Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend(MegaKernelBackend):
             self.ep_world_size,
             fleet_params.num_experts,
             k.top_k,
+            sync_protocol=k.sync_protocol,
         )
         fields.update(self._knob_overrides())
         try:
@@ -175,7 +177,7 @@ class Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend(MegaKernelBackend):
                 situ_beta=k.situ_beta,
                 situ_linear_beta=k.situ_linear_beta,
                 die_local_weights=k.die_local_weights,
-                # The counter combine's tail barrier publishes the in-kernel adds;
+                # The Fence combine's tail barrier publishes the in-kernel adds;
                 # the Sentinel combine keeps its slots and the separate reduce.
                 reduce_topk_in_kernel=(
                     k.reduce_topk_in_kernel and fields["combine_protocol"] == "counter"
@@ -214,7 +216,29 @@ class Sm103Mxfp8Mxfp4NVLinkOneSidedMegaKernelBackend(MegaKernelBackend):
         )
         config = self._engine_config(fleet_params)
         if on_device:
-            _build_engine(config)
+            try:
+                _build_engine(config)
+            except MoEEpConfigError as exc:
+                if not self._forces_sentinel(fleet_params):
+                    raise
+                raise MoEEpConfigError(
+                    f"{exc}. sync_protocol='sentinel' runs the Sentinel protocols "
+                    "at every capacity, and their dispatch stages a rank's whole "
+                    "top-k plane in one CTA's shared memory; sync_protocol='auto' "
+                    "runs the Fence protocols at this capacity"
+                ) from exc
+
+    def _forces_sentinel(self, fleet_params: FleetParams) -> bool:
+        """Whether ``sync_protocol="sentinel"`` runs the Sentinel protocols where ``"auto"`` would not."""
+        return self._kernel_config.sync_protocol == "sentinel" and (
+            _frontend().dispatch_protocol(
+                fleet_params.max_tokens_per_rank,
+                self.ep_world_size,
+                fleet_params.num_experts,
+                self._kernel_config.top_k,
+            )
+            != "sentinel"
+        )
 
     def _check_selection(self, config) -> None:
         """Require the same engine configuration on every EP rank."""

@@ -6,7 +6,12 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
+from .....split.comm.nvlink_one_sided.config import SYNC_PROTOCOLS, SyncProtocol
+
 KERNEL_NAME = "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided"
+
+# Engine fields that ``sync_protocol`` sets; ``knobs`` cannot.
+_PROTOCOL_FIELDS = ("dispatch_protocol", "combine_protocol")
 
 
 @dataclass
@@ -18,12 +23,37 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     One compiled call launches the EP dispatch, the fused FC1 / gated activation /
     MXFP8 requantization / FC2 kernel with its combine pushes, and the top-k reduce,
     over PyTorch symmetric memory on the EP process group. Activations and
-    weights carry UE8M0 scales per 32 values. The dispatch is the Sentinel
-    (data-as-flag) protocol up to 192 tokens per rank, and up to 256 where a
-    reached rank takes at most 1.5 routes per token (DeepSeek-V4.1-Flash at
-    EP8), with the Sentinel combine; above that each target rank pulls its rows
-    from the source ranks, with the counter (Fence) combine, one all-rank barrier
-    at the tail of the fused kernel (``dispatch_protocol``).
+    weights carry UE8M0 scales per 32 values.
+
+    ``sync_protocol`` selects how the dispatch and the combine learn that rows
+    have arrived; its values are those of the all-to-all's
+    ``NVLinkOneSidedConfig.sync_protocol``:
+
+    * ``"sentinel"``: the Sentinel dispatch and combine. Source ranks push each
+      token's rows at kernel entry into landing rows that hold the init
+      sentinel, and the target rank verifies the data itself, releasing each
+      expert's FC1 as its rows arrive; combine slots announce their own arrival
+      the same way, and the top-k reduce resets the slots it consumed.
+    * ``"fence"``: the pull dispatch and the Fence combine. Each target rank
+      fetches its rows from the source ranks' staged activations once the
+      plan exists, and the combine's bulk pushes are published by one all-rank
+      barrier at the tail of the fused kernel.
+    * ``"auto"`` (default): the Sentinel protocols up to 192 tokens per rank,
+      and up to 256 where a reached rank takes at most 1.5 routes per token
+      (DeepSeek-V4.1-Flash at EP8); the Fence protocols above.
+
+    The all-to-all resolves ``"auto"`` per step, from that step's busiest
+    rank. Here the protocol is chosen once, when the layer is built, from
+    ``max_tokens_per_rank``, the EP size and the routing shape (experts and
+    ``top_k``), because the plan, the landing layout and the compiled kernels
+    depend on it: every batch of the layer runs it, whatever its token count.
+    The schedule (group size, just-in-time claims) follows the protocol chosen.
+    It must be the same on every EP rank, as the whole engine configuration
+    must.
+    The Sentinel dispatch stages a rank's whole top-k plane in one CTA's shared
+    memory, which holds about 29,000 routes (``max_tokens_per_rank * top_k``:
+    4838 tokens per rank at top-6, 1814 at top-16); a forced ``"sentinel"``
+    past that fails at layer construction, where the engine is built.
 
     Landing rows move in runs of 32 x 16 bytes, so ``token_hidden_size`` must
     be a multiple of 512, and their reset checks one route per lane of a warp,
@@ -48,9 +78,11 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     DeepGEMM name. Setting both requires equal values. SiTU takes no clamp (its
     tanh bounds both factors), so it rejects both fields.
 
-    ``knobs`` overrides the engine geometry, schedule and protocols that
-    ``nvlink_one_sided_tiling`` derives from the capacity, EP size and routing shape.
-    Keys are the frontend's ``TUNING_FIELDS``. The backend has no autotuner.
+    ``knobs`` overrides the engine geometry and schedule that
+    ``nvlink_one_sided_tiling`` derives from the capacity, EP size, routing
+    shape and ``sync_protocol``. Keys are the frontend's ``TUNING_FIELDS``;
+    the protocols are not among them (``sync_protocol`` selects them). The
+    backend has no autotuner.
 
     ``die_local_weights`` homes the first and second half of every weight
     matrix's M tiles in the HBM of one die each (B300's two locality domains)
@@ -61,16 +93,18 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     device has two locality domains.
 
     ``reduce_topk_in_kernel`` sums the top-k partials in the fused kernel: under
-    the counter combine every target rank's FC2 epilogue adds each route's BF16
+    the Fence combine every target rank's FC2 epilogue adds each route's BF16
     partial straight into the source token's output row on the source rank
     (system-scope BF16 reductions over NVLink), the fused kernel zeroes the
     output at the start of every call, and the tail barrier publishes the sums,
     so the combine slots and the separate top-k reduce go. The adds round to BF16
     one at a time in arrival order instead of one FP32 sum per token, so the
     output changes and is not reproducible from run to run; it is opt-in. It
-    applies where the combine is the counter protocol (under the pull dispatch,
-    unless knobs pick it); the Sentinel combine's slots announce their own
-    arrival, which a sum cannot, so there the separate reduce stays.
+    takes effect where the layer runs the Fence protocols: under
+    ``sync_protocol="fence"``, and under ``"auto"`` at the capacities that
+    resolve to them. The Sentinel combine's slots announce their own arrival,
+    which a sum cannot, so under the Sentinel protocols the separate reduce stays
+    and the field has no effect.
 
     ``fc1_token_pool_capacity`` bounds the token pool of the pull dispatch (from
     256 expected routes per local expert), which holds one row of
@@ -119,6 +153,7 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
     activation: Literal["swiglu", "situ"] = field(default="swiglu", kw_only=True)
     situ_beta: Optional[float] = field(default=None, kw_only=True)
     situ_linear_beta: Optional[float] = field(default=None, kw_only=True)
+    sync_protocol: SyncProtocol = field(default="auto", kw_only=True)
     knobs: Optional[dict[str, Any]] = None
     die_local_weights: Optional[bool] = None
     reduce_topk_in_kernel: bool = False
@@ -223,10 +258,23 @@ class Sm103_Mxfp8_Mxfp4_Bf16_NVLinkOneSided_MegaMoeConfig:
                 "shared_bf16_rounding rounds the routes' sum before the shared expert's output "
                 "joins it, which reduce_topk_in_kernel (BF16 adds in arrival order) cannot do"
             )
+        if self.sync_protocol not in SYNC_PROTOCOLS:
+            raise ValueError(
+                f"sync_protocol must be one of {SYNC_PROTOCOLS}, "
+                f"got {self.sync_protocol!r}"
+            )
         if self.knobs is not None and not isinstance(self.knobs, dict):
             raise ValueError(
                 f"{KERNEL_NAME} knobs must be None or a dictionary of engine "
                 f"overrides (there is no autotuner), got {self.knobs!r}"
+            )
+        protocol_knobs = sorted(set(self.knobs or ()) & set(_PROTOCOL_FIELDS))
+        if protocol_knobs:
+            raise ValueError(
+                f"{KERNEL_NAME} knobs cannot set {protocol_knobs}; select the "
+                "protocols with sync_protocol ('sentinel': the Sentinel dispatch "
+                "and combine, 'fence': the pull dispatch and the Fence combine, "
+                "'auto': chosen from the capacity)"
             )
 
     @property

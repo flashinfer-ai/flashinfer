@@ -87,6 +87,12 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
 # rank) pairs, where a reached rank takes few routes per token.
 SENTINEL_MAX_TOKENS = 192
 SENTINEL_DISPATCH_THRESHOLDS = ((1.5, 256),)
+# The synchronization protocols a layer can run (``nvlink_one_sided_tiling``'s
+# ``sync_protocol``) and the dispatch each one selects: "sentinel" the Sentinel
+# dispatch with the Sentinel combine, "fence" the pull dispatch with the Fence
+# (counter) combine; "auto" takes the dispatch rule.
+SYNC_PROTOCOLS = ("auto", "fence", "sentinel")
+SYNC_PROTOCOL_DISPATCH = {"sentinel": "sentinel", "fence": "pull"}
 SINGLE_GROUP_MAX_TOKENS = 256
 PIPELINED_GROUPS_MIN_TOKENS = 1024
 # FC1 tiles of a schedule group, and of a pipelined group under the pull dispatch
@@ -215,7 +221,9 @@ def shared_head_token_tiles(
 def dispatch_protocol(
     max_tokens_per_rank: int, world_size: int, num_experts: int, num_topk: int
 ) -> str:
-    """Dispatch protocol for a capacity: ``sentinel`` or ``pull``; the combine follows it.
+    """Dispatch protocol the rule picks for a capacity: ``sentinel`` or ``pull``; the combine follows it.
+
+    The rule of ``sync_protocol="auto"`` (``nvlink_one_sided_tiling``).
 
     The Sentinel dispatch up to ``SENTINEL_MAX_TOKENS`` tokens per rank, and up to
     the bounds of ``SENTINEL_DISPATCH_THRESHOLDS`` where a reached target rank
@@ -255,9 +263,19 @@ def dispatch_protocol(
 
 
 def nvlink_one_sided_tiling(
-    max_tokens_per_rank: int, world_size: int, num_experts: int, num_topk: int
+    max_tokens_per_rank: int,
+    world_size: int,
+    num_experts: int,
+    num_topk: int,
+    sync_protocol: str = "auto",
 ) -> dict:
-    """Engine geometry and schedule for a capacity, as config keyword arguments.
+    """Engine geometry, schedule and protocols for a capacity, as config keyword arguments.
+
+    ``sync_protocol`` picks the dispatch: ``"auto"`` by ``dispatch_protocol``'s
+    rule, ``"sentinel"`` the Sentinel dispatch and ``"fence"`` the pull dispatch
+    at any capacity (``SYNC_PROTOCOL_DISPATCH``). The combine and every schedule
+    field below that depends on the dispatch follow the dispatch picked, so a
+    protocol forced to the one the rule picks gives the same fields.
 
     The expected load of one local expert is ``max_tokens_per_rank * world_size *
     num_topk / num_experts`` tokens and picks the token tile (``token_tile_n``);
@@ -288,15 +306,21 @@ def nvlink_one_sided_tiling(
     gate, so FC2 tiles are not claimed long before their FC1 tiles finish and the
     last tiles go to the clusters that free up first.
 
-    The combine follows the dispatch (``dispatch_protocol``). The Sentinel
-    dispatch runs with the Sentinel combine, which only resets the combine slots
-    the reduce consumed. The pull dispatch runs with the counter (Fence) combine,
-    whose all-rank tail barrier is what orders every peer's fetches of a rank's
-    staged activations before that rank stages again.
+    The combine follows the dispatch. The Sentinel dispatch runs with the
+    Sentinel combine, which only resets the combine slots the reduce consumed.
+    The pull dispatch runs with the counter (Fence) combine, whose all-rank tail
+    barrier is what orders every peer's fetches of a rank's staged activations
+    before that rank stages again.
     """
+    if sync_protocol not in SYNC_PROTOCOLS:
+        raise ValueError(
+            f"sync_protocol must be one of {SYNC_PROTOCOLS}, got {sync_protocol!r}"
+        )
     expected_load = max_tokens_per_rank * world_size * num_topk / num_experts
     tile_n = token_tile_n(expected_load)
-    dispatch = dispatch_protocol(max_tokens_per_rank, world_size, num_experts, num_topk)
+    dispatch = SYNC_PROTOCOL_DISPATCH.get(sync_protocol) or dispatch_protocol(
+        max_tokens_per_rank, world_size, num_experts, num_topk
+    )
     single_group = max_tokens_per_rank <= SINGLE_GROUP_MAX_TOKENS
     pipelined = max_tokens_per_rank >= PIPELINED_GROUPS_MIN_TOKENS
     pull_pipelined = pipelined and dispatch == "pull"
@@ -322,9 +346,10 @@ def nvlink_one_sided_tiling(
     )
 
 
-# Config fields that select engine geometry, scheduling and protocols without
-# changing the problem, the I/O tensors or the weight layout: the keys of
-# ``nvlink_one_sided_tiling`` and the remaining performance fields.
+# Config fields that select engine geometry and scheduling without changing the
+# problem, the I/O tensors, the weight layout or the protocols: the keys of
+# ``nvlink_one_sided_tiling`` but the protocols, which its ``sync_protocol``
+# picks, and the remaining performance fields.
 TUNING_FIELDS = frozenset(
     {
         "mma_tiler_mnk",
@@ -334,8 +359,6 @@ TUNING_FIELDS = frozenset(
         "pipelined_groups",
         "work_id_mode",
         "epi_flag_batches",
-        "dispatch_protocol",
-        "combine_protocol",
         "weight_evict",
         "entry_prefetch_bytes",
         "token_ab_stages",
