@@ -503,6 +503,9 @@ debug_print = False
 # False for static persistent.
 # Can also be overridden via --clc-dynamic-scheduler CLI flag.
 use_clc_dynamic_scheduler = False
+# Compatibility barrier for CUTLASS DSL builds whose CLC WorkQueue tail does
+# not drain CTA 0's empty barriers.
+use_clc_exit_cluster_barrier = False
 
 
 # Fallback cluster: when set, the kernel supports a smaller fallback cluster.
@@ -767,11 +770,11 @@ class SmemAbResource(MemoryResource):
         """
         pipe = super().create_pipeline(pipeline_config)
         layout = pipeline_config.cta_layout_vmnk
-        if layout is not None:
+        if cutlass.const_expr(layout is not None):
             cluster_total = 1
             for d in layout:
                 cluster_total *= d
-            if cluster_total > 2:
+            if cutlass.const_expr(cluster_total > 2):
                 object.__setattr__(pipe, "consumer_mask", (1 << cluster_total) - 1)
         return pipe
 
@@ -1020,11 +1023,11 @@ class SmemSfResource(MemoryResource):
         """Same empty-barrier consumer mask as the A/B TMA pipelines."""
         pipe = super().create_pipeline(pipeline_config)
         layout = pipeline_config.cta_layout_vmnk
-        if layout is not None:
+        if cutlass.const_expr(layout is not None):
             cluster_total = 1
             for d in layout:
                 cluster_total *= d
-            if cluster_total > 2:
+            if cutlass.const_expr(cluster_total > 2):
                 object.__setattr__(pipe, "consumer_mask", (1 << cluster_total) - 1)
         return pipe
 
@@ -3736,6 +3739,14 @@ def _run_gemm_execution(
         ):
             pass
 
+    # CLC consumers in every CTA release into CTA 0's empty barriers,
+    # including for the final response. Keep cluster SMEM alive until every
+    # CTA has delivered those releases on DSL builds that do not drain them.
+    if cutlass.const_expr(use_clc_exit_cluster_barrier):
+        prims.barrier_cluster_arrive()
+        prims.barrier_cluster_wait()
+
+    if warp_idx == tmem_allocator_warp_id:
         prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group="cta_2")
 
 

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from flashinfer.jit.cute_dsl_core import _get_compile_arch
+from flashinfer.prims_ts.cutlass_dsl import clc_exit_cluster_barrier_required
 from flashinfer.prims_ts.utils import get_prims_ts_compile_options
 
 _DISK_MODULE_NAME = "prims_ts_moe_gemm"
@@ -163,6 +164,7 @@ def _disk_kernel_name(cfg_hash: str, fc1_or_fc2: str, io: dict) -> str:
             # Read verbatim: the kernel and the compile entry point parse it
             # differently (line info, task-manager verification).
             "debug_checks": os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS"),
+            "clc_exit_barrier": clc_exit_cluster_barrier_required(),
         },
         sort_keys=True,
     )

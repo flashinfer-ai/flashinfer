@@ -29,6 +29,7 @@ from flashinfer.utils import (
     supported_compute_capability,
 )
 
+from ..cutlass_dsl import clc_exit_cluster_barrier_required
 from ..utils import is_prims_ts_arch_available
 from .config import PrimsTsGemmConfig
 from .support import nvfp4_128x4_numel as _nvfp4_128x4_numel
@@ -322,6 +323,9 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
         )
         module.fallback_cluster_shape_mnk = fallback_cluster(config.cluster_shape)
         module.use_clc_dynamic_scheduler = config.scheduler == "clc_dynamic"
+        module.use_clc_exit_cluster_barrier = (
+            module.use_clc_dynamic_scheduler and clc_exit_cluster_barrier_required()
+        )
         module._refresh_input_dependent_config()
         module._validate_cluster_shape(
             module.cluster_shape_mnk, option_name="cluster_shape_mnk"
@@ -443,6 +447,8 @@ def _compile(
                 f"mac{max_active_clusters}",
             )
         )
+        if module.use_clc_exit_cluster_barrier:
+            kernel_name += "_clcexitsync"
         if debug_checks:
             kernel_name += "_dbg"
         compiled = build_and_load_cute_dsl_kernel(

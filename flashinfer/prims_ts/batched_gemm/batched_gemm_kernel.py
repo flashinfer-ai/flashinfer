@@ -24,7 +24,11 @@ import os
 from dataclasses import replace
 from typing import Any
 
-from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
+from ..cutlass_dsl import (
+    clc_exit_cluster_barrier_required,
+    require_cutlass_dsl_experimental,
+    task_scheduling_scope,
+)
 
 require_cutlass_dsl_experimental()
 
@@ -152,6 +156,15 @@ def _task_manager_verify_enabled() -> bool:
 
 def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
     return bool(cfg.use_pdl and cfg.use_early_exit and not cfg.skip_early_exit_pdl)
+
+
+def _uses_clc_exit_cluster_barrier(cfg: BatchedGemmConfig) -> bool:
+    cluster_x, cluster_y, cluster_z = cfg.preferred_cluster_shape
+    return bool(
+        cfg.is_persistent
+        and cluster_x * cluster_y * cluster_z > 1
+        and clc_exit_cluster_barrier_required()
+    )
 
 
 def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
@@ -2781,6 +2794,12 @@ def _batched_gemm_kernel_bf16_body(
                         is_two_cta=False,
                         arch=cfg.arch_name,
                     )
+
+        # CLC consumers release into CTA 0's empty barriers. On affected DSL
+        # builds, keep every CTA's SMEM alive until all final releases land.
+        if cutlass.const_expr(_uses_clc_exit_cluster_barrier(cfg)):
+            prims.barrier_cluster_arrive()
+            prims.barrier_cluster_wait()
 
 
 @cute.kernel

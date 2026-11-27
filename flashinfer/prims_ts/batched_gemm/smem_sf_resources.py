@@ -126,12 +126,16 @@ class SmemSfAResource(MemoryResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def prepare_sfa_tile(self, stage_info: StageInfo) -> None:
-        self.weight_l2_cache_hint = make_weight_l2_cache_hint(
-            self.cfg.weight_l2_evict_first,
-            self.weight_tile_idx_view,
-            self.weight_num_token_tiles_view,
-            stage_info.work_tile.tile_idx[1],
-        )
+        # Without a policy the hint stays None. Rebinding that Python value per
+        # work tile is a metadata write inside the persistent loop, which PyIR
+        # rejects (UNSUP_META_CONDITIONAL_WRITE).
+        if cutlass.const_expr(self.cfg.weight_l2_evict_first):
+            self.weight_l2_cache_hint = make_weight_l2_cache_hint(
+                self.cfg.weight_l2_evict_first,
+                self.weight_tile_idx_view,
+                self.weight_num_token_tiles_view,
+                stage_info.work_tile.tile_idx[1],
+            )
 
     @producer_work
     @cute.jit
