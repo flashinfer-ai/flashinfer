@@ -653,10 +653,14 @@ template <typename DTypeIn, typename DTypeO>
 cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
                         uint32_t num_index_sets, uint32_t seq_len, uint32_t num_heads,
                         uint32_t head_dim, cudaStream_t stream = nullptr) {
+  if (seq_len == 0 || num_heads == 0) {
+    return cudaSuccess;
+  }
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    if (num_index_sets >= seq_len) {
+    // The large-index-set kernel puts heads on grid.y, so it needs num_heads <= 65535.
+    if (num_index_sets >= seq_len && num_heads <= 65535) {
       constexpr uint32_t num_threads = 128;
       constexpr uint32_t bdy = num_threads / bdx;
       dim3 nblks(seq_len, num_heads);

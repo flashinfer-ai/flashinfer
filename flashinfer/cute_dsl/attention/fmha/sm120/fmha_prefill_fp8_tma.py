@@ -3311,6 +3311,21 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             fixed_kv_l2_cache_hint,
                         )
                     self.wait_pipeline_barrier(v_consumed, consumed_phase)
+                    # Re-read the tile's pages for V rather than holding K's across the
+                    # wait: four page IDs per D=512 tile (page_size=16) otherwise spill.
+                    if cutlass.const_expr(
+                        self.use_paged_kv
+                        and not self.use_cp_async_paged_kv
+                        and self.split_d
+                        and self.kv_page_chunks > 2
+                    ):
+                        page_ids = self.resolve_paged_kv_tile_pages(
+                            request_idx,
+                            kv_seq_idx,
+                            seqlen_k,
+                            block_tables,
+                            cached_page,
+                        )
                     if cutlass.const_expr(self.use_cp_async_paged_kv):
                         self.load_one_paged_kv_tile_cp_async(
                             sV,

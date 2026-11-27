@@ -39,6 +39,7 @@ version is checked only when the SM120 backend is used.
 
 import math
 import os
+import struct
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from types import SimpleNamespace
@@ -138,11 +139,30 @@ def _resolve_balanced_scheduler(
     return balanced_scheduler
 
 
-def _validate_sm_scale(sm_scale: float) -> None:
-    # The online softmax takes the row max of the unscaled logits, which is the max of the
-    # scaled logits only for a positive scale; a zero scale also turns masked -inf logits into NaN.
-    if not (math.isfinite(sm_scale) and sm_scale > 0):
-        raise ValueError(f"sm_scale must be finite and > 0, got {sm_scale!r}")
+_FP32_MIN_NORMAL = 2.0**-126
+
+
+def _scale_log2(sm_scale: float) -> float:
+    """Return ``sm_scale * log2(e)`` rounded to FP32, the scale the kernel receives.
+
+    The online softmax takes the row max of the unscaled logits, which is the max of the
+    scaled logits only for a positive scale; a zero scale also turns masked -inf logits into
+    NaN. The check runs after FP32 rounding so scales that underflow to zero or overflow to
+    infinity are rejected too.
+    """
+    try:
+        value = struct.unpack(
+            "f", struct.pack("f", float(sm_scale) * math.log2(math.e))
+        )[0]
+    except OverflowError:
+        value = math.inf
+    if not (math.isfinite(value) and value >= _FP32_MIN_NORMAL):
+        raise ValueError(
+            "the effective softmax scale (sm_scale, times q_scale * k_scale in the "
+            "batch-prefill wrappers) must be finite and positive in FP32, got "
+            f"{sm_scale!r}"
+        )
+    return value
 
 
 def _select_tile_sizes(head_dim: int) -> tuple[int, int]:
@@ -334,7 +354,8 @@ def sm120_fmha_fp8_ragged_prefill(
         scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1`` or the
         Q-tile count exceeds CUDA's ``grid.y`` limit (65,535).
     sm_scale : float, optional
-        Softmax scale, finite and positive. Defaults to ``1 / sqrt(D)``.
+        Softmax scale. ``sm_scale * log2(e)`` must be finite and positive (normal) in FP32.
+        Defaults to ``1 / sqrt(D)``.
     kv_tile : int, optional
         K/V tile size (64 or 128). Defaults to 64 for ``D=512`` and 128 for
         other supported head dimensions.
@@ -403,11 +424,12 @@ def sm120_fmha_fp8_ragged_prefill(
         )
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
-    _validate_sm_scale(sm_scale)
-    # CUDA tensor maps cannot describe a zero-extent K/V tensor. Handle the
-    # all-empty ragged batch before TMA descriptor construction; requests with
-    # empty K/V inside a non-empty batch still use the kernel's empty-KV path.
-    if batch_size == 0 or k.shape[0] == 0:
+    scale_log2 = Float32(_scale_log2(sm_scale))
+    # CUDA tensor maps cannot describe a zero-extent tensor and CUDA rejects an
+    # empty grid. Handle an empty batch, zero total Q tokens, or all-empty K/V
+    # before TMA descriptor construction; requests with empty K/V inside a
+    # non-empty batch still use the kernel's empty-KV path.
+    if batch_size == 0 or q.shape[0] == 0 or k.shape[0] == 0:
         o.zero_()
         if lse is not None:
             lse.fill_(-float("inf"))
@@ -457,7 +479,6 @@ def sm120_fmha_fp8_ragged_prefill(
         enable_skip_softmax=threshold is not None,
     )
 
-    scale_log2 = Float32(sm_scale * math.log2(math.e))
     output_scale = Float32(1.0 if v_scale is None else float(v_scale))
 
     kernel_fn(
@@ -541,7 +562,8 @@ def sm120_fmha_fp8_paged_prefill(
         scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1`` or the
         Q-tile count exceeds CUDA's ``grid.y`` limit (65,535).
     sm_scale : float, optional
-        Softmax scale, finite and positive. Defaults to ``1 / sqrt(D)``.
+        Softmax scale. ``sm_scale * log2(e)`` must be finite and positive (normal) in FP32.
+        Defaults to ``1 / sqrt(D)``.
     max_seqlen_q : int, optional
         Runtime launch-grid bound. Derived from ``cu_seqlens_q`` if omitted.
     kv_tile : int, optional
@@ -628,19 +650,19 @@ def sm120_fmha_fp8_paged_prefill(
     threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, B)
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
-    _validate_sm_scale(sm_scale)
+    scale_log2 = Float32(_scale_log2(sm_scale))
     if B == 0:
         o.zero_()
         if lse is not None:
             lse.fill_(-float("inf"))
         return
     num_chunks = 1 if kv_tile_ranges is None else kv_tile_ranges.shape[0] // B
-    if kv_tile_ranges is not None and tuple(kv_tile_ranges.shape) != (
-        num_chunks * B,
-        2,
+    if kv_tile_ranges is not None and (
+        num_chunks < 1 or tuple(kv_tile_ranges.shape) != (num_chunks * B, 2)
     ):
         raise ValueError(
-            f"kv_tile_ranges must have shape (num_chunks * {B}, 2), got {tuple(kv_tile_ranges.shape)}"
+            f"kv_tile_ranges must have shape (num_chunks * {B}, 2) with num_chunks >= 1, "
+            f"got {tuple(kv_tile_ranges.shape)}"
         )
     num_items = num_chunks * B
     if num_items > _CUDA_MAX_GRID_Z:
@@ -652,6 +674,9 @@ def sm120_fmha_fp8_paged_prefill(
         raise ValueError(
             f"o must have {num_chunks} row(s) per Q token, got {o.shape[0]} rows for {q.shape[0]} tokens"
         )
+    # CUDA rejects an empty grid; zero total Q tokens leave nothing to write.
+    if q.shape[0] == 0:
+        return
 
     in_ct = _cutlass_dtype(q.dtype)
     out_ct = _cutlass_dtype(o.dtype)
@@ -711,7 +736,6 @@ def sm120_fmha_fp8_paged_prefill(
         **({"gqa_pack_size": gqa_pack_size} if gqa_pack_size > 1 else {}),
     )
 
-    scale_log2 = Float32(sm_scale * math.log2(math.e))
     output_scale = Float32(1.0 if v_scale is None else float(v_scale))
 
     # TVM-FFI ABI (env stream):
@@ -857,6 +881,8 @@ class SM120PrimsBatchPrefillBackend:
     Host-derived metadata and the base kernel are prepared in ``plan_*``.
     Runtime LSE specializations are compiled lazily and cached before dispatch.
     PDL is a runtime launch option shared by every compiled kernel.
+    ``run_*`` folds ``q_scale * k_scale`` into ``sm_scale``; the effective scale
+    must be finite and positive in FP32, or ``run_*`` raises ``ValueError``.
     """
 
     _FP8_DTYPES = (torch.float8_e4m3fn,)
@@ -1135,7 +1161,8 @@ class SM120PrimsBatchPrefillBackend:
                 f"backend='cute-dsl-prims' batch_size ({batch_size}) "
                 f"exceeds CUDA's grid.z limit of {_CUDA_MAX_GRID_Z}"
             )
-        if disable_split_kv or use_cuda_graph or head_dim < 64:
+        total_q = int(qo_indptr_host[-1].item()) if batch_size > 0 else 0
+        if disable_split_kv or use_cuda_graph or head_dim < 64 or total_q == 0:
             return 0
         q_tile, kv_tile = _select_tile_sizes(head_dim)
         bounds = _paged_kv_split_bounds(
@@ -1152,7 +1179,6 @@ class SM120PrimsBatchPrefillBackend:
         )
         if bounds is None:
             return 0
-        total_q = int(qo_indptr_host[-1].item())
         return _kv_split_scratch(
             total_q, num_qo_heads, head_dim, o_dtype, len(bounds[0]) - 1
         )[1]
@@ -1173,18 +1199,19 @@ class SM120PrimsBatchPrefillBackend:
         )
 
         self._kv_split = None
-        # merge_states needs head_dim >= 64.
+        total_q = int(qo_indptr_host[-1].item()) if qo_indptr_host.numel() > 1 else 0
+        # merge_states needs head_dim >= 64; zero Q tokens leave nothing to split.
         if (
             disable_split_kv
             or use_cuda_graph
             or self._head_dim < 64
             or float_workspace_buffer is None
+            or total_q == 0
         ):
             return
         q_tile, tile = _select_tile_sizes(self._head_dim)
         q_lens = (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist()
         kv_lens = seqlens_kv_host.tolist()
-        total_q = int(qo_indptr_host[-1].item())
         heads, dim = self._num_qo_heads, self._head_dim
         # Per chunk: one partial O row and one LSE row per Q token; plus the merged LSE.
         chunk_bytes = total_q * heads * (dim * self._o_dtype.itemsize + 4)

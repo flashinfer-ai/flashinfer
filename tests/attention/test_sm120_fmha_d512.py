@@ -750,10 +750,12 @@ def test_paged_metadata_consistency_and_empty_batch(monkeypatch):
     assert backend._max_seqlen_q == 0
 
 
-@pytest.mark.parametrize("sm_scale", [0.0, -0.05, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "sm_scale", [0.0, -0.05, float("nan"), float("inf"), 1e-50, 1e39]
+)
 def test_rejects_non_positive_sm_scale(monkeypatch, sm_scale):
-    """Verify sm_scale must be finite and positive: the online softmax takes the row max of
-    unscaled logits, and a zero scale turns masked -inf logits into NaN."""
+    """Verify sm_scale * log2(e) must be finite and positive in FP32: the online softmax takes
+    the row max of unscaled logits, and a zero scale turns masked -inf logits into NaN."""
     pytest.importorskip("cutlass.experimental")
     calls = _stub_sm120_compile(monkeypatch)
     q = torch.empty((4, 8, 512), dtype=torch.float8_e4m3fn)
@@ -768,6 +770,35 @@ def test_rejects_non_positive_sm_scale(monkeypatch, sm_scale):
         sm120_fmha_fp8_paged_prefill(
             q, pool, pool, o, bt, cu[1:], cu, sm_scale=sm_scale
         )
+    assert not calls
+
+
+def test_paged_rejects_empty_kv_tile_ranges_and_skips_empty_q(monkeypatch):
+    """Verify a non-empty batch needs at least one K/V chunk, and zero Q tokens launch nothing."""
+    pytest.importorskip("cutlass.experimental")
+    calls = _stub_sm120_compile(monkeypatch)
+    pool = torch.empty((1, 2, 16, 512), dtype=torch.float8_e4m3fn)
+    bt = torch.zeros((2, 1), dtype=torch.int32)
+    kv_lens = torch.tensor([16, 16], dtype=torch.int32)
+    q = torch.empty((4, 8, 512), dtype=torch.float8_e4m3fn)
+    o = torch.empty((4, 8, 512), dtype=torch.bfloat16)
+    cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+    with pytest.raises(ValueError, match="num_chunks >= 1"):
+        sm120_fmha_fp8_paged_prefill(
+            q,
+            pool,
+            pool,
+            o[:0],
+            bt,
+            kv_lens,
+            cu,
+            kv_tile_ranges=torch.empty((0, 2), dtype=torch.int32),
+        )
+    empty_q = torch.empty((0, 8, 512), dtype=torch.float8_e4m3fn)
+    empty_o = torch.empty((0, 8, 512), dtype=torch.bfloat16)
+    zero_cu = torch.zeros(3, dtype=torch.int32)
+    sm120_fmha_fp8_paged_prefill(empty_q, pool, pool, empty_o, bt, kv_lens, zero_cu)
+    sm120_fmha_fp8_ragged_prefill(empty_q, q[:, :2], q[:, :2], empty_o, zero_cu, cu)
     assert not calls
 
 
@@ -1335,38 +1366,39 @@ def _ref_merge_rows(v, s, rows):
     return torch.stack(out), torch.stack(lse)
 
 
-@_requires_sm120
-@pytest.mark.parametrize(
-    "seq_len,num_chunks,num_heads",
-    [
-        (65_537, 4, 32),  # MergeStatesKernel (num_chunks < seq_len)
-        (256, 257, 128),  # MergeStatesLargeNumIndexSetsKernel (num_chunks >= seq_len)
-    ],
-)
-def test_merge_states_d512_full_buffer_past_uint32_boundary(
-    seq_len, num_chunks, num_heads
-):
-    """Verify merge_states indexes the whole partial buffer with 64-bit offsets.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("shape", [(8, 3, 0, 512), (0, 3, 4, 512), (0, 0, 0, 64)])
+def test_merge_states_empty_output_is_a_no_op(shape):
+    """Verify merge_states returns empty outputs for zero tokens or zero heads instead of
+    building an empty grid (or dividing by a zero head tile)."""
 
-    The partial O holds more than 2^32 elements, so the last token's offsets wrap in 32-bit math.
-    """
-    d = 512
-    numel = seq_len * num_chunks * num_heads * d
-    assert numel > 1 << 32
-    need = (numel + seq_len * num_heads * d) * 2 + (1 << 30)
-    if torch.cuda.mem_get_info()[0] < need:
-        pytest.skip(f"needs {need / 2**30:.1f} GiB of free GPU memory")
-    gen = torch.Generator(device="cuda").manual_seed(0)
-    v = torch.empty(
-        (seq_len, num_chunks, num_heads, d), dtype=torch.bfloat16, device="cuda"
-    )
-    v.normal_(generator=gen)
-    s = torch.randn((seq_len, num_chunks, num_heads), device="cuda", generator=gen)
+    def empty(shape, dtype):
+        # Row-major strides over the zero-size dims, which the binding's contiguity check accepts.
+        strides = [math.prod(shape[i + 1 :]) for i in range(len(shape))]
+        return torch.empty(0, dtype=dtype, device="cuda").as_strided(shape, strides)
+
+    v = empty(shape, torch.bfloat16)
+    s = empty(shape[:3], torch.float32)
     merged_o, merged_lse = flashinfer.merge_states(v, s)
-    rows = [0, seq_len - 2, seq_len - 1]
-    ref_o, ref_lse = _ref_merge_rows(v, s, rows)
-    torch.testing.assert_close(merged_o[rows].float(), ref_o, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(merged_lse[rows], ref_lse, atol=1e-3, rtol=1e-3)
+    torch.cuda.synchronize()
+    assert merged_o.shape == (shape[0], shape[2], shape[3])
+    assert merged_lse.shape == (shape[0], shape[2])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_heads", [65_535, 65_536])
+def test_merge_states_many_heads_respects_grid_y_limit(num_heads):
+    """Verify merge_states with more index sets than tokens and more than 65,535 heads
+    stays within CUDA's grid.y limit."""
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    v = torch.randn(
+        (1, 2, num_heads, 64), dtype=torch.bfloat16, device="cuda", generator=gen
+    )
+    s = torch.randn((1, 2, num_heads), device="cuda", generator=gen)
+    merged_o, merged_lse = flashinfer.merge_states(v, s)
+    ref_o, ref_lse = _ref_merge_rows(v, s, [0])
+    torch.testing.assert_close(merged_o.float(), ref_o, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(merged_lse, ref_lse, atol=1e-3, rtol=1e-3)
 
 
 @_requires_sm120

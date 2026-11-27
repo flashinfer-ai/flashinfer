@@ -2493,7 +2493,7 @@ def _build_block_tables_from_paged_kv_indices(
     offsets = paged_kv_indptr_host.tolist()[: batch_size + 1]
     spans = list(zip(offsets, offsets[1:], strict=False))
     if out is None:
-        max_pages = max(end - start for start, end in spans)
+        max_pages = max((end - start for start, end in spans), default=0)
         out = torch.empty((batch_size, max_pages), dtype=torch.int32, device=device)
     indices = paged_kv_indices.to(device)
     rows, width = out.shape
@@ -3331,7 +3331,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             to select cuDNN for a new graph after planning FA2.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
-            CUTLASS primitives.
+            CUTLASS primitives. Its effective softmax scale, ``sm_scale * q_scale * k_scale``,
+            must be finite and positive in FP32; ``run`` raises ``ValueError`` otherwise.
 
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
@@ -4263,7 +4264,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if max_token_per_sequence is not None:
             max_q_len = max_token_per_sequence
         else:
-            max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
+            max_q_len = (
+                (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
+                if batch_size > 0
+                else 0
+            )
 
         kv_lens_arr_host = None
         if max_sequence_kv is None:
@@ -4272,7 +4277,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
                 )
             )
-            max_kv_len = kv_lens_arr_host.max().item()
+            max_kv_len = kv_lens_arr_host.max().item() if batch_size > 0 else 0
         else:
             max_kv_len = max_sequence_kv
 
@@ -6115,7 +6120,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-rubin`` is an explicit SM107-only E4M3 prefill backend
             with ``head_dim_qk=192``, ``head_dim_vo=128`` and BF16 output.
-            ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
+            ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend. Its
+            effective softmax scale, ``sm_scale * q_scale * k_scale``, must be finite and
+            positive in FP32; ``run`` raises ``ValueError`` otherwise.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
             opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
 
@@ -6900,12 +6907,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_qo_len = (
             max_token_per_sequence
             if explicit_cudnn and max_token_per_sequence is not None
-            else int(qo_len_arr.max().item())
+            else (int(qo_len_arr.max().item()) if qo_len_arr.numel() else 0)
         )
         max_seq_in_batch = (
             max_sequence_kv
             if explicit_cudnn and max_sequence_kv is not None
-            else int(kv_len_arr.max().item())
+            else (int(kv_len_arr.max().item()) if kv_len_arr.numel() else 0)
         )
 
         if self._backend == "cute-dsl-rubin":

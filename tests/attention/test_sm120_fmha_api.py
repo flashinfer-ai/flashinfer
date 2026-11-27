@@ -6,6 +6,9 @@ import inspect
 import pytest
 import torch
 
+# The SM120 host module imports the optional CuTe DSL at module level.
+pytest.importorskip("cutlass.cute", reason="nvidia-cutlass-dsl is not installed")
+
 from flashinfer.attention.cute_dsl.sm120_fmha import (
     _prepare_skip_softmax_threshold,
     sm120_fmha_fp8_paged_prefill,

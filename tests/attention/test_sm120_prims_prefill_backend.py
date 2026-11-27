@@ -767,3 +767,78 @@ def test_cuda_graph_page_size_1_reads_updated_block_table():
 
     torch.testing.assert_close(captured, eager, atol=0, rtol=0)
     torch.testing.assert_close(eager, torch.full_like(eager, -1))
+
+
+def _plan_wrapper(kind, q_lens, kv_lens, hq, hkv, d, page_size=16, **plan_kwargs):
+    """Plan a public prims wrapper and return it with matching inputs for ``run``."""
+    qo = torch.tensor([0, *q_lens], dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    q = _fp8((sum(q_lens), hq, d))
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    dtypes = dict(q_data_type=q.dtype, kv_data_type=q.dtype, o_data_type=torch.bfloat16)
+    if kind == "ragged":
+        kv = torch.tensor([0, *kv_lens], dtype=torch.int32).cumsum(0, dtype=torch.int32)
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, "NHD", backend="cute-dsl-prims"
+        )
+        wrapper.plan(qo.cuda(), kv.cuda(), hq, hkv, d, **dtypes, **plan_kwargs)
+        return wrapper, (q, _fp8((sum(kv_lens), hkv, d)), _fp8((sum(kv_lens), hkv, d)))
+    pages = [ceil_div(kv, page_size) for kv in kv_lens]
+    page_indptr = torch.tensor([0, *pages]).cumsum(0, dtype=torch.int32)
+    last_page_len = torch.tensor(
+        [kv - (p - 1) * page_size for kv, p in zip(kv_lens, pages, strict=True)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "HND", backend="cute-dsl-prims"
+    )
+    wrapper.plan(
+        qo.cuda(),
+        page_indptr.cuda(),
+        torch.arange(sum(pages), dtype=torch.int32, device="cuda"),
+        last_page_len,
+        hq,
+        hkv,
+        d,
+        page_size,
+        **dtypes,
+        **plan_kwargs,
+    )
+    return wrapper, (q, _fp8((max(sum(pages), 1), 2, hkv, page_size, d)))
+
+
+@pytest.mark.parametrize(
+    "kind,q_lens,kv_lens,plan_kwargs",
+    [
+        (kind, *case)
+        for kind in ("ragged", "paged")
+        for case in (
+            ([], [], {}),  # empty batch
+            ([0, 0], [500, 7000], {}),  # zero Q tokens, non-empty K/V
+            ([0, 0], [500, 7000], {"causal": True}),
+        )
+    ]
+    # Split-KV is paged-only; zero Q tokens must not plan a split.
+    + [("paged", [0, 0], [500, 7000], {"fixed_split_size": 4})],
+)
+def test_public_wrappers_accept_empty_q(kind, q_lens, kv_lens, plan_kwargs):
+    hq, hkv, d = 8, 2, 128
+    wrapper, inputs = _plan_wrapper(kind, q_lens, kv_lens, hq, hkv, d, **plan_kwargs)
+    if kind == "paged":
+        assert wrapper._prims_backend._kv_split is None
+    out, lse = wrapper.run_return_lse(*inputs)
+    torch.cuda.synchronize()
+    assert out.shape == (0, hq, d)
+    assert lse.shape == (0, hq)
+
+
+@pytest.mark.parametrize("kind", ["ragged", "paged"])
+@pytest.mark.parametrize("q_scale", [0.0, 1e-50, 1e39])
+def test_public_wrappers_reject_non_finite_positive_effective_scale(kind, q_scale):
+    """q_scale * k_scale is folded into sm_scale; the FP32 result must be finite and > 0."""
+    wrapper, inputs = _plan_wrapper(kind, [3, 2], [5, 4], 4, 2, 32, sm_scale=1.0)
+    with pytest.raises(ValueError, match="effective softmax scale"):
+        wrapper.run(*inputs, q_scale=q_scale)
+    out = wrapper.run(*inputs, q_scale=1e-30)
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(out.float()).all())
