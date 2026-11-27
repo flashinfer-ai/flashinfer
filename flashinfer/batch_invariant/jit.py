@@ -27,6 +27,7 @@ from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel, sanitize_symbol_
 __all__ = [
     "build_and_load",
     "module_source_sha256",
+    "precompile",
     "module_sources",
     "relative_sources",
     "sanitize_symbol_name",
@@ -70,15 +71,20 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
     ),
-    # the MoE kernels of the bf16 and the fp8 per-tensor classes: the grouped and the swapped GEMM bodies (one source for
-    # both operand formats, composing the dense GEMM blocks: they are in its closure), the routing, permutation and
-    # combine kernels; the MoE API, dispatchers and runners stay outside
+    # the MoE kernels of the bf16, the fp8 per-tensor and the NVFP4 classes: the grouped and the swapped GEMM bodies (one
+    # source for every operand format, composing the dense and the block-scaled GEMM blocks: they are in its closure), the
+    # routing, permutation, combine and fp4 scatter kernels; the MoE API, dispatchers and runners stay outside
     "batch_invariant_moe": (
         "fused_moe/batch_invariant/blocks/compile.py",
         "fused_moe/batch_invariant/route.py",
         "fused_moe/batch_invariant/route_plan.py",
         "fused_moe/batch_invariant/permute.py",
+        "fused_moe/batch_invariant/permute_nvfp4.py",
         "fused_moe/batch_invariant/combine.py",
+    ),
+    # the NVFP4 MoE classes' row-mapped per-token quantization (the quantizer class's kernel with a destination row map)
+    "batch_invariant_moe_nvfp4_quant": (
+        "fused_moe/batch_invariant/blocks/quant_nvfp4.py",
     ),
 }
 
@@ -205,8 +211,9 @@ def _export_compile_fn(
 
 
 def build_and_load(module: str, kernel: str, compile_fn: Callable[..., Any]) -> Any:
-    """Return a TVM-FFI callable for ``kernel`` of ``module``, compiling only on a cache miss. A ``compile_fn`` that
-    forwards ``**compile_options`` to ``cute.compile`` is compiled without the execution engine for the exported object
+    """Return a TVM-FFI callable for ``kernel`` of ``module``, compiling only on a cache miss (under the op family's module
+    lock: concurrent processes missing the same kernel compile it once). A ``compile_fn`` that forwards
+    ``**compile_options`` to ``cute.compile`` is compiled without the execution engine for the exported object
     (:func:`_export_compile_fn`); one without them keeps the engine."""
     try:
         source_sha256: Optional[str] = module_source_sha256(module)
@@ -221,3 +228,27 @@ def build_and_load(module: str, kernel: str, compile_fn: Callable[..., Any]) -> 
         source_sha256=source_sha256,
         export_compile_fn=_export_compile_fn(compile_fn),
     )
+
+
+def precompile(module: str, kernel: str, compile_fn: Callable[..., Any]) -> None:
+    """Compile ``kernel`` of ``module`` into the on-disk cache without loading it, OUTSIDE the module lock
+    (``JitSpecCuteDsl.compile_and_persist``: the lock is taken only for the stale-module wipe and the artifact export, the
+    path the GEMM and MoE precompilers use). The entry for precompile pools: ``build_and_load`` holds the lock for the whole
+    build, which makes a pool of workers compiling DIFFERENT kernels of one family serial -- 579 truncated-sampler kernels on
+    8 workers measured 1565 s through it against 259 s through this path (2026-11-18). The compile is the one
+    ``build_and_load`` would run (the module's cached source hash, the engine-less export for a ``compile_fn`` that forwards
+    ``**compile_options``: :func:`_export_compile_fn`). A kernel already in the cache is left alone; with the disk cache
+    disabled (``FLASHINFER_CUTE_DSL_DISABLE_CACHE=1``) there is nothing to persist and nothing is compiled."""
+    from ..jit.cute_dsl_core import JitSpecCuteDsl, cute_dsl_cache_disabled
+
+    if cute_dsl_cache_disabled():
+        return  # nothing to persist: with the disk cache disabled the serving path compiles in-process
+    spec = JitSpecCuteDsl(
+        module,
+        kernel,
+        compile_fn,
+        module_source_sha256(module),
+        export_compile_fn=_export_compile_fn(compile_fn),
+    )
+    if not spec.is_compiled:
+        spec.compile_and_persist()

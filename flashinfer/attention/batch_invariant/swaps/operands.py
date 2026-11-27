@@ -223,13 +223,23 @@ class SwapsPlan:
     """Tiled MMAs, tilers, smem / TMEM layouts, stage counts and the producer views of the swapped body."""
 
     def __init__(
-        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+        self,
+        D: int,
+        g: int,
+        page: int,
+        n_pad: int,
+        ragged: bool = False,
+        cap: int = 0,
+        *,
+        causal: bool = True,
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
+        self.causal = causal  # the mask mode (blocks/operands.StaticPlan.causal)
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
         self.D, self.g, self.page, self.n_pad = D, g, page, n_pad
+        self.sinks = False  # set by the kernel compiled for attention sinks
         self.ragged = (
             ragged  # the packed-token KV view (blocks/operands.StaticPlan.ragged)
         )

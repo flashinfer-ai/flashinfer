@@ -18,6 +18,7 @@ caller-owned; only the recommendation evaluates alternative groups.
 """
 
 from dataclasses import dataclass, replace
+from typing import Dict, NamedTuple
 
 # Groups beyond G8 use two (G16) or four (G32) page-major membership planes and
 # the Keeps recipes; the recommendation considers powers of two up to G32.
@@ -253,28 +254,54 @@ def candidate_union_tokens(
 
 
 # A group's K/V union grows sub-linearly in G: real sparse-indexer outputs
-# (prefill, 32K-64K context, 12 sparse layers) revisit a
-# shared pool of blocks, so union(G) ~ selected * G**0.48 (about 1.4x per
-# doubling of G, despite only ~60% adjacent-query overlap). The G latency
-# model uses a smaller fitted exponent, which also absorbs per-tile overlap
-# effects of larger groups.
-DEFAULT_UNION_EXPONENT = 0.35
-# Relative launch-cost model, in us, for GB300 D256 QToken recipes: one KV128
-# tile of a work item by Q tile (Q64, Q128), per-work-item prologue and
-# epilogue, grouped metadata by group class (G2-4 byte map, G5-8, G16, G32),
-# and the split reduction. Only the argmin matters: with
-# DEFAULT_UNION_EXPONENT the constants minimize chosen/best-measured latency
-# (geomean, then worst case) over NVFP4 sweeps on real indexer top-k of two
-# corpora (4/1 and 16/2 Q/KV heads per GPU, one request, 0-64K
-# prefix, 1-4096 queries, explicit G in {1, 2, 4, 8, 16, 32}; 152 SMs),
-# cross-validated between the corpora: geomean 1.000-1.001x, worst
-# 1.01-1.04x of the best G. NVFP4 K/V is transformed in the kernel (no
-# per-call K/V conversion), and the expected union is capped at the longest
-# request's KV length (``seq_len_kv``).
-_TILE_US = {64: 1.215, 128: 2.062}
-_ITEM_US = 1.041
-_METADATA_US = {4: 3.742, 8: 6.36, 16: 7.89, 32: 10.423}
-_REDUCE_US = 0.83
+# (prefill, 32K-64K context, 12 sparse layers) revisit a shared pool of
+# blocks, so union(G) ~ selected * G**0.42-0.56 (about 1.4x per doubling of
+# G, despite only ~60% adjacent-query overlap). The latency model uses the
+# measured growth: a smaller exponent made TileQ128 appear costlier than it
+# is, which picked too small a group for 32 and 64 Q heads per KV head.
+DEFAULT_UNION_EXPONENT = 0.48
+
+
+class _LatencyModel(NamedTuple):
+    """Relative launch-cost model, in us, of one NVFP4 K/V layout."""
+
+    tile_us: Dict[int, float]  # one KV128 tile of a work item, by TileQ
+    item_us: Dict[int, float]  # work-item prologue and epilogue, by TileQ
+    metadata_us: Dict[int, float]  # grouped metadata: G2-4, G5-8, G16, G32
+    reduce_us: float  # split reduction
+
+
+# GB300 D256 QToken recipes, keyed by ``nvfp4_interleaved_kv``: separate
+# scale tensors and interleaved rows stage K/V differently, and interleaved
+# rows at long contexts favor about one group size larger. Only the argmin
+# matters: with DEFAULT_UNION_EXPONENT the constants minimize
+# chosen/best-measured latency (geomean, then worst case) over NVFP4 sweeps
+# of every legal G in {1, 2, 4, 8, 16, 32} on real indexer top-k of two
+# corpora (1-64 Q heads per KV head, 1-8 KV heads, 1-64 requests, 0-64K
+# prefix, 1-4096 queries; 152 SMs), fitted on one corpus and checked on the
+# other: geomean 1.002x (separate scales) and 1.004x (interleaved rows),
+# worst 1.13x of the best G. The interleaved-rows constants are refit with
+# every launch spanning more than one SM wave measured under the balanced
+# (longest-first) scheduler it takes by default, which favors TileQ128 groups
+# there. SM waves are fractional (items / SMs, at least one), which fitted
+# better than whole waves. NVFP4 K/V is transformed in
+# the kernel (no per-call K/V conversion). With the longest request's KV
+# length (``seq_len_kv``), each route's expected union is capped at the
+# context its last query sees (``_mean_route_union_tokens``).
+_LATENCY_MODELS = {
+    False: _LatencyModel(
+        tile_us={64: 2.072, 128: 3.332},
+        item_us={64: 13.834, 128: 16.355},
+        metadata_us={4: 8.156, 8: 10.829, 16: 12.911, 32: 18.033},
+        reduce_us=1.861,
+    ),
+    True: _LatencyModel(
+        tile_us={64: 1.446, 128: 2.232},
+        item_us={64: 9.827, 128: 12.048},
+        metadata_us={4: 5.898, 8: 9.522, 16: 11.238, 32: 14.935},
+        reduce_us=0.718,
+    ),
+}
 # Candidate groups: powers of two up to G32 (two to four membership planes
 # beyond G8), plus the largest legal group (a short request then forms one
 # route). Other odd groups measured no better and only add JIT variants.
@@ -289,6 +316,28 @@ def expected_union_tokens(
     """Expected union of ``group_size`` adjacent queries' selections, in tokens."""
     grown = selected_kv_tokens * group_size**union_exponent
     return max(1, min(group_size * selected_kv_tokens, int(round(grown))))
+
+
+def _mean_route_union_tokens(
+    union: int, group_size: int, seq_len_q: int, kv_tokens: int
+) -> int:
+    """Mean over a request's routes of ``union`` capped by the route's context.
+
+    The request's ``seq_len_q`` queries end at KV length ``kv_tokens``; route
+    r covers queries rG..rG+G-1, whose last query sees ``kv_tokens -
+    seq_len_q + min((r + 1) G, seq_len_q)`` tokens. Causal prefill from a
+    short prefix therefore gathers far less than ``union`` in early routes.
+    """
+    prefix = max(0, kv_tokens - seq_len_q)
+    full_groups, tail = divmod(seq_len_q, group_size)
+    routes = full_groups + int(tail > 0)
+    # Full routes r < below end at or under the union: prefix + (r + 1) G.
+    below = min(full_groups, max(0, (union - prefix) // group_size))
+    total = below * prefix + group_size * below * (below + 1) // 2
+    total += (full_groups - below) * union
+    if tail:
+        total += min(union, kv_tokens)
+    return max(1, -(-total // routes))
 
 
 def suggest_sparse_group(
@@ -307,16 +356,19 @@ def suggest_sparse_group(
     nvfp4_kv: bool = False,
     kv_tokens: int = 0,
     packed_query: bool = False,
+    nvfp4_interleaved_kv: bool = False,
 ) -> int:
     """Choose G by an estimated-latency model of the whole sparse call.
 
     For each legal G (powers of two up to G32 with at most TileQ128 rows),
     the selected recipe's configured split fanout is applied to the group's
-    *expected* union (``expected_union_tokens``, capped at ``kv_tokens``,
-    the longest request's KV length, when positive) to obtain the active splits
-    and KV tiles per work item; the estimate is
-    ``waves * (tiles_per_item * tile_cost[TileQ] + item_cost)`` plus the
-    grouped metadata launch and the split reduction (active splits > 1).
+    *expected* union (``expected_union_tokens``; when ``kv_tokens``, the
+    longest request's KV length, is positive, each route's union is capped
+    at its last query's context and averaged, ``_mean_route_union_tokens``)
+    to obtain the active splits and KV tiles per work item; the estimate is
+    ``waves * (tiles_per_item * tile_cost[TileQ] + item_cost[TileQ])`` plus
+    the grouped metadata launch and the split reduction (active splits > 1),
+    with the constants of the NVFP4 layout (``nvfp4_interleaved_kv``).
     ``nvfp4_kv`` plans the NVFP4 transform recipes as the resolver does
     (``prefers_nvfp4_keeps``, else one-instance Swaps). G16/G32 are
     candidates only for ``packed_query`` launches with blocks of at most
@@ -348,6 +400,7 @@ def suggest_sparse_group(
             block_size=block_size,
         )
     largest = min(MAX_GROUP_SIZE, seq_len_q, MAX_TILE_SIZE_Q // heads_q_per_kv)
+    costs = _LATENCY_MODELS[bool(nvfp4_interleaved_kv)]
     best_group, best_cost = 1, None
     candidates = sorted({g for g in _CANDIDATE_GROUPS if g <= largest} | {largest})
     for group in candidates:
@@ -381,7 +434,7 @@ def suggest_sparse_group(
             launch = replace(launch, num_insts_kv=1)
         union = expected_union_tokens(group, selected_kv_tokens, union_exponent)
         if kv_tokens > 0:
-            union = min(union, kv_tokens)
+            union = _mean_route_union_tokens(union, group, seq_len_q, kv_tokens)
         tiles = (union + TILE_SIZE_KV - 1) // TILE_SIZE_KV
         active_splits = compute_runtime_active_splits_kv(
             valid_k=union,
@@ -391,14 +444,14 @@ def suggest_sparse_group(
         )
         tiles_per_item = (tiles + active_splits - 1) // active_splits
         items = routes * num_kv_heads * active_splits
-        waves = (items + multi_processor_count - 1) // multi_processor_count
-        tile_us = _TILE_US[128 if launch.tile_size_q > 64 else 64]
-        cost = waves * (tiles_per_item * tile_us + _ITEM_US)
+        waves = max(1.0, items / multi_processor_count)
+        tile_q = 128 if launch.tile_size_q > 64 else 64
+        cost = waves * (tiles_per_item * costs.tile_us[tile_q] + costs.item_us[tile_q])
         if group > 1:
-            cost += _METADATA_US[
+            cost += costs.metadata_us[
                 4 if group <= 4 else 8 if group <= 8 else 16 if group <= 16 else 32
             ]
-        cost += _REDUCE_US if active_splits > 1 else 0.0
+        cost += costs.reduce_us if active_splits > 1 else 0.0
         if best_cost is None or cost < best_cost - 1e-9:
             best_group, best_cost = group, cost
     return best_group

@@ -268,7 +268,8 @@ void Launch(TensorView block_indices, TensorView block_table, Optional<TensorVie
             TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens,
             const QTokenKvBlockSparseMetadataGeometry& geometry, int32_t group_size,
             bool release_pdl, int32_t locator_page_stride, bool count_current_block_in_topk,
-            int32_t fixed_query_len) {
+            int32_t fixed_query_len, int32_t* route_order, int32_t* route_order_counter,
+            int32_t route_order_tail) {
   const int topk_axis = block_indices.ndim() - 1;
   QTokenKvBlockSparseTouchedMetadataParams<PositionType> params{
       static_cast<const int32_t*>(block_indices.data_ptr()),
@@ -308,7 +309,10 @@ void Launch(TensorView block_indices, TensorView block_table, Optional<TensorVie
       locator_page_stride,
       release_pdl,
       count_current_block_in_topk,
-      fixed_query_len};
+      fixed_query_len,
+      route_order,
+      route_order_counter,
+      route_order_tail};
 
   ffi::CUDADeviceGuard device_guard(block_indices.device().device_id);
   const cudaStream_t stream = get_stream(block_indices.device());
@@ -327,7 +331,10 @@ void Run(TensorView block_indices, TensorView block_table, Optional<TensorView> 
          TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens,
          int64_t group_size, int64_t storage_page_size, int64_t sparse_block_size,
          int64_t max_seq_len_kv, bool release_pdl, int64_t locator_head_multiplier,
-         bool count_current_block_in_topk, int64_t fixed_query_len) {
+         bool count_current_block_in_topk, int64_t fixed_query_len,
+         Optional<TensorView> route_order = Optional<TensorView>(),
+         Optional<TensorView> route_order_counter = Optional<TensorView>(),
+         int64_t route_order_tail_routes = 0) {
   const QTokenKvBlockSparseMetadataGeometry geometry = ValidateInputs<PackedQuery, QueryMajor>(
       block_indices, block_table, token_to_request, query_positions, qo_indptr,
       q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens,
@@ -337,19 +344,49 @@ void Run(TensorView block_indices, TensorView block_table, Optional<TensorView> 
                  locator_head_multiplier <= std::numeric_limits<int32_t>::max() / subpages)
       << "locator page stride must fit positive int32";
   const int32_t locator_page_stride = static_cast<int32_t>(subpages * locator_head_multiplier);
+  TVM_FFI_ICHECK_EQ(route_order.has_value(), route_order_counter.has_value())
+      << "route_order and route_order_counter are passed together";
+  int32_t* route_order_ptr = nullptr;
+  int32_t* route_order_counter_ptr = nullptr;
+  int32_t route_order_tail = 0;
+  if (route_order.has_value()) {
+    CheckInt32CUDA(route_order.value(), "route_order");
+    CheckInt32CUDA(route_order_counter.value(), "route_order_counter");
+    CheckSameDevice(block_indices, route_order.value(), "route_order");
+    CheckSameDevice(block_indices, route_order_counter.value(), "route_order_counter");
+    TVM_FFI_ICHECK(group_size > 1 && geometry.pattern_heads == 1)
+        << "route_order requires grouped routes with a shared sparse pattern";
+    TVM_FFI_ICHECK(route_order.value().ndim() == 1 &&
+                   route_order.value().size(0) == geometry.groups &&
+                   route_order.value().IsContiguous())
+        << "route_order must be a contiguous [groups] tensor";
+    TVM_FFI_ICHECK(route_order_counter.value().ndim() == 1 &&
+                   route_order_counter.value().size(0) >= 1)
+        << "route_order_counter must be a nonempty one-dimensional tensor";
+    route_order_ptr = static_cast<int32_t*>(route_order.value().data_ptr());
+    route_order_counter_ptr = static_cast<int32_t*>(route_order_counter.value().data_ptr());
+    TVM_FFI_ICHECK(route_order_tail_routes >= 0 &&
+                   route_order_tail_routes <= std::numeric_limits<int32_t>::max())
+        << "route_order_tail must be a nonnegative int32";
+    // Zero orders every route longest first.
+    route_order_tail = route_order_tail_routes == 0 ? geometry.groups
+                                                    : static_cast<int32_t>(route_order_tail_routes);
+  }
 
   if (encode_dlpack_dtype(query_positions.dtype()) == int32_code) {
     Launch<int32_t, PackedQuery, QueryMajor>(
         block_indices, block_table, token_to_request, query_positions, qo_indptr,
         q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens,
         geometry, static_cast<int32_t>(group_size), release_pdl, locator_page_stride,
-        count_current_block_in_topk, fixed_query_len);
+        count_current_block_in_topk, fixed_query_len, route_order_ptr, route_order_counter_ptr,
+        route_order_tail);
   } else {
     Launch<int64_t, PackedQuery, QueryMajor>(
         block_indices, block_table, token_to_request, query_positions, qo_indptr,
         q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens,
         geometry, static_cast<int32_t>(group_size), release_pdl, locator_page_stride,
-        count_current_block_in_topk, fixed_query_len);
+        count_current_block_in_topk, fixed_query_len, route_order_ptr, route_order_counter_ptr,
+        route_order_tail);
   }
 }
 
@@ -373,11 +410,14 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
     TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len) {
+    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len,
+    Optional<TensorView> route_order, Optional<TensorView> route_order_counter,
+    int64_t route_order_tail) {
   Run<true>(block_indices, block_table, token_to_request, query_positions, &qo_indptr,
             q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
             seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv, release_pdl,
-            locator_head_multiplier, count_current_block_in_topk, fixed_query_len);
+            locator_head_multiplier, count_current_block_in_topk, fixed_query_len, route_order,
+            route_order_counter, route_order_tail);
 }
 
 // Dynamic SMEM the G16/G32 metadata launch needs for a model prefix, or -1
@@ -417,10 +457,12 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPackedQueryMajor(
     TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len) {
+    int64_t locator_head_multiplier, bool count_current_block_in_topk, int64_t fixed_query_len,
+    Optional<TensorView> route_order, Optional<TensorView> route_order_counter,
+    int64_t route_order_tail) {
   Run<true, true>(block_indices, block_table, token_to_request, query_positions, &qo_indptr,
                   q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
                   seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv,
                   release_pdl, locator_head_multiplier, count_current_block_in_topk,
-                  fixed_query_len);
+                  fixed_query_len, route_order, route_order_counter, route_order_tail);
 }

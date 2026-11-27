@@ -988,6 +988,7 @@ class W4A16GemmCompileResult:
     trellis_codebook: str = LUT_E4M3
     trellis_pair_kind: str | None = None
     trellis_rate_axis: str | None = None
+    schedule_whole_tiles: bool = False
 
 
 @dataclass(frozen=True)
@@ -10259,9 +10260,19 @@ def compile_w4a16_gemm(
     trellis_pair_kind: str | None = None,
     trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
+    schedule_whole_tiles: bool | None = None,
 ) -> W4A16GemmCompileResult:
+    """Compile one standalone W4A16 GEMM.
+
+    ``schedule_whole_tiles=None`` keeps the layout default: ``trellis_t256``
+    computes every mn-tile over the full K in one CTA (m-invariant row bits).
+    ``False`` compiles the stripe split-K schedule instead, whose launch grid
+    sets how many CTAs share each tile's K range.
+    """
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
+    if schedule_whole_tiles is None:
+        schedule_whole_tiles = weight_layout == "trellis_t256"
     if torch.cuda.is_available():
         device = int(torch.cuda.current_device())
     else:
@@ -10286,7 +10297,7 @@ def compile_w4a16_gemm(
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
         dense_route_fast_path=bool(dense_route_fast_path),
-        schedule_whole_tiles=weight_layout == "trellis_t256",
+        schedule_whole_tiles=bool(schedule_whole_tiles),
     )
     cache_key = (
         "w4a16_gemm",
@@ -10418,6 +10429,7 @@ def compile_w4a16_gemm(
         trellis_codebook=str(trellis_codebook).lower(),
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
+        schedule_whole_tiles=kernel.schedule_whole_tiles,
     )
     attach_programs(result, compiled)
     _CACHE[cache_key] = result
@@ -12842,6 +12854,57 @@ def _trellis256_dense_launch_geometry(
     return default
 
 
+# Split-K slice-count rule, fitted to RTX PRO 6000 sweeps (K6 MCG; 6144x1024,
+# 4096x6144 and 2048x4096 at M = 1..128 with 2..16 slices): the default lands
+# within 6% of the fastest slice count in every case.
+# - The stripe finalize is lock-ordered, so each extra slice of a tile adds a
+#   serial c_tmp read-modify-write: more than 8 slices never won.
+# - A slice owns at least 512 of K per two live 16-row blocks; fuller tiles
+#   make the per-slice partial larger and favour fewer slices.
+# - Slices split a tile's K-tiles evenly; an uneven split leaves a straggler.
+_TRELLIS_DENSE_SPLIT_K_MAX_SLICES = 8
+_TRELLIS_DENSE_SPLIT_K_MIN_K = 512
+
+
+def _trellis256_dense_split_k_slices(
+    *,
+    size_m: int,
+    size_k: int,
+    size_n: int,
+    block_rows: int,
+    tile_k: int,
+    tile_n: int,
+    sms: int,
+) -> int | None:
+    """Pick K slices per tile for an under-filled dense-Trellis launch.
+
+    The whole-tile schedule launches one CTA per mn-tile. At decode/verify M
+    a narrow projection has only a few tiles (N=1024 with N256 tiles is 4
+    CTAs), so most SMs idle while each CTA walks the full K range. Return the
+    number of CTAs that should share each tile's K range so the launch fills
+    about one SM wave, or ``None`` when whole tiles already fill the device.
+    """
+    if sms <= 0 or block_rows == 8:
+        return None
+    mn_tiles = _covering_count(int(size_m), int(block_rows)) * (
+        int(size_n) // int(tile_n)
+    )
+    if mn_tiles <= 0:
+        return None
+    live_blocks = _covering_count(min(int(size_m), int(block_rows)), 16)
+    min_k = _TRELLIS_DENSE_SPLIT_K_MIN_K * max(1, live_blocks // 2)
+    k_tiles = int(size_k) // int(tile_k)
+    limit = min(
+        _TRELLIS_DENSE_SPLIT_K_MAX_SLICES,
+        int(size_k) // min_k,
+        int(sms) // mn_tiles,
+    )
+    for slices in range(limit, 1, -1):
+        if k_tiles % slices == 0:
+            return slices
+    return None
+
+
 def _resolve_exl3_hadamard_128(hadamard_128):
     if hadamard_128 is None:
         try:
@@ -12905,6 +12968,8 @@ def _run_trellis256_dense_current_device(
     output_f16: torch.Tensor | None = None,
     hadamard_128,
     stream: cuda.CUstream | None = None,
+    split_k_slices: int | None = None,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one native EXL3 linear on the already-selected CUDA device.
 
@@ -12912,6 +12977,17 @@ def _run_trellis256_dense_current_device(
     inside the kernel, so no top-k tensors or route-packing kernels are created.
     Outer rotations follow EXL3 order exactly: fp16 ``suh`` multiply before the
     input H128, and fp16 ``svh`` multiply after the output H128.
+
+    ``split_k_slices`` requires a launch compiled with
+    ``schedule_whole_tiles=False``; the grid then holds that many CTAs per
+    mn-tile (capped at ``grid_cap``) and the kernel's lock-ordered split-K
+    finalize combines their partial sums in a fixed order.
+
+    A split-K launch also needs ``locks``: zero-initialized int32 counters, at
+    least as many as ``prepared_dense.workspace``, owned by one execution at a
+    time. Every complete launch leaves them zero. The weight's own workspace is
+    shared by every plan on that weight, so split-K never uses it: two launches
+    on different streams would otherwise interleave on the same counters.
     """
     if getattr(prepared_dense, "weight_layout", None) != "trellis_t256":
         raise ValueError("run_trellis256_dense requires prepared trellis_t256 weights")
@@ -13023,7 +13099,42 @@ def _run_trellis256_dense_current_device(
         raise ValueError("prepared Trellis launcher metadata differs from the weight")
     tile_n = int(launch.kernel.tile_n)
     n_tiles = size_n // tile_n
-    grid_x = min(int(grid_cap), max(route_blocks * n_tiles, 1))
+    mn_tiles = max(route_blocks * n_tiles, 1)
+    if split_k_slices is None:
+        if not launch.kernel.schedule_whole_tiles:
+            raise ValueError(
+                "a split-K Trellis launch requires split_k_slices to size its grid"
+            )
+        grid_x = min(int(grid_cap), mn_tiles)
+    else:
+        if type(split_k_slices) is not int or split_k_slices < 2:
+            raise ValueError(
+                f"split_k_slices must be an integer >= 2, got {split_k_slices!r}"
+            )
+        if launch.kernel.schedule_whole_tiles:
+            raise ValueError(
+                "split_k_slices requires a launch compiled with "
+                "schedule_whole_tiles=False"
+            )
+        if locks is None:
+            raise ValueError(
+                "a split-K Trellis launch requires its own lock storage (locks)"
+            )
+        if (
+            locks.dtype != torch.int32
+            or locks.device != x.device
+            or not locks.is_contiguous()
+            or locks.numel() < prepared_dense.workspace.numel()
+            or locks.data_ptr() == prepared_dense.workspace.data_ptr()
+        ):
+            raise ValueError(
+                "split-K locks must be contiguous int32 on the input's device, "
+                f"hold at least {prepared_dense.workspace.numel()} counters and "
+                "not be the prepared weight's shared workspace"
+            )
+        grid_x = min(int(grid_cap), mn_tiles * split_k_slices)
+    if split_k_slices is None and locks is not None:
+        raise ValueError("locks apply only to split-K launches")
     if trellis_codebook != "mcg" and execution_lut is None:
         raise ValueError("prepared Trellis decoder is missing its execution LUT")
     stream = current_cuda_stream() if stream is None else stream
@@ -13055,7 +13166,8 @@ def _run_trellis256_dense_current_device(
         dummy_i32,
         prepared_dense.global_scale,
         launch.c_tmp,
-        prepared_dense.workspace,
+        # Whole-tile launches never touch the lock slot.
+        prepared_dense.workspace if locks is None else locks,
         # MCG kernels never dereference the LUT ABI slot.
         dummy_i32 if trellis_codebook == "mcg" else execution_lut,
         m,
@@ -13105,6 +13217,8 @@ def run_trellis256_dense(
     gemm_output_f16: torch.Tensor | None = None,
     output_f16: torch.Tensor | None = None,
     hadamard_128,
+    split_k_slices: int | None = None,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a session-materialized native or compact P24/P33 EXL3 linear."""
     if not isinstance(x, torch.Tensor) or not x.is_cuda:
@@ -13125,6 +13239,8 @@ def run_trellis256_dense(
             output_f16=output_f16,
             hadamard_128=hadamard_128,
             stream=None,
+            split_k_slices=split_k_slices,
+            locks=locks,
         )
 
 

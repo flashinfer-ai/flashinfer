@@ -12,6 +12,7 @@ from .gemm_base import ragged_scaled_bmm as ragged_scaled_bmm
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
+from .gemm_base import mm_tf32 as mm_tf32
 from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
 from .gemm_base import group_gemm_mxfp4_nt_groupwise as group_gemm_mxfp4_nt_groupwise
 from .gemm_base import (
@@ -75,6 +76,7 @@ from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
+from .gemm_bf16_fp4_gather import gemv_bf16_fp4_gather as gemv_bf16_fp4_gather
 from .gemm_mxfp8_mxfp4 import mm_mxfp8_mxfp4 as mm_mxfp8_mxfp4
 
 from .gemm_svdquant import (
@@ -193,6 +195,7 @@ __all__ = (
         "mm_fp4",
         "mm_fp8",
         "mm_mxfp8",
+        "mm_tf32",
         "tgv_gemm_sm100",
         "group_gemm_mxfp4_nt_groupwise",
         "group_gemm_mxfp8_mxfp4_nt_groupwise",
@@ -222,6 +225,7 @@ __all__ = (
         "prepare_nvfp4_lora_adapter",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "gemv_bf16_fp4_gather",
         "mm_mxfp8_mxfp4",
         "fp8_linear",
         "fp8_linear_swiglu",

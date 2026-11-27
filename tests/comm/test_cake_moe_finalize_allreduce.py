@@ -401,6 +401,7 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, init_method: str) ->
         init_method=init_method,
         rank=rank,
         world_size=world_size,
+        device_id=device,
     )
     group = dist.group.WORLD
     cases = _cases(world_size)

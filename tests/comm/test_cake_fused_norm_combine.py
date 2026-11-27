@@ -353,6 +353,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=device,
     )
     workspace = None
     try:

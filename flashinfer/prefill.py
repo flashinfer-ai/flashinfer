@@ -48,7 +48,6 @@ from .cudnn.prefill import (
     _cudnn_supports_direct_seqlens,
     _cudnn_supports_paged_token_offsets,
     _cudnn_supports_paged_auto,
-    _cudnn_supports_paged_fp16_auto,
     _cudnn_supports_paged_gqa_auto,
     _cudnn_supports_paged_full_prefill_auto,
     CudnnPrefillGraph,
@@ -116,6 +115,7 @@ from .utils import (
     ceil_div,
     check_lse_base,
     check_lse_layout,
+    check_has_sinks_undeclared,
     check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
@@ -2648,10 +2648,7 @@ def _blackwell_paged_gqa_auto_cudnn(
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype
-        and (
-            q_dtype == torch.bfloat16
-            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
-        )
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo
         and head_dim_qk == 256
         and 1 <= batch <= 4
@@ -2721,10 +2718,7 @@ def _blackwell_paged_full_prefill_auto_cudnn(
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype
-        and (
-            q_dtype == torch.bfloat16
-            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
-        )
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo
         and 8 <= hq <= 64
         and hk > 0
@@ -2841,10 +2835,7 @@ def _blackwell_paged_auto_cudnn(
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype
-        and (
-            q_dtype == torch.bfloat16
-            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
-        )
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo == 128
         and batch > 0
         and 8 <= hq <= 64
@@ -3346,9 +3337,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            requires ``backend="auto"``. The mask mode is a class dimension: ``causal=True`` runs the causal class (bottom-right
+            aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
+            range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
+            class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
+            takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
+            with ``causal=False``, logits soft cap, custom masks, RoPE, scales) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
+            the class's LSE member (fp32; the output bits are the same with and without it). ``run(..., sinks=)`` with an
+            fp32 ``[num_qo_heads]`` tensor runs the class's sink member (one virtual key per head in the softmax
+            denominator, merged once after the row's last chunk; the LSE includes it). Both members exist in both mask
+            modes, with their own receipts per mode. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -3680,6 +3679,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
 
+        Under ``batch_invariant=True`` the size is that of the split-KV plan of
+        the mask mode :meth:`plan` will run, so pass the same ``causal`` and
+        ``window_left`` as to :meth:`plan`: ``causal`` defaults to ``False``
+        here as it does there (the non-causal class, which takes no window), a
+        causal plan is sized with ``causal=True``, and an input :meth:`plan`
+        refuses raises the same
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` here.
+
         Parameters
         ----------
         qo_indptr : torch.Tensor
@@ -3784,6 +3791,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_qk,
                 page_size,
                 window_left,
+                causal=causal,
             ), 0
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")
@@ -4001,6 +4009,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -4136,6 +4146,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (``run(..., sinks=)``): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -4198,6 +4218,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal
@@ -4212,6 +4233,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
             return
+        check_has_sinks_undeclared(has_sinks)
 
         # Reject this during planning so an unsupported request cannot reach the
         # lower-level trtllm-gen launcher if wrapper setup changes later.
@@ -5308,6 +5330,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl=enable_pdl,
                 use_fp16_softmax=use_fp16_softmax,
                 uses_spcompress=uses_spcompress,
+                lse_base=lse_base,
+                lse_layout=lse_layout,
             )
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -5903,6 +5927,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: This function is deprecated, please use :meth:`run_return_lse` instead."""
         if self._batch_invariant is not None:
+            self._batch_invariant.validate_forward_options(
+                sm_scale=sm_scale,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                window_left=window_left,
+                causal=causal,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+            )
             return self.run_return_lse(
                 q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale
             )
@@ -6105,9 +6139,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            requires ``backend="auto"``. The mask mode is a class dimension: ``causal=True`` runs the causal class (bottom-right
+            aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
+            range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
+            class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
+            takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
+            with ``causal=False``, logits soft cap, custom masks, RoPE, scales) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
+            the class's LSE member (fp32; the output bits are the same with and without it). Attention sinks set on the
+            wrapper (``_sinks``, an fp32 ``[num_qo_heads]`` tensor) run the class's sink member (one virtual key per head
+            in the softmax denominator, merged once after the row's last chunk; the LSE includes it). Both members exist
+            in both mask modes, with their own receipts per mode. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -6351,6 +6393,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -6492,6 +6536,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (the ``_sinks`` attribute): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -6579,6 +6633,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal
@@ -6593,6 +6648,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
             return
+        check_has_sinks_undeclared(has_sinks)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
@@ -7634,6 +7690,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 kv_cache_sf=kv_cache_sf,
                 skip_softmax_threshold_scale_factor=None,
                 enable_pdl=enable_pdl,
+                lse_base=lse_base,
+                lse_layout=lse_layout,
             )
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
@@ -8283,6 +8341,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: This function is deprecated, please use :meth:`run_return_lse` instead."""
         if self._batch_invariant is not None:
+            self._batch_invariant.validate_forward_options(
+                sm_scale=sm_scale,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                window_left=window_left,
+                causal=causal,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+            )
             return self.run_return_lse(q, k, v)
         if self._backend == "cute-dsl-rubin":
             cast("RubinPrefillPlan", self._plan_info).check_legacy_options(

@@ -140,6 +140,70 @@ def build_group_tables(
     cute.arch.sync_warp()
 
 
+@cute.jit
+def build_group_tables_dual(
+    counts: cute.Tensor,
+    E: Int32,
+    cluster_rows: cutlass.Constexpr,
+    s_off: cute.Tensor,
+    s_pre: cute.Tensor,
+    s_off_pad: cute.Tensor,
+    pad_align: cutlass.Constexpr,
+):
+    """The dense packing's three tables from one read of ``counts`` (one warp): ``s_off`` = exclusive prefix of the counts
+    (the dense group offsets), ``s_pre`` = exclusive prefix of ``ceil(counts[e] / cluster_rows)``, ``s_off_pad`` = exclusive
+    prefix of the counts rounded up to ``pad_align`` rows (the padded positions of the scale factors and row scales): the
+    integers of :func:`build_group_tables` at align 1 and at ``pad_align``. Integer sums: exact in every order."""
+    lane = cute.arch.lane_idx()
+    loc_c = cute.make_rmem_tensor((PER_LANE,), Int32)
+    loc_b = cute.make_rmem_tensor((PER_LANE,), Int32)
+    loc_p = cute.make_rmem_tensor((PER_LANE,), Int32)
+    # the lane's counts first, all loads in flight together (as build_group_tables), then the three sums
+    for i in cutlass.range_constexpr(PER_LANE):
+        e = lane * PER_LANE + i
+        c = Int32(0)
+        if e < E:
+            c = counts[e]
+        loc_c[i] = c
+    sum_c = Int32(0)
+    sum_b = Int32(0)
+    sum_p = Int32(0)
+    for i in cutlass.range_constexpr(PER_LANE):
+        c = loc_c[i]
+        loc_c[i] = sum_c
+        loc_b[i] = sum_b
+        loc_p[i] = sum_p
+        sum_c = sum_c + c
+        sum_b = sum_b + (c + Int32(cluster_rows - 1)) // Int32(cluster_rows)
+        sum_p = sum_p + ((c + Int32(pad_align - 1)) // Int32(pad_align)) * Int32(
+            pad_align
+        )
+    inc_c = sum_c
+    inc_b = sum_b
+    inc_p = sum_p
+    for sh in cutlass.range_constexpr(5):
+        oc = cute.arch.shuffle_sync_up(inc_c, offset=1 << sh)
+        ob = cute.arch.shuffle_sync_up(inc_b, offset=1 << sh)
+        op = cute.arch.shuffle_sync_up(inc_p, offset=1 << sh)
+        if lane >= (1 << sh):
+            inc_c = inc_c + oc
+            inc_b = inc_b + ob
+            inc_p = inc_p + op
+    base_c = inc_c - sum_c
+    base_b = inc_b - sum_b
+    base_p = inc_p - sum_p
+    for i in cutlass.range_constexpr(PER_LANE):
+        e = lane * PER_LANE + i
+        s_off[e] = base_c + loc_c[i]
+        s_pre[e] = base_b + loc_b[i]
+        s_off_pad[e] = base_p + loc_p[i]
+    if lane == 31:
+        s_off[MAX_E] = inc_c
+        s_pre[MAX_E] = inc_b
+        s_off_pad[MAX_E] = inc_p
+    cute.arch.sync_warp()
+
+
 class GroupScheduler:
     """Persistent walk over the cluster tiles of all groups. ``cluster_rows`` = CTA tile rows x cluster M (the rows one
     cluster tile covers), ``cn`` = cluster N, ``raster_m``: m-blocks fastest inside a group (consecutive clusters share

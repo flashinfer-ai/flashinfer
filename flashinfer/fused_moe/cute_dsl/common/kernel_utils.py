@@ -346,7 +346,8 @@ def griddepcontrol_wait(*, loc=None, ip=None) -> None:
         res=None,
         operands_=[],
         asm_string="griddepcontrol.wait;",
-        constraints="",
+        # No memory access may move across the PDL instruction.
+        constraints="~{memory}",
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -361,7 +362,8 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         res=None,
         operands_=[],
         asm_string="griddepcontrol.launch_dependents;",
-        constraints="",
+        # No memory access may move across the PDL instruction.
+        constraints="~{memory}",
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 
 KINDS = ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2")
 
@@ -22,9 +22,7 @@ def test_nvfp4_default_scalars_survive_other_graphs(monkeypatch, prequantized):
         MoEWeightPack,
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        quantize_nvfp4_block16,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import quantize_nvfp4_block16
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     experts, hidden, intermediate, live, topk = 8, 128, 64, 4, 2

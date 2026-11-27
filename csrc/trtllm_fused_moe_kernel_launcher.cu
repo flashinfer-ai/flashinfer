@@ -1035,6 +1035,9 @@ inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_
 }
 
 inline ActivationType validateAndCastActivationType(int64_t act_type) {
+  if (act_type == static_cast<int64_t>(ActivationType::ClampedRelu2)) {
+    return ActivationType::ClampedRelu2;
+  }
   TVM_FFI_ICHECK(act_type >= 0 && act_type < static_cast<int64_t>(ActivationType::InvalidType))
       << "Invalid activation type: " << act_type;
   return static_cast<ActivationType>(act_type);
@@ -1063,6 +1066,14 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
     ActivationType activation_type) {
+  if (activation_type == ActivationType::ClampedRelu2) {
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
+        << "TRTLLM ClampedRelu2 requires MXFP8.";
+    TVM_FFI_ICHECK(gemm1_clamp_limit.has_value()) << "ClampedRelu2 requires gemm1_clamp_limit.";
+    TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+        << "ClampedRelu2 accepts gemm1_clamp_limit only.";
+    return;
+  }
   validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
   TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
                  quantization_type == Fp8QuantizationType::MxFp8)
@@ -1716,6 +1727,12 @@ class FusedMoeLauncher {
   }
 
   void check_moe_common(bool allow_bias_with_none_type = false) const {
+    TVM_FFI_ICHECK(
+        activation_type != ActivationType::ClampedRelu2 ||
+        (((mDtypeAct == btg::Dtype::MxE4m3 && mDtypeWeights == btg::Dtype::MxE4m3) ||
+          (mDtypeAct == btg::Dtype::Bfloat16 && mDtypeWeights == btg::Dtype::Bfloat16)) &&
+         !args->mUseDeepSeekFp8))
+        << "TRTLLM ClampedRelu2 requires BF16 or MXFP8.";
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
     check_gemm1_bias_mn(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k,
@@ -2126,7 +2143,11 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
     check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
     validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
-    if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
+    if (activation_type == ActivationType::ClampedRelu2) {
+      TVM_FFI_ICHECK(gemm1_clamp_limit.has_value()) << "ClampedRelu2 requires gemm1_clamp_limit.";
+      TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
+          << "ClampedRelu2 accepts gemm1_clamp_limit only.";
+    } else if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
       TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
                      activation_type == ActivationType::SwigluStep)
           << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
@@ -2281,6 +2302,8 @@ class StagedMoeLauncher : public FusedMoeLauncher {
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
             int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
             bool norm_topk_prob = true) {
+    TVM_FFI_ICHECK(activation_type != ActivationType::ClampedRelu2)
+        << "Staged MoE does not support ClampedRelu2: no gemm1_clamp_limit input.";
     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
                                   use_shuffled_weight, weight_layout, activation_type,
                                   gemm1_bias_type, norm_topk_prob);
@@ -3575,6 +3598,8 @@ void trtllm_moe_run_deepseek_fp8_activation(
     TensorView activation_output_scale, TensorView expanded_idx_to_permuted_idx,
     TensorView total_num_padded_tokens, int64_t num_tokens, int64_t top_k,
     int64_t intermediate_size, int64_t activation_type, bool enable_pdl, int64_t sf_block_size) {
+  TVM_FFI_ICHECK(activation_type != static_cast<int64_t>(ActivationType::ClampedRelu2))
+      << "Standalone DeepSeek FP8 activation does not support ClampedRelu2.";
   TVM_FFI_ICHECK(sf_block_size == 128 || sf_block_size == 32)
       << "DeepSeek FP8 activation: sf_block_size must be 128 or 32.";
   TVM_FFI_ICHECK_EQ(intermediate_size % sf_block_size, 0)
@@ -6985,6 +7010,60 @@ Array<Optional<Tensor>> trtllm_mxint4_block_scale_moe(
       .to_ffi();
 }
 
+// The tile_N the FP4 block-scale MoE runs without a tuned tactic: the first tile of
+// tileFallbackOrder() whose default config is valid and loads, as trtllm_fp4_block_scale_moe
+// retries. -1 when no tile can run. Call it on the launch's device (cubin loads are per context).
+int64_t trtllm_fp4_moe_default_tile_n(int64_t const dtype_act_, int64_t const dtype_weights_,
+                                      int64_t const num_tokens, int64_t const top_k,
+                                      int64_t const hidden_size, int64_t const hidden_size_output,
+                                      int64_t const intermediate_size,
+                                      int64_t const num_local_experts, int64_t const act_type,
+                                      bool const use_per_token_scaling) {
+  using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+  auto const dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto const dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+  auto const bias_type = batchedGemm::gemm::BiasType::None;
+  auto const tile_ns =
+      FP4BlockScaleLauncher::getSupportedTileNums(dtype_act, dtype_weights, bias_type);
+  std::map<int32_t, bool> tiles;  // tileFallbackOrder() reads the keys only.
+  for (auto const tile_N : tile_ns) {
+    tiles[tile_N] = true;
+  }
+  // The runner filters its configs for the current GPU: key the cache by device and arch, as the
+  // launcher's runner cache does.
+  int device = -1, major = 0, minor = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  static thread_local std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int, int, int>,
+                               RunnerType>
+      runners;
+  for (int64_t const tile_N : tileFallbackOrder(
+           selectDefaultTileN(tile_ns, num_tokens, top_k, num_local_experts), tiles)) {
+    std::tuple const key{dtype_act_, dtype_weights_, tile_N, act_type, use_per_token_scaling,
+                         major,      minor,          device};
+    auto it = runners.find(key);
+    if (it == runners.end()) {
+      // The runner prepare_moe_runner() builds for an FP4 launch (see getValidConfigs).
+      it = runners
+               .try_emplace(key, dtype_act, dtype_weights, /*useDeepSeekFp8=*/false,
+                            static_cast<int32_t>(tile_N), static_cast<ActivationType>(act_type),
+                            /*useShuffledMatrix=*/true, batchedGemm::gemm::MatrixLayout::MajorK,
+                            bias_type, use_per_token_scaling,
+                            use_per_token_scaling && dtype_act == btg::Dtype::E2m1)
+               .first;
+    }
+    try {
+      (void)it->second.getDefaultValidConfigIndex(
+          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, hidden_size_output);
+      return tile_N;
+    } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
+    } catch (tensorrt_llm::kernels::NoValidConfigError const&) {
+    }
+  }
+  return -1;
+}
+
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     int64_t const dtype_act_, int64_t const dtype_weights_,
     Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
@@ -7562,6 +7641,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_moe_default_tile_n, trtllm_fp4_moe_default_tile_n);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_localized_moe_configs,
                               trtllm_get_valid_localized_moe_configs);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_factorizations,

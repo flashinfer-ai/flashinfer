@@ -95,13 +95,26 @@ def test_spec_without_the_closure_keeps_the_engine(jit_dir):
     assert c.calls == ["engine"]
 
 
-def test_compile_and_persist_exports_the_engine_less_kernel(jit_dir):
+def test_compile_and_persist_exports_the_engine_less_kernel(jit_dir, monkeypatch):
     c = _Closures()
     spec = _spec(c)
     spec.compile_and_persist()
     assert c.calls == ["no_engine"] and spec._compiled_kernel is None
     assert spec.is_compiled and spec.object_path.read_bytes() == b"mod_k:no_engine"
     assert json.loads(spec.meta_path.read_text())["source_sha256"] == "sha"
+
+    sibling = cute_dsl_core.JitSpecCuteDsl(
+        "mod", "other", _Closures().engine, "new source"
+    )
+    sibling.compile_and_persist()
+    assert not spec.is_compiled
+    with monkeypatch.context() as disabled:
+        disabled.setenv("FLASHINFER_DISABLE_JIT", "1")
+        with pytest.raises(cute_dsl_core.MissingJITCacheError):
+            spec.load()
+    kernel = spec.load()
+    assert kernel.tag == "engine" and spec.load() is kernel
+    assert c.calls == ["no_engine", "engine"]
 
 
 def test_compile_and_persist_failed_export_compiles_again_with_the_engine(jit_dir):
