@@ -783,8 +783,6 @@ def get_sampling_module():
         draft_probs = draft_probs.float()
         draft_token_ids = draft_token_ids.int()
         target_probs = target_probs.float()
-        output_accepted_token_num = output_accepted_token_num.int()
-        output_emitted_draft_token_num = output_emitted_draft_token_num.int()
         b, n = draft_token_ids.shape
         output_token_ids = torch.empty((b, n + 1), dtype=torch.int32, device=device)
         batch_size = b
@@ -3027,6 +3025,28 @@ def top_k_mask_logits(
     )
 
 
+def _validate_chain_counter(
+    counter: torch.Tensor, draft_probs: torch.Tensor, name: str
+) -> None:
+    # Output buffers must be written in place; casting or packing would lose updates.
+    if counter.ndim != 1:
+        raise ValueError(f"{name} must be 1D, got shape {tuple(counter.shape)}")
+    if counter.size(0) != draft_probs.size(0):
+        raise ValueError(
+            f"{name} length must equal batch size ({draft_probs.size(0)}), "
+            f"got {counter.size(0)}"
+        )
+    if counter.dtype != torch.int32:
+        raise TypeError(f"{name} must have dtype torch.int32, got {counter.dtype}")
+    if counter.device.type != "cuda" or counter.device != draft_probs.device:
+        raise ValueError(
+            f"{name} must be on the same CUDA device as draft_probs "
+            f"({draft_probs.device}), got {counter.device}"
+        )
+    if not counter.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
 @flashinfer_api(trace=chain_speculative_sampling_trace)
 def chain_speculative_sampling(
     draft_probs,
@@ -3061,13 +3081,15 @@ def chain_speculative_sampling(
         This metric does not consider the fact that rejection sampling will stop at the first token that does not
         satisfy the probability requirement r < p/q.
         It only evaluates the alignment of draft model and target model.
-        Shape: ``(batch_size)``
+        Shape: ``(batch_size,)``. Must be a contiguous ``torch.int32`` tensor
+        on the same CUDA device as ``draft_probs``.
         If specified, the number of accepted token number will be added to this tensor inplace. Default is ``None``.
     maybe_output_emitted_draft_token_num: Optional[torch.Tensor]
         The number of draft tokens that are finally emitted for each request. Does not include
         the bonus token. (Thus the total number of tokens sampled for a given request is
         output_emitted_draft_token_num + 1).
-        Shape: ``(batch_size)``
+        Shape: ``(batch_size,)``. Must be a contiguous ``torch.int32`` tensor
+        on the same CUDA device as ``draft_probs``.
         If specified, the number of emitted token number will be added to this tensor inplace. Default is ``None``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
@@ -3148,6 +3170,12 @@ def chain_speculative_sampling(
     >>> output_emitted_draft_token_num
     tensor([1], device='cuda:0')
     """
+    for name, counter in (
+        ("maybe_output_accepted_token_num", maybe_output_accepted_token_num),
+        ("maybe_output_emitted_draft_token_num", maybe_output_emitted_draft_token_num),
+    ):
+        if counter is not None:
+            _validate_chain_counter(counter, draft_probs, name)
     b = draft_probs.size(0)
     dev = draft_probs.device
     if maybe_output_accepted_token_num is None:

@@ -345,6 +345,18 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output, Tensor
   });
 }
 
+// Counters are caller-owned outputs: the kernel writes contiguous int32 elements.
+inline void check_chain_counter(const TensorView& counter, const TensorView& draft_probs,
+                                const char* name) {
+  TVM_FFI_CHECK(counter.ndim() == 1, ValueError) << name << " must be 1D";
+  TVM_FFI_CHECK(counter.size(0) == draft_probs.size(0), ValueError)
+      << name << " length must equal batch size (" << draft_probs.size(0) << "), got "
+      << counter.size(0);
+  check_dtype(counter, dl_int32, name);
+  check_same_device(counter, draft_probs, name, "draft_probs");
+  check_contiguous(counter, name);
+}
+
 void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_ids,
                                 TensorView target_probs, TensorView output_token_ids,
                                 TensorView output_accepted_token_num,
@@ -356,6 +368,9 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   CHECK_INPUT(target_probs);
   CHECK_DEVICE(draft_token_ids, draft_probs);
   CHECK_DEVICE(target_probs, draft_probs);
+  check_chain_counter(output_accepted_token_num, draft_probs, "maybe_output_accepted_token_num");
+  check_chain_counter(output_emitted_draft_token_num, draft_probs,
+                      "maybe_output_emitted_draft_token_num");
   const auto rng_strides = validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr,
                                                         draft_probs, draft_probs.size(0));
 
@@ -369,8 +384,6 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   TVM_FFI_ICHECK_EQ(batch_size, target_probs.size(0));
   TVM_FFI_ICHECK_EQ(num_speculate_tokens + 1, target_probs.size(1));
   TVM_FFI_ICHECK_EQ(vocab_size, target_probs.size(2));
-  TVM_FFI_ICHECK_EQ(batch_size, output_accepted_token_num.size(0));
-  TVM_FFI_ICHECK_EQ(batch_size, output_emitted_draft_token_num.size(0));
 
   ffi::CUDADeviceGuard device_guard(draft_probs.device().device_id);
   auto stream = get_stream(draft_probs.device());
