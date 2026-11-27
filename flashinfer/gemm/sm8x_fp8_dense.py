@@ -1259,16 +1259,21 @@ def sm8x_grouped_mm_fp4(
     block_size: int,
 ) -> torch.Tensor:
     """``grouped_mm_fp4`` on SM8x (``block_size`` 16: NVFP4, 32: MXFP4): ``alpha * (a @
-    b[e]^T)`` over cuDNN's MOE segments, the rows before ``m_indptr[0]`` unwritten."""
+    b[e]^T)`` over cuDNN's MOE segments, the rows before ``m_indptr[0]`` unwritten; an FP8
+    ``a`` (MXFP8, its E8M0 scales 128x4-swizzled like FP4's) runs against MXFP4 weights."""
     _grouped_one_device(a, alpha)
-    k, groups = 2 * int(a.shape[1]), int(b.shape[0])
+    fp8_a = a.dtype in _FMT
+    if fp8_a and block_size != 32:
+        raise ValueError("an FP8 a runs against MXFP4 weights only (block_size 32)")
+    k, groups = int(a.shape[1]) * (1 if fp8_a else 2), int(b.shape[0])
     out, ip = _grouped_mm_rows(
         a, b, a_descale, b_descale, m_indptr, k, block_size, out_dtype, out
     )
     if ip is not None:
         gs = torch.ones(groups, device=a.device) if alpha is None else alpha
+        fmt = None if fp8_a else _FP4_FMT["nvfp4" if block_size == 16 else "mxfp4"]
         _tuned_rows_fp4(
-            "grouped_mm_fp4_sm8x", _FP4_FMT["nvfp4" if block_size == 16 else "mxfp4"],
+            "grouped_mm_fp4_sm8x", fmt,
             [a, b, a_descale.reshape(-1).view(torch.uint8),
              b_descale.reshape(-1).view(torch.uint8), ip[:-1], ip[1:],
              gs.reshape(-1).expand(groups).contiguous(),

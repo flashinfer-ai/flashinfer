@@ -1903,6 +1903,16 @@ class _CutlassRunnerBase(MoERunner):
                 raise NotImplementedError(
                     "FP8 block scaling requires CUDA 12.8 or newer."
                 )
+        body = self._sm8x_body_class()
+        if body is not None and self._device_arch in body._supported_archs:
+            self._sm8x = body(self.config, self.device)
+            self._sm8x.check_support()
+
+    @staticmethod
+    def _sm8x_body_class() -> Any:
+        """The ``sm8x_fp8_moe`` pipeline that runs this pair where the CUTLASS
+        module has no kernel for it (its ``_supported_archs``), or None."""
+        return None
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -1923,6 +1933,7 @@ class _CutlassRunnerBase(MoERunner):
         self._enable_pdl = enable_pdl
         self._use_fused_finalize = True
         self._inner: Any = None
+        self._sm8x = None  # set by check_support; replaces _inner
 
         # pack_inputs replaces this with the current MoELayer token bucket.
         self.tuning_config = TuningConfig()
@@ -1939,6 +1950,15 @@ class _CutlassRunnerBase(MoERunner):
         from .core import get_cutlass_fused_moe_module
 
         with torch.cuda.device(self.device):
+            activation = self.config.activation
+            num_experts = self.config.routing.num_experts
+            self._activation_params = _cutlass_activation_params(
+                activation, num_experts, self.device
+            )
+            self._config_activation_params = dict(self._activation_params)
+            if self._sm8x is not None:
+                self._sm8x.build()
+                return
             module = get_cutlass_fused_moe_module(str(self._device_arch))
             self._inner = module.MoERunner(
                 x_dtype=self._x_dtype,
@@ -1962,12 +1982,6 @@ class _CutlassRunnerBase(MoERunner):
                 use_fused_finalize=self._use_fused_finalize,
                 use_wfp4afp8_humming=self._use_wfp4afp8_humming,
             )
-            activation = self.config.activation
-            num_experts = self.config.routing.num_experts
-            self._activation_params = _cutlass_activation_params(
-                activation, num_experts, self.device
-            )
-            self._config_activation_params = dict(self._activation_params)
 
     def _resolve_activation_params(
         self, view: dict[str, torch.Tensor]
@@ -2123,6 +2137,8 @@ class _CutlassRunnerBase(MoERunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
         self._require_built()
         self._validate_input_count(inputs)
+        if self._sm8x is not None:
+            return [(0, 0)]  # one kernel per GEMM stage
         # The two GEMMs have independent tactic spaces. Preserve the legacy
         # O(n1+n2) stage search, keep the best N tactics per stage, then let the
         # outer unified tuner profile only the N² compound pairs end-to-end.
@@ -2161,6 +2177,9 @@ class _CutlassRunnerBase(MoERunner):
         return pairs if pairs else [-1]
 
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        if self._sm8x is not None:
+            self._sm8x._ensure_workspace(num_tokens, hidden_size)
+            return
         max_num_tokens = self.config.execution.tune_max_num_tokens
         if num_tokens > max_num_tokens:
             raise ValueError(
@@ -2406,6 +2425,11 @@ class _CutlassRunnerBase(MoERunner):
     ) -> torch.Tensor:
         self._require_built()
         self._validate_input_count(inputs)
+        if self._sm8x is not None:
+            # One pipeline, no tactics or preparation launch.
+            if not do_preparation:
+                self._sm8x.run(inputs, self._activation_params)
+            return inputs[0]
         if self._workspace is None:
             raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
         if tactic == -1:
@@ -2774,6 +2798,12 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
     def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         return list(inputs[6:10])
 
+    @staticmethod
+    def _sm8x_body_class() -> Any:
+        from .sm8x_fp8_moe import Sm8xCutlassFp8PerTensorMoE
+
+        return Sm8xCutlassFp8PerTensorMoE
+
 
 class CutlassFp8BlockRunner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS DeepSeek 128x128 FP8 block-scale MoE."""
@@ -2931,6 +2961,12 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
             inputs[9],
         ]
 
+    @staticmethod
+    def _sm8x_body_class() -> Any:
+        from .sm8x_fp8_moe import Sm8xCutlassMxfp8Mxfp4MoE
+
+        return Sm8xCutlassMxfp8Mxfp4MoE
+
 
 class CutlassMxfp8Runner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS MXFP8 x MXFP8 fused MoE.
@@ -3017,6 +3053,12 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
 
     def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         return [inputs[6], inputs[8], inputs[7], inputs[9]]
+
+    @staticmethod
+    def _sm8x_body_class() -> Any:
+        from .sm8x_fp8_moe import Sm8xCutlassMxfp8MoE
+
+        return Sm8xCutlassMxfp8MoE
 
 
 class CutlassW4A8Runner(_CutlassRunnerBase):
@@ -10557,6 +10599,19 @@ _MOE_SORT_MAX_TOP_K = 32
 _FALLBACK_STAGE_TACTIC: tuple[int, int] = (-1, -1)
 
 
+def _check_moe_sort_limits(name: str, config: MoEConfig) -> None:
+    routing = config.routing
+    if (
+        routing.num_experts > _MOE_SORT_MAX_EXPERTS
+        or routing.top_k > _MOE_SORT_MAX_TOP_K
+    ):
+        raise NotImplementedError(
+            f"{name} routes with moe_sort, which supports up to "
+            f"{_MOE_SORT_MAX_EXPERTS} experts and top_k {_MOE_SORT_MAX_TOP_K}, "
+            f"got num_experts={routing.num_experts}, top_k={routing.top_k}."
+        )
+
+
 @dataclass
 class _GroupedGemmLayout:
     """Expert-sorted row layout of one call; rows beyond ``m_indptr[-1]`` are padding."""
@@ -10706,16 +10761,7 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 f"{type(self).__name__} requires intermediate_size divisible by 8 "
                 f"(the moe_activation kernel), got {intermediate_size}."
             )
-        routing = self.config.routing
-        if (
-            routing.num_experts > _MOE_SORT_MAX_EXPERTS
-            or routing.top_k > _MOE_SORT_MAX_TOP_K
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} routes with moe_sort, which supports up to "
-                f"{_MOE_SORT_MAX_EXPERTS} experts and top_k {_MOE_SORT_MAX_TOP_K}, "
-                f"got num_experts={routing.num_experts}, top_k={routing.top_k}."
-            )
+        _check_moe_sort_limits(type(self).__name__, self.config)
         from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
 
         _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
@@ -11118,6 +11164,29 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         """GEMM1 into ``workspace.gemm1_out``; returns the dequantized ``[rows, 2I | I]`` BF16 rows."""
         raise NotImplementedError(f"{type(self).__name__} must implement _gemm1.")
 
+    def _activate(
+        self,
+        gemm1_out: torch.Tensor,
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        inputs: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Activation of the live rows into ``workspace.intermediate``; gated
+        activations read GEMM1's [up | gate] halves from the canonical fc1 row order."""
+        from .cute_dsl.moe_utils import moe_activation
+
+        sort = workspace.sort
+        moe_activation(
+            gemm1_out,
+            workspace.intermediate,
+            sort["out_tile_idx_to_mn_limit"],
+            sort["out_num_non_exiting_tiles"],
+            self._moe_activation_type,
+            workspace.num_rows,
+            self._segment_alignment,
+        )
+        return workspace.intermediate
+
     def _gemm2(
         self,
         inputs: List[torch.Tensor],
@@ -11147,26 +11216,11 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 "cuDNN grouped-GEMM tactic must be -1 or a (gemm1, gemm2) pair, "
                 f"got {tactic!r}."
             )
-        from .cute_dsl.moe_utils import moe_activation
-
         _, topk_ids, topk_weights = inputs[:3]
         layout, workspace = self._permute(inputs)
         gemm1_out = self._gemm1(inputs, layout, workspace, gemm1_tactic)
-        sort = workspace.sort
-        # Activation of the live rows; gated activations read GEMM1's [up | gate]
-        # halves from the canonical fc1 row order.
-        moe_activation(
-            gemm1_out,
-            workspace.intermediate,
-            sort["out_tile_idx_to_mn_limit"],
-            sort["out_num_non_exiting_tiles"],
-            self._moe_activation_type,
-            workspace.num_rows,
-            self._segment_alignment,
-        )
-        gemm2_out = self._gemm2(
-            inputs, layout, workspace, workspace.intermediate, gemm2_tactic
-        )
+        intermediate = self._activate(gemm1_out, layout, workspace, inputs)
+        gemm2_out = self._gemm2(inputs, layout, workspace, intermediate, gemm2_tactic)
         fc2_dequant = (
             None if self._fc2_dequant_input is None else inputs[self._fc2_dequant_input]
         )
