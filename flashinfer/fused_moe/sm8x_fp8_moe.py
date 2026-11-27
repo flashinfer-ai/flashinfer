@@ -29,6 +29,7 @@ from .api import ActivationType, MoEConfig, SwiGLUStep
 from .runners import (
     _check_moe_sort_limits,
     _CudnnGroupedGemmBlockScaleRunnerBase,
+    CudnnGroupedGemmBf16Runner,
     _CudnnGroupedGemmRunnerBase,
     _GroupedGemmLayout,
     _GroupedGemmWorkspace,
@@ -269,6 +270,25 @@ class Sm8xCutlassFp8PerTensorMoE(_Sm8xCutlassMoEBase):
             intermediate, inputs[4], layout.m_indptr, None, torch.float32, None
         )
         return self._epilogue(acc, self._gemm2_alpha_input, layout, inputs)
+
+
+class Sm8xCutlassBf16MoE(_Sm8xCutlassMoEBase, CudnnGroupedGemmBf16Runner):
+    """``CutlassBf16Runner`` on SM80 / SM86 / SM87, which the CUTLASS module has no
+    kernel for: the ``grouped_mm_bf16`` GEMMs with the CUTLASS activation between
+    them. Inputs: ``[hidden, ids, weights, w1, w2, out]``."""
+
+    backend_key = "cutlass_bf16"
+    _supported_archs = (80, 86, 87)
+    _intermediate_alignment = 8  # GEMM2's K in 16-byte BF16 rows
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
+
+        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
+
+    def _body_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [*inputs[1:6], inputs[0]]
 
 
 class _Sm8xCutlassMxfp8MoEBase(

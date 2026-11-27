@@ -550,8 +550,9 @@ _TRTLLM_ROUTED_FP8_ARCHS = (80, 86, 87, 89, 100, 103, 107)
 _PRIMS_TS_ARCHS = (100, 103)
 
 # Dense BF16 follows the architecture dispatch already exposed by the flat
-# CUTLASS API.
-_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
+# CUTLASS API; SM80/86/87, which the CUTLASS module has no kernel for, run
+# ``sm8x_fp8_moe``.
+_CUTLASS_BF16_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
@@ -3208,12 +3209,13 @@ class CudnnFrostBf16Config:
 
     Register prepared weights under ``cudnn_frost_bf16``. The canonical
     ``cutlass_bf16`` view is also accepted without conversion. Supported model
-    geometries follow the backend's measured BF16 shortlist.
+    geometries follow the backend's measured BF16 shortlist. On SM80/86/87/89
+    the same forward runs on the CUTLASS BF16 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassBf16Config.prepare_weights)
 

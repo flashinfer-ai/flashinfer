@@ -13,7 +13,11 @@ from itertools import product
 import torch
 
 from .....fused_moe.api import QuantFormat, RoutingInputMode, SwiGLU
-from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
+from .....fused_moe.runners import (
+    CutlassBf16Runner,
+    MoERunner,
+    _validate_prerouted_inputs,
+)
 from .....utils import get_compute_capability
 from . import fc2, fma, runtime
 from .support import large_bf16_moe
@@ -32,7 +36,7 @@ from ..engine import (
 )
 from ..capabilities import require_compiler
 from ..activations import ACTIVATIONS, activation_name
-from ..support import SUPPORTED_ARCHS, weight_view
+from ..support import SM8X_ARCH_NUMBERS, SUPPORTED_ARCHS, weight_view
 from ..compiler import require_moe_assembler
 from ..shortlist import capture_profiles
 from ..shortlist import _read
@@ -43,7 +47,9 @@ from ..tuning import prepared_state, ranked_tactics
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
 _TAG = "cudnn_frost-bf16-moe-v2"
-_UNSUPPORTED = "cuDNN Frost BF16 MoE kernels require SM107a or SM120a"
+_UNSUPPORTED = (
+    "cuDNN Frost BF16 MoE kernels require SM80, SM86, SM87, SM89, SM107a or SM120a"
+)
 
 
 @functools.lru_cache(maxsize=None)
@@ -296,7 +302,8 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
         if self.device.type != "cuda":
             raise NotImplementedError(_UNSUPPORTED)
         major, minor = get_compute_capability(self.device)
-        if f"sm_{major}{minor}a" not in SUPPORTED_ARCHS:
+        sm8x = major * 10 + minor in SM8X_ARCH_NUMBERS
+        if f"sm_{major}{minor}a" not in SUPPORTED_ARCHS and not sm8x:
             raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize:
@@ -308,6 +315,9 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
             raise NotImplementedError(
                 "cuDNN Frost BF16 MoE does not consume quantization scales"
             )
+        if sm8x:
+            self._attach_sm8x(CutlassBf16Runner)
+            return
         arch = f"sm_{major}{minor}a"
         roots = runtime._artifact_roots()
         sources = tuple(
@@ -332,6 +342,9 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
         require_compiler(arch, sources)
 
     def _build(self):
+        if self._sm8x is not None:
+            self._sm8x.build()
+            return
         device, activation = self.device, self.config.activation
         self._engine = FrostEngine(
             device,
@@ -409,6 +422,8 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
             )
         if any(v.data_ptr() % 16 for v in (x, w1, w2)):
             raise ValueError("cuDNN Frost BF16 MoE requires 16B-aligned data")
+        if self._sm8x is not None:
+            return self._pack_sm8x(act, view, "cutlass_bf16", False)
         shape = (t, h, i, e, k)
         state = self._engine.state(shape)
         output = torch.empty_like(x)
@@ -417,6 +432,8 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
+        if self._sm8x is not None:
+            return self._sm8x.get_valid_tactics(inputs, profile)
         state = prepared_state(self, inputs)
         if state is not None:
             return ranked_tactics(state, inputs, _TAG)
@@ -436,6 +453,8 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
         )
 
     def _input_cache_key_extras(self, inputs):
+        if self._sm8x is not None:
+            return self._sm8x._input_cache_key_extras(inputs)
         # Profiling uses plain lists; keep its key tied to the full prepared
         # launch pool, just like PackedInputs, rather than the ranked shortlist.
         state = prepared_state(self, inputs)
@@ -459,6 +478,8 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
         return (POLICY_VERSION, key, tactics)
 
     def validate_tactic(self, inputs, tactic):
+        if self._sm8x is not None:
+            return tactic == -1 or tactic in self._sm8x.get_valid_tactics(inputs, None)
         state = prepared_state(self, inputs)
         return tactic == -1 or tactic in (
             state.launches

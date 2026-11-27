@@ -507,8 +507,8 @@ _SM8X = ((8, 0), (8, 6), (8, 7), (8, 9))
 
 def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6), frost_kernels=False):
     supported = ((10, 7), (12, 0))
-    if dtype in ("mxfp8", "mxfp8_mxfp4") and not frost_kernels:
-        # SM8x runs these forwards on the CUTLASS SM8x pipeline.
+    if dtype in ("bf16", "mxfp8", "mxfp8_mxfp4") and not frost_kernels:
+        # SM8x runs these forwards on the CUTLASS runners.
         supported += _SM8X
     if (
         not torch.cuda.is_available()

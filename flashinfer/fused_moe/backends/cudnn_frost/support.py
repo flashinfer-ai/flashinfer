@@ -5,7 +5,7 @@
 # runs them.
 SUPPORTED_ARCHS = ("sm_107a", "sm_120a")
 SUPPORTED_ARCH_NUMBERS = (107, 120)
-# The MXFP8 dtypes run CUTLASS's SM8x pipeline on these instead.
+# The MXFP8 and BF16 dtypes run the CUTLASS runners on these instead.
 SM8X_ARCH_NUMBERS = (80, 86, 87, 89)
 
 

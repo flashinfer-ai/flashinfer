@@ -111,7 +111,7 @@ def _config(**overrides) -> MoEConfig:
 
 
 def test_cutlass_bf16_config_architectures_and_registration():
-    for arch in (89, 90, 100, 103, 107, 110, 120, 121):
+    for arch in (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121):
         assert CutlassBf16Config.supported(arch)
         assert CutlassFp8PerTensorConfig.supported(arch)
     assert CutlassW4A16Config.supported(90)
@@ -123,7 +123,6 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Mxfp4Config.supported(arch)
     for arch in (100, 103, 107):
         assert CutlassMxfp8Config.supported(arch)
-    assert not CutlassBf16Config.supported(80)
     assert not CutlassW4A16Config.supported(100)
     assert not CutlassNvfp4Config.supported(90)
     assert not CutlassFp8BlockConfig.supported(100)
@@ -1856,7 +1855,7 @@ def _is_cutlass_bf16_runtime_supported() -> bool:
         return is_sm120a_supported(device)
     if arch == 121:
         return is_sm121a_supported(device)
-    return arch == 89
+    return arch in (80, 86, 87, 89)
 
 
 cutlass_bf16_required = pytest.mark.skipif(

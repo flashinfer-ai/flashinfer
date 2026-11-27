@@ -2540,6 +2540,12 @@ class CutlassBf16Runner(_CutlassRunnerBase):
         self._validate_weight_storage((w1, w2))
         return [w1, w2]
 
+    @staticmethod
+    def _sm8x_body_class() -> Any:
+        from .sm8x_fp8_moe import Sm8xCutlassBf16MoE
+
+        return Sm8xCutlassBf16MoE
+
 
 class CutlassW4A16Runner(_CutlassRunnerBase):
     """Unified adapter for MXFP4-weight x BF16-activation fused MoE."""
@@ -11402,7 +11408,7 @@ class CudnnGroupedGemmBf16Runner(_CudnnGroupedGemmRunnerBase):
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
     _x_dtype = torch.bfloat16
     _weight_dtype = torch.bfloat16
-    _supported_archs = _CUDNN_GROUPED_GEMM_BF16_ARCHS
+    _supported_archs: ClassVar[tuple[int, ...]] = _CUDNN_GROUPED_GEMM_BF16_ARCHS
     _required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
     _expected_num_inputs = 5
 
