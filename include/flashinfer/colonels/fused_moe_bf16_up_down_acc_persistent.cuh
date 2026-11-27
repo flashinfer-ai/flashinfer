@@ -16,7 +16,6 @@
 
 using bf16 = __nv_bfloat16;
 namespace cg = cooperative_groups;
-#define NUM_SM 132
 
 namespace bf16_persistent {
 
@@ -655,9 +654,12 @@ bool launch_fused_moe_kernel_up_down_acc(
   constexpr int BK = 64;
   constexpr int PRODUCER_THREADS = 128;
   if (K <= 0 || K % (2 * BK) || N <= 0 || N % 256 || N % (BN * WN)) return false;
+  int device, num_sms;
+  gpuErrchk(cudaGetDevice(&device));
+  gpuErrchk(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
   dim3 dimBlock(32 * WN + PRODUCER_THREADS, 1, 1);
   const int SPLIT_K = N / (BN * WN) == 0 ? 1 : N / (BN * WN);
-  const int block_count = std::min(NUM_SM / SPLIT_K, (int)std::ceil((float)sorted_num / block_m));
+  const int block_count = std::min(num_sms / SPLIT_K, (int)std::ceil((float)sorted_num / block_m));
   if (block_count <= 0) return false;
   dim3 dimGrid(1, block_count * SPLIT_K, 1);
 
