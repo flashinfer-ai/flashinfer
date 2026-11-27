@@ -66,6 +66,23 @@ __device__ __forceinline__ void triggerDependentLaunchAfterWrites() {
 #endif
 }
 
+template <typename KernelParams>
+__device__ __forceinline__ void writeNumNonExitingCtas(KernelParams const& params, int32_t value) {
+  params.mPtrNumNonExitingCtas[0] = value;
+  // Every caller reaches this write only after its routing kernel's
+  // cudaGridDependencySynchronize() when PDL is enabled. This prevents routing call N+1 from
+  // resetting counters while call N's dependent GEMMs may still claim work. Without PDL, stream
+  // ordering provides the corresponding cross-call ordering.
+#pragma unroll
+  for (int side = 0; side < 2; ++side) {
+    int32_t* counters = params.mPtrLocalityCounters[side];
+    if (counters != nullptr) {
+      counters[0] = 0;
+      counters[32] = 0;
+    }
+  }
+}
+
 // Parsed reserved-SM value and whether it came from the environment.
 struct ReservedSMsForOverlappingConfig {
   // Number of SMs to reserve for overlapping kernels.
@@ -549,7 +566,7 @@ __device__ void routingPermutation(KernelParams params,
       permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    writeNumNonExitingCtas(params, numNonExitingCtas);
   }
 
   // make expert offsets available to all threads
@@ -812,7 +829,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    writeNumNonExitingCtas(params, numNonExitingCtas);
   }
 
 #pragma unroll
@@ -1236,7 +1253,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   // write out padded count
   if (gridBlockIdx == 0 && warpIdx == NumThreads / WarpSize - 1 && cute::elect_one_sync()) {
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    writeNumNonExitingCtas(params, numNonExitingCtas);
   }
 
   // write expert offsets to shared

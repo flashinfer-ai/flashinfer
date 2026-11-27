@@ -95,6 +95,7 @@ def test_partition_resources_only_appear_on_partitioned_ops():
     for op in partitioned_ops:
         parameters = inspect.signature(op).parameters
         assert "partition_resources" in parameters
+        assert "MoePartitionHandle" in str(parameters["partition_resources"].annotation)
         assert "partition_strategy" in parameters
         assert parameters["enable_pdl"].default is None
         assert (

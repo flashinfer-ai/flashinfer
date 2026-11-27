@@ -191,19 +191,23 @@ def test_localized_setup_forwards_fp4_activation_parameters(bench, monkeypatch):
     monkeypatch.setitem(
         bench._LOCALIZED_OPS, ("prims_ts", "fp4"), lambda **kwargs: kwargs
     )
+    resources = {"streams": object(), "single_kernel": object()}
     monkeypatch.setattr(
         bench,
         "_localized_partition",
-        lambda device, sm_split: SimpleNamespace(resources=object()),
+        lambda device, sm_split, execution: SimpleNamespace(
+            resources=resources[execution]
+        ),
     )
     activation_parameter = object()
 
-    setup = bench._localized_setup(
+    setups = bench._localized_setup(
         batch_size=1,
         backend="prims_ts",
         family="fp4",
         strategy="tp_n_tp_n",
         sm_split="backfill",
+        executions=["streams", "single_kernel"],
         common_fn_kwargs={
             "gemm1_alpha": activation_parameter,
             "gemm1_beta": activation_parameter,
@@ -218,5 +222,14 @@ def test_localized_setup_forwards_fp4_activation_parameters(bench, monkeypatch):
         ),
     )
 
-    for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
-        assert setup.fn.keywords[name] is activation_parameter
+    assert [setup.locality_execution for setup in setups] == [
+        "streams",
+        "single_kernel",
+    ]
+    for setup in setups:
+        assert (
+            setup.fn.keywords["partition_resources"]
+            is resources[setup.locality_execution]
+        )
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            assert setup.fn.keywords[name] is activation_parameter

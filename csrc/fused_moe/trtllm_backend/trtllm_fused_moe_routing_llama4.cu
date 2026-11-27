@@ -271,7 +271,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     }
 
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    writeNumNonExitingCtas(params, numNonExitingCtas);
   }
 
   // at this point, all values for offsets are ready, except the final offsets

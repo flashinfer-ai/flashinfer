@@ -39,6 +39,18 @@ class CtaRasterOrder(IntEnum):
     ALONG_N = 1
 
 
+class LocalitySplit(IntEnum):
+    OFF = 0
+    WEIGHTS_OUTPUT = 1
+    WEIGHTS_ACTIVATIONS_OUTPUT = 2
+
+
+class LocalitySideSource(IntEnum):
+    DOMAIN = 0
+    SMID_PARITY = 1
+    ZERO = 2
+
+
 class ActKind(IntEnum):
     NONE = 0
     SWIGLU = 1

@@ -48,6 +48,7 @@ from flashinfer.tllm_enums import (
     WeightLayout,
 )
 from flashinfer.utils import get_compute_capability, round_up
+from flashinfer.prims_ts.batched_gemm.config_types import LocalitySplit
 
 from .compile_cache import get_compiled_gemm, stable_config_hash
 from .config_mapper import (
@@ -60,6 +61,7 @@ from .config_mapper import (
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
+    with_locality_overrides,
     valid_prims_ts_bf16_moe_tactics,
     valid_prims_ts_deepseek_fp8_moe_tactics,
     valid_prims_ts_fp8_per_tensor_moe_tactics,
@@ -90,7 +92,8 @@ from .tensor_adapter import (
     build_nvfp4_launch_io,
 )
 from .partition import (
-    MoePartitionResources,
+    MoeLocalizedKernelResources,
+    MoePartitionHandle,
     PartitionStrategy,
     PreparedWeightLayout,
     validate_partition_shape,
@@ -107,12 +110,22 @@ def _sm_arch_for_tensor(tensor: torch.Tensor) -> int:
 
 
 def _partition_stream_topology(
-    resources: MoePartitionResources | None,
-) -> tuple[tuple[str, int, int, int, int], ...]:
+    resources: MoePartitionHandle | None,
+) -> tuple:
     """Return stable resource-sharing and stream-alias topology for cache keys."""
 
     if resources is None:
         return ()
+    if isinstance(resources, MoeLocalizedKernelResources):
+        sm_count = resources.sm_count_per_domain
+        return (
+            (
+                "single_kernel",
+                2 * sm_count,
+                (sm_count, sm_count),
+                1,
+            ),
+        )
     if resources._stream_topology is not None:
         return resources._stream_topology
     topology: list[tuple[str, int, int, int, int]] = []
@@ -145,6 +158,18 @@ def _partition_stream_topology(
         )
     resources._stream_topology = tuple(topology)
     return resources._stream_topology
+
+
+def _locality_counter_views(
+    resources: MoeLocalizedKernelResources, offset: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the one-element counter view for each locality side."""
+    if offset not in (0, 32):
+        raise ValueError(f"locality counter offset must be 0 or 32, got {offset}")
+    return (
+        resources.counters[0][offset : offset + 1],
+        resources.counters[1][offset : offset + 1],
+    )
 
 
 def _moe_topk_ids_init_for_routing(
@@ -558,6 +583,14 @@ class _PrimsTsMoERunnerMixin:
     _partition_topology: tuple = ()
     _geometry_tactics_cache: dict = {}
 
+    def _routing_locality_counters(
+        self, kwargs: dict[str, Any]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        resources = kwargs.get("partition_resources")
+        if isinstance(resources, MoeLocalizedKernelResources):
+            return resources.counters
+        return None, None
+
     def set_cache_key_static_extras(self, **kwargs) -> None:
         fc1_per_channel_weight_scale, fc2_per_channel_weight_scale = (
             _split_per_channel_weight_scale_from_kwargs(kwargs)
@@ -603,7 +636,7 @@ class _PrimsTsMoERunnerMixin:
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         return (
-            ("prims_ts_moe_config_version", 11),
+            ("prims_ts_moe_config_version", 12),
             ("top_k", int(self.top_k)),
             ("num_local_experts", int(self.num_local_experts)),
             ("num_experts", int(self.num_experts)),
@@ -636,6 +669,18 @@ class _PrimsTsMoERunnerMixin:
     def _is_partitioned(self) -> bool:
         return self._partition_strategy is not None
 
+    @property
+    def _is_localized(self) -> bool:
+        return bool(getattr(self, "_localized", False))
+
+    def _partition_tactic_overrides(self, pair):
+        if not self._is_localized:
+            return pair
+        return with_locality_overrides(
+            pair,
+            split_fc2_activations=self._partition_strategy == "tp_n_tp_k",
+        )
+
     def _staged_tensor(self, kwargs: dict[str, Any], name: str) -> torch.Tensor | None:
         """Return a monolithic weight tensor, or None when shards are passed separately."""
         if self._is_partitioned:
@@ -645,7 +690,7 @@ class _PrimsTsMoERunnerMixin:
     def _partition_shards(
         self, kwargs: dict[str, Any]
     ) -> tuple[
-        MoePartitionResources,
+        MoePartitionHandle,
         Sequence[torch.Tensor],
         Sequence[torch.Tensor],
         Sequence[torch.Tensor] | None,
@@ -772,7 +817,7 @@ class _PrimsTsMoERunnerMixin:
     def _materialize_partition_execution(
         self,
         *,
-        partition: MoePartitionResources,
+        partition: MoePartitionHandle,
         fc1_cfg,
         fc2_cfg,
         gemm1_output: torch.Tensor,
@@ -846,14 +891,18 @@ class _PrimsTsMoERunnerMixin:
                     sf_block_size=int(fc1_cfg.output_sf_block_size_c),
                     sf_layout=int(fc1_cfg.sf_layout_c),
                 )
-                if gemm1_output_scale.numel() < 2 * scale_span:
+                # The span is exact, but each partition's SF-C base must be
+                # 16-byte aligned (one byte per scale factor).
+                scale_stride = (scale_span + 15) // 16 * 16
+                if gemm1_output_scale.numel() < scale_stride + scale_span:
                     raise ValueError(
                         "compact FC1 scale partitions do not fit in the routed "
                         "scale workspace"
                     )
                 fc1_scales = tuple(
                     gemm1_output_scale.reshape(-1)[
-                        partition_id * scale_span : (partition_id + 1) * scale_span
+                        partition_id * scale_stride : partition_id * scale_stride
+                        + scale_span
                     ]
                     for partition_id in partition_ids
                 )
@@ -888,7 +937,7 @@ class _PrimsTsMoERunnerMixin:
     def _run_partitioned_gemm_pair(
         self,
         *,
-        partition: MoePartitionResources,
+        partition: MoePartitionHandle,
         partition_fc1_weights: Sequence[torch.Tensor],
         partition_fc2_weights: Sequence[torch.Tensor],
         partition_fc1_scales: Sequence[torch.Tensor] | None,
@@ -904,6 +953,7 @@ class _PrimsTsMoERunnerMixin:
         gemm1_output_scale: torch.Tensor | None = None,
         fc1_extra_kwargs: dict[str, Any] | None = None,
         fc2_extra_kwargs: dict[str, Any] | None = None,
+        compile_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Launch a strategy-planned two-way tensor-parallel FC1/FC2 pair."""
 
@@ -945,13 +995,15 @@ class _PrimsTsMoERunnerMixin:
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
         )
+        self._check_localized_tactic(fc1_cfg, fc2_cfg)
         local_fc1_width = self._check_partition_tactic(fc1_cfg, fc2_cfg)
 
         caller_stream = torch.cuda.current_stream(
             common_io_kwargs["hidden_states"].device
         )
-        fork_join = partition.fork_join
-        if fork_join is None:
+        is_single_kernel = isinstance(partition, MoeLocalizedKernelResources)
+        fork_join = None if is_single_kernel else partition.fork_join
+        if not is_single_kernel and fork_join is None:
             raise ValueError("MoE partition streams must be CUDA streams")
         full_fc1_pitch = _fc1_out_hidden(
             self.intermediate_size, int(self.activation_type)
@@ -1035,6 +1087,19 @@ class _PrimsTsMoERunnerMixin:
             }
             fc2_ios.append(builder(fc="fc2", cfg=fc2_cfg, **fc2_kwargs))
 
+        if is_single_kernel:
+            return self._launch_localized_gemm_pair(
+                partition=partition,
+                fc1_ios=fc1_ios,
+                fc2_ios=fc2_ios,
+                fc1_label=fc1_label,
+                fc2_label=fc2_label,
+                caller_stream=caller_stream,
+                gemm2_output=gemm2_output,
+                second_gemm2_output=execution.second_fc2_output,
+                compile_only=compile_only,
+            )
+
         compiled_fc1 = []
         compiled_fc2 = []
         for torch_stream, fc1_io, fc2_io in zip(
@@ -1096,6 +1161,127 @@ class _PrimsTsMoERunnerMixin:
             fork_join.join(caller_stream)
         return gemm2_output, execution.second_fc2_output
 
+    def _launch_localized_gemm_pair(
+        self,
+        *,
+        partition: MoeLocalizedKernelResources,
+        fc1_ios: list[dict[str, Any]],
+        fc2_ios: list[dict[str, Any]],
+        fc1_label: str,
+        fc2_label: str,
+        caller_stream: torch.Stream,
+        gemm2_output: torch.Tensor,
+        second_gemm2_output: torch.Tensor | None,
+        compile_only: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Merge two side IOs and launch one localized FC1 and FC2 grid."""
+        import cutlass
+        from cutlass.cute.runtime import make_ptr
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            max_active_clusters,
+        )
+
+        fc1_cfg = fc1_ios[0]["cfg"]
+        fc2_cfg = fc2_ios[0]["cfg"]
+        expected_fc2_split = (
+            LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT
+            if self._partition_strategy == "tp_n_tp_k"
+            else LocalitySplit.WEIGHTS_OUTPUT
+        )
+        if not fc1_cfg.uses_locality_split or not fc2_cfg.uses_locality_split:
+            raise ValueError("localized GEMM launch requires locality-enabled configs")
+        if fc1_cfg.locality_split != int(LocalitySplit.WEIGHTS_OUTPUT):
+            raise ValueError("localized FC1 must split weights and output")
+        if fc2_cfg.locality_split != int(expected_fc2_split):
+            raise ValueError(
+                f"localized FC2 must use locality_split={int(expected_fc2_split)}"
+            )
+
+        def merge_sides(
+            ios: list[dict[str, Any]], counter_offset: int
+        ) -> dict[str, Any]:
+            primary, secondary = ios
+            side_specific = {
+                "a_dp",
+                "b_dp",
+                "sfa_dp",
+                "sfb_dp",
+                "c0_dp",
+                "sf_c_dp",
+                "sf_c_m_offset",
+                "_keepalive",
+            }
+            missing = object()
+            for key in primary.keys() | secondary.keys():
+                if key in side_specific:
+                    continue
+                primary_value = primary.get(key, missing)
+                secondary_value = secondary.get(key, missing)
+                is_scalar = (
+                    key == "cfg"
+                    or isinstance(primary_value, (bool, int))
+                    or isinstance(secondary_value, (bool, int))
+                )
+                if is_scalar and (
+                    primary_value is missing
+                    or secondary_value is missing
+                    or primary_value != secondary_value
+                ):
+                    raise ValueError(
+                        f"localized side IO field {key!r} must match: "
+                        f"{primary_value!r} != {secondary_value!r}"
+                    )
+            counter0, counter1 = _locality_counter_views(partition, counter_offset)
+            counter0_dp = make_ptr(
+                cutlass.Int32,
+                counter0.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=4,
+            )
+            counter1_dp = make_ptr(
+                cutlass.Int32,
+                counter1.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=4,
+            )
+            primary.update(
+                side1_a_dp=secondary["a_dp"],
+                side1_b_dp=secondary["b_dp"],
+                side1_sfa_dp=secondary["sfa_dp"],
+                side1_sfb_dp=secondary["sfb_dp"],
+                side1_c_dp=secondary["c0_dp"],
+                side1_sf_c_dp=secondary["sf_c_dp"],
+                side1_sf_c_m_offset=secondary["sf_c_m_offset"],
+                locality_counter0_dp=counter0_dp,
+                locality_counter1_dp=counter1_dp,
+                num_persistent_clusters=max_active_clusters(
+                    partition.device.index,
+                    tuple(primary["cfg"].preferred_cluster_shape),
+                ),
+            )
+            primary["_keepalive"] = [
+                *primary.get("_keepalive", ()),
+                *secondary.get("_keepalive", ()),
+                counter0,
+                counter1,
+            ]
+            return primary
+
+        fc1_io = merge_sides(fc1_ios, 0)
+        fc2_io = merge_sides(fc2_ios, 32)
+        stream = self._cuda_driver_stream(caller_stream)
+        fc1_fn = get_compiled_gemm(
+            stable_config_hash(fc1_io["cfg"]), fc1_label, fc1_io, stream
+        )
+        fc2_fn = get_compiled_gemm(
+            stable_config_hash(fc2_io["cfg"]), fc2_label, fc2_io, stream
+        )
+        if compile_only:
+            return gemm2_output, second_gemm2_output
+        fc1_fn(*self._launch_args(fc1_io, stream))
+        fc2_fn(*self._launch_args(fc2_io, stream))
+        return gemm2_output, second_gemm2_output
+
     def _run_partitioned(
         self,
         *,
@@ -1125,9 +1311,13 @@ class _PrimsTsMoERunnerMixin:
             partition_fc1_scales,
             partition_fc2_scales,
         ) = self._partition_shards(kwargs)
-        assert partition.fork_join is not None
-        with partition.launch_guard():
-            gemm2_output, second_gemm2_output = self._run_partitioned_gemm_pair(
+        if isinstance(partition, MoeLocalizedKernelResources) != self._is_localized:
+            raise ValueError(
+                "partition_resources type does not match the runner's execution topology"
+            )
+
+        def run_pair():
+            pair_output, second_pair_output = self._run_partitioned_gemm_pair(
                 partition=partition,
                 partition_fc1_weights=partition_fc1_weights,
                 partition_fc2_weights=partition_fc2_weights,
@@ -1144,10 +1334,13 @@ class _PrimsTsMoERunnerMixin:
                 gemm2_output=gemm2_output,
                 fc1_extra_kwargs=fc1_extra_kwargs,
                 fc2_extra_kwargs=fc2_extra_kwargs,
+                compile_only=bool(kwargs.get("_prims_ts_compile_only", False)),
             )
+            if kwargs.get("_prims_ts_compile_only", False):
+                return []
             return self._finish_partitioned(
-                gemm2_output=gemm2_output,
-                second_gemm2_output=second_gemm2_output,
+                gemm2_output=pair_output,
+                second_gemm2_output=second_pair_output,
                 output=output,
                 expert_weights=expert_weights,
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
@@ -1161,6 +1354,12 @@ class _PrimsTsMoERunnerMixin:
                     "zero_rows_without_local_expert", True
                 ),
             )
+
+        if isinstance(partition, MoeLocalizedKernelResources):
+            return run_pair()
+        assert partition.fork_join is not None
+        with partition.launch_guard():
+            return run_pair()
 
     @staticmethod
     def _cuda_driver_stream(torch_stream):
@@ -1248,6 +1447,17 @@ class _PrimsTsMoERunnerMixin:
         _validate_swap_ab_cluster_span(fc1_cfg, fc1_width)
         _validate_swap_ab_cluster_span(fc2_cfg, fc2_width)
 
+    def _check_localized_tactic(self, fc1_cfg, fc2_cfg) -> None:
+        if not self._is_localized:
+            return
+        if not fc1_cfg.is_persistent or not fc2_cfg.is_persistent:
+            raise ValueError("single-kernel localization requires persistent tactics")
+        if (
+            fc1_cfg.fallback_cluster_shape is not None
+            or fc2_cfg.fallback_cluster_shape is not None
+        ):
+            raise ValueError("single-kernel localization requires fixed cluster shapes")
+
     def _filter_partition_geometry_tactics(
         self, tactics: List[Any], inputs: List[torch.Tensor], cache_key: tuple
     ) -> List[Any]:
@@ -1257,6 +1467,7 @@ class _PrimsTsMoERunnerMixin:
             type(self),
             cache_key,
             self._partition_strategy,
+            self._partition_topology,
             self._cache_key_static_extras,
         )
         cached = _PrimsTsMoERunnerMixin._geometry_tactics_cache.get(key)
@@ -1272,6 +1483,7 @@ class _PrimsTsMoERunnerMixin:
                 fc2_cfg = pair.fc2.cfg.build()
                 self._check_cga_tactic(fc1_cfg, fc2_cfg)
                 if self._is_partitioned:
+                    self._check_localized_tactic(fc1_cfg, fc2_cfg)
                     self._check_partition_tactic(fc1_cfg, fc2_cfg)
             except ValueError as exc:
                 dropped += 1
@@ -1324,17 +1536,12 @@ class _PrimsTsMoERunnerMixin:
                 )
 
         tactics = _node_rank_rotated(tactics)
-        # Threads can overlap tactic preparation and cache loads. CuTe compiler
-        # entry is serialized within a process; different ranks compile independently.
-        max_workers = min(4, max(1, len(tactics)))
-        if max_workers == 1 or len(tactics) <= 1:
-            for tactic in tactics:
-                _precompile_one(tactic)
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                list(pool.map(_precompile_one, tactics))
+        # Run serially: BaseDSL.enable_pyir() leaks PyIR callee rewriting into
+        # other threads, which then evaluate config helpers outside a trace and
+        # segfault. Threads add no parallelism, because task_scheduling_scope()
+        # already serializes every compile.
+        for tactic in tactics:
+            _precompile_one(tactic)
         return True
 
 
@@ -1391,9 +1598,10 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return apply_weight_l2_policy(
+        pair = apply_weight_l2_policy(
             map_trtllm_bf16_moe_tactic(tactic, **common, **bias_and_oa)
         )
+        return self._partition_tactic_overrides(pair)
 
     def _make_tuning_config(
         self,
@@ -1523,6 +1731,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(self.activation_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
+            *self._routing_locality_counters(kwargs),
         )
 
         (
@@ -1664,7 +1873,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, extras = self._tactic_common(moe_inputs, kwargs)
         uses_per_token_scaling = moe_inputs.per_token_scale is not None
-        return apply_weight_l2_policy(
+        pair = apply_weight_l2_policy(
             map_trtllm_nvfp4_moe_tactic(
                 tactic,
                 **common,
@@ -1677,6 +1886,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 ),
             )
         )
+        return self._partition_tactic_overrides(pair)
 
     def _make_tuning_config(
         self,
@@ -1820,6 +2030,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(self.activation_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
+            *self._routing_locality_counters(kwargs),
         )
 
         (
@@ -2014,6 +2225,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         pair = apply_weight_l2_policy(
             map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
         )
+        pair = self._partition_tactic_overrides(pair)
         return self._maybe_fuse_finalize(
             pair, moe_inputs.hidden_states.shape[0], kwargs or {}
         )
@@ -2232,6 +2444,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     int(self.activation_type),
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    *self._routing_locality_counters(kwargs),
                 )
 
                 (
@@ -2373,6 +2586,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(self.activation_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
+            *self._routing_locality_counters(kwargs),
         )
 
         (
@@ -2539,9 +2753,10 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return apply_weight_l2_policy(
+        pair = apply_weight_l2_policy(
             map_trtllm_mxfp4_bf16_moe_tactic(tactic, **common, **bias_and_oa)
         )
+        return self._partition_tactic_overrides(pair)
 
     def _make_tuning_config(
         self,
@@ -2674,6 +2889,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(self.activation_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
+            *self._routing_locality_counters(kwargs),
         )
 
         (
@@ -2844,7 +3060,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             use_routing_scales_on_input=use_routing_scales,
             routing_logits=moe_inputs.routing_logits,
         )
-        return apply_weight_l2_policy(
+        pair = apply_weight_l2_policy(
             map_trtllm_fp8_per_tensor_moe_tactic(
                 tactic,
                 **common,
@@ -2855,6 +3071,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 per_token_sf_dtype=per_token_sf_dtype,
             )
         )
+        return self._partition_tactic_overrides(pair)
 
     def _make_tuning_config(
         self,
@@ -3030,6 +3247,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(self.activation_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
+            *self._routing_locality_counters(kwargs),
         )
 
         (
@@ -3207,9 +3425,10 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     ),
                 )
             )
-        return apply_weight_l2_policy(
+        pair = apply_weight_l2_policy(
             map_trtllm_mxfp8_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
         )
+        return self._partition_tactic_overrides(pair)
 
     def _make_tuning_config(
         self,
@@ -3354,6 +3573,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(self.fp8_quantization_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
+            *self._routing_locality_counters(kwargs),
         )
 
         (
@@ -3504,7 +3724,7 @@ class _PartitionedPrimsTsRunnerMixin:
         partition_strategy: PartitionStrategy,
         partition_fc1_layout: PreparedWeightLayout,
         partition_fc2_layout: PreparedWeightLayout,
-        partition_resources: MoePartitionResources | None = None,
+        partition_resources: MoePartitionHandle | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -3520,14 +3740,38 @@ class _PartitionedPrimsTsRunnerMixin:
         self._partition_strategy = partition_strategy
         self._partition_fc1_layout = partition_fc1_layout
         self._partition_fc2_layout = partition_fc2_layout
+        self._localized = isinstance(partition_resources, MoeLocalizedKernelResources)
         self._partition_topology = _partition_stream_topology(partition_resources)
+
+    def _precompile_tactic_compile_only(
+        self, inputs: List[torch.Tensor], tactic: Any, **kwargs
+    ) -> None:
+        if not self._is_localized:
+            self.forward(inputs, tactic=tactic, **kwargs)
+            torch.cuda.current_stream(
+                device=MoeRunnerInputs.from_list(inputs).hidden_states.device
+            ).synchronize()
+            return
+        kwargs["_prims_ts_compile_only"] = True
+        super().forward(inputs, tactic=tactic, **kwargs)
 
     def forward(self, inputs: List[torch.Tensor], tactic: Any = -1, **kwargs):
         # The autotuner falls back to -1 without consulting get_valid_tactics, and the
         # unpartitioned default pair may violate the partition geometry.
         if tactic == -1:
             tactic = self.get_valid_tactics(inputs, None)[0]
-        return super().forward(inputs, tactic=tactic, **kwargs)
+        if not self._is_localized:
+            return super().forward(inputs, tactic=tactic, **kwargs)
+
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        resources = kwargs.get("partition_resources")
+        if not isinstance(resources, MoeLocalizedKernelResources):
+            raise ValueError(
+                "single-kernel localization requires MoeLocalizedKernelResources"
+            )
+        torch_stream = torch.cuda.current_stream(moe_inputs.hidden_states.device)
+        with resources.launch_guard(torch_stream):
+            return super().forward(inputs, tactic=tactic, **kwargs)
 
 
 class PrimsTsPartitionedBf16MoERunner(

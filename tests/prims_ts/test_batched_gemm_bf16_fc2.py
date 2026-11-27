@@ -388,6 +388,10 @@ class TestBf16Fc2Persistent:
 
     def test_validate_persistent_pdl_uses_split_barriers(self):
         from cutlass.experimental.task_scheduling.enums import ScheduleStage
+        from cutlass.experimental.task_scheduling.schedule_builder import (
+            Step,
+            WorkTileLoop,
+        )
         from flashinfer.prims_ts.batched_gemm.pdl_resources import (
             PdlLaunchBarrier,
             PdlWaitBarrier,
@@ -418,32 +422,36 @@ class TestBf16Fc2Persistent:
             r for r in load_a_task.dst_resources if isinstance(r, PdlLaunchBarrier)
         )
 
-        assert (
-            id(pdl_wait),
-            ScheduleStage.ConsumerWork,
-            0,
-        ) in load_a_task.pre_work_loop_head_slots
-        assert (
-            id(pdl_launch),
-            ScheduleStage.ProducerWork,
-            0,
-        ) in load_a_task.post_work_loop_tail_slots
+        body = load_a_task.schedule.body
+        loop_pos = next(
+            idx for idx, node in enumerate(body) if isinstance(node, WorkTileLoop)
+        )
+        pre_loop = [
+            (node.memory_resource, node.schedule_stage)
+            for node in body[:loop_pos]
+            if isinstance(node, Step)
+        ]
+        post_loop = [
+            (node.memory_resource, node.schedule_stage)
+            for node in body[loop_pos + 1 :]
+            if isinstance(node, Step)
+        ]
 
         wait_pos = next(
             idx
-            for idx, (resource, stage, _call_id, _label) in enumerate(
-                load_a_task.head_schedule_list
-            )
+            for idx, (resource, stage) in enumerate(pre_loop)
             if resource is pdl_wait and stage == ScheduleStage.ConsumerWork
         )
         gmem_a_aux_pos = next(
             idx
-            for idx, (resource, stage, _call_id, _label) in enumerate(
-                load_a_task.head_schedule_list
-            )
+            for idx, (resource, stage) in enumerate(pre_loop)
             if resource.name == "GmemA" and stage == ScheduleStage.ConsumerAuxWork
         )
         assert wait_pos < gmem_a_aux_pos
+        assert any(
+            resource is pdl_launch and stage == ScheduleStage.ProducerWork
+            for resource, stage in post_loop
+        )
 
         dep_graph = {
             downstream.name: [upstream.name for upstream in upstreams]

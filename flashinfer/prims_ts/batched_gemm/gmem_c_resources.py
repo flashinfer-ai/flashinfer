@@ -206,6 +206,9 @@ class GmemCResource(MemoryResource):
     c_tensor: Any = None  # cute.Tensor for C output
     sf_c_tensor: Any = None  # cute.Tensor for output scaling factors
     tma_c_desc: Any = None
+    side1_c_tensor: Any = None
+    side1_sf_c_tensor: Any = None
+    side1_tma_c_desc: Any = None
     bias_tensor: Any = None
     scale_c_tensor: Any = None
     scale_gate_tensor: Any = None
@@ -236,6 +239,23 @@ class GmemCResource(MemoryResource):
     sFinalizeOutRow: Any = None
     sFinalizeCRow: Any = None
     sFinalizeWeight: Any = None
+    side1_sf_c_m_offset: Any = None
+    active_sf_c_m_offset: Any = None
+    side0_tma_c_desc: Any = None
+    side0_gC: Any = None
+    side0_gCBytes: Any = None
+    side0_gCInt16: Any = None
+    side0_gCInt32: Any = None
+    side0_gSfC: Any = None
+    side0_gSfCBytes: Any = None
+    side0_gSfCInt16: Any = None
+    side1_gC: Any = None
+    side1_gCBytes: Any = None
+    side1_gCInt16: Any = None
+    side1_gCInt32: Any = None
+    side1_gSfC: Any = None
+    side1_gSfCBytes: Any = None
+    side1_gSfCInt16: Any = None
     gC: Any = None  # make_array_view of c_tensor
     gCBytes: Any = None
     gCInt16: Any = None
@@ -337,6 +357,10 @@ class GmemCResource(MemoryResource):
                 self.gCInt32 = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int32)
             if self.cfg.uses_fp8_output or self.cfg.uses_mxfp8_output_quant:
                 self.gCInt16 = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int16)
+            self.side0_gC = self.gC
+            self.side0_gCBytes = self.gCBytes
+            self.side0_gCInt16 = self.gCInt16
+            self.side0_gCInt32 = self.gCInt32
         if self.sf_c_tensor is not None:
             self.gSfC = cutlass.make_array_view(self.sf_c_tensor)
             if self.cfg.has_output_block_scaling:
@@ -344,6 +368,37 @@ class GmemCResource(MemoryResource):
                 self.gSfCInt16 = cutlass.Array(
                     self.gSfC.data_ptr(), dtype=cutlass.Int16
                 )
+            self.side0_gSfC = self.gSfC
+            self.side0_gSfCBytes = self.gSfCBytes
+            self.side0_gSfCInt16 = self.gSfCInt16
+        if self.side1_c_tensor is not None:
+            self.side1_gC = cutlass.make_array_view(self.side1_c_tensor)
+            if (
+                self.cfg.uses_fp4_output_quant
+                or self.cfg.uses_mxfp8_output_quant
+                or self.cfg.uses_fp8_output
+            ):
+                self.side1_gCBytes = cutlass.Array(
+                    self.side1_gC.data_ptr(), dtype=cutlass.Int8
+                )
+            if self.cfg.uses_fp4_output_quant:
+                self.side1_gCInt32 = cutlass.Array(
+                    self.side1_gC.data_ptr(), dtype=cutlass.Int32
+                )
+            if self.cfg.uses_fp8_output or self.cfg.uses_mxfp8_output_quant:
+                self.side1_gCInt16 = cutlass.Array(
+                    self.side1_gC.data_ptr(), dtype=cutlass.Int16
+                )
+        if self.side1_sf_c_tensor is not None:
+            self.side1_gSfC = cutlass.make_array_view(self.side1_sf_c_tensor)
+            if self.cfg.has_output_block_scaling:
+                self.side1_gSfCBytes = cutlass.Array(
+                    self.side1_gSfC.data_ptr(), dtype=cutlass.Int8
+                )
+                self.side1_gSfCInt16 = cutlass.Array(
+                    self.side1_gSfC.data_ptr(), dtype=cutlass.Int16
+                )
+        self.side0_tma_c_desc = self.tma_c_desc
         if self.bias_tensor is not None:
             self.gBias = cutlass.make_array_view(self.bias_tensor)
         if self.scale_c_tensor is not None:
@@ -983,7 +1038,46 @@ class GmemCResource(MemoryResource):
     @cute.jit
     def init_epilogue_tile_state(self, stage_info: StageInfo) -> None:
         """Load epilogue-side scalar/tile data once at work-tile head."""
-        tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
+        tile_coord_m, tile_coord_n, tile_side = stage_info.work_tile.tile_idx
+        tma_c_desc = self.side0_tma_c_desc
+        gC = self.side0_gC
+        gCBytes = self.side0_gCBytes
+        gCInt16 = self.side0_gCInt16
+        gCInt32 = self.side0_gCInt32
+        gSfC = self.side0_gSfC
+        gSfCBytes = self.side0_gSfCBytes
+        gSfCInt16 = self.side0_gSfCInt16
+        active_sf_c_m_offset = self.sf_c_m_offset
+        if cutlass.const_expr(self.cfg.uses_locality_split):
+            # Select through locals and assign the attributes after the branch:
+            # attribute writes inside this runtime branch do not reliably
+            # become per-tile values.
+            if tile_side == Int32(1):
+                tma_c_desc = self.side1_tma_c_desc
+                active_sf_c_m_offset = self.side1_sf_c_m_offset
+                if cutlass.const_expr(gC is not None):
+                    gC = self.side1_gC
+                if cutlass.const_expr(gCBytes is not None):
+                    gCBytes = self.side1_gCBytes
+                if cutlass.const_expr(gCInt16 is not None):
+                    gCInt16 = self.side1_gCInt16
+                if cutlass.const_expr(gCInt32 is not None):
+                    gCInt32 = self.side1_gCInt32
+                if cutlass.const_expr(gSfC is not None):
+                    gSfC = self.side1_gSfC
+                if cutlass.const_expr(gSfCBytes is not None):
+                    gSfCBytes = self.side1_gSfCBytes
+                if cutlass.const_expr(gSfCInt16 is not None):
+                    gSfCInt16 = self.side1_gSfCInt16
+        self.tma_c_desc = tma_c_desc
+        self.gC = gC
+        self.gCBytes = gCBytes
+        self.gCInt16 = gCInt16
+        self.gCInt32 = gCInt32
+        self.gSfC = gSfC
+        self.gSfCBytes = gSfCBytes
+        self.gSfCInt16 = gSfCInt16
+        self.active_sf_c_m_offset = active_sf_c_m_offset
         expert_idx = Int32(0)
         if cutlass.const_expr(self.tile_idx_view is not None):
             if cutlass.const_expr(self.cfg.is_swap_ab):
@@ -2926,7 +3020,7 @@ class GmemCResource(MemoryResource):
     @cute.jit
     def _sf_c_index(self, m_row, n_col, output_m):
         if cutlass.const_expr(self.cfg.is_swap_ab):
-            m_row = m_row + cute.assume(self.sf_c_m_offset, divby=32)
+            m_row = m_row + cute.assume(self.active_sf_c_m_offset, divby=32)
         block_m = Int32(self.cfg.output_sf_block_size_c)
         group_m = block_m * Int32(4)
         sf_group_axis = self._sf_group_axis(output_m)

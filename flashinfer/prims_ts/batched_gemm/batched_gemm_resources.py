@@ -49,6 +49,7 @@ from .smem_sf_resources import (
 )
 from .smem_misc_resources import (
     BatchedGemmWorkQueue,
+    LocalityBatchedGemmWorkQueue,
     ProxyClusterBarrierResource,
     WorkThrottleBarrierResource,
 )
@@ -70,6 +71,7 @@ from .tmem_c_resources import (
 
 __all__ = [
     "BatchedGemmWorkQueue",
+    "LocalityBatchedGemmWorkQueue",
     "GmemAResource",
     "GmemBResource",
     "GmemCResource",

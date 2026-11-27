@@ -22,6 +22,8 @@ from .config_mapper import (
     map_trtllm_bf16_moe_tactic,
 )
 from .partition import (
+    MoeLocalizedKernelResources,
+    MoePartitionHandle,
     MoePartitionResources,
     MoeShardedWeights,
     PartitionStrategy,
@@ -34,6 +36,8 @@ from .partition import (
 from .support import is_prims_ts_bf16_supported
 
 __all__ = [
+    "MoeLocalizedKernelResources",
+    "MoePartitionHandle",
     "MoePartitionResources",
     "MoeShardedWeights",
     "PartitionStrategy",

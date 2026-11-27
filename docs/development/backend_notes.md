@@ -7,6 +7,7 @@ or dtypes. General workflow rules are in [AGENTS.md](../../AGENTS.md).
 - [cuDNN query sparse attention](#cudnn-query-sparse-attention)
 - [Attention plans and CUDA graphs](#attention-plan-and-cuda-graph-lifetime)
 - [Grouped FP8 GEMM](#grouped-fp8-gemm)
+- [Prims-TS MoE partition handles](#prims-ts-moe-partition-handles)
 - [SM90 FP4 MegaMoE](#sm90-fp4-megamoe)
 - [Prims-TS decode dtypes](#prims-ts-decode-dtypes)
 
@@ -252,6 +253,25 @@ With `skip_check=False`, `validate_indices=True` checks routing values for
 non-empty inputs and synchronizes with the CPU. Validate new routing data before
 capture. The default checks metadata only; `skip_check=True` bypasses both
 metadata and routing-value checks, even when `validate_indices=True`.
+
+## Prims-TS MoE partition handles
+
+Construct `MoePartitionResources` or `MoeLocalizedKernelResources` before CUDA
+Graph capture and keep the handle alive through every eager launch, capture and
+replay that uses it. One handle must not back overlapping launches or concurrent
+graph replays; use a distinct handle for each independently concurrent batch.
+The host launch guard serializes enqueue. For single-kernel resources, changing
+the eager caller stream also makes the new stream wait for the previously bound
+stream before reusing the shared scheduler counters.
+
+Single-kernel routing zeroes both domain-local scheduler counters after its PDL
+grid-dependency wait. FC1 performs the corresponding early-exit PDL wait before
+reading routing metadata or claiming work. FC2 may skip that wait because FC1
+waits before issuing the programmatic trigger that allows FC2 to proceed.
+
+The `DOMAIN` side source reads `%locality_domain_id` and requires CUTLASS DSL
+built with CUDA 13.5 or newer, a CUDA driver reporting
+`cuDriverGetVersion >= 13050`, and a device exposing two locality domains.
 
 ## SM90 FP4 MegaMoE
 

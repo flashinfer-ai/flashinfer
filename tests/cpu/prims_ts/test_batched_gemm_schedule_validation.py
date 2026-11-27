@@ -324,6 +324,34 @@ def test_use_shuffled_matrix_cli_accepts_boolean_spelling(value, expected):
 
 
 @pytest.mark.cpu_only
+def test_locality_cli_mapping():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+    from flashinfer.prims_ts.batched_gemm.config_types import (
+        LocalitySideSource,
+        LocalitySplit,
+    )
+
+    parser = build_arg_parser()
+    defaults = _parse_overrides(parser.parse_args([]))
+    assert defaults["locality_split"] == int(LocalitySplit.OFF)
+    assert defaults["locality_side_source"] == int(LocalitySideSource.DOMAIN)
+    args = parser.parse_args(
+        [
+            "--locality-split",
+            "weights_activations_output",
+            "--locality-side-source",
+            "zero",
+        ]
+    )
+    overrides = _parse_overrides(args)
+    assert overrides["locality_split"] == int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+    assert overrides["locality_side_source"] == int(LocalitySideSource.ZERO)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("distribution", ("default", "allZeros"))
 def test_data_distribution_cli_matches_trtllm_gen_spelling(distribution):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import build_arg_parser
@@ -3250,3 +3278,142 @@ def test_validation_rejects_plain_fp8_output_without_activation_side():
     )
     with pytest.raises(ValueError, match="Plain FP8 C output"):
         validate_config(cfg)
+
+
+def _locality_config(**overrides):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        DType,
+        TileScheduler,
+        make_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.config_types import LocalitySplit
+
+    values = dict(
+        batch_mode=int(BatchMode.BATCH_N),
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        mma_k=16,
+        tile_k=64,
+        tile_n=16,
+        use_early_exit=1,
+        use_clc_fast_drain=0,
+        locality_split=int(LocalitySplit.WEIGHTS_OUTPUT),
+    )
+    values.update(overrides)
+    return make_config(**values)
+
+
+@pytest.mark.cpu_only
+def test_locality_schedule_and_launch_grid_validate():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_launch_grid,
+        validate_config,
+    )
+
+    cfg = _locality_config()
+    validate_config(cfg)
+    assert compute_launch_grid(
+        cfg,
+        problem_m=256,
+        problem_n=64,
+        early_exit_max_token_ctas=4,
+        num_persistent_clusters=5,
+    ) == (cfg.preferred_cluster_shape[0], cfg.preferred_cluster_shape[1], 5)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("problem_m", "problem_n"),
+    ((65536 * 16, 64), (256, 65536 * 16)),
+)
+def test_locality_launch_rejects_tile_indices_that_do_not_fit_u16(problem_m, problem_n):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_launch_grid,
+    )
+
+    with pytest.raises(ValueError, match="packs M/N tile indices into 16 bits"):
+        compute_launch_grid(
+            _locality_config(),
+            problem_m=problem_m,
+            problem_n=problem_n,
+            early_exit_max_token_ctas=65536,
+            num_persistent_clusters=1,
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        ({"tile_scheduler": 0}, "persistent"),
+        ({"fallback_cluster_dim_x": 1, "fallback_cluster_dim_y": 1}, "flexible"),
+        ({"use_clc_fast_drain": 1}, "fast drain"),
+        ({"use_early_exit": 0}, "early exit"),
+        ({"fused_finalize_top_k": 1}, "fused finalize"),
+        ({"bias_type": 1}, "per-channel bias"),
+    ),
+)
+def test_locality_schedule_rejects_incompatible_options(overrides, match):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(_locality_config(**overrides))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("output_kind", ("activation", "fp8", "per_channel_scale"))
+def test_locality_schedule_rejects_unmerged_epilogue_inputs_and_outputs(output_kind):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        DType,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.config_types import LocalitySplit
+
+    overrides = {}
+    match = ""
+    if output_kind == "activation":
+        overrides["locality_split"] = int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+        overrides["act_kind"] = int(ActKind.RELU2)
+        match = "linear, unquantized epilogue"
+    else:
+        overrides.update(
+            dtype_a=int(DType.E4M3),
+            dtype_b=int(DType.E4M3),
+            dtype_c=int(DType.E4M3),
+            tile_k=32,
+            mma_k=32,
+        )
+        if output_kind == "fp8":
+            overrides["locality_split"] = int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+            match = "linear, unquantized epilogue"
+        else:
+            overrides["use_per_token_sf_a"] = 1
+            match = "per-channel weight scale"
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(_locality_config(**overrides))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("route_field", "match"),
+    (("route_act", "route_act=NONE"), ("route_sfs_act", "sf_route=NONE")),
+)
+def test_locality_activation_split_rejects_routed_operands(route_field, match):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+    from flashinfer.prims_ts.batched_gemm.config_types import (
+        LocalitySplit,
+        RouteImpl,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(
+            _locality_config(
+                locality_split=int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT),
+                **{route_field: int(RouteImpl.TMA)},
+            )
+        )

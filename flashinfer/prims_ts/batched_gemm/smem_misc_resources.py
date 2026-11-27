@@ -20,6 +20,13 @@ from typing import Any, Optional
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+from cutlass import Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import (
+    dsl_user_op,
+    extract_mlir_values,
+    new_from_mlir_values,
+)
 from cutlass.experimental import primitives as prims
 from cutlass.pipeline.sm100 import PipelineClcFetchAsync, PipelineTmaUmma
 
@@ -30,13 +37,16 @@ from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
     TaskLocalVariable,
     WorkQueue,
+    WorkTileInfo,
     consumer_work,
+    producer_work,
 )
 from cutlass.utils.dynamic_persistent_tile_scheduler import (
     ClcDynamicPersistentTileScheduler,
 )
 
 from .batched_gemm_config import BatchedGemmConfig
+from .config_types import LocalitySideSource
 from .batched_gemm_cga import (
     active_cga_coords,
     active_clc_consumer_threads,
@@ -89,6 +99,42 @@ class MixedCgaClcDynamicPersistentTileScheduler(ClcDynamicPersistentTileSchedule
             cluster_major * cluster_shape_n + y_idx,
             batch_l,
         )
+
+
+class LocalityClcDynamicPersistentTileScheduler(ClcDynamicPersistentTileScheduler):
+    """CLC-compatible scheduler state used by the locality work queue."""
+
+    def __init__(self, *args, home_side, home_exhausted, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.home_side = home_side
+        self.home_exhausted = home_exhausted
+
+    def __extract_mlir_values__(self):
+        values = super().__extract_mlir_values__()
+        values.extend(extract_mlir_values(self.home_side))
+        values.extend(extract_mlir_values(self.home_exhausted))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        home_side_len = len(extract_mlir_values(self.home_side))
+        home_exhausted_len = len(extract_mlir_values(self.home_exhausted))
+        base_len = len(values) - home_side_len - home_exhausted_len
+        assert base_len >= 0
+        rebuilt = super().__new_from_mlir_values__(values[:base_len])
+        home_side = new_from_mlir_values(
+            self.home_side,
+            values[base_len : base_len + home_side_len],
+        )
+        home_exhausted = new_from_mlir_values(
+            self.home_exhausted,
+            values[base_len + home_side_len :],
+        )
+        # The base class owns its constructor and private state. Preserve that
+        # reconstructed object instead of duplicating its field list here.
+        rebuilt.__class__ = LocalityClcDynamicPersistentTileScheduler
+        rebuilt.home_side = home_side
+        rebuilt.home_exhausted = home_exhausted
+        return rebuilt
 
 
 @dataclass(kw_only=True)
@@ -362,7 +408,7 @@ class BatchedGemmWorkQueue(WorkQueue):
             parity = cutlass.Int32(1) - parity
 
     @cute.jit
-    def _maybe_fast_drain_skipped_tile(self) -> None:
+    def _maybe_fast_drain_skipped_tile(self, work_tile) -> None:
         # Fast-drain cancels every cluster that has not launched yet. Early-exit
         # padding sits on the token axis only, so that is a suffix of the CLC
         # order solely when the token axis is the slow raster axis. Along-N on
@@ -371,8 +417,8 @@ class BatchedGemmWorkQueue(WorkQueue):
         if cutlass.const_expr(
             self._uses_fast_drain() and self.cfg.clc_fast_drain_skip_is_suffix
         ):
-            skip_work_tile = self._get_consumer_var_from_ts("skip_work_tile")
-            if skip_work_tile:
+            # Same predicate the work-tile loop uses as skip_if.
+            if self.should_skip_work_tile(work_tile):
                 self._clc_fast_drain_all()
 
     @cute.jit
@@ -386,13 +432,261 @@ class BatchedGemmWorkQueue(WorkQueue):
                 cute.arch.block_idx_in_cluster()
             )
             if cta_rank_in_cluster == 0:
-                self._maybe_fast_drain_skipped_tile()
+                self._maybe_fast_drain_skipped_tile(stage_info.work_tile)
                 mbarrier_addr = self.pipeline.producer_get_barrier(self.producer_state)
                 stage_response_ptr = self._get_stage_response_ptr(stage_info.stage_idx)
                 with cute.arch.elect_one():
                     cute.arch.issue_clc_query(mbarrier_addr, stage_response_ptr)
             assert self.tile_scheduler is not None
             self.tile_scheduler._num_tiles_executed += cutlass.Int32(1)
+
+
+@cute.jit
+def _locality_domain_id() -> cutlass.Int32:
+    return cute.arch.inline_ptx(
+        "mov.u32 {$w0}, %locality_domain_id;",
+        write_only_types=[cutlass.Int32],
+    )
+
+
+@cute.jit
+def _smid() -> cutlass.Int32:
+    return cute.arch.inline_ptx(
+        "mov.u32 {$w0}, %smid;",
+        write_only_types=[cutlass.Int32],
+    )
+
+
+@dsl_user_op
+def _st_async_u64x2_to_peer(
+    dst, mbarrier, cta_rank, lo, hi, *, loc=None, ip=None
+) -> None:
+    """Store a 16-byte record to ``dst`` in a peer CTA and complete its mbarrier.
+
+    ``dst`` and ``mbarrier`` are local SMEM pointers; the store targets the
+    same offsets in the CTA with cluster rank ``cta_rank``.
+    """
+    # The store writes peer SMEM that the operands do not describe; prevent
+    # compiler memory accesses from moving across it.
+    llvm.inline_asm(
+        None,
+        [
+            Int32(dst.toint()).ir_value(loc=loc, ip=ip),
+            Int32(mbarrier.toint()).ir_value(loc=loc, ip=ip),
+            Int32(cta_rank).ir_value(loc=loc, ip=ip),
+            Int64(lo).ir_value(loc=loc, ip=ip),
+            Int64(hi).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .b32 remote_dst, remote_mbar;\n"
+        "mapa.shared::cluster.u32 remote_dst, $0, $2;\n"
+        "mapa.shared::cluster.u32 remote_mbar, $1, $2;\n"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.u64 "
+        "[remote_dst], {$3, $4}, [remote_mbar];\n"
+        "}",
+        "r,r,r,l,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dataclass(kw_only=True)
+class LocalityBatchedGemmWorkQueue(BatchedGemmWorkQueue):
+    """Atomic home-first, then steal, persistent locality scheduler.
+
+    Each cluster claims from the counter for its inline-PTX-derived home side.
+    Its first out-of-range claim latches ``home_exhausted``; subsequent claims
+    only steal from the other side, which is encoded in the published work
+    response. Normal termination therefore costs one failed home claim and one
+    failed steal.
+
+    The first work tile is a dummy skip tile because the real first work ID
+    must come from the home-side counter. Once a single-wave grid has completed
+    that tile, its next fetch publishes an invalid response without another
+    atomic.
+    """
+
+    locality_counter0_tensor: Any = None
+    locality_counter1_tensor: Any = None
+
+    def __init__(
+        self, *, locality_counter0_tensor, locality_counter1_tensor, **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self.locality_counter0_tensor = locality_counter0_tensor
+        self.locality_counter1_tensor = locality_counter1_tensor
+
+    def create_tile_scheduler(self):
+        params = self.tile_scheduler_config.tile_scheduler_params
+        bidx, bidy, bidz = cute.arch.block_idx()
+        cluster_m, cluster_n, _ = self.cfg.preferred_cluster_shape
+        cta_id_in_cluster = (
+            cutlass.Int32(bidx % cluster_m),
+            cutlass.Int32(bidy % cluster_n),
+            cutlass.Int32(0),
+        )
+        # Every thread of a CTA shares one SM, so each thread derives the same
+        # home side without a branch; the claiming thread is chosen later.
+        source = self.cfg.locality_side_source
+        if source == int(LocalitySideSource.SMID_PARITY):
+            home_side = _smid() & cutlass.Int32(1)
+        elif source == int(LocalitySideSource.ZERO):
+            home_side = cutlass.Int32(0)
+        else:
+            home_side = _locality_domain_id() & cutlass.Int32(1)
+        return LocalityClcDynamicPersistentTileScheduler(
+            params,
+            cta_id_in_cluster,
+            cutlass.Int32(0),
+            self.tile_scheduler_config.response_ptr,
+            (bidx, bidy, bidz),
+            home_side=home_side,
+            # Materialize a runtime IR value because this latch is assigned
+            # under runtime control flow. A plain Int32(0) may be treated as a
+            # trace-time constant by newer DSLs.
+            home_exhausted=cutlass.Int32(cutlass.Int32(0).ir_value()),
+        )
+
+    @cute.jit
+    def initial_work_tile_info(self) -> WorkTileInfo:
+        return WorkTileInfo(
+            (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(2)),
+            cutlass.Boolean(True),
+        )
+
+    @cute.jit
+    def should_skip_work_tile(self, work_tile) -> bool:
+        return work_tile.tile_idx[2] == cutlass.Int32(2)
+
+    @cute.jit
+    def _num_active_token_clusters(self) -> cutlass.Int32:
+        if cutlass.const_expr(self.num_non_exiting_ctas_value is not None):
+            return self.num_non_exiting_ctas_value
+        view = cutlass.make_array_view(self.num_non_exiting_ctas_tensor)
+        return view.load(idx=cutlass.Int32(0), vector_size=1)[0]
+
+    @cute.jit
+    def _atomic_claim(self, side):
+        linear_idx = cutlass.Int32(0)
+        if side == cutlass.Int32(0):
+            linear_idx = cute.arch.atomic_add(
+                self.locality_counter0_tensor.iterator,
+                cutlass.Int32(1),
+                sem="relaxed",
+                scope="gpu",
+            )
+        else:
+            linear_idx = cute.arch.atomic_add(
+                self.locality_counter1_tensor.iterator,
+                cutlass.Int32(1),
+                sem="relaxed",
+                scope="gpu",
+            )
+        return linear_idx
+
+    @cute.jit
+    def _claim_tile(self):
+        assert self.tile_scheduler is not None
+        params = self.tile_scheduler.params
+        home_side = self.tile_scheduler.home_side
+        m_clusters = cutlass.Int32(params.problem_layout_ncluster_mnl.shape[0])
+        n_clusters = self._num_active_token_clusters()
+        total_clusters = m_clusters * n_clusters
+        linear_idx = total_clusters
+        if self.tile_scheduler.home_exhausted == cutlass.Int32(0):
+            linear_idx = self._atomic_claim(home_side)
+            if linear_idx >= total_clusters:
+                self.tile_scheduler.home_exhausted = cutlass.Int32(1)
+        # Derive the side without assigning to ``home_side`` under runtime
+        # control flow: the ZERO test source makes ``home_side`` a trace-time
+        # constant when `_atomic_claim` traces its side branch.
+        side = home_side ^ self.tile_scheduler.home_exhausted
+        if self.tile_scheduler.home_exhausted != cutlass.Int32(0):
+            linear_idx = self._atomic_claim(side)
+        valid = linear_idx < total_clusters
+        cluster_m = cutlass.Int32(0)
+        cluster_n = cutlass.Int32(0)
+        if cutlass.const_expr(self.cfg.raster_along_m):
+            cluster_n, cluster_m = divmod(linear_idx, m_clusters)
+        else:
+            cluster_m, cluster_n = divmod(linear_idx, n_clusters)
+        tile_m = cluster_m * cutlass.Int32(self.cfg.preferred_cluster_shape[0])
+        tile_n = cluster_n * cutlass.Int32(self.cfg.preferred_cluster_shape[1])
+        return tile_m, tile_n, side, valid, total_clusters
+
+    @cute.jit
+    def _publish_tile(self, stage_response_ptr, mbarrier_addr, packed) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        lane_idx = tidx % cutlass.Int32(32)
+        cluster_size = cutlass.Int32(
+            self.cfg.preferred_cluster_shape[0] * self.cfg.preferred_cluster_shape[1]
+        )
+        if lane_idx < cluster_size:
+            _st_async_u64x2_to_peer(
+                stage_response_ptr,
+                mbarrier_addr,
+                lane_idx,
+                packed,
+                cutlass.Int64(0),
+            )
+
+    @cute.jit
+    def _fetch_work_tile_impl(self, stage_info: StageInfo) -> None:
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        if cta_rank == cutlass.Int32(0):
+            mbarrier_addr = self.pipeline.producer_get_barrier(self.producer_state)
+            response_ptr = self._get_stage_response_ptr(stage_info.stage_idx)
+            assert self.tile_scheduler is not None
+            single_wave = (
+                self.tile_scheduler._num_tiles_executed > cutlass.Int32(0)
+            ) & (
+                cutlass.Int32(2)
+                * cutlass.Int32(
+                    self.tile_scheduler.params.problem_layout_ncluster_mnl.shape[0]
+                )
+                * self._num_active_token_clusters()
+                <= cute.arch.grid_dim()[2]
+            )
+            if single_wave:
+                self._publish_tile(response_ptr, mbarrier_addr, cutlass.Int64(0))
+            else:
+                tidx, _, _ = cute.arch.thread_idx()
+                packed_hi = cutlass.Int32(0)
+                packed_lo = cutlass.Int32(0)
+                if tidx % cutlass.Int32(32) == cutlass.Int32(0):
+                    tile_m, tile_n, side, valid, _ = self._claim_tile()
+                    packed_hi = (tile_m << 16) | tile_n
+                    packed_lo = (side << 16) | cutlass.Int32(valid)
+                packed_hi = cute.arch.shuffle_sync(packed_hi, 0)
+                packed_lo = cute.arch.shuffle_sync(packed_lo, 0)
+                packed = (cutlass.Int64(packed_hi) << 32) | (
+                    cutlass.Int64(packed_lo) & cutlass.Int64(0xFFFFFFFF)
+                )
+                self._publish_tile(response_ptr, mbarrier_addr, packed)
+        assert self.tile_scheduler is not None
+        self.tile_scheduler._num_tiles_executed += cutlass.Int32(1)
+
+    @cute.jit
+    def _work_tile_info_from_clc_response(self, response_ptr) -> WorkTileInfo:
+        tensor = cute.make_tensor(
+            cute.recast_ptr(response_ptr, dtype=cutlass.Int64),
+            cute.make_layout((2,), stride=(1,)),
+        )
+        cute.arch.fence_proxy("async.shared", space="cta")
+        packed = tensor.load().to_elements()[0]
+        assert self.tile_scheduler is not None
+        cta_m, cta_n, _ = self.tile_scheduler.cta_id_in_cluster
+        return WorkTileInfo(
+            (
+                cutlass.Int32((packed >> 48) & cutlass.Int64(0xFFFF)) + cta_m,
+                cutlass.Int32((packed >> 32) & cutlass.Int64(0xFFFF)) + cta_n,
+                cutlass.Int32((packed >> 16) & cutlass.Int64(0xFFFF)),
+            ),
+            cutlass.Boolean(packed & cutlass.Int64(1)),
+        )
 
 
 @dataclass(kw_only=True)
@@ -427,8 +721,12 @@ class ProxyClusterBarrierResource(MemoryResource):
             docs="Pipeline stage consumed by the cross-CTA proxy.",
         )
 
+    # Named rather than overriding the generic ``producer_work`` hook: newer
+    # task-scheduling runtimes reject unlabeled work, and older schedule
+    # proxies skip a named method that shadows a builtin proxy method.
+    @producer_work
     @cute.jit
-    def producer_work(self, stage_info: StageInfo) -> None:
+    def publish_smem_writes(self, stage_info: StageInfo) -> None:
         """Publish SMEM writes before the cross-CTA proxy arrive.
 
         SyncTask reaches this point only after waiting on the gather/TMA

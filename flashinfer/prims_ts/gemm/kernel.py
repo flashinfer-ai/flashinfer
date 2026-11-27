@@ -767,11 +767,14 @@ class SmemAbResource(MemoryResource):
         """
         pipe = super().create_pipeline(pipeline_config)
         layout = pipeline_config.cta_layout_vmnk
-        if layout is not None:
+        # The layout is fixed at compile time. const_expr keeps these Python
+        # conditions out of the runtime region this runs in, where PyIR rejects
+        # a guarded write (UNSUP_META_CONDITIONAL_WRITE).
+        if cutlass.const_expr(layout is not None):
             cluster_total = 1
             for d in layout:
                 cluster_total *= d
-            if cluster_total > 2:
+            if cutlass.const_expr(cluster_total > 2):
                 object.__setattr__(pipe, "consumer_mask", (1 << cluster_total) - 1)
         return pipe
 
@@ -1020,11 +1023,14 @@ class SmemSfResource(MemoryResource):
         """Same empty-barrier consumer mask as the A/B TMA pipelines."""
         pipe = super().create_pipeline(pipeline_config)
         layout = pipeline_config.cta_layout_vmnk
-        if layout is not None:
+        # The layout is fixed at compile time. const_expr keeps these Python
+        # conditions out of the runtime region this runs in, where PyIR rejects
+        # a guarded write (UNSUP_META_CONDITIONAL_WRITE).
+        if cutlass.const_expr(layout is not None):
             cluster_total = 1
             for d in layout:
                 cluster_total *= d
-            if cluster_total > 2:
+            if cutlass.const_expr(cluster_total > 2):
                 object.__setattr__(pipe, "consumer_mask", (1 << cluster_total) - 1)
         return pipe
 

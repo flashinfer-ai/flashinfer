@@ -28,7 +28,7 @@ from flashinfer.fused_moe.shared.inputs import (
     alloc_trtllm_moe_output,
 )
 from flashinfer.prims_ts.moe.partition import (
-    MoePartitionResources,
+    MoePartitionHandle,
     PartitionStrategy,
     prepared_block_major_k_bytes,
     prepared_weight_layouts,
@@ -172,7 +172,7 @@ def _prims_ts_fp8_per_tensor_scale_moe_impl(
     weight_layout: int = 0,
     fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
     fc2_per_channel_weight_scale: Optional[torch.Tensor] = None,
-    partition_resources: Optional[MoePartitionResources] = None,
+    partition_resources: Optional[MoePartitionHandle] = None,
     partition_strategy: Optional[PartitionStrategy] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""FP8 per-tensor-scaled MoE using Prims-TS on SM100/SM103/SM107.
@@ -657,7 +657,7 @@ def prims_ts_fp8_per_tensor_scale_moe_partitioned(
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    partition_resources: MoePartitionResources,
+    partition_resources: MoePartitionHandle,
     partition_strategy: PartitionStrategy,
     routed_scaling_factor: Optional[float] = None,
     use_routing_scales_on_input: bool = False,
@@ -676,7 +676,8 @@ def prims_ts_fp8_per_tensor_scale_moe_partitioned(
 
     Same computation as
     :func:`~flashinfer.fused_moe.prims_ts_fp8_per_tensor_scale_moe`, split
-    across two green-context partitions on SM107 (Rubin) only. Per-channel
+    across either two stream partitions or one locality-aware grid on SM107
+    (Rubin) only. Per-channel
     weight-scale vectors and ``gemm1_clamp_limit`` are not supported.
 
     Parameters
@@ -719,8 +720,9 @@ def prims_ts_fp8_per_tensor_scale_moe_partitioned(
         Global offset of the first local expert.
     local_num_experts : int
         Number of experts resident on this device.
-    partition_resources : MoePartitionResources
-        Caller-owned green-context streams and reusable fork/join events.
+    partition_resources : MoePartitionHandle
+        Caller-owned stream or single-kernel locality resources. A handle must
+        not be used concurrently by multiple launches or graph replays.
         Construct before CUDA graph capture and keep alive for every launch
         or replay that uses it.
     partition_strategy : PartitionStrategy
@@ -1228,7 +1230,7 @@ def _prims_ts_fp8_block_scale_moe_impl(
     gemm1_clamp_limit: Optional[torch.Tensor],
     routing_input_mode: int,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
-    partition_resources: Optional[MoePartitionResources] = None,
+    partition_resources: Optional[MoePartitionHandle] = None,
     partition_strategy: Optional[PartitionStrategy] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     if hidden_states.dtype != torch.float8_e4m3fn:
@@ -1473,7 +1475,7 @@ def prims_ts_fp8_block_scale_moe_partitioned(
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    partition_resources: MoePartitionResources,
+    partition_resources: MoePartitionHandle,
     partition_strategy: PartitionStrategy,
     routed_scaling_factor: Optional[float] = None,
     routing_method_type: int = 0,
@@ -1495,7 +1497,8 @@ def prims_ts_fp8_block_scale_moe_partitioned(
 
     Same computation as
     :func:`~flashinfer.fused_moe.prims_ts_fp8_block_scale_moe`, split across
-    two green-context partitions on SM107 (Rubin) only. DeepSeek FP8 has a
+    either two stream partitions or one locality-aware grid on SM107 (Rubin)
+    only. DeepSeek FP8 has a
     distinct activation/scale layout and is not supported by partitioned
     execution.
 
@@ -1539,8 +1542,9 @@ def prims_ts_fp8_block_scale_moe_partitioned(
         Global offset of the first local expert.
     local_num_experts : int
         Number of experts resident on this device.
-    partition_resources : MoePartitionResources
-        Caller-owned green-context streams and reusable fork/join events.
+    partition_resources : MoePartitionHandle
+        Caller-owned stream or single-kernel locality resources. A handle must
+        not be used concurrently by multiple launches or graph replays.
         Construct before CUDA graph capture and keep alive for every launch
         or replay that uses it.
     partition_strategy : PartitionStrategy

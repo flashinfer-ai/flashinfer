@@ -32,7 +32,7 @@ from flashinfer.fused_moe.shared.validation import (
     validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
 from flashinfer.prims_ts.moe.partition import (
-    MoePartitionResources,
+    MoePartitionHandle,
     PartitionStrategy,
     prepared_block_major_k_bytes,
     prepared_weight_layouts,
@@ -98,7 +98,7 @@ def prims_ts_bf16_moe_op(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
-    partition_resources: Optional[MoePartitionResources] = None,
+    partition_resources: Optional[MoePartitionHandle] = None,
     partition_strategy: Optional[PartitionStrategy] = None,
 ) -> List[torch.Tensor]:
     assert routing_logits is not None or topk_ids is not None, (
@@ -318,7 +318,7 @@ def _fake_prims_ts_bf16_moe(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
-    partition_resources: Optional[MoePartitionResources] = None,
+    partition_resources: Optional[MoePartitionHandle] = None,
     partition_strategy: Optional[PartitionStrategy] = None,
 ) -> List[torch.Tensor]:
     del (
@@ -376,7 +376,7 @@ def prims_ts_bf16_moe_partitioned(
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    partition_resources: MoePartitionResources,
+    partition_resources: MoePartitionHandle,
     partition_strategy: PartitionStrategy,
     routed_scaling_factor: Optional[float] = None,
     routing_method_type: int = 0,
@@ -396,7 +396,8 @@ def prims_ts_bf16_moe_partitioned(
     r"""Run two-way BF16 Prims-TS MoE with caller-owned shards and streams.
 
     Same computation as :func:`~flashinfer.fused_moe.prims_ts_bf16_moe`,     split
-    across two green-context partitions on SM107 (Rubin) only.
+    across either two stream partitions or one locality-aware grid on SM107
+    (Rubin) only.
 
     Parameters
     ----------
@@ -432,8 +433,9 @@ def prims_ts_bf16_moe_partitioned(
         Global offset of the first local expert.
     local_num_experts : int
         Number of experts resident on this device.
-    partition_resources : MoePartitionResources
-        Caller-owned green-context streams and reusable fork/join events.
+    partition_resources : MoePartitionHandle
+        Caller-owned stream or single-kernel locality resources. A handle must
+        not be used concurrently by multiple launches or graph replays.
         Construct before CUDA graph capture and keep alive for every launch
         or replay that uses it.
     partition_strategy : PartitionStrategy

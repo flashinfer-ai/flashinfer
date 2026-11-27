@@ -1010,6 +1010,26 @@ static void validate_fc2_input_out(Array<Tensor> const& out, TensorView const& h
       << "fc2_input_out token_scales must be float32 [>= num_tokens, top_k]";
 }
 
+static void validate_locality_counters(Optional<TensorView> const& side0,
+                                       Optional<TensorView> const& side1,
+                                       TensorView const& hidden_states) {
+  TVM_FFI_ICHECK(side0.has_value() == side1.has_value())
+      << "locality counter tensors must be both present or both absent";
+  if (!side0.has_value()) {
+    return;
+  }
+  auto const validate_side = [&](TensorView const& counters, char const* name) {
+    TVM_FFI_ICHECK_EQ(counters.dtype(), dl_int32) << name << " must have int32 dtype";
+    TVM_FFI_ICHECK_GE(counters.numel(), 64) << name << " must contain at least 64 elements";
+    TVM_FFI_ICHECK(counters.IsContiguous()) << name << " must be contiguous";
+    TVM_FFI_ICHECK_EQ(counters.device().device_type, kDLCUDA) << name << " must be a CUDA tensor";
+    TVM_FFI_ICHECK_EQ(counters.device().device_id, hidden_states.device().device_id)
+        << name << " must be on the same device as hidden_states";
+  };
+  validate_side(side0.value(), "locality_counters_side0");
+  validate_side(side1.value(), "locality_counters_side1");
+}
+
 enum class Fp8QuantizationType {
   NoneFp8,
   DeepSeekFp8,
@@ -1385,6 +1405,9 @@ class FusedMoeLauncher {
 
   // Optional routing replay output: [num_tokens, top_k] int16 tensor
   Optional<TensorView> routing_replay_out;
+  // Optional domain-local scheduler counters, one 64-int32 buffer per locality side.
+  Optional<TensorView> locality_counters_side0;
+  Optional<TensorView> locality_counters_side1;
 
   int64_t intermediate_size_factor{2};
 
@@ -1432,6 +1455,11 @@ class FusedMoeLauncher {
  public:
   void set_routing_replay_out(const Optional<TensorView>& replay_out) {
     routing_replay_out = replay_out;
+  }
+
+  void set_locality_counters(Optional<TensorView> const& side0, Optional<TensorView> const& side1) {
+    locality_counters_side0 = side0;
+    locality_counters_side1 = side1;
   }
 
   /** Carve the scratch of the next ordinary run() from a caller-owned 1-D byte buffer. */
@@ -2395,6 +2423,14 @@ class StagedMoeLauncher : public FusedMoeLauncher {
     if (routing_replay_out.has_value()) {
       replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
     }
+    int32_t* locality_counters0 =
+        locality_counters_side0.has_value()
+            ? static_cast<int32_t*>(locality_counters_side0.value().data_ptr())
+            : nullptr;
+    int32_t* locality_counters1 =
+        locality_counters_side1.has_value()
+            ? static_cast<int32_t*>(locality_counters_side1.value().data_ptr())
+            : nullptr;
     routing_runner.run(
         routing_logits_ptr, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
         args->num_fused_shared_experts, args->n_group, args->topk_group, args->local_expert_offset,
@@ -2410,7 +2446,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, routing_use_deep_seek_fp8(),
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, locality_counters0, locality_counters1);
   }
 
   Optional<Tensor> expert_weights_tensor() const { return FusedMoeLauncher::expert_weights; }
@@ -3407,7 +3443,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool enable_pdl,
     Array<int64_t> moe_tactic, int64_t activation_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Optional<TensorView> locality_counters_side0,
+    Optional<TensorView> locality_counters_side1) {
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16)
       << "Staged MoE routing (BF16): hidden_states must be bfloat16.";
   if (gemm1_weights.has_value()) {
@@ -3422,6 +3459,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing(
   if (routing_replay_out.has_value()) {
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
+  validate_locality_counters(locality_counters_side0, locality_counters_side1, hidden_states);
 
   auto const num_tokens = hidden_states.size(0);
   std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 192, 256};
@@ -3435,6 +3473,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing(
       local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type,
       use_shuffled_weight, weight_layout, tile_N, activation_type, norm_topk_prob,
       routing_replay_out);
+  launcher->set_locality_counters(locality_counters_side0, locality_counters_side1);
 
   launcher->check_routing();
   launcher->prepare_routing();
@@ -3664,7 +3703,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool enable_pdl, Array<int64_t> moe_tactic, int64_t weight_layout,
-    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Optional<TensorView> locality_counters_side0, Optional<TensorView> locality_counters_side1) {
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_uint8)
       << "Staged FP4 MoE routing: hidden_states must be packed fp4 uint8.";
   TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float8_e4m3fn)
@@ -3681,6 +3721,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
   if (routing_replay_out.has_value()) {
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
+  validate_locality_counters(locality_counters_side0, locality_counters_side1, hidden_states);
 
   auto const num_tokens = hidden_states.size(0);
   std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
@@ -3695,6 +3736,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
       n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
       routed_scaling_factor, routing_method_type, tile_N, weight_layout, activation_type,
       norm_topk_prob, routing_replay_out);
+  launcher->set_locality_counters(locality_counters_side0, locality_counters_side1);
 
   launcher->check_routing();
   launcher->prepare_routing();
@@ -3716,7 +3758,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool enable_pdl, Array<int64_t> moe_tactic, int64_t weight_layout,
-    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Optional<TensorView> locality_counters_side0, Optional<TensorView> locality_counters_side1) {
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn)
       << "Staged MXFP4xMXFP8 MoE routing: hidden_states must be float8_e4m3fn.";
   TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float8_e4m3fn)
@@ -3741,6 +3784,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
   if (routing_replay_out.has_value()) {
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
+  validate_locality_counters(locality_counters_side0, locality_counters_side1, hidden_states);
 
   auto const num_tokens = hidden_states.size(0);
   std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
@@ -3755,6 +3799,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
       n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
       routed_scaling_factor, routing_method_type, tile_N, weight_layout, activation_type,
       norm_topk_prob, routing_replay_out);
+  launcher->set_locality_counters(locality_counters_side0, locality_counters_side1);
 
   launcher->check_routing();
   launcher->prepare_routing();
@@ -3776,7 +3821,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_bf16(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool enable_pdl,
     Array<int64_t> moe_tactic, int64_t weight_layout, int64_t activation_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Optional<TensorView> locality_counters_side0,
+    Optional<TensorView> locality_counters_side1) {
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16)
       << "Staged MXFP4xBF16 MoE routing: hidden_states must be bfloat16.";
   if (gemm1_weights.has_value()) {
@@ -3799,6 +3845,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_bf16(
   if (routing_replay_out.has_value()) {
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
+  validate_locality_counters(locality_counters_side0, locality_counters_side1, hidden_states);
 
   auto const num_tokens = hidden_states.size(0);
   std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128};
@@ -3813,6 +3860,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_bf16(
       intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor,
       routing_method_type, tile_N, weight_layout, activation_type, norm_topk_prob,
       routing_replay_out);
+  launcher->set_locality_counters(locality_counters_side0, locality_counters_side1);
 
   launcher->check_routing();
   launcher->prepare_routing();
@@ -3834,7 +3882,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_per_tensor(
     Optional<double> routed_scaling_factor, int64_t routing_method_type,
     bool use_routing_scales_on_input, bool enable_pdl, Array<int64_t> moe_tactic,
     int64_t weight_layout, int64_t activation_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Optional<TensorView> locality_counters_side0,
+    Optional<TensorView> locality_counters_side1) {
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn)
       << "Staged FP8 MoE routing: hidden_states must be float8_e4m3fn.";
   if (gemm1_weights.has_value()) {
@@ -3849,6 +3898,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_per_tensor(
   if (routing_replay_out.has_value()) {
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
+  validate_locality_counters(locality_counters_side0, locality_counters_side1, hidden_states);
 
   auto const num_tokens = hidden_states.size(0);
   std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
@@ -3862,6 +3912,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_per_tensor(
       num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
       local_num_experts, routed_scaling_factor, routing_method_type, tile_N, weight_layout,
       activation_type, norm_topk_prob, routing_replay_out);
+  launcher->set_locality_counters(locality_counters_side0, locality_counters_side1);
 
   launcher->check_routing();
   launcher->prepare_routing();
@@ -3882,7 +3933,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_block_scale(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool enable_pdl,
     Array<int64_t> moe_tactic, int64_t weight_layout, int64_t activation_type,
-    int64_t fp8_quantization_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t fp8_quantization_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Optional<TensorView> locality_counters_side0, Optional<TensorView> locality_counters_side1) {
   auto const quantization_type = static_cast<Fp8QuantizationType>(fp8_quantization_type);
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn)
       << "Staged FP8 block-scale MoE routing: hidden_states must be float8_e4m3fn.";
@@ -3898,6 +3950,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_block_scale(
   if (routing_replay_out.has_value()) {
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
+  validate_locality_counters(locality_counters_side0, locality_counters_side1, hidden_states);
 
   auto const num_tokens = hidden_states.size(0);
   std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128};
@@ -3914,6 +3967,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_block_scale(
       num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
       local_num_experts, routed_scaling_factor, routing_method_type, tile_N, weight_layout,
       activation_type, quantization_type, norm_topk_prob, routing_replay_out);
+  launcher->set_locality_counters(locality_counters_side0, locality_counters_side1);
 
   launcher->check_routing();
   launcher->prepare_routing();

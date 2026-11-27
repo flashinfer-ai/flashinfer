@@ -61,7 +61,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
+                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl,
+                 int32_t* localityCounters0, int32_t* localityCounters1) {
+  FLASHINFER_CHECK((localityCounters0 == nullptr) == (localityCounters1 == nullptr),
+                   "locality counters must be both present or both absent");
+  FLASHINFER_CHECK(localityCounters0 == nullptr || numNonExitingCtas != nullptr,
+                   "locality counters require numNonExitingCtas");
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // Only the grouped DeepSeek kernel below populates the fused shared-expert
     // slots; routingCustom leaves them untouched, so reject rather than return
@@ -101,6 +106,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+    routingData.mPtrLocalityCounters[0] = localityCounters0;
+    routingData.mPtrLocalityCounters[1] = localityCounters1;
 
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
@@ -144,6 +151,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+    routingData.mPtrLocalityCounters[0] = localityCounters0;
+    routingData.mPtrLocalityCounters[1] = localityCounters1;
 
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
@@ -180,6 +189,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+    routingData.mPtrLocalityCounters[0] = localityCounters0;
+    routingData.mPtrLocalityCounters[1] = localityCounters1;
 
     // input:
     routingData.mPtrRoutingBias = routingBias;
@@ -241,6 +252,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+    routingData.mPtrLocalityCounters[0] = localityCounters0;
+    routingData.mPtrLocalityCounters[1] = localityCounters1;
 
     // input:
     // Pre-computed routing support: when expertIds is provided, use it directly
@@ -333,6 +346,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+    routingData.mPtrLocalityCounters[0] = localityCounters0;
+    routingData.mPtrLocalityCounters[1] = localityCounters1;
 
     //
     // Inputs

@@ -287,7 +287,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    writeNumNonExitingCtas(params, numNonExitingCtas);
   }
 
   for (int tokenIdx = 0; tokenIdx < params.mNumTokens; tokenIdx++) {
@@ -617,7 +617,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    writeNumNonExitingCtas(params, numNonExitingCtas);
   }
 
   // Phase 5: Permutation

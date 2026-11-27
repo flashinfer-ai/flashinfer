@@ -1,8 +1,10 @@
 """Benchmark TensorRT-LLM Gen and Prims-TS fused MoE implementations.
 
 Localized Prims-TS runs use FlashInfer's CUDAPluggableAllocator-based domain
-pools and locality-domain green-context streams. They require CUDA 13.4
-toolkit/driver support and a GPU exposing at least two locality domains.
+pools. ``--locality-execution streams`` runs each side on a locality-domain
+green-context stream and requires CUDA 13.4 toolkit/driver support;
+``single_kernel`` runs one persistent grid per GEMM and requires CUDA 13.5.
+Both need a GPU exposing at least two locality domains.
 """
 
 import argparse
@@ -54,6 +56,8 @@ from flashinfer.fused_moe.core import (
 )
 from flashinfer.autotuner import autotune, AutoTuner
 from flashinfer.prims_ts.moe.partition import (
+    MoeLocalizedKernelResources,
+    MoePartitionHandle,
     MoePartitionResources,
     MoeShardedWeights,
     PartitionStrategy,
@@ -74,6 +78,8 @@ LOCALIZATIONS = ("none", "tp_n_tp_n", "tp_n_tp_k")
 Localization = Literal["none", "tp_n_tp_n", "tp_n_tp_k"]
 LOCALITY_SM_SPLITS = ("backfill", "strict")
 LocalitySmSplit = Literal["backfill", "strict"]
+LOCALITY_EXECUTIONS = ("streams", "single_kernel")
+LocalityExecution = Literal["streams", "single_kernel"]
 
 
 @dataclass(frozen=True)
@@ -198,6 +204,7 @@ class BenchmarkSetup:
     fn: Callable
     input_kwargs: dict
     localization: Localization = "none"
+    locality_execution: Optional[LocalityExecution] = None
 
 
 @dataclass(frozen=True)
@@ -207,11 +214,12 @@ class BenchmarkResult:
     no_autotune_ms: float
     tuned_ms: float
     localization: Localization = "none"
+    locality_execution: Optional[LocalityExecution] = None
 
 
 @dataclass(frozen=True)
 class _LocalizedPartition:
-    resources: MoePartitionResources
+    resources: MoePartitionHandle
     alloc: Callable[[int, tuple[int, ...], torch.dtype], torch.Tensor]
     pointer_domain: Callable[[torch.Tensor], int]
     domain_count: int
@@ -223,9 +231,28 @@ class _LocalizedPartition:
 
 @cache
 def _localized_partition(
-    device: torch.device, sm_split: LocalitySmSplit
+    device: torch.device,
+    sm_split: LocalitySmSplit,
+    execution: LocalityExecution = "streams",
 ) -> _LocalizedPartition:
-    """Create matched compute and memory resources for two locality domains."""
+    """Create compute and memory resources for two locality domains.
+
+    Both execution modes allocate from the same process-wide domain pools, so
+    weight shards made for one mode are valid for the other.
+    """
+
+    if execution == "single_kernel":
+        resources = MoeLocalizedKernelResources(device)
+        return _LocalizedPartition(
+            resources=resources,
+            alloc=resources.pools.empty,
+            pointer_domain=resources.pools.pointer_domain,
+            domain_count=resources.pools.domain_count,
+            sm_split=sm_split,
+            sm_counts=(resources.sm_count_per_domain,) * 2,
+            remainder_sm_count=0,
+            keepalive=(resources,),
+        )
 
     from flashinfer.locality_domain import get_localized_domains
 
@@ -247,6 +274,7 @@ def _shard_for_partition(
     *,
     strategy: PartitionStrategy,
     sm_split: LocalitySmSplit,
+    execution: LocalityExecution,
     fc1_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
     hidden_size: int,
@@ -266,7 +294,7 @@ def _shard_for_partition(
         and fc1_scale.dtype != fc2_scale.dtype
     ):
         raise ValueError("FC1 and FC2 scales must use the same dtype")
-    localized = _localized_partition(fc1_weight.device, sm_split)
+    localized = _localized_partition(fc1_weight.device, sm_split, execution)
     # Return cached blocks held by the primary allocator before the localized
     # pools reserve the materialized weight shards.
     torch.cuda.empty_cache()
@@ -326,11 +354,15 @@ def _localized_setup(
     family: str,
     strategy: PartitionStrategy,
     sm_split: LocalitySmSplit,
+    executions: list[LocalityExecution],
     common_fn_kwargs: dict,
     input_kwargs: dict,
     shards: MoeShardedWeights,
-) -> BenchmarkSetup:
-    """Build one localized setup without exposing shards to buffer rotation."""
+) -> list[BenchmarkSetup]:
+    """Build one localized setup per execution mode, sharing the shards.
+
+    The shards stay out of buffer rotation.
+    """
 
     try:
         op = _LOCALIZED_OPS[(backend, family)]
@@ -354,9 +386,6 @@ def _localized_setup(
     fn_kwargs.update(
         gemm1_weights=shards.fc1,
         gemm2_weights=shards.fc2,
-        partition_resources=_localized_partition(
-            input_kwargs["hidden_states"].device, sm_split
-        ).resources,
         partition_strategy=strategy,
     )
     if shards.fc1_scale is not None:
@@ -369,13 +398,24 @@ def _localized_setup(
         for name in ("hidden_states", "hidden_states_scale")
         if name in input_kwargs
     }
-    return BenchmarkSetup(
-        batch_size=batch_size,
-        backend=backend,
-        fn=partial(op, **fn_kwargs),
-        input_kwargs=activation_kwargs,
-        localization=strategy,
-    )
+    device = input_kwargs["hidden_states"].device
+    return [
+        BenchmarkSetup(
+            batch_size=batch_size,
+            backend=backend,
+            fn=partial(
+                op,
+                **fn_kwargs,
+                partition_resources=_localized_partition(
+                    device, sm_split, execution
+                ).resources,
+            ),
+            input_kwargs=activation_kwargs,
+            localization=strategy,
+            locality_execution=execution,
+        )
+        for execution in executions
+    ]
 
 
 def _pack_topk(
@@ -420,12 +460,18 @@ def mxint4_quantize(
     ), scales.reshape(-1, sf_vec_size)
 
 
+def _localization_label(localization: str, locality_execution: Optional[str]) -> str:
+    if locality_execution is None:
+        return localization
+    return f"{localization}/{locality_execution}"
+
+
 def _print_table(results: list[BenchmarkResult], config_str: str):
     print(f"\n{config_str}")
     col0, col1, col2, col3, col4, col5, col6, col7 = (
         12,
         10,
-        12,
+        23,
         18,
         16,
         9,
@@ -457,7 +503,12 @@ def _print_table(results: list[BenchmarkResult], config_str: str):
     }
     for result in sorted(
         results,
-        key=lambda item: (item.batch_size, item.backend, item.localization),
+        key=lambda item: (
+            item.batch_size,
+            item.backend,
+            item.localization,
+            item.locality_execution or "",
+        ),
     ):
         speedup = result.no_autotune_ms / result.tuned_ms
         baseline = trtllm_tuned.get(result.batch_size)
@@ -474,7 +525,7 @@ def _print_table(results: list[BenchmarkResult], config_str: str):
         )
         print(
             f"  {result.batch_size:>{col0}}  {result.backend:>{col1}}"
-            f"  {result.localization:>{col2}}"
+            f"  {_localization_label(result.localization, result.locality_execution):>{col2}}"
             f"  {result.no_autotune_ms:>{col3}.6f}"
             f"  {result.tuned_ms:>{col4}.6f}  {speedup:>{col5}.2f}x"
             f"  {backend_ratio_str:>{col6}}"
@@ -516,7 +567,7 @@ def _run_benchmark(
     tuned_variants = set()
     tuning_buckets_tuple = None if tuning_buckets is None else tuple(tuning_buckets)
     for setup in setups:
-        variant = (setup.backend, setup.localization)
+        variant = (setup.backend, setup.localization, setup.locality_execution)
         if variant in tuned_variants:
             continue
         with autotune(
@@ -548,6 +599,7 @@ def _run_benchmark(
             no_autotune_ms=ms,
             tuned_ms=tuned_ms,
             localization=setup.localization,
+            locality_execution=setup.locality_execution,
         )
         for setup, ms, tuned_ms in zip(setups, ms_no_autotune, ms_tuned, strict=True)
     ]
@@ -582,6 +634,18 @@ def _normalize_localizations(localizations: list[str]) -> list[Localization]:
             raise ValueError(f"Unknown MoE localization mode: {localization}")
         if localization not in resolved:
             resolved.append(localization)
+    return resolved
+
+
+def _normalize_locality_executions(
+    executions: Optional[list[str]],
+) -> list[LocalityExecution]:
+    resolved: list[LocalityExecution] = []
+    for execution in executions or ["streams"]:
+        if execution not in LOCALITY_EXECUTIONS:
+            raise ValueError(f"Unknown locality execution mode: {execution}")
+        if execution not in resolved:
+            resolved.append(execution)
     return resolved
 
 
@@ -967,6 +1031,7 @@ def bench_trtllm_gen_fused_moe_autotuner_bf16(
     localizations: Optional[list[Localization]] = None,
     locality_sm_split: LocalitySmSplit = "backfill",
     enable_pdl: Optional[bool] = None,
+    locality_executions: Optional[list[LocalityExecution]] = None,
 ):
     device = torch.device("cuda:0")
     resolved_localizations = localizations or ["none"]
@@ -981,8 +1046,10 @@ def bench_trtllm_gen_fused_moe_autotuner_bf16(
         quant_mode="BF16",
         localizations=resolved_localizations,
     )
+    resolved_executions = _normalize_locality_executions(locality_executions)
     if any(localization != "none" for localization in resolved_localizations):
-        _localized_partition(device, locality_sm_split)
+        for execution in resolved_executions:
+            _localized_partition(device, locality_sm_split, execution)
     if enable_pdl is None:
         enable_pdl = device_support_pdl(device)
     tune_max = (
@@ -1013,6 +1080,7 @@ def bench_trtllm_gen_fused_moe_autotuner_bf16(
         strategy: _shard_for_partition(
             strategy=strategy,
             sm_split=locality_sm_split,
+            execution=resolved_executions[0],
             fc1_weight=gemm1_weights,
             fc2_weight=gemm2_weights,
             hidden_size=hidden_size,
@@ -1083,13 +1151,14 @@ def bench_trtllm_gen_fused_moe_autotuner_bf16(
                         )
                     )
                 elif (backend, "bf16") in _LOCALIZED_OPS:
-                    setups.append(
+                    setups.extend(
                         _localized_setup(
                             batch_size=batch_size,
                             backend=backend,
                             family="bf16",
                             strategy=localization,
                             sm_split=locality_sm_split,
+                            executions=resolved_executions,
                             common_fn_kwargs=common_fn_kwargs,
                             input_kwargs=input_kwargs,
                             shards=localized_shards[localization],
@@ -1126,6 +1195,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     localizations: Optional[list[Localization]] = None,
     locality_sm_split: LocalitySmSplit = "backfill",
     enable_pdl: Optional[bool] = None,
+    locality_executions: Optional[list[LocalityExecution]] = None,
 ):
     device = torch.device("cuda:0")
     resolved_localizations = localizations or ["none"]
@@ -1140,8 +1210,10 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         quant_mode=quant_mode,
         localizations=resolved_localizations,
     )
+    resolved_executions = _normalize_locality_executions(locality_executions)
     if any(localization != "none" for localization in resolved_localizations):
-        _localized_partition(device, locality_sm_split)
+        for execution in resolved_executions:
+            _localized_partition(device, locality_sm_split, execution)
     if enable_pdl is None:
         enable_pdl = device_support_pdl(device)
     is_gated = ActivationType(activation_type).is_gated
@@ -1252,6 +1324,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         strategy: _shard_for_partition(
             strategy=strategy,
             sm_split=locality_sm_split,
+            execution=resolved_executions[0],
             fc1_weight=localized_w13,
             fc2_weight=localized_w2,
             hidden_size=hidden_size,
@@ -1314,13 +1387,14 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                             )
                         )
                     elif (backend, "fp8_per_tensor") in _LOCALIZED_OPS:
-                        setups.append(
+                        setups.extend(
                             _localized_setup(
                                 batch_size=batch_size,
                                 backend=backend,
                                 family="fp8_per_tensor",
                                 strategy=localization,
                                 sm_split=locality_sm_split,
+                                executions=resolved_executions,
                                 common_fn_kwargs=common_fn_kwargs,
                                 input_kwargs=input_kwargs,
                                 shards=localized_shards[localization],
@@ -1397,13 +1471,14 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                         quant_mode == "MxFP8xMxFP8"
                         and (backend, "fp8_block") in _LOCALIZED_OPS
                     ):
-                        setups.append(
+                        setups.extend(
                             _localized_setup(
                                 batch_size=batch_size,
                                 backend=backend,
                                 family="fp8_block",
                                 strategy=localization,
                                 sm_split=locality_sm_split,
+                                executions=resolved_executions,
                                 common_fn_kwargs=common_fn_kwargs,
                                 input_kwargs=input_kwargs,
                                 shards=localized_shards[localization],
@@ -1449,6 +1524,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     localizations: Optional[list[Localization]] = None,
     locality_sm_split: LocalitySmSplit = "backfill",
     enable_pdl: Optional[bool] = None,
+    locality_executions: Optional[list[LocalityExecution]] = None,
 ):
     device = torch.device("cuda:0")
     resolved_localizations = localizations or ["none"]
@@ -1463,8 +1539,10 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         quant_mode=quant_mode,
         localizations=resolved_localizations,
     )
+    resolved_executions = _normalize_locality_executions(locality_executions)
     if any(localization != "none" for localization in resolved_localizations):
-        _localized_partition(device, locality_sm_split)
+        for execution in resolved_executions:
+            _localized_partition(device, locality_sm_split, execution)
     if enable_pdl is None:
         enable_pdl = device_support_pdl(device)
     tune_max = (
@@ -1591,6 +1669,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         strategy: _shard_for_partition(
             strategy=strategy,
             sm_split=locality_sm_split,
+            execution=resolved_executions[0],
             fc1_weight=shuffled["gemm1_weights"],
             fc2_weight=shuffled["gemm2_weights"],
             hidden_size=hidden_size,
@@ -1706,13 +1785,14 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
                         )
                     )
                 elif (backend, "fp4") in _LOCALIZED_OPS:
-                    setups.append(
+                    setups.extend(
                         _localized_setup(
                             batch_size=batch_size,
                             backend=backend,
                             family="fp4",
                             strategy=localization,
                             sm_split=locality_sm_split,
+                            executions=resolved_executions,
                             common_fn_kwargs=common_fn_kwargs,
                             input_kwargs=input_kwargs,
                             shards=localized_shards[localization],
@@ -1919,10 +1999,11 @@ if __name__ == "__main__":
         default=["none"],
         help=(
             "MoE localization modes. 'none' uses the ordinary backend path; "
-            "tp_n_tp_n and tp_n_tp_k use two locality-domain green contexts "
-            "with weight shards allocated in their matching domain pools. "
-            "Requires CUDA 13.4 toolkit/driver support and a GPU with at least "
-            "two locality domains. Localization is currently implemented only "
+            "tp_n_tp_n and tp_n_tp_k shard the weights into matching "
+            "locality-domain pools and run as --locality-execution selects. "
+            "Requires CUDA 13.4 toolkit/driver support (13.5 for single_kernel) "
+            "and a GPU with at least two locality domains. Localization is "
+            "currently implemented only "
             "by Prims-TS; unsupported backends run only their 'none' baseline. "
             "Localized execution rejects bias and DeepSeek Fp8-Block, but supports "
             "FP4 SwiGLU clamp and SiTU alpha/beta."
@@ -1936,6 +2017,19 @@ if __name__ == "__main__":
             "SM split for localized runs. 'backfill' (default) uses every SM "
             "and may incur stitch traffic; 'strict' uses only domain-local SMs "
             "and may leave remainder SMs idle."
+        ),
+    )
+    parser.add_argument(
+        "--locality-execution",
+        nargs="+",
+        choices=LOCALITY_EXECUTIONS,
+        default=["streams"],
+        help=(
+            "Execution modes for localized strategies. 'streams' runs each "
+            "side's GEMMs on its own green-context stream; 'single_kernel' runs "
+            "one persistent grid per GEMM on the caller stream (persistent "
+            "tactics only). Pass both to compare them in one table; both "
+            "reuse the same weight shards."
         ),
     )
     parser.add_argument(
@@ -2017,6 +2111,7 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+    locality_executions = _normalize_locality_executions(args.locality_execution)
 
     _apply_model_preset(args)
     torch.manual_seed(args.seed)
@@ -2083,6 +2178,7 @@ if __name__ == "__main__":
             cuda_graph_profile_replays=args.cuda_graph_profile_replays,
             localizations=localizations,
             locality_sm_split=args.locality_sm_split,
+            locality_executions=locality_executions,
         )
     elif is_fp8:
         results = bench_trtllm_gen_fused_moe_autotuner_fp8(
@@ -2102,6 +2198,7 @@ if __name__ == "__main__":
             cuda_graph_profile_replays=args.cuda_graph_profile_replays,
             localizations=localizations,
             locality_sm_split=args.locality_sm_split,
+            locality_executions=locality_executions,
         )
     elif is_mxint4:
         results = bench_trtllm_gen_fused_moe_autotuner_mxint4(
@@ -2144,6 +2241,7 @@ if __name__ == "__main__":
             cuda_graph_profile_replays=args.cuda_graph_profile_replays,
             localizations=localizations,
             locality_sm_split=args.locality_sm_split,
+            locality_executions=locality_executions,
         )
 
     if args.output_json is not None:
@@ -2174,6 +2272,7 @@ if __name__ == "__main__":
             _localized_partition(
                 torch.device("cuda:0"),
                 args.locality_sm_split,
+                locality_executions[0],
             )
             if has_localization
             else None
@@ -2250,6 +2349,9 @@ if __name__ == "__main__":
                 "localizations": localizations,
                 "locality_sm_split": (
                     args.locality_sm_split if has_localization else None
+                ),
+                "locality_executions": (
+                    locality_executions if has_localization else None
                 ),
             },
             "timing": {

@@ -42,7 +42,7 @@ from .batched_gemm_cga import (
     sfb_copy_uses_atom_leader,
 )
 from .mixed_cga_ts import CgaTask
-from .smem_misc_resources import BatchedGemmWorkQueue
+from .smem_misc_resources import BatchedGemmWorkQueue, LocalityBatchedGemmWorkQueue
 
 Constexpr = cutlass.Constexpr
 
@@ -85,10 +85,14 @@ def _persistent_work_tile_loop(cfg, work_queue):
     if cutlass.const_expr(cfg.use_early_exit):
         # CUDA-graph early exit over-launches token CTAs.  Use skip_if to
         # skip inactive persistent work-tile iterations while preserving the
-        # WorkQueue tail that advances CLC to the next tile.
-        return work_tile_loop(
-            work_queue, skip_if=BatchedGemmWorkQueue.should_skip_work_tile
+        # WorkQueue tail that advances CLC to the next tile.  Schedule tracing
+        # passes a resource proxy, so select the queue class from cfg.
+        queue_cls = (
+            LocalityBatchedGemmWorkQueue
+            if cfg.uses_locality_split
+            else BatchedGemmWorkQueue
         )
+        return work_tile_loop(work_queue, skip_if=queue_cls.should_skip_work_tile)
     return work_tile_loop(work_queue)
 
 
@@ -761,7 +765,7 @@ def create_sync_task(
             tma.wait()
             proxy.try_acquire()
             proxy.acquire()
-            proxy.producer_work()
+            proxy.publish_smem_writes()
             proxy.commit()
 
     captured_schedule = _call_schedule_with_optional_work_queue(

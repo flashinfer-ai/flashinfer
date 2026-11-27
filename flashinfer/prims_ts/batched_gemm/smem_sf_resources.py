@@ -67,6 +67,7 @@ class SmemSfAResource(MemoryResource):
     weight_tile_idx_view: Any = None
     weight_num_token_tiles_view: Any = None
     weight_l2_cache_hint: Any = None
+    side1_tma_sfa_desc: Any = None
     smem_buf: Any = None
     _alloc_sfa: Constexpr[Optional[SmemAllocation]] = None
     desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -126,12 +127,16 @@ class SmemSfAResource(MemoryResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def prepare_sfa_tile(self, stage_info: StageInfo) -> None:
-        self.weight_l2_cache_hint = make_weight_l2_cache_hint(
-            self.cfg.weight_l2_evict_first,
-            self.weight_tile_idx_view,
-            self.weight_num_token_tiles_view,
-            stage_info.work_tile.tile_idx[1],
-        )
+        # Without a policy the hint stays a Python None. Rebinding it per work
+        # tile would be a metadata write inside the persistent loop, which PyIR
+        # refuses once that loop also contains an unproven Python predicate.
+        if cutlass.const_expr(self.cfg.weight_l2_evict_first):
+            self.weight_l2_cache_hint = make_weight_l2_cache_hint(
+                self.cfg.weight_l2_evict_first,
+                self.weight_tile_idx_view,
+                self.weight_num_token_tiles_view,
+                stage_info.work_tile.tile_idx[1],
+            )
 
     @producer_work
     @cute.jit
@@ -152,6 +157,11 @@ class SmemSfAResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.smem_sfa_stage_stride_bytes * stage_info.stage_idx
         )
+        tma_sfa_desc = self.tma_sfa_desc
+        if cutlass.const_expr(self.cfg.uses_locality_split):
+            _, _, tile_side = stage_info.work_tile.tile_idx
+            if tile_side == Int32(1):
+                tma_sfa_desc = self.side1_tma_sfa_desc
         if prims.elect_sync():
             if cutlass.const_expr(
                 self.cfg.use_tile256_tmem_overlap
@@ -162,14 +172,14 @@ class SmemSfAResource(MemoryResource):
                 # Generated R128c4 SF TMA uses [256, 2, K/(sfBlock*4), outer/128].
                 self._tma_load(
                     stage_base,
-                    self.tma_sfa_desc,
+                    tma_sfa_desc,
                     (Int32(0), Int32(0), sfk_block, coord_sfa_mn),
                     stage_info.barrier,
                 )
             else:
                 self._tma_load(
                     stage_base,
-                    self.tma_sfa_desc,
+                    tma_sfa_desc,
                     (Int32(0), sfk_block, coord_sfa_mn),
                     stage_info.barrier,
                 )
@@ -271,6 +281,7 @@ class SmemSfBResource(MemoryResource):
 
     cfg: Constexpr[BatchedGemmConfig]
     tma_sfb_desc: Any = None
+    side1_tma_sfb_desc: Any = None
     smem_buf: Any = None
     _alloc_sfb: Constexpr[Optional[SmemAllocation]] = None
     desc_b_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -346,12 +357,17 @@ class SmemSfBResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.smem_sfb_stage_stride_bytes * stage_info.stage_idx
         )
+        tma_sfb_desc = self.tma_sfb_desc
+        if cutlass.const_expr(self.cfg.splits_activation_operands):
+            _, _, tile_side = stage_info.work_tile.tile_idx
+            if tile_side == Int32(1):
+                tma_sfb_desc = self.side1_tma_sfb_desc
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_split_r128c4_sfb_tma_desc):
                 outer_tile = coord_sfb_mn * Int32((self.cfg.tile_n + 127) // 128)
                 self._tma_load(
                     stage_base,
-                    self.tma_sfb_desc,
+                    tma_sfb_desc,
                     (Int32(0), Int32(0), sfk_block, outer_tile),
                     stage_info.barrier,
                 )
@@ -359,14 +375,14 @@ class SmemSfBResource(MemoryResource):
                 outer_tile = coord_sfb_mn * Int32((self.cfg.tile_n + 7) // 8)
                 self._tma_load(
                     stage_base,
-                    self.tma_sfb_desc,
+                    tma_sfb_desc,
                     (Int32(0), sfk_block, outer_tile),
                     stage_info.barrier,
                 )
             else:
                 self._tma_load(
                     stage_base,
-                    self.tma_sfb_desc,
+                    tma_sfb_desc,
                     (Int32(0), sfk_block, coord_sfb_mn),
                     stage_info.barrier,
                 )
@@ -875,72 +891,21 @@ class SmemSfLdgstsResource(MemoryResource):
         """LDGSTS cp.async wait-group depth."""
         return max(0, self.producer_commit_prefetch_depth - 1)
 
-    def _tail_cp_async_wait_group_depth(
-        self, stage_info: StageInfo, prefetch_idx: int
-    ) -> int:
-        """Return the tail drain depth for the groups actually prefetched.
+    def _tail_cp_async_wait_group_depth(self, prefetch_idx: int) -> int:
+        """Return the cp.async groups that may stay in flight at a tail drain.
 
         ``prefetch_idx`` is the per-section ordinal of the enclosing ``drain_tail``
         work call, threaded in by the work method from its constexpr work arg.
+
+        Tail work runs after the K-tile loop, so its ``StageInfo`` carries no
+        loop bounds.  None are needed: kernel construction uses
+        ``_resolved_ldgsts_sfb_producer_commit_prefetch_depth`` to require a
+        host-known K whenever the prefetch window could otherwise exceed the
+        K-tile count.  The head therefore issued every one of its
+        ``producer_commit_prefetch_depth`` groups, and each tail drain retires
+        exactly one more.
         """
-        if isinstance(stage_info.loop_end, int):
-            active_prefetch = min(
-                stage_info.loop_end,
-                self.producer_commit_prefetch_depth,
-            )
-            return max(0, active_prefetch - 1 - prefetch_idx)
         return max(0, self.cp_async_wait_group_depth - prefetch_idx)
-
-    @cute.jit
-    def _tail_cp_async_wait_group(
-        self, stage_info: StageInfo, prefetch_idx: int
-    ) -> None:
-        """Drain only the cp.async groups that exist for this runtime K depth.
-
-        ``prefetch_idx`` is the per-section ordinal of the enclosing ``drain_tail``
-        work call, threaded in by the work method from its constexpr work arg.
-        """
-        if isinstance(stage_info.loop_end, int):
-            depth = self._tail_cp_async_wait_group_depth(stage_info, prefetch_idx)
-            if cutlass.const_expr(depth == 0):
-                cute.arch.cp_async_wait_group(0)
-            elif cutlass.const_expr(depth == 1):
-                cute.arch.cp_async_wait_group(1)
-            else:
-                cute.arch.cp_async_wait_group(2)
-        else:
-            # cp.async.wait_group takes an immediate.  For runtime K depths
-            # shorter than the prefetch window, branch to the matching static
-            # wait depth instead of using the maximum-depth tail sequence.
-            # `__post_init__` rejects producer_commit_prefetch_depth >
-            # MAX_PRODUCER_COMMIT_PREFETCH_DEPTH (== 3), so
-            # cp_async_wait_group_depth is always in {0, 1, 2} below.
-            if cutlass.const_expr(self.cp_async_wait_group_depth == 0):
-                cute.arch.cp_async_wait_group(0)
-            elif cutlass.const_expr(self.cp_async_wait_group_depth == 1):
-                if cutlass.const_expr(prefetch_idx > 0):
-                    cute.arch.cp_async_wait_group(0)
-                else:
-                    if stage_info.loop_end <= cutlass.Int32(1):
-                        cute.arch.cp_async_wait_group(0)
-                    else:
-                        cute.arch.cp_async_wait_group(1)
-            else:
-                # cp_async_wait_group_depth == 2
-                if cutlass.const_expr(prefetch_idx == 0):
-                    if stage_info.loop_end <= cutlass.Int32(1):
-                        cute.arch.cp_async_wait_group(0)
-                    elif stage_info.loop_end <= cutlass.Int32(2):
-                        cute.arch.cp_async_wait_group(1)
-                    else:
-                        cute.arch.cp_async_wait_group(2)
-                elif cutlass.const_expr(prefetch_idx == 1):
-                    if stage_info.loop_end <= cutlass.Int32(2):
-                        cute.arch.cp_async_wait_group(0)
-                    else:
-                        cute.arch.cp_async_wait_group(1)
-                else:
-                    cute.arch.cp_async_wait_group(0)
 
     def __post_init__(self):
         if self.producer_commit_prefetch_depth < 0:
@@ -948,9 +913,8 @@ class SmemSfLdgstsResource(MemoryResource):
                 "producer_commit_prefetch_depth must be non-negative, "
                 f"got {self.producer_commit_prefetch_depth}."
             )
-        # The dynamic-`loop_end` path in `_tail_cp_async_wait_group` only
-        # hand-rolls cp_async_wait_group_depth in {0, 1, 2}; keep this in
-        # lockstep with MAX_PRODUCER_COMMIT_PREFETCH_DEPTH so the chain
+        # `drain_loop` hand-rolls cp_async_wait_group_depth in {0, 1, 2}; keep
+        # this in lockstep with MAX_PRODUCER_COMMIT_PREFETCH_DEPTH so the chain
         # stays exhaustive.
         if self.producer_commit_prefetch_depth > MAX_PRODUCER_COMMIT_PREFETCH_DEPTH:
             raise ValueError(
@@ -1260,11 +1224,14 @@ class SmemSfLdgstsResource(MemoryResource):
         self, stage_info: StageInfo, *, prefetch_idx: cutlass.Constexpr[int]
     ) -> None:
         """Drain producer cp.async work before producer_commit (tail phase)."""
+        del stage_info
         if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             if cutlass.const_expr(self.uses_async_load_pipeline):
                 pass
             else:
-                self._tail_cp_async_wait_group(stage_info, prefetch_idx)
+                cute.arch.cp_async_wait_group(
+                    self._tail_cp_async_wait_group_depth(prefetch_idx)
+                )
                 prims.fence_proxy_async_release_sync_restrict()
         else:
             cute.arch.fence_view_async_shared()
