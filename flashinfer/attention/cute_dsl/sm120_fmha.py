@@ -31,6 +31,23 @@ Causal kernels use load-balanced scheduling by default. Set
 ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1`` before planning or launching to
 disable it.
 
+Large logits
+------------
+The softmax of every head dimension takes the row max ``m`` of the unscaled
+logits and subtracts it after scaling in FP32. The signed rounding error of that
+subtraction, up to about ``x * 2^-23`` with ``x = |m| * scale * log2(e)``,
+shifts the exponent of every weight in the row. Weights are pre-scaled by 256
+and stored as FP8 E4M3 (finite up to 448) for the P @ V MMA, while the FP32 row
+sum uses the unclipped weights, so a weight pushed above 448 biases ``O`` low.
+The sign of the error matters, not only ``x``: with one key, a logit of
+``+75,497,472`` (every Q/K component 384 at ``D = 512``, ``sm_scale = 1``)
+pre-scales the weight to 2048 and gives ``O = 0.219``, while ``-75,497,472``
+gives 32 and no saturation. In the measured positive-logit, one-key cases with
+``V = 1``, ``x = 1.7e6``, ``2.7e7`` and ``1.1e8`` gave ``O`` of about ``0.969``,
+``0.965`` and ``0.219`` for ``D = 128``, ``256`` and ``512``. The ``sm_scale``
+upper bound only keeps the largest weight from underflowing to zero; it does not
+prevent this.
+
 Optional dependency
 -------------------
 Requires ``nvidia-cutlass-dsl>=4.7.0`` and ``cutlass.experimental``. The
@@ -39,6 +56,7 @@ version is checked only when the SM120 backend is used.
 
 import math
 import os
+import struct
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from types import SimpleNamespace
@@ -89,8 +107,97 @@ def _check_sm120(device: torch.device) -> None:
         )
 
 
-def _use_balanced_scheduler(is_causal: bool) -> bool:
-    return is_causal and os.environ.get("PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING") != "1"
+_CUDA_MAX_GRID_Y = 65535
+_CUDA_MAX_GRID_Z = 65535
+
+
+def _use_balanced_scheduler(
+    is_causal: bool,
+    *,
+    max_seqlen_q: Optional[int] = None,
+    q_tile: Optional[int] = None,
+    gqa_pack_size: int = 1,
+) -> bool:
+    if not is_causal or os.environ.get("PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING") == "1":
+        return False
+    if max_seqlen_q is not None and q_tile is not None:
+        q_tile_tokens = q_tile // gqa_pack_size
+        if ceil_div(max_seqlen_q, q_tile_tokens) > _CUDA_MAX_GRID_Y:
+            return False
+    return True
+
+
+def _resolve_balanced_scheduler(
+    balanced_scheduler: Optional[bool],
+    is_causal: bool,
+    *,
+    max_seqlen_q: int,
+    q_tile: int,
+    num_qo_heads: int,
+    gqa_pack_size: int = 1,
+) -> bool:
+    """Return the scheduler flag, defaulting to the environment, and check ``grid.y``."""
+    if balanced_scheduler is None:
+        balanced_scheduler = _use_balanced_scheduler(
+            is_causal,
+            max_seqlen_q=max_seqlen_q,
+            q_tile=q_tile,
+            gqa_pack_size=gqa_pack_size,
+        )
+    # The balanced grid puts Q tiles on grid.y; the unbalanced grid puts head groups there.
+    if balanced_scheduler:
+        grid_y = ceil_div(max_seqlen_q, q_tile // gqa_pack_size)
+    else:
+        grid_y = num_qo_heads // gqa_pack_size
+    if grid_y > _CUDA_MAX_GRID_Y:
+        raise ValueError(
+            f"launch grid.y ({grid_y}) exceeds CUDA's grid.y limit of {_CUDA_MAX_GRID_Y}"
+        )
+    return balanced_scheduler
+
+
+def _max_scale_log2(head_dim: int) -> float:
+    """Largest supported ``sm_scale * log2(e)`` for FP8 E4M3 inputs at ``head_dim``.
+
+    The softmax takes the row max of the unscaled logits and subtracts it after scaling in
+    FP32. Rounding shifts every exponent in the row by up to ``|max logit| * scale * 2^-23``.
+    With the largest FP8 logit, ``448^2 * head_dim``, this bound keeps that shift at most 64,
+    well inside FP32's ``exp2`` range, so the largest weight cannot underflow to zero and
+    silently zero the output. It does not prevent FP8 P saturation; see "Large logits" in
+    the module docstring.
+    """
+    return 2.0**29 / (448.0**2 * head_dim)
+
+
+def _scale_log2(sm_scale: float, head_dim: int) -> float:
+    """Return ``sm_scale * log2(e)`` rounded to FP32, the scale the kernel receives.
+
+    It must be positive: the online softmax takes the row max of the unscaled logits, which
+    is the max of the scaled logits only for a positive scale, and a zero scale turns masked
+    -inf logits into NaN. The check runs after FP32 rounding, so scales that underflow to
+    zero are rejected; positive subnormals are kept. See ``_max_scale_log2`` for the bound.
+    """
+    max_scale = _max_scale_log2(head_dim) / math.log2(math.e)
+    try:
+        value = struct.unpack(
+            "f", struct.pack("f", float(sm_scale) * math.log2(math.e))
+        )[0]
+    except OverflowError:
+        value = math.inf
+    if not (0.0 < value <= _max_scale_log2(head_dim)):
+        raise ValueError(
+            "the effective softmax scale (sm_scale, times q_scale * k_scale in the "
+            "batch-prefill wrappers) must be positive in FP32 and at most "
+            f"{max_scale:.4g} for head_dim={head_dim}; got {sm_scale!r}"
+        )
+    return value
+
+
+def _select_tile_sizes(head_dim: int) -> tuple[int, int]:
+    """Return default ``(q_tile, kv_tile)`` for the given head dimension."""
+    if head_dim == 512:
+        return (64, 64)
+    return (128, 128)
 
 
 def _validate_sm120_prims_plan_options(
@@ -219,11 +326,18 @@ def _validate_hnd_paged_pool(name: str, pool: torch.Tensor) -> None:
     if (
         tuple(pool.stride()[1:]) != expected_inner_strides
         or pool.stride(0) < min_page_stride
+        or (pool.stride(0) * pool.element_size()) % 16 != 0
     ):
         raise ValueError(
             f"{name} must use HND storage with compact [Hkv, page_size, D] "
-            "planes; a standalone pool or a K/V plane view from a combined "
-            f"cache is supported, got strides {pool.stride()}"
+            "planes and 16-byte aligned page stride; a standalone pool or a "
+            f"K/V plane view from a combined cache is supported, got strides "
+            f"{pool.stride()}"
+        )
+    if pool.data_ptr() % 16 != 0:
+        raise ValueError(
+            f"{name} base address must be 16-byte aligned, got "
+            f"data_ptr={pool.data_ptr():#x}"
         )
 
 
@@ -243,6 +357,7 @@ def sm120_fmha_fp8_ragged_prefill(
     v_scale: Optional[float] = None,
     enable_pdl: bool = False,
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
+    balanced_scheduler: Optional[bool] = None,
 ) -> None:
     """Run SM120 FP8 FMHA on packed contiguous ragged Q/K/V.
 
@@ -264,13 +379,19 @@ def sm120_fmha_fp8_ragged_prefill(
         Runtime launch-grid bound. Derived from ``cu_seqlens_q`` when omitted.
     is_causal : bool
         Bottom-right aligned causal mask. Causal kernels use balanced
-        scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1``.
+        scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1`` or the
+        Q-tile count exceeds CUDA's ``grid.y`` limit (65,535).
     sm_scale : float, optional
-        Softmax scale. Defaults to ``1 / sqrt(D)``.
+        Softmax scale. ``sm_scale * log2(e)`` must be positive in FP32 (subnormals
+        allowed) and at most ``2^29 / (448^2 * D)`` (``sm_scale`` <= 3.62 for ``D=512``).
+        Defaults to ``1 / sqrt(D)``. Very large scaled logits can lose accuracy; see
+        "Large logits" in the module docstring.
     kv_tile : int, optional
-        K/V tile size (64 or 128). Defaults to 128.
+        K/V tile size (64 or 128). Defaults to 64 for ``D=512`` and 128 for
+        other supported head dimensions.
     q_tile : int, optional
-        Q tile size (64 or 128). Defaults to 128.
+        Q tile size (64 or 128). Defaults to 64 for ``D=512`` and 128 for
+        other supported head dimensions.
     lse : torch.Tensor, optional
         Preallocated float32 log2 LSE output, shape ``(total_q, Hq)``.
     v_scale : float, optional
@@ -289,7 +410,10 @@ def sm120_fmha_fp8_ragged_prefill(
         be finite and non-negative; this content contract is not checked to
         avoid a device-to-host synchronization. ``None`` selects the dense
         specialization; every supplied value, including zero, selects the
-        skip-enabled specialization.
+        skip-enabled specialization. Not supported for ``head_dim=512``.
+    balanced_scheduler : bool, optional
+        Override the causal scheduler choice described under ``is_causal``.
+        ``None`` derives it from the environment and ``max_seqlen_q``.
     Raises
     ------
     RuntimeError
@@ -309,9 +433,18 @@ def sm120_fmha_fp8_ragged_prefill(
     _validate_lse(q, lse)
 
     batch_size = cu_seqlens_q.numel() - 1
-    threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, batch_size)
+    if batch_size > _CUDA_MAX_GRID_Z:
+        raise ValueError(
+            f"batch_size ({batch_size}) exceeds CUDA's grid.z limit of "
+            f"{_CUDA_MAX_GRID_Z}"
+        )
 
     _, Hq, D = q.shape
+    if D == 512 and skip_softmax_threshold is not None:
+        raise NotImplementedError(
+            "SM120 FP8 FMHA does not support skip_softmax_threshold for head_dim=512"
+        )
+    threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, batch_size)
     _, Hkv, D_k = k.shape
     if D_k != D:
         raise ValueError(f"head_dim mismatch: q={D}, k={D_k}")
@@ -319,10 +452,14 @@ def sm120_fmha_fp8_ragged_prefill(
         raise ValueError(
             f"k and v must have the same shape, got {k.shape} and {v.shape}"
         )
-    # CUDA tensor maps cannot describe a zero-extent K/V tensor. Handle the
-    # all-empty ragged batch before TMA descriptor construction; requests with
-    # empty K/V inside a non-empty batch still use the kernel's empty-KV path.
-    if k.shape[0] == 0:
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+    scale_log2 = Float32(_scale_log2(sm_scale, D))
+    # CUDA tensor maps cannot describe a zero-extent tensor and CUDA rejects an
+    # empty grid. Handle an empty batch, zero total Q tokens, or all-empty K/V
+    # before TMA descriptor construction; requests with empty K/V inside a
+    # non-empty batch still use the kernel's empty-KV path.
+    if batch_size == 0 or q.shape[0] == 0 or k.shape[0] == 0:
         o.zero_()
         if lse is not None:
             lse.fill_(-float("inf"))
@@ -332,13 +469,18 @@ def sm120_fmha_fp8_ragged_prefill(
     if max_seqlen_q is None:
         max_seqlen_q = int((cu_seqlens_q_i32[1:] - cu_seqlens_q_i32[:-1]).max().item())
 
-    kv_tile = kv_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES[0]
-    q_tile = q_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES[0]
-    if (
-        q_tile not in SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES
-        or kv_tile not in SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES
-        or D not in SM120FusedMultiHeadAttentionFP8ForwardTMA.SUPPORTED_HEAD_TILES
-        or Hq % Hkv != 0
+    default_q_tile, default_kv_tile = _select_tile_sizes(D)
+    kv_tile = kv_tile or default_kv_tile
+    q_tile = q_tile or default_q_tile
+    in_ct = _cutlass_dtype(q.dtype)
+    out_ct = _cutlass_dtype(o.dtype)
+    if not SM120FusedMultiHeadAttentionFP8ForwardTMA._can_implement(
+        in_ct,
+        out_ct,
+        q_shape=(batch_size, 1, Hq, D),
+        k_shape=(batch_size, 1, Hkv, D),
+        kv_tile=kv_tile,
+        q_tile=q_tile,
     ):
         raise RuntimeError(
             f"SM120 FP8 FMHA cannot implement config: "
@@ -357,13 +499,16 @@ def sm120_fmha_fp8_ragged_prefill(
         q_tile=q_tile,
         device=q.device,
         with_lse=lse is not None,
-        balanced_scheduler=_use_balanced_scheduler(is_causal),
+        balanced_scheduler=_resolve_balanced_scheduler(
+            balanced_scheduler,
+            is_causal,
+            max_seqlen_q=max_seqlen_q,
+            q_tile=q_tile,
+            num_qo_heads=Hq,
+        ),
         enable_skip_softmax=threshold is not None,
     )
 
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-    scale_log2 = Float32(sm_scale * math.log2(math.e))
     output_scale = Float32(1.0 if v_scale is None else float(v_scale))
 
     kernel_fn(
@@ -409,6 +554,7 @@ def sm120_fmha_fp8_paged_prefill(
     skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     kv_tile_ranges: Optional[torch.Tensor] = None,
     gqa_pack_size: int = 1,
+    balanced_scheduler: Optional[bool] = None,
 ) -> None:
     """Run SM120 FP8 FMHA prefill with paged K/V cache.
 
@@ -443,15 +589,21 @@ def sm120_fmha_fp8_paged_prefill(
         Runtime cumulative Q sequence offsets, shape ``(B+1,)`` int32.
     is_causal : bool
         Bottom-right aligned causal mask. Causal kernels use balanced
-        scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1``.
+        scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1`` or the
+        Q-tile count exceeds CUDA's ``grid.y`` limit (65,535).
     sm_scale : float, optional
-        Softmax scale. Defaults to ``1 / sqrt(D)``.
+        Softmax scale. ``sm_scale * log2(e)`` must be positive in FP32 (subnormals
+        allowed) and at most ``2^29 / (448^2 * D)`` (``sm_scale`` <= 3.62 for ``D=512``).
+        Defaults to ``1 / sqrt(D)``. Very large scaled logits can lose accuracy; see
+        "Large logits" in the module docstring.
     max_seqlen_q : int, optional
         Runtime launch-grid bound. Derived from ``cu_seqlens_q`` if omitted.
     kv_tile : int, optional
-        K/V tile size (64 or 128).  Auto-selected if ``None``.
+        K/V tile size (64 or 128). Auto-selected if ``None`` (64 for
+        ``D=512``, 128 otherwise).
     q_tile : int, optional
-        Q tile size (64 or 128).  Auto-selected if ``None``.
+        Q tile size (64 or 128). Auto-selected if ``None`` (64 for ``D=512``,
+        128 otherwise).
     lse : torch.Tensor, optional
         Preallocated float32 log2 LSE output, shape ``(total_q, Hq)``.
     v_scale : float, optional
@@ -470,13 +622,16 @@ def sm120_fmha_fp8_paged_prefill(
         be finite and non-negative; this content contract is not checked to
         avoid a device-to-host synchronization. ``None`` selects the dense
         specialization; every supplied value, including zero, selects the
-        skip-enabled specialization.
+        skip-enabled specialization. Not supported for ``head_dim=512``.
     kv_tile_ranges : torch.Tensor, optional
         Split KV: int32 ``(num_chunks * B, 2)`` K/V tile ranges ``[begin, end)``, row ``c * B + r`` for chunk
         ``c`` of request ``r``. ``o``/``lse`` then hold row ``p * num_chunks + c`` for chunk ``c`` of token
         ``p``, the layout ``merge_states`` reads.
     gqa_pack_size : int
         Q heads sharing one K/V head packed into each Q tile. Must divide ``Hq // Hkv`` and ``q_tile``.
+    balanced_scheduler : bool, optional
+        Override the causal scheduler choice described under ``is_causal``.
+        ``None`` derives it from the environment and ``max_seqlen_q``.
     Raises
     ------
     RuntimeError
@@ -496,6 +651,10 @@ def sm120_fmha_fp8_paged_prefill(
 
     assert q.ndim == 3, f"q must be packed (total_q, Hq, D), got {q.shape}"
     _, Hq, D = q.shape
+    if D == 512 and skip_softmax_threshold is not None:
+        raise NotImplementedError(
+            "SM120 FP8 paged FMHA does not support skip_softmax_threshold for head_dim=512"
+        )
 
     _validate_hnd_paged_pool("k_pool", k_pool)
     _validate_hnd_paged_pool("v_pool", v_pool)
@@ -515,19 +674,45 @@ def sm120_fmha_fp8_paged_prefill(
         f"block_tables must be (B, max_pages), got {block_tables.shape}"
     )
     B = block_tables.shape[0]
+    if cu_seqlens_q.numel() != B + 1 or seqlens_kv.numel() != B:
+        raise ValueError(
+            f"block_tables has {B} rows, so cu_seqlens_q must have {B + 1} entries "
+            f"and seqlens_kv {B}; got {cu_seqlens_q.numel()} and {seqlens_kv.numel()}"
+        )
     threshold = _prepare_skip_softmax_threshold(skip_softmax_threshold, q, B)
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+    scale_log2 = Float32(_scale_log2(sm_scale, D))
+    if B == 0:
+        o.zero_()
+        if lse is not None:
+            lse.fill_(-float("inf"))
+        return
     num_chunks = 1 if kv_tile_ranges is None else kv_tile_ranges.shape[0] // B
-    if kv_tile_ranges is not None and tuple(kv_tile_ranges.shape) != (
-        num_chunks * B,
-        2,
+    if kv_tile_ranges is not None and (
+        num_chunks < 1 or tuple(kv_tile_ranges.shape) != (num_chunks * B, 2)
     ):
         raise ValueError(
-            f"kv_tile_ranges must have shape (num_chunks * {B}, 2), got {tuple(kv_tile_ranges.shape)}"
+            f"kv_tile_ranges must have shape (num_chunks * {B}, 2) with num_chunks >= 1, "
+            f"got {tuple(kv_tile_ranges.shape)}"
+        )
+    num_items = num_chunks * B
+    if num_items > _CUDA_MAX_GRID_Z:
+        raise ValueError(
+            f"paged launch grid.z ({num_items}) exceeds CUDA's grid.z limit of "
+            f"{_CUDA_MAX_GRID_Z}"
         )
     if o.shape[0] != q.shape[0] * num_chunks:
         raise ValueError(
             f"o must have {num_chunks} row(s) per Q token, got {o.shape[0]} rows for {q.shape[0]} tokens"
         )
+    # CUDA rejects an empty grid and TMA descriptors need a nonzero page count. A pool
+    # without pages holds no K/V, so every row (or partial row) is empty.
+    if q.shape[0] == 0 or k_pool.shape[0] == 0:
+        o.zero_()
+        if lse is not None:
+            lse.fill_(-float("inf"))
+        return
 
     in_ct = _cutlass_dtype(q.dtype)
     out_ct = _cutlass_dtype(o.dtype)
@@ -536,8 +721,9 @@ def sm120_fmha_fp8_paged_prefill(
     cu_seqlens_q_i32 = cu_seqlens_q.to(torch.int32)
     if max_seqlen_q is None:
         max_seqlen_q = int((cu_seqlens_q_i32[1:] - cu_seqlens_q_i32[:-1]).max().item())
-    kv_tile = kv_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_KV_TILES[0]
-    q_tile = q_tile or SM120FusedMultiHeadAttentionFP8ForwardTMA.SEQ_Q_TILES[0]
+    default_q_tile, default_kv_tile = _select_tile_sizes(D)
+    kv_tile = kv_tile or default_kv_tile
+    q_tile = q_tile or default_q_tile
 
     # Only structural properties are checked here. Runtime lengths are bounded
     # by cu_seqlens_q, seqlens_kv, and block_tables capacity.
@@ -573,15 +759,19 @@ def sm120_fmha_fp8_paged_prefill(
         num_tokens_per_page=page_size,
         device=q.device,
         with_lse=lse is not None,
-        balanced_scheduler=_use_balanced_scheduler(is_causal),
+        balanced_scheduler=_resolve_balanced_scheduler(
+            balanced_scheduler,
+            is_causal,
+            max_seqlen_q=max_seqlen_q,
+            q_tile=q_tile,
+            num_qo_heads=Hq,
+            gqa_pack_size=gqa_pack_size,
+        ),
         enable_skip_softmax=threshold is not None,
         **({"with_kv_tile_ranges": True} if kv_tile_ranges is not None else {}),
         **({"gqa_pack_size": gqa_pack_size} if gqa_pack_size > 1 else {}),
     )
 
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-    scale_log2 = Float32(sm_scale * math.log2(math.e))
     output_scale = Float32(1.0 if v_scale is None else float(v_scale))
 
     # TVM-FFI ABI (env stream):
@@ -618,6 +808,7 @@ def _paged_kv_split_bounds(
     fixed_split_tokens: int,
     max_chunks: int,
     gqa_pack_size: int = 1,
+    q_tile: Optional[int] = None,
 ) -> Optional[list]:
     """K/V tile bounds per request and chunk, or ``None`` to run unsplit.
 
@@ -626,6 +817,10 @@ def _paged_kv_split_bounds(
     estimated time in K/V tiles: the larger of the longest CTAs' waves and the total CTA work spread over
     ``num_ctas_per_wave`` SMs.
     """
+    if not q_lens:
+        return None
+    batch_size = len(q_lens)
+    max_grid_chunks = _CUDA_MAX_GRID_Z // batch_size
     overhead = 4  # Fixed cost of one CTA (Q load, epilogue, merge share), in K/V tiles.
     kv_tiles = [ceil_div(kv, tile) for kv in kv_lens]
     visible = [
@@ -634,13 +829,21 @@ def _paged_kv_split_bounds(
     ]
     if fixed_split_tokens > 0:
         step = ceil_div(fixed_split_tokens, tile)
+        # Lazy ranges: count the chunks before materializing any cut list.
         cuts = [
-            list(range(step, min(v, t - 1) + 1, step))
+            range(step, min(v, t - 1) + 1, step)
             for t, v in zip(kv_tiles, visible, strict=True)
         ]
         num_chunks = max(len(c) for c in cuts) + 1
         if num_chunks < 2:
             return None
+        if num_chunks > max_grid_chunks:
+            raise ValueError(
+                f"fixed_split_size produces {num_chunks} K/V chunks across "
+                f"{batch_size} requests ({num_chunks * batch_size} range rows), "
+                f"exceeding CUDA's grid.z limit of {_CUDA_MAX_GRID_Z}; "
+                "increase fixed_split_size"
+            )
         if num_chunks > max_chunks:
             raise ValueError(
                 f"fixed_split_size needs {num_chunks} K/V chunks, but the float workspace buffer holds "
@@ -651,10 +854,10 @@ def _paged_kv_split_bounds(
             [0, *c, t] + [t] * (num_chunks - 1 - len(c))
             for c, t in zip(cuts, kv_tiles, strict=True)
         ]
-    max_chunks = min([128, max_chunks] + [v + 1 for v in visible])
+    max_chunks = min([128, max_chunks, max_grid_chunks] + [v + 1 for v in visible])
     if max_chunks < 2:
         return None
-    q_tile_tokens = tile // gqa_pack_size
+    q_tile_tokens = (tile if q_tile is None else q_tile) // gqa_pack_size
     ctas = [
         ceil_div(q, q_tile_tokens) * (num_qo_heads // gqa_pack_size) for q in q_lens
     ]
@@ -715,6 +918,9 @@ class SM120PrimsBatchPrefillBackend:
     Host-derived metadata and the base kernel are prepared in ``plan_*``.
     Runtime LSE specializations are compiled lazily and cached before dispatch.
     PDL is a runtime launch option shared by every compiled kernel.
+    ``run_*`` folds ``q_scale * k_scale`` into ``sm_scale``; the effective scale
+    must satisfy the ``sm_scale`` range of the prefill functions, or ``run_*``
+    raises ``ValueError``.
     """
 
     _FP8_DTYPES = (torch.float8_e4m3fn,)
@@ -725,6 +931,7 @@ class SM120PrimsBatchPrefillBackend:
         self.device = torch.device(device)
         self._split_buffers: dict = {}
         self._gqa_pack_size = 1
+        self._balanced_scheduler = False
         self._mode: Optional[str] = None
         self._compiled_lse_variants: set[bool] = set()
 
@@ -767,10 +974,10 @@ class SM120PrimsBatchPrefillBackend:
                 "backend='cute-dsl-prims' requires output dtype float16 or "
                 f"bfloat16; got {o_dtype}"
             )
-        if head_dim_qk != head_dim_vo or head_dim_qk not in (32, 64, 128, 256):
+        if head_dim_qk != head_dim_vo or head_dim_qk not in (32, 64, 128, 256, 512):
             raise ValueError(
                 "backend='cute-dsl-prims' requires equal QK/VO head dimensions "
-                f"in {{32, 64, 128, 256}}; got {head_dim_qk}/{head_dim_vo}"
+                f"in {{32, 64, 128, 256, 512}}; got {head_dim_qk}/{head_dim_vo}"
             )
         if num_kv_heads <= 0 or num_qo_heads % num_kv_heads != 0:
             raise ValueError(
@@ -810,6 +1017,11 @@ class SM120PrimsBatchPrefillBackend:
         )
         q_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
         kv_lens = kv_indptr_host[1:] - kv_indptr_host[:-1]
+        if int(q_lens.numel()) > _CUDA_MAX_GRID_Z:
+            raise ValueError(
+                f"backend='cute-dsl-prims' batch_size ({int(q_lens.numel())}) "
+                f"exceeds CUDA's grid.z limit of {_CUDA_MAX_GRID_Z}"
+            )
         if causal and bool(torch.any(q_lens > kv_lens)):
             raise ValueError(
                 "backend='cute-dsl-prims' causal attention requires q_len <= "
@@ -818,7 +1030,7 @@ class SM120PrimsBatchPrefillBackend:
         self._mode = "ragged"
         self._qo_indptr = qo_indptr
         self._kv_indptr = kv_indptr
-        self._max_seqlen_q = int(q_lens.max().item())
+        self._max_seqlen_q = int(q_lens.max().item()) if q_lens.numel() else 0
         self._q_dtype = q_dtype
         self._kv_dtype = kv_dtype
         self._o_dtype = o_dtype
@@ -828,6 +1040,16 @@ class SM120PrimsBatchPrefillBackend:
         self._causal = causal
         self._sm_scale = sm_scale
         self._page_size: Optional[int] = None
+        q_tile, kv_tile = _select_tile_sizes(head_dim_qk)
+        self._q_tile = q_tile
+        self._kv_tile = kv_tile
+        self._balanced_scheduler = _resolve_balanced_scheduler(
+            None,
+            causal,
+            max_seqlen_q=self._max_seqlen_q,
+            q_tile=q_tile,
+            num_qo_heads=num_qo_heads,
+        )
         compile_sm120_fmha_fp8_ragged_kernel(
             in_dtype=q_dtype,
             out_dtype=o_dtype,
@@ -835,11 +1057,11 @@ class SM120PrimsBatchPrefillBackend:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
             is_causal=causal,
-            kv_tile=128,
-            q_tile=128,
+            kv_tile=kv_tile,
+            q_tile=q_tile,
             device=self.device,
             with_lse=False,
-            balanced_scheduler=_use_balanced_scheduler(causal),
+            balanced_scheduler=self._balanced_scheduler,
             enable_skip_softmax=False,
         )
         self._compiled_lse_variants = {False}
@@ -880,12 +1102,24 @@ class SM120PrimsBatchPrefillBackend:
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
         )
-        if page_size not in (16, 32, 64, 128):
+        if page_size not in (1, 16, 32, 64, 128):
             raise ValueError(
                 "backend='cute-dsl-prims' supports page_size in "
-                f"{{16, 32, 64, 128}}; got {page_size}"
+                f"{{1, 16, 32, 64, 128}}; got {page_size}"
             )
         q_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
+        if int(q_lens.numel()) > _CUDA_MAX_GRID_Z:
+            raise ValueError(
+                f"backend='cute-dsl-prims' batch_size ({int(q_lens.numel())}) "
+                f"exceeds CUDA's grid.z limit of {_CUDA_MAX_GRID_Z}"
+            )
+        batch_size = q_lens.numel()
+        if block_tables.shape[0] != batch_size or seqlens_kv_host.numel() != batch_size:
+            raise ValueError(
+                f"backend='cute-dsl-prims' expected {batch_size} block_tables rows "
+                f"and seqlens_kv entries; got {block_tables.shape[0]} and "
+                f"{seqlens_kv_host.numel()}"
+            )
         if causal and bool(torch.any(q_lens > seqlens_kv_host)):
             raise ValueError(
                 "backend='cute-dsl-prims' causal attention requires q_len <= "
@@ -895,7 +1129,7 @@ class SM120PrimsBatchPrefillBackend:
         self._qo_indptr = qo_indptr
         self._seqlens_kv = seqlens_kv
         self._block_tables = block_tables
-        self._max_seqlen_q = int(q_lens.max().item())
+        self._max_seqlen_q = int(q_lens.max().item()) if q_lens.numel() else 0
         self._q_dtype = q_dtype
         self._kv_dtype = kv_dtype
         self._o_dtype = o_dtype
@@ -905,7 +1139,18 @@ class SM120PrimsBatchPrefillBackend:
         self._causal = causal
         self._sm_scale = sm_scale
         self._page_size = page_size
-        self._gqa_pack_size = _gqa_pack_size(num_qo_heads, num_kv_heads, 128)
+        q_tile, kv_tile = _select_tile_sizes(head_dim_qk)
+        self._q_tile = q_tile
+        self._kv_tile = kv_tile
+        self._gqa_pack_size = _gqa_pack_size(num_qo_heads, num_kv_heads, q_tile)
+        self._balanced_scheduler = _resolve_balanced_scheduler(
+            None,
+            causal,
+            max_seqlen_q=self._max_seqlen_q,
+            q_tile=q_tile,
+            num_qo_heads=num_qo_heads,
+            gqa_pack_size=self._gqa_pack_size,
+        )
         compile_sm120_fmha_fp8_paged_kernel(
             in_dtype=q_dtype,
             out_dtype=o_dtype,
@@ -913,12 +1158,12 @@ class SM120PrimsBatchPrefillBackend:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
             is_causal=causal,
-            kv_tile=128,
-            q_tile=128,
+            kv_tile=kv_tile,
+            q_tile=q_tile,
             num_tokens_per_page=page_size,
             device=self.device,
             with_lse=False,
-            balanced_scheduler=_use_balanced_scheduler(causal),
+            balanced_scheduler=self._balanced_scheduler,
             enable_skip_softmax=False,
             **self._pack_kwargs(),
         )
@@ -948,22 +1193,30 @@ class SM120PrimsBatchPrefillBackend:
         use_cuda_graph: bool,
     ) -> int:
         """Float workspace bytes the paged plan's K/V split needs; 0 when it does not split."""
-        if disable_split_kv or use_cuda_graph or head_dim < 64:
+        batch_size = qo_indptr_host.numel() - 1
+        if batch_size > _CUDA_MAX_GRID_Z:
+            raise ValueError(
+                f"backend='cute-dsl-prims' batch_size ({batch_size}) "
+                f"exceeds CUDA's grid.z limit of {_CUDA_MAX_GRID_Z}"
+            )
+        total_q = int(qo_indptr_host[-1].item()) if batch_size > 0 else 0
+        if disable_split_kv or use_cuda_graph or head_dim < 64 or total_q == 0:
             return 0
+        q_tile, kv_tile = _select_tile_sizes(head_dim)
         bounds = _paged_kv_split_bounds(
             (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist(),
             seqlens_kv_host.tolist(),
             num_qo_heads,
             causal,
-            128,
+            kv_tile,
             torch.cuda.get_device_properties(self.device).multi_processor_count,
             fixed_split_size * page_size if fixed_split_size > 0 else 0,
             1 << 30,
-            _gqa_pack_size(num_qo_heads, num_kv_heads, 128),
+            _gqa_pack_size(num_qo_heads, num_kv_heads, q_tile),
+            q_tile=q_tile,
         )
         if bounds is None:
             return 0
-        total_q = int(qo_indptr_host[-1].item())
         return _kv_split_scratch(
             total_q, num_qo_heads, head_dim, o_dtype, len(bounds[0]) - 1
         )[1]
@@ -984,18 +1237,19 @@ class SM120PrimsBatchPrefillBackend:
         )
 
         self._kv_split = None
-        # merge_states needs head_dim >= 64.
+        total_q = int(qo_indptr_host[-1].item()) if qo_indptr_host.numel() > 1 else 0
+        # merge_states needs head_dim >= 64; zero Q tokens leave nothing to split.
         if (
             disable_split_kv
             or use_cuda_graph
             or self._head_dim < 64
             or float_workspace_buffer is None
+            or total_q == 0
         ):
             return
-        tile = 128
+        q_tile, tile = _select_tile_sizes(self._head_dim)
         q_lens = (qo_indptr_host[1:] - qo_indptr_host[:-1]).tolist()
         kv_lens = seqlens_kv_host.tolist()
-        total_q = int(qo_indptr_host[-1].item())
         heads, dim = self._num_qo_heads, self._head_dim
         # Per chunk: one partial O row and one LSE row per Q token; plus the merged LSE.
         chunk_bytes = total_q * heads * (dim * self._o_dtype.itemsize + 4)
@@ -1020,6 +1274,7 @@ class SM120PrimsBatchPrefillBackend:
             fixed_split_size * self._page_size if fixed_split_size > 0 else 0,
             max_chunks,
             self._gqa_pack_size,
+            q_tile=q_tile,
         )
         if bounds is None:
             return
@@ -1062,11 +1317,11 @@ class SM120PrimsBatchPrefillBackend:
             head_dim=self._head_dim,
             is_causal=self._causal,
             kv_tile=tile,
-            q_tile=128,
+            q_tile=q_tile,
             num_tokens_per_page=self._page_size,
             device=self.device,
             with_lse=True,
-            balanced_scheduler=_use_balanced_scheduler(self._causal),
+            balanced_scheduler=self._balanced_scheduler,
             enable_skip_softmax=False,
             with_kv_tile_ranges=True,
             **self._pack_kwargs(),
@@ -1134,6 +1389,7 @@ class SM120PrimsBatchPrefillBackend:
             compile_sm120_fmha_fp8_ragged_kernel,
         )
 
+        q_tile, kv_tile = _select_tile_sizes(self._head_dim)
         if self._mode == "ragged":
             compile_sm120_fmha_fp8_ragged_kernel(
                 in_dtype=self._q_dtype,
@@ -1142,11 +1398,11 @@ class SM120PrimsBatchPrefillBackend:
                 num_kv_heads=self._num_kv_heads,
                 head_dim=self._head_dim,
                 is_causal=self._causal,
-                kv_tile=128,
-                q_tile=128,
+                kv_tile=kv_tile,
+                q_tile=q_tile,
                 device=self.device,
                 with_lse=with_lse,
-                balanced_scheduler=_use_balanced_scheduler(self._causal),
+                balanced_scheduler=self._balanced_scheduler,
                 enable_skip_softmax=False,
             )
         else:
@@ -1157,12 +1413,12 @@ class SM120PrimsBatchPrefillBackend:
                 num_kv_heads=self._num_kv_heads,
                 head_dim=self._head_dim,
                 is_causal=self._causal,
-                kv_tile=128,
-                q_tile=128,
+                kv_tile=kv_tile,
+                q_tile=q_tile,
                 num_tokens_per_page=self._page_size,
                 device=self.device,
                 with_lse=with_lse,
-                balanced_scheduler=_use_balanced_scheduler(self._causal),
+                balanced_scheduler=self._balanced_scheduler,
                 enable_skip_softmax=False,
                 **self._pack_kwargs(),
             )
@@ -1206,6 +1462,7 @@ class SM120PrimsBatchPrefillBackend:
             v_scale=scale_v,
             lse=lse,
             enable_pdl=enable_pdl,
+            balanced_scheduler=self._balanced_scheduler,
         )
 
     def run_paged(
@@ -1263,6 +1520,7 @@ class SM120PrimsBatchPrefillBackend:
                 enable_pdl=enable_pdl,
                 kv_tile_ranges=split.kv_tile_ranges,
                 gqa_pack_size=self._gqa_pack_size,
+                balanced_scheduler=self._balanced_scheduler,
             )
             rows, n = split.total_q, split.num_chunks
             get_cascade_module().merge_states(
@@ -1289,6 +1547,7 @@ class SM120PrimsBatchPrefillBackend:
             lse=lse,
             enable_pdl=enable_pdl,
             gqa_pack_size=self._gqa_pack_size,
+            balanced_scheduler=self._balanced_scheduler,
         )
         if return_lse:
             return out, lse

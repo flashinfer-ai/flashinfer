@@ -42,6 +42,13 @@ def _validate_balanced_scheduler(is_causal: bool, balanced_scheduler: bool) -> N
         raise ValueError("balanced_scheduler=True requires is_causal=True")
 
 
+def _validate_skip_softmax(head_dim: int, enable_skip_softmax: bool) -> None:
+    if enable_skip_softmax and head_dim == 512:
+        raise NotImplementedError(
+            "enable_skip_softmax=True is not supported for head_dim=512"
+        )
+
+
 def _compile_sm120_fmha_fp8_ragged_kernel(
     in_dtype: torch.dtype,
     out_dtype: torch.dtype,
@@ -59,6 +66,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
     """Compile one sequence-length-independent packed ragged kernel."""
 
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
+    _validate_skip_softmax(head_dim, enable_skip_softmax)
 
     from .fmha_prefill_fp8_tma import SM120FusedMultiHeadAttentionFP8ForwardTMA
 
@@ -163,6 +171,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
+    _validate_skip_softmax(head_dim, enable_skip_softmax)
 
     from .fmha_prefill_fp8_tma import SM120FusedMultiHeadAttentionFP8ForwardTMA
 
@@ -316,6 +325,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
     enable_skip_softmax: bool = False,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
+    _validate_skip_softmax(head_dim, enable_skip_softmax)
 
     from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
@@ -369,6 +379,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     gqa_pack_size: int = 1,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
+    _validate_skip_softmax(head_dim, enable_skip_softmax)
 
     from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 

@@ -3332,7 +3332,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             to select cuDNN for a new graph after planning FA2.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
-            CUTLASS primitives.
+            CUTLASS primitives. Its effective softmax scale, ``sm_scale * q_scale * k_scale``,
+            must be positive in FP32 and at most ``2^29 / (448^2 * head_dim) / log2(e)``
+            (3.62 for ``head_dim=512``); ``run`` raises ``ValueError`` otherwise. The bound
+            keeps the largest softmax weight from underflowing; very large scaled logits
+            can still lose accuracy (see ``flashinfer.attention.cute_dsl.sm120_fmha``).
 
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
@@ -4279,8 +4283,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         batch_size = len(qo_indptr) - 1
         total_num_rows = int(qo_indptr_host[-1])
+        # Only cute-dsl-prims plans an empty batch; other backends fail as before.
+        empty_prims_batch = batch_size == 0 and self._prims_backend is not None
         if max_token_per_sequence is not None:
             max_q_len = max_token_per_sequence
+        elif empty_prims_batch:
+            max_q_len = 0
         else:
             max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
 
@@ -4291,7 +4299,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
                 )
             )
-            max_kv_len = kv_lens_arr_host.max().item()
+            max_kv_len = 0 if empty_prims_batch else kv_lens_arr_host.max().item()
         else:
             max_kv_len = max_sequence_kv
 
@@ -4677,7 +4685,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             _validate_sm120_prims_plan_options(
                 kv_layout=self._kv_layout,
-                required_kv_layout="HND",
+                required_kv_layout=(
+                    self._kv_layout
+                    if page_size == 1 and self._kv_layout in ("HND", "NHD")
+                    else "HND"
+                ),
                 custom_mask=custom_mask,
                 packed_custom_mask=packed_custom_mask,
                 pos_encoding_mode=pos_encoding_mode,
@@ -4689,7 +4701,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
             )
-            if block_tables is None:
+            if block_tables is None and empty_prims_batch:
+                block_tables = torch.empty(
+                    (0, 0), dtype=torch.int32, device=self.device
+                )
+            elif block_tables is None:
                 block_tables = _build_block_tables_from_paged_kv_indices(
                     paged_kv_indptr_host,
                     self._paged_kv_indices_buf,
@@ -5438,13 +5454,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "backend='cute-dsl-prims' requires HND K/V pools with shape "
                     "[num_pages, num_kv_heads, page_size, head_dim]"
                 )
+            assert self._prims_backend is not None
+            if self._kv_layout == "NHD" and self._prims_backend._page_size == 1:
+                if k_cache.shape[1] != 1:
+                    raise ValueError(
+                        "backend='cute-dsl-prims' with kv_layout='NHD' and "
+                        "page_size=1 requires K/V pools with shape "
+                        "[num_pages, 1, num_kv_heads, head_dim]; got "
+                        f"{tuple(k_cache.shape)}"
+                    )
+                k_cache = k_cache.squeeze(1).unsqueeze(2)
+                v_cache = v_cache.squeeze(1).unsqueeze(2)
             if out is None:
                 out = torch.empty(
                     q.shape,
                     dtype=self._cached_o_data_type,
                     device=q.device,
                 )
-            assert self._prims_backend is not None
             lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
             res = self._prims_backend.run_paged(
                 q,
@@ -6132,7 +6158,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-rubin`` is an explicit SM107-only E4M3 prefill backend
             with ``head_dim_qk=192``, ``head_dim_vo=128`` and BF16 output.
-            ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
+            ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend. Its
+            effective softmax scale, ``sm_scale * q_scale * k_scale``, must be positive in
+            FP32 and at most ``2^29 / (448^2 * head_dim) / log2(e)`` (3.62 for
+            ``head_dim=512``); ``run`` raises ``ValueError`` otherwise. The bound keeps
+            the largest softmax weight from underflowing; very large scaled logits can
+            still lose accuracy (see ``flashinfer.attention.cute_dsl.sm120_fmha``).
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
             opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
 
@@ -6920,6 +6951,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # Infer only missing operands. Auto and the other providers still need
         # actual prefix differences and maxima for admission or scheduling.
         explicit_cudnn = self._requested_backend == "cudnn"
+        # Only cute-dsl-prims plans an empty batch; other backends fail as before.
+        empty_prims_batch = batch_size == 0 and self._prims_backend is not None
         qo_len_arr = (
             qo_indptr_host.diff(dim=0)
             if not explicit_cudnn
@@ -6935,12 +6968,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_qo_len = (
             max_token_per_sequence
             if explicit_cudnn and max_token_per_sequence is not None
-            else int(qo_len_arr.max().item())
+            else (0 if empty_prims_batch else int(qo_len_arr.max().item()))
         )
         max_seq_in_batch = (
             max_sequence_kv
             if explicit_cudnn and max_sequence_kv is not None
-            else int(kv_len_arr.max().item())
+            else (0 if empty_prims_batch else int(kv_len_arr.max().item()))
         )
 
         if self._backend == "cute-dsl-rubin":

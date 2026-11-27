@@ -225,8 +225,12 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
                                   DTypeO* __restrict__ v_merged, float* __restrict__ s_merged,
                                   uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t pos = blockIdx.x;
-  uint32_t head_idx = ty;
+  // 64-bit so element offsets do not wrap once V exceeds 2^32 elements.
+  size_t pos = blockIdx.x;
+  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
+  if (head_idx >= num_heads) {
+    return;
+  }
 
   if (num_index_sets == 0) {
     vec_t<DTypeO, vec_size> v;
@@ -289,7 +293,8 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
                                                    float* __restrict__ s_merged,
                                                    uint32_t num_index_sets, uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t pos = blockIdx.x;
+  // 64-bit so element offsets do not wrap once V exceeds 2^32 elements.
+  size_t pos = blockIdx.x;
   uint32_t head_idx = blockIdx.y;
   state_t<vec_size> st;
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
@@ -648,10 +653,14 @@ template <typename DTypeIn, typename DTypeO>
 cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
                         uint32_t num_index_sets, uint32_t seq_len, uint32_t num_heads,
                         uint32_t head_dim, cudaStream_t stream = nullptr) {
+  if (seq_len == 0 || num_heads == 0) {
+    return cudaSuccess;
+  }
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    if (num_index_sets >= seq_len) {
+    // The large-index-set kernel puts heads on grid.y, so it needs num_heads <= 65535.
+    if (num_index_sets >= seq_len && num_heads <= 65535) {
       constexpr uint32_t num_threads = 128;
       constexpr uint32_t bdy = num_threads / bdx;
       dim3 nblks(seq_len, num_heads);
@@ -666,8 +675,12 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     } else {
-      uint32_t bdy = num_heads;
-      dim3 nblks(seq_len);
+      // Split heads across grid.y once bdx * num_heads exceeds the 1024-thread block limit.
+      uint32_t bdy = std::min(num_heads, 1024U / bdx);
+      dim3 nblks(seq_len, ceil_div(num_heads, bdy));
+      if (nblks.y > 65535) {
+        return cudaErrorInvalidValue;  // Head tiles exceed CUDA's grid.y limit.
+      }
       dim3 nthrs(bdx, bdy);
       auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeO>;
       void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
