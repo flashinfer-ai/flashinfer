@@ -13,6 +13,7 @@
 #   bash tests/moe_ep/run_tests.sh mega_sm90_nvfp4 # 4-GPU Hopper NVFP4 accuracy + graph replay
 #   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
+#   bash tests/moe_ep/run_tests.sh mega_sm103_nvlink_one_sided # Blackwell (B300 / B200) W4A8 NVLinkOneSided MegaMoE: staging on one GPU, then EP2, EP4 and (8 GPUs) EP8
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
 #   bash tests/moe_ep/run_tests.sh qualify_bi    # strict MegaMoE BI + Lean + EP2/4/8; rejects skips
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
@@ -141,6 +142,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_nvfp4_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_nvlink_one_sided_megamoe_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_tables.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_eplb.py \
@@ -461,6 +463,59 @@ run_mega_sm107() {
     -m "gpu_2 and arch_rubin"
 }
 
+# Blackwell sm103_mxfp8_mxfp4_bf16_nvlink_one_sided MoEEpLayer tests against the
+# Torch oracle, once per EP size in NPROC_SM103_NVLINK_ONE_SIDED (each needs that many
+# SM103 or SM100 GPUs of GPU 0's architecture). The default is "2 4", plus 8
+# when eight such GPUs are visible: the Kimi-K3 cases, SiTU's included, run at EP8 only.
+# CUTE_DSL_ARCH must name GPU 0's target (sm_103a on B300, sm_100a on B200)
+# before cutlass is first imported, which already happens while pytest loads
+# the conftests.
+sm103_gpu_count() {
+  "${PY}" -c '
+import torch
+
+first = torch.cuda.get_device_capability(0)
+print(
+    sum(torch.cuda.get_device_capability(d) == first for d in range(torch.cuda.device_count()))
+    if first in ((10, 0), (10, 3))
+    else 0
+)
+' 2>/dev/null || echo 0
+}
+
+sm103_nvlink_one_sided_cute_dsl_arch() {
+  "${PY}" -c '
+import torch
+
+major, minor = torch.cuda.get_device_capability(0)
+print(f"sm_{major}{minor}a")
+' 2>/dev/null || echo sm_103a
+}
+
+run_mega_sm103_nvlink_one_sided() {
+  local rc=0
+  local nproc
+  local sizes="${NPROC_SM103_NVLINK_ONE_SIDED:-}"
+  if [[ -z "${sizes}" ]]; then
+    sizes="2 4"
+    if (( $(sm103_gpu_count) >= 8 )); then
+      sizes="2 4 8"
+    fi
+  fi
+  local arch
+  arch="$(sm103_nvlink_one_sided_cute_dsl_arch)"
+  echo "sm103 nvlink_one_sided mega: EP sizes ${sizes}, ${arch}"
+  # The one-launch staging against the Torch staging, on one GPU.
+  CUTE_DSL_ARCH="${arch}" "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_nvlink_one_sided_megamoe_staging.py -v || rc=1
+  for nproc in ${sizes}; do
+    CUTE_DSL_ARCH="${arch}" "${TORCHRUN}" --standalone --nproc_per_node="${nproc}" -m pytest \
+      "${MOE_EP_PYTEST_FLAGS[@]}" \
+      tests/moe_ep/test_moe_ep_nvlink_one_sided_megamoe_multirank.py -v || rc=1
+  done
+  return "${rc}"
+}
+
 # 2-GPU Hopper push-style FP8 (sm90_fp8_fp8_bf16_push_cuda) kernel + backend.
 # Own target rather than folded into `multirank` (upstream PR #4069 runs it
 # there): on non-Hopper nodes the arch-marked files collect 0 tests and
@@ -635,13 +690,14 @@ case "${1:-all}" in
   mega_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_mxfp4; print_summary ;;
   mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
   mega_sm107) run_section "sm107 block-scaled mega multirank (Rubin)" run_mega_sm107; print_summary ;;
+  mega_sm103_nvlink_one_sided) run_section "sm103_mxfp8_mxfp4_bf16_nvlink_one_sided mega multirank (Blackwell)" run_mega_sm103_nvlink_one_sided; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   sm90_bf16_push_cake) run_section "sm90_bf16_bf16_bf16_push_cake native BF16 backend (2 Hopper GPUs)" run_sm90_bf16_push_cake; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|qualify_bi|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|qualify_bi|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|mega_sm103_nvlink_one_sided|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

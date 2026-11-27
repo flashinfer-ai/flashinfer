@@ -27,6 +27,7 @@ kernels/
 └── flashinfer/
     ├── bf16_nvfp4/
     ├── bf16_rank_major/
+    ├── mxfp8_mxfp4_nvlink_one_sided/
     ├── push_style_megamoe/
     ├── sm120_split/
     └── sm120_swapab/
@@ -43,6 +44,8 @@ SM in an architecture family; each backend checks its supported capabilities.
 
 For SM100, the registered backend selects the following implementation. Paths
 in the last two columns are relative to `shims/sm100/` and `kernels/`.
+The SM103 MXFP8/MXFP4 NVLinkOneSided backend, which also admits SM100
+devices, is listed with them.
 
 | Implementation | Adapter | Kernel source |
 |---|---|---|
@@ -51,6 +54,7 @@ in the last two columns are relative to `shims/sm100/` and `kernels/`.
 | BF16/BF16 and BF16/MXFP8 | `cutedsl_megamoe/pre_unification/` | `cutedsl_megamoe/pre_unification/moe_{bf16,mxfp8_bf16}_glu/` |
 | BF16/NVFP4 | Backend calls the implementation's frontend | `flashinfer/bf16_nvfp4/` |
 | BF16 rank-major CUDA | Backend calls the implementation's session | `flashinfer/bf16_rank_major/` |
+| MXFP8/MXFP4 NVLinkOneSided (`sm103_mxfp8_mxfp4_bf16_nvlink_one_sided`) | Backend calls the implementation's frontend | `flashinfer/mxfp8_mxfp4_nvlink_one_sided/` |
 | Kimi K3 | `kimi_k3/` | `kimi_k3/` |
 | DeepGEMM | Backend calls the installed package | Installed `deep_gemm` package |
 

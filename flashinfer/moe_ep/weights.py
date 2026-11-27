@@ -154,6 +154,38 @@ class PrequantizedMoEWeights(MoEWeightPack):
     shared_expert: Optional[MoEWeightPack] = field(default=None, kw_only=True)
 
 
+@dataclass(frozen=True)
+class PrequantizedMoEWeightsWithSharedExpert(PrequantizedMoEWeights):
+    """Pre-quantized routed experts plus one MXFP8 (E4M3) shared expert.
+
+    The routed fields are those of :class:`PrequantizedMoEWeights`. The shared
+    expert is one per rank, identical on every rank, with intermediate width
+    ``Is``:
+
+    * ``shared_w13``: E4M3 ``[2 * Is, hidden]``, the gate rows then the up rows
+      (``float8_e4m3fn`` or raw ``uint8`` bytes);
+    * ``shared_w2``: E4M3 ``[hidden, Is]``;
+    * ``shared_w13_scale``: UE8M0 ``[2 * Is, hidden // 32]`` (``float8_e8m0fnu``
+      or raw ``uint8`` exponent bytes), one scale per 32 values along K;
+    * ``shared_w2_scale``: UE8M0 ``[hidden, Is // 32]``.
+
+    Backends that run the shared expert inside their MoE kernel take it from
+    here (``shared_expert="fp8_in_kernel"`` in their config) and add its output
+    to the routed experts' sum.
+    """
+
+    shared_w13: torch.Tensor
+    shared_w2: torch.Tensor
+    shared_w13_scale: torch.Tensor
+    shared_w2_scale: torch.Tensor
+
+    def __new__(cls, *args, **kwargs):
+        # MoEWeightPack.__new__ has the fixed four-tensor signature and would
+        # reject the shared_* keywords; this variant constructs directly and its
+        # dataclass __init__ checks the field set.
+        return object.__new__(cls)
+
+
 def dummy_moe_weights(
     *,
     num_local_experts: int,

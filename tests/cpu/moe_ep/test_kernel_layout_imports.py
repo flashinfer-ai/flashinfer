@@ -70,6 +70,11 @@ import pytest
             "session",
             "BlackwellBf16RankMajorSession",
         ),
+        (
+            "kernels.flashinfer.mxfp8_mxfp4_nvlink_one_sided.frontend",
+            "genphase",
+            "Sm100GenphaseMoeConfig",
+        ),
     ],
 )
 def test_canonical_adapter_import(package, child, symbol):
