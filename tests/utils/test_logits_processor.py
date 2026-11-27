@@ -892,5 +892,29 @@ class TestLogitsPipeVsSamplingOps:
         assert torch.all(samples_pipe == samples_direct)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("vocab_size", [2, 3])
+@pytest.mark.parametrize("compile", [False, True])
+@pytest.mark.parametrize("with_softmax", [False, True])
+def test_temperature_per_batch_tensor(dtype, vocab_size, compile, with_softmax):
+    # A square input otherwise silently applies per-row temperatures to columns.
+    logits = torch.arange(1, vocab_size + 1, device="cuda", dtype=dtype).repeat(2, 1)
+    temperature = torch.tensor([0.25, 2.0], device="cuda", dtype=dtype)
+    processors = [Temperature()]
+    expected = logits.double() / temperature.double()[:, None]
+    if with_softmax:
+        processors.append(Softmax())
+        expected = torch.softmax(expected, dim=-1)
+
+    actual = LogitsPipe(processors, compile=compile)(logits, temperature=temperature)
+
+    torch.testing.assert_close(
+        actual.double(),
+        expected,
+        atol=8 * torch.finfo(dtype).eps,
+        rtol=8 * torch.finfo(dtype).eps,
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
