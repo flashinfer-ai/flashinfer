@@ -4107,7 +4107,7 @@ class MoEConfig:
         if s == 0:
             return
 
-        if self.backend.candidates and all(
+        if self.backend.candidates and any(
             isinstance(b, ColonelsBf16Config) for b in self.backend
         ):
             return
