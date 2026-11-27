@@ -394,8 +394,8 @@ class MoELayer:
                 f"runners: [{mvp}].{hint}{reasons}"
             )
 
-        # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
-        # routing input mode).  See the MoELayer reuse contract (CR4): the
+        # Cross-backend winner cache, keyed by token-count bucket, activation
+        # width, routing mode, and eligible candidates. See the reuse contract (CR4): the
         # fastest backend can differ across token-count buckets, so each bucket
         # caches its own winner; the mode qualifier keeps a winner tuned for
         # one routing input style (e.g. pre-routed → CuteDSL) from being
@@ -416,7 +416,8 @@ class MoELayer:
 
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
-        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+        per ``(token-count bucket, activation width, mode, eligible candidates)``
+        so repeated calls skip reselection.
         Candidate pools containing Frost low-latency use exact token counts
         because their bounded tactics need not cover every row in a bucket.
 
@@ -461,7 +462,7 @@ class MoELayer:
             bucket = act_pack.num_tokens
         # Candidate positions distinguish different options for the same backend
         # and prevent changing weight views or shape eligibility from reusing a winner.
-        winner_key = (bucket, mode, eligible)
+        winner_key = (bucket, act_pack.hidden_states_q.shape[1], mode, eligible)
         winner = self._winners.get(winner_key)
         if winner is None:
             runners = [self.runners[index] for index in eligible]
