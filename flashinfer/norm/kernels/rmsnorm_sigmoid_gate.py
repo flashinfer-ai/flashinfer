@@ -405,20 +405,19 @@ def rmsnorm_sigmoid_gate(
     tiles = (rows + rows_per_cta - 1) // rows_per_cta
     sm_version = get_sm_version(x.device)
     # 16-CTA clusters are non-portable; some SM12x parts reject them.
-    with torch.cuda.device(x.device):  # max_cluster_n probes the current device
+    with torch.cuda.device(x.device):  # probe, compile and launch for x's device
         cluster = min(cluster, tiles, max_cluster_n(sm_version))
-
-    compiled = _get_compiled(
-        x.shape[1],
-        x.stride(0),
-        gate.stride(0),
-        lanes,
-        warps,
-        cluster,
-        enable_pdl,
-        sm_version,
-    )
-    compiled(x, gate, x, eps)
+        compiled = _get_compiled(
+            x.shape[1],
+            x.stride(0),
+            gate.stride(0),
+            lanes,
+            warps,
+            cluster,
+            enable_pdl,
+            sm_version,
+        )
+        compiled(x, gate, x, eps)
 
 
 def supports_rmsnorm_sigmoid_gate(

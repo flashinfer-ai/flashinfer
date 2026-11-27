@@ -427,29 +427,30 @@ def run(
         raise ValueError("router_input must be aligned contiguous FP32 like branch")
     if branch.shape[0] == 0:
         return
-    fn = _get_compiled(
-        float(post_eps),
-        float(next_eps),
-        float(next_gain_center),
-        post_weight is not None,
-        float(post_gain_center) if post_weight is not None else 0.0,
-        0 if alpha_scalar is None else 1 if alpha_scalar == 1.0 else 2,
-        enable_pdl,
-        router_input is not None,
-        get_sm_version(branch.device),
-    )
-    fn(
-        branch,
-        residual,
-        alpha.unsqueeze(0),
-        beta.unsqueeze(0),
-        next_weight.unsqueeze(0),
-        residual_out,
-        ffn_input,
-        (post_weight if post_weight is not None else next_weight).unsqueeze(0),
-        router_input if router_input is not None else residual_out,
-        1.0 if alpha_scalar is None else float(alpha_scalar),
-    )
+    with torch.cuda.device(branch.device):
+        fn = _get_compiled(
+            float(post_eps),
+            float(next_eps),
+            float(next_gain_center),
+            post_weight is not None,
+            float(post_gain_center) if post_weight is not None else 0.0,
+            0 if alpha_scalar is None else 1 if alpha_scalar == 1.0 else 2,
+            enable_pdl,
+            router_input is not None,
+            get_sm_version(branch.device),
+        )
+        fn(
+            branch,
+            residual,
+            alpha.unsqueeze(0),
+            beta.unsqueeze(0),
+            next_weight.unsqueeze(0),
+            residual_out,
+            ffn_input,
+            (post_weight if post_weight is not None else next_weight).unsqueeze(0),
+            router_input if router_input is not None else residual_out,
+            1.0 if alpha_scalar is None else float(alpha_scalar),
+        )
 
 
 def gated_residual_next_rmsnorm(

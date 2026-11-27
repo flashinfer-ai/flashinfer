@@ -512,20 +512,21 @@ def run(
     # split costs more than it saves -- the launch cannot start the row until a
     # single GPC has eight free SMs -- so wide splits are clustered pairwise.
     cx = s if s <= 4 else 2
-    fn = _get_compiled(
-        vec,
-        s,
-        mode_i,
-        lowreg,
-        float(gain_center),
-        float(eps),
-        mbpm,
-        cx,
-        bool(enable_pdl),
-        get_sm_version(branch.device),
-    )
-    # Launch on the caller's current stream so the kernel is graph capturable.
-    fn(branch, stream, norm_weight, alpha, beta, output)
+    with torch.cuda.device(branch.device):
+        fn = _get_compiled(
+            vec,
+            s,
+            mode_i,
+            lowreg,
+            float(gain_center),
+            float(eps),
+            mbpm,
+            cx,
+            bool(enable_pdl),
+            get_sm_version(branch.device),
+        )
+        # Launch on the caller's current stream so the kernel is graph capturable.
+        fn(branch, stream, norm_weight, alpha, beta, output)
 
 
 def gated_residual_rmsnorm(
