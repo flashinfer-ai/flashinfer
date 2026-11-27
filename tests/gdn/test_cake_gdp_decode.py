@@ -1690,15 +1690,20 @@ def _fp16_matrix() -> list:
     the runtime program of n = 3, from 10 rounds outside (3 x SM, 4 x SM] and from 11 within it, on SM107 from 16
     within it and from 11 above 124 x SM, on SM90 from 5 rounds within (2 x SM, 3 x SM]; on SM90 also at T = 6 above
     2 x SM), SM90's ``stochastic_forms`` siblings (stochastic calls at T = 4 within (3 x SM, 4.5 x SM] and above
-    13.5 x SM without snapshots and within (2.5 x SM, 4.5 x SM] and above 5 x SM with them; at T = 6 within
-    (2 x SM, 4.5 x SM] and above 12 x SM without snapshots; at T = 8 within (2 x SM, 4.5 x SM] and above 5 x SM; at
-    T = 16 above 19 x SM without snapshots) and ``scaled_rolled`` sibling (stochastic calls on the runtime program of
-    n = 4 above 1.5 x SM), SM90's row-split programs (the calls of these rows up to 2.5 x SM state heads, by token
-    count; at T = 4 and 80 state heads the call that rounds to nearest even runs ``l4r2`` instead), a padded pool,
-    padding rows and ``disable_state_update``."""
+    13.5 x SM without snapshots, within (6 x SM, 13.5 x SM] with 5 to 9 rounds without them and within
+    (2.5 x SM, 4.5 x SM] and above 5 x SM with them; at T = 6 within (2 x SM, 4.5 x SM] and above 12 x SM, and
+    within (10.5 x SM, 12 x SM] with 5 to 9 rounds, without snapshots; at T = 8 within (2 x SM, 4.5 x SM] and
+    above 5 x SM, and on ``l8r2`` within (SM / 2, SM]; at T = 16 above 19 x SM without snapshots; on the T = 1 row
+    partition within (SM, 1.5 x SM] without snapshots) and ``scaled_rolled`` sibling (stochastic calls on the
+    runtime program of n = 4 above 1.5 x SM), SM90's row-split programs (the calls of these rows up to 2.5 x SM
+    state heads, by token count; at T = 4 and 80 state heads the call that rounds to nearest even runs ``l4r2``
+    instead; at T = 6 a call without a state update), a padded pool, padding rows and ``disable_state_update``."""
     rows = [
         # (n, T, H, B, options)
-        (3, 1, 10, 16, {}),  # 160 state heads: the row partition
+        # 160 state heads: the row partition; on SM90 a stochastic call without snapshots runs its stochastic_forms
+        # sibling within (SM, 1.5 x SM] (on 107 to 159 SMs), as at 133, the lowest count of that cell on 132 SMs
+        (3, 1, 10, 16, {}),
+        (3, 1, 19, 7, {}),
         (3, 1, 24, 7, {"padding_row": True}),  # 168: the one-wave preload program
         (3, 1, 20, 64, {"distinct_write": True}),  # 1280: l8r4
         (3, 1, 80, 257, {}),  # 20560 > 64 x SM on up to 320 SMs: the many-wave program
@@ -1710,32 +1715,52 @@ def _fp16_matrix() -> list:
         # 80 state heads at T = 4, within (SM / 2, SM] on 80 to 159 SMs: on SM90 the call that rounds to nearest even
         # runs l4r2 and a stochastic call the row-split program; the other architectures run l8r4
         (3, 4, 10, 8, {}),
+        # 70 state heads at T = 8: on SM90 within (SM / 2, SM] (on 70 to 139 SMs) l8r2, whose stochastic_forms sibling
+        # runs a stochastic call there, as at 67 and 132, the lowest and the highest count of that cell on 132 SMs (132
+        # with snapshots; within (SM, 1.5 x SM] on 114 SMs, where it runs the row-split program)
         (3, 8, 10, 7, {"distinct_write": True}),
         (3, 8, 10, 7, {"distinct_write": True, "holes": True}),
+        (3, 8, 1, 67, {}),
+        (3, 8, 12, 11, {"scatter_tokens": True}),
         # 480 > 2 x SM on up to 216 SMs: l8r4; a stochastic call stores snapshots there, so it runs the l8r4
         # snapshot_noise sibling (one draw per launch into shared memory), a call that rounds to nearest even runs l8r4
         (3, 16, 24, 20, {"scatter_tokens": True}),
         (3, 16, 24, 20, {"scatter_tokens": True, "holes": True}),
         # 480 > 2 x SM at T = 6: l8r4 (on SM90 its own build); on SM90 a stochastic call that stores snapshots runs
         # that program's snapshot_noise sibling, one without snapshots its stochastic_forms sibling on 132 / 114 SMs
-        # (within (2 x SM, 4.5 x SM]) and the program on 78 (6.15 x SM, within (4.5 x SM, 12 x SM]), and a call that
+        # (within (2 x SM, 4.5 x SM]) and the program on 78 (6.15 x SM, within (4.5 x SM, 10.5 x SM]), and a call that
         # rounds to nearest even the program
         (3, 6, 24, 20, {"scatter_tokens": True}),
         (3, 6, 24, 20, {"distinct_write": True}),
+        # 1387 and 1584 state heads at T = 6 (10.5 x SM + 1 and 12 x SM on 132 SMs): on SM90 a stochastic call without
+        # snapshots runs the stochastic_forms sibling with 5 to 9 rounds (within (10.5 x SM, 12 x SM]) and the program
+        # from 10 on 132 SMs, and the sibling with every round count above 12 x SM (on 114 and 78 SMs)
+        (3, 6, 19, 73, {}),
+        (3, 6, 24, 66, {}),
         # 480 state heads at T = 4, 8 and 16 and on the runtime program of n = 4 (T = 3), and 2688 at T = 16: on SM90
         # a stochastic call without snapshots runs the program's stochastic_forms sibling where its cells admit the
-        # call (T = 4: within (3 x SM, 4.5 x SM] on 132 / 114 SMs, the program on 78 at 6.15 x SM; T = 8: within
-        # (2 x SM, 4.5 x SM] on 132 / 114 SMs and above 5 x SM on 78; T = 16: above 19 x SM, at 2688 state heads on up
-        # to 141 SMs, the program at 480) or, for n = 4, its scaled_rolled sibling (above 1.5 x SM), and a call that
-        # rounds to nearest even the program; the other architectures run the program in every class
+        # call (T = 4: within (3 x SM, 4.5 x SM] on 132 / 114 SMs, on 78 at 6.15 x SM within (6 x SM, 13.5 x SM] with
+        # 5 to 9 rounds and the program from 10; T = 8: within (2 x SM, 4.5 x SM] on 132 / 114 SMs and above 5 x SM on
+        # 78; T = 16: above 19 x SM, at 2688 state heads on up to 141 SMs, the program at 480) or, for n = 4, its
+        # scaled_rolled sibling (above 1.5 x SM), and a call that rounds to nearest even the program; the other
+        # architectures run the program in every class
         (3, 4, 24, 20, {}),
         (3, 8, 24, 20, {}),
         (3, 16, 24, 20, {"distinct_write": True}),
         (3, 16, 24, 112, {"distinct_write": True}),
         (4, 3, 24, 20, {}),
+        # 793 and 1782 state heads at T = 4 (6 x SM + 1 and 13.5 x SM on 132 SMs): on SM90 a stochastic call without
+        # snapshots runs the stochastic_forms sibling with 5 to 9 rounds (within (6 x SM, 13.5 x SM]) and the program
+        # from 10 (793 on 132, 114 and 78 SMs, 1782 on 132), and the sibling with every round count above 13.5 x SM
+        # (1782 on 114 and 78 SMs)
+        (3, 4, 13, 61, {}),
+        (3, 4, 22, 81, {}),
         (3, 16, 10, 3, {"scatter_tokens": True}),  # l8r2: the shared snapshot noise
         (3, 5, 12, 7, {"padded_pool": True}),
         (3, 2, 6, 5, {"disable_state_update": True}),
+        # 24 state heads at T = 6: on SM90 the row-split program, here without a state update (it fills its shared
+        # noise only for a call that stores the state)
+        (3, 6, 24, 1, {"disable_state_update": True}),
         (1, 3, 6, 5, {}),
         (2, 9, 6, 3, {"scatter_tokens": True}),
         # the runtime program of n = 3: its snapshot_noise sibling runs the snapshots of 10 rounds or more at these
@@ -1900,7 +1925,7 @@ def test_fp16_pool_layout(T: int, H: int, rounding: str) -> None:
     even and with 10 Philox rounds; a 4-byte aligned base or strides that are not multiples of four elements are
     refused before anything is launched.  On SM90 the 30 state heads of ``T = 4`` run a row-split program
     (:func:`_check_row_split_call`) and the 80 of ``T = 8`` (within (SM / 2, SM] on 80 to 159 SMs) the FP16 twin of
-    ``l8r2``, whose stores the rounding model checks."""
+    ``l8r2`` (its ``stochastic_forms`` sibling with 10 rounds), whose stores the rounding model checks."""
     _skip_unless_route(3, T, state_dtype=torch.float16)
     c = _make(5, T, H, 3, generator=_generator(43, T, H), pool_size=9)
     c16, _ = _fp16_twins(c)
@@ -2401,10 +2426,13 @@ def test_round_split_siblings_take_the_stochastic_calls_of_their_cells() -> None
     :data:`_PARTITION_SM_COUNTS` (the H100 parts among them), at every state-head count a cell of the sibling admits
     among the half-wave edges up to 20 x SM, the counts next to them and 20480, a call of the sibling's token count
     (a runtime sibling: the first token count no static program of its route has) selects the sibling with
-    every round count from the cell's ``rounds_at_least`` to :data:`PHILOX_ROUNDS_MAX` and each snapshot use the
-    cell admits, and its plain program when it rounds to nearest even.  Every sibling is selected on every one of
-    these SM counts, and the registry has a sibling of each of these flags (on SM90: the ``l8r4`` programs of 4, 6,
-    8 and 16 tokens with their ``stochastic_forms`` siblings, the runtime program of n = 4 with its
+    every round count from the cell's ``rounds_at_least`` to its ``rounds_at_most`` (:data:`PHILOX_ROUNDS_MAX` when
+    it has none) and each snapshot use the cell admits, and its plain program with a round count above that and
+    when it rounds to nearest even.  Every sibling is selected on every one of these SM counts where a cell of it
+    admits a state-head count up to 20 x SM (SM90's ``splitv8_tile8`` sibling, whose cell holds B x HV up to 160
+    above 1 x SM, has none from 160 SMs), and the registry has a sibling of each of these flags (on SM90: the
+    ``l8r4`` programs of 4, 6, 8 and 16 tokens, the ``l8r2`` program of 8 tokens and the one-token
+    ``splitv8_tile8`` program with their ``stochastic_forms`` siblings, the runtime program of n = 4 with its
     ``scaled_rolled`` sibling)."""
     twins, _, _, twin_of = _fp16_partners()
     sm_counts = sorted({*SM_COUNTS, *_PARTITION_SM_COUNTS})
@@ -2434,6 +2462,7 @@ def test_round_split_siblings_take_the_stochastic_calls_of_their_cells() -> None
                 inside = 0
                 for state_heads, cell in itertools.product(probes, cells):
                     low = cell["rounds_at_least"]
+                    high = cell.get("rounds_at_most", pkg.PHILOX_ROUNDS_MAX)
                     snapshots = (
                         (cell["snapshot"],) if "snapshot" in cell else (False, True)
                     )
@@ -2464,9 +2493,25 @@ def test_round_split_siblings_take_the_stochastic_calls_of_their_cells() -> None
 
                         where = (name, arch, sms, state_heads, snapshot)
                         assert picked(0) == plain, where
-                        for rounds in range(low, pkg.PHILOX_ROUNDS_MAX + 1):
+                        for rounds in range(low, high + 1):
                             assert picked(rounds) == name, (*where, rounds)
-                assert inside, (name, arch, sms)
+                        for rounds in range(high + 1, pkg.PHILOX_ROUNDS_MAX + 1):
+                            assert picked(rounds) == plain, (*where, rounds)
+                if not inside:
+                    # no state-head count up to 20 x SM in a cell (one that also bounds B x HV)
+                    assert not any(
+                        loader._selects(
+                            cell,
+                            state_heads,
+                            sms,
+                            arch,
+                            philox_rounds=cell["rounds_at_least"],
+                            snapshot=snapshot,
+                        )
+                        for cell in cells
+                        for state_heads in range(1, 20 * sms + 3)
+                        for snapshot in (False, True)
+                    ), (name, arch, sms)
     assert flags_seen == set(ROUND_SPLIT_FLAGS), flags_seen
 
 
@@ -2990,15 +3035,15 @@ _STATE_HEAD_PROBES = (
     26289,
     26784,
     26785,
-    # the half-wave edges k x sm / 2 and +1 (k = 1 to 10: up to 5 x sm; k = 24, 27 and 38: the 12, 13.5 and 19 x sm
-    # bounds of SM90's stochastic_forms cells) for every SM count of :data:`SM_COUNTS`: the wave bounds of SM90's
-    # row-split programs, of the FP16 cells they split and of SM90's stochastic_forms and scaled_rolled siblings are
-    # multiples of 1/2
+    # the half-wave edges k x sm / 2 and +1 (k = 1 to 10: up to 5 x sm; k = 12, 21, 24, 27 and 38: the 6, 10.5, 12,
+    # 13.5 and 19 x sm bounds of SM90's stochastic_forms cells) for every SM count of :data:`SM_COUNTS`: the wave
+    # bounds of SM90's row-split programs, of the FP16 cells they split and of SM90's stochastic_forms and
+    # scaled_rolled siblings are multiples of 1/2
     *sorted(
         {
             k * sm // 2 + d
             for sm in SM_COUNTS
-            for k in (*range(1, 11), 24, 27, 38)
+            for k in (*range(1, 11), 12, 21, 24, 27, 38)
             for d in (0, 1)
         }
     ),
