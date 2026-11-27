@@ -128,6 +128,11 @@ to 128 channels and the FlashInfer adapter explicitly requests its existing
 64-channel contract. Input and weight scale blocks remain 128. The scale choice
 also selects the matching reference and heuristic table.
 
+The hybrid FP4 stage-release fences in
+`pre_unification/moe_hopper_fp8/kernel_mxfp4_fp8_glu_fc12_swapab.py` are an
+in-tree change made after the export (manifest hash updated); preserve them
+across future snapshot refreshes.
+
 ## FlashInfer selectors
 
 SM100's unsuffixed `sm100_nvfp4_nvfp4_bf16_cutedsl` and
