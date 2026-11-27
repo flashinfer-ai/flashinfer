@@ -175,14 +175,6 @@ def test_mixed_knobs_and_candidates():
 
 @pytest.mark.cpu_only
 @cuda_13_required
-def test_mixed_batch_invariant_config_defaults_and_runtime_split():
-    assert _config(batch_invariant=True).batch_invariant
-    with pytest.raises(ValueError, match="runtime_mma_split=False"):
-        _config(batch_invariant=True, runtime_mma_split=True)
-
-
-@pytest.mark.cpu_only
-@cuda_13_required
 @pytest.mark.parametrize(
     ("mma_tiler_mnk", "transform_buffer", "accumulator_overlap", "transform_k_tile"),
     sorted(_LEGAL_IMPLS),

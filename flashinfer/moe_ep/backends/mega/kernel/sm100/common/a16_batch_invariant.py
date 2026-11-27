@@ -86,6 +86,7 @@ def validate_a16_batch_invariant(config, knobs=None):
         "accumulator_overlap",
         "transform_k_tile",
         "clc_bundle_size",
+        "runtime_mma_split",
     }
     unknown = values.keys() - allowed
     if unknown:
@@ -113,6 +114,7 @@ def validate_a16_batch_invariant(config, knobs=None):
         "use_custom_finalize",
         "enable_iket",
         "use_2cta_instrs",
+        "runtime_mma_split",
     ):
         if type(get(name, name == "use_2cta_instrs")) is not bool:
             raise ValueError(f"{name} must be a bool")
@@ -122,7 +124,6 @@ def validate_a16_batch_invariant(config, knobs=None):
         "in_kernel_fc2_reduce",
         "accumulator_overlap",
         "enable_iket",
-        "runtime_mma_split",
     ):
         if get(name, False):
             raise ValueError(f"batch_invariant A16 MegaMoE requires {name}=False")
