@@ -23,7 +23,7 @@ def padded_expert_rows(
 
     The single definition of a pool's per-expert stride. Communication components
     write bases derived from it while the FC12 scheduler rebuilds the same bases
-    from ``expert_sizes`` at runtime; if the two ever disagree the metadata a
+    from ``expert_num_tokens`` at runtime; if the two ever disagree the metadata a
     kernel reads no longer describes the rows it loads.
     """
     return round_up(token_count, padding_block)

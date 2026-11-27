@@ -48,7 +48,7 @@ Two per-expert row spaces coexist and must not be merged:
               token metadata, the FC1 output pool and therefore FC2's B operand
   sf rows     padded to ``sf_padding_block``, indexes the canonical scale factor
               pool; it is pinned to 128, the row count of one block-scaled SF
-              atom, because the refine block and its readiness counter are one
+              atom, because the SF block and its readiness counter are one
               padding block tall
 
 A token tile N that is not a whole number of SF atoms and does not divide one
@@ -57,10 +57,10 @@ spaces instead: an expert keeps ceil(count / N) token tiles and spreads its
 routes evenly over them (``balanced_tile_rows``), the expert's ``r``-th route
 lands on row ``slot_physical_row(r)``, the slot's trailing rows stay unrouted
 padding, and an expert spans one whole slot per token tile. Both spaces then
-share one in-expert row numbering, so a refine block is a half slot in either of
+share one in-expert row numbering, so an SF block is a half slot in either of
 them.
 
-The main kernel derives both cumulative bases from ``expert_sizes`` alone, so the
+The main kernel derives both cumulative bases from ``expert_num_tokens`` alone, so the
 bases this component writes must reproduce the scheduler's formula bit for bit.
 
 Payload representations
@@ -125,8 +125,8 @@ routes per (source, expert) in SMEM and runs the same deterministic fold,
 processing order and data-row scan as every other planner, which give it each
 expert's data-row base and its own source's segment base. Planner 0 publishes
 the sizes, the processing order and ``sizes_ready``, then the data-row, SF-row
-and refine-block bases; above 32 local experts it alone runs the SF-row and
-refine-block prefixes (``_plan_bases``). Every planner scatters the routes of
+and SF-block bases; above 32 local experts it alone runs the SF-row and
+SF-block prefixes (``_plan_bases``). Every planner scatters the routes of
 the source it exchanged with and adds one to ``metadata_ready``, whose target is
 then W. No hand-off between CTAs precedes either counter, and the helper goes
 straight to the refine. The end-of-round reduce resets every inbox word once the
@@ -183,7 +183,7 @@ after another in the order the main kernel processes them, from the end of the
 plan on: the rows claimed but not yet landed span only a few experts at a time.
 An N64 token tile shares its scale-factor atom with the next tile, so there, or
 with ``pull_tile_ready`` off, the rows count into the expert's ``fc1_sf_ready``
-instead, which then counts routes rather than refine blocks and gates every FC1
+instead, which then counts routes rather than SF blocks and gates every FC1
 tile of the expert. The first wave of claims, one per walking warp, otherwise
 lands together: every warp keeps its claim's first rows in flight and the link
 serves them side by side. The experts starting within that wave are claimed
@@ -580,18 +580,20 @@ class GenphaseTokenComm(KernelComponent):
     shared_layout_pad_region: ClassVar[str] = "genphase.token_comm.shared_layout_pad"
 
     # Local regions: produced and consumed on this rank only.
-    expert_sizes_region: ClassVar[str] = "genphase.token_comm.expert_sizes"
+    expert_num_tokens_region: ClassVar[str] = "genphase.token_comm.expert_num_tokens"
     sizes_ready_region: ClassVar[str] = "genphase.token_comm.sizes_ready"
     # The processing order: per position, the local expert the main kernel
     # processes there, and that expert's routed size.
     expert_order_region: ClassVar[str] = "genphase.token_comm.expert_order"
-    expert_sizes_in_order_region: ClassVar[str] = (
-        "genphase.token_comm.expert_sizes_in_order"
+    expert_num_tokens_in_order_region: ClassVar[str] = (
+        "genphase.token_comm.expert_num_tokens_in_order"
     )
-    data_expert_base_region: ClassVar[str] = "genphase.token_comm.data_expert_base"
-    sf_expert_base_region: ClassVar[str] = "genphase.token_comm.sf_expert_base"
-    refine_block_base_region: ClassVar[str] = "genphase.token_comm.refine_block_base"
-    refine_block_total_region: ClassVar[str] = "genphase.token_comm.refine_block_total"
+    expert_token_base_region: ClassVar[str] = "genphase.token_comm.expert_token_base"
+    expert_sf_base_region: ClassVar[str] = "genphase.token_comm.expert_sf_base"
+    expert_sf_block_base_region: ClassVar[str] = (
+        "genphase.token_comm.expert_sf_block_base"
+    )
+    num_sf_blocks_region: ClassVar[str] = "genphase.token_comm.num_sf_blocks"
     prefix_ready_region: ClassVar[str] = "genphase.token_comm.prefix_ready"
     token_src_metadata_region: ClassVar[str] = "genphase.token_comm.token_src_metadata"
     gather_index_region: ClassVar[str] = "genphase.token_comm.gather_index"
@@ -668,13 +670,13 @@ class GenphaseTokenComm(KernelComponent):
     helper_warp_totals_region: ClassVar[str] = (
         "genphase.token_comm.smem.helper_warp_totals"
     )
-    # The ranking's processing order and the expert sizes in that order, in SMEM
-    # (`_place_expert_at_position`).
+    # The ranking's processing order and the experts' token counts in that order,
+    # in SMEM (`_place_expert_at_position`).
     helper_expert_order_region: ClassVar[str] = (
         "genphase.token_comm.smem.helper_expert_order"
     )
-    helper_expert_sizes_in_order_region: ClassVar[str] = (
-        "genphase.token_comm.smem.helper_expert_sizes_in_order"
+    helper_expert_num_tokens_in_order_region: ClassVar[str] = (
+        "genphase.token_comm.smem.helper_expert_num_tokens_in_order"
     )
     helper_load_bin_region: ClassVar[str] = "genphase.token_comm.smem.helper_load_bin"
     # Pull dispatch only: every (source, chunk) count row.
@@ -711,9 +713,9 @@ class GenphaseTokenComm(KernelComponent):
     refine_expert_table_region: ClassVar[str] = (
         "genphase.token_comm.smem.refine_expert_table"
     )
-    # The refine block total, when the refine derives its table itself.
-    refine_block_count_region: ClassVar[str] = (
-        "genphase.token_comm.smem.refine_block_count"
+    # The SF block total, when the refine derives its table itself.
+    refine_num_sf_blocks_region: ClassVar[str] = (
+        "genphase.token_comm.smem.refine_num_sf_blocks"
     )
     refine_output_region: ClassVar[str] = "genphase.token_comm.smem.refine_output"
     # Pull dispatch only: per walking warp, a ring of data rows and its barriers;
@@ -773,9 +775,9 @@ class GenphaseTokenComm(KernelComponent):
     refine_claim_fields: ClassVar[int] = 4
 
     # Rows of `refine_expert_table`, staged once per CTA before the claim loop.
-    refine_table_block_base: ClassVar[int] = 0
-    refine_table_expert_size: ClassVar[int] = 1
-    refine_table_data_base: ClassVar[int] = 2
+    refine_table_sf_block_base: ClassVar[int] = 0
+    refine_table_expert_num_tokens: ClassVar[int] = 1
+    refine_table_token_base: ClassVar[int] = 2
     refine_table_sf_base: ClassVar[int] = 3
     refine_table_rows: ClassVar[int] = 4
 
@@ -1406,7 +1408,7 @@ class GenphaseTokenComm(KernelComponent):
 
     @property
     def refine_static_blocks(self) -> int:
-        """Leading refine blocks that are taken without a claim.
+        """Leading SF blocks that are taken without a claim.
 
         Under the Sentinel dispatch the refine runs in the helper and the pushers
         only, so every refine group has a fixed index among all of them, and its
@@ -1425,7 +1427,7 @@ class GenphaseTokenComm(KernelComponent):
         """Whether the refine derives its expert table from the processing order.
 
         Under the Sentinel dispatch planner 0 publishes the processing order and
-        the expert sizes in that order with ``sizes_ready``, and the row-space
+        the experts' token counts in that order with ``sizes_ready``, and the row-space
         bases only ahead of its ``metadata_ready`` contribution. With at most 32
         buckets the refine runs planner 0's one-warp scan on the published loads
         itself, so its table and its first block are settled while the planners
@@ -1473,7 +1475,7 @@ class GenphaseTokenComm(KernelComponent):
         return self._worst_case_pool_rows(self.sf_padding_block)
 
     @property
-    def worst_case_refine_blocks(self) -> int:
+    def worst_case_num_sf_blocks(self) -> int:
         return self.worst_case_sf_rows // self.sf_padding_block
 
     # ------------------------------------------------------------------
@@ -1743,7 +1745,7 @@ class GenphaseTokenComm(KernelComponent):
                 byte_alignment=16,
             )
         workspace.register(
-            self.expert_sizes_region,
+            self.expert_num_tokens_region,
             cutlass.Int32,
             (self.experts_per_rank,),
             buffer_space="local",
@@ -1766,7 +1768,7 @@ class GenphaseTokenComm(KernelComponent):
             byte_alignment=16,
         )
         workspace.register(
-            self.expert_sizes_in_order_region,
+            self.expert_num_tokens_in_order_region,
             cutlass.Int32,
             (self.experts_per_rank,),
             buffer_space="local",
@@ -1776,9 +1778,9 @@ class GenphaseTokenComm(KernelComponent):
         # scan that fills them runs over padded buckets, and letting the tail
         # entries exist removes every boundary special case downstream.
         for region_name in (
-            self.data_expert_base_region,
-            self.sf_expert_base_region,
-            self.refine_block_base_region,
+            self.expert_token_base_region,
+            self.expert_sf_base_region,
+            self.expert_sf_block_base_region,
         ):
             workspace.register(
                 region_name,
@@ -1850,7 +1852,7 @@ class GenphaseTokenComm(KernelComponent):
             self.sizes_ready_region,
             self.prefix_ready_region,
             self.metadata_ready_region,
-            self.refine_block_total_region,
+            self.num_sf_blocks_region,
             self.refine_work_counter_region,
         )
         if sentinel_layout:
@@ -2028,7 +2030,7 @@ class GenphaseTokenComm(KernelComponent):
         )
         for region_name in (
             self.helper_expert_order_region,
-            self.helper_expert_sizes_in_order_region,
+            self.helper_expert_num_tokens_in_order_region,
         ):
             helper.register_tensor(
                 region_name,
@@ -2180,7 +2182,7 @@ class GenphaseTokenComm(KernelComponent):
         )
         if self.refine_plans_table:
             refine.register_tensor(
-                self.refine_block_count_region, cutlass.Int32, (1,), byte_alignment=16
+                self.refine_num_sf_blocks_region, cutlass.Int32, (1,), byte_alignment=16
             )
         if self.dispatch_protocol == "sentinel":
             refine.register_tensor(
@@ -2326,8 +2328,10 @@ class GenphaseTokenComm(KernelComponent):
         )
 
     @cute.jit
-    def expert_sizes_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
-        return device_workspace.tensor(self.expert_sizes_region)
+    def expert_num_tokens_tensor(
+        self, device_workspace: DeviceWorkspace
+    ) -> cute.Tensor:
+        return device_workspace.tensor(self.expert_num_tokens_region)
 
     @cute.jit
     def expert_order_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
@@ -2335,19 +2339,19 @@ class GenphaseTokenComm(KernelComponent):
         return device_workspace.tensor(self.expert_order_region)
 
     @cute.jit
-    def scheduler_expert_sizes_tensor(
+    def scheduler_expert_num_tokens_tensor(
         self, device_workspace: DeviceWorkspace
     ) -> cute.Tensor:
-        """Per-expert sizes in the order the FC12 scheduler must walk them.
+        """Per-expert token counts in the order the FC12 scheduler must walk them.
 
         The scheduler rebuilds every pool base by scanning this array in index
         order, so handing it the sizes already permuted is what makes the
         processing order invisible to it: its running prefix reproduces the
-        layout this component wrote, unchanged. ``expert_sizes`` stays in expert
+        layout this component wrote, unchanged. ``expert_num_tokens`` stays in expert
         order for the readers that address an expert -- the refine table and the
         main kernel's per-expert scale-factor gate.
         """
-        return device_workspace.tensor(self.expert_sizes_in_order_region)
+        return device_workspace.tensor(self.expert_num_tokens_in_order_region)
 
     @cute.jit
     def token_src_metadata_tensor(
@@ -3660,15 +3664,15 @@ class GenphaseTokenComm(KernelComponent):
             self.stamp_plan_step(device_workspace, "c_planned", copier)
         # The data-row bases: the helper's padded scan in processing order, over
         # the same loads in the same order.
-        expert_sizes_in_order = self._smem_workspace.tensor(
-            self.helper_expert_sizes_in_order_region, smem_base
+        expert_num_tokens_in_order = self._smem_workspace.tensor(
+            self.helper_expert_num_tokens_in_order_region, smem_base
         )
         expert_order = self._smem_workspace.tensor(
             self.helper_expert_order_region, smem_base
         )
         prefix = self._smem_workspace.tensor(self.helper_prefix_region, smem_base)
         self._scan_padded_rows(
-            expert_sizes_in_order,
+            expert_num_tokens_in_order,
             self._smem_workspace.tensor(self.helper_scan_input_region, smem_base),
             prefix,
             warp_totals,
@@ -3991,14 +3995,14 @@ class GenphaseTokenComm(KernelComponent):
         smem_base: cute.Pointer,
         thread_idx: Int32,
     ) -> None:
-        """Fold the count rows into per-expert sizes and both row-space prefixes, and publish them.
+        """Fold the count rows into per-expert token counts and both row-space prefixes, and publish them.
 
         Every source sends one count row per exchange CTA into this rank's count
         inbox; the rows announce their own arrival (see "Expert-id lists"). Each
         index-copy CTA runs the same fold and ranking on the same rows itself
         (``_plan_from_count_rows``), so nothing here gates the index lists.
 
-        ``expert_sizes`` and its flag go out before the prefixes: the main kernel's
+        ``expert_num_tokens`` and its flag go out before the prefixes: the main kernel's
         scheduler only needs the sizes to lay out work and start streaming weights,
         so it should not wait for tables that only the refine and the walk read.
 
@@ -4029,11 +4033,11 @@ class GenphaseTokenComm(KernelComponent):
             self.stamp_plan_step(device_workspace, "h_planned", Int32(0))
 
         bucket_rounds = ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
-        expert_sizes = device_workspace.tensor(self.expert_sizes_region)
+        expert_num_tokens = device_workspace.tensor(self.expert_num_tokens_region)
         for bucket_round in cutlass.range_constexpr(bucket_rounds):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.experts_per_rank):
-                expert_sizes[bucket] = totals[bucket]
+                expert_num_tokens[bucket] = totals[bucket]
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             red_async_add_release_gpu_s32(
@@ -4048,20 +4052,20 @@ class GenphaseTokenComm(KernelComponent):
         # themselves stay keyed by expert, because every reader of them -- the
         # refine expert table and the main kernel's gather -- addresses an
         # expert rather than a position.
-        expert_sizes_in_order = self._smem_workspace.tensor(
-            self.helper_expert_sizes_in_order_region, smem_base
+        expert_num_tokens_in_order = self._smem_workspace.tensor(
+            self.helper_expert_num_tokens_in_order_region, smem_base
         )
         expert_order = self._smem_workspace.tensor(
             self.helper_expert_order_region, smem_base
         )
 
         for padding_block, region_name in (
-            (self.token_padding_block, self.data_expert_base_region),
-            (self.sf_padding_block, self.sf_expert_base_region),
+            (self.token_padding_block, self.expert_token_base_region),
+            (self.sf_padding_block, self.expert_sf_base_region),
         ):
             self._publish_padded_prefix(
                 device_workspace,
-                expert_sizes_in_order,
+                expert_num_tokens_in_order,
                 expert_order,
                 scan_input,
                 prefix,
@@ -4072,9 +4076,9 @@ class GenphaseTokenComm(KernelComponent):
                 lane_idx,
                 warp_idx,
             )
-        self._publish_refine_block_prefix(
+        self._publish_expert_sf_block_base(
             device_workspace,
-            expert_sizes_in_order,
+            expert_num_tokens_in_order,
             expert_order,
             scan_input,
             prefix,
@@ -4109,7 +4113,7 @@ class GenphaseTokenComm(KernelComponent):
         (``_rank_experts_by_load``), so all of them settle on the processing
         order the helper publishes. Leaves the rows in ``helper_chunk_counts``,
         the loads in ``helper_totals`` and the order in ``helper_expert_order``
-        and ``helper_expert_sizes_in_order``. Without ``poll`` the rows are
+        and ``helper_expert_num_tokens_in_order``. Without ``poll`` the rows are
         already in SMEM.
         """
         chunk_counts = self._smem_workspace.tensor(
@@ -4242,14 +4246,14 @@ class GenphaseTokenComm(KernelComponent):
             position
         ] = expert
         self._smem_workspace.tensor(
-            self.helper_expert_sizes_in_order_region, smem_base
+            self.helper_expert_num_tokens_in_order_region, smem_base
         )[position] = routed_count
         if cutlass.const_expr(publish):
             device_workspace.tensor(self.expert_order_region)[position] = expert
             if position < Int32(self.experts_per_rank):
-                device_workspace.tensor(self.expert_sizes_in_order_region)[position] = (
-                    routed_count
-                )
+                device_workspace.tensor(self.expert_num_tokens_in_order_region)[
+                    position
+                ] = routed_count
 
     @cute.jit
     def _rank_by_counting_in_warp(
@@ -4521,7 +4525,7 @@ class GenphaseTokenComm(KernelComponent):
     @cute.jit
     def _scan_padded_rows(
         self,
-        expert_sizes_in_order: cute.Tensor,
+        expert_num_tokens_in_order: cute.Tensor,
         scan_input: cute.Tensor,
         prefix: cute.Tensor,
         warp_totals: cute.Tensor,
@@ -4536,7 +4540,7 @@ class GenphaseTokenComm(KernelComponent):
             scan_entry = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if scan_entry < Int32(self.local_expert_bucket_count):
                 scan_input[scan_entry] = expert_pool_rows(
-                    expert_sizes_in_order[scan_entry],
+                    expert_num_tokens_in_order[scan_entry],
                     padding_block,
                     self.token_tile_n,
                     self.token_slot_rows,
@@ -4558,7 +4562,7 @@ class GenphaseTokenComm(KernelComponent):
     def _publish_padded_prefix(
         self,
         device_workspace: DeviceWorkspace,
-        expert_sizes_in_order: cute.Tensor,
+        expert_num_tokens_in_order: cute.Tensor,
         expert_order: cute.Tensor,
         scan_input: cute.Tensor,
         prefix: cute.Tensor,
@@ -4582,7 +4586,7 @@ class GenphaseTokenComm(KernelComponent):
         its positions and only the store side translates back to an expert.
         """
         self._scan_padded_rows(
-            expert_sizes_in_order,
+            expert_num_tokens_in_order,
             scan_input,
             prefix,
             warp_totals,
@@ -4600,10 +4604,10 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
 
     @cute.jit
-    def _publish_refine_block_prefix(
+    def _publish_expert_sf_block_base(
         self,
         device_workspace: DeviceWorkspace,
-        expert_sizes_in_order: cute.Tensor,
+        expert_num_tokens_in_order: cute.Tensor,
         expert_order: cute.Tensor,
         scan_input: cute.Tensor,
         prefix: cute.Tensor,
@@ -4612,7 +4616,7 @@ class GenphaseTokenComm(KernelComponent):
         lane_idx: Int32,
         warp_idx: Int32,
     ) -> None:
-        """Per-expert refine block counts and their prefix.
+        """Per-expert SF block counts and their prefix.
 
         A block is one SF padding block of scale-factor rows, the row count of one
         canonical atom. Only blocks holding at least one live route are enumerated:
@@ -4631,7 +4635,7 @@ class GenphaseTokenComm(KernelComponent):
         # order. Each padded row count is a multiple of sf_padding_block, so
         # converting that prefix to blocks replaces another CTA-wide scan.
         bucket_rounds = ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
-        destination = device_workspace.tensor(self.refine_block_base_region)
+        destination = device_workspace.tensor(self.expert_sf_block_base_region)
         for bucket_round in cutlass.range_constexpr(bucket_rounds):
             scan_entry = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if scan_entry < Int32(self.local_expert_bucket_count):
@@ -4641,13 +4645,13 @@ class GenphaseTokenComm(KernelComponent):
         if thread_idx == Int32(0):
             last = Int32(self.local_expert_bucket_count - 1)
             total_rows = prefix[last] + expert_pool_rows(
-                expert_sizes_in_order[last],
+                expert_num_tokens_in_order[last],
                 Int32(self.sf_padding_block),
                 self.token_tile_n,
                 self.token_slot_rows,
             )
-            device_workspace.tensor(self.refine_block_total_region)[0] = (
-                total_rows // Int32(self.sf_padding_block)
+            device_workspace.tensor(self.num_sf_blocks_region)[0] = total_rows // Int32(
+                self.sf_padding_block
             )
         cute.arch.sync_threads()
 
@@ -5071,12 +5075,12 @@ class GenphaseTokenComm(KernelComponent):
         helper_expert_order = self._smem_workspace.tensor(
             self.helper_expert_order_region, smem_base
         )
-        helper_expert_sizes_in_order = self._smem_workspace.tensor(
-            self.helper_expert_sizes_in_order_region, smem_base
+        helper_expert_num_tokens_in_order = self._smem_workspace.tensor(
+            self.helper_expert_num_tokens_in_order_region, smem_base
         )
-        expert_sizes = device_workspace.tensor(self.expert_sizes_region)
-        expert_sizes_in_order = device_workspace.tensor(
-            self.expert_sizes_in_order_region
+        expert_num_tokens = device_workspace.tensor(self.expert_num_tokens_region)
+        expert_num_tokens_in_order = device_workspace.tensor(
+            self.expert_num_tokens_in_order_region
         )
         expert_order = device_workspace.tensor(self.expert_order_region)
         for bucket_round in cutlass.range_constexpr(
@@ -5086,8 +5090,10 @@ class GenphaseTokenComm(KernelComponent):
             if bucket < Int32(self.local_expert_bucket_count):
                 expert_order[bucket] = helper_expert_order[bucket]
                 if bucket < Int32(self.experts_per_rank):
-                    expert_sizes_in_order[bucket] = helper_expert_sizes_in_order[bucket]
-                    expert_sizes[bucket] = totals[bucket]
+                    expert_num_tokens_in_order[bucket] = (
+                        helper_expert_num_tokens_in_order[bucket]
+                    )
+                    expert_num_tokens[bucket] = totals[bucket]
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             red_async_add_release_gpu_s32(
@@ -5112,20 +5118,20 @@ class GenphaseTokenComm(KernelComponent):
         Sources are laid out in ring order from this rank
         (``_store_plan_bases``), the order the pull index copy gives the
         segments as well. With ``publishes`` the data-row, SF-row and
-        refine-block bases and the refine block total go out as well, for the
+        SF-block bases and the SF block total go out as well, for the
         refine, which reads them once ``metadata_ready`` is complete. Up to 32
         buckets one warp scans both row spaces with shuffles in every planner;
         above, every planner runs the helper's CTA-wide scan of the data rows,
-        and only the publishing one the SF-row and refine-block prefixes.
+        and only the publishing one the SF-row and SF-block prefixes.
         """
         buckets = self.local_expert_bucket_count
-        expert_sizes_in_order = self._smem_workspace.tensor(
-            self.helper_expert_sizes_in_order_region, smem_base
+        expert_num_tokens_in_order = self._smem_workspace.tensor(
+            self.helper_expert_num_tokens_in_order_region, smem_base
         )
         expert_order = self._smem_workspace.tensor(
             self.helper_expert_order_region, smem_base
         )
-        data_expert_base = device_workspace.tensor(self.data_expert_base_region)
+        expert_token_base = device_workspace.tensor(self.expert_token_base_region)
         ring_position = (source_rank - local_rank + Int32(self.world_size)) % Int32(
             self.world_size
         )
@@ -5134,7 +5140,7 @@ class GenphaseTokenComm(KernelComponent):
                 load = Int32(0)
                 expert = Int32(0)
                 if lane_idx < Int32(buckets):
-                    load = expert_sizes_in_order[lane_idx]
+                    load = expert_num_tokens_in_order[lane_idx]
                     expert = expert_order[lane_idx]
                 data_rows = expert_pool_rows(
                     load,
@@ -5153,18 +5159,18 @@ class GenphaseTokenComm(KernelComponent):
                         smem_base, expert, data_base, local_rank, ring_position
                     )
                     if publishes:
-                        data_expert_base[expert] = data_base
-                        device_workspace.tensor(self.sf_expert_base_region)[expert] = (
+                        expert_token_base[expert] = data_base
+                        device_workspace.tensor(self.expert_sf_base_region)[expert] = (
                             sf_base
                         )
-                        device_workspace.tensor(self.refine_block_base_region)[
+                        device_workspace.tensor(self.expert_sf_block_base_region)[
                             expert
                         ] = sf_base // Int32(self.sf_padding_block)
                 # Lanes past the bucket count add nothing, so the last lane's sum
                 # is the whole SF-row extent.
                 if publishes:
                     if lane_idx == Int32(31):
-                        device_workspace.tensor(self.refine_block_total_region)[0] = (
+                        device_workspace.tensor(self.num_sf_blocks_region)[0] = (
                             sf_end // Int32(self.sf_padding_block)
                         )
             cute.arch.sync_threads()
@@ -5177,7 +5183,7 @@ class GenphaseTokenComm(KernelComponent):
                 self.helper_warp_totals_region, smem_base
             )
             self._scan_padded_rows(
-                expert_sizes_in_order,
+                expert_num_tokens_in_order,
                 scan_input,
                 prefix,
                 warp_totals,
@@ -5196,25 +5202,25 @@ class GenphaseTokenComm(KernelComponent):
                         smem_base, expert, prefix[scan_entry], local_rank, ring_position
                     )
                     if publishes:
-                        data_expert_base[expert] = prefix[scan_entry]
+                        expert_token_base[expert] = prefix[scan_entry]
             cute.arch.sync_threads()
             if publishes:
                 self._publish_padded_prefix(
                     device_workspace,
-                    expert_sizes_in_order,
+                    expert_num_tokens_in_order,
                     expert_order,
                     scan_input,
                     prefix,
                     warp_totals,
                     self.sf_padding_block,
-                    self.sf_expert_base_region,
+                    self.expert_sf_base_region,
                     thread_idx,
                     lane_idx,
                     warp_idx,
                 )
-                self._publish_refine_block_prefix(
+                self._publish_expert_sf_block_base(
                     device_workspace,
-                    expert_sizes_in_order,
+                    expert_num_tokens_in_order,
                     expert_order,
                     scan_input,
                     prefix,
@@ -5396,8 +5402,8 @@ class GenphaseTokenComm(KernelComponent):
             expert_table = self._plan_refine_expert_table(
                 device_workspace, smem_base, thread_idx
             )
-            block_total = self._smem_workspace.tensor(
-                self.refine_block_count_region, smem_base
+            num_sf_blocks = self._smem_workspace.tensor(
+                self.refine_num_sf_blocks_region, smem_base
             )[0]
         else:
             expert_table = self._stage_refine_expert_table(
@@ -5407,7 +5413,7 @@ class GenphaseTokenComm(KernelComponent):
         claim = self._smem_workspace.tensor(self.refine_claim_region, smem_base)
         work_counter = device_workspace.ptr(self.refine_work_counter_region)
         if cutlass.const_expr(not self.refine_plans_table):
-            block_total = device_workspace.tensor(self.refine_block_total_region)[0]
+            num_sf_blocks = device_workspace.tensor(self.num_sf_blocks_region)[0]
 
         claim_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128
@@ -5437,7 +5443,7 @@ class GenphaseTokenComm(KernelComponent):
             claim,
             expert_table,
             work_counter,
-            block_total,
+            num_sf_blocks,
             group_idx,
             thread_in_group,
             group_barrier,
@@ -5449,7 +5455,7 @@ class GenphaseTokenComm(KernelComponent):
             # The first block is settled; its rows are what the scatter still owes.
             self._wait_refine_open(device_workspace, linear_cta_idx, thread_idx)
 
-        while claimed[self.refine_claim_block] < block_total:
+        while claimed[self.refine_claim_block] < num_sf_blocks:
             self._refine_one_block(
                 device_workspace,
                 smem_base,
@@ -5475,7 +5481,7 @@ class GenphaseTokenComm(KernelComponent):
                 claim,
                 expert_table,
                 work_counter,
-                block_total,
+                num_sf_blocks,
                 group_idx,
                 thread_in_group,
                 group_barrier,
@@ -5580,16 +5586,16 @@ class GenphaseTokenComm(KernelComponent):
         planner 0 published, which is the same scan over the same values, so the
         bases agree with the ones the planner publishes bit for bit. Positions past
         the live experts carry no load. The block total lands in
-        ``refine_block_count``.
+        ``refine_num_sf_blocks``.
         """
         expert_table = self._smem_workspace.tensor(
             self.refine_expert_table_region, smem_base
         )
         block_count = self._smem_workspace.tensor(
-            self.refine_block_count_region, smem_base
+            self.refine_num_sf_blocks_region, smem_base
         )
-        expert_sizes_in_order = device_workspace.tensor(
-            self.expert_sizes_in_order_region
+        expert_num_tokens_in_order = device_workspace.tensor(
+            self.expert_num_tokens_in_order_region
         )
         expert_order = device_workspace.tensor(self.expert_order_region)
         buckets = self.local_expert_bucket_count
@@ -5608,7 +5614,7 @@ class GenphaseTokenComm(KernelComponent):
             if lane_idx < Int32(buckets):
                 expert = expert_order[lane_idx]
                 if lane_idx < Int32(self.experts_per_rank):
-                    load = expert_sizes_in_order[lane_idx]
+                    load = expert_num_tokens_in_order[lane_idx]
             data_rows = expert_pool_rows(
                 load, self.token_padding_block, self.token_tile_n, self.token_slot_rows
             )
@@ -5619,11 +5625,11 @@ class GenphaseTokenComm(KernelComponent):
             sf_end = _warp_inclusive_sum(sf_rows, lane_idx)
             sf_base = sf_end - sf_rows
             if lane_idx < Int32(buckets):
-                expert_table[self.refine_table_block_base, expert] = sf_base // Int32(
-                    self.sf_padding_block
+                expert_table[self.refine_table_sf_block_base, expert] = (
+                    sf_base // Int32(self.sf_padding_block)
                 )
-                expert_table[self.refine_table_expert_size, expert] = load
-                expert_table[self.refine_table_data_base, expert] = data_base
+                expert_table[self.refine_table_expert_num_tokens, expert] = load
+                expert_table[self.refine_table_token_base, expert] = data_base
                 expert_table[self.refine_table_sf_base, expert] = sf_base
             # Lanes past the bucket count add nothing, so the last lane's sum is
             # the whole SF-row extent.
@@ -5638,7 +5644,7 @@ class GenphaseTokenComm(KernelComponent):
         claim: cute.Tensor,
         expert_table: cute.Tensor,
         work_counter: cute.Pointer,
-        block_total: Int32,
+        num_sf_blocks: Int32,
         group_idx: Int32,
         thread_in_group: Int32,
         group_barrier: Int32,
@@ -5686,18 +5692,20 @@ class GenphaseTokenComm(KernelComponent):
             resolved[self.refine_claim_data_row] = Int32(0)
             resolved[self.refine_claim_sf_row] = Int32(0)
             resolved[self.refine_claim_live_rows] = Int32(0)
-            if claimed_block < block_total:
+            if claimed_block < num_sf_blocks:
                 block_rows = Int32(self.sf_padding_block)
                 owning_expert = self._resolve_block_expert(
                     expert_table, claimed_block, thread_in_group
                 )
                 block_in_expert = (
                     claimed_block
-                    - expert_table[self.refine_table_block_base, owning_expert]
+                    - expert_table[self.refine_table_sf_block_base, owning_expert]
                 )
                 rows_before = block_in_expert * block_rows
-                expert_size = expert_table[self.refine_table_expert_size, owning_expert]
-                data_base = expert_table[self.refine_table_data_base, owning_expert]
+                token_count = expert_table[
+                    self.refine_table_expert_num_tokens, owning_expert
+                ]
+                data_base = expert_table[self.refine_table_token_base, owning_expert]
                 sf_base = expert_table[self.refine_table_sf_base, owning_expert]
                 resolved[self.refine_claim_data_row] = data_base + rows_before
                 resolved[self.refine_claim_sf_row] = sf_base + rows_before
@@ -5707,12 +5715,12 @@ class GenphaseTokenComm(KernelComponent):
                     blocks_per_slot = self.token_slot_rows // self.sf_padding_block
                     block_in_slot = block_in_expert % Int32(blocks_per_slot)
                     rows_in_slot_before = block_in_slot * block_rows
-                    tile_rows = balanced_tile_rows(expert_size, self.token_tile_n)
+                    tile_rows = balanced_tile_rows(token_count, self.token_tile_n)
                     routes_before = (
                         block_in_expert // Int32(blocks_per_slot)
                     ) * tile_rows + rows_in_slot_before
                     live_rows = cutlass.min(
-                        expert_size - routes_before,
+                        token_count - routes_before,
                         cutlass.min(block_rows, tile_rows - rows_in_slot_before),
                     )
                     resolved[self.refine_claim_live_rows] = cutlass.max(
@@ -5720,7 +5728,7 @@ class GenphaseTokenComm(KernelComponent):
                     )
                 else:
                     resolved[self.refine_claim_live_rows] = cutlass.min(
-                        expert_size - rows_before, block_rows
+                        token_count - rows_before, block_rows
                     )
 
             if thread_in_group == Int32(0):
@@ -5746,26 +5754,28 @@ class GenphaseTokenComm(KernelComponent):
         expert_table = self._smem_workspace.tensor(
             self.refine_expert_table_region, smem_base
         )
-        block_base = device_workspace.tensor(self.refine_block_base_region)
-        data_base = device_workspace.tensor(self.data_expert_base_region)
-        sf_base = device_workspace.tensor(self.sf_expert_base_region)
-        expert_sizes = device_workspace.tensor(self.expert_sizes_region)
+        sf_block_base = device_workspace.tensor(self.expert_sf_block_base_region)
+        data_base = device_workspace.tensor(self.expert_token_base_region)
+        sf_base = device_workspace.tensor(self.expert_sf_base_region)
+        expert_num_tokens = device_workspace.tensor(self.expert_num_tokens_region)
 
         for bucket_round in cutlass.range_constexpr(
             ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
         ):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
-                expert_table[self.refine_table_block_base, bucket] = block_base[bucket]
-                expert_table[self.refine_table_data_base, bucket] = data_base[bucket]
+                expert_table[self.refine_table_sf_block_base, bucket] = sf_block_base[
+                    bucket
+                ]
+                expert_table[self.refine_table_token_base, bucket] = data_base[bucket]
                 expert_table[self.refine_table_sf_base, bucket] = sf_base[bucket]
-                # `expert_sizes` only covers live experts; padded buckets read as
+                # `expert_num_tokens` only covers live experts; padded buckets read as
                 # empty so the ownership test rejects them.
-                expert_table[self.refine_table_expert_size, bucket] = Int32(0)
+                expert_table[self.refine_table_expert_num_tokens, bucket] = Int32(0)
                 if bucket < Int32(self.experts_per_rank):
-                    expert_table[self.refine_table_expert_size, bucket] = expert_sizes[
-                        bucket
-                    ]
+                    expert_table[self.refine_table_expert_num_tokens, bucket] = (
+                        expert_num_tokens[bucket]
+                    )
         cute.arch.sync_threads()
         return expert_table
 
@@ -5814,7 +5824,7 @@ class GenphaseTokenComm(KernelComponent):
     def _resolve_block_expert(
         self, expert_table: cute.Tensor, block_index: Int32, lane_idx: Int32
     ) -> Int32:
-        """Which local expert owns a linear refine block.
+        """Which local expert owns a linear SF block.
 
         One lane per bucket, so the answer comes out of a ballot rather than a scan
         every thread repeats. The whole group works on one block, so a scan would
@@ -5833,9 +5843,9 @@ class GenphaseTokenComm(KernelComponent):
             bucket = Int32(bucket_round * 32) + lane_idx
             bucket_owns_block = cutlass.Boolean(False)
             if bucket < Int32(self.local_expert_bucket_count):
-                bucket_base = expert_table[self.refine_table_block_base, bucket]
+                bucket_base = expert_table[self.refine_table_sf_block_base, bucket]
                 bucket_blocks = expert_pool_rows(
-                    expert_table[self.refine_table_expert_size, bucket],
+                    expert_table[self.refine_table_expert_num_tokens, bucket],
                     Int32(self.sf_padding_block),
                     self.token_tile_n,
                     self.token_slot_rows,
@@ -6288,7 +6298,8 @@ class GenphaseTokenComm(KernelComponent):
         tile = chunk_in_expert // chunks_per_tile
         first_in_tile = (chunk_in_expert - tile * chunks_per_tile) * chunk_rows
         tile_routes = cutlass.min(
-            expert_table[self.refine_table_expert_size, expert] - tile * tile_rows,
+            expert_table[self.refine_table_expert_num_tokens, expert]
+            - tile * tile_rows,
             tile_rows,
         )
         rows = cutlass.min(tile_routes - first_in_tile, chunk_rows)
@@ -6296,7 +6307,7 @@ class GenphaseTokenComm(KernelComponent):
         if cutlass.const_expr(self.pull_tile_ready):
             tile_slot = chunk_table[self.pull_table_tile_base, expert] + tile
         pool_row = tile * Int32(self.token_slot_rows) + first_in_tile
-        data_row = expert_table[self.refine_table_data_base, expert] + pool_row
+        data_row = expert_table[self.refine_table_token_base, expert] + pool_row
         sf_row = expert_table[self.refine_table_sf_base, expert] + pool_row
 
         lane_landing = Int32(0)
@@ -6452,39 +6463,41 @@ class GenphaseTokenComm(KernelComponent):
                 chunks = Int32(0)
                 tiles = Int32(0)
                 tile_rows = tile_n
-                expert_size = Int32(0)
+                token_count = Int32(0)
                 if position < Int32(buckets):
                     expert = expert_order[position]
-                    expert_size = expert_table[self.refine_table_expert_size, expert]
+                    token_count = expert_table[
+                        self.refine_table_expert_num_tokens, expert
+                    ]
                 claim_rows = chunk_rows
                 if cutlass.const_expr(
                     self.pull_lead_chunk_rows != self.pull_chunk_rows
                     or self.fc1_token_pool_capacity
                 ):
                     route_end = carried_routes + _warp_inclusive_sum(
-                        expert_size, lane_idx
+                        token_count, lane_idx
                     )
                     carried_routes = Int32(cute.arch.shuffle_sync(route_end, Int32(31)))
                 if cutlass.const_expr(
                     self.pull_lead_chunk_rows != self.pull_chunk_rows
                 ):
                     claim_rows = cutlass.select_(
-                        route_end - expert_size < Int32(self.pull_lead_routes),
+                        route_end - token_count < Int32(self.pull_lead_routes),
                         Int32(self.pull_lead_chunk_rows),
                         chunk_rows,
                     )
                 if position < Int32(buckets):
                     if cutlass.const_expr(self.token_tile_strided):
-                        tile_rows = balanced_tile_rows(expert_size, self.token_tile_n)
+                        tile_rows = balanced_tile_rows(token_count, self.token_tile_n)
                     full_tiles = cutlass.max(
-                        (expert_size + tile_n - Int32(1)) // tile_n, Int32(1)
+                        (token_count + tile_n - Int32(1)) // tile_n, Int32(1)
                     ) - Int32(1)
-                    last_tile_rows = expert_size - full_tiles * tile_rows
+                    last_tile_rows = token_count - full_tiles * tile_rows
                     chunks = (
                         full_tiles * ((tile_rows + claim_rows - Int32(1)) // claim_rows)
                         + (last_tile_rows + claim_rows - Int32(1)) // claim_rows
                     )
-                    tiles = (expert_size + tile_n - Int32(1)) // tile_n
+                    tiles = (token_count + tile_n - Int32(1)) // tile_n
                 chunk_end = carried + _warp_inclusive_sum(chunks, lane_idx)
                 if position < Int32(buckets):
                     chunk_table[self.pull_table_chunk_base, expert] = chunk_end - chunks
@@ -6496,7 +6509,7 @@ class GenphaseTokenComm(KernelComponent):
                         chunk_table[self.pull_table_claim_rows, expert] = claim_rows
                     if cutlass.const_expr(self.fc1_token_pool_capacity):
                         chunk_table[self.pull_table_route_base, expert] = (
-                            route_end - expert_size
+                            route_end - token_count
                         )
                 carried = Int32(cute.arch.shuffle_sync(chunk_end, Int32(31)))
                 if cutlass.const_expr(self.pull_tile_ready):
@@ -6981,7 +6994,7 @@ class GenphaseTokenComm(KernelComponent):
         running total from round to round.
         """
         expert_order = device_workspace.tensor(self.expert_order_region)
-        expert_sizes = device_workspace.tensor(self.expert_sizes_region)
+        expert_num_tokens = device_workspace.tensor(self.expert_num_tokens_region)
         buckets = self.local_expert_bucket_count
         fields = self.pull_lane_fields
         chunk_rows = Int32(self.pull_chunk_rows)
@@ -6991,17 +7004,17 @@ class GenphaseTokenComm(KernelComponent):
         for position_round in cutlass.range_constexpr(ceil_div(buckets, 32)):
             position = Int32(position_round * 32) + lane
             expert = Int32(0)
-            expert_size = Int32(0)
+            token_count = Int32(0)
             chunks = Int32(0)
             if position < Int32(buckets):
                 expert = expert_order[position]
                 if expert < Int32(self.experts_per_rank):
-                    expert_size = expert_sizes[expert]
-                tile_rows = self._pull_tile_rows(expert_size)
+                    token_count = expert_num_tokens[expert]
+                tile_rows = self._pull_tile_rows(token_count)
                 full_tiles = cutlass.max(
-                    (expert_size + tile_n - Int32(1)) // tile_n, Int32(1)
+                    (token_count + tile_n - Int32(1)) // tile_n, Int32(1)
                 ) - Int32(1)
-                last_tile_rows = expert_size - full_tiles * tile_rows
+                last_tile_rows = token_count - full_tiles * tile_rows
                 chunks = (
                     full_tiles * ((tile_rows + chunk_rows - Int32(1)) // chunk_rows)
                     + (last_tile_rows + chunk_rows - Int32(1)) // chunk_rows
@@ -7011,16 +7024,16 @@ class GenphaseTokenComm(KernelComponent):
             table[base + self.pull_lane_expert] = expert
             table[base + self.pull_lane_first_claim] = chunk_end - chunks
             table[base + self.pull_lane_end_claim] = chunk_end
-            table[base + self.pull_lane_size] = expert_size
+            table[base + self.pull_lane_size] = token_count
             carried = Int32(cute.arch.shuffle_sync(chunk_end, Int32(31)))
         return table, carried
 
     @cute.jit
-    def _pull_tile_rows(self, expert_size: Int32) -> Int32:
+    def _pull_tile_rows(self, token_count: Int32) -> Int32:
         """Routes in each of an expert's token tiles but the last (see "Row spaces")."""
         tile_rows = Int32(self.token_tile_n)
         if cutlass.const_expr(self.token_tile_strided):
-            tile_rows = balanced_tile_rows(expert_size, self.token_tile_n)
+            tile_rows = balanced_tile_rows(token_count, self.token_tile_n)
         return tile_rows
 
     @cute.jit
@@ -7067,8 +7080,8 @@ class GenphaseTokenComm(KernelComponent):
                 if owner_round == Int32(position_round):
                     claim[field] = value
         expert = claim[self.pull_lane_expert]
-        data_base = device_workspace.tensor(self.data_expert_base_region)[expert]
-        sf_base = device_workspace.tensor(self.sf_expert_base_region)[expert]
+        data_base = device_workspace.tensor(self.expert_token_base_region)[expert]
+        sf_base = device_workspace.tensor(self.expert_sf_base_region)[expert]
         # Claims never cross a token tile: tile t of the expert holds its routes
         # [t * tile_rows, (t + 1) * tile_rows) at the start of slot t.
         tile_rows = self._pull_tile_rows(claim[self.pull_lane_size])

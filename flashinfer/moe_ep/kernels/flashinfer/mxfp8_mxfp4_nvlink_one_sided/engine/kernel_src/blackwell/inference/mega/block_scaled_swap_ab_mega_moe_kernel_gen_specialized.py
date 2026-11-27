@@ -25,9 +25,9 @@ grid's walk itself stores each route's row at its expert-major pool row, and
 FC1 loads its token tiles from there by tiled TMA, as FC2 does; the Gather-B
 warps then idle. A pool of ``fc1_token_pool_capacity`` rows holds a launch's
 token tiles only up to that many routes in processing order: each launch plans
-the pool from its expert sizes once they are final (``_plan_token_pool``), and
-every token tile past it falls back to the landing slots, which stay allocated,
-and to the Gather-B warps. Under
+the pool from its experts' token counts once they are final
+(``_plan_token_pool``), and every token tile past it falls back to the landing
+slots, which stay allocated, and to the Gather-B warps. Under
 the pull dispatch a fourth warpgroup can fetch the routed rows from their source
 ranks into that plane instead of walking CTAs of the communication grid, which
 then ends with the plan and holds no SM through the fetch.
@@ -83,7 +83,7 @@ most 128 routes per tile reaches only instruction N 128, and the wider tile's
 token stages then cost the AB ring depth the MMA needs at that N. The kernel can
 therefore carry a second configuration of its mainloop and epilogue at N128
 (``alternate_tile_n``) that runs the same plan: the same tiles, rows and slots.
-Each launch picks one once the plan's expert sizes are final, which the first
+Each launch picks one once the plan's expert token counts are final, which the first
 FC1 tile waits for anyway (``_choose_token_tile``), and every warp role then
 runs the chosen configuration's body. The two SMEM plans overlay one allocation,
 so each configuration initializes its own barriers and TMEM after the choice;
@@ -1143,9 +1143,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         token tile of the plan has more rows than it holds. Its own split AB ring
         (``alternate_token_ab_stages`` token stages, 0 for one shared ring) and
         weight eviction (``alternate_weight_evict``) size it. Each launch picks
-        one configuration once its expert sizes are known (``_choose_token_tile``):
-        ``token_tile_choice`` "rule" applies the choice rule, "primary" keeps the
-        plan's own tile N in a kernel that carries both.
+        one configuration once its experts' token counts are known
+        (``_choose_token_tile``): ``token_tile_choice`` "rule" applies the choice
+        rule, "primary" keeps the plan's own tile N in a kernel that carries both.
         """
         self.alternate_tile_n = impl_desc.get("alternate_tile_n", 0)
         self.alternate_token_ab_stages = impl_desc.get("alternate_token_ab_stages", 0)
@@ -1809,8 +1809,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         canonical_activation_sf = self.token_comm.canonical_activation_sf_tensor(
             self._device_workspace
         )
-        scheduler_expert_sizes = self.token_comm.scheduler_expert_sizes_tensor(
-            self._device_workspace
+        scheduler_expert_num_tokens = (
+            self.token_comm.scheduler_expert_num_tokens_tensor(self._device_workspace)
         )
         fc1_output = self._device_workspace.tensor(self.fc1_output_region)
         fc1_output_sf = self._device_workspace.tensor(self.fc1_output_sf_region)
@@ -2235,7 +2235,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             fc1_output_tma_tensor,
             fc2_output,
             (experts, intermediate_gateup, hidden),
-            scheduler_expert_sizes,
+            scheduler_expert_num_tokens,
             peer_rank_ptr_mapper,
             local_workspace,
             shared_workspace,
@@ -2636,9 +2636,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         fc1_output_tma_tensor: cute.Tensor,
         fc2_output: cute.Tensor,
         actual_expert_shape: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
-        # Per-expert sizes in the order the scheduler walks them, which is the
+        # Per-expert token counts in the order the scheduler walks them, which is the
         # processing order rather than the expert order.
-        scheduler_expert_sizes: cute.Tensor,
+        scheduler_expert_num_tokens: cute.Tensor,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
@@ -2847,7 +2847,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 hidden=hidden,
                 intermediate_gateup=intermediate_gateup,
                 actual_expert_shape=actual_expert_shape,
-                scheduler_expert_sizes=scheduler_expert_sizes,
+                scheduler_expert_num_tokens=scheduler_expert_num_tokens,
                 peer_rank_ptr_mapper=peer_rank_ptr_mapper,
                 token_src_metadata=token_src_metadata,
                 gather_index=gather_index,
@@ -2864,7 +2864,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             )
         else:
             # The entry weight prefetch does not depend on the plan, so it leaves
-            # before the choice waits for the expert sizes.
+            # before the choice waits for the experts' token counts.
             if cutlass.const_expr(self.entry_prefetch_bytes > 0):
                 if warp_idx < len(self.epilogue_warp_ids):
                     iket.range_push("epilogue.entry_prefetch")
@@ -2925,7 +2925,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                     hidden=hidden,
                     intermediate_gateup=intermediate_gateup,
                     actual_expert_shape=actual_expert_shape,
-                    scheduler_expert_sizes=scheduler_expert_sizes,
+                    scheduler_expert_num_tokens=scheduler_expert_num_tokens,
                     peer_rank_ptr_mapper=peer_rank_ptr_mapper,
                     token_src_metadata=token_src_metadata,
                     gather_index=gather_index,
@@ -2959,7 +2959,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                         hidden=hidden,
                         intermediate_gateup=intermediate_gateup,
                         actual_expert_shape=actual_expert_shape,
-                        scheduler_expert_sizes=scheduler_expert_sizes,
+                        scheduler_expert_num_tokens=scheduler_expert_num_tokens,
                         peer_rank_ptr_mapper=peer_rank_ptr_mapper,
                         token_src_metadata=token_src_metadata,
                         gather_index=gather_index,
@@ -2992,7 +2992,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                         hidden=hidden,
                         intermediate_gateup=intermediate_gateup,
                         actual_expert_shape=actual_expert_shape,
-                        scheduler_expert_sizes=scheduler_expert_sizes,
+                        scheduler_expert_num_tokens=scheduler_expert_num_tokens,
                         peer_rank_ptr_mapper=peer_rank_ptr_mapper,
                         token_src_metadata=token_src_metadata,
                         gather_index=gather_index,
@@ -3046,7 +3046,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         pool (``_plan_token_pool``) before the same barrier, and the launch runs
         the primary configuration where there is no alternate.
 
-        The scheduler warp waits for the plan's expert sizes, which the first FC1
+        The scheduler warp waits for the plan's expert token counts, which the first FC1
         tile needs anyway, applies the choice rule, and a CTA barrier hands the
         answer to every warp before any of them initializes the barriers, the
         TMEM or the work queue of the configuration it then runs. Every CTA
@@ -3079,8 +3079,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             )
             lane = cute.arch.lane_idx()
             if cutlass.const_expr(self._alternate is not None):
-                expert_sizes = self._device_workspace.tensor(
-                    self.token_comm.expert_sizes_region
+                expert_num_tokens = self._device_workspace.tensor(
+                    self.token_comm.expert_num_tokens_region
                 )
                 largest_tile = Int32(0)
                 for batch in cutlass.range_constexpr(
@@ -3090,7 +3090,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                     if expert < Int32(self.local_expert_count):
                         largest_tile = cutlass.max(
                             largest_tile,
-                            balanced_tile_rows(expert_sizes[expert], self.cta_tile_n),
+                            balanced_tile_rows(
+                                expert_num_tokens[expert], self.cta_tile_n
+                            ),
                         )
                 for step in cutlass.range_constexpr(5):
                     largest_tile = cutlass.max(
@@ -3140,7 +3142,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     def _plan_token_pool(
         self, plan: cute.Tensor, lane: Int32, linear_cta_idx: Int32
     ) -> None:
-        """The scheduler warp's plan of a token pool with a capacity, once the expert sizes are final.
+        """The scheduler warp's plan of a token pool with a capacity, once the token counts are final.
 
         The pool holds the launch's routes in processing order, the order the
         scheduler walks (see GenphaseTokenComm, "Pull dispatch"). Word
@@ -3155,7 +3157,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         CTA 0 records the launch's routes and capacity in
         ``token_pool_record_region``.
         """
-        expert_sizes_in_order = self.token_comm.scheduler_expert_sizes_tensor(
+        expert_num_tokens_in_order = self.token_comm.scheduler_expert_num_tokens_tensor(
             self._device_workspace
         )
         expert_order = self.token_comm.expert_order_tensor(self._device_workspace)
@@ -3164,7 +3166,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             position = Int32(batch * 32) + lane
             size = Int32(0)
             if position < Int32(self.local_expert_count):
-                size = expert_sizes_in_order[position]
+                size = expert_num_tokens_in_order[position]
             route_end = carried + _warp_inclusive_sum(size, lane)
             if position < Int32(self.local_expert_count):
                 plan[Int32(1) + expert_order[position]] = (
@@ -3200,7 +3202,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         hidden,
         intermediate_gateup,
         actual_expert_shape,
-        scheduler_expert_sizes: cute.Tensor,
+        scheduler_expert_num_tokens: cute.Tensor,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         token_src_metadata: cute.Tensor,
         gather_index: cute.Tensor,
@@ -3287,7 +3289,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             allocator_warp_id=self.epilogue_warp_ids[0],
         )
         self.scheduler.assign_device_members(
-            expert_token_sizes=scheduler_expert_sizes,
+            expert_token_sizes=scheduler_expert_num_tokens,
             expert_token_prefix_sum=None,
             actual_expert_shape=actual_expert_shape,
             block_idx=block_idx,
@@ -3388,7 +3390,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                         )
             iket.range_push("scheduler.wait_sizes_ready")
             # One communication CTA (the helper, or planner 0 under the Sentinel
-            # dispatch) publishes `expert_sizes` once, so the target is one rather
+            # dispatch) publishes `expert_num_tokens` once, so the target is one rather
             # than a derived count.
             spin_wait(
                 self._device_workspace.ptr(self.token_comm.sizes_ready_region),
@@ -3489,8 +3491,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 ab_pipeline_state=tma_a_pipeline_state,
                 sched_consumer=sched_consumer,
                 kernel_extension=kernel_extension,
-                expert_sizes=self._device_workspace.tensor(
-                    self.token_comm.expert_sizes_region
+                expert_num_tokens=self._device_workspace.tensor(
+                    self.token_comm.expert_num_tokens_region
                 ),
                 claim_gate=claim_gate,
                 claim_lead_k_tiles=self.claim_lead_k_tiles,
@@ -3518,8 +3520,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 fc1_sf_ready_pointer=self._device_workspace.ptr(
                     self.token_comm.fc1_sf_ready_region
                 ),
-                expert_sizes=self._device_workspace.tensor(
-                    self.token_comm.expert_sizes_region
+                expert_num_tokens=self._device_workspace.tensor(
+                    self.token_comm.expert_num_tokens_region
                 ),
                 fc1_tile_ready_pointer=(
                     self._device_workspace.ptr(self.token_comm.fc1_tile_ready_region)

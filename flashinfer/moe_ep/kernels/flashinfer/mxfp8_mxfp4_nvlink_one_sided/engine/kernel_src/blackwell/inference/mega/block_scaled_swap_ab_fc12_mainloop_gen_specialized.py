@@ -1585,7 +1585,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         return {"cache_policy": policy}
 
     @cute.jit
-    def _weight_cache_policy(self, work_tile, expert_sizes: cute.Tensor):
+    def _weight_cache_policy(self, work_tile, expert_num_tokens: cute.Tensor):
         if cutlass.const_expr(self.weight_evict == "first"):
             return Int64(_EVICT_FIRST)
         policy = Int64(_EVICT_NORMAL)
@@ -1594,7 +1594,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             # them may be partial; the last one is the last reader.
             if (work_tile.tile_n_idx + Int32(1)) * Int32(
                 self.plan_tile_n
-            ) >= expert_sizes[work_tile.expert_idx]:
+            ) >= expert_num_tokens[work_tile.expert_idx]:
                 policy = Int64(_EVICT_FIRST)
         elif work_tile.valid_tokens_in_cta_tile < Int32(self.plan_tile_n):
             policy = Int64(_EVICT_FIRST)
@@ -1636,7 +1636,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         ab_pipeline_state: pipeline.PipelineState,
         sched_consumer: SchedulerConsumer,
         kernel_extension: BlockScaledSwapAbFc12Extension,
-        expert_sizes: cute.Tensor,
+        expert_num_tokens: cute.Tensor,
         claim_gate: Optional[cute.Pointer] = None,
         claim_lead_k_tiles: int = 1,
         shared_tma: Optional[Tuple] = None,
@@ -1665,7 +1665,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 ab_pipeline_state=ab_pipeline_state,
                 sched_consumer=sched_consumer,
                 kernel_extension=kernel_extension,
-                expert_sizes=expert_sizes,
+                expert_num_tokens=expert_num_tokens,
                 claim_gate=claim_gate,
                 claim_lead_k_tiles=claim_lead_k_tiles,
                 shared_tma=shared_tma,
@@ -1697,7 +1697,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 if is_fc1:
                     iket.range_push("tma_weight_fc1")
                     k_tile_count = self.fc1_k_tile_count
-                    weight_policy = self._weight_cache_policy(work_tile, expert_sizes)
+                    weight_policy = self._weight_cache_policy(
+                        work_tile, expert_num_tokens
+                    )
                     weight_tile, mma_tile_m = self._weight_tile(work_tile, 0)
                     real_a, a_descriptor_ptr = kernel_extension.get_gmem_tensor(
                         "a", fc1_tma_a_tensor, weight_tile
@@ -1791,7 +1793,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 else:
                     iket.range_push("tma_weight_fc2")
                     k_tile_count = self.fc2_k_tile_count
-                    weight_policy = self._weight_cache_policy(work_tile, expert_sizes)
+                    weight_policy = self._weight_cache_policy(
+                        work_tile, expert_num_tokens
+                    )
                     weight_tile, mma_tile_m = self._weight_tile(work_tile, 1)
                     real_a, a_descriptor_ptr = kernel_extension.get_gmem_tensor(
                         "a", fc2_tma_a_tensor, weight_tile
@@ -1895,7 +1899,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         ab_pipeline_state: pipeline.PipelineState,
         sched_consumer: SchedulerConsumer,
         kernel_extension: BlockScaledSwapAbFc12Extension,
-        expert_sizes: cute.Tensor,
+        expert_num_tokens: cute.Tensor,
         claim_gate: Optional[cute.Pointer] = None,
         claim_lead_k_tiles: int = 1,
         shared_tma: Optional[Tuple] = None,
@@ -1960,7 +1964,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                             fc2_tma_sfa_tensor,
                             fc2_tma_sfa_atom,
                         ),
-                        expert_sizes,
+                        expert_num_tokens,
                         ab_pipeline_state,
                         **tile_loads,
                     )
@@ -1980,7 +1984,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                         fc2_tma_sfa_tensor,
                         fc2_tma_sfa_atom,
                     ),
-                    expert_sizes,
+                    expert_num_tokens,
                     ab_pipeline_state,
                     **tile_loads,
                 )
@@ -1995,7 +1999,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         is_fc1,
         fc1_tma: Tuple,
         fc2_tma: Tuple,
-        expert_sizes: cute.Tensor,
+        expert_num_tokens: cute.Tensor,
         ab_pipeline_state: pipeline.PipelineState,
         **tile_loads,
     ) -> pipeline.PipelineState:
@@ -2004,7 +2008,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         fc2_tma_a_tensor, fc2_tma_a_atom, fc2_tma_sfa_tensor, fc2_tma_sfa_atom = fc2_tma
         if is_fc1:
             iket.range_push("tma_weight_fc1")
-            weight_policy = self._weight_cache_policy(work_tile, expert_sizes)
+            weight_policy = self._weight_cache_policy(work_tile, expert_num_tokens)
             weight_tile, mma_tile_m = self._weight_tile(work_tile, 0)
             ab_pipeline_state = self._load_weight_tile(
                 fc1_tma_a_tensor,
@@ -2022,7 +2026,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             )
         else:
             iket.range_push("tma_weight_fc2")
-            weight_policy = self._weight_cache_policy(work_tile, expert_sizes)
+            weight_policy = self._weight_cache_policy(work_tile, expert_num_tokens)
             weight_tile, mma_tile_m = self._weight_tile(work_tile, 1)
             ab_pipeline_state = self._load_weight_tile(
                 fc2_tma_a_tensor,
@@ -2241,7 +2245,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         fc1_done_counter_pointer: cute.Pointer,
         fc2_spin_threshold: Int32,
         fc1_sf_ready_pointer: cute.Pointer,
-        expert_sizes: cute.Tensor,
+        expert_num_tokens: cute.Tensor,
         fc1_tile_ready_pointer: Optional[cute.Pointer] = None,
         first_fc1_stamp: Optional[cute.Pointer] = None,
         claim_gate: Optional[cute.Pointer] = None,
@@ -2269,7 +2273,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         meets the Gather-B warps on every other tile.
 
         The FC1 scale factors are gated per expert rather than once for the whole
-        pool: the communication kernel counts refine blocks into
+        pool: the communication kernel counts SF blocks into
         ``fc1_sf_ready_pointer``, and both sides walk experts in the same order, so
         this tile only has to outlast its own expert's blocks.
 
@@ -2281,7 +2285,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         gate (the FC1 scale factors or the FC2 ``fc1_done`` count).
 
         ``fc1_ready_counts_routes`` makes the gate's target the expert's route
-        count rather than its refine blocks, for a dispatch that counts routes.
+        count rather than its SF blocks, for a dispatch that counts routes.
         ``fc1_tile_ready_pointer``, when given, gates each FC1 tile on its own
         token tile instead: the slot ``cumulative_token_block_count +
         tile_n_idx`` counts the tile's landed routes, and the gate waits for the
@@ -2310,7 +2314,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 fc1_done_counter_pointer=fc1_done_counter_pointer,
                 fc2_spin_threshold=fc2_spin_threshold,
                 fc1_sf_ready_pointer=fc1_sf_ready_pointer,
-                expert_sizes=expert_sizes,
+                expert_num_tokens=expert_num_tokens,
                 fc1_tile_ready_pointer=fc1_tile_ready_pointer,
                 first_fc1_stamp=first_fc1_stamp,
                 claim_gate=claim_gate,
@@ -2371,10 +2375,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                         )
                     else:
                         if cutlass.const_expr(fc1_ready_counts_routes):
-                            fc1_ready_target = expert_sizes[expert_idx]
+                            fc1_ready_target = expert_num_tokens[expert_idx]
                         else:
                             fc1_ready_target = expert_pool_rows(
-                                expert_sizes[expert_idx],
+                                expert_num_tokens[expert_idx],
                                 Int32(self.sf_padding_block),
                                 self.plan_tile_n,
                                 self.token_slot_rows,
@@ -2783,7 +2787,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         fc1_done_counter_pointer: cute.Pointer,
         fc2_spin_threshold: Int32,
         fc1_sf_ready_pointer: cute.Pointer,
-        expert_sizes: cute.Tensor,
+        expert_num_tokens: cute.Tensor,
         fc1_tile_ready_pointer: Optional[cute.Pointer] = None,
         first_fc1_stamp: Optional[cute.Pointer] = None,
         claim_gate: Optional[cute.Pointer] = None,
@@ -2838,7 +2842,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             fc1_tma_sfb_tensor=fc1_tma_sfb_tensor,
             fc1_tma_sfb_atom=fc1_tma_sfb_atom,
             fc1_sf_ready_pointer=fc1_sf_ready_pointer,
-            expert_sizes=expert_sizes,
+            expert_num_tokens=expert_num_tokens,
             fc1_tile_ready_pointer=fc1_tile_ready_pointer,
             first_fc1_stamp=first_fc1_stamp,
             claim_gate=claim_gate,
@@ -2925,7 +2929,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
         fc1_tma_sfb_tensor: cute.Tensor,
         fc1_tma_sfb_atom: cute.CopyAtom,
         fc1_sf_ready_pointer: cute.Pointer,
-        expert_sizes: cute.Tensor,
+        expert_num_tokens: cute.Tensor,
         fc1_tile_ready_pointer: Optional[cute.Pointer],
         first_fc1_stamp: Optional[cute.Pointer],
         claim_gate: Optional[cute.Pointer],
@@ -2956,10 +2960,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
             )
         else:
             if cutlass.const_expr(fc1_ready_counts_routes):
-                fc1_ready_target = expert_sizes[expert_idx]
+                fc1_ready_target = expert_num_tokens[expert_idx]
             else:
                 fc1_ready_target = expert_pool_rows(
-                    expert_sizes[expert_idx],
+                    expert_num_tokens[expert_idx],
                     Int32(self.sf_padding_block),
                     self.plan_tile_n,
                     self.token_slot_rows,

@@ -364,7 +364,7 @@ class BlockScaledMoeConfig:
     # GenPhase under a strided token tile (N192, N240): a second configuration of
     # the main kernel's mainloop and epilogue at this token tile N, which runs the
     # same plan's token tiles while each of them fits it; every launch picks one
-    # once its expert sizes are known (``token_tile_choice``). 0 compiles none
+    # once its experts' token counts are known (``token_tile_choice``). 0 compiles none
     # (None: ALTERNATE_TOKEN_TILE_N under a strided tile at cluster (2, 1)).
     alternate_token_tile_n: Optional[int] = None
     # Token stages of the alternate tile's split AB ring, or 0 for one shared ring
@@ -465,7 +465,7 @@ class BlockScaledMoeConfig:
     # "balanced" sizes the shared token tiles to fit it where a balanced plan, every
     # local expert at the expected load, would take it; "always" wherever the kernel
     # carries one; "never" keeps the plan's tile N. Fitting holds the head until the
-    # launch has chosen its configuration from the plan's expert sizes, and costs
+    # launch has chosen its configuration from the plan's expert token counts, and costs
     # more shared weight reads per token. Placement only: the output is the same
     # bit for bit.
     shared_alternate_token_tile: Literal["never", "balanced", "always"] = "never"

@@ -1072,9 +1072,9 @@ class _MetadataPushRouter(KernelComponent):
         for expert_round in cutlass.range_constexpr(padded_expert_rounds):
             expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
             if expert < Int32(self.expert_count_padded):
-                expert_size = sizes[expert]
+                token_count = sizes[expert]
                 padded_totals[expert] = (
-                    (expert_size + Int32(self.token_padding_block - 1))
+                    (token_count + Int32(self.token_padding_block - 1))
                     // Int32(self.token_padding_block)
                 ) * Int32(self.token_padding_block)
         cute.arch.sync_threads()
@@ -1417,10 +1417,10 @@ class _MetadataPushRouter(KernelComponent):
                         )
 
     @cute.jit
-    def local_expert_sizes(
+    def local_expert_num_tokens(
         self, device_workspace: DeviceWorkspace, local_rank: Int32
     ) -> cute.Tensor:
-        """Return this rank's contiguous expert-size view."""
+        """Return this rank's contiguous expert token-count view."""
         sizes = device_workspace.tensor(self.sizes_region)
         expert_begin = local_rank * Int32(self.experts_per_rank)
         return cute.make_tensor(
@@ -1514,7 +1514,7 @@ class TokenCommNonDeterministic(KernelComponent):
 
     token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"
     token_back_mbarrier_region = "nvlink.token_comm.main_smem.token_back_mbarriers"
-    expert_sizes_smem_region = "nvlink.token_comm.main_smem.expert_sizes"
+    expert_num_tokens_smem_region = "nvlink.token_comm.main_smem.expert_num_tokens"
     token_in_activation_smem_region = "nvlink.token_comm.main_smem.token_in_activation"
     token_in_sf_smem_region = "nvlink.token_comm.main_smem.token_in_sf"
     token_back_activation_smem_region = (
@@ -1786,10 +1786,10 @@ class TokenCommNonDeterministic(KernelComponent):
         )
 
     @cute.jit
-    def local_expert_sizes(
+    def local_expert_num_tokens(
         self, device_workspace: DeviceWorkspace, local_rank: Int32
     ) -> cute.Tensor:
-        return self._router.local_expert_sizes(device_workspace, local_rank)
+        return self._router.local_expert_num_tokens(device_workspace, local_rank)
 
     @cute.jit
     def wait_for_sizes_ready(
@@ -1968,7 +1968,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 self.token_back_mbarrier_region, self.transfer_warp_count
             )
         workspace.register_tensor(
-            self.expert_sizes_smem_region,
+            self.expert_num_tokens_smem_region,
             cutlass.Int32,
             (self.experts_per_rank,),
             byte_alignment=16,
@@ -2173,7 +2173,9 @@ class TokenCommNonDeterministic(KernelComponent):
         self._router.wait_for_sizes_ready(self._device_workspace)
         iket.range_pop()
         iket.range_push("token_in.stage_sizes")
-        owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
+        owned_sizes = smem_workspace.tensor(
+            self.expert_num_tokens_smem_region, smem_base
+        )
         owner_expert_begin = self._local_rank * Int32(self.experts_per_rank)
         source_sizes = cute.make_tensor(
             sizes.iterator + owner_expert_begin,
@@ -2511,7 +2513,9 @@ class TokenCommNonDeterministic(KernelComponent):
             cute.arch.mbarrier_init(worker_mbarrier, 1)
         cute.arch.sync_warp()
 
-        owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
+        owned_sizes = smem_workspace.tensor(
+            self.expert_num_tokens_smem_region, smem_base
+        )
         if cutlass.const_expr(self.token_back_mode == "standalone_warps"):
             sizes_ready_barrier = pipeline.NamedBarrier(
                 barrier_id=self.standalone_size_barrier_id,
