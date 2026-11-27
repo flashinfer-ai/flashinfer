@@ -1249,7 +1249,9 @@ def build_sdist(sdist_directory, config_settings=None):
 # _EXPERIMENTAL_SOURCES_KEEP.
 # Experimental features are JIT-only and intended for main-branch users
 # (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
-# 100 MB. Python modules, build.json manifests and route catalogs stay,
+# 300 MiB (raised on request from PyPI's 100 MiB default; see
+# docs/development/jit_and_build.md, "PyPI file size limit"). Python modules,
+# build.json manifests and route catalogs stay,
 # so `import flashinfer` is unchanged. Loads requiring omitted sources fail on
 # first use; the marker file below explains how to obtain those sources.
 _EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"

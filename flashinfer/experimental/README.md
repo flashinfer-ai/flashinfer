@@ -346,7 +346,9 @@ for graduation.
 Release wheels published to PyPI omit most experimental packages' generated
 kernel sources (`csrc/**` and `csrc/experimental/**`): the release
 workflow builds with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` so that
-`flashinfer-python` stays under PyPI's per-file size limit (#7977). The Python
+`flashinfer-python` stays under its 300 MiB PyPI per-file limit, raised on
+request from PyPI's 100 MiB default (#7977; see
+[PyPI file size limit](../../docs/development/jit_and_build.md#pypi-file-size-limit)). The Python
 modules stay importable, but loads requiring omitted sources raise;
 `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt` explains the omissions.
 Nightly wheels on https://flashinfer.ai/whl and source installs include the

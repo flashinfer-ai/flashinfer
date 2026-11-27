@@ -1,0 +1,87 @@
+# Nightly early warning for the size of the flashinfer-python files on PyPI.
+#
+# PyPI rejects files above the project's per-file limit: 300 MiB for
+# flashinfer-python, which we requested from PyPI (the default is 100 MiB; see
+# docs/development/jit_and_build.md, "PyPI file size limit"). A release that
+# crosses it fails only at upload time.
+# This builds, from main, the same two files release.yml uploads (the sdist and
+# the wheel with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1) and posts to
+# #swdl-flashinfer-ci every night the largest one is at or above 250 MiB, so
+# the package can be slimmed before a release is blocked. Below the threshold
+# it only records the sizes in the job summary.
+#
+# It builds the Python package alone, not the cubin or JIT-cache wheels, which
+# are not uploaded to PyPI by release.yml. A manual dispatch from another
+# branch measures that branch but never posts to Slack.
+#
+# Requires the SLACK_BOT_PYPI_SIZE_CHECKER_TOKEN repository secret: a bot token
+# with chat:write whose app has been added to the channel. The check step
+# passes it to the script as SLACK_BOT_TOKEN.
+name: PyPI Package Size
+
+on:
+  schedule:
+    # 06:00 UTC, after the 00:00 UTC nightly release has started its builds.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print the Slack alert instead of posting it'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-package-size-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WARN_MIB: '250'
+  LIMIT_MIB: '300'
+  # #swdl-flashinfer-ci
+  SLACK_CHANNEL: C09AY3CNFEK
+
+jobs:
+  check-size:
+    if: github.repository == 'flashinfer-ai/flashinfer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel
+
+      # Same build as release-build.yml's build-flashinfer-python job with
+      # release.yml's inputs: no dev suffix and experimental sources excluded.
+      - name: Build flashinfer-python wheel and sdist as released
+        env:
+          FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES: '1'
+        run: |
+          python -m build
+          ls -l dist/
+
+      - name: Check size and alert Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_PYPI_SIZE_CHECKER_TOKEN }}
+          # Alert only for main; dispatches from other branches are dry runs.
+          DRY_RUN: ${{ github.ref != 'refs/heads/main' || inputs.dry_run == true }}
+        run: |
+          ARGS=(--dist-dir dist --warn-mib "${WARN_MIB}" --limit-mib "${LIMIT_MIB}"
+                --slack-channel "${SLACK_CHANNEL}")
+          if [ "${DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python3 scripts/infra/check_pypi_package_size.py "${ARGS[@]}"
