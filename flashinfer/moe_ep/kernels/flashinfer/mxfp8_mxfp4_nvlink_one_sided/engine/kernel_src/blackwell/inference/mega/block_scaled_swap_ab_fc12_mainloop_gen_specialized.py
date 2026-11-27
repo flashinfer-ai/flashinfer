@@ -3545,8 +3545,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
     ) -> None:
         """Gather dense-order FC1 activations directly into B SMEM.
 
-        gather_index holds rows of the round's landing set; gather_row_offset
-        moves them to that set's rows of the descriptor, which spans both sets.
+        gather_index holds rows of the round's ping-pong buffer; gather_row_offset
+        moves them to that buffer's rows of the descriptor, which spans both.
 
         Under a token pool with a capacity, TMA-B loads the token tiles the
         launch's ``token_pool_plan`` places in the pool (see ``run_tma_b``), and

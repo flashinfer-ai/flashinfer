@@ -38,7 +38,7 @@ poller CTAs poll their combine slots while FC2 is still running; its
 housekeeping CTAs wait for this grid, which has itself drained the
 communication grid, before they reset landing rows and clear the local counters
 this round used. Under the Sentinel combine no cross-rank barrier is needed:
-every peer-written region is a landing set whose bytes announce their arrival.
+every peer-written region of the ping-pong buffers announces its own arrival.
 The counter (Fence) combine ends this kernel with one all-rank tail barrier
 instead (``tail_barrier``): after the grid's last FC2 store it publishes this
 rank's pushes, and leaving it means every peer's pushes into this rank have
@@ -198,7 +198,7 @@ from .token_comm_gen_specialized import (
     GenphaseTokenCommArgs,
     _warp_inclusive_sum,
 )
-from .combine_reduce import CombineTopkReduce, SetNvlinkBarrier
+from .combine_reduce import CombineTopkReduce, PingPongNvlinkBarrier
 
 
 _aot_symbol_prefix = "blackwell_genphase_mega_moe_aot"
@@ -236,7 +236,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     )
     # In-kernel top-k reduce: the output's zeroing (see ``_zero_output``). Chunks
     # claimed and chunks zeroed on this rank, and the ranks whose output is zeroed
-    # this round, which each rank adds to in every rank's set.
+    # this round, which each rank adds to in every rank's ping-pong buffer.
     output_zero_claim_region: ClassVar[str] = "blackwell.genphase_moe.output_zero_claim"
     output_zero_done_region: ClassVar[str] = "blackwell.genphase_moe.output_zero_done"
     output_zeroed_ranks_region: ClassVar[str] = (
@@ -698,7 +698,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         # The counter combine publishes this rank's finished pushes with one
         # all-rank barrier after the grid's last FC2 store.
         self.tail_barrier = (
-            SetNvlinkBarrier(
+            PingPongNvlinkBarrier(
                 world_size=self.world_size, barrier_id=self.tail_barrier_id
             )
             if self.combine_protocol == "counter"
@@ -1347,8 +1347,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                     byte_alignment=16,
                     reset="tail_reset",
                 )
-            # Peers add into this rank's word of the round's set; the end-of-round
-            # reset clears it, and peers next add into this set two rounds later.
+            # Peers add into this rank's word in the round's ping-pong buffer; the
+            # end-of-round reset clears it, and peers next add into that buffer two
+            # rounds later.
             device_workspace.register(
                 self.output_zeroed_ranks_region,
                 cutlass.Int32,
@@ -1370,19 +1371,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             self.tail_barrier.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         device_workspace.finalize()
-        # Two landing sets alternate by round. Their stride is a whole number of
-        # dense activation rows, so one Gather4 descriptor spanning both sets
-        # reaches set 1's row r at row r + gather_set_row_offset.
+        # The ping and pong buffers alternate by round. Their stride is a whole
+        # number of dense activation rows, so one Gather4 descriptor spanning both
+        # reaches the pong buffer's row r at row r + gather_pong_row_offset.
         data_row_bytes = (
             self.token_comm.plain_activation_row_elements
             * int(self.token_comm.activation_dtype.width)
             // 8
         )
-        self.shared_set_bytes = round_up(
+        self.pingpong_buffer_bytes = round_up(
             device_workspace.total_bytes("shared"), math.lcm(4096, data_row_bytes)
         )
-        self.gather_set_row_offset = self.shared_set_bytes // data_row_bytes
-        self.token_comm.shared_set_bytes = self.shared_set_bytes
+        self.gather_pong_row_offset = self.pingpong_buffer_bytes // data_row_bytes
+        self.token_comm.pingpong_buffer_bytes = self.pingpong_buffer_bytes
         # Regions whose bytes announce their own arrival; armed with 0xFF at allocation.
         landing_regions = [
             (self.token_comm.plain_activation_region, self.dispatch_protocol),
@@ -1876,7 +1877,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             fc1_b_plane = self.token_comm.dense_activation_tensor(
                 self._device_workspace
             )
-            fc1_b_rows = self.gather_set_row_offset + fc1_b_plane.shape[0]
+            fc1_b_rows = self.gather_pong_row_offset + fc1_b_plane.shape[0]
         fc1_b = cute.make_tensor(
             fc1_b_plane.iterator,
             cute.make_layout(
@@ -2502,8 +2503,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         each zeroes its chunks with 16-byte stores and adds them to the done count
         with a release. The warp whose add completes the count publishes the zeroed
         output to every rank with a system-scope add into that rank's word of the
-        round's set, which every epilogue thread acquires before its first tile
-        (``_wait_outputs_zeroed``). The zeroing thus overlaps the plan.
+        round's ping-pong buffer, which every epilogue thread acquires before its
+        first tile (``_wait_outputs_zeroed``). The zeroing thus overlaps the plan.
         """
         chunk = self.output_zero_chunk_bytes
         total_bytes = self.max_tokens_per_rank * self.hidden_size * 2
@@ -2706,17 +2707,18 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         smem_base = storage.buffer.data_ptr()
         # The end-of-round reduce may launch as soon as every CTA here has started.
         cute.arch.griddepcontrol_launch_dependents()
-        round_set = self.token_comm.select_round_set(
+        pingpong_buffer = self.token_comm.select_pingpong_buffer(
             self._device_workspace, local_workspace, shared_workspace
         )
-        # fc2_output addresses set 0; this round's peers expect their partials in this round's set.
-        # Under the in-kernel top-k reduce it is the caller's output, which no set holds.
+        # fc2_output addresses the ping buffer; this round's peers expect their partials in this
+        # round's buffer. Under the in-kernel top-k reduce it is the caller's output, which
+        # neither buffer holds.
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             fc2_output = cute.make_tensor(
                 cute.make_ptr(
                     fc2_output.element_type,
                     fc2_output.iterator.toint()
-                    + Int64(round_set) * Int64(self.shared_set_bytes),
+                    + Int64(pingpong_buffer) * Int64(self.pingpong_buffer_bytes),
                     AddressSpace.gmem,
                     assumed_align=128,
                 ),
@@ -2772,7 +2774,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         )
         if cutlass.const_expr(self.tail_barrier is not None):
             self.tail_barrier.assign_device_members(
-                self._device_workspace, peer_rank_ptr_mapper, round_set
+                self._device_workspace, peer_rank_ptr_mapper, pingpong_buffer
             )
 
         primary_tma = (
@@ -2838,7 +2840,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 cta_coord_in_cluster=cta_coord_in_cluster,
                 linear_cta_idx=linear_cta_idx,
                 smem_base=smem_base,
-                round_set=round_set,
+                pingpong_buffer=pingpong_buffer,
                 fc2_output=fc2_output,
                 fc1_done_counter=fc1_done_counter,
                 fc1_output_sf=fc1_output_sf,
@@ -2916,7 +2918,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                     cta_coord_in_cluster=cta_coord_in_cluster,
                     linear_cta_idx=linear_cta_idx,
                     smem_base=smem_base,
-                    round_set=round_set,
+                    pingpong_buffer=pingpong_buffer,
                     fc2_output=fc2_output,
                     fc1_done_counter=fc1_done_counter,
                     fc1_output_sf=fc1_output_sf,
@@ -2950,7 +2952,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                         cta_coord_in_cluster=cta_coord_in_cluster,
                         linear_cta_idx=linear_cta_idx,
                         smem_base=smem_base,
-                        round_set=round_set,
+                        pingpong_buffer=pingpong_buffer,
                         fc2_output=fc2_output,
                         fc1_done_counter=fc1_done_counter,
                         fc1_output_sf=fc1_output_sf,
@@ -2983,7 +2985,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                         cta_coord_in_cluster=cta_coord_in_cluster,
                         linear_cta_idx=linear_cta_idx,
                         smem_base=smem_base,
-                        round_set=round_set,
+                        pingpong_buffer=pingpong_buffer,
                         fc2_output=fc2_output,
                         fc1_done_counter=fc1_done_counter,
                         fc1_output_sf=fc1_output_sf,
@@ -3191,7 +3193,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         cta_coord_in_cluster,
         linear_cta_idx: Int32,
         smem_base: cute.Pointer,
-        round_set: Int32,
+        pingpong_buffer: Int32,
         fc2_output: cute.Tensor,
         fc1_done_counter: cute.Tensor,
         fc1_output_sf: cute.Tensor,
@@ -3712,7 +3714,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                         ab_pipeline_state=gather_b_pipeline_state,
                         sched_consumer=sched_consumer,
                         gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
-                        gather_row_offset=round_set * Int32(self.gather_set_row_offset),
+                        gather_row_offset=pingpong_buffer
+                        * Int32(self.gather_pong_row_offset),
                         token_pool_plan=token_pool_plan,
                         **gather_entry_wait,
                     )

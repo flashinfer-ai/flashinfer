@@ -1490,15 +1490,16 @@ class BlockScaledSymmBuffer:
         self.local_workspace = torch.zeros(
             (max(local_bytes, 1),), dtype=torch.uint8, device="cuda"
         )
-        # Two landing sets alternate by round. Every landing region starts armed with
-        # 0xFF bytes in both sets, and no peer may push before every rank has armed.
-        set_bytes = int(kernel.shared_set_bytes)
+        # The ping and pong buffers alternate by round. Every landing region starts
+        # with the 0xFF init sentinel in both, and no peer may push before every rank
+        # has written it.
+        buffer_bytes = int(kernel.pingpong_buffer_bytes)
         self.shared_workspace = comm.sym_zeros(
-            (2 * set_bytes,), torch.uint8, self.process_group
+            (2 * buffer_bytes,), torch.uint8, self.process_group
         )
-        for landing_set in range(2):
+        for pingpong_buffer in range(2):
             for region in kernel.sentinel_landing_regions:
-                start = landing_set * set_bytes + workspace.offset(region)
+                start = pingpong_buffer * buffer_bytes + workspace.offset(region)
                 self.shared_workspace[start : start + workspace.nbytes(region)].fill_(
                     0xFF
                 )

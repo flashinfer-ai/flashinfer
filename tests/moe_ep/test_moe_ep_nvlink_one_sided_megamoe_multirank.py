@@ -84,7 +84,7 @@ and 4096 tokens per rank: the Sentinel protocols, then the pull dispatch on N64,
 N192 and N240 token tiles, the last into the token pool and with its top-k plane
 split over more exchange CTAs than the list-segment bound allows, since 16
 routes per token among 112 local experts would otherwise outgrow SMEM. Each
-output is checked against both oracles, and reruns on both landing sets and a
+output is checked against both oracles, and reruns on both ping-pong buffers and a
 CUDA graph replay reproduce it bit for bit.
 
 SiTU (``activation="situ"``: ``beta * tanh(gate / beta) * sigmoid(gate) *
@@ -1027,7 +1027,7 @@ def _check_and_reproduce(
 ):
     """Check a full batch, then counts that differ by rank (rank 0 empty), against
     both oracles under ``routing`` ("perfect" or "random"); then rerun the full
-    batch on both landing sets and from a CUDA graph, each of which must give the
+    batch on both ping-pong buffers and from a CUDA graph, each of which must give the
     first output's bits (collective). Returns the full batch and its output.
     """
     import torch
@@ -1367,7 +1367,7 @@ def test_layer_vs_oracle(request, capacity, sync_protocol, knobs):
         )
 
         # Six launches without host synchronization, each with a distinct
-        # batch. Landing sets alternate by round, so each set is reused with
+        # batch. The ping and pong buffers alternate by round, so each is reused with
         # different data; a landing row or combine slot that kept a previous
         # round's bytes would put that round's token into the output and fail
         # the oracle bound.
@@ -2296,7 +2296,7 @@ def test_kimi_k3(request, capacity, routing):
 
     Each capacity runs its own engine path (``KIMI_K3_PATHS``) on a full batch,
     then on counts that differ by rank (rank 0 empty), under perfect or random
-    routing. The full batch then runs again on both landing sets and from a
+    routing. The full batch then runs again on both ping-pong buffers and from a
     CUDA graph, each giving the first output's bits.
     """
     import torch

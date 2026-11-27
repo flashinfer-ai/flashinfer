@@ -84,7 +84,7 @@ CTA in a source's slab), padded to whole 16-byte vectors with sentinel words.
 
 The rows and the list words announce their own arrival, as the Sentinel inbox
 does: every word of the three inboxes holds the 0xFFFFFFFF init sentinel in
-both landing sets from allocation on, and no word sent into them takes that
+both ping-pong buffers from allocation on, and no word sent into them takes that
 value (a score whose bits do travels as 0x7FFFFFFF). The helper and every
 index-copy CTA poll the count rows with relaxed system loads and run the same
 fold and ranking on them, which break ties the same way in every CTA (by expert
@@ -110,22 +110,22 @@ default; off, every walking CTA acquires all W slots before its first fetch);
 every lane of a main-kernel pull warp acquires all W before its first fetch.
 That edge orders every source's staged activations before the fetches (see
 "Pull dispatch"). A rank's resets precede the writes two rounds later into the
-same landing set: they complete with the rank's communication grid, and every
-peer acquires the rank's ``topk_ready`` release of the next round before the
-peer's grid of the round after that starts.
+same ping-pong buffer: they complete with the rank's communication grid, and
+every peer acquires the rank's ``topk_ready`` release of the next round before
+the peer's grid of the round after that starts.
 
 Sentinel top-k inbox
 -------------------
 Under the Sentinel dispatch the top-k planes carry their own arrival too. Both
-inbox planes start armed with 0xFFFFFFFF words in both landing sets, and each
-exchange CTA writes this rank's whole id and score planes into its peer's slab
-with volatile 16-byte vector stores. The exchange CTAs then turn into W
-replicated planners: each one polls every source's id plane, counts the routes
-per (source, expert) in SMEM and runs the same deterministic fold, processing
-order and data-row scan as every other planner, which give it each expert's
-data-row base and its own source's segment base. Planner 0 publishes the sizes,
-the processing order and ``sizes_ready``, then the data-row, SF-row and
-refine-block bases; above 32 local experts it alone runs the SF-row and
+inbox planes start with the 0xFFFFFFFF init sentinel in both ping-pong buffers,
+and each exchange CTA writes this rank's whole id and score planes into its
+peer's slab with volatile 16-byte vector stores. The exchange CTAs then turn
+into W replicated planners: each one polls every source's id plane, counts the
+routes per (source, expert) in SMEM and runs the same deterministic fold,
+processing order and data-row scan as every other planner, which give it each
+expert's data-row base and its own source's segment base. Planner 0 publishes
+the sizes, the processing order and ``sizes_ready``, then the data-row, SF-row
+and refine-block bases; above 32 local experts it alone runs the SF-row and
 refine-block prefixes (``_plan_bases``). Every planner scatters the routes of
 the source it exchanged with and adds one to ``metadata_ready``, whose target is
 then W. No hand-off between CTAs precedes either counter, and the helper goes
@@ -157,7 +157,7 @@ which offset varies from launch to launch and changes no output.
 ``topk_ready`` keeps its system-scope release, a one issued after the inbox
 stores, which the planner acquires after it has published. Planes observed
 through volatile loads order nothing, and this edge is what orders a rank's
-reduce, which resets the inbox set its peers write two rounds later, before
+reduce, which resets the inbox its peers write two rounds later, before
 those writes. It also tells a late peer from a lost word: the planners' polls
 are the round's first wait on the peers, so they wait for a peer that has not
 launched for as long as it takes, and trap only once every source's
@@ -976,9 +976,9 @@ class GenphaseTokenComm(KernelComponent):
                 "comm_exchange_ctas", self.default_exchange_cta_count
             )
         self._smem_workspace = self._build_smem_workspace()
-        # Byte stride between the two landing sets of the symmetric workspace. The
-        # owning kernel sets it once its workspace is finalized.
-        self.shared_set_bytes: Optional[int] = None
+        # Byte stride between the ping and pong buffers of the symmetric workspace.
+        # The owning kernel sets it once its workspace is finalized.
+        self.pingpong_buffer_bytes: Optional[int] = None
 
     def _validate_configuration(self) -> None:
         positive_fields = (
@@ -1699,7 +1699,7 @@ class GenphaseTokenComm(KernelComponent):
         )
 
     def _register_local_regions(self, workspace: DeviceWorkspace) -> None:
-        # Both start at zero: every rank begins on landing set 0, and the reduce's
+        # Both start at zero: every rank begins in the ping buffer, and the reduce's
         # round advance waits for the ticket to count exactly its grid.
         workspace.register(
             self.sentinel_control_region,
@@ -2399,16 +2399,17 @@ class GenphaseTokenComm(KernelComponent):
                 )
 
     @cute.jit
-    def select_round_set(
+    def select_pingpong_buffer(
         self,
         device_workspace: DeviceWorkspace,
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
     ) -> Int32:
-        """Point device_workspace at this round's landing set and return the set index.
+        """Point device_workspace at this round's ping-pong buffer and return its index.
 
-        The symmetric workspace holds two sets shared_set_bytes apart; round
-        epoch uses set epoch & 1. Every kernel of a round reads the same epoch:
+        The symmetric workspace holds the ping and pong buffers
+        pingpong_buffer_bytes apart; round epoch uses buffer epoch & 1 (0 ping,
+        1 pong). Every kernel of a round reads the same epoch:
         only the end-of-round reduce advances it, after the round's other kernels
         have finished.
         """
@@ -2417,17 +2418,17 @@ class GenphaseTokenComm(KernelComponent):
             device_workspace.ptr(self.sentinel_control_region).toint()
             + Int64(self.sentinel_epoch_word * 4)
         )
-        round_set = Int32(epoch & Uint32(1))
-        set_base = shared_workspace.toint() + Int64(round_set) * Int64(
-            self.shared_set_bytes
+        pingpong_buffer = Int32(epoch & Uint32(1))
+        buffer_base = shared_workspace.toint() + Int64(pingpong_buffer) * Int64(
+            self.pingpong_buffer_bytes
         )
         device_workspace.assign_device_members(
             local_workspace,
             cute.make_ptr(
-                cutlass.Uint8, set_base, AddressSpace.gmem, assumed_align=128
+                cutlass.Uint8, buffer_base, AddressSpace.gmem, assumed_align=128
             ),
         )
-        return round_set
+        return pingpong_buffer
 
     # ------------------------------------------------------------------
     # Launch
@@ -2567,11 +2568,11 @@ class GenphaseTokenComm(KernelComponent):
         smem_base = storage.buffer.data_ptr()
 
         if cutlass.const_expr(self.dispatch_protocol == "sentinel"):
-            # The top-k planes do not depend on the round's landing set, so their
+            # The top-k planes do not depend on the round's ping-pong buffer, so their
             # load leaves before the epoch read and the two latencies overlap.
             if linear_cta_idx < Int32(self.world_size):
                 self._issue_topk_load(topk_indices, topk_scores, smem_base, thread_idx)
-        round_set = self.select_round_set(
+        pingpong_buffer = self.select_pingpong_buffer(
             device_workspace, local_workspace, shared_workspace
         )
         if thread_idx == Int32(0):
@@ -2588,7 +2589,7 @@ class GenphaseTokenComm(KernelComponent):
                     local_rank,
                     smem_base,
                     linear_cta_idx,
-                    round_set,
+                    pingpong_buffer,
                     thread_idx,
                 )
                 self._run_planner(
@@ -2608,7 +2609,7 @@ class GenphaseTokenComm(KernelComponent):
                     topk_scores,
                     smem_base,
                     linear_cta_idx,
-                    round_set,
+                    pingpong_buffer,
                     thread_idx,
                 )
         elif linear_cta_idx == Int32(self.helper_cta_index):
@@ -2701,7 +2702,7 @@ class GenphaseTokenComm(KernelComponent):
         topk_scores: Optional[cute.Tensor],
         smem_base: cute.Pointer,
         chunk: Int32,
-        round_set: Int32,
+        pingpong_buffer: Int32,
         thread_idx: Int32,
     ) -> None:
         """Sort one chunk of this rank's routes into a list per destination rank and send them (pull dispatch).
@@ -3037,7 +3038,7 @@ class GenphaseTokenComm(KernelComponent):
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0)
                 self._clear_previous_topk_ready(
-                    device_workspace, destination, round_set
+                    device_workspace, destination, pingpong_buffer
                 )
                 # One add per exchange CTA of this rank; the destination's
                 # walking CTAs wait for all of them.
@@ -3108,7 +3109,7 @@ class GenphaseTokenComm(KernelComponent):
         local_rank: Int32,
         smem_base: cute.Pointer,
         destination_rank: Int32,
-        round_set: Int32,
+        pingpong_buffer: Int32,
         thread_idx: Int32,
     ) -> None:
         """Write this rank's top-k planes into one peer's Sentinel inbox.
@@ -3190,7 +3191,7 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             self._clear_previous_topk_ready(
-                device_workspace, destination_rank, round_set
+                device_workspace, destination_rank, pingpong_buffer
             )
             own_ready_slot = device_workspace.ptr(self.topk_ready_region) + local_rank
             red_async_add_release_sys_u32(
@@ -3200,9 +3201,12 @@ class GenphaseTokenComm(KernelComponent):
 
     @cute.jit
     def _clear_previous_topk_ready(
-        self, device_workspace: DeviceWorkspace, peer_rank: Int32, round_set: Int32
+        self,
+        device_workspace: DeviceWorkspace,
+        peer_rank: Int32,
+        pingpong_buffer: Int32,
     ) -> None:
-        """Zero this rank's ``topk_ready[peer]`` in the other landing set.
+        """Zero this rank's ``topk_ready[peer]`` in the other ping-pong buffer.
 
         ``peer``'s exchange CTAs are the slot's only writers. Their last writes
         there came in the previous round, and this rank acquired them in a launch
@@ -3211,12 +3215,12 @@ class GenphaseTokenComm(KernelComponent):
         ``topk_ready`` release this thread issues right after the zero, so that
         release orders the zero before the writes.
         """
-        other_set_delta = Int64(Int32(1) - Int32(2) * round_set) * Int64(
-            self.shared_set_bytes
+        other_buffer_delta = Int64(Int32(1) - Int32(2) * pingpong_buffer) * Int64(
+            self.pingpong_buffer_bytes
         )
         previous_slot = (
             device_workspace.ptr(self.topk_ready_region) + peer_rank
-        ).toint() + other_set_delta
+        ).toint() + other_buffer_delta
         sentinel_ptx.st_volatile_u32(previous_slot, Uint32(0))
 
     @cute.jit
@@ -3817,7 +3821,7 @@ class GenphaseTokenComm(KernelComponent):
                     ).pack(),
                     live,
                 )
-                # Reset for the round that reuses this landing set; see
+                # Reset for the round that reuses this ping-pong buffer; see
                 # "Expert-id lists".
                 stg_b32(index_address + slab_offsets[entry], Int32(-1), live)
                 if cutlass.const_expr(self.apply_topk_at_fc1):
@@ -4713,9 +4717,9 @@ class GenphaseTokenComm(KernelComponent):
     def _reset_count_rows(
         self, device_workspace: DeviceWorkspace, thread_idx: Int32
     ) -> None:
-        """Reset every count row of this landing set to the sentinel once the helper and every index-copy CTA read it.
+        """Reset every count row of this ping-pong buffer to the sentinel once the helper and every index-copy CTA read it.
 
-        The set is reused two rounds later; the system-scope ``topk_ready``
+        The buffer is reused two rounds later; the system-scope ``topk_ready``
         releases of the round in between order this reset before those writes
         (see "Expert-id lists").
         """
@@ -5908,9 +5912,9 @@ class GenphaseTokenComm(KernelComponent):
         The data rows stream through the warp's ring of ``pull_pipeline_depth``
         slots: up to one less than that many bulk loads from the source ranks'
         staged activations in flight, each landed row leaving for its landing
-        slot in this round's set (with ``fc1_token_pool``, for its route's row
-        of the token pool unless its token tile falls back to the landing slots)
-        as one bulk store, and the slot of the store
+        slot in this round's ping-pong buffer (with ``fc1_token_pool``, for its
+        route's row of the token pool unless its token tile falls back to the
+        landing slots) as one bulk store, and the slot of the store
         before it reloaded, so the warp never waits for the store it has just
         issued. The warp claims its next routes while the claim's stores drain,
         then each lane writes its route's scale-factor words into their

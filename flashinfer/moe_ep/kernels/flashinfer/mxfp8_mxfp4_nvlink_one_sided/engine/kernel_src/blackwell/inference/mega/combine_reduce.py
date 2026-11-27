@@ -3,12 +3,12 @@
 """End-of-round kernel: Sentinel top-k reduce, landing reset and round advance.
 
 Peers push each route's BF16 FC2 partial into this rank's combine slot
-``(token, topk, hidden)`` of the round's set. One thread owns 16 bytes of one
-token's row and sums every valid route's slot in FP32 in ascending top-k order
-with one BF16 rounding. Under the Sentinel combine the slots are armed with
-0xFFFFFFFF words, which no pushed word takes: the thread issues all of its loads,
-reloads only the vectors still holding the sentinel, and resets the slots it
-consumed. Under the counter combine the main kernel's tail barrier has already
+``(token, topk, hidden)`` of the round's ping-pong buffer. One thread owns 16
+bytes of one token's row and sums every valid route's slot in FP32 in ascending
+top-k order with one BF16 rounding. Under the Sentinel combine the slots hold
+the 0xFFFFFFFF init sentinel, which no pushed word takes: the thread issues all
+of its loads, reloads only the vectors still holding the sentinel, and resets
+the slots it consumed. Under the counter combine the main kernel's tail barrier has already
 seen every peer finish, so the thread waits for the main grid and loads once.
 Peers rewrite a valid slot before it is next read, and an invalid one is never
 read, so with ``discard_slots`` a warp drops each 128-byte slot line it has
@@ -29,7 +29,7 @@ entry, so its CTAs start as soon as SMs free up. They take one of two roles:
                      ``(source rank, source token)`` landing row if that token
                      routed here, and that token's top-k inbox words in any
                      case; every thread clears its share of the local and
-                     set-shared counters the round used
+                     counters shared by the ping-pong buffers that the round used
 
 A housekeeping warp reads its first row's inbox ids before it waits: an id word
 holds either the sentinel or this round's final value, so only a sentinel needs
@@ -56,9 +56,9 @@ with release semantics; the ticket is spread over several lines so that the
 adds, which arrive together, do not queue on one address. The last housekeeping
 CTA, which resets no landing row unless the grid is capped, waits until every
 CTA of the grid has entered, then for the main grid, then clears the ticket and
-advances the epoch, which moves the next round to the other set. Its spin runs
-while the main grid is still running, so usually only stores follow the wait,
-and it can trap only once the main grid is done. No CTA waits for the reduce
+advances the epoch, which moves the next round to the other ping-pong buffer.
+Its spin runs while the main grid is still running, so usually only stores
+follow the wait, and it can trap only once the main grid is done. No CTA waits for the reduce
 work of another, so the grid ends with whichever of the two roles ends last
 rather than with a ticket taken after both.
 """
@@ -78,12 +78,13 @@ from .....helpers.software_sync import NvlinkBarrier
 from ......comm import ptx as sentinel_ptx
 
 
-class SetNvlinkBarrier(NvlinkBarrier):
-    """All-rank barrier whose signal words live in the round's landing set.
+class PingPongNvlinkBarrier(NvlinkBarrier):
+    """All-rank barrier whose signal words live in the round's ping-pong buffer.
 
-    The shared workspace alternates between two sets by round, so each set keeps
-    its own phase counter; every rank is on the same set in the same round, so
-    each set's signals and phase stay a self-consistent sense-reversing barrier.
+    The shared workspace alternates between its ping and pong buffers by round,
+    so each buffer keeps its own phase counter; every rank is in the same buffer
+    in the same round, so each ping-pong buffer's signal words and phase stay a
+    self-consistent sense-reversing barrier.
     """
 
     def register_device_workspace(self, workspace: DeviceWorkspace) -> None:
@@ -107,12 +108,12 @@ class SetNvlinkBarrier(NvlinkBarrier):
 
     @cute.jit
     def assign_device_members(
-        self, workspace: DeviceWorkspace, peer_rank_ptr_mapper, round_set: Int32
+        self, workspace: DeviceWorkspace, peer_rank_ptr_mapper, pingpong_buffer: Int32
     ) -> None:
         # Spelled out rather than delegated: the DSL rewrites jit methods, which
         # breaks zero-argument super() inside the base class's own jit methods.
         self._grid_counter = workspace.ptr(self.grid_counter_region)
-        self._phase_counter = workspace.ptr(self.phase_counter_region) + round_set
+        self._phase_counter = workspace.ptr(self.phase_counter_region) + pingpong_buffer
         self._signal = workspace.ptr(self.signal_region)
         self._peer_rank_ptr_mapper = peer_rank_ptr_mapper
 
@@ -236,7 +237,7 @@ class CombineTopkReduce:
     @cute.jit
     def __call__(
         self,
-        combine_output: cute.Tensor,  # (capacity, slots per token, hidden) BF16, set-0 address
+        combine_output: cute.Tensor,  # (capacity, slots per token, hidden) BF16, ping-buffer address
         reduced_output: cute.Tensor,  # (capacity, hidden) BF16
         topk_indices: cute.Tensor,  # (capacity, topk) Int32
         local_rank: Int32,
@@ -331,7 +332,7 @@ class CombineTopkReduce:
         comm = self.token_comm
         thread_idx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
-        round_set = comm.select_round_set(
+        pingpong_buffer = comm.select_pingpong_buffer(
             device_workspace, local_workspace, shared_workspace
         )
         epoch_word = device_workspace.ptr(comm.sentinel_control_region).toint() + Int64(
@@ -354,9 +355,9 @@ class CombineTopkReduce:
             )
 
         if block_idx < Int32(self.poller_ctas):
-            combine_base = combine_output.iterator.toint() + Int64(round_set) * Int64(
-                comm.shared_set_bytes
-            )
+            combine_base = combine_output.iterator.toint() + Int64(
+                pingpong_buffer
+            ) * Int64(comm.pingpong_buffer_bytes)
             if cutlass.const_expr(not self.poll_slots):
                 cute.arch.griddepcontrol_wait()
             item = block_idx * Int32(self.threads) + thread_idx
@@ -391,8 +392,9 @@ class CombineTopkReduce:
                     landing_row += Int32(housekeeping_threads // 32)
                     inbox_id = Uint32(sentinel_ptx.WORD_SENTINEL)
             device_workspace.reset_tail_space("local", worker, housekeeping_threads)
-            # Peer-incremented counters of this round's set; peers next write this set
-            # two rounds later, after this rank's next top-k publication.
+            # Peer-incremented counters of this round's ping-pong buffer; peers next
+            # write that buffer two rounds later, after this rank's next top-k
+            # publication.
             device_workspace.reset_tail_space("shared", worker, housekeeping_threads)
 
     @cute.jit
