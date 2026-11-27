@@ -6181,7 +6181,17 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         self._require_built()
         self._validate_pack_contract(act)
         from ..tllm_enums import SfLayout
-        from .core import MoeRunnerInputs, RoutingInputMode
+        from .core import (
+            MoeRunnerInputs,
+            RoutingInputMode,
+            _validate_fp4_nvfp4_hidden_size,
+        )
+
+        if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            # Same check as the flat trtllm_fp4_block_scale_* entry points (#9333).
+            _validate_fp4_nvfp4_hidden_size(
+                act.hidden_states_q, act.hidden_states_scale
+            )
 
         v = weights.get_view(self.backend_key)
         _validate_prepared_activation_params(
