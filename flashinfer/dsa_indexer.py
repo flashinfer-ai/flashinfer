@@ -173,8 +173,10 @@ def dsa_indexer_det_topk(
         ``C * candidate_block_size <= 16384``.  Ragged: a row ranks all its
         visible keys with the unlisted ones at ``-inf``, so a row with fewer
         than ``top_k`` listed keys also returns unlisted keys (score
-        ``-inf``, not padding); a row has at most 393216 blocks.  ``C`` and the block size fix the launches, so a
-        captured graph replays for any lists.
+        ``-inf``, not padding).  The call's key bound (``max_seqlen_k``, else
+        ``k.shape[0]``) is at most 393216 blocks: with a long concatenated
+        ``k``, pass ``max_seqlen_k``.  ``C`` and the block size fix the
+        launches, so a captured graph replays for any lists.
     candidate_block_size : int
         Keys a candidate block: a power of two from 8 to
         ``min(k.shape[1], 128)``; 8 or 16 with ``candidate_out``.

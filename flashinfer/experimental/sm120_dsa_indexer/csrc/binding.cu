@@ -739,6 +739,10 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView w, TensorVie
         plan_waited = true;
         dispatch_score<Mode::kResident, kResSlots, true>(xp, in, num_heads, fp4, pstream, false, 0,
                                                          enable_pdl);
+        if (res_side) {  // joinable before the selector's launch can fail
+          cudaEventRecord(join_ev[side_dev][1 + i], pstream);
+          joined[1 + i] = true;
+        }
         SplitSelParams ss{};
         ss.logits = xp.res_split;
         ss.stride = stride;
