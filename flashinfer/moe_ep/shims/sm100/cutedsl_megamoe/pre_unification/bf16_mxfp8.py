@@ -47,6 +47,10 @@ class MegaMoEBf16Mxfp8Config:
     group_hint: Optional[int] = None
     clc_bundle_size: Optional[int] = None
     num_sched_stages: Optional[int] = 2
+    num_activation_stages: Optional[int] = None
+    runtime_mma_split: bool = False
+    direct_bf16_cvt: bool = True
+    num_weight_stages: Optional[int] = None
     flag_batch: int = 1
     epi_flag_batch: Tuple[int, int] = (1, 1)
     enable_in_kernel_fc2_reduce: bool = False
@@ -142,6 +146,8 @@ class MegaMoEBf16Mxfp8Config:
             )
         if self.load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError("unsupported load_balance_mode.")
+        if self.num_activation_stages is not None and self.num_activation_stages < 2:
+            raise ValueError("num_activation_stages must be at least 2.")
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -448,6 +454,10 @@ class MegaMoEBf16Mxfp8Frontend:
             force_static_sched=True,
             clc_bundle_size=c.clc_bundle_size,
             num_sched_stages=c.num_sched_stages,
+            num_activation_stages=c.num_activation_stages,
+            runtime_mma_split=c.runtime_mma_split,
+            direct_bf16_cvt=c.direct_bf16_cvt,
+            num_weight_stages=c.num_weight_stages,
             transform_buffer=c.transform_buffer,
             accumulator_overlap=c.accumulator_overlap,
             transform_k_tile=c.transform_k_tile,

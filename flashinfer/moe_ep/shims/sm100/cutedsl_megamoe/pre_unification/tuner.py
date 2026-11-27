@@ -180,11 +180,17 @@ _BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
     "accumulator_overlap": False,
     "transform_k_tile": 128,
     "cluster_shape_mnk": (2, 1, 1),
-    "flag_batch": 1,
-    "epi_flag_batch": (1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
     "token_back_mode": "epi_warps",
     "load_balance_mode": "static",
+    "direct_bf16_cvt": True,
+    "runtime_mma_split": True,
+    "num_weight_stages": 6,
+    "num_activation_stages": 5,
 }
+_BF16_MXFP8_ATOMIC_MIN_LOCAL_EXPERTS = 16
 
 
 def _nvfp4_default_knobs(
@@ -254,12 +260,54 @@ def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
     return knobs
 
 
-# TODO: Actually implement some heuristics
-def _bf16_mxfp8_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
+def _bf16_mxfp8_default_knobs(
+    *,
+    enable_in_kernel_fc2_reduce: bool,
+    experts_per_rank: Optional[int],
+    hidden: Optional[int],
+    num_total_experts: Optional[int],
+) -> Dict[str, Any]:
     """The default mixed implementation tuple (``is_valid_bf16_mxfp8``)."""
     knobs = dict(_BF16_MXFP8_TOKEN_KNOBS)
+    if (
+        experts_per_rank is not None
+        and experts_per_rank >= _BF16_MXFP8_ATOMIC_MIN_LOCAL_EXPERTS
+    ):
+        knobs["load_balance_mode"] = "atomic_counter"
     # Default to IKR if enabled by the user
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
+    if hidden is not None and num_total_experts is not None:
+        knobs = fit_bf16_mxfp8_stages(
+            knobs, hidden=hidden, num_total_experts=num_total_experts
+        )
+    return knobs
+
+
+def fit_bf16_mxfp8_stages(
+    knobs: Dict[str, Any], *, hidden: int, num_total_experts: int
+) -> Dict[str, Any]:
+    """Shed explicit SMEM stages until ``knobs`` fit the session's shape.
+
+    Large hidden sizes grow the dispatch buffer. Weight stages go first
+    (w5a5 beats w6a4 where both fit). Knobs without explicit stage counts are
+    returned unchanged.
+    """
+    knobs = dict(knobs)
+    if (
+        knobs.get("num_weight_stages") is None
+        or knobs.get("num_activation_stages") is None
+    ):
+        return knobs
+    shape = {"hidden": hidden, "num_total_experts": num_total_experts}
+    while not is_valid_bf16_mxfp8({**knobs, **shape}):
+        weight = knobs["num_weight_stages"]
+        activation = knobs["num_activation_stages"]
+        if weight > activation:
+            knobs["num_weight_stages"] = weight - 1
+        elif activation > 2:
+            knobs["num_activation_stages"] = activation - 1
+        else:
+            break
     return knobs
 
 
@@ -278,6 +326,9 @@ def default_knobs(
     dtype: str = "nvfp4",
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
+    experts_per_rank: Optional[int] = None,
+    hidden: Optional[int] = None,
+    num_total_experts: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
 
@@ -301,7 +352,10 @@ def default_knobs(
         )
     if dtype == "bf16_mxfp8":
         return _bf16_mxfp8_default_knobs(
-            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            experts_per_rank=experts_per_rank,
+            hidden=hidden,
+            num_total_experts=num_total_experts,
         )
     if dtype == "mxfp8":
         return _mxfp8_default_knobs(
@@ -392,13 +446,36 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         knobs.get("accumulator_overlap", False),
         knobs.get("transform_k_tile", 128),
     )
+    if impl not in _BF16_MXFP8_IMPLS:
+        return False
+    weight_stages = knobs.get("num_weight_stages")
+    # Session configs carry the shape; bare knob dicts check the tiles only.
+    dispatch_bytes = 0
+    if knobs.get("hidden") is not None and knobs.get("num_total_experts") is not None:
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_mxfp8_bf16_glu.megamoe_kernel_mxfp8_bf16 import (
+            Sm100MegaMoEMxfp8Bf16Kernel,
+        )
+
+        dispatch_bytes = Sm100MegaMoEMxfp8Bf16Kernel.dispatch_smem_bytes(
+            knobs["hidden"], knobs["num_total_experts"]
+        )
+    try:
+        Sm100SwapABMxfp8Bf16Fc12Kernel._derive_b_stages(
+            *impl,
+            weight_stages,
+            knobs.get("num_activation_stages"),
+            dispatch_bytes,
+        )
+    except ValueError:
+        return False
     return (
-        impl in _BF16_MXFP8_IMPLS
+        (weight_stages is None or weight_stages >= 2)
         and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
         and knobs.get("use_2cta_instrs", True)
         and knobs.get("token_back_mode", "epi_warps")
         in ("epi_warps", "reuse_dispatch_warps")
         and knobs.get("clc_bundle_size") is None
+        and (not knobs.get("runtime_mma_split", False) or impl[0][1] == 128)
         and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
     )
 
@@ -688,6 +765,7 @@ __all__ = [
     "is_valid_bf16_for_config",
     "is_valid_bf16_mxfp8",
     "is_valid_bf16_mxfp8_for_config",
+    "fit_bf16_mxfp8_stages",
     "is_valid_mxfp8_for_config",
     "is_valid_bf16_nvfp4",
     "is_valid_bf16_nvfp4_for_config",

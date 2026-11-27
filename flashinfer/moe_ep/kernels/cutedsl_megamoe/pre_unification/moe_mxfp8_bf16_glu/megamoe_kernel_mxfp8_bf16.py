@@ -69,9 +69,13 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         force_static_sched: bool = True,
         clc_bundle_size: Optional[int] = None,
         num_sched_stages: Optional[int] = 2,
+        num_activation_stages: Optional[int] = None,
         transform_buffer: Literal["smem", "tmem"] = "tmem",
         accumulator_overlap: bool = False,
         transform_k_tile: Literal[64, 128] = 128,
+        runtime_mma_split: bool = False,
+        direct_bf16_cvt: bool = False,
+        num_weight_stages: Optional[int] = None,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         ab_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         # MegaMoE constants.
@@ -196,9 +200,13 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             num_sched_stages=(
                 2 if num_sched_stages is None else num_sched_stages
             ),
+            num_activation_stages=num_activation_stages,
             transform_buffer=transform_buffer,
             accumulator_overlap=accumulator_overlap,
             transform_k_tile=transform_k_tile,
+            runtime_mma_split=runtime_mma_split,
+            direct_bf16_cvt=direct_bf16_cvt,
+            num_weight_stages=num_weight_stages,
             acc_dtype=acc_dtype,
             epi_flag_batch=epi_flag_batch,
             gate_up_clamp=gate_up_clamp,
@@ -248,6 +256,17 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             max_tokens_per_rank, num_topk, self.num_total_experts, self.hidden_bytes
         )
         self.sf_uint32_per_token = 0
+
+        # Re-resolve with the dispatch buffer, which the base budget omits.
+        self.num_b_stage = self._derive_b_stages(
+            mma_tiler_mnk,
+            transform_buffer,
+            accumulator_overlap,
+            transform_k_tile,
+            self.num_a_stage,
+            num_activation_stages,
+            self.dispatch_smem_bytes(hidden, self.num_total_experts),
+        )
 
         # Swap-AB token axis is MMA N.  Cluster N is one for the supported
         # mixed geometry, but retain the general formula for later layouts.
@@ -1102,6 +1121,17 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
 
     def token_comm_extra_smem_storage_class(self) -> type:
         return self.token_comm.extra_smem_storage_class()
+
+    @classmethod
+    def dispatch_smem_bytes(cls, hidden: int, num_total_experts: int) -> int:
+        """SMEM of ``TokenInPullTokenBackPush.extra_smem_storage_class``."""
+        warps = TokenInPullTokenBackPush.num_dispatch_warps
+        hidden_bytes = hidden * (cutlass.BFloat16.width // 8)
+        return (
+            warps * 8
+            + max(num_total_experts, warps) * 4
+            + warps * hidden_bytes
+        )
 
     def token_comm_hook_fc1_ready_counter_ptr(self, token_comm_args):
         return self.token_comm.fc1_ready_counter_ptr(token_comm_args)
