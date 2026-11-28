@@ -136,6 +136,10 @@ def _compute_stages(
     return num_acc_stage, num_ab_stage, num_c_stage
 
 
+def _identity_epilogue(x):
+    return x
+
+
 class PersistentDenseGemmKernel:
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -150,6 +154,9 @@ class PersistentDenseGemmKernel:
     :type cluster_shape_mn: Tuple[int, int]
     :param use_tma_store: Whether to use Tensor Memory Access (TMA) for storing results
     :type use_tma_store: bool
+    :param split_k_slices: Number of K slices per output tile. Slices > 1 TMA
+        reduce-add their partials into C, which the caller must zero first.
+    :type split_k_slices: int
     """
 
     def __init__(
@@ -161,6 +168,7 @@ class PersistentDenseGemmKernel:
         use_tma_store: bool,
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
+        split_k_slices: int = 1,
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -172,6 +180,16 @@ class PersistentDenseGemmKernel:
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_tma_store = use_tma_store
         self.arch = "sm_100"
+        # Split-K, ported from TensorRT-LLM's dense_gemm_persistent.py
+        # ("direct" split-K reduce): the persistent scheduler's L dimension is
+        # expanded by split_k_slices, each work tile accumulates one K slice,
+        # and its epilogue reduce-adds the partial into C with a TMA
+        # reduction store. C must be zeroed before the launch.
+        if split_k_slices < 1:
+            raise ValueError(f"split_k_slices must be >= 1, got {split_k_slices}")
+        if split_k_slices > 1 and not use_tma_store:
+            raise ValueError("split-K reduces through the TMA store epilogue")
+        self.split_k_slices = split_k_slices
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -248,7 +266,7 @@ class PersistentDenseGemmKernel:
                 self.c_dtype, self.c_layout, self.epi_tile, 1
             )
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = _compute_stages(
@@ -290,16 +308,23 @@ class PersistentDenseGemmKernel:
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        a_scale_tensor: cute.Tensor,
-        b_scale_tensor: cute.Tensor,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
+        a_scale_tensor: Optional[cute.Tensor],
+        b_scale_tensor: Optional[cute.Tensor],
+        epilogue_op: cutlass.Constexpr = _identity_epilogue,
     ):
         """Execute the GEMM operation.
 
         :param a_scale_tensor: 1-element Float32 tensor; the kernel multiplies it with
                                b_scale_tensor in the epilogue (no host-side product).
+                               Pass None for both scales to skip the multiply (BF16).
         :param b_scale_tensor: 1-element Float32 tensor, see a_scale_tensor.
+        :param epilogue_op: Applied per output element; must be the identity with
+                            split-K, where each K slice's partial is stored.
         """
+        if cutlass.const_expr(
+            self.split_k_slices > 1 and epilogue_op is not _identity_epilogue
+        ):
+            raise ValueError("split-K supports only the identity epilogue_op")
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
@@ -362,8 +387,12 @@ class PersistentDenseGemmKernel:
         tma_tensor_c = None
         if cutlass.const_expr(self.use_tma_store):
             epi_smem_layout = cute.select(self.c_smem_layout_staged, mode=[0, 1])
+            # Split-K partials are reduce-added (cp.reduce.async.bulk .add)
+            c_store_op = cpasync.CopyBulkTensorTileS2GOp()
+            if cutlass.const_expr(self.split_k_slices > 1):
+                c_store_op = cpasync.CopyReduceBulkTensorTileS2GOp()
             tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(), c, epi_smem_layout, self.epi_tile
+                c_store_op, c, epi_smem_layout, self.epi_tile
             )
 
         # Compute grid size
@@ -374,6 +403,7 @@ class PersistentDenseGemmKernel:
             self.swizzle_size,
             self.raster_along,
             max_active_clusters,
+            self.split_k_slices,
         )
 
         # Launch the kernel synchronously
@@ -420,12 +450,14 @@ class PersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
-        a_scale_tensor: cute.Tensor,
-        b_scale_tensor: cute.Tensor,
+        a_scale_tensor: Optional[cute.Tensor],
+        b_scale_tensor: Optional[cute.Tensor],
     ):
         """GPU device kernel performing the Persistent batched GEMM computation."""
-        output_scale = a_scale_tensor[0] * b_scale_tensor[0]
-
+        # No scales (e.g. BF16 GEMM): the epilogue skips the multiply
+        output_scale = None
+        if cutlass.const_expr(a_scale_tensor is not None):
+            output_scale = a_scale_tensor[0] * b_scale_tensor[0]
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -603,11 +635,21 @@ class PersistentDenseGemmKernel:
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
+                # With split-K the scheduler's L coordinate enumerates
+                # batch * split_k_slices tiles: A/B are indexed by the real
+                # batch and the K loop covers this split's K-tile range.
+                if cutlass.const_expr(self.split_k_slices > 1):
+                    batch_idx = cur_tile_coord[2] // self.split_k_slices
+                    split_idx = cur_tile_coord[2] % self.split_k_slices
+                else:
+                    batch_idx = cur_tile_coord[2]
+                    split_idx = 0
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
-                    cur_tile_coord[2],
+                    batch_idx,
                 )
+                k_tile_begin, k_tiles_this = self._split_k_range(k_tile_cnt, split_idx)
 
                 tAgA_slice = tAgA[
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
@@ -619,26 +661,26 @@ class PersistentDenseGemmKernel:
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
 
-                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_tiles_this, 1, unroll=1):
                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
                     cute.copy(
                         tma_atom_a,
-                        tAgA_slice[(None, handle.count)],
+                        tAgA_slice[(None, k_tile_begin + handle.count)],
                         tAsA[(None, handle.index)],
                         tma_bar_ptr=handle.barrier,
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, handle.count)],
+                        tBgB_slice[(None, k_tile_begin + handle.count)],
                         tBsB[(None, handle.index)],
                         tma_bar_ptr=handle.barrier,
                         mcast_mask=b_full_mcast_mask,
                     )
 
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if handle.count + 1 < k_tile_cnt:
+                    if handle.count + 1 < k_tiles_this:
                         peek_ab_empty_status = ab_producer.try_acquire()
 
                 tile_sched.advance_to_next_work()
@@ -668,6 +710,10 @@ class PersistentDenseGemmKernel:
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
+                split_idx = 0
+                if cutlass.const_expr(self.split_k_slices > 1):
+                    split_idx = cur_tile_coord[2] % self.split_k_slices
+                _, k_tiles_this = self._split_k_range(k_tile_cnt, split_idx)
 
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
@@ -679,7 +725,7 @@ class PersistentDenseGemmKernel:
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
-                for k_tile in range(k_tile_cnt):
+                for k_tile in range(k_tiles_this):
                     if is_leader_cta:
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
 
@@ -692,7 +738,7 @@ class PersistentDenseGemmKernel:
                         handle.release()
 
                         peek_ab_full_status = cutlass.Boolean(1)
-                        if handle.count + 1 < k_tile_cnt:
+                        if handle.count + 1 < k_tiles_this:
                             peek_ab_full_status = ab_consumer.try_wait()
 
                 if is_leader_cta:
@@ -762,6 +808,20 @@ class PersistentDenseGemmKernel:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
+    def _split_k_range(self, k_tile_cnt, split_idx):
+        """Return ``(k_tile_begin, k_tiles_this_split)`` for one K slice.
+
+        Balanced partition: split ``s`` covers
+        ``[floor(k_tile_cnt * s / S), floor(k_tile_cnt * (s + 1) / S))``, so
+        every split is non-empty when ``k_tile_cnt >= S``.
+        """
+        if cutlass.const_expr(self.split_k_slices == 1):
+            return 0, k_tile_cnt
+        splits = self.split_k_slices
+        k_tile_begin = (k_tile_cnt * split_idx) // splits
+        k_tile_end = (k_tile_cnt * (split_idx + 1)) // splits
+        return k_tile_begin, k_tile_end - k_tile_begin
+
     @staticmethod
     def _compute_grid(
         c: cute.Tensor,
@@ -770,11 +830,19 @@ class PersistentDenseGemmKernel:
         swizzle_size: int,
         raster_along: Literal["m", "n"],
         max_active_clusters: cutlass.Constexpr,
+        split_k_slices: int = 1,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size."""
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
+        # Split-K: every K slice of an output tile is its own work tile
+        if split_k_slices > 1:
+            num_ctas_mnl = (
+                num_ctas_mnl[0],
+                num_ctas_mnl[1],
+                num_ctas_mnl[2] * split_k_slices,
+            )
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
@@ -957,6 +1025,29 @@ class PersistentDenseGemmKernel:
                     f"Problem shape {m}, {n} must be divisible by swizzle size {self.swizzle_size} for non TMA store"
                 )
 
+    def check_split_k(
+        self,
+        k: int,
+        ab_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
+    ):
+        """Check that the TMA reduce-add store supports C and that every K
+        slice gets at least one K tile (an empty slice would reduce-add an
+        accumulator it never wrote)."""
+        if self.split_k_slices == 1:
+            return
+        if c_dtype not in {cutlass.BFloat16, cutlass.Float16, cutlass.Float32}:
+            raise testing.CantImplementError(
+                f"split-K cannot reduce-add into C of type {c_dtype}"
+            )
+        # _setup_attributes uses 4 MMA instructions of 256 bits of K per tile
+        k_tile = 4 * 256 // ab_dtype.width
+        if (k + k_tile - 1) // k_tile < self.split_k_slices:
+            raise testing.CantImplementError(
+                f"K={k} has fewer than split_k_slices={self.split_k_slices} "
+                f"K tiles of {k_tile}"
+            )
+
     def can_implement(
         self,
         mnkl: Tuple[int, int, int, int],
@@ -977,6 +1068,7 @@ class PersistentDenseGemmKernel:
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
             self.check_epilog_store_option(m, n)
+            self.check_split_k(k, a_dtype, c_dtype)
         except testing.CantImplementError:
             return False
         return True
@@ -992,7 +1084,7 @@ def bmm(
     stream: cuda.CUstream,
     a_scale_tensor: cute.Tensor,
     b_scale_tensor: cute.Tensor,
-    epilogue_op: cutlass.Constexpr = lambda x: x,
+    epilogue_op: cutlass.Constexpr = _identity_epilogue,
 ):
     """Wrapper API for persistent GEMM kernel to follow the convention of PyTorch's batch matrix-multiply (bmm).
 
