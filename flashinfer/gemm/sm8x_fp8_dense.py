@@ -42,6 +42,17 @@ _FMT = {_E4M3: 1, _E5M2: 2}
 _OUT = (torch.bfloat16, torch.float16, torch.float32)  # the GEMM2 output modules
 _FP4_FMT = {"nvfp4": 0, "mxfp4": 5, "mixed": None}  # the prep's A format (mixed: FP8)
 _I32_MAX = 2**31 - 1
+# GW over E4M3 weights: gemm_f8 takes the weight's FP32 scale times 2^8 (the products carry
+# 2^-8) before the activation's, an intermediate that overflows from 2^120 where the scales'
+# product sa sb is finite to 2^128. The weight scales enter divided by 2^8 (exact from 2^-118)
+# and alpha 2^8 restores the sum: the same product sa sb, without that intermediate.
+GW_E4M3_ALPHA = 256.0
+
+
+def gw_e4m3_weight_scales(scale_b: torch.Tensor) -> torch.Tensor:
+    """The GW weight scales ``scale_b / 2^8`` of E4M3 weights, run with alpha
+    ``GW_E4M3_ALPHA``."""
+    return scale_b * (1.0 / GW_E4M3_ALPHA)
 
 
 def _weight(b: torch.Tensor, k: int, n: int, shuffled: bool):
@@ -233,6 +244,8 @@ def _run_fp8(
         alpha, beta, sf, asf = _ones(a.device), None, scale_b, scale_a
     elif gm:
         alpha, beta, gsa, gsb = _ones(a.device), None, scale_a, scale_b
+        if b.dtype == _E4M3:
+            alpha, gsb = alpha * GW_E4M3_ALPHA, gw_e4m3_weight_scales(scale_b)
     gemm.gemm_f8(
         w, alpha, beta, act, meta, rowmap, target, r, n, k, max_blocks, groups, rs, ks, bs,
         _FMT[b.dtype], shuffled, sf, asf, a8x4, sf_bstride, gsa, gsb, max(gm, 1), None,
