@@ -515,3 +515,7 @@ from .kda_prefill import (
     kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
 )
 from . import megamoe as megamoe
+
+from .rope import (
+    apply_mrope_with_cos_sin_cache_inplace as apply_mrope_with_cos_sin_cache_inplace,
+)

@@ -36,6 +36,8 @@ from .trace.templates.rope import (
     rope_quantize_fp8_trace,
 )
 from .jit.rope import gen_rope_module
+from .jit.mrope import gen_mrope_module
+from .trace.templates.mrope import apply_mrope_with_cos_sin_cache_inplace_trace
 from .utils import get_compute_capability, register_custom_op, register_fake_op
 
 
@@ -1821,3 +1823,182 @@ def rope_quantize_fp8_append_paged_kv_cache(
     )
 
     return q_rope_out, q_nope_out
+
+
+@functools.cache
+def get_mrope_module():
+    return gen_mrope_module().build_and_load()
+
+
+def _apply_mrope_impl(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    section_t: int,
+    section_h: int,
+    section_w: int,
+    mrope_interleaved: bool,
+) -> None:
+    get_mrope_module().apply_mrope(
+        query,
+        key,
+        positions,
+        cos_sin_cache,
+        head_size,
+        section_t,
+        section_h,
+        section_w,
+        mrope_interleaved,
+    )
+
+
+# Use a functional boundary for compilation: aliased mutable custom-op inputs
+# can be lowered with incorrect storage offsets by dynamic-shape compilation.
+@torch.library.custom_op("flashinfer::mrope_functional", mutates_args=())
+def _apply_mrope_compiled(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    section_t: int,
+    section_h: int,
+    section_w: int,
+    mrope_interleaved: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    module = get_mrope_module()
+    # Check the original views before cloning, so overlap and metadata errors
+    # are rejected before any caller-visible writes, just as in eager mode.
+    module.validate_mrope(
+        query,
+        key,
+        positions,
+        cos_sin_cache,
+        head_size,
+        section_t,
+        section_h,
+        section_w,
+        mrope_interleaved,
+    )
+    query_out, key_out = query.clone(), key.clone()
+    module.apply_mrope(
+        query_out,
+        key_out,
+        positions,
+        cos_sin_cache,
+        head_size,
+        section_t,
+        section_h,
+        section_w,
+        mrope_interleaved,
+    )
+    return query_out, key_out
+
+
+@_apply_mrope_compiled.register_fake
+def _fake_apply_mrope(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    section_t: int,
+    section_h: int,
+    section_w: int,
+    mrope_interleaved: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(query), torch.empty_like(key)
+
+
+@flashinfer_api(trace=apply_mrope_with_cos_sin_cache_inplace_trace)
+def apply_mrope_with_cos_sin_cache_inplace(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    mrope_section: Tuple[int, int, int],
+    mrope_interleaved: bool = False,
+) -> None:
+    """Apply cached three-axis MRoPE to query and key in place.
+
+    Uses NeoX pairing: channel ``i`` is paired with ``i + rotary_dim/2``.
+    ``mrope_interleaved`` selects the temporal/height/width frequency layout;
+    it does not change the component-pairing convention.
+
+    Parameters
+    ----------
+    positions : torch.Tensor
+        CUDA int32/int64 positions of shape ``[3, nnz]`` in temporal, height,
+        width order. Token entries are contiguous; axis rows may be padded.
+        Values must be in ``[0, max_position)``. This device-value precondition
+        is not checked or synchronized on the host.
+    query, key : torch.Tensor
+        CUDA FP16/BF16 tensors of shape ``[nnz, num_heads * head_size]`` with
+        matching dtype. Each row is contiguous; token rows may be padded.
+        Query/key head counts are independently in ``[1, 1024]``.
+    head_size : int
+        Even head dimension in ``[2, 512]``.
+    cos_sin_cache : torch.Tensor
+        Contiguous CUDA cache ``[max_position, rotary_dim]``, containing
+        ``[cos | sin]``. Its dtype is FP32 or the query dtype. ``rotary_dim``
+        is even and in ``[2, head_size]``. Channels beyond it are unchanged.
+    mrope_section : tuple of int
+        Three nonnegative frequency-pair counts summing to ``rotary_dim/2``.
+        In sectioned mode they partition consecutive pairs. In interleaved
+        mode height selects pairs ``i % 3 == 1 and i < 3 * section_h``, width
+        selects ``i % 3 == 2 and i < 3 * section_w``, and time fills the rest.
+        Height/width counts must fit their available slots.
+    mrope_interleaved : bool
+        Whether to interleave the three frequency axes. Default: ``False``.
+
+    Notes
+    -----
+    Computes in the cache dtype: round ``b*sin`` and ``b*cos`` separately,
+    then evaluate ``fma(a, cos, -b*sin)`` and ``fma(a, sin, b*cos)`` before
+    converting to the query dtype. FP32 and native-dtype caches therefore
+    have different rounding behavior.
+
+    Disjoint buffers or disjoint segments of equal-pitch QKV rows are supported.
+    Overlapping Q/K, shifted overlapping rows and aliases with positions/cache
+    are rejected conservatively. Eager execution allocates no packing or device
+    scratch. Compiled execution uses temporary Q/K results and copies them back
+    to preserve mutation semantics for aliased views with dynamic shapes.
+    Empty batches are allowed. Warm up once before CUDA graph capture.
+
+    Examples
+    --------
+    >>> qkv = torch.randn(32, 32 * 128, device="cuda", dtype=torch.bfloat16)
+    >>> q, k = qkv[:, :16 * 128], qkv[:, 16 * 128:24 * 128]
+    >>> positions = torch.zeros(3, 32, device="cuda", dtype=torch.int64)
+    >>> cache = torch.cat((torch.ones(256, 64), torch.zeros(256, 64)), dim=1).cuda()
+    >>> apply_mrope_with_cos_sin_cache_inplace(positions, q, k, 128, cache, (16, 24, 24))
+    """
+    if len(mrope_section) != 3 or any(type(x) is not int for x in mrope_section):
+        raise ValueError("mrope_section must contain three integers")
+    if type(head_size) is not int:
+        raise ValueError("head_size must be an integer")
+    if torch.compiler.is_compiling():
+        query_out, key_out = _apply_mrope_compiled(
+            positions,
+            query,
+            key,
+            head_size,
+            cos_sin_cache,
+            *mrope_section,
+            mrope_interleaved,
+        )
+        query.copy_(query_out)
+        key.copy_(key_out)
+    else:
+        _apply_mrope_impl(
+            positions,
+            query,
+            key,
+            head_size,
+            cos_sin_cache,
+            *mrope_section,
+            mrope_interleaved,
+        )

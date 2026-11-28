@@ -221,6 +221,7 @@ from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.qsa_sparse_paged import gen_qsa_sparse_paged_module
 from .jit.rope import gen_rope_module
+from .jit.mrope import gen_mrope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.gdn_batch_invariant import gen_gdn_batch_invariant_module
 from .jit.kda_batch_invariant import gen_kda_batch_invariant_module
@@ -1192,6 +1193,7 @@ def gen_all_modules(
             gen_page_module(),
             gen_quantization_module(),
             gen_rope_module(),
+            gen_mrope_module(),
             gen_sampling_module(),
             gen_topk_module(),
         ]
