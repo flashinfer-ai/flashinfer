@@ -47,6 +47,7 @@ from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 from tests.moe.trtllm_gen_fused_moe_utils import (
+    routing_reference,
     routing_reference_default,
     routing_reference_minimax2,
     routing_reference_no_aux,
@@ -411,35 +412,141 @@ def test_invalid_group_args_rejected():
         )
 
 
+def test_llama4_fused_shared_experts_rejected():
+    """Llama4's top-1 kernel cannot fill the shared-expert slots and must error."""
+    num_experts = 16
+    logits = make_logits(4, num_experts, torch.float32, 0)
+    with pytest.raises(Exception, match="fusing shared expert"):
+        trtllm_gen_routing(
+            logits, None, RoutingMethodType.Llama4, 1, num_fused_shared_experts=1
+        )
+
+
 @pytest.mark.parametrize(
-    "routing_method,n_group,topk_group",
-    [
-        # Only the grouped DeepSeek kernel populates the fused shared-expert
-        # slots. Every other method dispatches to routingCustom, which leaves
-        # them untouched, so they must reject num_fused_shared_experts > 0
-        # rather than hand back uninitialized slots.
-        pytest.param(RoutingMethodType.DeepSeekV3, 1, 1, id="DeepSeekV3_no_groups"),
-        pytest.param(RoutingMethodType.MiniMax2, 0, 0, id="MiniMax2"),
-        pytest.param(RoutingMethodType.Renormalize, 0, 0, id="Renormalize"),
-        pytest.param(RoutingMethodType.Llama4, 0, 0, id="Llama4"),
-    ],
+    "routing_method", [RoutingMethodType.MiniMax2, RoutingMethodType.Renormalize]
 )
-def test_unsupported_fused_shared_experts_rejected(routing_method, n_group, topk_group):
-    """Methods whose kernel cannot fill the shared-expert slots must error."""
+def test_fused_shared_experts_ep_shard_rejected(routing_method):
+    """Shared ids follow the routed range, so an EP shard must be rejected."""
     num_experts = 16
     logits = make_logits(4, num_experts, torch.float32, 0)
     bias = make_bias(num_experts, torch.bfloat16, 1)
-    top_k = 1 if routing_method == RoutingMethodType.Llama4 else 4
-    with pytest.raises(Exception, match="fusing shared expert"):
+    with pytest.raises(Exception, match="without expert parallelism"):
         trtllm_gen_routing(
             logits,
-            bias,
+            bias if routing_method == RoutingMethodType.MiniMax2 else None,
+            routing_method,
+            4,
+            num_fused_shared_experts=1,
+            local_expert_offset=8,
+            local_num_experts=8,
+        )
+
+
+def _fused_shared_kwargs(routing_method, num_experts, seed):
+    """trtllm_gen_routing kwargs for one routingCustom method."""
+    if routing_method == RoutingMethodType.MiniMax2:
+        bias = make_bias(num_experts, torch.bfloat16, seed + 1)
+        return {"routing_bias": bias, "routed_scaling_factor": 1.0}
+    if routing_method == RoutingMethodType.DeepSeekV3:
+        # n_group = 1 takes the routingCustom no-groups path, not the grouped kernel.
+        bias = make_bias(num_experts, torch.bfloat16, seed + 1)
+        return {
+            "routing_bias": bias,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+        }
+    return {"routing_bias": None}
+
+
+FUSED_SHARED_METHODS = [
+    *(p.values[0] for p in CUSTOM_METHODS),
+    RoutingMethodType.MiniMax2,
+    RoutingMethodType.DeepSeekV3,
+]
+
+
+def run_and_check_fused_shared(
+    routing_method, num_tokens, num_experts, top_k, num_shared, tile_tokens_dim
+):
+    """The routed slots must equal the num_fused_shared_experts=0 result (whose
+    selection the per-method tests above check against the host oracles); the
+    shared experts must occupy slots [top_k, top_k + S) as ids E + i at weight
+    1.0 and be permuted together with the routed experts over E + S experts.
+
+    Comparing against the routed-only call rather than the oracle keeps the
+    check exact at large batches, where sigmoid + bias selection keys of
+    distinct logits can sit within float rounding of each other."""
+    seed = stable_seed("fused_shared", int(routing_method), num_tokens, num_experts)
+    logits = make_logits(num_tokens, num_experts, torch.float32, seed)
+    kwargs = _fused_shared_kwargs(routing_method, num_experts, seed)
+    routing_bias = kwargs.pop("routing_bias")
+
+    def route(num_fused_shared_experts):
+        return trtllm_gen_routing(
+            logits,
+            routing_bias,
             routing_method,
             top_k,
-            num_fused_shared_experts=1,
-            n_group=n_group,
-            topk_group=topk_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            tile_tokens_dim=tile_tokens_dim,
+            **kwargs,
         )
+
+    routed = route(0)
+    result = route(num_shared)
+    total_top_k = top_k + num_shared
+    assert result.topk_ids.shape == (num_tokens, total_top_k)
+
+    shared_ids = torch.arange(
+        num_experts, num_experts + num_shared, device="cuda", dtype=torch.int32
+    ).expand(num_tokens, -1)
+    assert (result.topk_ids[:, top_k:] == shared_ids).all(), "shared expert ids"
+    assert (result.topk_weights[:, top_k:].float() == 1.0).all(), "shared weights"
+
+    # Dense routed weights of the routed-only call, widened by the shared
+    # experts: the oracle for selection and for the per-expert padded layout.
+    dense = torch.zeros(num_tokens, num_experts, device="cuda")
+    dense.scatter_(1, routed.topk_ids.long(), routed.topk_weights.float())
+    permute_info = routing_reference(dense, top_k, tile_tokens_dim, num_shared)
+    ref_scores = torch.cat(
+        (dense, torch.ones(num_tokens, num_shared, device="cuda")), dim=1
+    )
+    check_selection(result, permute_info, ref_scores, total_top_k)
+    torch.testing.assert_close(
+        result.topk_weights.float(),
+        ref_scores.gather(1, result.topk_ids.long()),
+        atol=0,
+        rtol=0,
+    )
+    check_permutation(result, permute_info, num_tokens, total_top_k)
+
+
+# Token counts span every post-TopK path: static block (<= 4), dyn-block
+# (<= 16), single cluster, and the cooperative kernel; 150 tokens takes the
+# block-per-token scores kernel and 2000 the warp-per-token one where the
+# policy supports both.
+@pytest.mark.parametrize("num_tokens", [1, 8, 150, 2000])
+@pytest.mark.parametrize("num_experts,top_k", [(128, 4), (256, 8)])
+@pytest.mark.parametrize("num_shared", [1, 2])
+@pytest.mark.parametrize("tile_tokens_dim", [8, 32])
+@pytest.mark.parametrize("routing_method", FUSED_SHARED_METHODS, ids=lambda m: m.name)
+def test_fused_shared_experts_custom_routing(
+    routing_method, num_tokens, num_experts, top_k, num_shared, tile_tokens_dim
+):
+    run_and_check_fused_shared(
+        routing_method, num_tokens, num_experts, top_k, num_shared, tile_tokens_dim
+    )
+
+
+@pytest.mark.parametrize(
+    "routing_method",
+    [RoutingMethodType.MiniMax2, RoutingMethodType.Renormalize],
+    ids=lambda m: m.name,
+)
+def test_fused_shared_experts_custom_routing_large_batch(routing_method):
+    """Past the single-cluster capacity the post-TopK pipeline goes cooperative."""
+    run_and_check_fused_shared(routing_method, 10000, 128, 4, 1, 64)
 
 
 def test_invalid_args_rejected():
