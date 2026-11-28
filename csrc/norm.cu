@@ -20,6 +20,7 @@
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
+using tvm::ffi::Optional;
 
 void rmsnorm(TensorView output, TensorView input, TensorView weight, double eps, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
@@ -186,37 +187,38 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
   });
 }
 
-// Add-residual + RMSNorm + 1x128 fp8 block-quant. Emits fp8 `output` [M,d], fp32 `block_scale`
-// (d/128, round_up(M,4)) column-major TMA layout, bf16 `normed_out` [M,d], and updates `residual`
-// in place with (input+residual). See norm::FusedAddRMSNormFP8BlockQuant.
+// Add-residual + RMSNorm + 1x128 fp8 block-quant. Emits fp8 `output` [M,d], `block_scale` in the
+// column-major TMA layout, optional bf16 `normed_out` [M,d], and updates `residual` in place with
+// (input+residual). block_scale is fp32 (d/128, round_up(M,4)), or int32 (ceil(d/512),
+// round_up(M,4)) holding packed UE8M0 scales. See norm::FusedAddRMSNormFP8BlockQuant.
 void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale,
-                                       TensorView normed_out, TensorView input, TensorView residual,
-                                       TensorView weight, double eps, bool enable_pdl) {
+                                       Optional<TensorView> normed_out, TensorView input,
+                                       TensorView residual, TensorView weight, double eps,
+                                       bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(normed_out);
   // The kernel indexes block_scale as [(d/128) * stride(0) + m], i.e. unit-stride along m.
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(block_scale);
   CHECK_DEVICE(input, residual);
   CHECK_DEVICE(input, weight);
   CHECK_DEVICE(input, output);
   CHECK_DEVICE(input, block_scale);
-  CHECK_DEVICE(input, normed_out);
   CHECK_DIM(2, input);     // (batch_size, hidden_size)
   CHECK_DIM(2, residual);  // (batch_size, hidden_size)
   CHECK_DIM(1, weight);    // (hidden_size)
   CHECK_DIM(2, output);    // fp8 (batch_size, hidden_size)
-  CHECK_DIM(2, normed_out);
-  CHECK_DIM(2, block_scale);  // (hidden_size/128, round_up(batch_size, 4))
+  CHECK_DIM(2, block_scale);
   // residual/weight/normed_out share the kernel's compute type with input; output is e4m3 and
-  // block_scale is fp32 (the dtypes the fp8 block-scaled GEMMs consume).
+  // block_scale is fp32 or packed UE8M0 int32 (the dtypes the fp8 block-scaled GEMMs consume).
   CHECK_SAME_DTYPE(residual, input);
   CHECK_SAME_DTYPE(weight, input);
-  CHECK_SAME_DTYPE(normed_out, input);
   CHECK_INPUT_TYPE(output, dl_float8_e4m3fn);
-  CHECK_INPUT_TYPE(block_scale, dl_float32);
+  const bool scale_ue8m0 = block_scale.dtype() == dl_int32;
+  if (!scale_ue8m0) {
+    CHECK_INPUT_TYPE(block_scale, dl_float32);
+  }
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
   unsigned int m_pad = (batch_size + 3) & ~3u;
@@ -225,10 +227,27 @@ void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale
   TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
   TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
-  TVM_FFI_ICHECK_EQ(normed_out.size(0), batch_size);
-  TVM_FFI_ICHECK_EQ(normed_out.size(1), hidden_size);
-  TVM_FFI_ICHECK_EQ(block_scale.size(0), hidden_size / 128);
+  if (normed_out.has_value()) {
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(normed_out.value());
+    CHECK_DEVICE(input, normed_out.value());
+    CHECK_DIM(2, normed_out.value());
+    CHECK_SAME_DTYPE(normed_out.value(), input);
+    TVM_FFI_ICHECK_EQ(normed_out.value().size(0), batch_size);
+    TVM_FFI_ICHECK_EQ(normed_out.value().size(1), hidden_size);
+  }
+  // Packed UE8M0 holds four 1x128 blocks per int32.
+  const unsigned int num_blocks = hidden_size / 128;
+  TVM_FFI_ICHECK_EQ(block_scale.size(0), scale_ue8m0 ? (num_blocks + 3) / 4 : num_blocks);
   TVM_FFI_ICHECK_EQ(block_scale.size(1), m_pad);
+  if (scale_ue8m0) {
+    // flashinfer.deep_gemm reads packed UE8M0 without a transform and asserts this TMA pitch.
+    TVM_FFI_ICHECK_EQ(block_scale.stride(0), m_pad)
+        << "packed UE8M0 block_scale must be contiguous";
+  } else {
+    // The kernel writes row r at r * stride(0), so overlapping rows would clobber each other.
+    TVM_FFI_ICHECK(block_scale.size(0) == 1 || block_scale.stride(0) >= m_pad)
+        << "block_scale rows must not overlap";
+  }
   // Kernel covers each row single-wave with no per-thread bounds guard: hidden_size must be a whole
   // number of warps of vectors -> <= 16384 and a multiple of 32*vec_size (256 for <=8192, 512
   // above).
@@ -245,9 +264,11 @@ void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale
     cudaError_t status = norm::FusedAddRMSNormFP8BlockQuant<c_type, __nv_fp8_e4m3>(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
         static_cast<c_type*>(weight.data_ptr()), static_cast<__nv_fp8_e4m3*>(output.data_ptr()),
-        static_cast<float*>(block_scale.data_ptr()), static_cast<c_type*>(normed_out.data_ptr()),
+        block_scale.data_ptr(),
+        normed_out.has_value() ? static_cast<c_type*>(normed_out.value().data_ptr()) : nullptr,
         batch_size, hidden_size, input.stride(0), residual.stride(0), output.stride(0),
-        normed_out.stride(0), block_scale.stride(0), eps, enable_pdl, stream);
+        normed_out.has_value() ? normed_out.value().stride(0) : 0, block_scale.stride(0), eps,
+        enable_pdl, stream, scale_ue8m0);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "FusedAddRMSNormFP8BlockQuant failed with error code " << cudaGetErrorString(status);
     return true;

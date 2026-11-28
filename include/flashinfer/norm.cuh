@@ -705,13 +705,15 @@ cudaError_t FusedAddRMSNormQuant(T* input, T* residual, T* weight, O* output, ui
 // single wave (host picks VEC_SIZE so num_threads<=1024). kLanesPerBlock = 128/VEC_SIZE
 // consecutive, warp-local threads own one 1x128 block, so its amax is a register-only warp-subgroup
 // reduction. Requires d % (32*VEC_SIZE) == 0 and d % 128 == 0. Emits: fp8 output[M,d]; fp32
-// block_scale; bf16 residual (hidden+residual, pre-norm, in place); bf16 normed_out. The fp8 is
-// quantized from the T-rounded normed so it exactly matches normed_out (a bf16 consumer's re-quant
-// is identical).
-template <uint32_t VEC_SIZE, typename T, typename O>
+// block_scale; bf16 residual (hidden+residual, pre-norm, in place); bf16 normed_out (skipped when
+// null). The fp8 is quantized from the T-rounded normed so it exactly matches normed_out (a bf16
+// consumer's re-quant is identical). With SCALE_UE8M0 the scale is rounded up to a power of two and
+// stored as its UE8M0 byte, four blocks per int32 (d/512 rounded up, round_up(M,4)), the packed
+// layout Blackwell DeepGEMM reads without a transform.
+template <uint32_t VEC_SIZE, bool SCALE_UE8M0, typename T, typename O>
 __global__ void FusedAddRMSNormFP8BlockQuantKernel(
     T* __restrict__ input, T* __restrict__ residual, T* __restrict__ weight, O* __restrict__ output,
-    float* __restrict__ block_scale, T* __restrict__ normed_out, const uint32_t d,
+    void* __restrict__ block_scale, T* __restrict__ normed_out, const uint32_t d,
     const uint32_t stride_input, const uint32_t stride_residual, const uint32_t stride_output,
     const uint32_t stride_normed, const uint32_t scale_stride_m, float eps) {
   constexpr uint32_t kQuantBlock = 128;
@@ -774,18 +776,41 @@ __global__ void FusedAddRMSNormFP8BlockQuantKernel(
     normed_vec[j] = nb;
     lamax = fmaxf(lamax, fabsf(normed[j]));
   }
-  normed_vec.store(normed_out + bx * stride_normed + col);
+  if (normed_out != nullptr) normed_vec.store(normed_out + bx * stride_normed + col);
 
   // amax over the 1x128 block: kLanesPerBlock consecutive lanes reduce within their warp subgroup.
 #pragma unroll
   for (uint32_t offset = kLanesPerBlock / 2; offset > 0; offset /= 2)
     lamax = fmaxf(lamax, math::shfl_xor_sync(lamax, offset));
   const float amax = fmaxf(lamax, 1e-4f);
-  if ((thread_id % kLanesPerBlock) == 0)  // one scale per 1x128 block, column-major (TMA) layout
-    block_scale[(col / kQuantBlock) * scale_stride_m + bx] = amax / max_val;
+  const bool block_leader = (thread_id % kLanesPerBlock) == 0;
+  const uint32_t block_idx = col / kQuantBlock;
+  float inv;
+  if constexpr (SCALE_UE8M0) {
+    // DeepGEMM's ceil_to_ue8m0(amax / 448). The quotient must be correctly rounded: under
+    // -use_fast_math an exact power of two can come out 1 ulp high and round up one exponent.
+    const uint32_t bits = __float_as_uint(__fdiv_rn(amax, max_val));
+    // Clamped to 254: an inf amax would give 255, the E8M0 NaN code, and wrap the inverse below.
+    const uint32_t exponent =
+        min(((bits >> 23) & 0xffu) + static_cast<uint32_t>((bits & 0x7fffffu) != 0), 254u);
+    inv = __uint_as_float((254u - exponent) << 23);  // exact 1 / 2^(exponent - 127)
+    if (block_leader) {
+      // Little-endian byte (block_idx % 4) of int32 [block_idx / 4][bx]. The row's last block
+      // zeroes the unused bytes past d/128, as deep_gemm's packing helper does.
+      uint8_t* word = static_cast<uint8_t*>(block_scale) +
+                      (static_cast<size_t>(block_idx / 4) * scale_stride_m + bx) * 4;
+      word[block_idx % 4] = static_cast<uint8_t>(exponent);
+      if (block_idx == d / kQuantBlock - 1) {
+        for (uint32_t b = block_idx % 4 + 1; b < 4; ++b) word[b] = 0;
+      }
+    }
+  } else {
+    if (block_leader)  // one scale per 1x128 block, column-major (TMA) layout
+      static_cast<float*>(block_scale)[block_idx * scale_stride_m + bx] = amax / max_val;
+    inv = max_val / amax;
+  }
 
   // Quantize the T-rounded normed to fp8.
-  const float inv = max_val / amax;
   vec_t<float, VEC_SIZE> out_vec;
 #pragma unroll
   for (uint32_t j = 0; j < VEC_SIZE; ++j) out_vec[j] = normed[j] * inv;
@@ -800,15 +825,16 @@ __global__ void FusedAddRMSNormFP8BlockQuantKernel(
 // 128 % VEC_SIZE == 0 for the block reduction. The kernel has no per-thread bounds guard, so d must
 // be a whole number of warps of vectors: d <= 16384 and d % (32*VEC_SIZE) == 0 (VEC_SIZE=8 for
 // d<=8192 -> d%256==0; VEC_SIZE=16 for d<=16384 -> d%512==0). Returns cudaErrorInvalidValue
-// otherwise. scale_stride_m = round_up(batch_size, 4) (the block_scale column stride, elements).
+// otherwise. scale_stride_m = round_up(batch_size, 4) (the block_scale column stride, in fp32 or
+// int32 elements). block_scale is fp32, or packed UE8M0 int32 when scale_ue8m0.
 template <typename T, typename O>
 cudaError_t FusedAddRMSNormFP8BlockQuant(T* input, T* residual, T* weight, O* output,
-                                         float* block_scale, T* normed_out, uint32_t batch_size,
+                                         void* block_scale, T* normed_out, uint32_t batch_size,
                                          uint32_t d, uint32_t stride_input,
                                          uint32_t stride_residual, uint32_t stride_output,
                                          uint32_t stride_normed, uint32_t scale_stride_m,
                                          float eps = 1e-5, bool enable_pdl = false,
-                                         cudaStream_t stream = 0) {
+                                         cudaStream_t stream = 0, bool scale_ue8m0 = false) {
   const uint32_t vec_size = (d <= 8192) ? 8 : 16;  // num_threads = d/vec_size <= 1024
   if (d == 0 || d > 16384 || d % (32 * vec_size) != 0)
     return cudaErrorInvalidValue;  // kernel covers the row single-wave with no bounds guard
@@ -830,7 +856,8 @@ cudaError_t FusedAddRMSNormFP8BlockQuant(T* input, T* residual, T* weight, O* ou
   config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = FusedAddRMSNormFP8BlockQuantKernel<VEC_SIZE, T, O>;
+    auto kernel = scale_ue8m0 ? FusedAddRMSNormFP8BlockQuantKernel<VEC_SIZE, true, T, O>
+                              : FusedAddRMSNormFP8BlockQuantKernel<VEC_SIZE, false, T, O>;
     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
         &config, kernel, input, residual, weight, output, block_scale, normed_out, d, stride_input,
         stride_residual, stride_output, stride_normed, scale_stride_m, eps));
