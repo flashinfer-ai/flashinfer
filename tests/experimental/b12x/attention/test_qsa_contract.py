@@ -302,6 +302,27 @@ def _rebind(binding: qsa.Binding, **changes: torch.Tensor) -> qsa.Binding:
     return qsa.bind(binding.plan, **tensors)
 
 
+@pytest.mark.parametrize("byte_offset", [0, 8, 16])
+def test_qsa_bind_checks_scratch_base_alignment(byte_offset: int) -> None:
+    """Reject misaligned contiguous slices while accepting aligned suballocations."""
+    binding = _allocate_binding(_caps())
+    nbytes = binding.scratch.numel()
+    allocation = torch.empty(
+        nbytes + 16, dtype=torch.uint8, device=binding.scratch.device
+    )
+    assert allocation.data_ptr() % 16 == 0
+    scratch = allocation[byte_offset : byte_offset + nbytes]
+    assert scratch.is_contiguous()
+    if byte_offset % 16:
+        with pytest.raises(
+            ValueError, match="QSA scratch base must be 16-byte aligned"
+        ):
+            _rebind(binding, scratch=scratch)
+    else:
+        rebound = _rebind(binding, scratch=scratch)
+        assert rebound.scratch.data_ptr() == scratch.data_ptr()
+
+
 def test_qsa_bind_accepts_a_runtime_pool_smaller_than_planned_capacity() -> None:
     binding = _allocate_binding(_caps())
 
