@@ -230,6 +230,8 @@ def _run_fp8(
     batches, m, k = (int(x) for x in a.shape)
     n = int(out.shape[2])
     routed = m_indptr is not None or m_keys is not None
+    if bias is not None and (routed or masked_m is not None):
+        raise ValueError("_run_fp8: the bias is for the unrouted GEMM")
     groups = int(b.shape[0]) if routed else batches
     if m == 0 or batches == 0 or n == 0 or groups == 0:
         return
