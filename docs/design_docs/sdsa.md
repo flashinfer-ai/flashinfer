@@ -19,8 +19,9 @@ module has five parts:
 - Top-K from the selection: `top_k_from_candidates` writes the Top-K keys of
   each query row from its selected keys;
 - thresholds from a key sample: `gather_key_sample` and `thresholds_from_sample`;
-- NVFP4 keys and queries: `quantize_write_index_qk_nvfp4` writes the keys to the
-  paged cache and the queries to rows, in one launch.
+- NVFP4 and FP8 keys and queries: `quantize_write_index_qk_nvfp4` and
+  `quantize_write_index_qk_fp8` write the keys to the paged cache and the
+  queries to rows, in one launch.
 
 For decode, a Top-K kernel takes the Top-K from the scores. The Top-K keys feed
 token-sparse attention (below).
@@ -31,12 +32,13 @@ All functions are in `flashinfer.sdsa`.
 
 | API | Purpose |
 | --- | --- |
-| `indexer_scores(query, key_cache, block_table, context_lengths, *, requests, scores, query_scales=None, key_scales=None)` | Write the FP32 score of each query row with each key of its request. |
-| `indexer_threshold_select(query, key_cache, row_ends, tile_requests, block_table, *, thresholds, counters, candidates, max_context, top_k, query_scales=None, key_scales=None, arrivals=None, ranges=None)` | Keep the keys at or above the threshold of each query row, as (key, score) pairs. |
+| `indexer_scores(query, key_cache, block_table, context_lengths, *, requests, scores, query_scales=None, key_scales=None, score_scale=None)` | Write the FP32 score of each query row with each key of its request. |
+| `indexer_threshold_select(query, key_cache, row_ends, tile_requests, block_table, *, thresholds, counters, candidates, max_context, top_k, query_scales=None, key_scales=None, arrivals=None, ranges=None, score_scale=None)` | Keep the keys at or above the threshold of each query row, as (key, score) pairs. |
 | `top_k_from_candidates(candidates, ranges, *, top_keys)` | Write the Top-K keys of each query row from the pairs in its range. |
 | `gather_key_sample(key_cache, block_table, offsets, sample_ends, *, sample_keys, samples_per_run, pages_per_run, key_scales=None, sample_scales=None)` | Copy a strided random sample of the keys of each request into dense rows. |
 | `thresholds_from_sample(sample_scores, sample_top, *, thresholds, counters)` | Set the threshold of each query row from its sampled Top scores, and zero its counters. |
 | `quantize_write_index_qk_nvfp4(key, slots, query, query_rows, *, key_cache, key_scales, packed_query, query_scales)` | Quantize BF16 or FP16 keys and queries to NVFP4: the keys at their cache slots, the queries at their rows. |
+| `quantize_write_index_qk_fp8(key, slots, query, query_rows, *, key_cache, key_scale, fp8_query, query_scale)` | Quantize BF16 or FP16 keys and queries to FP8 E4M3 at per-tensor scales: the keys at their cache slots, the queries at their rows. |
 
 ### Layout
 
@@ -45,10 +47,15 @@ A key has 128 values. The keys are in pages of 64 keys.
 ```text
 BF16 query:        [rows, 128]
 BF16 key_cache:    [pages, 64, 128]
+FP8 query:         [rows, 128] float8_e4m3fn
+FP8 key_cache:     [pages, 64, 128] float8_e4m3fn
+FP8 score_scale:   [1] fp32        optional: query scale * key scale
 NVFP4 query:       [rows, 64] uint8    E2M1 values, two in a byte
 NVFP4 query_scales:[rows, 8] E4M3      a scale for each 16 values
 NVFP4 key_cache:   [pages, 64, 64] uint8
 NVFP4 key_scales:  [pages, 64, 8] E4M3
+FP8 query:         [rows, 128] E4M3       at one per-tensor scale
+FP8 key_cache:     [pages, 64, 128] E4M3  at one per-tensor scale
 block_table:       [requests, blocks] int32   the pages of each request
 ```
 
@@ -135,8 +142,8 @@ runs without host synchronization. CTAs after the length of their group exit
 at once. The groups share two CTAs for each SM. A group gets more CTAs when it
 needs them, so that the pages of each CTA run fit in its shared memory.
 
-On other GPUs, such as Hopper, a Triton kernel scores BF16 keys. NVFP4 keys need
-SM10x.
+On other GPUs, such as Hopper, a Triton kernel scores BF16 or FP8 keys. NVFP4
+keys need SM10x.
 
 #### Selection
 
@@ -192,6 +199,48 @@ scale: their largest magnitude over 6, with a global scale of 1. It writes the
 `query_scales`. It skips negative slots and rows. Keys and queries are
 quantized the same way, so their scores stay comparable.
 
+#### FP8 keys and queries
+
+FP8 keys and queries are E4M3, with one static scale for all the keys and one
+for all the queries, as in the FP8 KV cache of the main attention. The cache
+holds only the E4M3 values, so a page is 64 keys of 128 bytes, half the bytes
+of BF16, and TMA loads it the way it loads BF16 pages. A score is
+
+```text
+score = fp32(sum_d query[d] * key[d]) * score_scale    # score_scale = query scale * key scale
+```
+
+- On SM10x, the scorer runs a tcgen05 `kind::f8f6f4` MMA (not block-scaled),
+  with K = 32: four MMAs for each 128-value tile. Decode keeps the shape of
+  BF16, M = 128 keys and N = 8 query rows, which `kind::f8f6f4` allows when the
+  query (B) is K-major. The accumulator is FP32.
+- On Hopper, the Triton kernel calls `tl.dot` on E4M3 operands, with FP32
+  accumulation. Triton 3.8 runs it as an FP16 `mma.sync` on the converted
+  values, so its scores match an FP64 reference to FP32 rounding.
+- `score_scale` is an FP32 tensor of one element on the device, or None for 1.
+  The kernels read it once, and multiply each FP32 dot product by it before
+  they store it or compare it with a threshold: on SM10x, right after each
+  load of the scores from TMEM. So FP8 scores are in the units of BF16 scores.
+  A CUDA graph replay sees a new value written into the tensor.
+- A positive scale keeps the order of the scores of a row, so the Top-K keys
+  are the same with or without it. But thresholds and scores must be in the
+  same units: score the key sample from `gather_key_sample` with the
+  `score_scale` that the select gets. The select then compares, stores and
+  repairs scaled scores.
+- `gather_key_sample` copies FP8 keys as bytes, without scales.
+- BF16 and NVFP4 scores are in real units already, so `score_scale` is for FP8
+  only.
+
+`quantize_write_index_qk_fp8` divides each value of a key by `key_scale`, and
+of a query by `query_scale`, in FP32. It saturates the result to +-448 and
+rounds it to the nearest E4M3 value, ties to even. It writes a key at its slot
+`s` (page `s // 64`, row `s % 64`) and a query at its row `r` of `fp8_query`,
+and skips negative slots and rows. The scales are FP32 tensors of one value,
+read on the device, so a CUDA graph replay uses scales written after capture.
+The keys of a cache must all have the same `key_scale`, so that their scores
+stay comparable. One Triton kernel serves SM89 and newer: a program quantizes
+one key or query.
+
 ### Limits
 
 - A key has 128 values, and a page has 64 keys.
@@ -200,16 +249,23 @@ quantized the same way, so their scores stay comparable.
 - The block table must cover `max_context`.
 - The CuTe-DSL kernels need CuTe DSL 4.7 or newer. The scorer and the select
   need SM10x. Off SM10x, `indexer_scores` runs the Triton kernel,
-  which takes only BF16 queries and keys, with contiguous rows.
+  which takes only BF16 or FP8 queries and keys, with contiguous rows.
+- FP8 runs on SM10x (decode scores, selection and sampling) and on SM90 (decode
+  scores only, as for BF16: the selection, sampling, thresholds and Top-K
+  kernels need SM10x for every format). FP8 off SM10x needs SM89 or newer.
+- Queries and keys have the same format. `score_scale` takes FP8 only.
 - `gather_key_sample` takes sample rows of whole 128-key tiles.
+- `quantize_write_index_qk_nvfp4` needs SM10x. `quantize_write_index_qk_fp8`
+  runs on SM89 and newer, and takes contiguous rows.
 - `top_k_from_candidates` takes `top_k` below 65536.
 
 ### CUDA graphs
 
 No kernel synchronizes with the host. Run each one once before capture, because
 the CuTe-DSL kernels compile on first use. Queries, keys, pages, lengths,
-thresholds and ranges can change between replays. Zero the `arrivals` of the
-select once: every call leaves them at zero.
+thresholds and ranges can change between replays, and so can the scales of
+`quantize_write_index_qk_fp8`. Zero the `arrivals` of the select once: every
+call leaves them at zero.
 
 ### Tracing
 
@@ -219,29 +275,41 @@ Each API records a trace template, with the op type `sdsa_<api>`.
 
 `tests/sdsa/test_indexer.py` covers:
 
-- decode scores: BF16, BF16 through the Triton kernel, NVFP4, and NVFP4 keys and
+- decode scores: BF16, BF16 through the Triton kernel, FP8 and FP8 through the
+  Triton kernel (each with and without `score_scale`), NVFP4, and NVFP4 keys and
   scales in one cache; 1, 3 and 8 rows for each request; lengths that end on a
   page, in a key tile, at 0, and in runs of several CTAs. The values are exact in
-  FP32, so the scores must equal an FP64 reference bit for bit. The pages are
+  FP32, so the scores must equal an FP64 reference bit for bit. FP8 values are
+  small integers times 1 or 2, and `score_scale` is a power of two. The pages are
   shuffled, block-table entries past a length are invalid, and the scores past a
-  length must stay as they are. A CUDA graph replay then uses new lengths.
-- selection: BF16 and NVFP4; `top_k` 64, 512 and 2048; with and without the
-  repair; query and key lengths that end on a page or in a key tile, and tiles
-  with runs of several CTAs, some short and some empty; a CUDA graph replay.
-  After the repair, `top_k_from_candidates` must give the Top-K keys of each
-  row's scores.
+  length must stay as they are. A CUDA graph replay then uses new lengths, and a
+  new `score_scale`.
+- selection: BF16, FP8 with and without `score_scale`, and NVFP4; `top_k` 64,
+  512 and 2048; with and without the repair; query and key lengths that end on
+  a page or in a key tile, and tiles with runs of several CTAs, some short and
+  some empty; a CUDA graph replay, with a new `score_scale`. With FP8 and
+  `score_scale`, the thresholds and stored scores are in scaled units. After the
+  repair, `top_k_from_candidates` must give the Top-K keys of each row's
+  scores.
 - `top_k_from_candidates`: `top_k` 512, 2048 and 65535; random ranges, empty,
   shorter than `top_k`, one pair longer, and of all the slots; normal scores, a
   few values, all equal, and zeros of both signs, infinities and NaNs; a CUDA
   graph replay with new ranges. The selected scores must be the largest of the
   row.
-- `gather_key_sample`: BF16 and NVFP4, with pages in the first 2**31 bytes of
-  the cache and after them. Slots after the sample end stay as they are.
+- `gather_key_sample`: BF16, FP8 and NVFP4, with pages in the first 2**31 bytes
+  of the cache and after them. Slots after the sample end stay as they are.
 - `thresholds_from_sample`: -1 positions and NaN scores.
 - `quantize_write_index_qk_nvfp4`: 0 to 300 keys and 0 to 300 queries, at
   shuffled slots and rows, with negative ones skipped.
+- `quantize_write_index_qk_fp8`, on SM90 and SM10x: BF16 and FP16, 0 to 300
+  keys and 0 to 300 queries, at shuffled slots and rows, with negative ones
+  skipped, and values that saturate. The output must equal a PyTorch reference
+  bit for bit, and nothing else may be written. A CUDA graph replay uses new
+  inputs and new scales.
 - the checks that reject bad shapes, bad layouts off SM10x, bad counters, and
-  CuTe DSL older than 4.7.
+  CuTe DSL older than 4.7; FP8 queries with BF16 keys, FP8 keys of the wrong
+  shape or with scales, `score_scale` with BF16 or NVFP4, a `score_scale` that
+  is not one float32 on the device, NVFP4 off SM10x, and FP8 below SM89.
 
 ## Token-sparse attention
 

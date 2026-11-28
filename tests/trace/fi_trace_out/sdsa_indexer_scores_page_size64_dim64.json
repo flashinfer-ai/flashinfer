@@ -1,6 +1,6 @@
 {
   "name": "sdsa_indexer_scores_page_size64_dim64",
-  "description": "Single-head paged MQA logits: FP32 dot products of query rows with their request's paged BF16 or NVFP4 keys (no head weights or ReLU). SM100/SM103.",
+  "description": "Single-head paged MQA logits: FP32 dot products of query rows with their request's paged BF16, FP8 or NVFP4 keys (no head weights or ReLU), FP8 ones times an optional score scale. SM100/SM103.",
   "op_type": "sdsa_indexer_scores",
   "tags": [
     "fi_api:flashinfer.sdsa.indexer.indexer_scores",
@@ -40,11 +40,16 @@
     "dim": {
       "type": "const",
       "value": 64,
-      "description": "Elements per key: 128 BF16, or 64 NVFP4 bytes."
+      "description": "Elements per key: 128 BF16 or FP8, or 64 NVFP4 bytes."
     },
     "scales": {
       "type": "var",
       "description": "NVFP4's E4M3 scales per key, one per 16 values."
+    },
+    "one": {
+      "type": "const",
+      "value": 1,
+      "description": "FP8 score_scale's element."
     }
   },
   "inputs": {
@@ -104,6 +109,13 @@
         "scales"
       ],
       "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "score_scale": {
+      "shape": [
+        "one"
+      ],
+      "dtype": "unknown",
       "optional": true
     }
   },
