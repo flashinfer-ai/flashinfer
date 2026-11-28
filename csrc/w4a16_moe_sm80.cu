@@ -788,9 +788,10 @@ __device__ __forceinline__ int shuffled_row(int n) {
 // k-step's sum times its FP32 scales (GemmParamsF8).
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
           bool Q12F = false, bool VS = false, bool FQ = false, bool PT = false, bool OW = false,
-          bool MX = false, bool SH = false, int F8 = 0, bool GW = false>
+          bool MX = false, bool SH = false, int F8 = 0, bool GW = false, bool SK = false>
 __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) {
   static_assert(!FQ || ACT != 0 || R == 8, "FQ: a GEMM1 epilogue or the R 8 GEMM2 sum");
+  static_assert(!SK || (OW && !KT && !FQ && !PT && F8 == 0), "SK: OW, whole k-steps");
   static_assert(!MX || OW, "MX: OW");
   static_assert(!SH || (OW && (!MX || F8)), "SH: OW, not MXFP4");
   static_assert(!F8 || OW, "F8: OW");
@@ -856,6 +857,13 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
   int iw = (blockIdx.x % chunks) * NC * S;
   int iks = 0;
   uint32_t islot = 0;
+  // SK (split-K): CTA y of gridDim.y runs the tile's k-steps kb .. kb + nk - 1
+  int nk = S;
+  if constexpr (SK) {
+    const int y = blockIdx.y, spl = gridDim.y;
+    iks = y * S / spl;
+    nk = (y + 1) * S / spl - iks;
+  }
   const uint8_t* gws[NC];
   bool valid_record[NC];
   constexpr int RJ = R > RP ? R / RP : 1;
@@ -1886,7 +1894,7 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
 
 #pragma unroll
   for (int i = 0; i < STAGES - 1; ++i) {
-    if (i < S) issue();
+    if (i < nk) issue();
     flashinfer::cp_async::commit_group();
   }
   if constexpr (PT && ACT) {
@@ -1903,10 +1911,10 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
   // quarters of this warp's TW rows that hold a real row of the tile's block
   const int nq =
       SC == 1 ? 1 : min(Q, (max(0, p.block_rows[tile / chunks] - wt * TW) * Q + TW - 1) / TW);
-  for (int u = 0; u < S; ++u) {
+  for (int u = 0; u < nk; ++u) {
     flashinfer::cp_async::wait_group<STAGES - 2>();
     __syncthreads();
-    if (u + STAGES - 1 < S) issue();
+    if (u + STAGES - 1 < nk) issue();
     flashinfer::cp_async::commit_group();
     const uint32_t sb = cslot;
     cslot = cslot + kStage == kRing ? 0u : cslot + kStage;
@@ -1924,6 +1932,44 @@ __device__ __forceinline__ void gemm_body(GemmParamsT<FQ, OW, MX, F8> const& p) 
     }
 #undef W4A16_STEP
     // clang-format on
+  }
+  if constexpr (SK) {
+    // split y's partial sums at ws [tile][y][SC G][NT] (float4); the tile's last CTA to arrive
+    // adds the splits in split order (deterministic), resets cnt[tile] and writes the tile
+    const int y = blockIdx.y, spl = gridDim.y;
+    float4* ws4 = reinterpret_cast<float4*>(p.ws) + static_cast<long>(tile) * spl * SC * G * NT;
+#pragma unroll
+    for (int s = 0; s < SC; ++s)
+#pragma unroll
+      for (int gi = 0; gi < G; ++gi)
+        __stcg(ws4 + (static_cast<long>(y) * SC * G + s * G + gi) * NT + tid,
+               make_float4(acc[s][gi][0], acc[s][gi][1], acc[s][gi][2], acc[s][gi][3]));
+    __threadfence();
+    __syncthreads();
+    int arrived = 0;
+    if (tid == 0) arrived = atomicAdd(p.cnt + tile, 1);
+    if (!__syncthreads_or(tid == 0 && arrived == spl - 1)) return;
+    __threadfence();
+#pragma unroll
+    for (int s = 0; s < SC; ++s)
+#pragma unroll
+      for (int gi = 0; gi < G; ++gi) {
+        float4 t = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int z = 0; z < spl; ++z) {
+          const float4 v =
+              z == y ? make_float4(acc[s][gi][0], acc[s][gi][1], acc[s][gi][2], acc[s][gi][3])
+                     : __ldcg(ws4 + (static_cast<long>(z) * SC * G + s * G + gi) * NT + tid);
+          t.x += v.x;
+          t.y += v.y;
+          t.z += v.z;
+          t.w += v.w;
+        }
+        acc[s][gi][0] = t.x;
+        acc[s][gi][1] = t.y;
+        acc[s][gi][2] = t.z;
+        acc[s][gi][3] = t.w;
+      }
+    if (tid == 0) p.cnt[tile] = 0;
   }
   if constexpr (FQ && ACT != 0) {
     write_tile_fq(tile / chunks, tile % chunks, acc, cslot);
@@ -1959,6 +2005,12 @@ template <int R, int WC, int NW, int STAGES, bool KT, bool MX = false, bool SH =
 __global__ void __launch_bounds__(NW * 32) gemm_ow(GemmParamsT<false, true, MX, F8> p) {
   gemm_body<R, WC, NW, 0, STAGES, KT, 1, false, false, false, false, false, true, MX, SH, F8, GW>(
       p);
+}
+// gemm_ow split over K (SK): gridDim.y splits, p.ws / p.cnt its partial sums and arrival counts
+template <int R, int WC, int NW, int STAGES>
+__global__ void __launch_bounds__(NW * 32) gemm_ow_sk(GemmParamsT<false, true> p) {
+  gemm_body<R, WC, NW, 0, STAGES, false, 1, false, false, false, false, false, true, false, false,
+            0, false, true>(p);
 }
 
 // gemm_f8's input: the threads stride over the routing of b batches of bm rows to blocks of R
@@ -2792,9 +2844,19 @@ constexpr int ow_stage_bytes() {  // gemm_body's kStage
             : Cfg<R, 1>::kStageBytes;
 }
 template <int R, int WC, int NW, int STAGES, bool KT, bool MX, bool SH, int F8, bool GW>
-void launch_gemm_ow(GemmParamsT<false, true, MX, F8> const& p, int grid, cudaStream_t st) {
+void launch_gemm_ow(GemmParamsT<false, true, MX, F8> const& p, int grid, cudaStream_t st,
+                    int spl = 1) {
   const int smem = STAGES * ow_stage_bytes<R, F8, MX, GW>();
   TVM_FFI_ICHECK(smem <= max_smem_optin()) << "W4A16 MoE GEMM: tile exceeds device shared memory";
+  if constexpr (!KT && !MX && !SH && F8 == 0 && !GW) {
+    if (spl > 1) {
+      cudaFuncSetAttribute(gemm_ow_sk<R, WC, NW, STAGES>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+      gemm_ow_sk<R, WC, NW, STAGES><<<dim3(grid, spl), NW * 32, smem, st>>>(p);
+      return;
+    }
+  }
+  TVM_FFI_ICHECK(spl == 1) << "split-K: NVFP4, whole k-steps";
   cudaFuncSetAttribute(gemm_ow<R, WC, NW, STAGES, KT, MX, SH, F8, GW>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   gemm_ow<R, WC, NW, STAGES, KT, MX, SH, F8, GW><<<grid, NW * 32, smem, st>>>(p);
@@ -2802,23 +2864,24 @@ void launch_gemm_ow(GemmParamsT<false, true, MX, F8> const& p, int grid, cudaStr
 
 // OW: launch_tile's kBase tiles
 template <bool KT, bool MX, bool SH, int F8 = 0, bool GW = false>
-void launch_tile_ow(int R, GemmParamsT<false, true, MX, F8> const& p, int grid, cudaStream_t st) {
+void launch_tile_ow(int R, GemmParamsT<false, true, MX, F8> const& p, int grid, cudaStream_t st,
+                    int spl = 1) {
   if (R == 8) {  // as launch_tile_pt
     constexpr int s = ow_stage_bytes<8, F8, MX, GW>();
     if (ctas_per_sm<gemm_ow<8, 8, 8, 3, KT, MX, SH, F8, GW>, 3 * s>() >
         ctas_per_sm<gemm_ow<8, 8, 8, 4, KT, MX, SH, F8, GW>, 4 * s>())
-      launch_gemm_ow<8, 8, 8, 3, KT, MX, SH, F8, GW>(p, grid, st);
+      launch_gemm_ow<8, 8, 8, 3, KT, MX, SH, F8, GW>(p, grid, st, spl);
     else
-      launch_gemm_ow<8, 8, 8, 4, KT, MX, SH, F8, GW>(p, grid, st);
+      launch_gemm_ow<8, 8, 8, 4, KT, MX, SH, F8, GW>(p, grid, st, spl);
   } else if (R == 16)
-    launch_gemm_ow<16, 8, 8, 2, KT, MX, SH, F8, GW>(p, grid, st);
+    launch_gemm_ow<16, 8, 8, 2, KT, MX, SH, F8, GW>(p, grid, st, spl);
   else if (R == 32) {
     if (max_smem_per_sm() <= 100 * 1024)
-      launch_gemm_ow<32, 8, 8, 2, KT, MX, SH, F8, GW>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 2, KT, MX, SH, F8, GW>(p, grid, st, spl);
     else
-      launch_gemm_ow<32, 8, 8, 4, KT, MX, SH, F8, GW>(p, grid, st);
+      launch_gemm_ow<32, 8, 8, 4, KT, MX, SH, F8, GW>(p, grid, st, spl);
   } else
-    launch_gemm_ow<64, 4, 4, 3, KT, MX, SH, F8, GW>(p, grid, st);
+    launch_gemm_ow<64, 4, 4, 3, KT, MX, SH, F8, GW>(p, grid, st, spl);
 }
 #endif
 
@@ -3402,11 +3465,17 @@ void w4a16_moe_sm80_gemm(
 // are, sf their E4M3 block scales 128x4-swizzled [pad(N, 128)][pad(K / 16, 4)]; alpha [1], or
 // [rows] per row with alpha_rows. Columns N .. Nout - 1 are 0. With shuffled (NVFP4, N % 32 == 0)
 // w and sf hold their rows in TRT-LLM's epilogue-tile-128 shuffle (nvfp4_quantize do_shuffle).
-void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, TensorView act,
-                             TensorView meta, TensorView rowmap, TensorView out, int64_t row_tile,
-                             int64_t N, int64_t K, int64_t max_blocks, bool alpha_rows,
-                             tvm::ffi::Optional<TensorView> act_sf, bool shuffled,
-                             tvm::ffi::Optional<TensorView> act_sf_off, int64_t act_shift) {
+// gemm_fp4_sk: gemm_fp4 split over K into split CTAs per tile (NVFP4, K % 128 == 0), sk_ws
+// float32 >= tiles x split x row_tile x 128 their partial sums, sk_cnt int32 >= tiles zeroed once
+// (each launch leaves it zero).
+void w4a16_moe_sm80_gemm_fp4_sk(TensorView w, TensorView sf, TensorView alpha, TensorView act,
+                                TensorView meta, TensorView rowmap, TensorView out,
+                                int64_t row_tile, int64_t N, int64_t K, int64_t max_blocks,
+                                bool alpha_rows, tvm::ffi::Optional<TensorView> act_sf,
+                                bool shuffled, tvm::ffi::Optional<TensorView> act_sf_off,
+                                int64_t act_shift, int64_t split,
+                                tvm::ffi::Optional<TensorView> sk_ws,
+                                tvm::ffi::Optional<TensorView> sk_cnt) {
   // act_sf: MXFP4 (E8M0 scales of both operands, the activation's 128x4 [pad(M, 128)][4 nka]).
   // act_sf_off (int32 [groups]): w, sf (NVFP4 too, group e's at e [pad(N, 128)][4 nka]) and
   // act_sf as GemmParamsMx's groups, act block-ordered, alpha [groups]. act_shift: MXFP4's sh.
@@ -3469,13 +3538,36 @@ void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, Tens
   p.sh = static_cast<int>(act_shift);
   const int grid = static_cast<int>(max_blocks * (n_pad / kTileN));
   const int rt = static_cast<int>(row_tile);
+  if (split > 1) {
+    TVM_FFI_ICHECK(!mx && !shuffled && groups == 1 && K % kTileK == 0 && split <= K / kTileK &&
+                   sk_ws.has_value() && sk_cnt.has_value())
+        << "split-K: NVFP4, unshuffled, one group, K % 128 == 0, split <= K / 128, sk_ws, sk_cnt";
+    CHECK_INPUT_AND_TYPE(sk_ws.value(), dl_float32);
+    CHECK_INPUT_AND_TYPE(sk_cnt.value(), dl_int32);
+    TVM_FFI_ICHECK(sk_ws.value().numel() >= static_cast<int64_t>(grid) * split * row_tile * 128 &&
+                   sk_cnt.value().numel() >= grid)
+        << "sk_ws [tiles x split x row_tile x 128], sk_cnt [tiles]";
+    p.ws = static_cast<float*>(sk_ws.value().data_ptr());
+    p.cnt = static_cast<int*>(sk_cnt.value().data_ptr());
+  }
+  const int spl = static_cast<int>(split > 1 ? split : 1);
   auto tile = [&](auto kt) {
     constexpr bool T = decltype(kt)::value;
-    mx         ? launch_tile_ow<T, true, false>(rt, p, grid, st)
-    : shuffled ? launch_tile_ow<T, false, true>(rt, p, grid, st)
-               : launch_tile_ow<T, false, false>(rt, p, grid, st);
+    mx         ? launch_tile_ow<T, true, false>(rt, p, grid, st, spl)
+    : shuffled ? launch_tile_ow<T, false, true>(rt, p, grid, st, spl)
+               : launch_tile_ow<T, false, false>(rt, p, grid, st, spl);
   };
   K % kTileK != 0 ? tile(std::true_type{}) : tile(std::false_type{});
+}
+
+void w4a16_moe_sm80_gemm_fp4(TensorView w, TensorView sf, TensorView alpha, TensorView act,
+                             TensorView meta, TensorView rowmap, TensorView out, int64_t row_tile,
+                             int64_t N, int64_t K, int64_t max_blocks, bool alpha_rows,
+                             tvm::ffi::Optional<TensorView> act_sf, bool shuffled,
+                             tvm::ffi::Optional<TensorView> act_sf_off, int64_t act_shift) {
+  w4a16_moe_sm80_gemm_fp4_sk(w, sf, alpha, act, meta, rowmap, out, row_tile, N, K, max_blocks,
+                             alpha_rows, act_sf, shuffled, act_sf_off, act_shift, 1,
+                             tvm::ffi::Optional<TensorView>(), tvm::ffi::Optional<TensorView>());
 }
 
 #endif
@@ -3846,6 +3938,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(finalize, w4a16_moe_sm80_finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(row_quant, w4a16_moe_sm80_row_quant);
 #ifdef RECORDS_OW
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_fp4, w4a16_moe_sm80_gemm_fp4);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_fp4_sk, w4a16_moe_sm80_gemm_fp4_sk);
 #endif
 #ifdef RECORDS_F8
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(prep_f8, w4a16_moe_sm80_prep_f8);

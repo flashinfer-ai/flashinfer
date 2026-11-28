@@ -44,7 +44,7 @@ from ..fused_moe.prepare import (
     _w4a16_records_geometry,
 )
 from ..jit.fused_moe import gen_w4a16_moe_sm80_module
-from ..utils import get_compute_capability
+from ..utils import _get_stream_cache_buf, get_compute_capability, get_device_sm_count
 
 # (row tile, GEMM2 variant) of the MoE tactics, GEMM1's variant dropped
 _TACTICS = tuple(dict.fromkeys((r, g2) for r, _, g2 in W4A16_SM80_TACTICS))
@@ -501,11 +501,14 @@ def _run_fp4(
     mx: bool = False,
     shuffled: bool = False,
     sf_8x4: bool = False,
+    split: int = 1,
 ) -> None:
     """``out = (a @ b) * alpha`` for ``mm_fp4``'s NVFP4 (MXFP4: ``mx``) operands: the prep
     restores ``a`` to BF16 exactly (MXFP4: without its scales; ``sf_8x4``: its scales 8x4
     swizzled), then the dense GEMM (``gemm_fp4``) reads ``b`` and its 128x4-swizzled scales as
-    given (MXFP4: and ``a``'s; ``shuffled``: both in the trtllm row shuffle)."""
+    given (MXFP4: and ``a``'s; ``shuffled``: both in the trtllm row shuffle). ``split`` > 1
+    (NVFP4, unshuffled, K % 128 == 0): each output tile's K is split over ``split`` CTAs, whose
+    FP32 partial sums the tile's last CTA adds in split order (``gemm_fp4_sk``)."""
     m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
     if m == 0:
         return
@@ -542,17 +545,40 @@ def _run_fp4(
         else torch.empty((m, _pad(n, 8)), dtype=out.dtype, device=a.device)
     )
     gemm = module if out.dtype == torch.bfloat16 else _out_module(out.dtype)
-    gemm.gemm_fp4(
+    args = (
         w, sf, alpha, act, meta, rowmap, target, r, n, k, max_blocks, alpha.numel() > 1,
         asf if mx else None, shuffled, None, 0,
     )  # fmt: skip
+    if split > 1:
+        tiles = max_blocks * -(-n // 128)
+        ws_bytes, cnt_bytes = tiles * split * r * 512, tiles * 4
+        if _is_current_stream_capturing():
+            # the replay stream is unknown and two graphs may replay concurrently: each
+            # captured call owns its scratch in the graph's pool, and the captured memset
+            # re-zeroes its arrival counts on every replay
+            ws = torch.empty(ws_bytes, dtype=torch.uint8, device=a.device)
+            cnt = torch.zeros(cnt_bytes, dtype=torch.uint8, device=a.device)
+        else:
+            # launches on one stream are ordered and the kernel leaves every tile's arrival
+            # count at 0 on exit, so the stream's scratch, zeroed once, stays valid
+            ws = _get_stream_cache_buf("sm8x_mm_fp4_splitk_ws", ws_bytes, a.device)
+            cnt = _get_stream_cache_buf(
+                "sm8x_mm_fp4_splitk_cnt", cnt_bytes, a.device, zero_init=True
+            )
+        gemm.gemm_fp4_sk(*args, split, ws.view(torch.float32), cnt.view(torch.int32))
+    else:
+        gemm.gemm_fp4(*args)
     if not direct:
         out.copy_(target[:, :n])
 
 
+_FP4_SPLITS = (2, 3, 4, 6, 8, 12, 16)
+
+
 class Sm8xMmFp4Runner(TunableRunner):
     """``_run_fp4`` behind ``mm_fp4`` as an autotuner candidate on ``mm_fp4``'s inputs; tactic:
-    the row tile."""
+    the row tile, or (row tile, split) for a split over K (NVFP4, unshuffled, K % 128 == 0, at
+    most 8 CTAs per SM, which bounds the partial sums' scratch)."""
 
     def __init__(self, shuffled: bool, sf_8x4: bool):
         self.shuffled = shuffled
@@ -563,10 +589,24 @@ class Sm8xMmFp4Runner(TunableRunner):
         return (inputs[5], alpha_rows, inputs[8], self.shuffled, self.sf_8x4)
 
     def get_valid_tactics(self, inputs, profile: OptimizationProfile) -> List:
-        return [8, 16, 32, 64]
+        tactics: List = [8, 16, 32, 64]
+        a, b = inputs[0], inputs[1]
+        m, k, n = int(a.shape[0]), 2 * int(a.shape[1]), int(b.shape[1])
+        if not inputs[8] or self.shuffled or k % 128 or m == 0:
+            return tactics
+        ctas = 8 * get_device_sm_count(a.device)
+        for r in (8, 16, 32, 64):
+            tiles = -(-m // r) * -(-n // 128)
+            tactics += [
+                (r, s) for s in _FP4_SPLITS if s <= k // 128 and tiles * s <= ctas
+            ]
+        return tactics
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         a, b, a_descale, b_descale, alpha, _, out = inputs[:7]
+        if tactic is None or tactic == -1:
+            tactic = 64
+        r, split = (tactic, 1) if isinstance(tactic, int) else tuple(tactic)
         _run_fp4(
             a,
             b,
@@ -574,10 +614,11 @@ class Sm8xMmFp4Runner(TunableRunner):
             b_descale,
             alpha,
             out,
-            64 if tactic in (None, -1) else tactic,
+            r,
             not inputs[8],
             self.shuffled,
             self.sf_8x4,
+            split,
         )
         return out
 

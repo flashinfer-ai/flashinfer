@@ -721,7 +721,7 @@ def test_mm_fp4_per_token_alpha_auto_misaligned_n_raises():
 def test_mm_fp4_per_token_alpha_splitk(m, n, k, res_dtype):
     _skip_unless_per_token_alpha_gpu()
     if get_compute_capability(torch.device("cuda"))[0] == 8:
-        pytest.skip("SM8x has no split-K kernel.")
+        pytest.skip("The cluster split-K kernel is SM100/SM103 only.")
     from flashinfer.gemm.gemm_base import _select_sm100_mm_fp4_splitk_tactic
     from flashinfer.utils import get_device_sm_count
 
