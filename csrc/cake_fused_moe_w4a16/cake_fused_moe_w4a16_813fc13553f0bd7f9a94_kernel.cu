@@ -50,33 +50,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 448
-#define TMEM_ACC_OFFSET 0
-#define TMEM_A_BF16_OFFSET 64
-#define NUM_RAW_RING_STAGES 6
-#define NUM_B_RING_STAGES 6
-#define NUM_A_RING_STAGES 3
-#define NUM_ACC_RING_STAGES 2
-#define NUM_TILE_RING_STAGES 3
-#define NUM_STORE_RING_STAGES 2
-#define SMEM_RAW_SMEM_OFF 1024
-#define SMEM_RAW_SMEM_STAGE_BYTES 16384
-#define SMEM_RAW_SMEM_STRIDE 16384
-#define SMEM_SF_SMEM_OFF 99328
-#define SMEM_SF_SMEM_STAGE_BYTES 2048
-#define SMEM_SF_SMEM_STRIDE 2048
-#define SMEM_SMEM_B_OFF 111616
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_STAGING_OFF 209920
-#define SMEM_STAGING_STAGE_BYTES 4096
-#define SMEM_STAGING_STRIDE 4096
-#define SMEM_TILE_INFO_OFF 218112
-#define SMEM_TILE_INFO_STAGE_BYTES 16
-#define SMEM_TILE_INFO_STRIDE 16
-#define SMEM_TOTAL 218240
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 __device__ __forceinline__ uint32_t cvt_bf16x2_e4m3x2_p112(uint16_t src) {
@@ -293,6 +266,21 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_CLUSTER_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+        "DONE_CLUSTER_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
 
 
 
@@ -380,7 +368,7 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* raw_smem = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int raw_smem_addr = smem + 1024;
     uint8_t* sf_smem = reinterpret_cast<uint8_t*>(smem_raw + 99328);
@@ -392,8 +380,7 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
     int* tile_info = reinterpret_cast<int*>(smem_raw + 218112);
     const int tile_info_addr = smem + 218112;
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 40 barriers)
-    // Mbarriers at smem_raw[0..320)
+    // Mbarrier init (40 barriers at smem_raw[0..320))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -471,11 +458,11 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
+    const unsigned int tmem_a_bf16 = taddr + 64;
 
     // Kernel post-init ops
-    const int tmem_acc = taddr;
-    const int tmem_a_bf16 = taddr + 64;
     if (warp >= 4 && warp <= 7) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
     }
@@ -501,10 +488,10 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
             for (unsigned int w = bid; w < end; w += num_bids) {
-                uint32_t _fast_div_q_3 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w);
-                uint32_t _fast_div_r_3 = (uint32_t)(w) - _fast_div_q_3 * (uint32_t)(m_tile_div.divisor);
-                int t = (int)_fast_div_q_3;
-                int m_cta = (int)_fast_div_r_3;
+                uint32_t fast_div_q = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w);
+                uint32_t fast_div_r = (uint32_t)(w) - fast_div_q * (uint32_t)(m_tile_div.divisor);
+                int t = (int)fast_div_q;
+                int m_cta = (int)fast_div_r;
                 mbarrier_wait(tile_full_addr + (tile_cur) * 8, _phase_tile_full);
                 asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&record[0])), "=r"(*reinterpret_cast<uint32_t*>(&record[(0) + 1]))
@@ -519,7 +506,7 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
                 float alpha_e = alpha[expert];
                 int feature0 = m_cta * 64;
                 int row0 = t * 32;
-                mbarrier_wait(acc_full_addr + (acc_cur) * 8, _phase_acc_full);
+                mbarrier_wait_cluster_hint(acc_full_addr + (acc_cur) * 8, _phase_acc_full, 10000000);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll
                 for (int sub = 0; sub < 1; sub++) {
@@ -544,354 +531,354 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
                         }
                     }
                     unsigned int out_base = staging_addr + out_cur * 4096 + (unsigned int)thread_off;
-                    float g;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g) : "f"(_tmem_load_0[0]), "f"(alpha_e));
-                    float u;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u) : "f"(_tmem_load_1[0]), "f"(alpha_e));
+                    float g_1_0;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_0) : "f"(_tmem_load_0[0]), "f"(alpha_e));
+                    float u_2_0;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_0) : "f"(_tmem_load_1[0]), "f"(alpha_e));
                     float _min_1;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_1) : "f"(g), "f"(swiglu_limit));
-                    g = _min_1;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_1) : "f"(g_1_0), "f"(swiglu_limit));
+                    g_1_0 = _min_1;
                     float _min_3;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_3) : "f"(u), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_3) : "f"(u_2_0), "f"(swiglu_limit));
                     float _max_2;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_2) : "f"(_min_3), "f"(neg_limit));
-                    u = _max_2;
-                    float _exp2_6 = approx_exp2(mul_f32_rn_noftz(g, -1.442695f));
+                    u_2_0 = _max_2;
+                    float _exp2_6 = approx_exp2(mul_f32_rn_noftz(g_1_0, -1.442695f));
                     float _add_5;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(_exp2_6), "f"(1.0f));
                     float _rcp_4 = approx_rcp(_add_5);
                     {
-                        __nv_bfloat16 _bval_7 = __float2bfloat16_rn(mul_f32_rn_noftz(u, mul_f32_rn_noftz(g, _rcp_4)));
+                        __nv_bfloat16 _bval_7 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_0, mul_f32_rn_noftz(g_1_0, _rcp_4)));
                         uint16_t _bits_7 = *(uint16_t*)&_bval_7;
                         uint32_t _addr_7 = static_cast<uint32_t>(out_base);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_7), "h"(_bits_7) : "memory");
                     }
-                    float g_0;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_0) : "f"(_tmem_load_0[1]), "f"(alpha_e));
-                    float u_1;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_1) : "f"(_tmem_load_1[1]), "f"(alpha_e));
+                    float g_1_1;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_1) : "f"(_tmem_load_0[1]), "f"(alpha_e));
+                    float u_2_1;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_1) : "f"(_tmem_load_1[1]), "f"(alpha_e));
                     float _min_8;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_8) : "f"(g_0), "f"(swiglu_limit));
-                    g_0 = _min_8;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_8) : "f"(g_1_1), "f"(swiglu_limit));
+                    g_1_1 = _min_8;
                     float _min_10;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_10) : "f"(u_1), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_10) : "f"(u_2_1), "f"(swiglu_limit));
                     float _max_9;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_9) : "f"(_min_10), "f"(neg_limit));
-                    u_1 = _max_9;
-                    float _exp2_13 = approx_exp2(mul_f32_rn_noftz(g_0, -1.442695f));
+                    u_2_1 = _max_9;
+                    float _exp2_13 = approx_exp2(mul_f32_rn_noftz(g_1_1, -1.442695f));
                     float _add_12;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(_exp2_13), "f"(1.0f));
                     float _rcp_11 = approx_rcp(_add_12);
                     {
-                        __nv_bfloat16 _bval_14 = __float2bfloat16_rn(mul_f32_rn_noftz(u_1, mul_f32_rn_noftz(g_0, _rcp_11)));
+                        __nv_bfloat16 _bval_14 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_1, mul_f32_rn_noftz(g_1_1, _rcp_11)));
                         uint16_t _bits_14 = *(uint16_t*)&_bval_14;
                         uint32_t _addr_14 = static_cast<uint32_t>(out_base + 256);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_14), "h"(_bits_14) : "memory");
                     }
-                    float g_2;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_2) : "f"(_tmem_load_0[2]), "f"(alpha_e));
-                    float u_3;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_3) : "f"(_tmem_load_1[2]), "f"(alpha_e));
+                    float g_1_2;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_2) : "f"(_tmem_load_0[2]), "f"(alpha_e));
+                    float u_2_2;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_2) : "f"(_tmem_load_1[2]), "f"(alpha_e));
                     float _min_15;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_15) : "f"(g_2), "f"(swiglu_limit));
-                    g_2 = _min_15;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_15) : "f"(g_1_2), "f"(swiglu_limit));
+                    g_1_2 = _min_15;
                     float _min_17;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_17) : "f"(u_3), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_17) : "f"(u_2_2), "f"(swiglu_limit));
                     float _max_16;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_16) : "f"(_min_17), "f"(neg_limit));
-                    u_3 = _max_16;
-                    float _exp2_20 = approx_exp2(mul_f32_rn_noftz(g_2, -1.442695f));
+                    u_2_2 = _max_16;
+                    float _exp2_20 = approx_exp2(mul_f32_rn_noftz(g_1_2, -1.442695f));
                     float _add_19;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19) : "f"(_exp2_20), "f"(1.0f));
                     float _rcp_18 = approx_rcp(_add_19);
                     {
-                        __nv_bfloat16 _bval_21 = __float2bfloat16_rn(mul_f32_rn_noftz(u_3, mul_f32_rn_noftz(g_2, _rcp_18)));
+                        __nv_bfloat16 _bval_21 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_2, mul_f32_rn_noftz(g_1_2, _rcp_18)));
                         uint16_t _bits_21 = *(uint16_t*)&_bval_21;
                         uint32_t _addr_21 = static_cast<uint32_t>(out_base + 512);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_21), "h"(_bits_21) : "memory");
                     }
-                    float g_4;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_4) : "f"(_tmem_load_0[3]), "f"(alpha_e));
-                    float u_5;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_5) : "f"(_tmem_load_1[3]), "f"(alpha_e));
+                    float g_1_3;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_3) : "f"(_tmem_load_0[3]), "f"(alpha_e));
+                    float u_2_3;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_3) : "f"(_tmem_load_1[3]), "f"(alpha_e));
                     float _min_22;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_22) : "f"(g_4), "f"(swiglu_limit));
-                    g_4 = _min_22;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_22) : "f"(g_1_3), "f"(swiglu_limit));
+                    g_1_3 = _min_22;
                     float _min_24;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_24) : "f"(u_5), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_24) : "f"(u_2_3), "f"(swiglu_limit));
                     float _max_23;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_23) : "f"(_min_24), "f"(neg_limit));
-                    u_5 = _max_23;
-                    float _exp2_27 = approx_exp2(mul_f32_rn_noftz(g_4, -1.442695f));
+                    u_2_3 = _max_23;
+                    float _exp2_27 = approx_exp2(mul_f32_rn_noftz(g_1_3, -1.442695f));
                     float _add_26;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_26) : "f"(_exp2_27), "f"(1.0f));
                     float _rcp_25 = approx_rcp(_add_26);
                     {
-                        __nv_bfloat16 _bval_28 = __float2bfloat16_rn(mul_f32_rn_noftz(u_5, mul_f32_rn_noftz(g_4, _rcp_25)));
+                        __nv_bfloat16 _bval_28 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_3, mul_f32_rn_noftz(g_1_3, _rcp_25)));
                         uint16_t _bits_28 = *(uint16_t*)&_bval_28;
                         uint32_t _addr_28 = static_cast<uint32_t>(out_base + 768);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_28), "h"(_bits_28) : "memory");
                     }
-                    float g_6;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_6) : "f"(_tmem_load_0[4]), "f"(alpha_e));
-                    float u_7;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_7) : "f"(_tmem_load_1[4]), "f"(alpha_e));
+                    float g_1_4;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_4) : "f"(_tmem_load_0[4]), "f"(alpha_e));
+                    float u_2_4;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_4) : "f"(_tmem_load_1[4]), "f"(alpha_e));
                     float _min_29;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_29) : "f"(g_6), "f"(swiglu_limit));
-                    g_6 = _min_29;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_29) : "f"(g_1_4), "f"(swiglu_limit));
+                    g_1_4 = _min_29;
                     float _min_31;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_31) : "f"(u_7), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_31) : "f"(u_2_4), "f"(swiglu_limit));
                     float _max_30;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_30) : "f"(_min_31), "f"(neg_limit));
-                    u_7 = _max_30;
-                    float _exp2_34 = approx_exp2(mul_f32_rn_noftz(g_6, -1.442695f));
+                    u_2_4 = _max_30;
+                    float _exp2_34 = approx_exp2(mul_f32_rn_noftz(g_1_4, -1.442695f));
                     float _add_33;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_33) : "f"(_exp2_34), "f"(1.0f));
                     float _rcp_32 = approx_rcp(_add_33);
                     {
-                        __nv_bfloat16 _bval_35 = __float2bfloat16_rn(mul_f32_rn_noftz(u_7, mul_f32_rn_noftz(g_6, _rcp_32)));
+                        __nv_bfloat16 _bval_35 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_4, mul_f32_rn_noftz(g_1_4, _rcp_32)));
                         uint16_t _bits_35 = *(uint16_t*)&_bval_35;
                         uint32_t _addr_35 = static_cast<uint32_t>(out_base + 1024);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_35), "h"(_bits_35) : "memory");
                     }
-                    float g_8;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_8) : "f"(_tmem_load_0[5]), "f"(alpha_e));
-                    float u_9;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_9) : "f"(_tmem_load_1[5]), "f"(alpha_e));
+                    float g_1_5;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_5) : "f"(_tmem_load_0[5]), "f"(alpha_e));
+                    float u_2_5;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_5) : "f"(_tmem_load_1[5]), "f"(alpha_e));
                     float _min_36;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_36) : "f"(g_8), "f"(swiglu_limit));
-                    g_8 = _min_36;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_36) : "f"(g_1_5), "f"(swiglu_limit));
+                    g_1_5 = _min_36;
                     float _min_38;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_38) : "f"(u_9), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_38) : "f"(u_2_5), "f"(swiglu_limit));
                     float _max_37;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_37) : "f"(_min_38), "f"(neg_limit));
-                    u_9 = _max_37;
-                    float _exp2_41 = approx_exp2(mul_f32_rn_noftz(g_8, -1.442695f));
+                    u_2_5 = _max_37;
+                    float _exp2_41 = approx_exp2(mul_f32_rn_noftz(g_1_5, -1.442695f));
                     float _add_40;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_40) : "f"(_exp2_41), "f"(1.0f));
                     float _rcp_39 = approx_rcp(_add_40);
                     {
-                        __nv_bfloat16 _bval_42 = __float2bfloat16_rn(mul_f32_rn_noftz(u_9, mul_f32_rn_noftz(g_8, _rcp_39)));
+                        __nv_bfloat16 _bval_42 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_5, mul_f32_rn_noftz(g_1_5, _rcp_39)));
                         uint16_t _bits_42 = *(uint16_t*)&_bval_42;
                         uint32_t _addr_42 = static_cast<uint32_t>(out_base + 1280);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_42), "h"(_bits_42) : "memory");
                     }
-                    float g_10;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_10) : "f"(_tmem_load_0[6]), "f"(alpha_e));
-                    float u_11;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_11) : "f"(_tmem_load_1[6]), "f"(alpha_e));
+                    float g_1_6;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_6) : "f"(_tmem_load_0[6]), "f"(alpha_e));
+                    float u_2_6;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_6) : "f"(_tmem_load_1[6]), "f"(alpha_e));
                     float _min_43;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_43) : "f"(g_10), "f"(swiglu_limit));
-                    g_10 = _min_43;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_43) : "f"(g_1_6), "f"(swiglu_limit));
+                    g_1_6 = _min_43;
                     float _min_45;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_45) : "f"(u_11), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_45) : "f"(u_2_6), "f"(swiglu_limit));
                     float _max_44;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_44) : "f"(_min_45), "f"(neg_limit));
-                    u_11 = _max_44;
-                    float _exp2_48 = approx_exp2(mul_f32_rn_noftz(g_10, -1.442695f));
+                    u_2_6 = _max_44;
+                    float _exp2_48 = approx_exp2(mul_f32_rn_noftz(g_1_6, -1.442695f));
                     float _add_47;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_47) : "f"(_exp2_48), "f"(1.0f));
                     float _rcp_46 = approx_rcp(_add_47);
                     {
-                        __nv_bfloat16 _bval_49 = __float2bfloat16_rn(mul_f32_rn_noftz(u_11, mul_f32_rn_noftz(g_10, _rcp_46)));
+                        __nv_bfloat16 _bval_49 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_6, mul_f32_rn_noftz(g_1_6, _rcp_46)));
                         uint16_t _bits_49 = *(uint16_t*)&_bval_49;
                         uint32_t _addr_49 = static_cast<uint32_t>(out_base + 1536);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_49), "h"(_bits_49) : "memory");
                     }
-                    float g_12;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_12) : "f"(_tmem_load_0[7]), "f"(alpha_e));
-                    float u_13;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_13) : "f"(_tmem_load_1[7]), "f"(alpha_e));
+                    float g_1_7;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_7) : "f"(_tmem_load_0[7]), "f"(alpha_e));
+                    float u_2_7;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_7) : "f"(_tmem_load_1[7]), "f"(alpha_e));
                     float _min_50;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_50) : "f"(g_12), "f"(swiglu_limit));
-                    g_12 = _min_50;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_50) : "f"(g_1_7), "f"(swiglu_limit));
+                    g_1_7 = _min_50;
                     float _min_52;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_52) : "f"(u_13), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_52) : "f"(u_2_7), "f"(swiglu_limit));
                     float _max_51;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_51) : "f"(_min_52), "f"(neg_limit));
-                    u_13 = _max_51;
-                    float _exp2_55 = approx_exp2(mul_f32_rn_noftz(g_12, -1.442695f));
+                    u_2_7 = _max_51;
+                    float _exp2_55 = approx_exp2(mul_f32_rn_noftz(g_1_7, -1.442695f));
                     float _add_54;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_54) : "f"(_exp2_55), "f"(1.0f));
                     float _rcp_53 = approx_rcp(_add_54);
                     {
-                        __nv_bfloat16 _bval_56 = __float2bfloat16_rn(mul_f32_rn_noftz(u_13, mul_f32_rn_noftz(g_12, _rcp_53)));
+                        __nv_bfloat16 _bval_56 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_7, mul_f32_rn_noftz(g_1_7, _rcp_53)));
                         uint16_t _bits_56 = *(uint16_t*)&_bval_56;
                         uint32_t _addr_56 = static_cast<uint32_t>(out_base + 1792);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_56), "h"(_bits_56) : "memory");
                     }
-                    float g_14;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_14) : "f"(_tmem_load_0[8]), "f"(alpha_e));
-                    float u_15;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_15) : "f"(_tmem_load_1[8]), "f"(alpha_e));
+                    float g_1_8;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_8) : "f"(_tmem_load_0[8]), "f"(alpha_e));
+                    float u_2_8;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_8) : "f"(_tmem_load_1[8]), "f"(alpha_e));
                     float _min_57;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_57) : "f"(g_14), "f"(swiglu_limit));
-                    g_14 = _min_57;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_57) : "f"(g_1_8), "f"(swiglu_limit));
+                    g_1_8 = _min_57;
                     float _min_59;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_59) : "f"(u_15), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_59) : "f"(u_2_8), "f"(swiglu_limit));
                     float _max_58;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_58) : "f"(_min_59), "f"(neg_limit));
-                    u_15 = _max_58;
-                    float _exp2_62 = approx_exp2(mul_f32_rn_noftz(g_14, -1.442695f));
+                    u_2_8 = _max_58;
+                    float _exp2_62 = approx_exp2(mul_f32_rn_noftz(g_1_8, -1.442695f));
                     float _add_61;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_61) : "f"(_exp2_62), "f"(1.0f));
                     float _rcp_60 = approx_rcp(_add_61);
                     {
-                        __nv_bfloat16 _bval_63 = __float2bfloat16_rn(mul_f32_rn_noftz(u_15, mul_f32_rn_noftz(g_14, _rcp_60)));
+                        __nv_bfloat16 _bval_63 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_8, mul_f32_rn_noftz(g_1_8, _rcp_60)));
                         uint16_t _bits_63 = *(uint16_t*)&_bval_63;
                         uint32_t _addr_63 = static_cast<uint32_t>(out_base + 2048);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_63), "h"(_bits_63) : "memory");
                     }
-                    float g_16;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_16) : "f"(_tmem_load_0[9]), "f"(alpha_e));
-                    float u_17;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_17) : "f"(_tmem_load_1[9]), "f"(alpha_e));
+                    float g_1_9;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_9) : "f"(_tmem_load_0[9]), "f"(alpha_e));
+                    float u_2_9;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_9) : "f"(_tmem_load_1[9]), "f"(alpha_e));
                     float _min_64;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_64) : "f"(g_16), "f"(swiglu_limit));
-                    g_16 = _min_64;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_64) : "f"(g_1_9), "f"(swiglu_limit));
+                    g_1_9 = _min_64;
                     float _min_66;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_66) : "f"(u_17), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_66) : "f"(u_2_9), "f"(swiglu_limit));
                     float _max_65;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_65) : "f"(_min_66), "f"(neg_limit));
-                    u_17 = _max_65;
-                    float _exp2_69 = approx_exp2(mul_f32_rn_noftz(g_16, -1.442695f));
+                    u_2_9 = _max_65;
+                    float _exp2_69 = approx_exp2(mul_f32_rn_noftz(g_1_9, -1.442695f));
                     float _add_68;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_68) : "f"(_exp2_69), "f"(1.0f));
                     float _rcp_67 = approx_rcp(_add_68);
                     {
-                        __nv_bfloat16 _bval_70 = __float2bfloat16_rn(mul_f32_rn_noftz(u_17, mul_f32_rn_noftz(g_16, _rcp_67)));
+                        __nv_bfloat16 _bval_70 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_9, mul_f32_rn_noftz(g_1_9, _rcp_67)));
                         uint16_t _bits_70 = *(uint16_t*)&_bval_70;
                         uint32_t _addr_70 = static_cast<uint32_t>(out_base + 2304);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_70), "h"(_bits_70) : "memory");
                     }
-                    float g_18;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_18) : "f"(_tmem_load_0[10]), "f"(alpha_e));
-                    float u_19;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_19) : "f"(_tmem_load_1[10]), "f"(alpha_e));
+                    float g_1_10;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_10) : "f"(_tmem_load_0[10]), "f"(alpha_e));
+                    float u_2_10;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_10) : "f"(_tmem_load_1[10]), "f"(alpha_e));
                     float _min_71;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_71) : "f"(g_18), "f"(swiglu_limit));
-                    g_18 = _min_71;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_71) : "f"(g_1_10), "f"(swiglu_limit));
+                    g_1_10 = _min_71;
                     float _min_73;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_73) : "f"(u_19), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_73) : "f"(u_2_10), "f"(swiglu_limit));
                     float _max_72;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_72) : "f"(_min_73), "f"(neg_limit));
-                    u_19 = _max_72;
-                    float _exp2_76 = approx_exp2(mul_f32_rn_noftz(g_18, -1.442695f));
+                    u_2_10 = _max_72;
+                    float _exp2_76 = approx_exp2(mul_f32_rn_noftz(g_1_10, -1.442695f));
                     float _add_75;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_75) : "f"(_exp2_76), "f"(1.0f));
                     float _rcp_74 = approx_rcp(_add_75);
                     {
-                        __nv_bfloat16 _bval_77 = __float2bfloat16_rn(mul_f32_rn_noftz(u_19, mul_f32_rn_noftz(g_18, _rcp_74)));
+                        __nv_bfloat16 _bval_77 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_10, mul_f32_rn_noftz(g_1_10, _rcp_74)));
                         uint16_t _bits_77 = *(uint16_t*)&_bval_77;
                         uint32_t _addr_77 = static_cast<uint32_t>(out_base + 2560);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_77), "h"(_bits_77) : "memory");
                     }
-                    float g_20;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_20) : "f"(_tmem_load_0[11]), "f"(alpha_e));
-                    float u_21;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_21) : "f"(_tmem_load_1[11]), "f"(alpha_e));
+                    float g_1_11;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_11) : "f"(_tmem_load_0[11]), "f"(alpha_e));
+                    float u_2_11;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_11) : "f"(_tmem_load_1[11]), "f"(alpha_e));
                     float _min_78;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_78) : "f"(g_20), "f"(swiglu_limit));
-                    g_20 = _min_78;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_78) : "f"(g_1_11), "f"(swiglu_limit));
+                    g_1_11 = _min_78;
                     float _min_80;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_80) : "f"(u_21), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_80) : "f"(u_2_11), "f"(swiglu_limit));
                     float _max_79;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_79) : "f"(_min_80), "f"(neg_limit));
-                    u_21 = _max_79;
-                    float _exp2_83 = approx_exp2(mul_f32_rn_noftz(g_20, -1.442695f));
+                    u_2_11 = _max_79;
+                    float _exp2_83 = approx_exp2(mul_f32_rn_noftz(g_1_11, -1.442695f));
                     float _add_82;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_82) : "f"(_exp2_83), "f"(1.0f));
                     float _rcp_81 = approx_rcp(_add_82);
                     {
-                        __nv_bfloat16 _bval_84 = __float2bfloat16_rn(mul_f32_rn_noftz(u_21, mul_f32_rn_noftz(g_20, _rcp_81)));
+                        __nv_bfloat16 _bval_84 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_11, mul_f32_rn_noftz(g_1_11, _rcp_81)));
                         uint16_t _bits_84 = *(uint16_t*)&_bval_84;
                         uint32_t _addr_84 = static_cast<uint32_t>(out_base + 2816);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_84), "h"(_bits_84) : "memory");
                     }
-                    float g_22;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_22) : "f"(_tmem_load_0[12]), "f"(alpha_e));
-                    float u_23;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_23) : "f"(_tmem_load_1[12]), "f"(alpha_e));
+                    float g_1_12;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_12) : "f"(_tmem_load_0[12]), "f"(alpha_e));
+                    float u_2_12;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_12) : "f"(_tmem_load_1[12]), "f"(alpha_e));
                     float _min_85;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_85) : "f"(g_22), "f"(swiglu_limit));
-                    g_22 = _min_85;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_85) : "f"(g_1_12), "f"(swiglu_limit));
+                    g_1_12 = _min_85;
                     float _min_87;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_87) : "f"(u_23), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_87) : "f"(u_2_12), "f"(swiglu_limit));
                     float _max_86;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_86) : "f"(_min_87), "f"(neg_limit));
-                    u_23 = _max_86;
-                    float _exp2_90 = approx_exp2(mul_f32_rn_noftz(g_22, -1.442695f));
+                    u_2_12 = _max_86;
+                    float _exp2_90 = approx_exp2(mul_f32_rn_noftz(g_1_12, -1.442695f));
                     float _add_89;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_89) : "f"(_exp2_90), "f"(1.0f));
                     float _rcp_88 = approx_rcp(_add_89);
                     {
-                        __nv_bfloat16 _bval_91 = __float2bfloat16_rn(mul_f32_rn_noftz(u_23, mul_f32_rn_noftz(g_22, _rcp_88)));
+                        __nv_bfloat16 _bval_91 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_12, mul_f32_rn_noftz(g_1_12, _rcp_88)));
                         uint16_t _bits_91 = *(uint16_t*)&_bval_91;
                         uint32_t _addr_91 = static_cast<uint32_t>(out_base + 3072);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_91), "h"(_bits_91) : "memory");
                     }
-                    float g_24;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_24) : "f"(_tmem_load_0[13]), "f"(alpha_e));
-                    float u_25;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_25) : "f"(_tmem_load_1[13]), "f"(alpha_e));
+                    float g_1_13;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_13) : "f"(_tmem_load_0[13]), "f"(alpha_e));
+                    float u_2_13;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_13) : "f"(_tmem_load_1[13]), "f"(alpha_e));
                     float _min_92;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_92) : "f"(g_24), "f"(swiglu_limit));
-                    g_24 = _min_92;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_92) : "f"(g_1_13), "f"(swiglu_limit));
+                    g_1_13 = _min_92;
                     float _min_94;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_94) : "f"(u_25), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_94) : "f"(u_2_13), "f"(swiglu_limit));
                     float _max_93;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_93) : "f"(_min_94), "f"(neg_limit));
-                    u_25 = _max_93;
-                    float _exp2_97 = approx_exp2(mul_f32_rn_noftz(g_24, -1.442695f));
+                    u_2_13 = _max_93;
+                    float _exp2_97 = approx_exp2(mul_f32_rn_noftz(g_1_13, -1.442695f));
                     float _add_96;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_96) : "f"(_exp2_97), "f"(1.0f));
                     float _rcp_95 = approx_rcp(_add_96);
                     {
-                        __nv_bfloat16 _bval_98 = __float2bfloat16_rn(mul_f32_rn_noftz(u_25, mul_f32_rn_noftz(g_24, _rcp_95)));
+                        __nv_bfloat16 _bval_98 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_13, mul_f32_rn_noftz(g_1_13, _rcp_95)));
                         uint16_t _bits_98 = *(uint16_t*)&_bval_98;
                         uint32_t _addr_98 = static_cast<uint32_t>(out_base + 3328);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_98), "h"(_bits_98) : "memory");
                     }
-                    float g_26;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_26) : "f"(_tmem_load_0[14]), "f"(alpha_e));
-                    float u_27;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_27) : "f"(_tmem_load_1[14]), "f"(alpha_e));
+                    float g_1_14;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_14) : "f"(_tmem_load_0[14]), "f"(alpha_e));
+                    float u_2_14;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_14) : "f"(_tmem_load_1[14]), "f"(alpha_e));
                     float _min_99;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_99) : "f"(g_26), "f"(swiglu_limit));
-                    g_26 = _min_99;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_99) : "f"(g_1_14), "f"(swiglu_limit));
+                    g_1_14 = _min_99;
                     float _min_101;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_101) : "f"(u_27), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_101) : "f"(u_2_14), "f"(swiglu_limit));
                     float _max_100;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_100) : "f"(_min_101), "f"(neg_limit));
-                    u_27 = _max_100;
-                    float _exp2_104 = approx_exp2(mul_f32_rn_noftz(g_26, -1.442695f));
+                    u_2_14 = _max_100;
+                    float _exp2_104 = approx_exp2(mul_f32_rn_noftz(g_1_14, -1.442695f));
                     float _add_103;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_103) : "f"(_exp2_104), "f"(1.0f));
                     float _rcp_102 = approx_rcp(_add_103);
                     {
-                        __nv_bfloat16 _bval_105 = __float2bfloat16_rn(mul_f32_rn_noftz(u_27, mul_f32_rn_noftz(g_26, _rcp_102)));
+                        __nv_bfloat16 _bval_105 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_14, mul_f32_rn_noftz(g_1_14, _rcp_102)));
                         uint16_t _bits_105 = *(uint16_t*)&_bval_105;
                         uint32_t _addr_105 = static_cast<uint32_t>(out_base + 3584);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_105), "h"(_bits_105) : "memory");
                     }
-                    float g_28;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_28) : "f"(_tmem_load_0[15]), "f"(alpha_e));
-                    float u_29;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_29) : "f"(_tmem_load_1[15]), "f"(alpha_e));
+                    float g_1_15;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(g_1_15) : "f"(_tmem_load_0[15]), "f"(alpha_e));
+                    float u_2_15;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(u_2_15) : "f"(_tmem_load_1[15]), "f"(alpha_e));
                     float _min_106;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_106) : "f"(g_28), "f"(swiglu_limit));
-                    g_28 = _min_106;
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_106) : "f"(g_1_15), "f"(swiglu_limit));
+                    g_1_15 = _min_106;
                     float _min_108;
-                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_108) : "f"(u_29), "f"(swiglu_limit));
+                    asm("min.NaN.f32 %0, %1, %2;" : "=f"(_min_108) : "f"(u_2_15), "f"(swiglu_limit));
                     float _max_107;
                     asm("max.NaN.f32 %0, %1, %2;" : "=f"(_max_107) : "f"(_min_108), "f"(neg_limit));
-                    u_29 = _max_107;
-                    float _exp2_111 = approx_exp2(mul_f32_rn_noftz(g_28, -1.442695f));
+                    u_2_15 = _max_107;
+                    float _exp2_111 = approx_exp2(mul_f32_rn_noftz(g_1_15, -1.442695f));
                     float _add_110;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_110) : "f"(_exp2_111), "f"(1.0f));
                     float _rcp_109 = approx_rcp(_add_110);
                     {
-                        __nv_bfloat16 _bval_112 = __float2bfloat16_rn(mul_f32_rn_noftz(u_29, mul_f32_rn_noftz(g_28, _rcp_109)));
+                        __nv_bfloat16 _bval_112 = __float2bfloat16_rn(mul_f32_rn_noftz(u_2_15, mul_f32_rn_noftz(g_1_15, _rcp_109)));
                         uint16_t _bits_112 = *(uint16_t*)&_bval_112;
                         uint32_t _addr_112 = static_cast<uint32_t>(out_base + 3840);
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_112), "h"(_bits_112) : "memory");
@@ -1021,7 +1008,7 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_acc + (acc_cur_1 * 32))), "r"(_smem_desc_lo_0), "r"((unsigned int)tmem_a_bf16 + a_cur * 128), "r"(((((kt == 0) ? 1 : 0)) ? 0 : 1)) : "memory");
+                    :: "r"((tmem_acc + (acc_cur_1 * 32))), "r"(_smem_desc_lo_0), "r"(tmem_a_bf16 + a_cur * 128), "r"(((((kt == 0) ? 1 : 0)) ? 0 : 1)) : "memory");
                         tcgen05_commit(b_empty_addr + (b_cur) * 8);
                         tcgen05_commit(a_empty_addr + (a_cur) * 8);
                         a_cur += 1;
@@ -1046,10 +1033,10 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
             if (elect_sync()) {
                 #pragma unroll 1
                 for (unsigned int w_1 = bid; w_1 < end_2; w_1 += num_bids) {
-                    uint32_t _fast_div_q_0 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w_1), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w_1);
-                    uint32_t _fast_div_r_0 = (uint32_t)(w_1) - _fast_div_q_0 * (uint32_t)(m_tile_div.divisor);
-                    int t_1 = (int)_fast_div_q_0;
-                    int m_cta_1 = (int)_fast_div_r_0;
+                    uint32_t fast_div_q_1 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w_1), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w_1);
+                    uint32_t fast_div_r_1 = (uint32_t)(w_1) - fast_div_q_1 * (uint32_t)(m_tile_div.divisor);
+                    int t_1 = (int)fast_div_q_1;
+                    int m_cta_1 = (int)fast_div_r_1;
                     int expert_1 = tile_idx_to_expert_idx[t_1];
                     int valid_rows = tile_idx_to_mn_limit[t_1] - t_1 * 32;
                     mbarrier_wait(tile_empty_addr + (tile_cur_1) * 8, _phase_tile_empty);
@@ -1077,10 +1064,10 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
                 #pragma unroll 1
                 for (unsigned int w_2 = bid; w_2 < end_3; w_2 += num_bids) {
-                    uint32_t _fast_div_q_1 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w_2), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w_2);
-                    uint32_t _fast_div_r_1 = (uint32_t)(w_2) - _fast_div_q_1 * (uint32_t)(m_tile_div.divisor);
-                    int t_2 = (int)_fast_div_q_1;
-                    int m_cta_2 = (int)_fast_div_r_1;
+                    uint32_t fast_div_q_2 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w_2), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w_2);
+                    uint32_t fast_div_r_2 = (uint32_t)(w_2) - fast_div_q_2 * (uint32_t)(m_tile_div.divisor);
+                    int t_2 = (int)fast_div_q_2;
+                    int m_cta_2 = (int)fast_div_r_2;
                     mbarrier_wait(tile_full_addr + (tile_cur_2) * 8, _phase_tile_full_1);
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&record_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&record_1[(0) + 1]))
@@ -1136,27 +1123,29 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
             if (elect_sync()) {
                 #pragma unroll 1
                 for (unsigned int w_3 = bid; w_3 < end_4; w_3 += num_bids) {
-                    uint32_t _fast_div_q_2 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w_3), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w_3);
-                    uint32_t _fast_div_r_2 = (uint32_t)(w_3) - _fast_div_q_2 * (uint32_t)(m_tile_div.divisor);
-                    int t_3 = (int)_fast_div_q_2;
-                    int m_cta_3 = (int)_fast_div_r_2;
+                    uint32_t fast_div_q_3 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(w_3), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(w_3);
+                    uint32_t fast_div_r_3 = (uint32_t)(w_3) - fast_div_q_3 * (uint32_t)(m_tile_div.divisor);
+                    int t_3 = (int)fast_div_q_3;
+                    int m_cta_3 = (int)fast_div_r_3;
                     int row0_1 = t_3 * 32;
                     #pragma unroll 1
                     for (int kt_2 = 0; kt_2 < num_k_2; kt_2++) {
-                        mbarrier_wait(b_empty_addr + (b_cur_1) * 8, _phase_b_empty);
+                        mbarrier_wait_cluster_hint(b_empty_addr + (b_cur_1) * 8, _phase_b_empty, 10000000);
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(smem_b_addr + b_cur_1 * 16384), "l"((&X)), "r"(0), "r"(row0_1), "r"(kt_2 * 4),
                                "r"(b_full_addr + (b_cur_1) * 8), "l"(0x14F0000000000000ULL) : "memory");
-                        mbarrier_arrive_expect_tx(b_full_addr + (b_cur_1) * 8, 16384);
+                        asm volatile(
+                            "mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64 _, [%0], %1;"
+                            :: "r"(b_full_addr + (b_cur_1) * 8), "r"((uint32_t)(16384)) : "memory");
                         b_cur_1 += 1;
                         if (b_cur_1 == 6) { b_cur_1 = 0; _phase_b_empty ^= 1; }
                     }
                 }
                 #pragma unroll 1
                 for (int _ = 0; _ < 6; _++) {
-                    mbarrier_wait(b_empty_addr + (b_cur_1) * 8, _phase_b_empty);
+                    mbarrier_wait_cluster_hint(b_empty_addr + (b_cur_1) * 8, _phase_b_empty, 10000000);
                     b_cur_1 += 1;
                     if (b_cur_1 == 6) { b_cur_1 = 0; _phase_b_empty ^= 1; }
                 }
@@ -1185,7 +1174,7 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
                 #pragma unroll 1
                 for (int _kt = 0; _kt < num_k_3; _kt++) {
                     mbarrier_wait(raw_full_addr + (raw_cur_1) * 8, _phase_raw_full);
-                    mbarrier_wait(a_empty_addr + (a_cur_1) * 8, _phase_a_empty);
+                    mbarrier_wait_cluster_hint(a_empty_addr + (a_cur_1) * 8, _phase_a_empty, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int raw_row = raw_smem_addr + raw_cur_1 * 16384 + (unsigned int)(src_row * 128);
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -1203,6 +1192,7 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&scale_words[0])), "=r"(*reinterpret_cast<uint32_t*>(&scale_words[(0) + 1]))
                         : "r"(sf_smem_addr + raw_cur_1 * 2048 + (unsigned int)(src_row * 16 + half * 8)));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     unsigned int a_base = taddr + 64 + lane_base + (a_cur_1 * 128 + (unsigned int)(half * 64));
                     uint32_t _fp4_dequant_block32_bf16_0[16];
                     cvt_bf16x16_e2m1x32_e4m3x2_lo((uint32_t)(raw_words[0]), (uint32_t)(raw_words[1]), (uint32_t)(raw_words[2]), (uint32_t)(raw_words[3]), (uint32_t)(scale_words[0]), _fp4_dequant_block32_bf16_0);
@@ -1248,7 +1238,7 @@ kernel_cake_fused_moe_w4a16_813fc13553f0bd7f9a94(const __grid_constant__ CUtenso
             }
             #pragma unroll 1
             for (int __1 = 0; __1 < 3; __1++) {
-                mbarrier_wait(a_empty_addr + (a_cur_1) * 8, _phase_a_empty);
+                mbarrier_wait_cluster_hint(a_empty_addr + (a_cur_1) * 8, _phase_a_empty, 10000000);
                 a_cur_1 += 1;
                 if (a_cur_1 == 3) { a_cur_1 = 0; _phase_a_empty ^= 1; }
             }

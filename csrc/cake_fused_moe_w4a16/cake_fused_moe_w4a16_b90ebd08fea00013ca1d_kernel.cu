@@ -50,33 +50,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_OFFSET 0
-#define TMEM_A_BF16_OFFSET 256
-#define NUM_RAW_PIPE_STAGES 4
-#define NUM_B_PIPE_STAGES 4
-#define NUM_A_PIPE_STAGES 2
-#define NUM_ACC_PIPE_STAGES 2
-#define NUM_TILE_PIPE_STAGES 3
-#define NUM_STORE_PIPE_STAGES 2
-#define SMEM_RAW_OFF 1024
-#define SMEM_RAW_STAGE_BYTES 16384
-#define SMEM_RAW_STRIDE 16384
-#define SMEM_SF_OFF 66560
-#define SMEM_SF_STAGE_BYTES 2048
-#define SMEM_SF_STRIDE 2048
-#define SMEM_XB_OFF 74752
-#define SMEM_XB_STAGE_BYTES 32768
-#define SMEM_XB_STRIDE 32768
-#define SMEM_STAGING_OFF 205824
-#define SMEM_STAGING_STAGE_BYTES 8192
-#define SMEM_STAGING_STRIDE 8192
-#define SMEM_TILE_INFO_OFF 222208
-#define SMEM_TILE_INFO_STAGE_BYTES 16
-#define SMEM_TILE_INFO_STRIDE 16
-#define SMEM_TOTAL 222336
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 __device__ __forceinline__ uint32_t cvt_bf16x2_e4m3x2_p112(uint16_t src) {
@@ -398,7 +371,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* raw = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int raw_addr = smem + 1024;
     uint8_t* sf = reinterpret_cast<uint8_t*>(smem_raw + 66560);
@@ -410,8 +383,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
     int* tile_info = reinterpret_cast<int*>(smem_raw + 222208);
     const int tile_info_addr = smem + 222208;
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 30 barriers)
-    // Mbarriers at smem_raw[0..240)
+    // Mbarrier init (30 barriers at smem_raw[0..240))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -481,11 +453,11 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
+    const unsigned int tmem_a_bf16 = taddr + 256;
 
     // Kernel post-init ops
-    const int tmem_acc = taddr;
-    const int tmem_a_bf16 = taddr + 256;
     if (warp >= 4 && warp <= 7) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
     }
@@ -507,8 +479,8 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
             for (unsigned int item = cluster_id; item < end; item += num_clusters) {
-                uint32_t _fast_div_q_3 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item * 2 + (unsigned int)cta_rank);
-                uint32_t _fast_div_r_3 = (uint32_t)(item * 2 + (unsigned int)cta_rank) - _fast_div_q_3 * (uint32_t)(m_tile_div.divisor);
+                uint32_t fast_div_q = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item * 2 + (unsigned int)cta_rank);
+                uint32_t fast_div_r = (uint32_t)(item * 2 + (unsigned int)cta_rank) - fast_div_q * (uint32_t)(m_tile_div.divisor);
                 mbarrier_wait(tile_full_addr + (ti) * 8, _phase_tile_full);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&info[0])), "=r"(*reinterpret_cast<uint32_t*>(&info[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&info[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&info[(0) + 3]))
@@ -521,9 +493,9 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
                 if (ti == 3) { ti = 0; _phase_tile_full ^= 1; }
                 int expert = info[0];
                 float alpha_e = alpha[expert];
-                int col_m = (int)_fast_div_r_3 * 128;
-                int row_t = (int)_fast_div_q_3 * 128;
-                mbarrier_wait(acc_full_addr + (accs) * 8, _phase_acc_full);
+                int col_m = (int)fast_div_r * 128;
+                int row_t = (int)fast_div_q * 128;
+                mbarrier_wait_cluster_hint(acc_full_addr + (accs) * 8, _phase_acc_full, 10000000);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll
                 for (int s = 0; s < 4; s++) {
@@ -859,7 +831,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_acc + (accs_1 * 128))), "r"(_smem_desc_lo_0), "r"((unsigned int)tmem_a_bf16 + a_s * 128), "r"(((first_stage) ? 0 : 1)) : "memory");
+                    :: "r"((tmem_acc + (accs_1 * 128))), "r"(_smem_desc_lo_0), "r"(tmem_a_bf16 + a_s * 128), "r"(((first_stage) ? 0 : 1)) : "memory");
                             tcgen05_commit_cg2_multicast(b_empty_addr + (bs) * 8, (uint16_t)(3));
                             tcgen05_commit_cg2_multicast(a_empty_addr + (a_s) * 8, (uint16_t)(3));
                             bs += 1;
@@ -885,10 +857,10 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
             if (elect_sync()) {
                 #pragma unroll 1
                 for (unsigned int item_1 = cluster_id; item_1 < end_2; item_1 += num_clusters) {
-                    uint32_t _fast_div_q_0 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item_1 * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item_1 * 2 + (unsigned int)cta_rank);
-                    uint32_t _fast_div_r_0 = (uint32_t)(item_1 * 2 + (unsigned int)cta_rank) - _fast_div_q_0 * (uint32_t)(m_tile_div.divisor);
-                    int expert_1 = tile_idx_to_expert_idx[_fast_div_q_0];
-                    int dist = tile_idx_to_mn_limit[_fast_div_q_0] - (int)_fast_div_q_0 * 128;
+                    uint32_t fast_div_q_1 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item_1 * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item_1 * 2 + (unsigned int)cta_rank);
+                    uint32_t fast_div_r_1 = (uint32_t)(item_1 * 2 + (unsigned int)cta_rank) - fast_div_q_1 * (uint32_t)(m_tile_div.divisor);
+                    int expert_1 = tile_idx_to_expert_idx[fast_div_q_1];
+                    int dist = tile_idx_to_mn_limit[fast_div_q_1] - (int)fast_div_q_1 * 128;
                     mbarrier_wait(tile_empty_addr + (ti_1) * 8, _phase_tile_empty);
                     asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(tile_info_addr + ti_1 * 16), "r"(expert_1), "r"(dist) : "memory");
                     mbarrier_arrive(tile_full_addr + (ti_1) * 8);
@@ -911,8 +883,8 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
             unsigned int _phase_raw_empty = 1;
             #pragma unroll 1
             for (unsigned int item_2 = cluster_id; item_2 < end_3; item_2 += num_clusters) {
-                uint32_t _fast_div_q_1 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item_2 * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item_2 * 2 + (unsigned int)cta_rank);
-                uint32_t _fast_div_r_1 = (uint32_t)(item_2 * 2 + (unsigned int)cta_rank) - _fast_div_q_1 * (uint32_t)(m_tile_div.divisor);
+                uint32_t fast_div_q_2 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item_2 * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item_2 * 2 + (unsigned int)cta_rank);
+                uint32_t fast_div_r_2 = (uint32_t)(item_2 * 2 + (unsigned int)cta_rank) - fast_div_q_2 * (uint32_t)(m_tile_div.divisor);
                 mbarrier_wait(tile_full_addr + (ti_2) * 8, _phase_tile_full_1);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&info_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&info_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&info_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&info_1[(0) + 3]))
@@ -924,7 +896,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
                 ti_2 += 1;
                 if (ti_2 == 3) { ti_2 = 0; _phase_tile_full_1 ^= 1; }
                 int expert_2 = info_1[0];
-                int m_row = (int)_fast_div_r_1 * 128;
+                int m_row = (int)fast_div_r_2 * 128;
                 #pragma unroll 1
                 for (int kt_1 = 0; kt_1 < num_k_1; kt_1++) {
                     mbarrier_wait(raw_empty_addr + (rs) * 8, _phase_raw_empty);
@@ -960,19 +932,19 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
                 #pragma unroll 1
                 for (unsigned int item_3 = cluster_id; item_3 < end_4; item_3 += num_clusters) {
-                    uint32_t _fast_div_q_2 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item_3 * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item_3 * 2 + (unsigned int)cta_rank);
-                    uint32_t _fast_div_r_2 = (uint32_t)(item_3 * 2 + (unsigned int)cta_rank) - _fast_div_q_2 * (uint32_t)(m_tile_div.divisor);
-                    int row0 = (int)_fast_div_q_2 * 128 + cta_rank * 64;
+                    uint32_t fast_div_q_3 = (m_tile_div.divisor != 1) ? (__umulhi((uint32_t)(item_3 * 2 + (unsigned int)cta_rank), m_tile_div.multiplier) >> m_tile_div.shift_right) : (uint32_t)(item_3 * 2 + (unsigned int)cta_rank);
+                    uint32_t fast_div_r_3 = (uint32_t)(item_3 * 2 + (unsigned int)cta_rank) - fast_div_q_3 * (uint32_t)(m_tile_div.divisor);
+                    int row0 = (int)fast_div_q_3 * 128 + cta_rank * 64;
                     #pragma unroll 1
                     for (int kt_2 = 0; kt_2 < num_k_2; kt_2++) {
-                        mbarrier_wait(b_empty_addr + (bs_1) * 8, _phase_b_empty);
+                        mbarrier_wait_cluster_hint(b_empty_addr + (bs_1) * 8, _phase_b_empty, 10000000);
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(xb_addr + bs_1 * 32768), "l"((&X)), "r"(0), "r"(row0), "r"(kt_2 * 4),
                                "r"(((b_full_addr + (bs_1) * 8) & 0xFEFFFFFF)), "l"(0x14F0000000000000ULL) : "memory");
                         asm volatile(
-                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                            "mbarrier.arrive.expect_tx.relaxed.cluster.shared::cluster.b64 _, [%0], %1;"
                             :: "r"((b_full_addr + (bs_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                         bs_1 += 1;
                         if (bs_1 == 4) { bs_1 = 0; _phase_b_empty ^= 1; }
@@ -980,7 +952,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
                 }
                 #pragma unroll 1
                 for (int _ = 0; _ < 4; _++) {
-                    mbarrier_wait(b_empty_addr + (bs_1) * 8, _phase_b_empty);
+                    mbarrier_wait_cluster_hint(b_empty_addr + (bs_1) * 8, _phase_b_empty, 10000000);
                     bs_1 += 1;
                     if (bs_1 == 4) { bs_1 = 0; _phase_b_empty ^= 1; }
                 }
@@ -1015,7 +987,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
                 #pragma unroll 1
                 for (int _kt = 0; _kt < num_k_3; _kt++) {
                     mbarrier_wait(raw_full_addr + (rs_1) * 8, _phase_raw_full);
-                    mbarrier_wait(a_empty_addr + (a_s_1) * 8, _phase_a_empty);
+                    mbarrier_wait_cluster_hint(a_empty_addr + (a_s_1) * 8, _phase_a_empty, 10000000);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int raw_base = raw_addr + rs_1 * 16384;
                     int sf_base = sf_addr + rs_1 * 2048;
@@ -1034,6 +1006,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&sc_w[0])), "=r"(*reinterpret_cast<uint32_t*>(&sc_w[(0) + 1]))
                         : "r"(sf_base + sf_off_thread));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     unsigned int a_addr = taddr + 256 + row_base_1 + (a_s_1 * 128 + a_half);
                     uint32_t _fp4_dequant_block32_bf16_0[16];
                     cvt_bf16x16_e2m1x32_e4m3x2_lo((uint32_t)(raw_w[0]), (uint32_t)(raw_w[1]), (uint32_t)(raw_w[2]), (uint32_t)(raw_w[3]), (uint32_t)(sc_w[0]), _fp4_dequant_block32_bf16_0);
@@ -1078,7 +1051,7 @@ kernel_cake_fused_moe_w4a16_b90ebd08fea00013ca1d(const __grid_constant__ CUtenso
             }
             #pragma unroll 1
             for (int __1 = 0; __1 < 2; __1++) {
-                mbarrier_wait(a_empty_addr + (a_s_1) * 8, _phase_a_empty);
+                mbarrier_wait_cluster_hint(a_empty_addr + (a_s_1) * 8, _phase_a_empty, 10000000);
                 a_s_1 += 1;
                 if (a_s_1 == 2) { a_s_1 = 0; _phase_a_empty ^= 1; }
             }
