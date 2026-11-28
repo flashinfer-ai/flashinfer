@@ -808,6 +808,40 @@ inline __device__ T blockReduceSum(T val) {
     return blockReduceSumFull<T>(val);
   }
 }
+
+// Called only after a token-uniform overflow result from the ordinary sum.
+// Use the existing reduction storage again, after all prior readers finish.
+template <bool UseCGA>
+__device__ __noinline__ float reduceOverflowRmsSum(float scaledThreadSum, float* sharedVal) {
+  __syncthreads();
+  float const blockSum = blockReduceSum<float, true>(scaledThreadSum);
+  if constexpr (UseCGA) {
+    namespace cg = cooperative_groups;
+    auto cluster = cg::this_cluster();
+    int const numBlocks = cluster.num_blocks();
+    if (numBlocks > 1) {
+      cluster.sync();
+      if (threadIdx.x < numBlocks) {
+        cluster.map_shared_rank(sharedVal, threadIdx.x)[cluster.block_rank()] = blockSum;
+      }
+      cluster.sync();
+      float result = 0.f;
+      for (int i = 0; i < numBlocks; ++i) {
+        result += sharedVal[i];
+      }
+      return result;
+    }
+  }
+  return blockSum;
+}
+
+// Scaling in double on the exceptional path avoids dropping small inputs
+// before multiplication by gamma. No FP64 operations on the normal path.
+template <typename T>
+inline __device__ T finishOverflowRms(float x, float inv, float weight) {
+  return fromFloat<T>(static_cast<float>(static_cast<double>(x) * 0x1p-80 * inv * weight));
+}
+
 // Tune the grid configuration for fused oneshot and RMSNorm kernels.
 // Return (block_size, cluster_size, loads_per_thread).
 std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread,
@@ -1167,11 +1201,35 @@ __global__ void __launch_bounds__(1024)
         fullSum += sharedVal[i];
       }
     }
-    float rcpRms = rsqrtf(fullSum / tokenDim + params.epsilon);
+    bool recovered = false;
+    if constexpr (std::is_same_v<T, __nv_bfloat16> && QType == QuantType::kNone) {
+      if (isinf(fullSum)) {
+        // Every thread in the token sees the same reduction result. Recompute
+        // only on overflow, leaving the ordinary arithmetic unchanged.
+        float scaledThreadSum = 0.f;
 #pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      packedAccum.elements[i] = fromFloat<T>(toFloat<T>(packedAccum.elements[i]) * rcpRms *
-                                             (params.weightBias + toFloat<T>(gamma.elements[i])));
+        for (int i = 0; i < kELTS_PER_THREAD; ++i) {
+          float const x = toFloat<T>(packedAccum.elements[i]) * 0x1p-80f;
+          scaledThreadSum += x * x;
+        }
+        float scaledSum = utils::reduceOverflowRmsSum<true>(scaledThreadSum, sharedVal);
+        float const inv = rsqrtf(scaledSum / tokenDim + ldexpf(params.epsilon, -160));
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; ++i) {
+          float const weight = params.weightBias + toFloat<T>(gamma.elements[i]);
+          packedAccum.elements[i] =
+              utils::finishOverflowRms<T>(packedAccum.elements[i], inv, weight);
+        }
+        recovered = true;
+      }
+    }
+    if (!recovered) {
+      float const rcpRms = rsqrtf(fullSum / tokenDim + params.epsilon);
+#pragma unroll
+      for (int i = 0; i < kELTS_PER_THREAD; ++i) {
+        packedAccum.elements[i] = fromFloat<T>(toFloat<T>(packedAccum.elements[i]) * rcpRms *
+                                               (params.weightBias + toFloat<T>(gamma.elements[i])));
+      }
     }
   }
   if (params.outputPtr != nullptr) {
@@ -1683,6 +1741,51 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       for (int i = 0; i < numBlocks; ++i) {
         fullSum += sharedVal[i];
       }
+    }
+  }
+
+  if constexpr (std::is_same_v<T, __nv_bfloat16> && QType == QuantType::kNone) {
+    if (isinf(fullSum)) {
+      float scaledThreadSum = 0.f;
+#pragma unroll
+      for (uint32_t i = 0; i < LoadsPerThread; ++i) {
+        uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+        if (baseTokenOffset + chunkOffset < params.tokenDim) {
+#pragma unroll
+          for (int j = 0; j < kELTS_PER_LOAD; ++j) {
+            float const x = rInput[i * kELTS_PER_LOAD + j] * 0x1p-80f;
+            scaledThreadSum += x * x;
+          }
+        }
+      }
+      float const scaledSum = utils::reduceOverflowRmsSum<UseCGA>(scaledThreadSum, sharedVal);
+      float const inv = rsqrtf(scaledSum / params.tokenDim + ldexpf(params.epsilon, -160));
+      if (params.outputPtr != nullptr) {
+#pragma unroll
+        for (uint32_t i = 0; i < LoadsPerThread; ++i) {
+          uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+          uint32_t const tokenOffset = baseTokenOffset + chunkOffset;
+          if (tokenOffset < params.tokenDim) {
+            PackedVec<PackedType, T> gamma{.packed =
+                                               loadPacked<PackedType>(&smemGamma[chunkOffset])};
+            PackedVec<PackedType, T> out;
+#pragma unroll
+            for (int j = 0; j < kELTS_PER_LOAD; ++j) {
+              float const weight = params.weightBias + toFloat<T>(gamma.elements[j]);
+              out.elements[j] =
+                  utils::finishOverflowRms<T>(rInput[i * kELTS_PER_LOAD + j], inv, weight);
+            }
+            reinterpret_cast<PackedType*>(
+                &params.outputPtr[token * params.tokenDim + tokenOffset])[0] = out.packed;
+          }
+        }
+      }
+      cudaGridDependencySynchronize();
+      flag.waitAndUpdate({static_cast<uint32_t>(round_up(params.numTokens, params.nRanks) *
+                                                params.tokenDim * kELT_SIZE),
+                          static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), 0,
+                          0});
+      return;
     }
   }
 
