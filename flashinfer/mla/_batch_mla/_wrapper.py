@@ -13,6 +13,11 @@ from typing import Any, ClassVar, Literal, Optional, Protocol, Tuple, Union, ove
 
 import torch
 
+from ._decode_fp8_sm90 import (
+    _mla_dec_fp8q_sm90_dispatch,
+    _mla_dec_fp8q_sm90_prepare,
+)
+
 from ...api_logging import (
     _warn_from_external_caller,
     flashinfer_api,
@@ -261,6 +266,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_indices: Optional[torch.Tensor] = None,
         kv_len_arr: Optional[torch.Tensor] = None,
         backend: str = "auto",
+        fp8q_backend: str = "auto",
     ) -> None:
         r"""Construct a planned MLA wrapper.
 
@@ -299,7 +305,24 @@ class BatchMLAPagedAttentionWrapper:
             or KV storage requires a backend with native split-input support.
             Existing non-FA graph plans allow one plan per wrapper. Use a new
             wrapper when preparing a different backend for a new capture.
+        fp8q_backend : {"auto", "specialized", "dequant"}
+            Execution selector for the SM90 E4M3-query/E4M3-cache route with
+            BF16 output; separate from the planner ``backend``. ``"auto"``
+            uses the all-FP8 kernel when eligible, otherwise dequantises Q for
+            the stock plan. ``"specialized"`` raises rather than substituting
+            that fallback. ``"dequant"`` never prepares the all-FP8 kernel.
         """
+        if fp8q_backend not in ("auto", "specialized", "dequant"):
+            raise ValueError(
+                "fp8q_backend must be one of ('auto', 'specialized', "
+                "'dequant'), got %r" % (fp8q_backend,)
+            )
+        # SM90 fp8-query fast-path selector (orthogonal to `backend`, which
+        # names the PLANNER backend): 'auto' = guarded dispatch with
+        # fail-closed dequant fallback; 'specialized' = explicit selection,
+        # never silently swapped (ineligible plans/calls raise); 'dequant' =
+        # never prepare the fast path.
+        self._fp8q_backend = fp8q_backend
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
@@ -478,6 +501,20 @@ class BatchMLAPagedAttentionWrapper:
         modifying caller metadata does not update that plan. Replan eagerly,
         or create a new wrapper for a different CUDA graph workload.
 
+        SM90 fp8-query fast path under CUDA graphs: on a
+        ``use_cuda_graph=True`` wrapper the fast path's prepared metadata
+        (block table, sequence lengths) lives in wrapper-owned buffers whose
+        addresses never change. A successful replan at the prepared buffer
+        geometry (same batch size, query length, and table width) refreshes
+        those buffers' contents in place, so previously captured graphs
+        replay the NEW plan. A successful replan that cannot be refreshed
+        through those buffers — a different geometry, or a plan outside the
+        fast-path contract — leaves their contents untouched and INVALIDATES
+        previously captured graphs: their replays keep computing the
+        previous plan's values, so discard them and capture anew. A FAILED
+        (backend-rejected) replan restores the buffer contents, and existing
+        captures stay valid.
+
         The plan also declares the later :meth:`run` contract. In particular,
         ``query_layout``, ``kv_cache_layout``, ``lse_mode``, ``output_dtype``,
         ``output_scale``, ``scale_mode``, ``skip_softmax``, and ``use_sinks``
@@ -637,7 +674,94 @@ class BatchMLAPagedAttentionWrapper:
             query_layout = "split" if legacy_flat else "packed"
         if kv_cache_layout is None:
             kv_cache_layout = "split" if legacy_flat else "packed"
+        _fp8q_sm90_explicit_output_dtype = output_dtype
         output_dtype = q_data_type if output_dtype is None else output_dtype
+        # mla_decode_fp8_paged_sm90: fp8 Q over an fp8 packed paged cache on
+        # SM90, where no stock backend has an fp8-Q MLA form. The underlying
+        # plan is made for the exact bf16-dequantised query (bf16 holds every
+        # e4m3 value exactly) with bf16 output; run() dispatches the
+        # specialized all-fp8 kernel at the supported contract and otherwise
+        # dequantises Q into this stock plan (see
+        # flashinfer/mla/_batch_mla/_decode_fp8_sm90.py).
+        self._mla_dec_fp8q_sm90_state = None
+        self._mla_dec_fp8q_sm90_requested = False
+        _fp8q_sm90_prospective = False
+        _fp8q_sm90_prospective_state = None
+        _fp8q_sm90_graph_buf_snapshot = None
+
+        def _fp8q_restore_graph_bufs() -> None:
+            # A rejected replan must leave every buffer a captured graph
+            # reads unchanged, WHATEVER step rejected it: the fp8-Q prepare
+            # itself, plan-argument validation (_MLAPlanArguments), or the
+            # backend plan. The specialized state is only held in locals
+            # until the backend plan succeeds, but prepare rewrites the
+            # reused block-table and sequence-length buffer CONTENTS in
+            # place; restore the snapshot so a graph captured from the
+            # previous plan does not replay with the rejected plan's page
+            # IDs and lengths.
+            if _fp8q_sm90_graph_buf_snapshot:
+                _fp8q_bufs = getattr(self, "_mla_dec_fp8q_sm90_bufs", None) or {}
+                for _name, _saved in _fp8q_sm90_graph_buf_snapshot.items():
+                    _live = _fp8q_bufs.get(_name)
+                    if (
+                        isinstance(_live, torch.Tensor)
+                        and _live.shape == _saved.shape
+                        and _live.dtype == _saved.dtype
+                    ):
+                        _live.copy_(_saved)
+
+        if (
+            q_data_type == torch.float8_e4m3fn
+            and kv_data_type == torch.float8_e4m3fn
+            and _fp8q_sm90_explicit_output_dtype in (None, torch.bfloat16)
+            and _get_compute_capability(self.device) == (9, 0)
+        ):
+            _fp8q_sm90_prospective = True
+            if self._use_cuda_graph:
+                # prepare below rewrites the reused block-table and
+                # sequence-length buffers IN PLACE when the geometry matches.
+                # A graph captured from the previous plan reads those
+                # buffers, so snapshot their contents: if ANY later step
+                # rejects this plan — prepare itself, plan-argument
+                # validation (_MLAPlanArguments), or the backend plan — they
+                # are restored (_fp8q_restore_graph_bufs) and the old
+                # capture stays valid.
+                _fp8q_bufs = getattr(self, "_mla_dec_fp8q_sm90_bufs", None) or {}
+                _fp8q_sm90_graph_buf_snapshot = {
+                    name: _fp8q_bufs[name].clone()
+                    for name in ("block_table", "seq_lens")
+                    if isinstance(_fp8q_bufs.get(name), torch.Tensor)
+                }
+            try:
+                _mla_dec_fp8q_sm90_prepare(
+                    self,
+                    plan_metadata,
+                    num_heads,
+                    head_dim_ckv,
+                    head_dim_kpe,
+                    page_size,
+                    causal,
+                    sm_scale,
+                    lse_mode,
+                    skip_softmax,
+                    use_sinks,
+                    _fp8q_sm90_explicit_output_dtype,
+                    use_profiler=use_profiler,
+                )
+            except Exception:
+                # e.g. fp8q_backend='specialized' raising after a partial
+                # in-place refresh: the capture must keep its plan intact.
+                _fp8q_restore_graph_bufs()
+                raise
+            # Hold the prospective fast-path decision in locals until the
+            # backend plan below validates and succeeds: a plan the backend
+            # rejects must not leave fresh specialized state (or the
+            # requested flag) next to the previous backend plan, which run()
+            # would then mix.
+            _fp8q_sm90_prospective_state = self._mla_dec_fp8q_sm90_state
+            self._mla_dec_fp8q_sm90_state = None
+            q_data_type = torch.bfloat16
+            output_dtype = torch.bfloat16
         if (
             kv_data_type == torch.float8_e4m3fn
             and scale_mode == "default"
@@ -658,63 +782,76 @@ class BatchMLAPagedAttentionWrapper:
         ):
             graph_plan_int_workspace_buffer = previous_backend._int_workspace_buffer
 
-        input_contract = MLAInputContract(
-            lse_mode=lse_mode,
-            output_dtype=output_dtype,
-            output_scale=output_scale,
-            scale_mode=scale_mode,
-            query_layout=query_layout,
-            kv_cache_layout=kv_cache_layout,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-            skip_softmax=skip_softmax,
-            use_sinks=use_sinks,
-        )
+        # Everything from here through the backend plan is one rollback
+        # transaction for the fp8-Q graph buffers: the input contract,
+        # plan-argument VALIDATION (_MLAPlanArguments.__post_init__, e.g. an
+        # unsupported scale_mode), and the backend plan itself can all reject
+        # the plan AFTER prepare refreshed the captured buffers in place.
+        try:
+            input_contract = MLAInputContract(
+                lse_mode=lse_mode,
+                output_dtype=output_dtype,
+                output_scale=output_scale,
+                scale_mode=scale_mode,
+                query_layout=query_layout,
+                kv_cache_layout=kv_cache_layout,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                skip_softmax=skip_softmax,
+                use_sinks=use_sinks,
+            )
 
-        # ---------------------------------------------------------------------------
-        # Lower wrapper inputs to backend plan arguments
-        # ---------------------------------------------------------------------------
-        kv_layout: Literal["combined", "independent-split"] = (
-            "combined" if kv_cache_layout == "packed" else "independent-split"
-        )
-        plan_args = _MLAPlanArguments(
-            metadata=plan_metadata,
-            num_heads=num_heads,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-            page_size=page_size,
-            causal=causal,
-            sm_scale=sm_scale,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            query_kind=("packed" if query_layout == "packed" else "independent-split"),
-            kv_kind=("packed" if kv_cache_layout == "packed" else "independent-split"),
-            query_layout=query_layout,
-            kv_cache_layout=kv_cache_layout,
-            lse_mode=lse_mode,
-            kv_layout=kv_layout,
-            output_dtype=output_dtype,
-            output_scale=output_scale,
-            scale_mode=scale_mode,
-            skip_softmax=skip_softmax,
-            enable_pdl=enable_pdl,
-            use_sinks=use_sinks,
-            use_profiler=use_profiler,
-            legacy_flat_csr=legacy_flat_csr,
-            _float_workspace_buffer=self._float_workspace_buffer,
-            _use_cuda_graph=self._use_cuda_graph,
-            _qo_indptr_buf=self._qo_indptr_buf,
-            _kv_indptr_buf=self._kv_indptr_buf,
-            _kv_indices_buf=self._kv_indices_buf,
-            _kv_len_arr_buf=self._kv_len_arr_buf,
-            _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
-            _previous_backend_name=previous_backend_name,
-        )
+            # -----------------------------------------------------------------------
+            # Lower wrapper inputs to backend plan arguments
+            # -----------------------------------------------------------------------
+            kv_layout: Literal["combined", "independent-split"] = (
+                "combined" if kv_cache_layout == "packed" else "independent-split"
+            )
+            plan_args = _MLAPlanArguments(
+                metadata=plan_metadata,
+                num_heads=num_heads,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                page_size=page_size,
+                causal=causal,
+                sm_scale=sm_scale,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                query_kind=(
+                    "packed" if query_layout == "packed" else "independent-split"
+                ),
+                kv_kind=(
+                    "packed" if kv_cache_layout == "packed" else "independent-split"
+                ),
+                query_layout=query_layout,
+                kv_cache_layout=kv_cache_layout,
+                lse_mode=lse_mode,
+                kv_layout=kv_layout,
+                output_dtype=output_dtype,
+                output_scale=output_scale,
+                scale_mode=scale_mode,
+                skip_softmax=skip_softmax,
+                enable_pdl=enable_pdl,
+                use_sinks=use_sinks,
+                use_profiler=use_profiler,
+                legacy_flat_csr=legacy_flat_csr,
+                _float_workspace_buffer=self._float_workspace_buffer,
+                _use_cuda_graph=self._use_cuda_graph,
+                _qo_indptr_buf=self._qo_indptr_buf,
+                _kv_indptr_buf=self._kv_indptr_buf,
+                _kv_indices_buf=self._kv_indices_buf,
+                _kv_len_arr_buf=self._kv_len_arr_buf,
+                _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
+                _previous_backend_name=previous_backend_name,
+            )
 
-        # ---------------------------------------------------------------------------
-        # Plan with the selected backend
-        # ---------------------------------------------------------------------------
-        planned_backend = self._backend_type.plan_from_wrapper(plan_args)
+            # -----------------------------------------------------------------------
+            # Plan with the selected backend
+            # -----------------------------------------------------------------------
+            planned_backend = self._backend_type.plan_from_wrapper(plan_args)
+        except Exception:
+            _fp8q_restore_graph_bufs()
+            raise
         capabilities = planned_backend._plan_capabilities
         if capabilities.is_experimental:
             warn_experimental_backend_once(
@@ -726,6 +863,9 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         # Publish the successful plan state
         # ---------------------------------------------------------------------------
+        if _fp8q_sm90_prospective:
+            self._mla_dec_fp8q_sm90_requested = True
+            self._mla_dec_fp8q_sm90_state = _fp8q_sm90_prospective_state
         self._backend = planned_backend._backend
         self._planned_backend = planned_backend
         self._planned_backend_name = planned_backend._backend
@@ -792,6 +932,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor: ...
 
     # Output-and-LSE form -- ``return_lse=True`` returns ``(output, lse)``.
@@ -817,6 +958,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     # Deprecated separate-tensor output-only form. Pass split pairs through
@@ -844,6 +986,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor: ...
 
     # Deprecated separate-tensor output-and-LSE form. Pass split pairs through
@@ -871,6 +1014,7 @@ class BatchMLAPagedAttentionWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
         bmm2_scale: Optional[MLABmmScale] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @_warn_on_positional_mla_arguments
@@ -895,6 +1039,7 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         bmm1_scale: Optional[MLABmmScale] = None,
@@ -966,6 +1111,12 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale, ckv_scale_arr, kpe_scale : optional
             Per-tensor or per-token FP8 KV-cache scales required by plans that
             selected ``scale_mode="kv-per-tensor"``.
+        q_scale : float or torch.Tensor, optional
+            Per-tensor query descale (default 1) for E4M3 queries on the SM90
+            FP8-query route. A non-None value is rejected off that route.
+            Specialization requires a finite positive value. For graph capture,
+            pass a Python float or a one-element CPU tensor: the value is baked
+            into the graph. Reading a CUDA scalar is supported only eagerly.
         sinks : Optional[torch.Tensor]
             Per-head sink values. This must be present exactly when the plan
             used ``use_sinks=True``.
@@ -1022,6 +1173,88 @@ class BatchMLAPagedAttentionWrapper:
             raise RuntimeError(
                 "BatchMLAPagedAttentionWrapper.run() called before plan()."
             )
+
+        # ---------------------------------------------------------------------------
+        # Validate the declared run contract (planned wrappers)
+        # ---------------------------------------------------------------------------
+        # This runs before any specialized dispatch so that options the plan
+        # does not support (o_scale, BMM scales, a missing kpe_scale, ...)
+        # are rejected on every path instead of being silently ignored by a
+        # fast-path return.
+        contract: Optional[MLAInputContract] = None
+        if not is_unplanned_cutlass:
+            contract = self._input_contract
+            assert contract is not None
+            if (
+                getattr(self, "_legacy_flat_csr_plan", False)
+                and self._planned_query_layout == "split"
+                and self._planned_kv_cache_layout == "split"
+                and contract.lse_mode == "none"
+                and (return_lse or lse is not None or return_lse_base_on_e)
+            ):
+                self._warn_legacy_dynamic_lse_once()
+                contract = replace(
+                    contract,
+                    lse_mode="basee" if return_lse_base_on_e else "base2",
+                )
+            contract.validate_run_options(
+                out=out,
+                lse=lse,
+                return_lse=return_lse,
+                return_lse_base_on_e=return_lse_base_on_e,
+                o_scale=o_scale,
+                ckv_scale=ckv_scale,
+                ckv_scale_arr=ckv_scale_arr,
+                kpe_scale=kpe_scale,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+            )
+
+        # mla_decode_fp8_paged_sm90: fp8 Q on the SM90 MLA route — the
+        # specialized all-fp8 kernel at the supported contract, exact
+        # dequantisation into the stock plan otherwise (including under
+        # FLASHINFER_DISABLE_MLA_DECODE_FP8_PAGED_SM90). `q_scale` is the
+        # scalar fp8-q descale; on the fallback it is applied during
+        # dequantisation and consumed.
+        # Route on the first tensor LEAF of the structural form, so the
+        # reversed dual form ((nope, pe), packed) reaches the fp8-Q dispatch
+        # (whose shared structural parser decides the form) instead of the
+        # stock lowering's dtype check.
+        _fp8q_first = query[0] if isinstance(query, (tuple, list)) else query
+        if isinstance(_fp8q_first, (tuple, list)) and len(_fp8q_first) > 0:
+            _fp8q_first = _fp8q_first[0]
+        _fp8q_route = getattr(self, "_mla_dec_fp8q_sm90_requested", False) and (
+            isinstance(_fp8q_first, torch.Tensor)
+            and _fp8q_first.dtype == torch.float8_e4m3fn
+        )
+        if q_scale is not None and not _fp8q_route:
+            # Only the fp8-Q route consumes q_scale (kernel descale, or
+            # applied during the dequant fallback). Any other plan/query
+            # combination would drop it silently, so reject it here.
+            raise ValueError(
+                "q_scale is only supported for fp8 e4m3 queries on a plan "
+                "that requested the SM90 fp8-query MLA decode route; this "
+                "plan or query would silently ignore it."
+            )
+        if _fp8q_route:
+            _fp8q_res, query = _mla_dec_fp8q_sm90_dispatch(
+                self,
+                query,
+                kv_cache,
+                out,
+                lse,
+                return_lse,
+                q_scale,
+                ckv_scale,
+                ckv_scale_arr,
+                kpe_scale,
+                sinks,
+                skip_softmax_threshold_scale_factor,
+            )
+            if _fp8q_res is not None:
+                return _fp8q_res
 
         if is_unplanned_cutlass:
             widths = (512, 64)
@@ -1100,40 +1333,9 @@ class BatchMLAPagedAttentionWrapper:
             )
 
         # ---------------------------------------------------------------------------
-        # Validate the declared run contract
-        # ---------------------------------------------------------------------------
-        contract = self._input_contract
-        assert contract is not None
-        if (
-            getattr(self, "_legacy_flat_csr_plan", False)
-            and self._planned_query_layout == "split"
-            and self._planned_kv_cache_layout == "split"
-            and contract.lse_mode == "none"
-            and (return_lse or lse is not None or return_lse_base_on_e)
-        ):
-            self._warn_legacy_dynamic_lse_once()
-            contract = replace(
-                contract,
-                lse_mode="basee" if return_lse_base_on_e else "base2",
-            )
-        contract.validate_run_options(
-            out=out,
-            lse=lse,
-            return_lse=return_lse,
-            return_lse_base_on_e=return_lse_base_on_e,
-            o_scale=o_scale,
-            ckv_scale=ckv_scale,
-            ckv_scale_arr=ckv_scale_arr,
-            kpe_scale=kpe_scale,
-            sinks=sinks,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-        )
-
-        # ---------------------------------------------------------------------------
         # Lower structural inputs to backend layouts
         # ---------------------------------------------------------------------------
+        assert contract is not None
         widths = (contract.head_dim_ckv, contract.head_dim_kpe)
         assert widths[0] is not None and widths[1] is not None
         typed_widths = (widths[0], widths[1])
@@ -1167,6 +1369,21 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         planned_backend = self._planned_backend
         assert planned_backend is not None
+        if _fp8q_route:
+            # Dequantisation replaced Q only. Check the KV leaves selected by
+            # layout lowering, and the actual store destination, on every exit
+            # to stock (including a kill switch set after planning).
+            kv_leaves = (
+                (kv_for_backend,)
+                if isinstance(kv_for_backend, torch.Tensor)
+                else kv_for_backend
+            )
+            if any(t.data_ptr() % 16 for t in kv_leaves):
+                raise ValueError(
+                    "fp8-Q stock fallback requires 16-byte aligned KV cache"
+                )
+            if out is not None and out.data_ptr() % 16:
+                raise ValueError("fp8-Q stock fallback requires 16-byte aligned out")
         return planned_backend.run_from_wrapper(
             query=query_for_backend,
             kv_cache=kv_for_backend,
