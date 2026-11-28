@@ -6007,17 +6007,19 @@ def fast_decode_plan(
 
     with torch.cuda.device(self.device):
         if self.use_tensor_cores:
-            # ALSO convert last_page_len to CPU
-            if page_size == 1:
-                # When page size is 1, last_page_len is always 1.
-                # Directly construct the host tensor rather than executing a device-to-host copy.
-                last_page_len_host = torch.ones(
-                    (batch_size,), dtype=torch.int32, device="cpu"
-                )
+            if self._backend == "fa2" and self._jit_module is None:
+                # The native FA2 planner schedules pages from indptr. Its
+                # shared ABI with FA3 still takes a KV-length tensor.
+                kv_lens_arr_host = indptr_host[:0]
             else:
-                last_page_len_host = last_page_len.cpu()
-
-            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+                last_page_len_host = (
+                    torch.ones(batch_size, dtype=torch.int32, device="cpu")
+                    if page_size == 1
+                    else last_page_len.cpu()
+                )
+                kv_lens_arr_host = get_seq_lens(
+                    indptr_host, last_page_len_host, page_size
+                )
 
             try:
                 # Make sure we pass exactly 19 arguments for fa2 backend and 16 arguments for fa3 backend
