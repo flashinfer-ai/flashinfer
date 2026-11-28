@@ -456,9 +456,9 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 // triggered, those tables are final, whatever point the routing kernel triggered at (the
 // small-batch routing kernels trigger at their start). Reading them before
 // cudaGridDependencySynchronize() is therefore sound here; it would not be in a kernel launched
-// directly after routing. GEMM1's output (inPtr, inDqSfsPtr) is read only after the wait. A
-// caller whose primary is not a trtllm-gen GEMM (the standalone activation op) does not provide
-// the row map and keeps activationDeepSeekKernel.
+// directly after routing. GEMM1's output (inPtr, inDqSfsPtr) is read only after the wait.
+// The standalone activation op does not provide the row map. Its kernels wait before reading
+// routing data because the preceding kernel is not a trtllm-gen GEMM.
 //
 // Numerics are activationDeepSeekKernel's, operation for operation: x = scale * float(e4m3),
 // gatedSilu (its per-expert controls looked up once per piece instead of once per element),
@@ -754,10 +754,8 @@ inline bool isAligned16(void const* ptr) {
 }
 
 // Whether activationDeepSeekKernelPersistent128 can run: the row -> token map and its bound (the
-// fused MoE runner sets them; the standalone activation op does not, and its primary is not a
-// trtllm-gen GEMM, so it keeps activationDeepSeekKernel), whole scale blocks of the width the
-// kernel is built for, 16-byte aligned rows and pointers, and the tile -> expert map when the
-// per-expert controls are set.
+// fused MoE runner sets them), whole scale blocks of the width the kernel is built for, 16-byte
+// aligned rows and pointers, and the tile -> expert map when the per-expert controls are set.
 inline bool persistentActivationSupported(Data const& data) {
   int const outputDim = data.innerDim / 2;
   int const eltBytes = tg::dtypeGetNumBits(data.mDtypeElt) / 8;
@@ -789,6 +787,84 @@ inline int persistentActivationNumCtas(Data const& data, int numSms) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Assign one warp to each (token, top-k slot, 128-channel scale block). Each lane loads and
+// stores four adjacent channels as one 32-bit word.
+template <typename KernelParams>
+__global__ void activationDeepSeekVectorKernel(KernelParams params) {
+  using Type = typename KernelParams::Type;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+  }
+#endif
+  float constexpr E4m3MaxVal{448.f};
+  int const lane = threadIdx.x & 31;
+  int const numBlocks = params.innerDim / 2 / 128;
+  int64_t const warpId = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  int64_t const numWarps = (int64_t)params.numTokens * params.topK * numBlocks;
+  if (warpId >= numWarps) {
+    return;
+  }
+  int const blk = (int)(warpId % numBlocks);
+  int64_t const expandedIdx = warpId / numBlocks;
+  int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+  if (permutedIdx == -1) {
+    return;
+  }
+  int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+  int const hiddenIdx = blk * 128 + lane * 4;
+  float const scale1 =
+      params.inDqSfsPtr[(int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * blk];
+  float const scale2 =
+      params.inDqSfsPtr[(int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (blk + numBlocks)];
+  int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
+  uint32_t const raw1 = *reinterpret_cast<uint32_t const*>(params.inPtr + baseIdx);
+  uint32_t const raw2 =
+      *reinterpret_cast<uint32_t const*>(params.inPtr + baseIdx + params.innerDim / 2);
+  // Keep the expert lookup outside the four-channel loop while matching gatedSilu's arithmetic.
+  bool const hasClamp = params.gatedActClampLimitPtr != nullptr;
+  bool const hasControls =
+      params.gatedActAlphaPtr != nullptr || params.gatedActBetaPtr != nullptr || hasClamp;
+  float limit = 0.0f, alpha = 1.0f, beta = 0.0f;
+  if (hasControls) {
+    int32_t const localExpertIdx = params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim];
+    if (hasClamp) {
+      limit = params.gatedActClampLimitPtr[localExpertIdx];
+    }
+    alpha = params.gatedActAlphaPtr != nullptr ? params.gatedActAlphaPtr[localExpertIdx] : 1.0f;
+    beta = params.gatedActBetaPtr != nullptr ? params.gatedActBetaPtr[localExpertIdx] : 0.0f;
+  }
+  float outArr[4];
+  float aMax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float const d1 = static_cast<float>(Type::bitcast((raw1 >> (8 * i)) & 0xff));
+    float const d2 = static_cast<float>(Type::bitcast((raw2 >> (8 * i)) & 0xff));
+    float const out =
+        gatedSiluFromControls(hasControls, hasClamp, alpha, beta, limit, scale1 * d1, scale2 * d2);
+    outArr[i] = out;
+    aMax = fmaxf(aMax, fabsf(out));
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffffu, aMax, o));
+  }
+  float const scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
+  if (lane == 0) {
+    params.outDqSfsPtr[(int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * blk] = scaleOut;
+  }
+  uint32_t packed = 0;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    packed |= (uint32_t)(static_cast<Type>(outArr[i] / scaleOut).storage) << (8 * i);
+  }
+  *reinterpret_cast<uint32_t*>(params.outPtr + (int64_t)permutedIdx * (params.innerDim / 2) +
+                               hiddenIdx) = packed;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
@@ -801,12 +877,28 @@ void run(Data const& data, void* stream) {
     FLASHINFER_CHECK(data.mDeepSeekSfBlockSize == 128 || data.mDeepSeekSfBlockSize == 32,
                      "DeepSeek FP8 activation: scale block must be 128 or 32.");
 
+    bool const usePersistent = persistentActivationSupported(data);
+    if (!usePersistent && data.mDtypeElt == tg::Dtype::E4m3 && data.mDeepSeekSfBlockSize == 128 &&
+        data.innerDim > 0 && data.innerDim % 256 == 0 && data.topK > 0 && data.numTokens >= 1024 &&
+        reinterpret_cast<std::uintptr_t>(data.inPtr) % alignof(uint32_t) == 0 &&
+        reinterpret_cast<std::uintptr_t>(data.outPtr) % alignof(uint32_t) == 0) {
+      int64_t const numWarps = (int64_t)data.numTokens * data.topK * (data.innerDim / 256);
+      int const numThreads = 256;
+      int64_t const numBlocks = (numWarps + (numThreads / 32) - 1) / (numThreads / 32);
+      if (numBlocks <= std::numeric_limits<int>::max()) {
+        LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, 1),
+                   activationDeepSeekVectorKernel, static_cast<int>(numBlocks), numThreads, 0,
+                   stream);
+        return;
+      }
+    }
+
     int device{-1};
     cudaGetDevice(&device);
     int numSms = 0;
     cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
 
-    if (persistentActivationSupported(data)) {
+    if (usePersistent) {
       dim3 const grid(persistentActivationNumCtas(data, numSms));
       LAUNCH_ACTIVATION_PERSISTENT(data, activationDeepSeekKernelPersistent128, grid,
                                    DEEP_SEEK_ACTIVATION_PERSISTENT_THREADS_PER_CTA, 0, stream);
