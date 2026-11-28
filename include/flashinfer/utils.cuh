@@ -346,6 +346,18 @@ __forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y
   return (x + y - 1) / y;
 }
 
+/*!
+ * \brief Number of lanes (blockDim.x) the CUDA-core decode kernels spread one head over:
+ *   head_dim / vec_size rounded up to a power of two, because their QK dot product is reduced
+ *   with a shfl_xor butterfly. The lanes past head_dim / vec_size carry no data.
+ */
+__forceinline__ __device__ __host__ constexpr uint32_t decode_num_lanes(uint32_t head_dim,
+                                                                        uint32_t vec_size) {
+  uint32_t lanes = 1;
+  while (lanes * vec_size < head_dim) lanes *= 2;
+  return lanes;
+}
+
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ constexpr T1 round_up(const T1 x, const T2 y) noexcept {
   return ceil_div(x, y) * y;

@@ -1659,3 +1659,161 @@ def test_tensor_core_decode_cuda_graph_padding_without_split_kv():
 
     o = wrapper.run(q, kv_data)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+
+def _llama_rope_reference(x, pos, theta=1e4):
+    # x: [..., head_dim] at integer positions pos (broadcastable to x[..., 0]).
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    inv_freq = theta ** (
+        -torch.arange(half, dtype=torch.float32, device=x.device) * 2 / head_dim
+    )
+    angle = pos.float().unsqueeze(-1) * inv_freq
+    cos, sin = angle.cos(), angle.sin()
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
+def _decode_reference(q, k, v, rope):
+    # q: [num_qo_heads, D]; k, v: [kv_len, num_kv_heads, D], all float32.
+    kv_len, num_kv_heads, head_dim = k.shape
+    if rope:
+        q = _llama_rope_reference(q, torch.tensor(kv_len - 1, device=q.device))
+        k = _llama_rope_reference(k, torch.arange(kv_len, device=k.device).view(-1, 1))
+    group = q.shape[0] // num_kv_heads
+    k = k.repeat_interleave(group, dim=1)
+    v = v.repeat_interleave(group, dim=1)
+    logits = torch.einsum("hd,nhd->hn", q, k) / head_dim**0.5
+    return torch.einsum("hn,nhd->hd", logits.softmax(-1), v)
+
+
+_PADDED_LANE_CASES = [
+    (head_dim, kv_dtype, pos_encoding_mode)
+    for head_dim in (80, 96, 192)
+    for kv_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    for pos_encoding_mode in ("NONE", "ROPE_LLAMA")
+    # with fp8, vec_size 16 does not divide 80 / 2: refused, see the test below
+    if not (
+        head_dim == 80
+        and kv_dtype == torch.float8_e4m3fn
+        and pos_encoding_mode != "NONE"
+    )
+]
+
+
+@pytest.mark.parametrize("head_dim, kv_dtype, pos_encoding_mode", _PADDED_LANE_CASES)
+@pytest.mark.parametrize("group_size", [1, 4])
+def test_cuda_core_decode_head_dim_not_a_power_of_two_lanes(
+    head_dim, kv_dtype, pos_encoding_mode, group_size
+):
+    """The CUDA-core decode spreads a head over head_dim / vec_size lanes and
+    reduces QK with a shfl_xor butterfly, which needs a power of two. head_dim
+    80, 96 and 192 give 10, 12, 24 lanes (bf16) or 5, 6, 12 (fp8); the lane
+    count is now padded to a power of two. Both entry points, with and without
+    KV splitting, must match a float32 reference.
+    """
+    torch.manual_seed(0)
+    device = "cuda:0"
+    rope = pos_encoding_mode == "ROPE_LLAMA"
+    num_kv_heads, page_size = 2, 16
+    num_qo_heads = num_kv_heads * group_size
+
+    # single decode: 1000 tokens takes the KV-split path, 100 does not
+    for kv_len in (100, 1000):
+        q = torch.randn(num_qo_heads, head_dim, device=device).bfloat16()
+        k = torch.randn(kv_len, num_kv_heads, head_dim, device=device).to(kv_dtype)
+        v = torch.randn(kv_len, num_kv_heads, head_dim, device=device).to(kv_dtype)
+        o = flashinfer.decode.single_decode_with_kv_cache(
+            q, k, v, pos_encoding_mode=pos_encoding_mode, use_tensor_cores=False
+        )
+        o_ref = _decode_reference(q.float(), k.float(), v.float(), rope)
+        torch.testing.assert_close(o.float(), o_ref, rtol=2e-2, atol=2e-2)
+
+    # batch decode over a paged cache; 4 requests are few enough to split KV
+    kv_lens = [37, 512, 1, 260]
+    pages = [-(-n // page_size) for n in kv_lens]
+    kv_indptr = torch.tensor([0] + pages, dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+    num_pages = int(kv_indptr[-1])
+    kv_indices = torch.randperm(num_pages, dtype=torch.int32)
+    kv_last_page_len = torch.tensor(
+        [n - (p - 1) * page_size for n, p in zip(kv_lens, pages, strict=True)],
+        dtype=torch.int32,
+    )
+    k_cache = torch.randn(
+        num_pages, page_size, num_kv_heads, head_dim, device=device
+    ).to(kv_dtype)
+    v_cache = torch.randn(
+        num_pages, page_size, num_kv_heads, head_dim, device=device
+    ).to(kv_dtype)
+    q = torch.randn(len(kv_lens), num_qo_heads, head_dim, device=device).bfloat16()
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", use_tensor_cores=False
+    )
+    wrapper.plan(
+        kv_indptr.to(device),
+        kv_indices.to(device),
+        kv_last_page_len.to(device),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode=pos_encoding_mode,
+        q_data_type=torch.bfloat16,
+        kv_data_type=kv_dtype,
+    )
+    o = wrapper.run(q, (k_cache, v_cache))
+    for b, kv_len in enumerate(kv_lens):
+        page_ids = kv_indices[kv_indptr[b] : kv_indptr[b + 1]].long()
+        k = k_cache[page_ids].flatten(0, 1)[:kv_len].float()
+        v = v_cache[page_ids].flatten(0, 1)[:kv_len].float()
+        o_ref = _decode_reference(q[b].float(), k, v, rope)
+        torch.testing.assert_close(o[b].float(), o_ref, rtol=2e-2, atol=2e-2)
+
+
+def test_cuda_core_decode_refuses_rope_lanes_straddling_the_half():
+    """With an fp8 KV cache, head_dim 80 gives vec_size 16, which does not divide
+    head_dim / 2 = 40, so a lane would hold both halves that RoPE pairs."""
+    q = torch.randn(8, 80, dtype=torch.bfloat16, device="cuda:0")
+    k = torch.randn(64, 2, 80, device="cuda:0").to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="head_dim 80"):
+        flashinfer.decode.single_decode_with_kv_cache(
+            q, k, k, pos_encoding_mode="ROPE_LLAMA", use_tensor_cores=False
+        )
+
+
+def test_cuda_core_decode_refuses_head_dim_not_a_multiple_of_vec_size():
+    """With an fp8 KV cache each lane loads vec_size = 16 elements, which does not
+    divide head_dim 72."""
+    q = torch.randn(8, 72, dtype=torch.bfloat16, device="cuda:0")
+    k = torch.randn(64, 2, 72, device="cuda:0").to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="head_dim 72"):
+        flashinfer.decode.single_decode_with_kv_cache(q, k, k, use_tensor_cores=False)
+
+
+def test_cuda_core_decode_refuses_split_merge_layout_of_an_fp8_output():
+    """With KV split the partial outputs are merged with vec_size = 16 elements of
+    an fp8 output per lane, which does not divide head_dim 88."""
+    device = "cuda:0"
+    kv_indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(2, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.tensor([16], dtype=torch.int32, device=device)
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", use_tensor_cores=False
+    )
+    with pytest.raises(ValueError, match="head_dim 88"):
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            8,
+            2,
+            88,
+            16,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.float8_e4m3fn,
+        )
