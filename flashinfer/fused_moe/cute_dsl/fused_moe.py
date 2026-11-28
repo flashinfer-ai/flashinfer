@@ -645,6 +645,8 @@ def _moe_core_impl(
     gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
+    gemm2_raster_along_m: bool = False,
+    gemm2_epilogue: Optional[Tuple[int, ...]] = None,
     # Pre-allocated buffers (for CUDA graph)
     moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None,
     gemm1_out: Optional[torch.Tensor] = None,
@@ -729,6 +731,10 @@ def _moe_core_impl(
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
+        gemm2_raster_along_m: GEMM2 tile raster order.
+        gemm2_epilogue: Optional GEMM2 epilogue
+            (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
+            None keeps the default epilogue.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
@@ -1379,6 +1385,18 @@ def _moe_core_impl(
         )
 
     # Step 3: GEMM2 with optional atomic finalize
+    if gemm2_epilogue is not None and (use_localized_path or swap_ab):
+        raise ValueError(
+            "gemm2_epilogue is not supported on the localized or swap_ab path"
+        )
+    if gemm2_epilogue is not None:
+        gemm2_options.update(
+            raster_along_m=gemm2_raster_along_m,
+            num_c_stage=gemm2_epilogue[0],
+            num_store_warps=gemm2_epilogue[1],
+            swizzle_size=gemm2_epilogue[2],
+            use_l2_hints=len(gemm2_epilogue) > 3 and bool(gemm2_epilogue[3]),
+        )
     if use_localized_path:
         # Both domains read the joined FC1 output and write disjoint hidden
         # columns. Each contracts the full intermediate, so no reduction is needed.
@@ -1828,6 +1846,8 @@ class CuteDslMoEWrapper:
         gemm2_k_steps: Optional[int] = None,
         gemm1_use_clc_scheduler: bool = True,
         gemm2_use_clc_scheduler: bool = False,
+        gemm2_raster_along_m: bool = False,
+        gemm2_epilogue: Optional[Tuple[int, ...]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -1882,6 +1902,8 @@ class CuteDslMoEWrapper:
             gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
             gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
             swap_ab=self.swap_ab,
+            gemm2_raster_along_m=gemm2_raster_along_m,
+            gemm2_epilogue=gemm2_epilogue,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -2163,6 +2185,8 @@ def _cute_dsl_fused_moe_impl(
     swap_ab: bool = False,
     routing_weights_before_fc2: bool = False,
     localized_options: Optional[dict] = None,
+    gemm2_raster_along_m: bool = False,
+    gemm2_epilogue: Optional[Tuple[int, ...]] = None,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -2216,6 +2240,8 @@ def _cute_dsl_fused_moe_impl(
         gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
         swap_ab=swap_ab,
         localized_options=localized_options,
+        gemm2_raster_along_m=gemm2_raster_along_m,
+        gemm2_epilogue=gemm2_epilogue,
     )
 
 

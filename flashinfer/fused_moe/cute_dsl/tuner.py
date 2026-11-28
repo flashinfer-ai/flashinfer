@@ -22,7 +22,9 @@ enabling automatic performance tuning across different GEMM tactics.
 
 Tactic format follows TRT-LLM's style and is architecture-dependent:
 - Blackwell (SM100): tactic = (mma_tiler_mn, cluster_shape_mn, raster_along_m)
-  for both GEMM1 (Gather + FC1 activation) and GEMM2 (Finalize)
+  for both GEMM1 (Gather + FC1 activation) and GEMM2 (Finalize). A GEMM2
+  tactic may carry a 4th element, the store-warp/swizzle epilogue
+  (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]).
 - Rubin (SM107): tactic = (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
@@ -109,7 +111,9 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     1-CTA tactic at tile_size=256 yields a layout mismatch and incorrect output
     (bug #3067, fixed upstream by #3171).
 
-    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m), optionally followed
+    by an epilogue (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
+    see BLACKWELL_GEMM2_EPILOGUE_CANDIDATES.
     """
     mma_tiler_mn_candidates = [(tile_size, 128), (tile_size, 256)]
     cluster_shape_mn_candidates = [
@@ -118,7 +122,7 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     ]
     raster_along_m_candidates = [False]
 
-    return [
+    tactics: List[Tuple] = [
         (mma_tiler_mn, cluster_shape_mn, raster_along_m)
         for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
             mma_tiler_mn_candidates,
@@ -126,6 +130,27 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
             raster_along_m_candidates,
         )
     ]
+    if tile_size == 256:
+        tactics += [
+            ((256, 256), (2, 1), True, epilogue)
+            for epilogue in BLACKWELL_GEMM2_EPILOGUE_CANDIDATES
+        ]
+    return tactics
+
+
+# GEMM2 epilogue variants (num_c_stage, num_store_warps, swizzle_size[,
+# use_l2_hints]), offered only on the (256, 256) 2-CTA tile with
+# raster_along_m=True.
+BLACKWELL_GEMM2_EPILOGUE_CANDIDATES: Tuple[Tuple[int, ...], ...] = (
+    (1, 0, 2),
+    (1, 0, 4),
+    (2, 2, 2),
+    (2, 2, 4),
+    (2, 4, 4),
+    (2, 2, 2, True),
+    (2, 2, 4, True),
+    (2, 4, 4, True),
+)
 
 
 def get_blackwell_moe_valid_tactics() -> List[Tuple]:
@@ -409,10 +434,16 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             "gemm2_raster_along_m": gemm2_raster_along_m,
             "gemm2_mma_tiler": gemm2_mma_tiler,
             "gemm2_mma_inst_shape": gemm2_mma_inst_shape,
+            "gemm2_epilogue": None,
         }
     else:
         gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, gemm1_raster_along_m = gemm1_tactic
-        gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, gemm2_raster_along_m = gemm2_tactic
+        (
+            gemm2_mma_tiler_mn,
+            gemm2_cluster_shape_mn,
+            gemm2_raster_along_m,
+            *gemm2_extra,
+        ) = gemm2_tactic
         return {
             "tile_size": tile_size,
             "is_rubin": False,
@@ -426,6 +457,7 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             "gemm2_raster_along_m": gemm2_raster_along_m,
             "gemm2_mma_tiler": None,
             "gemm2_mma_inst_shape": None,
+            "gemm2_epilogue": tuple(gemm2_extra[0]) if gemm2_extra else None,
         }
 
 
@@ -953,7 +985,26 @@ class CuteDslFusedMoERunner(TunableRunner):
                 )
 
                 gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, _ = gemm1_tactic
-                gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, _ = gemm2_tactic
+                gemm2_mma_tiler_mn, gemm2_cluster_shape_mn = gemm2_tactic[:2]
+
+                # Two C stages of a 32-bit output tile leave no shared memory
+                # for the A/B pipeline.
+                if (
+                    len(gemm2_tactic) > 3
+                    and gemm2_tactic[3][0] > 1
+                    and gemm2_out_dtype.width > 16
+                ):
+                    return False
+                # The L2 hints apply only to the fused BF16 reduce.
+                if (
+                    len(gemm2_tactic) > 3
+                    and len(gemm2_tactic[3]) > 3
+                    and gemm2_tactic[3][3]
+                    and not (
+                        self.use_fused_finalize and gemm2_out_dtype == cutlass.BFloat16
+                    )
+                ):
+                    return False
 
                 gemm1_ok = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
                     a_dtype=a_dtype,
@@ -1107,6 +1158,13 @@ class CuteDslFusedMoERunner(TunableRunner):
                 localized_memset_stream=self.localized_memset_stream,
                 sm_count=self.localized_sm_count,
                 localized_options=self.localized_options,
+            )
+        if params["gemm2_epilogue"] is not None:
+            # Only forwarded when requested, so forward_impls without these
+            # parameters keep working with the plain 3-element tactics.
+            kwargs.update(
+                gemm2_raster_along_m=params["gemm2_raster_along_m"],
+                gemm2_epilogue=params["gemm2_epilogue"],
             )
 
         if self.routing_weights_before_fc2:
