@@ -47,33 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_VALUES_TMEM_OFFSET 0
-#define NUM_MAIN_STAGES 1
-#define SMEM_SOURCE_BUF_OFF 0
-#define SMEM_SOURCE_BUF_STAGE_BYTES 28672
-#define SMEM_SOURCE_BUF_STRIDE 28672
-#define SMEM_SOURCE_WORDS_OFF 0
-#define SMEM_SOURCE_WORDS_STAGE_BYTES 114688
-#define SMEM_SOURCE_WORDS_STRIDE 114688
-#define SMEM_DELTA_BUF_OFF 114688
-#define SMEM_DELTA_BUF_STAGE_BYTES 14336
-#define SMEM_DELTA_BUF_STRIDE 14336
-#define SMEM_DELTA_WORDS_OFF 114688
-#define SMEM_DELTA_WORDS_STAGE_BYTES 28672
-#define SMEM_DELTA_WORDS_STRIDE 28672
-#define SMEM_OUTPUT_NORM_BUF_OFF 143360
-#define SMEM_OUTPUT_NORM_BUF_STAGE_BYTES 14336
-#define SMEM_OUTPUT_NORM_BUF_STRIDE 14336
-#define SMEM_STATS_OFF 157696
-#define SMEM_STATS_STAGE_BYTES 1024
-#define SMEM_STATS_STRIDE 1024
-#define SMEM_OUTPUT_STATS_OFF 158720
-#define SMEM_OUTPUT_STATS_STAGE_BYTES 64
-#define SMEM_OUTPUT_STATS_STRIDE 64
-#define SMEM_TOTAL 158976
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -237,7 +210,7 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* source_buf = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int source_buf_addr = smem + 0;
     unsigned int* source_words = reinterpret_cast<unsigned int*>(smem_raw + 0);
@@ -253,8 +226,7 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
     float* output_stats = reinterpret_cast<float*>(smem_raw + 158720);
     const int output_stats_addr = smem + 158720;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 9 barriers)
-    // Mbarriers at smem_raw[158784..158856)
+    // Mbarrier init (9 barriers at smem_raw[158784..158856))
 
     if (warp == 8) {
         uint32_t leader = elect_sync();
@@ -288,10 +260,10 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_values_tmem = taddr;
 
     // Kernel post-init ops
-    const int tmem_values_tmem = taddr;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 104;");
     }
@@ -310,7 +282,7 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + ((unsigned long long)0 * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(norm_ready_addr)
+                        :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + (unsigned long long)0 * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(norm_ready_addr)
                         : "memory");
                 }
                 unsigned int stage = 0;
@@ -322,27 +294,12 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)token * blocks_m_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
-                        : "memory");
-                    stage += 1;
-                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
-                    asm volatile(
-                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
-                        "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 2 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
-                        : "memory");
-                    asm volatile(
-                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
-                        "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 3 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)token * blocks_m_stride + blocks_k_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
                     if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
@@ -352,12 +309,12 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 4 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)token * blocks_m_stride + 2ull * blocks_k_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 5 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)token * blocks_m_stride + 3ull * blocks_k_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
                     if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
@@ -367,12 +324,27 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)token * blocks_m_stride + 4ull * blocks_k_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(delta_buf_addr + stream_u * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)token * blocks_m_stride + 5ull * blocks_k_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        : "memory");
+                    stage += 1;
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
+                    asm volatile(
+                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+                        "[%0], [%1], %2, [%3];"
+                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + (unsigned long long)(token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        : "memory");
+                    asm volatile(
+                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+                        "[%0], [%1], %2, [%3];"
+                        :: "r"(delta_buf_addr + stream_u * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + (unsigned long long)(token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
                     if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
@@ -1585,6 +1557,7 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 float2 q_pair_35_83 = make_float2(q_cache[54], q_cache[55]);
                 local_sum_sq[3] = fma_f32x2_rn_ftz(value_pair_1_55, value_pair_1_55, local_sum_sq[3]);
                 local_dot[3] = fma_f32x2_rn_ftz(value_pair_1_55, q_pair_35_83, local_dot[3]);
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(consumed_addr + (ring_stage) * 8);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -2900,6 +2873,7 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 float2 q_pair_35_139 = make_float2(q_cache[54], q_cache[55]);
                 local_sum_sq_421[3] = fma_f32x2_rn_ftz(value_pair_1_111, value_pair_1_111, local_sum_sq_421[3]);
                 local_dot_422[3] = fma_f32x2_rn_ftz(value_pair_1_111, q_pair_35_139, local_dot_422[3]);
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(consumed_addr + (ring_stage_420) * 8);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -4215,6 +4189,7 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 float2 q_pair_35_195 = make_float2(q_cache[54], q_cache[55]);
                 local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1_167, value_pair_1_167, local_sum_sq_852[3]);
                 local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1_167, q_pair_35_195, local_dot_853[3]);
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(consumed_addr + (ring_stage_851) * 8);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -4918,26 +4893,26 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_49 = 0; _lr_49 < 4; _lr_49++) {
                     smem_regs_60[_lr_49] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1_32 / 2) + (unsigned int)_lr_49];
                 }
-                __nv_bfloat162 prefix_pair_1_0 = __as_bf16x2(smem_regs_59[0]);
-                __nv_bfloat162 delta_pair_1_0 = __as_bf16x2(smem_regs_60[0]);
+                __nv_bfloat162 prefix_pair_1 = __as_bf16x2(smem_regs_59[0]);
+                __nv_bfloat162 delta_pair_1 = __as_bf16x2(smem_regs_60[0]);
+                __nv_bfloat162 updated_bf16_pair_1 = prefix_pair_1 + delta_pair_1;
+                values_1_48[0] = (float)updated_bf16_pair_1.x;
+                values_1_48[1] = (float)updated_bf16_pair_1.y;
+                __nv_bfloat162 prefix_pair_1_0 = __as_bf16x2(smem_regs_59[1]);
+                __nv_bfloat162 delta_pair_1_0 = __as_bf16x2(smem_regs_60[1]);
                 __nv_bfloat162 updated_bf16_pair_1_0 = prefix_pair_1_0 + delta_pair_1_0;
-                values_1_48[0] = (float)updated_bf16_pair_1_0.x;
-                values_1_48[1] = (float)updated_bf16_pair_1_0.y;
-                __nv_bfloat162 prefix_pair_1_1 = __as_bf16x2(smem_regs_59[1]);
-                __nv_bfloat162 delta_pair_1_1 = __as_bf16x2(smem_regs_60[1]);
+                values_1_48[2] = (float)updated_bf16_pair_1_0.x;
+                values_1_48[3] = (float)updated_bf16_pair_1_0.y;
+                __nv_bfloat162 prefix_pair_1_1 = __as_bf16x2(smem_regs_59[2]);
+                __nv_bfloat162 delta_pair_1_1 = __as_bf16x2(smem_regs_60[2]);
                 __nv_bfloat162 updated_bf16_pair_1_1 = prefix_pair_1_1 + delta_pair_1_1;
-                values_1_48[2] = (float)updated_bf16_pair_1_1.x;
-                values_1_48[3] = (float)updated_bf16_pair_1_1.y;
-                __nv_bfloat162 prefix_pair_1_2 = __as_bf16x2(smem_regs_59[2]);
-                __nv_bfloat162 delta_pair_1_2 = __as_bf16x2(smem_regs_60[2]);
+                values_1_48[4] = (float)updated_bf16_pair_1_1.x;
+                values_1_48[5] = (float)updated_bf16_pair_1_1.y;
+                __nv_bfloat162 prefix_pair_1_2 = __as_bf16x2(smem_regs_59[3]);
+                __nv_bfloat162 delta_pair_1_2 = __as_bf16x2(smem_regs_60[3]);
                 __nv_bfloat162 updated_bf16_pair_1_2 = prefix_pair_1_2 + delta_pair_1_2;
-                values_1_48[4] = (float)updated_bf16_pair_1_2.x;
-                values_1_48[5] = (float)updated_bf16_pair_1_2.y;
-                __nv_bfloat162 prefix_pair_1_3 = __as_bf16x2(smem_regs_59[3]);
-                __nv_bfloat162 delta_pair_1_3 = __as_bf16x2(smem_regs_60[3]);
-                __nv_bfloat162 updated_bf16_pair_1_3 = prefix_pair_1_3 + delta_pair_1_3;
-                values_1_48[6] = (float)updated_bf16_pair_1_3.x;
-                values_1_48[7] = (float)updated_bf16_pair_1_3.y;
+                values_1_48[6] = (float)updated_bf16_pair_1_2.x;
+                values_1_48[7] = (float)updated_bf16_pair_1_2.y;
                 unsigned int _packed_0[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -4989,26 +4964,26 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_51 = 0; _lr_51 < 4; _lr_51++) {
                     smem_regs_62[_lr_51] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_2_0 / 2) + (unsigned int)_lr_51];
                 }
-                __nv_bfloat162 prefix_pair_1_4 = __as_bf16x2(smem_regs_61[0]);
-                __nv_bfloat162 delta_pair_1_4 = __as_bf16x2(smem_regs_62[0]);
+                __nv_bfloat162 prefix_pair_1_3 = __as_bf16x2(smem_regs_61[0]);
+                __nv_bfloat162 delta_pair_1_3 = __as_bf16x2(smem_regs_62[0]);
+                __nv_bfloat162 updated_bf16_pair_1_3 = prefix_pair_1_3 + delta_pair_1_3;
+                values_2_0[0] = (float)updated_bf16_pair_1_3.x;
+                values_2_0[1] = (float)updated_bf16_pair_1_3.y;
+                __nv_bfloat162 prefix_pair_1_4 = __as_bf16x2(smem_regs_61[1]);
+                __nv_bfloat162 delta_pair_1_4 = __as_bf16x2(smem_regs_62[1]);
                 __nv_bfloat162 updated_bf16_pair_1_4 = prefix_pair_1_4 + delta_pair_1_4;
-                values_2_0[0] = (float)updated_bf16_pair_1_4.x;
-                values_2_0[1] = (float)updated_bf16_pair_1_4.y;
-                __nv_bfloat162 prefix_pair_1_5 = __as_bf16x2(smem_regs_61[1]);
-                __nv_bfloat162 delta_pair_1_5 = __as_bf16x2(smem_regs_62[1]);
+                values_2_0[2] = (float)updated_bf16_pair_1_4.x;
+                values_2_0[3] = (float)updated_bf16_pair_1_4.y;
+                __nv_bfloat162 prefix_pair_1_5 = __as_bf16x2(smem_regs_61[2]);
+                __nv_bfloat162 delta_pair_1_5 = __as_bf16x2(smem_regs_62[2]);
                 __nv_bfloat162 updated_bf16_pair_1_5 = prefix_pair_1_5 + delta_pair_1_5;
-                values_2_0[2] = (float)updated_bf16_pair_1_5.x;
-                values_2_0[3] = (float)updated_bf16_pair_1_5.y;
-                __nv_bfloat162 prefix_pair_1_6 = __as_bf16x2(smem_regs_61[2]);
-                __nv_bfloat162 delta_pair_1_6 = __as_bf16x2(smem_regs_62[2]);
+                values_2_0[4] = (float)updated_bf16_pair_1_5.x;
+                values_2_0[5] = (float)updated_bf16_pair_1_5.y;
+                __nv_bfloat162 prefix_pair_1_6 = __as_bf16x2(smem_regs_61[3]);
+                __nv_bfloat162 delta_pair_1_6 = __as_bf16x2(smem_regs_62[3]);
                 __nv_bfloat162 updated_bf16_pair_1_6 = prefix_pair_1_6 + delta_pair_1_6;
-                values_2_0[4] = (float)updated_bf16_pair_1_6.x;
-                values_2_0[5] = (float)updated_bf16_pair_1_6.y;
-                __nv_bfloat162 prefix_pair_1_7 = __as_bf16x2(smem_regs_61[3]);
-                __nv_bfloat162 delta_pair_1_7 = __as_bf16x2(smem_regs_62[3]);
-                __nv_bfloat162 updated_bf16_pair_1_7 = prefix_pair_1_7 + delta_pair_1_7;
-                values_2_0[6] = (float)updated_bf16_pair_1_7.x;
-                values_2_0[7] = (float)updated_bf16_pair_1_7.y;
+                values_2_0[6] = (float)updated_bf16_pair_1_6.x;
+                values_2_0[7] = (float)updated_bf16_pair_1_6.y;
                 unsigned int _packed_16_0[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -5060,26 +5035,26 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_53 = 0; _lr_53 < 4; _lr_53++) {
                     smem_regs_64[_lr_53] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_4_0 / 2) + (unsigned int)_lr_53];
                 }
-                __nv_bfloat162 prefix_pair_1_8 = __as_bf16x2(smem_regs_63[0]);
-                __nv_bfloat162 delta_pair_1_8 = __as_bf16x2(smem_regs_64[0]);
+                __nv_bfloat162 prefix_pair_1_7 = __as_bf16x2(smem_regs_63[0]);
+                __nv_bfloat162 delta_pair_1_7 = __as_bf16x2(smem_regs_64[0]);
+                __nv_bfloat162 updated_bf16_pair_1_7 = prefix_pair_1_7 + delta_pair_1_7;
+                values_3_0[0] = (float)updated_bf16_pair_1_7.x;
+                values_3_0[1] = (float)updated_bf16_pair_1_7.y;
+                __nv_bfloat162 prefix_pair_1_8 = __as_bf16x2(smem_regs_63[1]);
+                __nv_bfloat162 delta_pair_1_8 = __as_bf16x2(smem_regs_64[1]);
                 __nv_bfloat162 updated_bf16_pair_1_8 = prefix_pair_1_8 + delta_pair_1_8;
-                values_3_0[0] = (float)updated_bf16_pair_1_8.x;
-                values_3_0[1] = (float)updated_bf16_pair_1_8.y;
-                __nv_bfloat162 prefix_pair_1_9 = __as_bf16x2(smem_regs_63[1]);
-                __nv_bfloat162 delta_pair_1_9 = __as_bf16x2(smem_regs_64[1]);
+                values_3_0[2] = (float)updated_bf16_pair_1_8.x;
+                values_3_0[3] = (float)updated_bf16_pair_1_8.y;
+                __nv_bfloat162 prefix_pair_1_9 = __as_bf16x2(smem_regs_63[2]);
+                __nv_bfloat162 delta_pair_1_9 = __as_bf16x2(smem_regs_64[2]);
                 __nv_bfloat162 updated_bf16_pair_1_9 = prefix_pair_1_9 + delta_pair_1_9;
-                values_3_0[2] = (float)updated_bf16_pair_1_9.x;
-                values_3_0[3] = (float)updated_bf16_pair_1_9.y;
-                __nv_bfloat162 prefix_pair_1_10 = __as_bf16x2(smem_regs_63[2]);
-                __nv_bfloat162 delta_pair_1_10 = __as_bf16x2(smem_regs_64[2]);
+                values_3_0[4] = (float)updated_bf16_pair_1_9.x;
+                values_3_0[5] = (float)updated_bf16_pair_1_9.y;
+                __nv_bfloat162 prefix_pair_1_10 = __as_bf16x2(smem_regs_63[3]);
+                __nv_bfloat162 delta_pair_1_10 = __as_bf16x2(smem_regs_64[3]);
                 __nv_bfloat162 updated_bf16_pair_1_10 = prefix_pair_1_10 + delta_pair_1_10;
-                values_3_0[4] = (float)updated_bf16_pair_1_10.x;
-                values_3_0[5] = (float)updated_bf16_pair_1_10.y;
-                __nv_bfloat162 prefix_pair_1_11 = __as_bf16x2(smem_regs_63[3]);
-                __nv_bfloat162 delta_pair_1_11 = __as_bf16x2(smem_regs_64[3]);
-                __nv_bfloat162 updated_bf16_pair_1_11 = prefix_pair_1_11 + delta_pair_1_11;
-                values_3_0[6] = (float)updated_bf16_pair_1_11.x;
-                values_3_0[7] = (float)updated_bf16_pair_1_11.y;
+                values_3_0[6] = (float)updated_bf16_pair_1_10.x;
+                values_3_0[7] = (float)updated_bf16_pair_1_10.y;
                 unsigned int _packed_17_0[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -5131,16 +5106,16 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_55 = 0; _lr_55 < 2; _lr_55++) {
                     smem_regs_66[_lr_55] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_5_0 / 2) + (unsigned int)_lr_55];
                 }
-                __nv_bfloat162 prefix_pair_1_12 = __as_bf16x2(smem_regs_65[0]);
-                __nv_bfloat162 delta_pair_1_12 = __as_bf16x2(smem_regs_66[0]);
+                __nv_bfloat162 prefix_pair_1_11 = __as_bf16x2(smem_regs_65[0]);
+                __nv_bfloat162 delta_pair_1_11 = __as_bf16x2(smem_regs_66[0]);
+                __nv_bfloat162 updated_bf16_pair_1_11 = prefix_pair_1_11 + delta_pair_1_11;
+                values_4_0[0] = (float)updated_bf16_pair_1_11.x;
+                values_4_0[1] = (float)updated_bf16_pair_1_11.y;
+                __nv_bfloat162 prefix_pair_1_12 = __as_bf16x2(smem_regs_65[1]);
+                __nv_bfloat162 delta_pair_1_12 = __as_bf16x2(smem_regs_66[1]);
                 __nv_bfloat162 updated_bf16_pair_1_12 = prefix_pair_1_12 + delta_pair_1_12;
-                values_4_0[0] = (float)updated_bf16_pair_1_12.x;
-                values_4_0[1] = (float)updated_bf16_pair_1_12.y;
-                __nv_bfloat162 prefix_pair_1_13 = __as_bf16x2(smem_regs_65[1]);
-                __nv_bfloat162 delta_pair_1_13 = __as_bf16x2(smem_regs_66[1]);
-                __nv_bfloat162 updated_bf16_pair_1_13 = prefix_pair_1_13 + delta_pair_1_13;
-                values_4_0[2] = (float)updated_bf16_pair_1_13.x;
-                values_4_0[3] = (float)updated_bf16_pair_1_13.y;
+                values_4_0[2] = (float)updated_bf16_pair_1_12.x;
+                values_4_0[3] = (float)updated_bf16_pair_1_12.y;
                 unsigned int _packed_18_0[2];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -5174,26 +5149,26 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_57 = 0; _lr_57 < 4; _lr_57++) {
                     smem_regs_68[_lr_57] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1_33 / 2) + (unsigned int)_lr_57];
                 }
-                __nv_bfloat162 prefix_pair_1_14 = __as_bf16x2(smem_regs_67[0]);
-                __nv_bfloat162 delta_pair_1_14 = __as_bf16x2(smem_regs_68[0]);
+                __nv_bfloat162 prefix_pair_1_13 = __as_bf16x2(smem_regs_67[0]);
+                __nv_bfloat162 delta_pair_1_13 = __as_bf16x2(smem_regs_68[0]);
+                __nv_bfloat162 updated_bf16_pair_1_13 = prefix_pair_1_13 + delta_pair_1_13;
+                values_1_49[0] = (float)updated_bf16_pair_1_13.x;
+                values_1_49[1] = (float)updated_bf16_pair_1_13.y;
+                __nv_bfloat162 prefix_pair_1_14 = __as_bf16x2(smem_regs_67[1]);
+                __nv_bfloat162 delta_pair_1_14 = __as_bf16x2(smem_regs_68[1]);
                 __nv_bfloat162 updated_bf16_pair_1_14 = prefix_pair_1_14 + delta_pair_1_14;
-                values_1_49[0] = (float)updated_bf16_pair_1_14.x;
-                values_1_49[1] = (float)updated_bf16_pair_1_14.y;
-                __nv_bfloat162 prefix_pair_1_15 = __as_bf16x2(smem_regs_67[1]);
-                __nv_bfloat162 delta_pair_1_15 = __as_bf16x2(smem_regs_68[1]);
+                values_1_49[2] = (float)updated_bf16_pair_1_14.x;
+                values_1_49[3] = (float)updated_bf16_pair_1_14.y;
+                __nv_bfloat162 prefix_pair_1_15 = __as_bf16x2(smem_regs_67[2]);
+                __nv_bfloat162 delta_pair_1_15 = __as_bf16x2(smem_regs_68[2]);
                 __nv_bfloat162 updated_bf16_pair_1_15 = prefix_pair_1_15 + delta_pair_1_15;
-                values_1_49[2] = (float)updated_bf16_pair_1_15.x;
-                values_1_49[3] = (float)updated_bf16_pair_1_15.y;
-                __nv_bfloat162 prefix_pair_1_16 = __as_bf16x2(smem_regs_67[2]);
-                __nv_bfloat162 delta_pair_1_16 = __as_bf16x2(smem_regs_68[2]);
+                values_1_49[4] = (float)updated_bf16_pair_1_15.x;
+                values_1_49[5] = (float)updated_bf16_pair_1_15.y;
+                __nv_bfloat162 prefix_pair_1_16 = __as_bf16x2(smem_regs_67[3]);
+                __nv_bfloat162 delta_pair_1_16 = __as_bf16x2(smem_regs_68[3]);
                 __nv_bfloat162 updated_bf16_pair_1_16 = prefix_pair_1_16 + delta_pair_1_16;
-                values_1_49[4] = (float)updated_bf16_pair_1_16.x;
-                values_1_49[5] = (float)updated_bf16_pair_1_16.y;
-                __nv_bfloat162 prefix_pair_1_17 = __as_bf16x2(smem_regs_67[3]);
-                __nv_bfloat162 delta_pair_1_17 = __as_bf16x2(smem_regs_68[3]);
-                __nv_bfloat162 updated_bf16_pair_1_17 = prefix_pair_1_17 + delta_pair_1_17;
-                values_1_49[6] = (float)updated_bf16_pair_1_17.x;
-                values_1_49[7] = (float)updated_bf16_pair_1_17.y;
+                values_1_49[6] = (float)updated_bf16_pair_1_16.x;
+                values_1_49[7] = (float)updated_bf16_pair_1_16.y;
                 unsigned int _packed_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -5245,26 +5220,26 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_59 = 0; _lr_59 < 4; _lr_59++) {
                     smem_regs_70[_lr_59] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_2_1 / 2) + (unsigned int)_lr_59];
                 }
-                __nv_bfloat162 prefix_pair_1_18 = __as_bf16x2(smem_regs_69[0]);
-                __nv_bfloat162 delta_pair_1_18 = __as_bf16x2(smem_regs_70[0]);
+                __nv_bfloat162 prefix_pair_1_17 = __as_bf16x2(smem_regs_69[0]);
+                __nv_bfloat162 delta_pair_1_17 = __as_bf16x2(smem_regs_70[0]);
+                __nv_bfloat162 updated_bf16_pair_1_17 = prefix_pair_1_17 + delta_pair_1_17;
+                values_2_1[0] = (float)updated_bf16_pair_1_17.x;
+                values_2_1[1] = (float)updated_bf16_pair_1_17.y;
+                __nv_bfloat162 prefix_pair_1_18 = __as_bf16x2(smem_regs_69[1]);
+                __nv_bfloat162 delta_pair_1_18 = __as_bf16x2(smem_regs_70[1]);
                 __nv_bfloat162 updated_bf16_pair_1_18 = prefix_pair_1_18 + delta_pair_1_18;
-                values_2_1[0] = (float)updated_bf16_pair_1_18.x;
-                values_2_1[1] = (float)updated_bf16_pair_1_18.y;
-                __nv_bfloat162 prefix_pair_1_19 = __as_bf16x2(smem_regs_69[1]);
-                __nv_bfloat162 delta_pair_1_19 = __as_bf16x2(smem_regs_70[1]);
+                values_2_1[2] = (float)updated_bf16_pair_1_18.x;
+                values_2_1[3] = (float)updated_bf16_pair_1_18.y;
+                __nv_bfloat162 prefix_pair_1_19 = __as_bf16x2(smem_regs_69[2]);
+                __nv_bfloat162 delta_pair_1_19 = __as_bf16x2(smem_regs_70[2]);
                 __nv_bfloat162 updated_bf16_pair_1_19 = prefix_pair_1_19 + delta_pair_1_19;
-                values_2_1[2] = (float)updated_bf16_pair_1_19.x;
-                values_2_1[3] = (float)updated_bf16_pair_1_19.y;
-                __nv_bfloat162 prefix_pair_1_20 = __as_bf16x2(smem_regs_69[2]);
-                __nv_bfloat162 delta_pair_1_20 = __as_bf16x2(smem_regs_70[2]);
+                values_2_1[4] = (float)updated_bf16_pair_1_19.x;
+                values_2_1[5] = (float)updated_bf16_pair_1_19.y;
+                __nv_bfloat162 prefix_pair_1_20 = __as_bf16x2(smem_regs_69[3]);
+                __nv_bfloat162 delta_pair_1_20 = __as_bf16x2(smem_regs_70[3]);
                 __nv_bfloat162 updated_bf16_pair_1_20 = prefix_pair_1_20 + delta_pair_1_20;
-                values_2_1[4] = (float)updated_bf16_pair_1_20.x;
-                values_2_1[5] = (float)updated_bf16_pair_1_20.y;
-                __nv_bfloat162 prefix_pair_1_21 = __as_bf16x2(smem_regs_69[3]);
-                __nv_bfloat162 delta_pair_1_21 = __as_bf16x2(smem_regs_70[3]);
-                __nv_bfloat162 updated_bf16_pair_1_21 = prefix_pair_1_21 + delta_pair_1_21;
-                values_2_1[6] = (float)updated_bf16_pair_1_21.x;
-                values_2_1[7] = (float)updated_bf16_pair_1_21.y;
+                values_2_1[6] = (float)updated_bf16_pair_1_20.x;
+                values_2_1[7] = (float)updated_bf16_pair_1_20.y;
                 unsigned int _packed_16_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -5316,26 +5291,26 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_61 = 0; _lr_61 < 4; _lr_61++) {
                     smem_regs_72[_lr_61] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_4_1 / 2) + (unsigned int)_lr_61];
                 }
-                __nv_bfloat162 prefix_pair_1_22 = __as_bf16x2(smem_regs_71[0]);
-                __nv_bfloat162 delta_pair_1_22 = __as_bf16x2(smem_regs_72[0]);
+                __nv_bfloat162 prefix_pair_1_21 = __as_bf16x2(smem_regs_71[0]);
+                __nv_bfloat162 delta_pair_1_21 = __as_bf16x2(smem_regs_72[0]);
+                __nv_bfloat162 updated_bf16_pair_1_21 = prefix_pair_1_21 + delta_pair_1_21;
+                values_3_1[0] = (float)updated_bf16_pair_1_21.x;
+                values_3_1[1] = (float)updated_bf16_pair_1_21.y;
+                __nv_bfloat162 prefix_pair_1_22 = __as_bf16x2(smem_regs_71[1]);
+                __nv_bfloat162 delta_pair_1_22 = __as_bf16x2(smem_regs_72[1]);
                 __nv_bfloat162 updated_bf16_pair_1_22 = prefix_pair_1_22 + delta_pair_1_22;
-                values_3_1[0] = (float)updated_bf16_pair_1_22.x;
-                values_3_1[1] = (float)updated_bf16_pair_1_22.y;
-                __nv_bfloat162 prefix_pair_1_23 = __as_bf16x2(smem_regs_71[1]);
-                __nv_bfloat162 delta_pair_1_23 = __as_bf16x2(smem_regs_72[1]);
+                values_3_1[2] = (float)updated_bf16_pair_1_22.x;
+                values_3_1[3] = (float)updated_bf16_pair_1_22.y;
+                __nv_bfloat162 prefix_pair_1_23 = __as_bf16x2(smem_regs_71[2]);
+                __nv_bfloat162 delta_pair_1_23 = __as_bf16x2(smem_regs_72[2]);
                 __nv_bfloat162 updated_bf16_pair_1_23 = prefix_pair_1_23 + delta_pair_1_23;
-                values_3_1[2] = (float)updated_bf16_pair_1_23.x;
-                values_3_1[3] = (float)updated_bf16_pair_1_23.y;
-                __nv_bfloat162 prefix_pair_1_24 = __as_bf16x2(smem_regs_71[2]);
-                __nv_bfloat162 delta_pair_1_24 = __as_bf16x2(smem_regs_72[2]);
+                values_3_1[4] = (float)updated_bf16_pair_1_23.x;
+                values_3_1[5] = (float)updated_bf16_pair_1_23.y;
+                __nv_bfloat162 prefix_pair_1_24 = __as_bf16x2(smem_regs_71[3]);
+                __nv_bfloat162 delta_pair_1_24 = __as_bf16x2(smem_regs_72[3]);
                 __nv_bfloat162 updated_bf16_pair_1_24 = prefix_pair_1_24 + delta_pair_1_24;
-                values_3_1[4] = (float)updated_bf16_pair_1_24.x;
-                values_3_1[5] = (float)updated_bf16_pair_1_24.y;
-                __nv_bfloat162 prefix_pair_1_25 = __as_bf16x2(smem_regs_71[3]);
-                __nv_bfloat162 delta_pair_1_25 = __as_bf16x2(smem_regs_72[3]);
-                __nv_bfloat162 updated_bf16_pair_1_25 = prefix_pair_1_25 + delta_pair_1_25;
-                values_3_1[6] = (float)updated_bf16_pair_1_25.x;
-                values_3_1[7] = (float)updated_bf16_pair_1_25.y;
+                values_3_1[6] = (float)updated_bf16_pair_1_24.x;
+                values_3_1[7] = (float)updated_bf16_pair_1_24.y;
                 unsigned int _packed_17_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -5387,16 +5362,16 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 for (int _lr_63 = 0; _lr_63 < 2; _lr_63++) {
                     smem_regs_74[_lr_63] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_5_1 / 2) + (unsigned int)_lr_63];
                 }
-                __nv_bfloat162 prefix_pair_1_26 = __as_bf16x2(smem_regs_73[0]);
-                __nv_bfloat162 delta_pair_1_26 = __as_bf16x2(smem_regs_74[0]);
+                __nv_bfloat162 prefix_pair_1_25 = __as_bf16x2(smem_regs_73[0]);
+                __nv_bfloat162 delta_pair_1_25 = __as_bf16x2(smem_regs_74[0]);
+                __nv_bfloat162 updated_bf16_pair_1_25 = prefix_pair_1_25 + delta_pair_1_25;
+                values_4_1[0] = (float)updated_bf16_pair_1_25.x;
+                values_4_1[1] = (float)updated_bf16_pair_1_25.y;
+                __nv_bfloat162 prefix_pair_1_26 = __as_bf16x2(smem_regs_73[1]);
+                __nv_bfloat162 delta_pair_1_26 = __as_bf16x2(smem_regs_74[1]);
                 __nv_bfloat162 updated_bf16_pair_1_26 = prefix_pair_1_26 + delta_pair_1_26;
-                values_4_1[0] = (float)updated_bf16_pair_1_26.x;
-                values_4_1[1] = (float)updated_bf16_pair_1_26.y;
-                __nv_bfloat162 prefix_pair_1_27 = __as_bf16x2(smem_regs_73[1]);
-                __nv_bfloat162 delta_pair_1_27 = __as_bf16x2(smem_regs_74[1]);
-                __nv_bfloat162 updated_bf16_pair_1_27 = prefix_pair_1_27 + delta_pair_1_27;
-                values_4_1[2] = (float)updated_bf16_pair_1_27.x;
-                values_4_1[3] = (float)updated_bf16_pair_1_27.y;
+                values_4_1[2] = (float)updated_bf16_pair_1_26.x;
+                values_4_1[3] = (float)updated_bf16_pair_1_26.y;
                 unsigned int _packed_18_1[2];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -5418,6 +5393,7 @@ kernel_cake_kimi_k3_attn_res_9ae901030a5b68348dda(__nv_bfloat16* __restrict__ ou
                 float2 q_pair_35_223 = make_float2(q_cache[54], q_cache[55]);
                 local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1_195, value_pair_1_195, local_sum_sq_1283[2]);
                 local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1_195, q_pair_35_223, local_dot_1284[2]);
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(consumed_addr + (ring_stage_1282) * 8);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");

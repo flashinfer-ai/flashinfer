@@ -47,22 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_TOKEN_PIPE_STAGES 2
-#define SMEM_PREFIX_BUFS_OFF 0
-#define SMEM_PREFIX_BUFS_STAGE_BYTES 14336
-#define SMEM_PREFIX_BUFS_STRIDE 14336
-#define SMEM_DELTA_BUFS_OFF 28672
-#define SMEM_DELTA_BUFS_STAGE_BYTES 14336
-#define SMEM_DELTA_BUFS_STRIDE 14336
-#define SMEM_OUTPUT_NORM_BUF_OFF 57344
-#define SMEM_OUTPUT_NORM_BUF_STAGE_BYTES 14336
-#define SMEM_OUTPUT_NORM_BUF_STRIDE 14336
-#define SMEM_STATS_OFF 71680
-#define SMEM_STATS_STAGE_BYTES 32
-#define SMEM_STATS_STRIDE 32
-#define SMEM_TOTAL 71808
-#define THREADS 288
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -166,7 +150,7 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* prefix_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int prefix_bufs_addr = smem + 0;
     __nv_bfloat16* delta_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 28672);
@@ -176,8 +160,7 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
     float* stats = reinterpret_cast<float*>(smem_raw + 71680);
     const int stats_addr = smem + 71680;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[71712..71752)
+    // Mbarrier init (5 barriers at smem_raw[71712..71752))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -206,7 +189,7 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                     "[%0], [%1], %2, [%3];"
-                    :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + ((unsigned long long)0 * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
+                    :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + (unsigned long long)0 * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
                     : "memory");
             }
             unsigned int producer_stage = 0;
@@ -220,12 +203,12 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(prefix_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                        :: "r"(prefix_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + (unsigned long long)(token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                         : "memory");
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(delta_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                        :: "r"(delta_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + (unsigned long long)(token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                         : "memory");
                 }
                 producer_stage += 1;
@@ -382,6 +365,7 @@ kernel_cake_kimi_k3_attn_res_aacff5029f2f4bdfdc5b(__nv_bfloat16* __restrict__ ou
                         }
                     }
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                 if (token_1 == bid) {
                     mbarrier_wait(output_norm_ready_addr, 0);
