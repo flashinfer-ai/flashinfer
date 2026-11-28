@@ -19,6 +19,7 @@ import math
 
 import torch
 
+from .kda_host_offsets import cu_seqlens_to_list, host_cu_seqlens_for
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace,
     _bind_workspace,
@@ -197,6 +198,8 @@ def _launch_ptx_kda(
             if tensor is not None and _storage_ranges_overlap(initial_state, tensor):
                 raise ValueError("initial_state must not overlap other inputs")
     tensors = (q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens, out)
+    if cu_seqlens is not None:
+        host_cu_seqlens_for(cu_seqlens)
     cu_version = (
         None if cu_seqlens is None or cu_seqlens.is_inference() else cu_seqlens._version
     )
@@ -239,7 +242,7 @@ def _launch_ptx_kda(
             ):
                 offsets = entry["offsets"]
             else:
-                offsets = cu_seqlens.tolist()
+                offsets = cu_seqlens_to_list(cu_seqlens)
             if (
                 offsets[0] != 0
                 or offsets[-1] != B * T
