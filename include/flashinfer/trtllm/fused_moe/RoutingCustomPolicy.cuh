@@ -745,6 +745,22 @@ static constexpr int BlockKernelMaxNumTokens = 4;
 static constexpr int DynBlockKernelMaxNumTokens = 16;
 static constexpr int DynBlockKernelMaxNumExperts = 512;
 
+// Small-token kernel (routingIndicesSmallTokenKernel): one warp per token for the TopK and
+// one thread per expert for the histogram / offsets / permutation.
+// - Tokens: each expert's (token -> position in the top-K) map is one 64-bit shared-memory
+//   row, one byte per token, so at most 8. The per-tier bound is also the tier's warp count
+//   (4 at 128 experts, 5 at 160, 8 from 256 up).
+// - Experts: 512 is the largest tier the kernel is compiled for.
+// - Tile: the packed block scan keeps the padded row count in 20 bits.
+static constexpr int SmallTokenKernelMaxNumTokens = 8;
+static constexpr int SmallTokenKernelDispatchMaxNumExperts = 512;
+static constexpr int SmallTokenKernelMaxTileTokensDim = 4096;
+
+__host__ __device__ constexpr int32_t getSmallTokenKernelMaxNumTokens(int32_t maxNumExperts) {
+  int32_t const numWarps = maxNumExperts / WarpSize;
+  return numWarps < SmallTokenKernelMaxNumTokens ? numWarps : SmallTokenKernelMaxNumTokens;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getMaxNumExperts(int32_t numExperts) {
