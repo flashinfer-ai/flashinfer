@@ -20,7 +20,8 @@ blocks in rank order and runs its consumer on the full rows, without
 materializing the gathered ``[M, H]`` tensor: either the residual boundary of
 ``flashinfer.norm.gated_residual_next_rmsnorm`` or an RMSNorm followed by
 NVFP4 quantization. Each is two kernels (LL publish, then gather + consumer)
-over a dedicated LL mailbox.
+over a dedicated LL mailbox; the RMSNorm + NVFP4 op can instead exchange
+through a caller's two-phase :class:`PushPlane`.
 """
 
 from __future__ import annotations
@@ -51,15 +52,18 @@ from .mnnvl_cutedsl.kernel_ll.all_gather_norm_quant import (
     LLAllGatherNormQuant,
     _NormQuantConstants,
 )
+from .mnnvl_cutedsl.kernel_ll.column_gather import PushPlane
 
 __all__ = [
     "LLAllGatherDualNormTuning",
     "MNNVLCuteDSLAllGatherDualNormWorkspace",
     "MNNVLCuteDSLAllGatherNormQuantWorkspace",
+    "PushPlane",
     "all_gather_gated_residual_next_rmsnorm",
     "all_gather_rmsnorm_fp4_quantize",
     "supports_all_gather_gated_residual_next_rmsnorm",
     "supports_all_gather_rmsnorm_fp4_quantize",
+    "supports_push_plane",
 ]
 
 
@@ -95,11 +99,18 @@ class _AllGatherWorkspace(Generic[_Impl]):
         self._group = group
         self._impl: _Impl | None = create()
 
+    @flashinfer_api
     def check_support(self, local_supported: bool) -> bool:
         """Collectively agree on a local ``supports_*`` result before capture.
 
         Call on every rank during warmup, even when its local result is False.
         All ranks must use the agreed path and keep valid layouts for replay.
+
+        Args:
+            local_supported: This rank's ``supports_*`` result.
+
+        Returns:
+            True only if every rank passed True.
         """
         return collective_support(local_supported, self._group, self.device)
 
@@ -109,6 +120,7 @@ class _AllGatherWorkspace(Generic[_Impl]):
             raise RuntimeError("workspace has been destroyed")
         return self._impl
 
+    @flashinfer_api
     def destroy(self) -> None:
         """Release the mailbox once in-flight work on every rank is done."""
         if self._impl is not None:
@@ -128,6 +140,7 @@ class _AllGatherWorkspace(Generic[_Impl]):
 
 
 class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDualNorm]):
+    @flashinfer_api
     def __init__(
         self,
         tp_size: int,
@@ -138,6 +151,16 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDual
         group: ProcessGroup,
         tuning: LLAllGatherDualNormTuning | None = None,
     ) -> None:
+        """Create the workspace on every rank of ``group`` (collective).
+
+        Args:
+            tp_size: Number of ranks in ``group``, at least 2.
+            tp_rank: This rank's index in ``group``.
+            max_token_num: Largest ``M`` a call may gather.
+            hidden_dim: Full hidden size ``H``; each rank holds ``H/tp_size`` columns.
+            group: TP process group.
+            tuning: Kernel launch tuning; None uses the defaults.
+        """
         super().__init__(
             tp_size,
             max_token_num,
@@ -153,6 +176,7 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDual
             ),
         )
 
+    @flashinfer_api
     def compile(
         self,
         *,
@@ -162,7 +186,15 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace(_AllGatherWorkspace[LLAllGatherDual
         has_post_weight: bool = False,
         post_gain_center: float = 0.0,
     ) -> None:
-        """Compile one constant set ahead of time, e.g. before graph capture."""
+        """Compile one constant set ahead of time, e.g. before graph capture.
+
+        Args:
+            post_eps: Epsilon of the branch RMSNorm.
+            next_eps: Epsilon of the next RMSNorm.
+            next_gain_center: Constant added to ``next_weight``.
+            has_post_weight: Whether calls pass ``post_weight``.
+            post_gain_center: Constant added to ``post_weight``.
+        """
         self.impl.compiled(
             _norm_constants(
                 post_eps, next_eps, next_gain_center, has_post_weight, post_gain_center
@@ -186,6 +218,7 @@ def _norm_constants(
     )
 
 
+@flashinfer_api
 def supports_all_gather_gated_residual_next_rmsnorm(
     workspace: MNNVLCuteDSLAllGatherDualNormWorkspace,
     branch_shard: torch.Tensor,
@@ -195,7 +228,16 @@ def supports_all_gather_gated_residual_next_rmsnorm(
     next_weight: torch.Tensor,
     post_weight: torch.Tensor | None = None,
 ) -> bool:
-    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks.
+
+    Args:
+        workspace: Workspace the call will use.
+        branch_shard, residual, alpha, beta, next_weight, post_weight: The
+            arguments of :func:`all_gather_gated_residual_next_rmsnorm`.
+
+    Returns:
+        Whether this rank's arguments fit the fused path.
+    """
     hidden = workspace.hidden_dim
     device = workspace.device
     vectors = [(alpha, torch.float32, 32), (beta, torch.float32, 32)]
@@ -286,6 +328,7 @@ def all_gather_gated_residual_next_rmsnorm(
 class MNNVLCuteDSLAllGatherNormQuantWorkspace(
     _AllGatherWorkspace[LLAllGatherNormQuant]
 ):
+    @flashinfer_api
     def __init__(
         self,
         tp_size: int,
@@ -295,7 +338,27 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
         *,
         group: ProcessGroup,
         enable_pdl: bool = True,
+        push_plane: PushPlane | None = None,
     ) -> None:
+        """Create the workspace on every rank of ``group`` (collective).
+
+        Args:
+            tp_size: Number of ranks in ``group``, at least 2.
+            tp_rank: This rank's index in ``group``.
+            max_token_num: Largest ``M`` a call may gather.
+            hidden_dim: Full hidden size ``H``; each rank holds ``H/tp_size`` columns.
+            group: TP process group.
+            enable_pdl: Launch the kernels with programmatic dependent launch.
+            push_plane: Exchange through the caller's two-slot buffer instead of
+                an own mailbox; must pass :func:`supports_push_plane` on every rank.
+        """
+        # Every rank votes, so all ranks reject or construct together.
+        if push_plane is not None and not collective_support(
+            supports_push_plane(push_plane, max_token_num, hidden_dim),
+            group,
+            torch.device("cuda", torch.cuda.current_device()),
+        ):
+            raise ValueError("unsupported push plane")
         super().__init__(
             tp_size,
             max_token_num,
@@ -308,25 +371,83 @@ class MNNVLCuteDSLAllGatherNormQuantWorkspace(
                 capacity_m=max_token_num,
                 group=group,
                 enable_pdl=enable_pdl,
+                push_plane=push_plane,
             ),
         )
 
+    @flashinfer_api
     def compile(self, *, eps: float, gain_center: float = 0.0) -> None:
-        """Compile one constant set ahead of time, e.g. before graph capture."""
+        """Compile one constant set ahead of time, e.g. before graph capture.
+
+        Args:
+            eps: RMSNorm epsilon.
+            gain_center: Constant added to the RMSNorm weight.
+        """
         self.impl.compiled(_NormQuantConstants(float(eps), float(gain_center)))
 
 
+@flashinfer_api
+def supports_push_plane(
+    push_plane: PushPlane, max_token_num: int, hidden_dim: int
+) -> bool:
+    """Whether ``push_plane`` is valid and one phase half holds ``max_token_num`` rows.
+
+    Args:
+        push_plane: The caller's two-slot buffer, multicast address and epoch.
+        max_token_num: Largest ``M`` of the workspace.
+        hidden_dim: Full hidden size ``H``.
+
+    Returns:
+        Whether the workspace can exchange through ``push_plane`` on this rank.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    half_bytes = push_plane.half_bytes
+    buffer = push_plane.buffer
+    return (
+        half_bytes > 0
+        and push_plane.atom_bytes in (2, 4)
+        and half_bytes % 16 == 0
+        and max_token_num * hidden_dim * 2 <= half_bytes
+        and is_dense_on(buffer, device, 16)
+        and buffer.numel() * buffer.element_size() >= 2 * half_bytes
+        and push_plane.multicast_address > 0
+        and push_plane.multicast_address % 16 == 0
+        and push_plane.epoch.dtype == torch.int64
+        and push_plane.epoch.shape == (1,)
+        and is_dense_on(push_plane.epoch, device, 8)
+    )
+
+
+@flashinfer_api
 def supports_all_gather_rmsnorm_fp4_quantize(
     workspace: MNNVLCuteDSLAllGatherNormQuantWorkspace,
-    shard: torch.Tensor,
+    shard: torch.Tensor | None,
     weight: torch.Tensor,
     global_scale: torch.Tensor,
+    *,
+    num_tokens: int = 0,
 ) -> bool:
-    """Check only this rank. Use ``workspace.check_support`` to agree across ranks."""
+    """Check only this rank. Use ``workspace.check_support`` to agree across ranks.
+
+    Args:
+        workspace: Workspace the call will use.
+        shard, weight, global_scale, num_tokens: The arguments of
+            :func:`all_gather_rmsnorm_fp4_quantize`; ``shard`` None checks the
+            consumer-only call for ``num_tokens`` rows.
+
+    Returns:
+        Whether this rank's arguments fit the fused path.
+    """
     hidden = workspace.hidden_dim
     device = workspace.device
-    return (
+    rows_fit = (
         workspace.fits(shard)
+        if shard is not None
+        else workspace.impl.push_plane is not None
+        and 1 <= num_tokens <= workspace.max_token_num
+    )
+    return (
+        rows_fit
         and weight.shape == (hidden,)
         and weight.dtype == torch.bfloat16
         and is_dense_on(weight, device, 16)
@@ -338,13 +459,14 @@ def supports_all_gather_rmsnorm_fp4_quantize(
 
 @flashinfer_api(trace=all_gather_rmsnorm_fp4_quantize_trace)
 def all_gather_rmsnorm_fp4_quantize(
-    shard: torch.Tensor,
+    shard: torch.Tensor | None,
     weight: torch.Tensor,
     global_scale: torch.Tensor,
     workspace: MNNVLCuteDSLAllGatherNormQuantWorkspace,
     *,
     eps: float,
     gain_center: float = 0.0,
+    num_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather column shards across TP, then RMSNorm and NVFP4-quantize the rows.
 
@@ -356,25 +478,32 @@ def all_gather_rmsnorm_fp4_quantize(
         )
 
     Args:
-        shard: ``[M, H/TP]`` BF16 columns ``[rank*H/TP, (rank+1)*H/TP)``.
+        shard: ``[M, H/TP]`` BF16 columns ``[rank*H/TP, (rank+1)*H/TP)``, or
+            None when another kernel already pushed every rank's shard into the
+            workspace's :class:`PushPlane` (e.g. FlashInfer's peer-store BF16
+            GEMM with ``layout="gather"``, ``slot_bytes = half_bytes / TP``, on
+            a plane with ``atom_bytes=4``),
+            just before on the same stream and without advancing the epoch.
         weight: ``[H]`` BF16 RMSNorm weight.
         global_scale: ``[1]`` FP32 NVFP4 global scale.
         workspace: Workspace created on every rank of the TP group.
         eps: RMSNorm epsilon.
         gain_center: Constant added to ``weight``.
+        num_tokens: ``M`` when ``shard`` is None.
 
     Returns:
         ``(packed, scales)``: ``[M, H/2]`` uint8 E2M1 pairs and ``[M, H/16]``
         uint8 E4M3 block scales in linear layout.
     """
     if not supports_all_gather_rmsnorm_fp4_quantize(
-        workspace, shard, weight, global_scale
+        workspace, shard, weight, global_scale, num_tokens=num_tokens
     ):
         raise ValueError("unsupported all-gather RMSNorm FP4 quantize arguments")
-    m = shard.shape[0]
+    m = num_tokens if shard is None else shard.shape[0]
     hidden = workspace.hidden_dim
-    packed = torch.empty((m, hidden // 2), dtype=torch.uint8, device=shard.device)
-    scales = torch.empty((m, hidden // 16), dtype=torch.uint8, device=shard.device)
+    device = workspace.device
+    packed = torch.empty((m, hidden // 2), dtype=torch.uint8, device=device)
+    scales = torch.empty((m, hidden // 16), dtype=torch.uint8, device=device)
     workspace.impl(
         shard,
         weight,

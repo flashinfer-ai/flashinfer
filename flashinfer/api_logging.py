@@ -2510,6 +2510,10 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
                         "BatchMLAPagedAttentionWrapper",
                         "MoELayer",
                         "NVFP4KVMaterializer",
+                        "MNNVLCuteDSLAllGatherDualNormWorkspace",
+                        "MNNVLCuteDSLAllGatherNormQuantWorkspace",
+                        "MNNVLCuteDSLAllReduceDualNormWorkspace",
+                        "MNNVLCuteDSLMoEFinalizeAllReduceWorkspace",
                     ]:
                         func_name = f"{class_name}.{func_name}"
                         self_id = id(args[0])

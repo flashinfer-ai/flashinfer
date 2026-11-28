@@ -1273,20 +1273,59 @@ all_gather_gated_residual_next_rmsnorm_trace = TraceTemplate(
     tags=["stage:comm", "fused"],
 )
 
+all_reduce_gated_residual_next_rmsnorm_trace = TraceTemplate(
+    op_type="all_reduce_gated_residual_next_rmsnorm",
+    name_prefix="all_reduce_gated_residual_next_rmsnorm",
+    description="All-reduce TP row-parallel partials, combine the gated residual, and normalize it.",
+    axes={
+        "num_tokens": Var(),
+        "hidden": Const(abbrev="h"),
+        "gate_len": Var(),
+    },
+    inputs={
+        # None (consumer only): a producer GEMM already pushed every partial.
+        "partial": Tensor(["num_tokens", "hidden"], dtype="bfloat16", optional=True),
+        "residual": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "alpha": Tensor(["gate_len"], dtype="float32", optional=True),
+        "beta": Tensor(["gate_len"], dtype="float32", optional=True),
+        "post_weight": Tensor(["hidden"], optional=True),
+        "next_weight": Tensor(["hidden"], optional=True),
+        "post_eps": Scalar("float32"),
+        "next_eps": Scalar("float32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "residual_out": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "norm_out": Tensor(["num_tokens", "hidden"], dtype="bfloat16"),
+        "router_out": Tensor(["num_tokens", "hidden"], dtype="float32", optional=True),
+    },
+    tags=["stage:comm", "fused"],
+)
+
 all_gather_rmsnorm_fp4_quantize_trace = TraceTemplate(
     op_type="all_gather_rmsnorm_fp4_quantize",
     name_prefix="all_gather_rmsnorm_fp4_quantize",
     description="Gather TP column shards, normalize, and quantize to NVFP4.",
     axes={
         "num_tokens": Var(),
-        "shard_hidden": Const(abbrev="sh"),
+        # shard=None (consumer only): the workspace gives the shard width.
+        "shard_hidden": Const(
+            abbrev="sh",
+            extract=lambda kw: (
+                kw["workspace"].hidden_dim // kw["workspace"].tp_size
+                if kw.get("shard") is None
+                else kw["shard"].shape[1]
+            ),
+        ),
         "hidden": Const(abbrev="h"),
         "packed_hidden": Var(),
         "scale_hidden": Var(),
         "one": Const(value=1),
     },
     inputs={
-        "shard": Tensor(["num_tokens", "shard_hidden"]),
+        "shard": Tensor(
+            ["num_tokens", "shard_hidden"], dtype="bfloat16", optional=True
+        ),
         "weight": Tensor(["hidden"]),
         "global_scale": Tensor(["one"], dtype="float32"),
         "eps": Scalar("float32"),
