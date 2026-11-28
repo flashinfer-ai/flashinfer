@@ -1489,14 +1489,13 @@ def single_prefill_with_kv_cache(
     >>> q = torch.randn(qo_len, num_qo_heads, head_dim).half().to("cuda:0")
     >>> k = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
     >>> v = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True,
-            use_fp16_qk_reduction=True)
+    >>> o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True)
     >>> o.shape
     torch.Size([128, 32, 128])
     >>> mask = torch.tril(
-    >>>     torch.full((qo_len, kv_len), True, device="cuda:0"),
-    >>>     diagonal=(kv_len - qo_len),
-    >>> )
+    ...     torch.full((qo_len, kv_len), True, device="cuda:0"),
+    ...     diagonal=(kv_len - qo_len),
+    ... )
     >>> mask
     tensor([[ True,  True,  True,  ..., False, False, False],
             [ True,  True,  True,  ..., False, False, False],
