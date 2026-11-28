@@ -69,6 +69,35 @@ def route(
     return fp._hopper_paged_auto_cudnn(**args)
 
 
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_layout_and_page_transfer(dtype, monkeypatch, layout, page_size):
+    assert route(
+        monkeypatch, [65], [16379], dtype=dtype, layout=layout, page_size=page_size
+    )
+    assert not route(
+        monkeypatch, [65], [65], dtype=dtype, layout=layout, page_size=page_size
+    )
+
+
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_noncausal_keeps_its_qualified_storage_domain(
+    dtype, monkeypatch, layout, page_size
+):
+    # The layout/page proposal was qualified with a causal mask. Merging the
+    # independent noncausal feature must not admit their unmeasured product.
+    assert route(
+        monkeypatch,
+        [65],
+        [16379],
+        dtype=dtype,
+        layout=layout,
+        page_size=page_size,
+        causal=False,
+    ) is (layout == "HND" and page_size == 16)
+
+
 @pytest.mark.parametrize("batch", [1, 4, 32])
 @pytest.mark.parametrize("group", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("hq", [16, 32, 48])
@@ -113,13 +142,14 @@ def test_full_prefill_and_mixed_lengths_are_included(
 @pytest.mark.parametrize(
     "change",
     [
-        dict(layout="NHD"),
+        dict(layout="NDH"),
         dict(q_dtype=torch.float32),
         dict(kv_dtype=torch.float32),
         dict(o_dtype=torch.float32),
         dict(head_dim_qk=128),
         dict(head_dim_vo=128),
-        dict(page_size=64),
+        dict(page_size=8),
+        dict(page_size=256),
         dict(hq=8, hk=2),
         dict(hq=64, hk=8),
         dict(hk=0),
