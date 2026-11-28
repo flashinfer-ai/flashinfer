@@ -119,6 +119,81 @@ def test_nvfp4_kv_dequant(shape, dtype):
     torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
 
+# Large, bandwidth-bound shapes. One pass of the capped grid (3456 x 256 threads) covers
+# 884,736 NVFP4 blocks, so (32768, 512) -- 1,048,576 blocks -- makes the grid-stride loop
+# iterate; the other two finish in a single pass.
+LARGE_SHAPES = [(16384, 512), (4096, 2048), (32768, 512)]
+
+# Non-power-of-two global scales. These matter: with a power-of-two scale (e.g. 0.5) the
+# products stay exactly representable, which would hide a multiplication-order change. The
+# dequant computes (e2m1 * block_scale) * global_scale in fp32, matching reference_dequant,
+# so the result must be bit-for-bit identical to the reference.
+NON_POW2_SCALES = [0.3, 1.7, 0.7601996]
+
+
+def assert_bit_identical(output, ref):
+    """Compare via the integer bit pattern: exact, and distinguishes +0.0 from -0.0."""
+    assert output.dtype == ref.dtype
+    torch.testing.assert_close(
+        output.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("shape", LARGE_SHAPES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("global_scale_val", NON_POW2_SCALES)
+def test_nvfp4_kv_dequant_large(shape, dtype, global_scale_val):
+    """Dequant at production scale with non-power-of-two scales; bit-exact vs reference."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    M, K = shape
+    torch.manual_seed(0)
+    fp4_data = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
+    block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
+
+    output = flashinfer.nvfp4_kv_dequantize(
+        fp4_data, block_scales, global_scale, output_dtype=dtype
+    )
+    ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
+    assert_bit_identical(output, ref)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("global_scale_val", NON_POW2_SCALES)
+def test_nvfp4_kv_dequant_all_e2m1_values_and_unaligned(dtype, global_scale_val):
+    """Cover every E2M1 codepoint, and a contiguous input with a nonzero storage offset.
+
+    The offset makes the base pointer non-16-byte-aligned, exercising the kernel's
+    byte-safe fallback path (rather than the vectorized fast path). Output must still be
+    bit-identical to the reference.
+    """
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    M, K = 256, 128
+    # Every byte value 0..255 appears -> every (lo, hi) E2M1 nibble pair is covered.
+    base = (torch.arange(M * (K // 2), device="cuda") % 256).to(torch.uint8)
+    # Allocate one extra byte and slice it off so the view has a nonzero storage offset
+    # (still contiguous), i.e. an unaligned base pointer.
+    padded = torch.empty(M * (K // 2) + 1, dtype=torch.uint8, device="cuda")
+    padded[1:].copy_(base)
+    fp4_data = padded[1:].view(M, K // 2)
+    assert fp4_data.is_contiguous() and fp4_data.storage_offset() == 1
+
+    block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
+
+    output = flashinfer.nvfp4_kv_dequantize(
+        fp4_data, block_scales, global_scale, output_dtype=dtype
+    )
+    ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
+    assert_bit_identical(output, ref)
+
+
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("block_table_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -239,6 +314,108 @@ def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype, non_cont
 
     torch.testing.assert_close(output_k.float(), ref_k.float(), atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(output_v.float(), ref_v.float(), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("aligned", [True, False])
+def test_nvfp4_kv_dequantize_paged_bitexact(kv_layout, dtype, aligned):
+    """Paged dequant is bit-exact at non-power-of-two scales on both kernel paths.
+
+    aligned=True: contiguous cache and an offset-0 output, so the vectorized fast path runs.
+    aligned=False: non-contiguous cache views and an output with a nonzero storage offset,
+    so the byte-safe fallback runs on both the load and the store side.
+    """
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    torch.manual_seed(7)
+    num_pages, page_size, batch_size, max_seq_len, num_kv_heads = 8, 3, 2, 7, 2
+    k_head_dim, v_head_dim = 64, 128
+
+    def rand_cache(hd):
+        return torch.randint(
+            0,
+            256,
+            (num_pages, page_size, num_kv_heads, hd // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+
+    def rand_scales(hd):
+        return torch.randint(
+            1,
+            120,
+            (num_pages, page_size, num_kv_heads, hd // 16),
+            dtype=torch.uint8,
+            device="cuda",
+        ).view(torch.float8_e4m3fn)
+
+    k_cache_nhd, v_cache_nhd = rand_cache(k_head_dim), rand_cache(v_head_dim)
+    k_scales_nhd, v_scales_nhd = rand_scales(k_head_dim), rand_scales(v_head_dim)
+
+    def to_layout(x):
+        return x if kv_layout == "NHD" else x.permute(0, 2, 1, 3).contiguous()
+
+    # non-contiguous last-dim views -> misaligned base / non-multiple strides -> fallback
+    make_view = (lambda x: x) if aligned else make_non_contiguous_last_dim_view
+    k_cache = make_view(to_layout(k_cache_nhd))
+    v_cache = make_view(to_layout(v_cache_nhd))
+    k_scales = make_view(to_layout(k_scales_nhd))
+    v_scales = make_view(to_layout(v_scales_nhd))
+    if aligned:
+        assert k_cache.data_ptr() % 8 == 0 and v_cache.data_ptr() % 8 == 0
+
+    block_tables = torch.tensor(
+        [[2, 5, 1], [6, 3, 0]], dtype=torch.int32, device="cuda"
+    )
+    seq_lens = torch.tensor([7, 4], dtype=torch.int32, device="cuda")
+    k_scale_val, v_scale_val = 0.7601996, 0.31234
+    k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor([v_scale_val], dtype=torch.float32, device="cuda")
+
+    # unaligned: an odd-element storage offset makes the output base unaligned -> fallback
+    def offset_output(hd):
+        offset = 0 if aligned else 1
+        numel = batch_size * max_seq_len * num_kv_heads * hd
+        buf = torch.full((numel + offset,), 123.0, dtype=dtype, device="cuda")
+        view = buf[offset:].view(batch_size, max_seq_len, num_kv_heads, hd)
+        assert view.is_contiguous() and view.storage_offset() == offset
+        if aligned:
+            assert view.data_ptr() % 16 == 0
+        return view
+
+    output_k, output_v = offset_output(k_head_dim), offset_output(v_head_dim)
+
+    flashinfer.nvfp4_kv_dequantize_paged(
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        block_tables,
+        seq_lens,
+        k_scale,
+        v_scale,
+        output_k,
+        output_v,
+        kv_layout=kv_layout,
+    )
+
+    ref_k = torch.full_like(output_k, 123.0)
+    ref_v = torch.full_like(output_v, 123.0)
+    for batch_idx, seq_len in enumerate(seq_lens.cpu().tolist()):
+        for token_idx in range(seq_len):
+            page = int(block_tables[batch_idx, token_idx // page_size].item())
+            entry = token_idx % page_size
+            ref_k[batch_idx, token_idx] = reference_dequant(
+                k_cache_nhd[page, entry], k_scales_nhd[page, entry], k_scale_val, dtype
+            )
+            ref_v[batch_idx, token_idx] = reference_dequant(
+                v_cache_nhd[page, entry], v_scales_nhd[page, entry], v_scale_val, dtype
+            )
+
+    # invalid rows are left at the sentinel in both, so a full bit-exact compare is valid
+    assert_bit_identical(output_k, ref_k)
+    assert_bit_identical(output_v, ref_v)
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
