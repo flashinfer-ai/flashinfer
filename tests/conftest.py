@@ -18,6 +18,17 @@ def _configure_cute_dsl_cache_dir():
 
 _configure_cute_dsl_cache_dir()
 
+
+def _prefer_cublaslt_on_windows():
+    # PyTorch's Windows build ignores torch.backends.cuda.preferred_blas_library();
+    # only this variable, read when torch is imported, selects cuBLASLt there.
+    # The bit-exact W4A16 MoE oracle needs cuBLASLt for its no-split-K GEMM.
+    if os.name == "nt":
+        os.environ.setdefault("TORCH_BLAS_PREFER_CUBLASLT", "1")
+
+
+_prefer_cublaslt_on_windows()
+
 import pytest
 import torch
 from torch.torch_version import TorchVersion
