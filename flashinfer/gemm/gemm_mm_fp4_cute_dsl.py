@@ -31,6 +31,7 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
         dense_blockscaled_gemm_sm100,
         dense_blockscaled_gemm_sm100_common,
         dense_blockscaled_gemm_sm103,
+        dense_blockscaled_gemm_sm107,
     )
 
     return (
@@ -38,6 +39,7 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
         dense_blockscaled_gemm_sm100.__file__,
         dense_blockscaled_gemm_sm100_common.__file__,
         dense_blockscaled_gemm_sm103.__file__,
+        dense_blockscaled_gemm_sm107.__file__,
     )
 
 

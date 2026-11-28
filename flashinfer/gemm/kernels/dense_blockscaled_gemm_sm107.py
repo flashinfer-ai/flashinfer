@@ -1315,10 +1315,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
         """
-        if cutlass.const_expr(mSFC_mnl is not None):
-            alpha_value = alpha[0]
-        else:
-            alpha_value = alpha[0].to(self.c_dtype)
+        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
+        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
+        # before multiplication could cause underflow or overflow.
+        alpha_value = alpha[0].to(cutlass.Float32)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -3302,7 +3302,10 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-        alpha_value = alpha[0].to(self.c_dtype)
+        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
+        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
+        # before multiplication could cause underflow or overflow.
+        alpha_value = alpha[0].to(cutlass.Float32)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
