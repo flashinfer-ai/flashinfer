@@ -35,23 +35,18 @@ def issue_slot(
     kv_head: Int32,
 ):
     """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``): acquire it, issue ``boxes_per_slot x halves`` TMA
-    boxes (a box is ``box_rows = min(page, slot_keys)`` keys of one page).
+    boxes (a box is ``box_rows = min(page, slot_keys)`` keys of one page). On a two-slot ring (``st.lookup_ahead``) the slot's page ids
+    are read from the page table BEFORE the slot is acquired: the load warp waits for nearly every slot there, and the lookups'
+    latency passes under that wait instead of following it (a placement: the same boxes reach the same smem bytes).
     Under ``st.ragged`` the pool is one page of ``total_kv`` tokens and the box starts at the request's token offset plus the key
     (the domain shifted by ``kv_indptr[req]``, a token offset, in ``load_loop``); coordinates past the pool are zero-filled by the TMA and keys past the
     request's length are masked / zeroed exactly as the junk of a paged pool's pages is."""
     page = st.page
-    h = kv_prod.acquire_and_advance()
-    for i in cutlass.range_constexpr(st.boxes_per_slot):
-        k0 = key0 + i * st.box_rows
-        if cutlass.const_expr(st.ragged):
-            for half in cutlass.range_constexpr(st.halves):
-                cute.copy(
-                    atom,
-                    tg[(None, (half, k0 // st.box_rows, kv_head, 0))],
-                    ts[(None, i, half, h.index)],
-                    tma_bar_ptr=h.barrier,
-                )
-        else:
+    if cutlass.const_expr(st.lookup_ahead):
+        page_ids = []
+        boxes_in_page = []
+        for i in cutlass.range_constexpr(st.boxes_per_slot):
+            k0 = key0 + i * st.box_rows
             pslot = k0 // page
             if cutlass.const_expr(page <= st.slot_keys):
                 box_in_page = Int32(0)
@@ -59,14 +54,45 @@ def issue_slot(
                 box_in_page = (k0 % page) // st.box_rows
             if pslot > n_pages - 1:
                 pslot = n_pages - 1
-            page_id = mKvIndices[kv_ptr0 + pslot]
+            page_ids.append(mKvIndices[kv_ptr0 + pslot])
+            boxes_in_page.append(box_in_page)
+        h = kv_prod.acquire_and_advance()
+        for i in cutlass.range_constexpr(st.boxes_per_slot):
             for half in cutlass.range_constexpr(st.halves):
                 cute.copy(
                     atom,
-                    tg[(None, (half, box_in_page, kv_head, page_id))],
+                    tg[(None, (half, boxes_in_page[i], kv_head, page_ids[i]))],
                     ts[(None, i, half, h.index)],
                     tma_bar_ptr=h.barrier,
                 )
+    else:
+        h = kv_prod.acquire_and_advance()
+        for i in cutlass.range_constexpr(st.boxes_per_slot):
+            k0 = key0 + i * st.box_rows
+            if cutlass.const_expr(st.ragged):
+                for half in cutlass.range_constexpr(st.halves):
+                    cute.copy(
+                        atom,
+                        tg[(None, (half, k0 // st.box_rows, kv_head, 0))],
+                        ts[(None, i, half, h.index)],
+                        tma_bar_ptr=h.barrier,
+                    )
+            else:
+                pslot = k0 // page
+                if cutlass.const_expr(page <= st.slot_keys):
+                    box_in_page = Int32(0)
+                else:
+                    box_in_page = (k0 % page) // st.box_rows
+                if pslot > n_pages - 1:
+                    pslot = n_pages - 1
+                page_id = mKvIndices[kv_ptr0 + pslot]
+                for half in cutlass.range_constexpr(st.halves):
+                    cute.copy(
+                        atom,
+                        tg[(None, (half, box_in_page, kv_head, page_id))],
+                        ts[(None, i, half, h.index)],
+                        tma_bar_ptr=h.barrier,
+                    )
     return kv_prod
 
 

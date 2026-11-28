@@ -158,7 +158,7 @@ class Roles:
         elif q2 and D in REGS_Q2_DIMS:
             # the paired placement at D = 128: the MMA / load warpgroup at 64 so the MMA warp's two Q tiles' descriptors and pipeline
             # state stay in registers (its spills miss L1 next to the 300 KB smem plan and sit on every tile's chain), the correction
-            # at 80 with 8-column pieces, the softmax at 184 with the streamed exponential form (StaticPlan.streamed)
+            # at 80 with 8-column pieces, the softmax at 184
             self.regs_softmax, self.regs_correction, self.regs_other = REGS_Q2_128
         elif q2:
             self.regs_correction = 96
@@ -261,9 +261,12 @@ class StaticPlan:
         # tile whenever one warpgroup worked alone; at D = 128 its P exchange and four-slice stats payload would also not leave room for
         # the third ring slot next to the two Q tiles and the smem O_m
         self.rep_ok = g <= REP_ROWS and not q2
-        # the softmax's exponential form: streamed (the P words take the scores' registers) for the one-warpgroup body and the paired
-        # placement at D = 128, where the register split needs the smaller live set; packed for the paired placement at D = 64
-        self.streamed = not q2 or D in (128,)
+        # TMEM columns per load of the softmax's whole-row copy of S: 32-column pieces; 64-column pieces (two loads per tile and
+        # warpgroup) under the paired placement at D = 64 on the 228 KB parts with the hardware row maximum (sm_103), the one build
+        # they measured faster in (slower for the one-warpgroup body and on sm_107). The same columns reach the same registers
+        self.s_load_cols = (
+            64 if q2 and D == 64 and hw_rowmax and self.cap < (300 << 10) else 32
+        )
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
         self.n_slices = (
@@ -289,6 +292,9 @@ class StaticPlan:
             kv_slots * self.slots_per_tile
         )  # physical ring slots (kv_slots counts whole-tile equivalents)
         self.box_rows = min(page, self.slot_keys)  # keys per TMA box
+        # the producer reads a slot's page ids before it acquires the slot (producer.issue_slot) on a two-slot ring, where it waits for
+        # nearly every slot; with a deeper ring the slot is usually free and the plain order measured as fast or faster
+        self.lookup_ahead = self.n_slots <= 2 and not ragged
         self.boxes_per_slot = self.slot_keys // self.box_rows  # per 64-wide half
         self.boxes_per_tile = self.T // self.box_rows
         self.halves = D // HALF
