@@ -24,8 +24,8 @@ static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignme
 
 #ifndef NUM_O_HEADS_LOG2
 #error "NUM_O_HEADS_LOG2 is a downstream specialization of this program; define it on the compile line"
-#elif NUM_O_HEADS_LOG2 != 2 && NUM_O_HEADS_LOG2 != 3 && NUM_O_HEADS_LOG2 != 4 && NUM_O_HEADS_LOG2 != 5
-#error "NUM_O_HEADS_LOG2 takes 2, 3, 4, 5 in this program; another value renders other code"
+#elif NUM_O_HEADS_LOG2 != 3 && NUM_O_HEADS_LOG2 != 4 && NUM_O_HEADS_LOG2 != 5
+#error "NUM_O_HEADS_LOG2 takes 3, 4, 5 in this program; another value renders other code"
 #endif
 #ifndef HEAD_GROUP_LOG2
 #error "HEAD_GROUP_LOG2 is a downstream specialization of this program; define it on the compile line"
@@ -104,7 +104,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform_local(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, float* __restrict__ initial_state, float* __restrict__ output_state, float* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles, int metadata_i64_mask)
+kernel_cake_gdn_e79b2c2b9b9843fcd44a_vec2full(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ output_state, __nv_bfloat16* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles, int metadata_i64_mask)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform_local(tid / 32);
@@ -1241,7 +1241,7 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                 long long output_state_head_base_cg1 = (long long)state_slot_cg1 * output_state_stride_slot + state_head_offset_cg1;
                 if (USE_INITIAL_STATE != 0 && num_chunks_b_1 > 0) {
                     #if !CAKE_GDN_STATE_VEC_ALIGNED
-                    bool init_vec_ok = ((unsigned long long)initial_state + (unsigned long long)initial_state_head_base_cg1 * 4ull & 7ull) == 0ull;
+                    bool init_vec_ok = ((unsigned long long)initial_state + (unsigned long long)initial_state_head_base_cg1 * 2ull & 3ull) == 0ull;
                     #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                     int warp_in_wg = warp % 4;
                     int state_tmem_row_base_init = warp_in_wg * 32 << 16;
@@ -1261,14 +1261,16 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                 int state_col_pair_init = state_col_half_init * 64 + state_col_group_init * 8 + (lane & 3) * 2;
                                 const int state_reg_base_init = state_col_group_init * 4;
                                 {
-                                    float2 _v2_0 = *reinterpret_cast<const float2*>(initial_state + state_base_top_init + (long long)state_col_pair_init);
-                                    state_init_frag[state_reg_base_init] = _v2_0.x;
-                                    state_init_frag[state_reg_base_init + 1] = _v2_0.y;
+                                    uint32_t _bf16x2_bits_0;
+                                    _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(initial_state + state_base_top_init + (long long)state_col_pair_init);
+                                    (&state_init_frag[state_reg_base_init])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_0) << 16);
+                                    (&state_init_frag[state_reg_base_init])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_0) & 0xffff0000u);
                                 }
                                 {
-                                    float2 _v2_1 = *reinterpret_cast<const float2*>(initial_state + state_base_bot_init + (long long)state_col_pair_init);
-                                    state_init_frag[state_reg_base_init + 2] = _v2_1.x;
-                                    state_init_frag[state_reg_base_init + 2 + 1] = _v2_1.y;
+                                    uint32_t _bf16x2_bits_1;
+                                    _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(initial_state + state_base_bot_init + (long long)state_col_pair_init);
+                                    (&state_init_frag[state_reg_base_init + 2])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_1) << 16);
+                                    (&state_init_frag[state_reg_base_init + 2])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_1) & 0xffff0000u);
                                 }
                             }
                             #else  // CAKE_GDN_STATE_VEC_ALIGNED
@@ -1278,14 +1280,18 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                     int state_col_pair_init = state_col_half_init * 64 + state_col_group_init * 8 + (lane & 3) * 2;
                                     const int state_reg_base_init = state_col_group_init * 4;
                                     {
-                                        float2 _v2_0 = *reinterpret_cast<const float2*>(initial_state + state_base_top_init + (long long)state_col_pair_init);
-                                        state_init_frag[state_reg_base_init] = _v2_0.x;
-                                        state_init_frag[state_reg_base_init + 1] = _v2_0.y;
+                                        uint32_t _bf16x2_bits_0;
+                                        asm volatile("ld.global.nc.b32 %0, [%1];"
+                                            : "=r"(_bf16x2_bits_0) : "l"((const void*)(initial_state + (state_base_top_init + (long long)state_col_pair_init))));
+                                        (&state_init_frag[state_reg_base_init])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_0) << 16);
+                                        (&state_init_frag[state_reg_base_init])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_0) & 0xffff0000u);
                                     }
                                     {
-                                        float2 _v2_1 = *reinterpret_cast<const float2*>(initial_state + state_base_bot_init + (long long)state_col_pair_init);
-                                        state_init_frag[state_reg_base_init + 2] = _v2_1.x;
-                                        state_init_frag[state_reg_base_init + 2 + 1] = _v2_1.y;
+                                        uint32_t _bf16x2_bits_1;
+                                        asm volatile("ld.global.nc.b32 %0, [%1];"
+                                            : "=r"(_bf16x2_bits_1) : "l"((const void*)(initial_state + (state_base_bot_init + (long long)state_col_pair_init))));
+                                        (&state_init_frag[state_reg_base_init + 2])[0] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_1) << 16);
+                                        (&state_init_frag[state_reg_base_init + 2])[1] = __uint_as_float(static_cast<uint32_t>(_bf16x2_bits_1) & 0xffff0000u);
                                     }
                                 }
                             } else {
@@ -1294,16 +1300,28 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                     int state_col_pair_init_1 = state_col_half_init * 64 + state_col_group_init_1 * 8 + (lane & 3) * 2;
                                     const int state_reg_base_init_1 = state_col_group_init_1 * 4;
                                     {
-                                        state_init_frag[state_reg_base_init_1] = *reinterpret_cast<const float*>(initial_state + (state_base_top_init + (long long)state_col_pair_init_1));
+                                        uint32_t _bf16_bits_2;
+                                        asm volatile("ld.global.nc.u16 %0, [%1];"
+                                            : "=r"(_bf16_bits_2) : "l"((const void*)(initial_state + (state_base_top_init + (long long)state_col_pair_init_1))));
+                                        state_init_frag[state_reg_base_init_1] = __uint_as_float(_bf16_bits_2 << 16);
                                     }
                                     {
-                                        state_init_frag[state_reg_base_init_1 + 1] = *reinterpret_cast<const float*>(initial_state + (state_base_top_init + (long long)state_col_pair_init_1 + 1ll));
+                                        uint32_t _bf16_bits_3;
+                                        asm volatile("ld.global.nc.u16 %0, [%1];"
+                                            : "=r"(_bf16_bits_3) : "l"((const void*)(initial_state + (state_base_top_init + (long long)state_col_pair_init_1 + 1ll))));
+                                        state_init_frag[state_reg_base_init_1 + 1] = __uint_as_float(_bf16_bits_3 << 16);
                                     }
                                     {
-                                        state_init_frag[state_reg_base_init_1 + 2] = *reinterpret_cast<const float*>(initial_state + (state_base_bot_init + (long long)state_col_pair_init_1));
+                                        uint32_t _bf16_bits_4;
+                                        asm volatile("ld.global.nc.u16 %0, [%1];"
+                                            : "=r"(_bf16_bits_4) : "l"((const void*)(initial_state + (state_base_bot_init + (long long)state_col_pair_init_1))));
+                                        state_init_frag[state_reg_base_init_1 + 2] = __uint_as_float(_bf16_bits_4 << 16);
                                     }
                                     {
-                                        state_init_frag[state_reg_base_init_1 + 3] = *reinterpret_cast<const float*>(initial_state + (state_base_bot_init + (long long)state_col_pair_init_1 + 1ll));
+                                        uint32_t _bf16_bits_5;
+                                        asm volatile("ld.global.nc.u16 %0, [%1];"
+                                            : "=r"(_bf16_bits_5) : "l"((const void*)(initial_state + (state_base_bot_init + (long long)state_col_pair_init_1 + 1ll))));
+                                        state_init_frag[state_reg_base_init_1 + 3] = __uint_as_float(_bf16_bits_5 << 16);
                                     }
                                 }
                             }
@@ -1417,6 +1435,7 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                             :: "r"(state_inp_addr_3), "r"(kk_scaled_cg0_bf16_2_1[0]), "r"(kk_scaled_cg0_bf16_2_1[1]), "r"(kk_scaled_cg0_bf16_2_1[2]), "r"(kk_scaled_cg0_bf16_2_1[3]), "r"(kk_scaled_cg0_bf16_2_1[4]), "r"(kk_scaled_cg0_bf16_2_1[5]), "r"(kk_scaled_cg0_bf16_2_1[6]), "r"(kk_scaled_cg0_bf16_2_1[7]), "r"(kk_scaled_cg0_bf16_2_1[8]), "r"(kk_scaled_cg0_bf16_2_1[9]), "r"(kk_scaled_cg0_bf16_2_1[10]), "r"(kk_scaled_cg0_bf16_2_1[11]), "r"(kk_scaled_cg0_bf16_2_1[12]), "r"(kk_scaled_cg0_bf16_2_1[13]), "r"(kk_scaled_cg0_bf16_2_1[14]), "r"(kk_scaled_cg0_bf16_2_1[15]));
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         mbarrier_arrive(state_inp_ready_addr);
+                        #if CAKE_GDN_STATE_VEC_ALIGNED
                         const float2 _scale2_2 = {chunk_decay_cg1, chunk_decay_cg1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
@@ -1433,6 +1452,24 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_20)[_ls], _scale2_5);
+                        #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                        const float2 _scale2_6 = {chunk_decay_cg1, chunk_decay_cg1};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_17)[_ls], _scale2_6);
+                        const float2 _scale2_7 = {chunk_decay_cg1, chunk_decay_cg1};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_18)[_ls], _scale2_7);
+                        const float2 _scale2_8 = {chunk_decay_cg1, chunk_decay_cg1};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_19)[_ls], _scale2_8);
+                        const float2 _scale2_9 = {chunk_decay_cg1, chunk_decay_cg1};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_20)[_ls], _scale2_9);
+                        #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                         tmem_st_x32_f32(state_addr_0, _tmem_load_17);
                         tmem_st_x32_f32(state_addr_1, _tmem_load_18);
                         tmem_st_x32_f32(state_addr_2, _tmem_load_19);
@@ -1450,8 +1487,13 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                 int cg1_scale_col = cg1_scale_repeat * 8 + lane_quad_cg1 * 2 + (cg1_scale_reg & 1);
                                 float cg1_scale_log = smem_cumsumlog[gate_cg1_elem_base + cg1_scale_col];
                                 cg1_cumprod_frag[cg1_scale_j] = smem_cumprod[gate_cg1_elem_base + cg1_scale_col];
+                                #if CAKE_GDN_STATE_VEC_ALIGNED
                                 float _exp2_6 = approx_exp2(last_cumsumlog_cg1 - cg1_scale_log);
                                 cg1_decay_scale_frag[cg1_scale_j] = _exp2_6;
+                                #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                                float _exp2_10 = approx_exp2(last_cumsumlog_cg1 - cg1_scale_log);
+                                cg1_decay_scale_frag[cg1_scale_j] = _exp2_10;
+                                #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                             }
                         }
                         {
@@ -1504,6 +1546,7 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                             : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[31]))
                             : "r"(ks_addr_hi_cg1));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(cg1_shared_acc_empty_addr);
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
@@ -1561,10 +1604,17 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_23)[_ls], reinterpret_cast<const float2*>(cg1_cumprod_frag)[_ls]);
+                            #if CAKE_GDN_STATE_VEC_ALIGNED
                             const float2 _scale2_7 = {scale, scale};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_23)[_ls], _scale2_7);
+                            #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                            const float2 _scale2_11 = {scale, scale};
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++)
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_23)[_ls], _scale2_11);
+                            #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                             asm volatile(
                                 "tcgen05.st.sync.aligned.16x256b.x8.b32"
                                 " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
@@ -1687,10 +1737,17 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                 int o_raw_col_cg1 = (o_dim_base_cg1 & 63 ^ (o_token_pair_cg1 & 3) << 4 ^ o_token_parity_cg1 << 3) + o_token_parity_cg1 * 64;
                                 int o_stsm_offset_cg1 = (o_raw_row_cg1 * 128 + o_raw_col_cg1) * 2;
                                 const int o_pack_base_cg1 = token_group_cg1 * 4;
+                                #if CAKE_GDN_STATE_VEC_ALIGNED
                                 uint32_t _stmatrix_addr_8 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1 + o_stsm_offset_cg1));
                                 asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                     :: "r"(_stmatrix_addr_8), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1 + 3]))
                                     : "memory");
+                                #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                                uint32_t _stmatrix_addr_12 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1 + o_stsm_offset_cg1));
+                                asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
+                                    :: "r"(_stmatrix_addr_12), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_9[o_pack_base_cg1 + 3]))
+                                    : "memory");
+                                #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                             }
                         }
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1789,6 +1846,7 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                         :: "r"(state_inp_addr_3_1), "r"(kk_scaled_cg0_bf16_16[0]), "r"(kk_scaled_cg0_bf16_16[1]), "r"(kk_scaled_cg0_bf16_16[2]), "r"(kk_scaled_cg0_bf16_16[3]), "r"(kk_scaled_cg0_bf16_16[4]), "r"(kk_scaled_cg0_bf16_16[5]), "r"(kk_scaled_cg0_bf16_16[6]), "r"(kk_scaled_cg0_bf16_16[7]), "r"(kk_scaled_cg0_bf16_16[8]), "r"(kk_scaled_cg0_bf16_16[9]), "r"(kk_scaled_cg0_bf16_16[10]), "r"(kk_scaled_cg0_bf16_16[11]), "r"(kk_scaled_cg0_bf16_16[12]), "r"(kk_scaled_cg0_bf16_16[13]), "r"(kk_scaled_cg0_bf16_16[14]), "r"(kk_scaled_cg0_bf16_16[15]));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(state_inp_ready_addr);
+                    #if CAKE_GDN_STATE_VEC_ALIGNED
                     const float2 _scale2_9 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
@@ -1805,6 +1863,24 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_20_1)[_ls], _scale2_12);
+                    #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                    const float2 _scale2_13 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 16; _ls++)
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_17_1)[_ls], _scale2_13);
+                    const float2 _scale2_14 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 16; _ls++)
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_18_1)[_ls], _scale2_14);
+                    const float2 _scale2_15 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 16; _ls++)
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_19_1)[_ls], _scale2_15);
+                    const float2 _scale2_16 = {chunk_decay_cg1_1, chunk_decay_cg1_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 16; _ls++)
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_20_1)[_ls], _scale2_16);
+                    #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                     tmem_st_x32_f32(state_addr_0_1, _tmem_load_17_1);
                     tmem_st_x32_f32(state_addr_1_1, _tmem_load_18_1);
                     tmem_st_x32_f32(state_addr_2_1, _tmem_load_19_1);
@@ -1822,8 +1898,13 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                             int cg1_scale_col_1 = cg1_scale_repeat_1 * 8 + lane_quad_cg1_1 * 2 + (cg1_scale_reg_1 & 1);
                             float cg1_scale_log_1 = smem_cumsumlog[gate_cg1_elem_base_1 + cg1_scale_col_1];
                             cg1_cumprod_frag_1[cg1_scale_j_1] = smem_cumprod[gate_cg1_elem_base_1 + cg1_scale_col_1];
+                            #if CAKE_GDN_STATE_VEC_ALIGNED
                             float _exp2_13 = approx_exp2(last_cumsumlog_cg1_1 - cg1_scale_log_1);
                             cg1_decay_scale_frag_1[cg1_scale_j_1] = _exp2_13;
+                            #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                            float _exp2_17 = approx_exp2(last_cumsumlog_cg1_1 - cg1_scale_log_1);
+                            cg1_decay_scale_frag_1[cg1_scale_j_1] = _exp2_17;
+                            #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                         }
                     }
                     {
@@ -1876,6 +1957,7 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_22[31]))
                         : "r"(ks_addr_hi_cg1_1));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(cg1_shared_acc_empty_addr);
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
@@ -1933,10 +2015,17 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_23_1)[_ls], reinterpret_cast<const float2*>(cg1_cumprod_frag_1)[_ls]);
+                        #if CAKE_GDN_STATE_VEC_ALIGNED
                         const float2 _scale2_14 = {scale, scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_23_1)[_ls], _scale2_14);
+                        #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                        const float2 _scale2_18 = {scale, scale};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_23_1)[_ls], _scale2_18);
+                        #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x256b.x8.b32"
                             " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
@@ -2059,10 +2148,17 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                             int o_raw_col_cg1_1 = (o_dim_base_cg1_1 & 63 ^ (o_token_pair_cg1_1 & 3) << 4 ^ o_token_parity_cg1_1 << 3) + o_token_parity_cg1_1 * 64;
                             int o_stsm_offset_cg1_1 = (o_raw_row_cg1_1 * 128 + o_raw_col_cg1_1) * 2;
                             const int o_pack_base_cg1_1 = token_group_cg1_1 * 4;
+                            #if CAKE_GDN_STATE_VEC_ALIGNED
                             uint32_t _stmatrix_addr_15 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1_1 + o_stsm_offset_cg1_1));
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_15), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1 + 3]))
                                 : "memory");
+                            #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                            uint32_t _stmatrix_addr_19 = static_cast<uint32_t>((unsigned long long)(o_stage_addr_cg1_1 + o_stsm_offset_cg1_1));
+                            asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
+                                :: "r"(_stmatrix_addr_19), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&kk_scaled_cg0_bf16_23[o_pack_base_cg1_1 + 3]))
+                                : "memory");
+                            #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                         }
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -2097,14 +2193,26 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                 int state_col_pair_cg1 = state_col_half_cg1 * 64 + state_col_group_cg1 * 8 + (lane & 3) * 2;
                                 const int state_reg_base_cg1 = state_col_group_cg1 * 4;
                                 {
-                                    asm volatile("st.global.L1::no_allocate.v2.f32 [%0], {%1, %2};" :: "l"(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1)), "f"(_tmem_load[(state_reg_base_cg1) + 0]), "f"(_tmem_load[(state_reg_base_cg1) + 1]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.v2.f32 [%0], {%1, %2};" :: "l"(output_state + (state_base_idx_top_cg1 + 1024ll + (long long)state_col_pair_cg1)), "f"(_tmem_load[(state_reg_base_cg1 + 2) + 0]), "f"(_tmem_load[(state_reg_base_cg1 + 2) + 1]) : "memory");
+                                    unsigned int packed_0[1];
+                                    #pragma unroll
+                                    for (int _lp = 0; _lp < 1; _lp++) {
+                                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((_tmem_load + state_reg_base_cg1)[_lp*2 + 0], (_tmem_load + state_reg_base_cg1)[_lp*2+1 + 0]));
+                                        packed_0[_lp] = *(uint32_t*)&_bf2;
+                                    }
+                                    reinterpret_cast<unsigned*>(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1))[0] = reinterpret_cast<unsigned*>(packed_0)[0];
+                                    unsigned int packed_1[1];
+                                    #pragma unroll
+                                    for (int _lp = 0; _lp < 1; _lp++) {
+                                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((_tmem_load + (state_reg_base_cg1 + 2))[_lp*2 + 0], (_tmem_load + (state_reg_base_cg1 + 2))[_lp*2+1 + 0]));
+                                        packed_1[_lp] = *(uint32_t*)&_bf2;
+                                    }
+                                    reinterpret_cast<unsigned*>(output_state + (state_base_idx_top_cg1 + 1024ll + (long long)state_col_pair_cg1))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
                                 }
                             }
                         }
                     }
                     #else  // CAKE_GDN_STATE_VEC_ALIGNED
-                    if (__builtin_expect((STORE_FINAL_STATE == 0 || ((unsigned long long)output_state + (unsigned long long)output_state_head_base_cg1 * 4ull & 7ull) == 0ull) && (ENABLE_CHECKPOINTS == 0 || ((unsigned long long)checkpoint_state & 7ull) == 0ull), 1)) {
+                    if (__builtin_expect((STORE_FINAL_STATE == 0 || ((unsigned long long)output_state + (unsigned long long)output_state_head_base_cg1 * 2ull & 3ull) == 0ull) && (ENABLE_CHECKPOINTS == 0 || ((unsigned long long)checkpoint_state & 3ull) == 0ull), 1)) {
                         #pragma unroll
                         for (int state_lane_half_cg1 = 0; state_lane_half_cg1 < 2; state_lane_half_cg1++) {
                             int warp_id_in_role_6 = warp - 4;
@@ -2125,8 +2233,20 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                     int state_col_pair_cg1 = state_col_half_cg1 * 64 + state_col_group_cg1 * 8 + (lane & 3) * 2;
                                     const int state_reg_base_cg1 = state_col_group_cg1 * 4;
                                     {
-                                        asm volatile("st.global.L1::no_allocate.v2.f32 [%0], {%1, %2};" :: "l"(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1)), "f"(_tmem_load[(state_reg_base_cg1) + 0]), "f"(_tmem_load[(state_reg_base_cg1) + 1]) : "memory");
-                                        asm volatile("st.global.L1::no_allocate.v2.f32 [%0], {%1, %2};" :: "l"(output_state + (state_base_idx_top_cg1 + 1024ll + (long long)state_col_pair_cg1)), "f"(_tmem_load[(state_reg_base_cg1 + 2) + 0]), "f"(_tmem_load[(state_reg_base_cg1 + 2) + 1]) : "memory");
+                                        unsigned int packed_0[1];
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((_tmem_load + state_reg_base_cg1)[_lp*2 + 0], (_tmem_load + state_reg_base_cg1)[_lp*2+1 + 0]));
+                                            packed_0[_lp] = *(uint32_t*)&_bf2;
+                                        }
+                                        reinterpret_cast<unsigned*>(output_state + (state_base_idx_top_cg1 + (long long)state_col_pair_cg1))[0] = reinterpret_cast<unsigned*>(packed_0)[0];
+                                        unsigned int packed_1[1];
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((_tmem_load + (state_reg_base_cg1 + 2))[_lp*2 + 0], (_tmem_load + (state_reg_base_cg1 + 2))[_lp*2+1 + 0]));
+                                            packed_1[_lp] = *(uint32_t*)&_bf2;
+                                        }
+                                        reinterpret_cast<unsigned*>(output_state + (state_base_idx_top_cg1 + 1024ll + (long long)state_col_pair_cg1))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
                                     }
                                 }
                             }
@@ -2152,10 +2272,22 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                                     int state_col_pair_cg1_1 = state_col_half_cg1_1 * 64 + state_col_group_cg1_1 * 8 + (lane & 3) * 2;
                                     const int state_reg_base_cg1_1 = state_col_group_cg1_1 * 4;
                                     {
-                                        *(reinterpret_cast<float*>(output_state + (state_base_idx_top_cg1_1 + (long long)state_col_pair_cg1_1)) + (0)) = _tmem_load_1[state_reg_base_cg1_1];
-                                        *(reinterpret_cast<float*>(output_state + (state_base_idx_top_cg1_1 + (long long)state_col_pair_cg1_1 + 1ll)) + (0)) = _tmem_load_1[state_reg_base_cg1_1 + 1];
-                                        *(reinterpret_cast<float*>(output_state + (state_base_idx_top_cg1_1 + 1024ll + (long long)state_col_pair_cg1_1)) + (0)) = _tmem_load_1[state_reg_base_cg1_1 + 2];
-                                        *(reinterpret_cast<float*>(output_state + (state_base_idx_top_cg1_1 + 1024ll + (long long)state_col_pair_cg1_1 + 1ll)) + (0)) = _tmem_load_1[state_reg_base_cg1_1 + 3];
+                                        unsigned int packed_4[1];
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((_tmem_load_1 + state_reg_base_cg1_1)[_lp*2 + 0], (_tmem_load_1 + state_reg_base_cg1_1)[_lp*2+1 + 0]));
+                                            packed_4[_lp] = *(uint32_t*)&_bf2;
+                                        }
+                                        *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state) + (state_base_idx_top_cg1_1 + (long long)state_col_pair_cg1_1)) = (unsigned short)((uint16_t)packed_4[0]);
+                                        *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state) + (state_base_idx_top_cg1_1 + (long long)state_col_pair_cg1_1 + 1ll)) = (unsigned short)((uint16_t)(packed_4[0] >> 16));
+                                        unsigned int packed_5[1];
+                                        #pragma unroll
+                                        for (int _lp = 0; _lp < 1; _lp++) {
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((_tmem_load_1 + (state_reg_base_cg1_1 + 2))[_lp*2 + 0], (_tmem_load_1 + (state_reg_base_cg1_1 + 2))[_lp*2+1 + 0]));
+                                            packed_5[_lp] = *(uint32_t*)&_bf2;
+                                        }
+                                        *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state) + (state_base_idx_top_cg1_1 + 1024ll + (long long)state_col_pair_cg1_1)) = (unsigned short)((uint16_t)packed_5[0]);
+                                        *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state) + (state_base_idx_top_cg1_1 + 1024ll + (long long)state_col_pair_cg1_1 + 1ll)) = (unsigned short)((uint16_t)(packed_5[0] >> 16));
                                     }
                                 }
                             }
@@ -2170,739 +2302,111 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                     int empty_state_row = warp_id_in_role_7 * 32 + lane;
                     long long empty_initial_base = initial_state_head_base_cg1 + (long long)empty_state_row * 128ll;
                     long long empty_output_base = output_state_head_base_cg1 + (long long)empty_state_row * 128ll;
-                    float empty_stage[128];
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 0ll);
-                        empty_stage[0 + 0] = _v4.x;
-                        empty_stage[0 + 1] = _v4.y;
-                        empty_stage[0 + 2] = _v4.z;
-                        empty_stage[0 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 4ll);
-                        empty_stage[4 + 0] = _v4.x;
-                        empty_stage[4 + 1] = _v4.y;
-                        empty_stage[4 + 2] = _v4.z;
-                        empty_stage[4 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 8ll);
-                        empty_stage[8 + 0] = _v4.x;
-                        empty_stage[8 + 1] = _v4.y;
-                        empty_stage[8 + 2] = _v4.z;
-                        empty_stage[8 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 12ll);
-                        empty_stage[12 + 0] = _v4.x;
-                        empty_stage[12 + 1] = _v4.y;
-                        empty_stage[12 + 2] = _v4.z;
-                        empty_stage[12 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 16ll);
-                        empty_stage[16 + 0] = _v4.x;
-                        empty_stage[16 + 1] = _v4.y;
-                        empty_stage[16 + 2] = _v4.z;
-                        empty_stage[16 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 20ll);
-                        empty_stage[20 + 0] = _v4.x;
-                        empty_stage[20 + 1] = _v4.y;
-                        empty_stage[20 + 2] = _v4.z;
-                        empty_stage[20 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 24ll);
-                        empty_stage[24 + 0] = _v4.x;
-                        empty_stage[24 + 1] = _v4.y;
-                        empty_stage[24 + 2] = _v4.z;
-                        empty_stage[24 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 28ll);
-                        empty_stage[28 + 0] = _v4.x;
-                        empty_stage[28 + 1] = _v4.y;
-                        empty_stage[28 + 2] = _v4.z;
-                        empty_stage[28 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 32ll);
-                        empty_stage[32 + 0] = _v4.x;
-                        empty_stage[32 + 1] = _v4.y;
-                        empty_stage[32 + 2] = _v4.z;
-                        empty_stage[32 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 36ll);
-                        empty_stage[36 + 0] = _v4.x;
-                        empty_stage[36 + 1] = _v4.y;
-                        empty_stage[36 + 2] = _v4.z;
-                        empty_stage[36 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 40ll);
-                        empty_stage[40 + 0] = _v4.x;
-                        empty_stage[40 + 1] = _v4.y;
-                        empty_stage[40 + 2] = _v4.z;
-                        empty_stage[40 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 44ll);
-                        empty_stage[44 + 0] = _v4.x;
-                        empty_stage[44 + 1] = _v4.y;
-                        empty_stage[44 + 2] = _v4.z;
-                        empty_stage[44 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 48ll);
-                        empty_stage[48 + 0] = _v4.x;
-                        empty_stage[48 + 1] = _v4.y;
-                        empty_stage[48 + 2] = _v4.z;
-                        empty_stage[48 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 52ll);
-                        empty_stage[52 + 0] = _v4.x;
-                        empty_stage[52 + 1] = _v4.y;
-                        empty_stage[52 + 2] = _v4.z;
-                        empty_stage[52 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 56ll);
-                        empty_stage[56 + 0] = _v4.x;
-                        empty_stage[56 + 1] = _v4.y;
-                        empty_stage[56 + 2] = _v4.z;
-                        empty_stage[56 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 60ll);
-                        empty_stage[60 + 0] = _v4.x;
-                        empty_stage[60 + 1] = _v4.y;
-                        empty_stage[60 + 2] = _v4.z;
-                        empty_stage[60 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 64ll);
-                        empty_stage[64 + 0] = _v4.x;
-                        empty_stage[64 + 1] = _v4.y;
-                        empty_stage[64 + 2] = _v4.z;
-                        empty_stage[64 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 68ll);
-                        empty_stage[68 + 0] = _v4.x;
-                        empty_stage[68 + 1] = _v4.y;
-                        empty_stage[68 + 2] = _v4.z;
-                        empty_stage[68 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 72ll);
-                        empty_stage[72 + 0] = _v4.x;
-                        empty_stage[72 + 1] = _v4.y;
-                        empty_stage[72 + 2] = _v4.z;
-                        empty_stage[72 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 76ll);
-                        empty_stage[76 + 0] = _v4.x;
-                        empty_stage[76 + 1] = _v4.y;
-                        empty_stage[76 + 2] = _v4.z;
-                        empty_stage[76 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 80ll);
-                        empty_stage[80 + 0] = _v4.x;
-                        empty_stage[80 + 1] = _v4.y;
-                        empty_stage[80 + 2] = _v4.z;
-                        empty_stage[80 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 84ll);
-                        empty_stage[84 + 0] = _v4.x;
-                        empty_stage[84 + 1] = _v4.y;
-                        empty_stage[84 + 2] = _v4.z;
-                        empty_stage[84 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 88ll);
-                        empty_stage[88 + 0] = _v4.x;
-                        empty_stage[88 + 1] = _v4.y;
-                        empty_stage[88 + 2] = _v4.z;
-                        empty_stage[88 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 92ll);
-                        empty_stage[92 + 0] = _v4.x;
-                        empty_stage[92 + 1] = _v4.y;
-                        empty_stage[92 + 2] = _v4.z;
-                        empty_stage[92 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 96ll);
-                        empty_stage[96 + 0] = _v4.x;
-                        empty_stage[96 + 1] = _v4.y;
-                        empty_stage[96 + 2] = _v4.z;
-                        empty_stage[96 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 100ll);
-                        empty_stage[100 + 0] = _v4.x;
-                        empty_stage[100 + 1] = _v4.y;
-                        empty_stage[100 + 2] = _v4.z;
-                        empty_stage[100 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 104ll);
-                        empty_stage[104 + 0] = _v4.x;
-                        empty_stage[104 + 1] = _v4.y;
-                        empty_stage[104 + 2] = _v4.z;
-                        empty_stage[104 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 108ll);
-                        empty_stage[108 + 0] = _v4.x;
-                        empty_stage[108 + 1] = _v4.y;
-                        empty_stage[108 + 2] = _v4.z;
-                        empty_stage[108 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 112ll);
-                        empty_stage[112 + 0] = _v4.x;
-                        empty_stage[112 + 1] = _v4.y;
-                        empty_stage[112 + 2] = _v4.z;
-                        empty_stage[112 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 116ll);
-                        empty_stage[116 + 0] = _v4.x;
-                        empty_stage[116 + 1] = _v4.y;
-                        empty_stage[116 + 2] = _v4.z;
-                        empty_stage[116 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 120ll);
-                        empty_stage[120 + 0] = _v4.x;
-                        empty_stage[120 + 1] = _v4.y;
-                        empty_stage[120 + 2] = _v4.z;
-                        empty_stage[120 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 124ll);
-                        empty_stage[124 + 0] = _v4.x;
-                        empty_stage[124 + 1] = _v4.y;
-                        empty_stage[124 + 2] = _v4.z;
-                        empty_stage[124 + 3] = _v4.w;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[0 + 0], empty_stage[0 + 1], empty_stage[0 + 2], empty_stage[0 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 0ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[4 + 0], empty_stage[4 + 1], empty_stage[4 + 2], empty_stage[4 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 4ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[8 + 0], empty_stage[8 + 1], empty_stage[8 + 2], empty_stage[8 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 8ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[12 + 0], empty_stage[12 + 1], empty_stage[12 + 2], empty_stage[12 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 12ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[16 + 0], empty_stage[16 + 1], empty_stage[16 + 2], empty_stage[16 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 16ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[20 + 0], empty_stage[20 + 1], empty_stage[20 + 2], empty_stage[20 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 20ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[24 + 0], empty_stage[24 + 1], empty_stage[24 + 2], empty_stage[24 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 24ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[28 + 0], empty_stage[28 + 1], empty_stage[28 + 2], empty_stage[28 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 28ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[32 + 0], empty_stage[32 + 1], empty_stage[32 + 2], empty_stage[32 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 32ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[36 + 0], empty_stage[36 + 1], empty_stage[36 + 2], empty_stage[36 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 36ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[40 + 0], empty_stage[40 + 1], empty_stage[40 + 2], empty_stage[40 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 40ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[44 + 0], empty_stage[44 + 1], empty_stage[44 + 2], empty_stage[44 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 44ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[48 + 0], empty_stage[48 + 1], empty_stage[48 + 2], empty_stage[48 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 48ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[52 + 0], empty_stage[52 + 1], empty_stage[52 + 2], empty_stage[52 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 52ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[56 + 0], empty_stage[56 + 1], empty_stage[56 + 2], empty_stage[56 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 56ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[60 + 0], empty_stage[60 + 1], empty_stage[60 + 2], empty_stage[60 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 60ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[64 + 0], empty_stage[64 + 1], empty_stage[64 + 2], empty_stage[64 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 64ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[68 + 0], empty_stage[68 + 1], empty_stage[68 + 2], empty_stage[68 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 68ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[72 + 0], empty_stage[72 + 1], empty_stage[72 + 2], empty_stage[72 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 72ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[76 + 0], empty_stage[76 + 1], empty_stage[76 + 2], empty_stage[76 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 76ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[80 + 0], empty_stage[80 + 1], empty_stage[80 + 2], empty_stage[80 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 80ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[84 + 0], empty_stage[84 + 1], empty_stage[84 + 2], empty_stage[84 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 84ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[88 + 0], empty_stage[88 + 1], empty_stage[88 + 2], empty_stage[88 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 88ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[92 + 0], empty_stage[92 + 1], empty_stage[92 + 2], empty_stage[92 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 92ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[96 + 0], empty_stage[96 + 1], empty_stage[96 + 2], empty_stage[96 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 96ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[100 + 0], empty_stage[100 + 1], empty_stage[100 + 2], empty_stage[100 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 100ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[104 + 0], empty_stage[104 + 1], empty_stage[104 + 2], empty_stage[104 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 104ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[108 + 0], empty_stage[108 + 1], empty_stage[108 + 2], empty_stage[108 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 108ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[112 + 0], empty_stage[112 + 1], empty_stage[112 + 2], empty_stage[112 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 112ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[116 + 0], empty_stage[116 + 1], empty_stage[116 + 2], empty_stage[116 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 116ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[120 + 0], empty_stage[120 + 1], empty_stage[120 + 2], empty_stage[120 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 120ll)) + 0) = _v4;
-                    }
-                    {
-                        float4 _v4 = make_float4(empty_stage[124 + 0], empty_stage[124 + 1], empty_stage[124 + 2], empty_stage[124 + 3]);
-                        *reinterpret_cast<float4*>((output_state + (empty_output_base + 124ll)) + 0) = _v4;
+                    #pragma unroll
+                    for (int empty_state_vec = 0; empty_state_vec < 32; empty_state_vec++) {
+                        int empty_state_col = empty_state_vec * 4;
+                        float _vec_load[4];
+                        {
+                            uint2 _vld_16;
+                            _vld_16 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + (long long)empty_state_col);
+                            uint32_t* _vpairs_16 = reinterpret_cast<uint32_t*>(&_vld_16);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 2; _pair++) {
+                                (&_vec_load[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_16[_pair]) << 16);
+                                (&_vec_load[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_16[_pair]) & 0xffff0000u);
+                            }
+                        }
+                        unsigned int packed[2];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_vec_load[_lp*2 + 0], _vec_load[_lp*2+1 + 0]));
+                            packed[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 1; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_vec_load[_lp*2 + 2], _vec_load[_lp*2+1 + 2]));
+                            packed[_lp + 1] = *(uint32_t*)&_bf2;
+                        }
+                        reinterpret_cast<int2*>(output_state + (empty_output_base + (long long)empty_state_col))[0] = reinterpret_cast<int2*>(packed)[0];
                     }
                     #else  // CAKE_GDN_STATE_VEC_ALIGNED
-                    bool empty_vec_ok = ((unsigned long long)initial_state + (unsigned long long)initial_state_head_base_cg1 * 4ull & 15ull) == 0ull && ((unsigned long long)output_state + (unsigned long long)output_state_head_base_cg1 * 4ull & 15ull) == 0ull;
+                    bool empty_vec_ok = ((unsigned long long)initial_state + (unsigned long long)initial_state_head_base_cg1 * 2ull & 7ull) == 0ull && ((unsigned long long)output_state + (unsigned long long)output_state_head_base_cg1 * 2ull & 7ull) == 0ull;
                     int warp_id_in_role_8 = warp - 4;
                     int empty_state_row = warp_id_in_role_8 * 32 + lane;
                     long long empty_initial_base = initial_state_head_base_cg1 + (long long)empty_state_row * 128ll;
                     long long empty_output_base = output_state_head_base_cg1 + (long long)empty_state_row * 128ll;
                     if (__builtin_expect(empty_vec_ok, 1)) {
-                        float empty_stage[128];
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 0ll);
-                            empty_stage[0 + 0] = _v4.x;
-                            empty_stage[0 + 1] = _v4.y;
-                            empty_stage[0 + 2] = _v4.z;
-                            empty_stage[0 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 4ll);
-                            empty_stage[4 + 0] = _v4.x;
-                            empty_stage[4 + 1] = _v4.y;
-                            empty_stage[4 + 2] = _v4.z;
-                            empty_stage[4 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 8ll);
-                            empty_stage[8 + 0] = _v4.x;
-                            empty_stage[8 + 1] = _v4.y;
-                            empty_stage[8 + 2] = _v4.z;
-                            empty_stage[8 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 12ll);
-                            empty_stage[12 + 0] = _v4.x;
-                            empty_stage[12 + 1] = _v4.y;
-                            empty_stage[12 + 2] = _v4.z;
-                            empty_stage[12 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 16ll);
-                            empty_stage[16 + 0] = _v4.x;
-                            empty_stage[16 + 1] = _v4.y;
-                            empty_stage[16 + 2] = _v4.z;
-                            empty_stage[16 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 20ll);
-                            empty_stage[20 + 0] = _v4.x;
-                            empty_stage[20 + 1] = _v4.y;
-                            empty_stage[20 + 2] = _v4.z;
-                            empty_stage[20 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 24ll);
-                            empty_stage[24 + 0] = _v4.x;
-                            empty_stage[24 + 1] = _v4.y;
-                            empty_stage[24 + 2] = _v4.z;
-                            empty_stage[24 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 28ll);
-                            empty_stage[28 + 0] = _v4.x;
-                            empty_stage[28 + 1] = _v4.y;
-                            empty_stage[28 + 2] = _v4.z;
-                            empty_stage[28 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 32ll);
-                            empty_stage[32 + 0] = _v4.x;
-                            empty_stage[32 + 1] = _v4.y;
-                            empty_stage[32 + 2] = _v4.z;
-                            empty_stage[32 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 36ll);
-                            empty_stage[36 + 0] = _v4.x;
-                            empty_stage[36 + 1] = _v4.y;
-                            empty_stage[36 + 2] = _v4.z;
-                            empty_stage[36 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 40ll);
-                            empty_stage[40 + 0] = _v4.x;
-                            empty_stage[40 + 1] = _v4.y;
-                            empty_stage[40 + 2] = _v4.z;
-                            empty_stage[40 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 44ll);
-                            empty_stage[44 + 0] = _v4.x;
-                            empty_stage[44 + 1] = _v4.y;
-                            empty_stage[44 + 2] = _v4.z;
-                            empty_stage[44 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 48ll);
-                            empty_stage[48 + 0] = _v4.x;
-                            empty_stage[48 + 1] = _v4.y;
-                            empty_stage[48 + 2] = _v4.z;
-                            empty_stage[48 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 52ll);
-                            empty_stage[52 + 0] = _v4.x;
-                            empty_stage[52 + 1] = _v4.y;
-                            empty_stage[52 + 2] = _v4.z;
-                            empty_stage[52 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 56ll);
-                            empty_stage[56 + 0] = _v4.x;
-                            empty_stage[56 + 1] = _v4.y;
-                            empty_stage[56 + 2] = _v4.z;
-                            empty_stage[56 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 60ll);
-                            empty_stage[60 + 0] = _v4.x;
-                            empty_stage[60 + 1] = _v4.y;
-                            empty_stage[60 + 2] = _v4.z;
-                            empty_stage[60 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 64ll);
-                            empty_stage[64 + 0] = _v4.x;
-                            empty_stage[64 + 1] = _v4.y;
-                            empty_stage[64 + 2] = _v4.z;
-                            empty_stage[64 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 68ll);
-                            empty_stage[68 + 0] = _v4.x;
-                            empty_stage[68 + 1] = _v4.y;
-                            empty_stage[68 + 2] = _v4.z;
-                            empty_stage[68 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 72ll);
-                            empty_stage[72 + 0] = _v4.x;
-                            empty_stage[72 + 1] = _v4.y;
-                            empty_stage[72 + 2] = _v4.z;
-                            empty_stage[72 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 76ll);
-                            empty_stage[76 + 0] = _v4.x;
-                            empty_stage[76 + 1] = _v4.y;
-                            empty_stage[76 + 2] = _v4.z;
-                            empty_stage[76 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 80ll);
-                            empty_stage[80 + 0] = _v4.x;
-                            empty_stage[80 + 1] = _v4.y;
-                            empty_stage[80 + 2] = _v4.z;
-                            empty_stage[80 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 84ll);
-                            empty_stage[84 + 0] = _v4.x;
-                            empty_stage[84 + 1] = _v4.y;
-                            empty_stage[84 + 2] = _v4.z;
-                            empty_stage[84 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 88ll);
-                            empty_stage[88 + 0] = _v4.x;
-                            empty_stage[88 + 1] = _v4.y;
-                            empty_stage[88 + 2] = _v4.z;
-                            empty_stage[88 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 92ll);
-                            empty_stage[92 + 0] = _v4.x;
-                            empty_stage[92 + 1] = _v4.y;
-                            empty_stage[92 + 2] = _v4.z;
-                            empty_stage[92 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 96ll);
-                            empty_stage[96 + 0] = _v4.x;
-                            empty_stage[96 + 1] = _v4.y;
-                            empty_stage[96 + 2] = _v4.z;
-                            empty_stage[96 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 100ll);
-                            empty_stage[100 + 0] = _v4.x;
-                            empty_stage[100 + 1] = _v4.y;
-                            empty_stage[100 + 2] = _v4.z;
-                            empty_stage[100 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 104ll);
-                            empty_stage[104 + 0] = _v4.x;
-                            empty_stage[104 + 1] = _v4.y;
-                            empty_stage[104 + 2] = _v4.z;
-                            empty_stage[104 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 108ll);
-                            empty_stage[108 + 0] = _v4.x;
-                            empty_stage[108 + 1] = _v4.y;
-                            empty_stage[108 + 2] = _v4.z;
-                            empty_stage[108 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 112ll);
-                            empty_stage[112 + 0] = _v4.x;
-                            empty_stage[112 + 1] = _v4.y;
-                            empty_stage[112 + 2] = _v4.z;
-                            empty_stage[112 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 116ll);
-                            empty_stage[116 + 0] = _v4.x;
-                            empty_stage[116 + 1] = _v4.y;
-                            empty_stage[116 + 2] = _v4.z;
-                            empty_stage[116 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 120ll);
-                            empty_stage[120 + 0] = _v4.x;
-                            empty_stage[120 + 1] = _v4.y;
-                            empty_stage[120 + 2] = _v4.z;
-                            empty_stage[120 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + 124ll);
-                            empty_stage[124 + 0] = _v4.x;
-                            empty_stage[124 + 1] = _v4.y;
-                            empty_stage[124 + 2] = _v4.z;
-                            empty_stage[124 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[0 + 0], empty_stage[0 + 1], empty_stage[0 + 2], empty_stage[0 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 0ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[4 + 0], empty_stage[4 + 1], empty_stage[4 + 2], empty_stage[4 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 4ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[8 + 0], empty_stage[8 + 1], empty_stage[8 + 2], empty_stage[8 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 8ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[12 + 0], empty_stage[12 + 1], empty_stage[12 + 2], empty_stage[12 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 12ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[16 + 0], empty_stage[16 + 1], empty_stage[16 + 2], empty_stage[16 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 16ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[20 + 0], empty_stage[20 + 1], empty_stage[20 + 2], empty_stage[20 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 20ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[24 + 0], empty_stage[24 + 1], empty_stage[24 + 2], empty_stage[24 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 24ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[28 + 0], empty_stage[28 + 1], empty_stage[28 + 2], empty_stage[28 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 28ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[32 + 0], empty_stage[32 + 1], empty_stage[32 + 2], empty_stage[32 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 32ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[36 + 0], empty_stage[36 + 1], empty_stage[36 + 2], empty_stage[36 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 36ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[40 + 0], empty_stage[40 + 1], empty_stage[40 + 2], empty_stage[40 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 40ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[44 + 0], empty_stage[44 + 1], empty_stage[44 + 2], empty_stage[44 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 44ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[48 + 0], empty_stage[48 + 1], empty_stage[48 + 2], empty_stage[48 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 48ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[52 + 0], empty_stage[52 + 1], empty_stage[52 + 2], empty_stage[52 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 52ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[56 + 0], empty_stage[56 + 1], empty_stage[56 + 2], empty_stage[56 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 56ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[60 + 0], empty_stage[60 + 1], empty_stage[60 + 2], empty_stage[60 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 60ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[64 + 0], empty_stage[64 + 1], empty_stage[64 + 2], empty_stage[64 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 64ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[68 + 0], empty_stage[68 + 1], empty_stage[68 + 2], empty_stage[68 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 68ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[72 + 0], empty_stage[72 + 1], empty_stage[72 + 2], empty_stage[72 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 72ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[76 + 0], empty_stage[76 + 1], empty_stage[76 + 2], empty_stage[76 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 76ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[80 + 0], empty_stage[80 + 1], empty_stage[80 + 2], empty_stage[80 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 80ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[84 + 0], empty_stage[84 + 1], empty_stage[84 + 2], empty_stage[84 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 84ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[88 + 0], empty_stage[88 + 1], empty_stage[88 + 2], empty_stage[88 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 88ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[92 + 0], empty_stage[92 + 1], empty_stage[92 + 2], empty_stage[92 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 92ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[96 + 0], empty_stage[96 + 1], empty_stage[96 + 2], empty_stage[96 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 96ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[100 + 0], empty_stage[100 + 1], empty_stage[100 + 2], empty_stage[100 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 100ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[104 + 0], empty_stage[104 + 1], empty_stage[104 + 2], empty_stage[104 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 104ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[108 + 0], empty_stage[108 + 1], empty_stage[108 + 2], empty_stage[108 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 108ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[112 + 0], empty_stage[112 + 1], empty_stage[112 + 2], empty_stage[112 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 112ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[116 + 0], empty_stage[116 + 1], empty_stage[116 + 2], empty_stage[116 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 116ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[120 + 0], empty_stage[120 + 1], empty_stage[120 + 2], empty_stage[120 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 120ll)) + 0) = _v4;
-                        }
-                        {
-                            float4 _v4 = make_float4(empty_stage[124 + 0], empty_stage[124 + 1], empty_stage[124 + 2], empty_stage[124 + 3]);
-                            *reinterpret_cast<float4*>((output_state + (empty_output_base + 124ll)) + 0) = _v4;
+                        #pragma unroll
+                        for (int empty_state_vec = 0; empty_state_vec < 32; empty_state_vec++) {
+                            int empty_state_col = empty_state_vec * 4;
+                            float _vec_load[4];
+                            {
+                                uint2 _vld_20;
+                                asm volatile("ld.global.nc.v2.b32 {%0, %1}, [%2];"
+                                    : "=r"(_vld_20.x), "=r"(_vld_20.y) : "l"((const void*)(initial_state + empty_initial_base + (long long)empty_state_col)));
+                                uint32_t* _vpairs_20 = reinterpret_cast<uint32_t*>(&_vld_20);
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 2; _pair++) {
+                                    (&_vec_load[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_20[_pair]) << 16);
+                                    (&_vec_load[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_20[_pair]) & 0xffff0000u);
+                                }
+                            }
+                            unsigned int packed[2];
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_vec_load[_lp*2 + 0], _vec_load[_lp*2+1 + 0]));
+                                packed[_lp] = *(uint32_t*)&_bf2;
+                            }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_vec_load[_lp*2 + 2], _vec_load[_lp*2+1 + 2]));
+                                packed[_lp + 1] = *(uint32_t*)&_bf2;
+                            }
+                            reinterpret_cast<int2*>(output_state + (empty_output_base + (long long)empty_state_col))[0] = reinterpret_cast<int2*>(packed)[0];
                         }
                     } else {
                         #pragma unroll 1
                         for (int state_copy_step = 0; state_copy_step < 32; state_copy_step++) {
                             float state_copy_vals[4];
                             {
-                                state_copy_vals[0] = *reinterpret_cast<const float*>(initial_state + (empty_initial_base + (long long)(state_copy_step * 4)));
+                                uint32_t _bf16_bits_21;
+                                asm volatile("ld.global.nc.u16 %0, [%1];"
+                                    : "=r"(_bf16_bits_21) : "l"((const void*)(initial_state + (empty_initial_base + (long long)(state_copy_step * 4)))));
+                                state_copy_vals[0] = __uint_as_float(_bf16_bits_21 << 16);
                             }
                             {
-                                state_copy_vals[1] = *reinterpret_cast<const float*>(initial_state + (empty_initial_base + (long long)(state_copy_step * 4 + 1)));
+                                uint32_t _bf16_bits_22;
+                                asm volatile("ld.global.nc.u16 %0, [%1];"
+                                    : "=r"(_bf16_bits_22) : "l"((const void*)(initial_state + (empty_initial_base + (long long)(state_copy_step * 4 + 1)))));
+                                state_copy_vals[1] = __uint_as_float(_bf16_bits_22 << 16);
                             }
                             {
-                                state_copy_vals[2] = *reinterpret_cast<const float*>(initial_state + (empty_initial_base + (long long)(state_copy_step * 4 + 2)));
+                                uint32_t _bf16_bits_23;
+                                asm volatile("ld.global.nc.u16 %0, [%1];"
+                                    : "=r"(_bf16_bits_23) : "l"((const void*)(initial_state + (empty_initial_base + (long long)(state_copy_step * 4 + 2)))));
+                                state_copy_vals[2] = __uint_as_float(_bf16_bits_23 << 16);
                             }
                             {
-                                state_copy_vals[3] = *reinterpret_cast<const float*>(initial_state + (empty_initial_base + (long long)(state_copy_step * 4 + 3)));
+                                uint32_t _bf16_bits_24;
+                                asm volatile("ld.global.nc.u16 %0, [%1];"
+                                    : "=r"(_bf16_bits_24) : "l"((const void*)(initial_state + (empty_initial_base + (long long)(state_copy_step * 4 + 3)))));
+                                state_copy_vals[3] = __uint_as_float(_bf16_bits_24 << 16);
                             }
-                            *(reinterpret_cast<float*>(output_state + (empty_output_base + (long long)(state_copy_step * 4))) + (0)) = state_copy_vals[0];
-                            *(reinterpret_cast<float*>(output_state + (empty_output_base + (long long)(state_copy_step * 4 + 1))) + (0)) = state_copy_vals[1];
-                            *(reinterpret_cast<float*>(output_state + (empty_output_base + (long long)(state_copy_step * 4 + 2))) + (0)) = state_copy_vals[2];
-                            *(reinterpret_cast<float*>(output_state + (empty_output_base + (long long)(state_copy_step * 4 + 3))) + (0)) = state_copy_vals[3];
+                            unsigned int packed_2[2];
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_copy_vals[_lp*2 + 0], state_copy_vals[_lp*2+1 + 0]));
+                                packed_2[_lp] = *(uint32_t*)&_bf2;
+                            }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_copy_vals[_lp*2 + 2], state_copy_vals[_lp*2+1 + 2]));
+                                packed_2[_lp + 1] = *(uint32_t*)&_bf2;
+                            }
+                            *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state + (empty_output_base + (long long)(state_copy_step * 4))) + 0) = (unsigned short)((uint16_t)packed_2[0]);
+                            *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state + (empty_output_base + (long long)(state_copy_step * 4))) + 1) = (unsigned short)((uint16_t)(packed_2[0] >> 16));
+                            *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state + (empty_output_base + (long long)(state_copy_step * 4))) + 2) = (unsigned short)((uint16_t)packed_2[1]);
+                            *reinterpret_cast<unsigned short*>(reinterpret_cast<uint16_t*>(output_state + (empty_output_base + (long long)(state_copy_step * 4))) + 3) = (unsigned short)((uint16_t)(packed_2[1] >> 16));
                         }
                     }
                     #endif  // CAKE_GDN_STATE_VEC_ALIGNED
@@ -3203,17 +2707,6 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                 int seqlen_b_3 = batch_end_3 - batch_start_3;
                 int num_pairs_b_3 = (seqlen_b_3 + 128 - 1) / 128;
                 int num_chunks_b_3 = num_pairs_b_3 * 2;
-                if (USE_INITIAL_STATE != 0 && (int)tile_3 >= num_bids && (num_chunks_b_3 > 0 || STORE_FINAL_STATE != 0)) {
-                    if (elect_sync()) {
-                        long long pf_state_base = (long long)batch_idx_3 * initial_state_stride_slot + (long long)head_idx_3 * 16384ll;
-                        int pf_skew = (int)(-((unsigned long long)initial_state + (unsigned long long)pf_state_base * 4ull) & 15ull);
-                        long long pf_first = pf_state_base + (long long)(pf_skew / 4);
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + pf_first), "r"((uint32_t)(((1) ? 16384 : 16384 - (pf_skew + 15) / 16 * 16))) : "memory");
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + (pf_first + 4096ll)), "r"((uint32_t)(((1) ? 16384 : 16384 - (pf_skew + 15) / 16 * 16))) : "memory");
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + (pf_first + 8192ll)), "r"((uint32_t)(((1) ? 16384 : 16384 - (pf_skew + 15) / 16 * 16))) : "memory");
-                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + (pf_first + 12288ll)), "r"((uint32_t)(((0) ? 16384 : 16384 - (pf_skew + 15) / 16 * 16))) : "memory");
-                    }
-                }
                 int k_head_idx = ((num_q_heads >= num_v_heads) ? v_head_idx_3 : qk_head_idx_3);
                 if (elect_sync()) {
                     asm volatile("tensormap.replace.tile.global_dim.global.b1024.b32 [%0], 1, %1;" :: "l"((uint64_t)(tensormap_workspace + cta_slot_base)), "r"((uint32_t)(batch_end_3)) : "memory");
@@ -3834,38 +3327,9 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                 }
                 int num_valid_chunks_b = (batch_end_5 - batch_start_5 + 64 - 1) / 64;
                 int gate_chunks_b = ((UNIT_GATES != 0) ? 0 : num_chunks_b_5);
-                int tile_ord = (int)tile_5 - bid;
-                int gate_prologue_chunks = ((tile_ord == 0) ? gate_chunks_b : 0);
-                int gate_next_issued = 0;
-                int next_tile_i32 = (int)tile_5 + num_bids;
-                int next_head_idx = 0;
-                int next_batch_start = 0;
-                int next_batch_end = 0;
-                int next_gate_budget = 0;
-                if (next_tile_i32 < total_tiles) {
-                    int num_o_heads_0 = ((IS_GQA != 0) ? num_q_heads : num_v_heads);
-                    int batch_idx_0 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)next_tile_i32 >> (unsigned int)NUM_O_HEADS_LOG2 : (unsigned int)next_tile_i32 / (unsigned int)num_o_heads_0);
-                    int head_idx_0 = ((NUM_O_HEADS_LOG2 >= 0) ? (unsigned int)next_tile_i32 & (unsigned int)(num_o_heads_0 - 1) : (unsigned int)next_tile_i32 % (unsigned int)num_o_heads_0);
-                    int qk_head_idx_0 = ((IS_GQA != 0) ? head_idx_0 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_0 >> HEAD_GROUP_LOG2 : head_idx_0 / (num_v_heads / num_q_heads)));
-                    int v_head_idx_0 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_0 >> HEAD_GROUP_LOG2 : head_idx_0 / (num_q_heads / num_v_heads)) : head_idx_0);
-                    int raw_batch_start_0 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_0] : cu_seqlens[batch_idx_0]);
-                    int raw_batch_end_0 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_0 + 1)] : cu_seqlens[batch_idx_0 + 1]);
-                    int batch_start_floor_0 = ((raw_batch_start_0 > 0) ? raw_batch_start_0 : 0);
-                    int batch_start_0 = ((batch_start_floor_0 < total_tokens) ? batch_start_floor_0 : total_tokens);
-                    int batch_end_floor_0 = ((raw_batch_end_0 > batch_start_0) ? raw_batch_end_0 : batch_start_0);
-                    int batch_end_0 = ((batch_end_floor_0 < total_tokens) ? batch_end_floor_0 : total_tokens);
-                    int seqlen_b_0 = batch_end_0 - batch_start_0;
-                    int num_pairs_b_1_1 = (seqlen_b_0 + 128 - 1) / 128;
-                    int num_chunks_b_0 = num_pairs_b_1_1 * 2;
-                    next_head_idx = head_idx_0;
-                    next_batch_start = batch_start_0;
-                    next_batch_end = batch_end_0;
-                    int la_gate_chunks = ((UNIT_GATES != 0) ? 0 : num_chunks_b_0);
-                    next_gate_budget = ((la_gate_chunks < 4) ? la_gate_chunks : 4);
-                }
                 #pragma unroll
                 for (int prefetch_idx = 0; prefetch_idx < 4; prefetch_idx++) {
-                    if (gate_prologue_chunks > prefetch_idx) {
+                    if (gate_chunks_b > prefetch_idx) {
                         int prefetch_offset = batch_start_5 + prefetch_idx * 64;
                         mbarrier_wait(gate_cg0_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
                         mbarrier_wait(gate_cg1_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
@@ -4085,116 +3549,6 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                         gate_k_prod += 1;
                         if (gate_k_prod == 5) { gate_k_prod = 0; _phase_gate_cg0_empty ^= 1; }
                     }
-                    int next_due = ((prefetch_idx_1 >= gate_chunks_b && gate_next_issued < next_gate_budget) ? 1 : 0);
-                    if (next_due == 1) {
-                        int next_valid_chunks = (next_batch_end - next_batch_start + 64 - 1) / 64;
-                        int next_gate_offset = next_batch_start + gate_next_issued * 64;
-                        mbarrier_wait(gate_cg0_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
-                        mbarrier_wait(gate_cg1_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
-                        mbarrier_wait(beta_smem_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
-                        int gb_lane_2 = lane;
-                        int gate_elem_base_2 = gate_k_prod * 64;
-                        float gate_log_0_2 = 0.0f;
-                        float gate_log_1_2 = 0.0f;
-                        int token_0_2 = next_gate_offset + gb_lane_2;
-                        int token_1_2 = token_0_2 + 32;
-                        int gate_idx_0_2 = token_0_2 * num_o_heads_5 + next_head_idx;
-                        int gate_idx_1_2 = token_1_2 * num_o_heads_5 + next_head_idx;
-                        int beta_idx_0_2 = gate_idx_0_2;
-                        int beta_idx_1_2 = gate_idx_1_2;
-                        float gate_val_0_2 = 1.0f;
-                        float gate_val_1_2 = 1.0f;
-                        if (gate_next_issued >= next_valid_chunks - 1) {
-                            if (token_0_2 < next_batch_end) {
-                                gate_val_0_2 = gate[gate_idx_0_2];
-                            }
-                            if (token_1_2 < next_batch_end) {
-                                gate_val_1_2 = gate[gate_idx_1_2];
-                            }
-                        } else {
-                            gate_val_0_2 = gate[gate_idx_0_2];
-                            gate_val_1_2 = gate[gate_idx_1_2];
-                        }
-                        float _log2_10;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_10) : "f"(gate_val_0_2 + 1e-10f));
-                        gate_log_0_2 = _log2_10;
-                        float _log2_11;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_11) : "f"(gate_val_1_2 + 1e-10f));
-                        gate_log_1_2 = _log2_11;
-                        float shfl_up_11 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_2, 1, 32);
-                        if (gb_lane_2 >= 1) {
-                            gate_log_0_2 = gate_log_0_2 + shfl_up_11;
-                        }
-                        float shfl_up_1_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_2, 1, 32);
-                        if (gb_lane_2 >= 1) {
-                            gate_log_1_2 = gate_log_1_2 + shfl_up_1_2;
-                        }
-                        float shfl_up_2_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_2, 2, 32);
-                        if (gb_lane_2 >= 2) {
-                            gate_log_0_2 = gate_log_0_2 + shfl_up_2_2;
-                        }
-                        float shfl_up_3_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_2, 2, 32);
-                        if (gb_lane_2 >= 2) {
-                            gate_log_1_2 = gate_log_1_2 + shfl_up_3_2;
-                        }
-                        float shfl_up_4_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_2, 4, 32);
-                        if (gb_lane_2 >= 4) {
-                            gate_log_0_2 = gate_log_0_2 + shfl_up_4_2;
-                        }
-                        float shfl_up_5_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_2, 4, 32);
-                        if (gb_lane_2 >= 4) {
-                            gate_log_1_2 = gate_log_1_2 + shfl_up_5_2;
-                        }
-                        float shfl_up_6_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_2, 8, 32);
-                        if (gb_lane_2 >= 8) {
-                            gate_log_0_2 = gate_log_0_2 + shfl_up_6_2;
-                        }
-                        float shfl_up_7_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_2, 8, 32);
-                        if (gb_lane_2 >= 8) {
-                            gate_log_1_2 = gate_log_1_2 + shfl_up_7_2;
-                        }
-                        float shfl_up_8_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_2, 16, 32);
-                        if (gb_lane_2 >= 16) {
-                            gate_log_0_2 = gate_log_0_2 + shfl_up_8_2;
-                        }
-                        float shfl_up_9_2 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_2, 16, 32);
-                        if (gb_lane_2 >= 16) {
-                            gate_log_1_2 = gate_log_1_2 + shfl_up_9_2;
-                        }
-                        float _shfl_sync_12;
-                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xFFFFFFFF;" : "=f"(_shfl_sync_12) : "f"(gate_log_0_2), "r"(31));
-                        gate_log_1_2 = gate_log_1_2 + _shfl_sync_12;
-                        smem_cumsumlog[gate_elem_base_2 + gb_lane_2] = gate_log_0_2;
-                        smem_cumsumlog[gate_elem_base_2 + gb_lane_2 + 32] = gate_log_1_2;
-                        float _exp2_13_1 = approx_exp2(gate_log_0_2);
-                        smem_cumprod[gate_elem_base_2 + gb_lane_2] = _exp2_13_1;
-                        float _exp2_14 = approx_exp2(gate_log_1_2);
-                        smem_cumprod[gate_elem_base_2 + gb_lane_2 + 32] = _exp2_14;
-                        mbarrier_arrive(load_gate_full_addr + (gate_k_prod) * 8);
-                        int beta_stage_addr_2 = smem_beta_addr + gate_k_prod * 256;
-                        int beta_dst_0_2 = beta_stage_addr_2 + gb_lane_2 * 4;
-                        int beta_dst_1_2 = beta_stage_addr_2 + (gb_lane_2 + 32) * 4;
-                        if (gate_next_issued >= next_valid_chunks - 1) {
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
-                                :: "r"(beta_dst_0_2), "l"(beta + beta_idx_0_2), "r"((token_0_2 < next_batch_end) ? 4 : 0));
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
-                                :: "r"(beta_dst_1_2), "l"(beta + beta_idx_1_2), "r"((token_1_2 < next_batch_end) ? 4 : 0));
-                        } else {
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
-                                :: "r"(beta_dst_0_2), "l"(beta + beta_idx_0_2));
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
-                                :: "r"(beta_dst_1_2), "l"(beta + beta_idx_1_2));
-                        }
-                        asm volatile("cp.async.commit_group;");
-                        asm volatile(
-                            "{\n\t"
-                            "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
-                            "}"
-                            :: "r"(load_beta_full_addr + (gate_k_prod) * 8) : "memory");
-                        gate_k_prod += 1;
-                        if (gate_k_prod == 5) { gate_k_prod = 0; _phase_gate_cg0_empty ^= 1; }
-                        gate_next_issued = gate_next_issued + 1;
-                    }
                     mbarrier_wait(o_store_ready_addr + (o_epi_stage) * 8, _phase_o_store_ready);
                     if (lane == 0) {
                         if (chunk_idx_6 == 0) {
@@ -4214,118 +3568,6 @@ kernel_cake_gdn_d48ff4b056112bb361ba_pf(const __grid_constant__ CUtensorMap Q, c
                         mbarrier_arrive(o_smem_empty_addr + (o_release_stage) * 8);
                         o_release_stage += 1;
                         if (o_release_stage == 2) { o_release_stage = 0; }
-                    }
-                }
-                #pragma unroll
-                for (int next_idx = 0; next_idx < 4; next_idx++) {
-                    int tail_due = ((gate_next_issued <= next_idx && next_gate_budget > next_idx) ? 1 : 0);
-                    if (tail_due == 1) {
-                        int next_valid_chunks_1 = (next_batch_end - next_batch_start + 64 - 1) / 64;
-                        int next_gate_offset_1 = next_batch_start + next_idx * 64;
-                        mbarrier_wait(gate_cg0_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
-                        mbarrier_wait(gate_cg1_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
-                        mbarrier_wait(beta_smem_empty_addr + (gate_k_prod) * 8, _phase_gate_cg0_empty);
-                        int gb_lane_3 = lane;
-                        int gate_elem_base_3 = gate_k_prod * 64;
-                        float gate_log_0_3 = 0.0f;
-                        float gate_log_1_3 = 0.0f;
-                        int token_0_3 = next_gate_offset_1 + gb_lane_3;
-                        int token_1_3 = token_0_3 + 32;
-                        int gate_idx_0_3 = token_0_3 * num_o_heads_5 + next_head_idx;
-                        int gate_idx_1_3 = token_1_3 * num_o_heads_5 + next_head_idx;
-                        int beta_idx_0_3 = gate_idx_0_3;
-                        int beta_idx_1_3 = gate_idx_1_3;
-                        float gate_val_0_3 = 1.0f;
-                        float gate_val_1_3 = 1.0f;
-                        if (next_valid_chunks_1 - 1 <= next_idx) {
-                            if (token_0_3 < next_batch_end) {
-                                gate_val_0_3 = gate[gate_idx_0_3];
-                            }
-                            if (token_1_3 < next_batch_end) {
-                                gate_val_1_3 = gate[gate_idx_1_3];
-                            }
-                        } else {
-                            gate_val_0_3 = gate[gate_idx_0_3];
-                            gate_val_1_3 = gate[gate_idx_1_3];
-                        }
-                        float _log2_15;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_15) : "f"(gate_val_0_3 + 1e-10f));
-                        gate_log_0_3 = _log2_15;
-                        float _log2_16;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_16) : "f"(gate_val_1_3 + 1e-10f));
-                        gate_log_1_3 = _log2_16;
-                        float shfl_up_12 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_3, 1, 32);
-                        if (gb_lane_3 >= 1) {
-                            gate_log_0_3 = gate_log_0_3 + shfl_up_12;
-                        }
-                        float shfl_up_1_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_3, 1, 32);
-                        if (gb_lane_3 >= 1) {
-                            gate_log_1_3 = gate_log_1_3 + shfl_up_1_3;
-                        }
-                        float shfl_up_2_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_3, 2, 32);
-                        if (gb_lane_3 >= 2) {
-                            gate_log_0_3 = gate_log_0_3 + shfl_up_2_3;
-                        }
-                        float shfl_up_3_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_3, 2, 32);
-                        if (gb_lane_3 >= 2) {
-                            gate_log_1_3 = gate_log_1_3 + shfl_up_3_3;
-                        }
-                        float shfl_up_4_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_3, 4, 32);
-                        if (gb_lane_3 >= 4) {
-                            gate_log_0_3 = gate_log_0_3 + shfl_up_4_3;
-                        }
-                        float shfl_up_5_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_3, 4, 32);
-                        if (gb_lane_3 >= 4) {
-                            gate_log_1_3 = gate_log_1_3 + shfl_up_5_3;
-                        }
-                        float shfl_up_6_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_3, 8, 32);
-                        if (gb_lane_3 >= 8) {
-                            gate_log_0_3 = gate_log_0_3 + shfl_up_6_3;
-                        }
-                        float shfl_up_7_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_3, 8, 32);
-                        if (gb_lane_3 >= 8) {
-                            gate_log_1_3 = gate_log_1_3 + shfl_up_7_3;
-                        }
-                        float shfl_up_8_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_0_3, 16, 32);
-                        if (gb_lane_3 >= 16) {
-                            gate_log_0_3 = gate_log_0_3 + shfl_up_8_3;
-                        }
-                        float shfl_up_9_3 = __shfl_up_sync(0xFFFFFFFF, gate_log_1_3, 16, 32);
-                        if (gb_lane_3 >= 16) {
-                            gate_log_1_3 = gate_log_1_3 + shfl_up_9_3;
-                        }
-                        float _shfl_sync_17;
-                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xFFFFFFFF;" : "=f"(_shfl_sync_17) : "f"(gate_log_0_3), "r"(31));
-                        gate_log_1_3 = gate_log_1_3 + _shfl_sync_17;
-                        smem_cumsumlog[gate_elem_base_3 + gb_lane_3] = gate_log_0_3;
-                        smem_cumsumlog[gate_elem_base_3 + gb_lane_3 + 32] = gate_log_1_3;
-                        float _exp2_18 = approx_exp2(gate_log_0_3);
-                        smem_cumprod[gate_elem_base_3 + gb_lane_3] = _exp2_18;
-                        float _exp2_19 = approx_exp2(gate_log_1_3);
-                        smem_cumprod[gate_elem_base_3 + gb_lane_3 + 32] = _exp2_19;
-                        mbarrier_arrive(load_gate_full_addr + (gate_k_prod) * 8);
-                        int beta_stage_addr_3 = smem_beta_addr + gate_k_prod * 256;
-                        int beta_dst_0_3 = beta_stage_addr_3 + gb_lane_3 * 4;
-                        int beta_dst_1_3 = beta_stage_addr_3 + (gb_lane_3 + 32) * 4;
-                        if (next_valid_chunks_1 - 1 <= next_idx) {
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
-                                :: "r"(beta_dst_0_3), "l"(beta + beta_idx_0_3), "r"((token_0_3 < next_batch_end) ? 4 : 0));
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
-                                :: "r"(beta_dst_1_3), "l"(beta + beta_idx_1_3), "r"((token_1_3 < next_batch_end) ? 4 : 0));
-                        } else {
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
-                                :: "r"(beta_dst_0_3), "l"(beta + beta_idx_0_3));
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
-                                :: "r"(beta_dst_1_3), "l"(beta + beta_idx_1_3));
-                        }
-                        asm volatile("cp.async.commit_group;");
-                        asm volatile(
-                            "{\n\t"
-                            "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
-                            "}"
-                            :: "r"(load_beta_full_addr + (gate_k_prod) * 8) : "memory");
-                        gate_k_prod += 1;
-                        if (gate_k_prod == 5) { gate_k_prod = 0; _phase_gate_cg0_empty ^= 1; }
                     }
                 }
                 if (active_output_chunks_b > 0) {
