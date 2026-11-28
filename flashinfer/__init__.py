@@ -172,6 +172,12 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    # GC MoE (Green Context MoE): the operator entry plus its workspace and
+    # weight-transform companions.  The facade imports the CuTe DSL backend
+    # (under flashinfer.experimental.gc_moe) on first use.
+    "gc_moe": (".gc_moe_ops", "gc_moe"),
+    "GCMoEWorkspace": (".gc_moe_ops", "GCMoEWorkspace"),
+    "transform_gc_moe_weights": (".gc_moe_ops", "transform_gc_moe_weights"),
 }
 
 
