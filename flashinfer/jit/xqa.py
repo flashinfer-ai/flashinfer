@@ -61,6 +61,8 @@ def gen_xqa_module(
     output_dtype: torch.dtype,
     q_seq_len: int = 1,
     use_ragged_q: bool = False,
+    *,
+    _sm120_long_kv: bool = False,
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -162,8 +164,9 @@ def gen_xqa_module(
     # Suffix the URI only when ragged Q actually changes the compile flags
     # (i.e. it suppressed the SPEC_Q_SEQ_LEN specialization above).
     ragged_suffix = "_ragged_q" if ragged_changes_flags else ""
+    long_kv_suffix = "_sm120_long_kv" if _sm120_long_kv else ""
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}{long_kv_suffix}",
         sources,
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags
@@ -176,7 +179,8 @@ def gen_xqa_module(
         + flag_low_prec_output
         + flag_spec_dec
         + flag_mla_wrapper
-        + flag_sm90_mha,
+        + flag_sm90_mha
+        + (["-DXQA_SM120_LONG_KV=1"] if _sm120_long_kv else []),
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
 

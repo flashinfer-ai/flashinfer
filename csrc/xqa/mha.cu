@@ -76,7 +76,17 @@ constexpr bool enableMicroFastPath = false;
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
 // z: must be 2 for warp specialization.
+// Host launch dimensions and every device image in a fatbin must agree on the CTA shape.
+#if XQA_SM120_LONG_KV
+static_assert(!SPEC_DEC && !SLIDING_WINDOW && beamWidth == 1 && headGrpSize == 8 &&
+              validElemsPerHead == 64 && tokensPerPage == 16 && usePagedKVCache);
+static_assert(mha::is_same_v<InputElem, __nv_bfloat16> &&
+              mha::is_same_v<OutputElem, __nv_bfloat16> &&
+              mha::is_same_v<CacheElem, __nv_fp8_e4m3>);
+constexpr uint3 ctaShapeInWarps = {2, 1, 2};
+#else
 constexpr uint3 ctaShapeInWarps = {4, 1, 2};
+#endif
 
 static_assert(ctaShapeInWarps.z == 2);  // for warp specialization
 constexpr uint32_t nbWarpsPerCta = ctaShapeInWarps.x * ctaShapeInWarps.y * ctaShapeInWarps.z;
@@ -109,7 +119,10 @@ constexpr uint32_t cvtExpansion = exactDiv(inputElemSize, cacheElemSize);
 // At HEAD_ELEMS > 256 the group-shared V buffer holds full heads (grpLoadV), so shrink
 // the V tile sequence length to keep smem within budget: on 99KB archs (SM86/89/120/121)
 // 16-bit KV needs 16 tokens per tile (fp8 fits at 32); 227KB archs fit 32 for both.
-#ifndef __CUDA_ARCH__
+#if XQA_SM120_LONG_KV
+constexpr uint32_t preferedKHeadPartBytes = 64;
+__constant__ constexpr uint32_t cacheVTileSeqLen = 64;
+#elif !defined(__CUDA_ARCH__)
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen =
     (HEAD_ELEMS > 256 && CACHE_ELEM_ENUM == 0 ? 16 : 32);
@@ -996,19 +1009,32 @@ loadMatrix(Warp const& warp, Array2D<LdGrain, srcRows, srcCols> const& src, uint
   return dst;
 }
 
+#if XQA_SM120_LONG_KV
+static_assert(persistentQ && nbPartsPerCacheKHead == 1 && ctaTile.x == 128 && ctaSize == 128);
+using QGemmSlice = Array2D<InstInMat<2, 2>, exactDiv(warpTile.y, 16), 1>;
+constexpr uint32_t nbQGemmSlices = exactDiv(headElems, 16U);
+using QGemmFragments = QGemmSlice[nbQGemmSlices];
+#endif
+
 // acc is used as both input and output
 // qColBeg is in the unit of LdGrain
 // using KElemType = int8_t;
 template <typename KElemType>
 __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
+#if XQA_SM120_LONG_KV
+                                      QGemmFragments const& qFragments,
+#else
                                       SharedMem::QSmemBuffer const& q, uint32_t qColBeg,
+#endif
                                       SharedMem::KSmemBuffer const& k
 #if ENABLE_4BIT_KV_CACHE
                                       ,
                                       SharedMem::KSfSmemBuffer const& kSf
 #endif
 ) {
+#if !XQA_SM120_LONG_KV
   assert(qColBeg % (SharedMem::KSmemBuffer::cols) == 0);
+#endif
   constexpr uint32_t kEx = 2;
   constexpr uint32_t mnEx = 2;
   static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>,
@@ -1077,15 +1103,24 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
 
   // @fixme: check if compiler mixes LDS+HMMA and does prefetch properly. We are not doing prefetch
   // explicitly. But we do fully unroll and expect compiler to do that for us.
+#if XQA_SM120_LONG_KV
+  static_assert(gemmKSplit == nbQGemmSlices);
+#pragma unroll
+#else
   constexpr uint32_t nbUnroll = cacheElemSize == 2 ? gemmKSplit : 2;
 #pragma unroll(nbUnroll)
+#endif
   for (uint32_t s = 0; s < gemmKSplit; s++) {
     // load q
     constexpr uint32_t qSliceRows = exactDiv(warpTile.y, 8 * mnEx);  // in InstInMat
+#if XQA_SM120_LONG_KV
+    auto const& qSlice = qFragments[s];
+#else
     constexpr uint32_t qSliceCols = nbInstInMatPerSliceInGemmKDim;
     Array2D<InstInMat<kEx, mnEx>, qSliceRows, qSliceCols> const qSlice =
         loadMatrix<kEx, mnEx, qSliceRows, qSliceCols, false, false, false, false>(
             warp, q, 0, qColBeg + kEx * qSliceCols * s);
+#endif
     // load k
     constexpr uint32_t cvtExp = exactDiv(inputElemSize, kElemSize);
     constexpr uint32_t mnExK = mnEx * cvtExp;
@@ -1592,6 +1627,15 @@ CUBIN_EXPORT __global__
         uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
 #endif
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
+#if XQA_SM120_LONG_KV
+  // K and V are independently based HND views with strides measured here in cache heads.
+  static_assert(sizeof(GMemCacheHead) == 64);
+  assert(nbKHeads == 8 && kv_stride_page == 2 * 8 * tokensPerPage &&
+         kv_stride_head == tokensPerPage && kv_stride_token == 1);
+  kv_stride_page = 2 * 8 * tokensPerPage;
+  kv_stride_head = tokensPerPage;
+  kv_stride_token = 1;
+#endif
 
   assert(allowMultiBlockMode || gridDim.x == 1);
   bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
@@ -1969,6 +2013,15 @@ CUBIN_EXPORT __global__
     ThrdRegRowMax initRowMax;
     initRowMax.fill(safeInitRowMax);
 #endif
+#if XQA_SM120_LONG_KV
+    // Every K tile uses the same Q after the shared-memory reorder is complete.
+    QGemmFragments qFragments;
+#pragma unroll
+    for (uint32_t s = 0; s < nbQGemmSlices; ++s) {
+      qFragments[s] = loadMatrix<2, 2, exactDiv(warpTile.y, 16), 1, false, false, false, false>(
+          warp, smem.q[warpIdx.y][0], 0, 2 * s);
+    }
+#endif
     for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters) {
 #if SHORT_SEQ_OPT
       if (ctaTile.x * seqIter + warpTile.x * warpIdx.x >= cacheSeqLen) {
@@ -2008,9 +2061,11 @@ CUBIN_EXPORT __global__
             // synchronize k
             ldgsts::waitGroup<1>();
           }
+#if !XQA_SM120_LONG_KV
           SharedMem::QSmemBuffer const& smemQ = smem.q[warpIdx.y][0];
           constexpr uint32_t qOffsetPerPart = exactDiv(elemsPerKHeadPart, inputElemsPerGrain);
           uint32_t const smemQOffset = qOffsetPerPart * p;
+#endif
           SharedMem::KSmemBuffer const& smemKPart = getSMemKTile(idxCurrSMemKBuf);
 #if ENABLE_4BIT_KV_CACHE
           SharedMem::KSfSmemBuffer const& smemKSfPart = getSMemKSfTile(idxCurrSMemKBuf);
@@ -2027,12 +2082,17 @@ CUBIN_EXPORT __global__
           //                     }
           // #endif
           // do computation.
+#if XQA_SM120_LONG_KV
+          static_assert(nbPartsPerKHead == 1);
+          smemQKPartGemm<KElemType>(warp, acc, qFragments, smemKPart);
+#else
           smemQKPartGemm<KElemType>(warp, acc, smemQ, smemQOffset, smemKPart
 #if ENABLE_4BIT_KV_CACHE
                                     ,
                                     smemKSfPart
 #endif
           );
+#endif
           idxCurrSMemKBuf++;
         }
         return acc;
@@ -2876,7 +2936,9 @@ CUBIN_EXPORT __global__
   }
 }
 
-#if SPEC_DEC
+#if XQA_SM120_LONG_KV
+constexpr uint32_t nbCtaPerSM = 2;
+#elif SPEC_DEC
 #if __CUDA_ARCH__ == 900 && M_TILESIZE == 16
 constexpr uint32_t nbCtaPerSM = 2;
 #else
@@ -2894,7 +2956,7 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType =
     XQAKernelType::kAMPERE_WARP_SPECIALIZED;
 
 #ifdef NDEBUG
-CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
+CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
     uint32_t const qSeqLen, uint32_t const nbKHeads, uint32_t const headGrpSize,
     SeqLenDataType const* qCuSeqLens,

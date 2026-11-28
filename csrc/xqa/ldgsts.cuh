@@ -31,11 +31,15 @@ __device__ inline void copyAsync(void* dst, void const* src,
 {
   static_assert(size == 4 || size == 8 || size == 16);
   if constexpr (size == 16) {
-    // asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::
-    // "l"(__cvta_generic_to_shared(dst)), "l"(src), "r"(srcSize));
+#if XQA_SM120_LONG_KV
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;" ::"l"(
+                     __cvta_generic_to_shared(dst)),
+                 "l"(src), "r"(srcSize));
+#else
     asm volatile(
         "cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"l"(__cvta_generic_to_shared(dst)),
         "l"(src), "r"(srcSize));
+#endif
   } else {
     asm volatile(
         "cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"l"(__cvta_generic_to_shared(dst)),
