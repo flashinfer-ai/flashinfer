@@ -167,19 +167,27 @@ def _routes(
 ) -> Tuple[int, bool]:
     """(resident classes as a bit mask, scan) the call may need, from its
     shapes and the bound on a row's keys alone."""
-    # One segment, its queries the tail of its keys: every row sees at least
-    # this many keys.
-    least = (
-        num_keys - num_rows + 1
-        if num_segments == 1 and offsets is None and ratio == 1
-        else 0
-    )
+    least = _least_keys(num_keys, num_rows, num_segments, offsets, ratio)
     classes = 0
     for i, cap in enumerate(_CLASS_CAPS):
         lo = 0 if i == 0 else _RES_CAP * _CLASS_CAPS[i - 1]
         if bound > lo and least <= _RES_CAP * cap:
             classes |= 1 << i
     return classes, bound > _RES_CAP * _CLASS_CAPS[-1]
+
+
+def _least_keys(
+    num_keys: int,
+    num_rows: int,
+    num_segments: int,
+    offsets: Optional[torch.Tensor],
+    ratio: int,
+) -> int:
+    """Keys every row sees: one segment whose queries are the tail of its keys
+    gives row i this many plus i; otherwise 0 (unknown)."""
+    if num_segments == 1 and offsets is None and ratio == 1:
+        return max(0, num_keys - num_rows + 1)
+    return 0
 
 
 def _target(top_k: int) -> int:
@@ -195,14 +203,66 @@ def _res_cta_words(block_q: int, stride: int, slots: int = _RES_SLOTS) -> int:
     )
 
 
+def _check_candidate_out(
+    candidate_out: torch.Tensor, bs: int, num_rows: int, dev: torch.device
+) -> None:
+    if bs not in (8, 16):
+        # The scores' epilogue reduces a warp's 16 keys.
+        raise ValueError("candidate_out takes a candidate_block_size of 8 or 16")
+    if (
+        candidate_out.dtype != torch.int32
+        or candidate_out.device != dev
+        or candidate_out.dim() != 2
+        or candidate_out.shape[0] != num_rows
+        or not 1 <= candidate_out.shape[1] <= _MAX_TOP_K
+        or not candidate_out.is_contiguous()
+    ):
+        raise ValueError(
+            f"candidate_out must be a contiguous int32 [rows, C] tensor on q's "
+            f"device, 1 <= C <= {_MAX_TOP_K}"
+        )
+
+
+def _source_args(
+    candidate_out: Optional[torch.Tensor],
+    bs: int,
+    num_rows: int,
+    bound: int,
+    dev: torch.device,
+) -> tuple:
+    """The binding's source-row arguments (candidate_out and its scratch)."""
+    max_blocks = (bound + bs - 1) // bs
+    if candidate_out is None:
+        return (None, bs.bit_length() - 1, None, None, None, max_blocks)
+    return (
+        candidate_out,
+        bs.bit_length() - 1,
+        torch.empty(
+            num_rows, (max_blocks + 3) // 4 * 4, dtype=torch.float32, device=dev
+        ),
+        torch.empty(num_rows, dtype=torch.int32, device=dev),
+        _decode_long_ws(dev, num_rows, slot=1)
+        if max_blocks > _row_sel_keys()
+        else None,
+        max_blocks,
+    )
+
+
 def ragged_scratch_bytes(
     num_rows: int,
     top_k: int = 2048,
     num_heads: int = 32,
     device: Optional[torch.device] = None,
+    *,
+    candidate: Optional[str] = None,
+    max_seqlen_k: int = 0,
+    candidate_block_size: int = 8,
 ) -> int:
     """An upper bound of the scratch bytes a ragged call of ``num_rows`` rows
-    allocates, whatever its keys."""
+    allocates, whatever its keys. With ``candidate="source"``
+    (``candidate_out``) or ``"consumer"`` (``candidate_blocks``) it also
+    counts a word (source) or a bit (consumer) per row per block of
+    ``max_seqlen_k``: a source call's scratch grows with rows times keys."""
     if num_rows <= 0:
         return 0
     block_q = 128 // num_heads
@@ -218,12 +278,72 @@ def ragged_scratch_bytes(
         if device is not None
         else torch.device("cuda", torch.cuda.current_device())
     )
-    ctas = min(q_blocks, _sm_count(dev))
+    ctas = _sm_count(dev)  # split launches use every SM, whatever the rows
     res = max(
         _res_cta_words(block_q, _RES_CAP * cap, slots)
         for cap, slots in zip(_CLASS_CAPS, _CLASS_SLOTS, strict=True)
     )
-    return scan + rows + 4 * ctas * res
+    split = 4 * min(num_rows, ctas * block_q) * _RES_CAP * sum(_CLASS_CAPS)
+    plan = 4 * (4 * len(_CLASS_CAPS) + len(_CLASS_CAPS) * ctas + q_blocks + 2)
+    cand = 0
+    if candidate is not None:
+        if candidate not in ("source", "consumer"):
+            raise ValueError("candidate must be None, 'source' or 'consumer'")
+        blocks = max(
+            1, (max_seqlen_k + candidate_block_size - 1) // candidate_block_size
+        )
+        if candidate == "source":
+            cand = 4 * num_rows * ((blocks + 3) // 4 * 4 + 1)
+            if blocks > _row_sel_keys():
+                cand += 4 * num_rows * _long_words()
+        else:
+            cand = 4 * num_rows * (max(1, (blocks + 31) // 32) + 1)
+    return scan + rows + 4 * ctas * res + split + plan + cand
+
+
+_MAX_SPLIT_BLOCKS = 256  # kMaxSplitBlocks
+
+
+def _split_class_words(
+    classes: int, num_rows: int, block_q: int, bound: int, dev: torch.device
+) -> int:
+    """res_split words when several classes may each be split."""
+    rows = min(num_rows, _sm_count(dev) * block_q)
+    return sum(
+        rows * min(bound, _RES_CAP * cap)
+        for i, cap in enumerate(_CLASS_CAPS)
+        if classes >> i & 1
+    )
+
+
+# Schedule switches (tests compare the schedules bitwise). With several
+# resident classes: split a class of fewer blocks than the SMs over every SM,
+# run the classes' whole blocks from one queue launch, and run those launches
+# on side streams beside the scan.
+_CLASS_SPLIT = True
+_QUEUE = True
+_RES_CONCURRENT = True
+# "always" / "never" overrides _rest_leaves.
+_REST_RULE: Optional[str] = None
+
+
+def _rest_leaves(q_blocks: int, ctas: int, bound: int = 0, top_k: int = 0) -> bool:
+    """Whether one resident class's blocks past its whole waves may leave them
+    for the split launch, decided from the shapes alone so a captured graph
+    holds for every replay. rows_kernel makes the final decision on the
+    device from the row lengths; this only drops split launches that could
+    never be taken."""
+    rest = q_blocks % ctas
+    if (
+        rest == 0 or rest > _MAX_SPLIT_BLOCKS
+    ):  # the split launch's prefix (kMaxSplitBlocks)
+        return False
+    if _REST_RULE is not None:
+        return _REST_RULE == "always"
+    # Rows within the bound never pass rows_kernel's cost rule.
+    if bound and bound <= _module().rest_min_keys(q_blocks, ctas, top_k):
+        return False
+    return q_blocks < ctas or 2 * rest <= ctas
 
 
 def dsa_indexer_det_topk(
@@ -243,6 +363,9 @@ def dsa_indexer_det_topk(
     scores: Optional[torch.Tensor] = None,
     return_scores: bool = True,
     enable_pdl: Optional[bool] = None,
+    candidate_block_size: int = 8,
+    candidate_out: Optional[torch.Tensor] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """The ragged form (see flashinfer.dsa_indexer.dsa_indexer_det_topk)."""
     fp4 = q_scale is not None
@@ -284,6 +407,35 @@ def dsa_indexer_det_topk(
     indices, scores = _outputs(indices, scores, return_scores, num_rows, top_k, dev)
     # A row sees at most its segment's keys.
     bound = k.shape[0] if max_seqlen_k is None else min(k.shape[0], max_seqlen_k)
+    bs = int(candidate_block_size)
+    if candidate_out is not None:
+        if candidate_blocks is not None:
+            raise ValueError(
+                "candidate_blocks (consumer rows) and candidate_out (source rows) "
+                "are mutually exclusive"
+            )
+        _check_candidate_out(candidate_out, bs, num_rows, dev)
+    cand = None
+    if candidate_blocks is not None:
+        if bs < 8 or bs & (bs - 1) or bs > 128:
+            raise ValueError(
+                "candidate_block_size must be a power of two from 8 to 128"
+            )
+        if (
+            candidate_blocks.dtype != torch.int32
+            or candidate_blocks.device != dev
+            or candidate_blocks.dim() != 2
+            or candidate_blocks.shape[0] != num_rows
+            or candidate_blocks.shape[1] < 1
+        ):
+            raise ValueError(
+                "candidate_blocks must be int32 [T, C] on q's device, C >= 1"
+            )
+        cand = (
+            candidate_blocks
+            if candidate_blocks.stride(1) == 1
+            else candidate_blocks.contiguous()
+        )
     if num_rows == 0:
         return indices, scores
     if bound == 0:
@@ -291,6 +443,8 @@ def dsa_indexer_det_topk(
         indices.fill_(-1)
         if scores is not None:
             scores.fill_(-math.inf)
+        if candidate_out is not None:
+            candidate_out.fill_(-1)
         return indices, scores
 
     i32 = dict(dtype=torch.int32, device=dev)
@@ -299,6 +453,16 @@ def dsa_indexer_det_topk(
     classes, scan = _routes(
         bound, k.shape[0], num_rows, num_segments, q_causal_offsets, ratio
     )
+    block_q = 128 // num_heads
+    q_blocks = (num_rows + block_q - 1) // block_q
+    rest = 0
+    one_class = classes and (classes & (classes - 1)) == 0
+    # A green context or partition may have fewer SMs than the device.
+    sms = _module().launch_sms(q) if one_class else 0
+    if one_class and _rest_leaves(q_blocks, sms, bound, top_k):
+        rest = q_blocks % sms
+        if _REST_RULE == "always":
+            rest = -rest  # the binding: they leave whatever their rows
     sr = min(num_rows, _SCAN_ROWS) if scan else 0
     row_ks = torch.empty(num_rows, **i32)
     row_ke = torch.empty(num_rows, **i32)
@@ -311,10 +475,9 @@ def dsa_indexer_det_topk(
     fallback_count = torch.empty(4, **i32)  # zeroed on the device
     exact_state = torch.empty(sr, 8, **i32)
     sample_slots = torch.empty(sr, **i32)
-    block_q = 128 // num_heads
-    q_blocks = (num_rows + block_q - 1) // block_q
     tile_prefix = torch.empty(q_blocks, **i32)
     res_scratch, res_bound, row_classes = None, 0, None
+    res_split, res_plan = None, None
     if classes:
         # Score rows as long as the class's cap, or the bound when shorter.
         res_bound = (bound + 31) // 32 * 32
@@ -325,7 +488,17 @@ def dsa_indexer_det_topk(
             )
             if classes >> i & 1
         )
-        res_scratch = torch.empty(min(q_blocks, _sm_count(dev)) * cta_words, **f32)
+        res_scratch = torch.empty(_sm_count(dev) * cta_words, **f32)
+        split_words = abs(rest) * block_q * min(res_bound, _RES_CAP * _CLASS_CAPS[-1])
+        if not one_class and _CLASS_SPLIT:
+            split_words = _split_class_words(classes, num_rows, block_q, res_bound, dev)
+            res_plan = torch.empty(
+                4 * len(_CLASS_CAPS)
+                + len(_CLASS_CAPS) * _sm_count(dev)
+                + (q_blocks + 2 if _QUEUE else 0),
+                **i32,
+            )
+        res_split = torch.empty(max(1, split_words), **f32)
         # With several classes, a class's launch without rows of its class
         # leaves at once, by the rows' class masks (a word per 256 rows).
         if classes & (classes - 1):
@@ -365,6 +538,23 @@ def dsa_indexer_det_topk(
         int(classes),
         bool(scan),
         device_support_pdl(dev) if enable_pdl is None else bool(enable_pdl),
+        *_source_args(candidate_out, bs, num_rows, bound, dev),
+        cand,
+        None
+        if cand is None
+        else torch.empty(
+            num_rows,
+            max(1, ((bound + bs - 1) // bs + 31) // 32),
+            dtype=torch.int32,
+            device=dev,
+        ),
+        None if cand is None else torch.empty(num_rows, dtype=torch.int32, device=dev),
+        res_split,
+        rest,
+        torch.empty(3, **i32) if rest else None,
+        _RES_CONCURRENT,
+        res_plan,
+        _QUEUE and res_plan is not None,
     )
     return indices, scores
 

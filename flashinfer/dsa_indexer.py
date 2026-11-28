@@ -165,21 +165,27 @@ def dsa_indexer_det_topk(
         launch and setup overlap the previous kernel's end; ``None``: on where
         the device supports it.
     candidate_blocks : Optional[torch.Tensor]
-        The paged form only: int32 ``[B * next_n, C]`` request-local block ids
-        (blocks of ``candidate_block_size`` keys), in any order, with
-        duplicates and ``-1`` padding allowed (DeepSeek-V4.1's consumer
-        layers).  Row ``r`` then ranks only its visible keys whose block it
-        lists: its ids and scores are the plain form's over those keys.  Needs
-        ``C * candidate_block_size <= 16384``; ``C`` and the block size fix the
+        int32 ``[B * next_n, C]`` (paged) or ``[T, C]`` (ragged) block ids,
+        local to the row's request, of ``candidate_block_size`` keys each; any
+        order, with duplicates and ``-1`` padding allowed (DeepSeek-V4.1's
+        consumer layers).  Paged: a row ranks only the visible keys of its
+        listed blocks, with the plain form's ids and scores over them, and
+        ``C * candidate_block_size <= 16384``.  Ragged: a row ranks all its
+        visible keys with the unlisted ones at ``-inf``, so a row with fewer
+        than ``top_k`` listed keys also returns unlisted keys (score
+        ``-inf``, not padding).  The call's key bound (``max_seqlen_k``, else
+        ``k.shape[0]``) is at most 393216 blocks: with a long concatenated
+        ``k``, pass ``max_seqlen_k``.  ``C`` and the block size fix the
         launches, so a captured graph replays for any lists.
     candidate_block_size : int
         Keys a candidate block: a power of two from 8 to
         ``min(k.shape[1], 128)``; 8 or 16 with ``candidate_out``.
     candidate_out : Optional[torch.Tensor]
-        The paged form only, not with ``candidate_blocks``: int32
-        ``[B * next_n, C]`` (``C <= 4096``) that also receives each row's top
-        ``min(C, blocks)`` blocks of ``candidate_block_size`` keys, in no
-        particular order, then ``-1`` (DeepSeek-V4.1's candidate source layer).
+        Not with ``candidate_blocks``: int32 ``[B * next_n, C]`` (paged) or
+        ``[T, C]`` (ragged), ``C <= 4096``, that also receives each row's top
+        ``min(C, blocks)`` blocks of ``candidate_block_size`` request-local
+        keys, in no particular order, then ``-1`` (DeepSeek-V4.1's candidate
+        source layer).
         A block's score is the largest score of its visible keys; the row's
         newest block, and a block with a NaN score, rank first.  Ties go to the
         larger block id.  The row's own top-k is returned as without it.
@@ -246,10 +252,6 @@ def dsa_indexer_det_topk(
             candidate_block_size=candidate_block_size,
             candidate_out=candidate_out,
         )
-    if candidate_blocks is not None or candidate_out is not None:
-        raise ValueError(
-            "candidate_blocks and candidate_out need the paged form of backend='sm120'"
-        )
     if k_scale is None:
         raise ValueError("backend='sm120' requires k_scale")
     if cu_seqlens_q is None or cu_seqlens_k is None:
@@ -274,4 +276,7 @@ def dsa_indexer_det_topk(
         scores=scores,
         return_scores=return_scores,
         enable_pdl=enable_pdl,
+        candidate_block_size=candidate_block_size,
+        candidate_out=candidate_out,
+        candidate_blocks=candidate_blocks,
     )
