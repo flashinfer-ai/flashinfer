@@ -213,10 +213,6 @@ def _run_attention(
 
 
 # -------------------------  PyTest test case  ----------------------------- #
-@pytest.mark.xfail(
-    get_compute_capability(torch.device(device="cuda"))[0] == 12,
-    reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
-)
 def test_batch_attention_with_noncontiguous_q():
     # Pick the first sequence length config's first pair
     seq_len_pairs = _build_seq_len_configs()[0]
@@ -252,10 +248,6 @@ def test_batch_attention_with_noncontiguous_q():
     )
 
 
-@pytest.mark.xfail(
-    get_compute_capability(torch.device(device="cuda"))[0] == 12,
-    reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
-)
 @pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
 @parametrize_product(
     {
@@ -283,6 +275,11 @@ def test_batch_attention_correctness(
     test_dtype,
     logits_soft_cap,
 ):
+    if head_dim >= 128 and get_compute_capability(torch.device("cuda"))[0] == 12:
+        # Not launched: the failing launch leaves a pending CUDA error that
+        # fails the next test in the same process. head_dim=128 exceeds the
+        # cooperative grid (#9503), head_dim=256 exceeds shared memory (#9501).
+        pytest.xfail("SM120/121: 16-bit BatchAttention needs head_dim < 128")
     num_qo_heads = num_kv_heads * gqa_group_size
     kv_lens = [p[0] for p in seq_len_pairs]
     qo_lens = [p[1] for p in seq_len_pairs]
@@ -303,10 +300,6 @@ def test_batch_attention_correctness(
     )
 
 
-@pytest.mark.xfail(
-    get_compute_capability(torch.device(device="cuda"))[0] == 12,
-    reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
-)
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 256])
 @pytest.mark.parametrize("qo_len", [64, 128])
