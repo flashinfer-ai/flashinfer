@@ -492,6 +492,143 @@ def test_ragged_fp8_calibration_scales(q_dtype, kv_dtype, causal, k_scale, v_sca
     torch.testing.assert_close(actual_lse, expected_lse, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo,qo_len",
+    [(192, 128, 7), (192, 128, 99), (128, 192, 7), (128, 192, 31)],
+)
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_layout", ["single", "ragged", "NHD", "HND"])
+def test_fp8_prefill_asymmetric_head_dims(
+    head_dim_qk, head_dim_vo, q_dtype, kv_dtype, qo_len, causal, kv_layout
+):
+    """FP8 K/V tails must survive both direct and repacked FA2 prefill paths."""
+    # VO=192 uses shorter Q tiles to stay within the single-prefill register limit.
+    # The batch merge kernel does not support VO=192, so test it without split-KV.
+    torch.manual_seed(42)
+    kv_lens = [99, 131]
+    num_qo_heads, num_kv_heads, page_size = 4, 2, 16
+    q = torch.randn(2 * qo_len, num_qo_heads, head_dim_qk, device="cuda", dtype=q_dtype)
+    k = torch.randn(
+        sum(kv_lens), num_kv_heads, head_dim_qk, device="cuda", dtype=q_dtype
+    ).to(kv_dtype)
+    v = torch.randn(
+        sum(kv_lens), num_kv_heads, head_dim_vo, device="cuda", dtype=q_dtype
+    ).to(kv_dtype)
+    q_indptr = torch.tensor([0, qo_len, 2 * qo_len], dtype=torch.int32)
+    kv_indptr = torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32)
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+    def run(kv_type):
+        if kv_layout == "single":
+            return torch.cat(
+                [
+                    flashinfer.single_prefill_with_kv_cache(
+                        q[i * qo_len : (i + 1) * qo_len],
+                        k[sum(kv_lens[:i]) : sum(kv_lens[: i + 1])].to(kv_type),
+                        v[sum(kv_lens[:i]) : sum(kv_lens[: i + 1])].to(kv_type),
+                        causal=causal,
+                        backend="fa2",
+                    )
+                    for i in range(len(kv_lens))
+                ]
+            )
+        if kv_layout == "ragged":
+            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                workspace, "NHD", backend="fa2"
+            )
+            wrapper.plan(
+                q_indptr,
+                kv_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                causal=causal,
+                q_data_type=q_dtype,
+                kv_data_type=kv_type,
+                disable_split_kv=head_dim_vo == 192,
+            )
+            return wrapper.run(q, k.to(kv_type), v.to(kv_type))
+        num_pages = [(length + page_size - 1) // page_size for length in kv_lens]
+        k_pages = torch.zeros(
+            sum(num_pages),
+            page_size,
+            num_kv_heads,
+            head_dim_qk,
+            device="cuda",
+            dtype=q_dtype,
+        )
+        v_pages = torch.zeros(
+            sum(num_pages),
+            page_size,
+            num_kv_heads,
+            head_dim_vo,
+            device="cuda",
+            dtype=q_dtype,
+        )
+        for i, length in enumerate(kv_lens):
+            page_start, token_start = sum(num_pages[:i]), sum(kv_lens[:i])
+            k_pages[page_start : page_start + num_pages[i]].flatten(0, 1)[
+                :length
+            ].copy_(k[token_start : token_start + length])
+            v_pages[page_start : page_start + num_pages[i]].flatten(0, 1)[
+                :length
+            ].copy_(v[token_start : token_start + length])
+        if kv_layout == "HND":
+            k_pages = k_pages.transpose(1, 2).contiguous()
+            v_pages = v_pages.transpose(1, 2).contiguous()
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, kv_layout, backend="fa2"
+        )
+        wrapper.plan(
+            q_indptr,
+            torch.tensor([0, num_pages[0], sum(num_pages)], dtype=torch.int32),
+            torch.arange(sum(num_pages), dtype=torch.int32),
+            torch.tensor(
+                [(length - 1) % page_size + 1 for length in kv_lens], dtype=torch.int32
+            ),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            page_size,
+            head_dim_vo=head_dim_vo,
+            causal=causal,
+            q_data_type=q_dtype,
+            kv_data_type=kv_type,
+            disable_split_kv=head_dim_vo == 192,
+        )
+        return wrapper.run(q, (k_pages.to(kv_type), v_pages.to(kv_type)))
+
+    out, control = run(kv_dtype), run(q_dtype)
+    for i, length in enumerate(kv_lens):
+        token_start = sum(kv_lens[:i])
+        qi = q[i * qo_len : (i + 1) * qo_len].float()
+        ki = (
+            k[token_start : token_start + length]
+            .float()
+            .repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+        )
+        vi = (
+            v[token_start : token_start + length]
+            .float()
+            .repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+        )
+        scores = torch.einsum("qhd,khd->hqk", qi, ki) * head_dim_qk**-0.5
+        if causal:
+            mask = (
+                torch.arange(length, device="cuda")[None, :]
+                <= torch.arange(qo_len, device="cuda")[:, None] + length - qo_len
+            )
+            scores.masked_fill_(~mask, float("-inf"))
+        ref = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), vi)
+        for result in [out, control]:
+            torch.testing.assert_close(
+                result[i * qo_len : (i + 1) * qo_len].float(), ref, atol=1e-2, rtol=1e-2
+            )
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         12, 7, 54, 1, 4, 4, 128, "NHD", torch.float8_e5m2
