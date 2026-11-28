@@ -1034,6 +1034,10 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                             tiled_copy, smem_partition, copy_view,
                         )
                 warpgroup.wait_group(0)
+                if k_tile + cutlass.Int32(1) == k_tile_cnt:
+                    # The scales loaded above are read after the loop.
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
@@ -1247,6 +1251,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 scale_plane=cutlass.Int32(0),
                 tidx=tidx,
             )
+            # Order the scale loads above before the async-proxy refill.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_warp()
             weight_sf_pipeline.consumer_release(release_state)
             ab_pipeline.consumer_release(release_state)
 
@@ -1491,6 +1498,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                             tidx=tidx,
                         )
 
+                # Order the scale loads above before the async-proxy refill.
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
                 if cutlass.const_expr(not self._weight_sf_decoupled()):
                     weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
@@ -1650,6 +1660,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     ),
                     tidx=tidx,
                 )
+                # Order the scale loads above before the async-proxy refill.
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()

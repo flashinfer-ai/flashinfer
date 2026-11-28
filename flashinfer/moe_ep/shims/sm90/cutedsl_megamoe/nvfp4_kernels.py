@@ -607,6 +607,9 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
                 scale_plane=cutlass.Int32(0),
                 tidx=tidx,
             )
+            # Order the scale loads above before the async-proxy refill.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_warp()
             if cutlass.const_expr(not self._weight_sf_decoupled()):
                 weight_sf_pipeline.consumer_release(release_state)
             ab_pipeline.consumer_release(release_state)
