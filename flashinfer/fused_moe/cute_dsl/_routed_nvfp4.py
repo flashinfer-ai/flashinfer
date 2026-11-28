@@ -21,6 +21,7 @@ import torch
 from ...utils import get_compute_capability
 from ...tllm_enums import ActivationType
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    ZERO_OUTPUT_MAX_BYTES,
     blockscaled_contiguous_gather_grouped_gemm_act_fusion as gather_gemm,
 )
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
@@ -36,6 +37,13 @@ from .moe_utils import (
 )
 
 _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
+
+# Fused finalize: GEMM1's idle warp zeroes the output (after its grid-dependency
+# wait) and GEMM2 uses the constant router scale 1.0, instead of an output
+# memset and a tensor of ones: two fewer launches, and GEMM1 follows the routing
+# kernel directly through programmatic dependent launch. Tests set this to False
+# to compare against the memset path.
+_ZERO_OUTPUT_IN_GEMM1 = True
 
 
 def _nvfp4_moe_with_pre_fc2_routing_weights(
@@ -81,10 +89,24 @@ def _nvfp4_moe_with_pre_fc2_routing_weights(
         cluster_shape_mn=PRE_FC2_CLUSTER_SHAPE,
         enable_pdl=enable_pdl,
     )
+    # In-GEMM1 zeroing needs FP32 weights (passed as the never-read
+    # token_final_scales) and a 16-byte aligned output of at most
+    # ZERO_OUTPUT_MAX_BYTES; otherwise memset.
+    output_bytes = output.numel() * output.element_size()
+    zero_in_gemm1 = (
+        _ZERO_OUTPUT_IN_GEMM1
+        and use_fused_finalize
+        and weights.dtype == torch.float32
+        and weights.is_contiguous()
+        and output.data_ptr() % 16 == 0
+        and output_bytes % 16 == 0
+        and output_bytes <= ZERO_OUTPUT_MAX_BYTES
+    )
     # Zero the atomically finalized output first so GEMM1 -> GEMM2 stay
     # adjacent and can overlap through programmatic dependent launch.
     if use_fused_finalize:
-        output.zero_()
+        if not zero_in_gemm1:
+            output.zero_()
         final_output = output
     else:
         final_output = torch.empty(
@@ -92,7 +114,10 @@ def _nvfp4_moe_with_pre_fc2_routing_weights(
         )
     # FC2 must not reapply the weights already consumed by the FC1 epilogue.
     # Allocated before GEMM1 so no other launch sits between the two GEMMs.
-    final_scales = torch.ones_like(weights, dtype=torch.float32)
+    # With zero_in_gemm1, GEMM2 uses the constant 1.0 and never reads this tensor.
+    final_scales = (
+        weights if zero_in_gemm1 else torch.ones_like(weights, dtype=torch.float32)
+    )
     # The epilogue reads one FC2 input scale per local expert and FP32 weights.
     scale2 = scale2.reshape(-1)
     expert_scales = (
@@ -113,6 +138,7 @@ def _nvfp4_moe_with_pre_fc2_routing_weights(
         gated=False,
         clamped_relu2_limit=clamp,
         routing_weights=weights.reshape(-1).float(),
+        zero_output=output if zero_in_gemm1 else None,
         **common,
     )
     grouped_gemm(
@@ -125,6 +151,7 @@ def _nvfp4_moe_with_pre_fc2_routing_weights(
         out=final_output,
         permuted_idx_to_expanded_idx=mapping,
         use_fused_finalize=use_fused_finalize,
+        unit_token_scales=zero_in_gemm1,
         **common,
     )
     if not use_fused_finalize:

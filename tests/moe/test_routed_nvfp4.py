@@ -1091,3 +1091,129 @@ def test_pre_fc2_accepts_single_value_fc2_scale_of_any_rank(fused, gpu):
         **inputs, **options, tactic=DEFAULT_BLACKWELL_MOE_TACTIC
     )
     assert torch.equal(flat, square)
+
+
+# Fused finalize: GEMM1's idle warp zeroes the output and GEMM2 uses the router
+# scale 1.0, instead of an output memset and a tensor of ones. At most one local
+# route per token makes the atomically finalized output deterministic, so it
+# compares bitwise with the memset path.
+@pytest.mark.parametrize("tokens", [1, 17, 300])
+def test_pre_fc2_output_zeroing_in_gemm1_matches_memset_bitwise(
+    tokens, gpu, monkeypatch
+):
+    from flashinfer.fused_moe.cute_dsl import _routed_nvfp4 as routed
+
+    inputs, _ = _case(tokens, gpu, True, 768, 4096)
+    t = torch.arange(tokens, device=gpu)
+    ids = inputs["token_selected_experts"]
+    ids[:, 0] = (2 + t % 4).int()  # local experts are 2..4: expert 5 = no local route
+    ids[:, 1] = (6 + t % 2).int()  # always remote
+    options = dict(
+        num_experts=8,
+        top_k=2,
+        num_local_experts=3,
+        local_expert_offset=2,
+        activation_type=ActivationType.ClampedRelu2.value,
+        clamped_relu2_limit=torch.tensor([0.15], device=gpu),
+        routing_weights_before_fc2=True,
+        tactic=DEFAULT_BLACKWELL_MOE_TACTIC,
+    )
+    zeroing_calls = []
+    gather_gemm = routed.gather_gemm
+
+    def recording_gather_gemm(*args, **kwargs):
+        zeroing_calls.append(kwargs.get("zero_output") is not None)
+        return gather_gemm(*args, **kwargs)
+
+    monkeypatch.setattr(routed, "gather_gemm", recording_gather_gemm)
+
+    def run(fused, prefill):
+        out = torch.full((tokens, 768), prefill, dtype=torch.bfloat16, device=gpu)
+        cute_dsl_fused_moe(
+            **inputs, **options, moe_output=out, use_fused_finalize=fused
+        )
+        return out
+
+    monkeypatch.setattr(routed, "_ZERO_OUTPUT_IN_GEMM1", False)
+    ref_fused, ref_det = run(True, float("nan")), run(False, 0.0)
+    assert zeroing_calls == [False, False]
+    monkeypatch.setattr(routed, "_ZERO_OUTPUT_IN_GEMM1", True)
+    fused, det = run(True, float("nan")), run(False, 0.0)
+    assert zeroing_calls[2:] == [True, False]  # in-GEMM1 zeroing on the fused path only
+    assert torch.isfinite(fused.float()).all()  # every element zeroed in-kernel
+    assert torch.equal(fused.view(torch.int16), ref_fused.view(torch.int16))
+    assert torch.equal(det.view(torch.int16), ref_det.view(torch.int16))
+    no_local = (t % 4) == 3
+    if no_local.any():
+        assert torch.count_nonzero(fused[no_local]) == 0
+    # The in-kernel zeroing also replays inside a CUDA graph.
+    out = torch.full((tokens, 768), float("nan"), dtype=torch.bfloat16, device=gpu)
+    cute_dsl_fused_moe(**inputs, **options, moe_output=out, use_fused_finalize=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cute_dsl_fused_moe(**inputs, **options, moe_output=out, use_fused_finalize=True)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), ref_fused.view(torch.int16))
+
+
+# Outputs above ZERO_OUTPUT_MAX_BYTES (the in-kernel zeroing loop's 32-bit chunk
+# range) take the memset path; the GEMM1 API rejects them as zero_output. The
+# limit is lowered here so a small output crosses it.
+def test_pre_fc2_output_zeroing_falls_back_to_memset_above_the_size_limit(
+    gpu, monkeypatch
+):
+    import importlib
+
+    from flashinfer.fused_moe.cute_dsl import _routed_nvfp4 as routed
+
+    fc1 = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl."
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion"
+    )
+    tokens = 17
+    inputs, _ = _case(tokens, gpu, True, 768, 4096)
+    t = torch.arange(tokens, device=gpu)
+    ids = inputs["token_selected_experts"]
+    ids[:, 0] = (2 + t % 4).int()
+    ids[:, 1] = (6 + t % 2).int()
+    options = dict(
+        num_experts=8,
+        top_k=2,
+        num_local_experts=3,
+        local_expert_offset=2,
+        activation_type=ActivationType.ClampedRelu2.value,
+        clamped_relu2_limit=torch.tensor([0.15], device=gpu),
+        routing_weights_before_fc2=True,
+        tactic=DEFAULT_BLACKWELL_MOE_TACTIC,
+        use_fused_finalize=True,
+    )
+    zeroing_calls = []
+    gather_gemm = routed.gather_gemm
+
+    def recording_gather_gemm(*args, **kwargs):
+        zeroing_calls.append(kwargs.get("zero_output") is not None)
+        return gather_gemm(*args, **kwargs)
+
+    monkeypatch.setattr(routed, "gather_gemm", recording_gather_gemm)
+
+    def run():
+        out = torch.full((tokens, 768), float("nan"), dtype=torch.bfloat16, device=gpu)
+        cute_dsl_fused_moe(**inputs, **options, moe_output=out)
+        return out
+
+    nbytes = tokens * 768 * 2
+    monkeypatch.setattr(routed, "_ZERO_OUTPUT_IN_GEMM1", False)
+    ref = run()
+    monkeypatch.setattr(routed, "_ZERO_OUTPUT_IN_GEMM1", True)
+    monkeypatch.setattr(routed, "ZERO_OUTPUT_MAX_BYTES", nbytes - 16)
+    above = run()
+    monkeypatch.setattr(routed, "ZERO_OUTPUT_MAX_BYTES", nbytes)
+    at_limit = run()
+    assert zeroing_calls == [False, False, True]
+    assert torch.equal(above.view(torch.int16), ref.view(torch.int16))
+    assert torch.equal(at_limit.view(torch.int16), ref.view(torch.int16))
+    monkeypatch.setattr(fc1, "ZERO_OUTPUT_MAX_BYTES", nbytes - 16)
+    with pytest.raises(ValueError, match="zero_output"):
+        run()

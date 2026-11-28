@@ -367,8 +367,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
+        unit_token_scales: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
+
+        ``unit_token_scales``: every router scale is 1 (pre-FC2 routing): use
+        the constant 1.0 the unfused path already uses instead of loading
+        ``token_final_scales`` (the caller then needs no tensor of ones).
 
         This configuration includes several key aspects:
 
@@ -390,6 +395,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
+        self.unit_token_scales = bool(unit_token_scales)
+        if self.unit_token_scales and use_a_per_token_scale:
+            raise ValueError("unit_token_scales does not support per-token A scales")
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -2007,7 +2015,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     topk_idx = safe_idx % topK
                     is_valid_row = cutlass.Int32(permuted_row < tile_info[4])
                     gather_tok = token_idx * is_valid_row
-                    token_scale = token_final_scales[(gather_tok, topk_idx)]
+                    if cutlass.const_expr(self.unit_token_scales):
+                        token_scale = self.final_scale_dtype(1.0)
+                    else:
+                        token_scale = token_final_scales[(gather_tok, topk_idx)]
                     output_idx = token_idx
                     if cutlass.const_expr(not self.use_fused_finalize):
                         token_scale = self.final_scale_dtype(1.0)

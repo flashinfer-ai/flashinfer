@@ -219,6 +219,11 @@ def create_gather_gemm_tensors(
 # Kernel cache for compiled kernels (class-level to persist across calls)
 _gather_kernel_cache: Dict[Tuple, Any] = {}
 
+# Largest zero_output accepted: the kernel's zeroing loop indexes 16-byte chunks
+# with 32-bit integers, so 2**30 chunks (16 GiB) keep the index and its grid
+# stride in range. Callers memset larger outputs instead.
+ZERO_OUTPUT_MAX_BYTES = 1 << 34
+
 
 def _get_compiled_gather_kernel(
     # Problem dimensions (runtime parameters - NOT in cache key)
@@ -277,6 +282,7 @@ def _get_compiled_gather_kernel(
     # locality-domain half-GEMM (Rubin only, compile-time - IN cache key)
     localized_half_gemm: bool = False,
     pre_fc2_routing: bool = False,
+    zero_out_ptr=None,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -330,6 +336,8 @@ def _get_compiled_gather_kernel(
         gated,
         use_a_per_token_scale,
         pre_fc2_routing,
+        # Output zeroing by the idle warp (zero_output=); off = unchanged kernel.
+        zero_out_ptr is not None,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -469,6 +477,7 @@ def _get_compiled_gather_kernel(
                 if is_rubin
                 else {}
             ),
+            **({"zero_out_ptr": zero_out_ptr} if zero_out_ptr is not None else {}),
         )
 
         _gather_kernel_cache[cache_key] = compiled_gemm
@@ -517,6 +526,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     gated: bool = True,
     clamped_relu2_limit: Optional[torch.Tensor] = None,
     routing_weights: Optional[torch.Tensor] = None,
+    zero_output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -606,6 +616,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             ``cluster_shape_mn=(1, 1)``; SM100/SM103 only. Padding rows of
             ``out`` and ``out_scale`` (rows of a tile past its
             ``tile_idx_to_mn_limit``) may be left unwritten.
+        zero_output: Optional contiguous BF16 tensor of shape (seq_len, k)
+            (the MoE output that GEMM2 finalizes atomically). The kernel's idle
+            warp zeroes it after the grid-dependency wait, replacing a separate
+            memset launch. At most ``ZERO_OUTPUT_MAX_BYTES`` (16 GiB); 1-CTA
+            Blackwell tactics only.
 
     Returns:
         Tuple of:
@@ -740,6 +755,23 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ):
             raise ValueError(
                 "routing_weights requires one float32 global_scale per expert"
+            )
+    if zero_output is not None:
+        if (
+            zero_output.device != a.device
+            or zero_output.dtype != torch.bfloat16
+            or not zero_output.is_contiguous()
+            or zero_output.numel() != seq_len * k
+            or zero_output.data_ptr() % 16
+            or (seq_len * k * 2) % 16
+            or seq_len * k * 2 > ZERO_OUTPUT_MAX_BYTES
+            or tuple(mma_tiler_mn)[0] != 128
+            or mma_tiler is not None
+        ):
+            raise ValueError(
+                "zero_output must be a contiguous, 16-byte aligned BF16 tensor of "
+                f"{seq_len} x {k} elements (at most {ZERO_OUTPUT_MAX_BYTES} bytes) "
+                "on the input device, with a 1-CTA Blackwell tactic"
             )
 
     # Output quantization is explicit because Float8E4M3FN can also be used as
@@ -936,6 +968,17 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
+    zero_out_ptr = (
+        make_ptr(
+            cutlass.BFloat16,
+            zero_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        if zero_output is not None
+        else None
+    )
+
     # Create raw pointers (TRT-LLM style) - allows same compiled kernel for different sizes
     a_ptr = make_ptr(
         a_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
@@ -1073,6 +1116,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         use_a_per_token_scale=use_a_per_token_scale,
         localized_half_gemm=localized_half_gemm,
         pre_fc2_routing=pre_fc2_routing,
+        zero_out_ptr=zero_out_ptr,
     )
 
     # Execute kernel with runtime parameters.
@@ -1117,6 +1161,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             if is_rubin
             else {}
         ),
+        **({"zero_out_ptr": zero_out_ptr} if zero_out_ptr is not None else {}),
     )
 
     return out, out_scale if generate_sfc else None
