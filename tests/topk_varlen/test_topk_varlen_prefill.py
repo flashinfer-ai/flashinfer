@@ -1392,3 +1392,105 @@ def test_prefill_all_neginf_window(top_k, lead, hinted):
     torch.cuda.synchronize()
     _check_windowed(lg, out, rs, le, top_k)
     assert bool((vals == float("-inf")).all())
+
+
+def test_prefill_tier0_slab_plan_is_pinned():
+    """The windowed slab plan is a deliberate choice (post-#5312 review, measured
+    on B200; see _prefill_slab_plan): tier 0 runs the 512-thread (512, 8, 2) plan
+    up to the 32K envelope bucket and the 1024-thread (1024, 8, 1) plan from the
+    64K bucket, which every wider window maps to; tiers 1 and 2 keep
+    route_streaming's non-big regime (512 and 256 threads). A change to the
+    wide bucket, to the tier-0 override or to route_streaming's CTA-shape
+    branches must fail here, not show up in a perf chart (tier 0 bypasses the
+    shared selector on purpose)."""
+    for k in (512, 1024, 2048):
+        for n, want in (
+            (8192, (512, 8, 2)),
+            (32768, (512, 8, 2)),
+            (65536, (1024, 8, 1)),
+            (262144, (1024, 8, 1)),
+        ):
+            nb = _host._prefill_bucket_for(n, k)
+            plan = _host._prefill_slab_plan(0, k, nb)
+            assert plan["kernel"] == "main" and tuple(plan["tpl"])[:3] == want, (
+                k,
+                n,
+                nb,
+                plan["tpl"],
+            )
+        assert (
+            _host._prefill_bucket_for(262144, k)
+            == _host._prefill_bucket_for(65536, k)
+            == 65536
+        )
+        for tier, want in (
+            (1, (512, 8, 2)),
+            (2, (256, 8, 4)),
+        ):  # 149+ rows: the non-big regime
+            for n in (8192, 65536):
+                nb = _host._prefill_bucket_for(n, k)
+                assert (
+                    tuple(_host._prefill_slab_plan(tier, k, nb)["tpl"])[:3] == want
+                ), (tier, k, n)
+
+
+def test_prefill_tiers_are_row_bands():
+    """Slab tiers depend on the row count alone: the upstream detour of <= 148-row
+    launches to tier 1 just above the pair-sample gate was tuned for the old
+    tier-0 plan and is gone (measured B200: the tier-0 scalars win 13-23% in most
+    of that band)."""
+    for k in (512, 1024, 2048):
+        for n in (4353, 8704, 12288, 16384, 65536):
+            assert _host._prefill_tier(100, n, k) == 0, (k, n)
+            assert _host._prefill_tier(148, n, k) == 0
+            assert _host._prefill_tier(149, n, k) == 1
+            assert _host._prefill_tier(296, n, k) == 1
+            assert _host._prefill_tier(297, n, k) == 2
+
+
+@requires_gvr2
+@pytest.mark.parametrize("rows", [16, 148])
+def test_prefill_tier0_wide_bucket_slab_exact_and_captures(rows):
+    """The 1024-thread windowed slab at the 64K bucket (tier 0, bounds above
+    32768) became reachable with the deliberate plan: exact under +inf lead
+    lanes and misaligned starts, found by prefill_ready after
+    warmup_prefill(k, 65536) as the 64K-bucket launcher, and replayed from a
+    CUDA graph captured on a side stream."""
+    k, bound = 512, 65536
+    n = bound + 4
+    lg, rs, le = _make_case(rows, n, [3] * rows, [bound] * rows, seed=rows)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _host.warmup_prefill(k, bound)
+        assert _host.prefill_ready(rows, k, bound, width=n)
+        assert (
+            _host._prefill_cache_key("main", 0, k, 65536, False) in _host._PREFILL_CACHE
+        )
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            k,
+            row_starts=rs,
+            max_window_len=bound,
+            out_indices=out,
+            backend="gvr_2",
+        )
+        torch.cuda.synchronize()
+        _check_windowed(lg, out, rs, le, k)
+        out2 = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            flashinfer.top_k_varlen(
+                lg,
+                le,
+                k,
+                row_starts=rs,
+                max_window_len=bound,
+                out_indices=out2,
+                backend="gvr_2",
+            )
+        g.replay()
+    torch.cuda.synchronize()
+    _check_windowed(lg, out2, rs, le, k)
