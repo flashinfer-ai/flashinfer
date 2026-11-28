@@ -732,6 +732,41 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         head_dim_vo: int = 128,
         v_sf_swizzled: bool = False,
     ) -> None:
+        """Create a paged prefill wrapper specialized for bidirectional ranges.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            Workspace for split-K intermediate results on the query device.
+        kv_layout : str
+            KV-cache layout, either ``"NHD"`` or ``"HND"``. Defaults to ``"NHD"``.
+        use_cuda_graph : bool
+            Enable CUDA Graph capture. Supply all four metadata buffers below
+            when enabled. Defaults to ``False``.
+        qo_indptr_buf : torch.Tensor, optional
+            CUDA Graph buffer for query/output offsets.
+        paged_kv_indptr_buf : torch.Tensor, optional
+            CUDA Graph buffer for KV page offsets.
+        paged_kv_indices_buf : torch.Tensor, optional
+            CUDA Graph buffer for KV page indices.
+        paged_kv_last_page_len_buf : torch.Tensor, optional
+            CUDA Graph buffer for the valid token count in each last KV page.
+        pos_encoding_mode : str
+            Positional encoding mode. The only supported value is ``"NONE"``.
+        q_data_type : torch.dtype
+            Query dtype for the JIT specialization. Defaults to ``torch.bfloat16``.
+        kv_data_type : torch.dtype
+            KV-cache dtype for the JIT specialization. Defaults to ``torch.bfloat16``.
+        o_data_type : torch.dtype, optional
+            Output dtype for the JIT specialization. Defaults to the query dtype.
+        head_dim_qk : int
+            Query/key head dimension. Defaults to 128.
+        head_dim_vo : int
+            Value/output head dimension. Defaults to 128.
+        v_sf_swizzled : bool
+            Read packed NVFP4 V scale factors in the TRT-LLM per-page swizzle.
+            Defaults to ``False``.
+        """
         if pos_encoding_mode != "NONE":
             # POS_ENCODING_MODE is a compile-time constant of the customize
             # config, and a rotary mode makes the kernel read rope parameters
