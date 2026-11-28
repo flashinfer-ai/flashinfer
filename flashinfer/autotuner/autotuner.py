@@ -2104,6 +2104,17 @@ class AutoTuner:
                 logger.warning(
                     f"[Autotuner]: Tactics blocklist file not found at {_bl_path}"
                 )
+        # Blocklist loads already applied by _sweep_blocklisted_winners; the
+        # load above precedes every winner, so there is nothing to sweep.
+        self._blocklist_swept_generation = self._blocklist.generation
+        # In-memory winners evicted because their tactic is blocklisted, keyed
+        # like _profiling_cache_policies, so a later lookup reports the miss
+        # as "blocklisted_tactic" rather than "not_found" until a retune
+        # publishes a replacement (the in-memory twin of
+        # _blocklisted_file_keys).
+        self._blocklisted_winner_keys: set[tuple[tuple | None, ProfilingCacheKey]] = (
+            set()
+        )
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = _WinnerSourceDict()
@@ -2168,6 +2179,7 @@ class AutoTuner:
         # (op, runner, source) triples whose cached tactic failed
         # revalidation, so the warning fires once, not per call.
         self._logged_invalid_tactic: set[tuple[str, str, str]] = set()
+        self._logged_blocklisted_tactic: set[tuple[str, str, str]] = set()
         # Cache-metadata mismatch severities ("hard"/"soft") already logged at
         # WARNING; repeats for further cache files are logged at DEBUG (a
         # deployment can touch dozens of cache files per process).
@@ -2356,6 +2368,119 @@ class AutoTuner:
                     f"failed revalidation; treating as a cache miss."
                 )
         return ok
+
+    def _cached_winner_rejection(
+        self,
+        runner: TunableRunner,
+        inputs,
+        tactic: Any,
+        custom_op: str,
+        source: str,
+        *,
+        validation_profile: OptimizationProfile | None = None,
+        rejections: list[str] | None = None,
+    ) -> str | None:
+        """Why a cached winner may not be served, or ``None`` if it may.
+
+        The one eligibility check of every cached-winner source (memory,
+        config file, managed cache, bundled config): the tactics blocklist
+        first (``"blocklisted_tactic"``), then the runner-contract
+        revalidation of :meth:`_tactic_still_valid` (``"invalid_tactic"``).
+        A blocked winner was tuned before its tactic was listed, by this or
+        another process, or shipped in a package; serving it would defeat
+        the blocklist, so it is a miss at every source alike.  The reason is
+        appended once to ``rejections`` (a replay report's miss reasons).
+        What becomes of the rejected entry is the caller's decision: each
+        source owns its storage.
+        """
+        runner_name = runner.__class__.__name__
+        blocklist = self._blocklist
+        if blocklist.is_loaded and blocklist.is_blocked(custom_op, runner_name, tactic):
+            reason = "blocklisted_tactic"
+            key = (custom_op, runner_name, source)
+            if key not in self._logged_blocklisted_tactic:
+                self._logged_blocklisted_tactic.add(key)
+                logger.warning(
+                    f"[Autotuner]: cached tactic {tactic!r} for {custom_op} "
+                    f"(runner={runner_name}, source={source}) is in the tactics "
+                    f"blocklist ({blocklist.loaded_path}); treating as a cache "
+                    "miss."
+                )
+        elif self._tactic_still_valid(
+            runner,
+            inputs,
+            tactic,
+            custom_op,
+            source,
+            validation_profile=validation_profile,
+        ):
+            return None
+        else:
+            reason = "invalid_tactic"
+        if rejections is not None and reason not in rejections:
+            rejections.append(reason)
+        return reason
+
+    def _evict_blocklisted_winner(
+        self, winners: dict, identity: tuple | None, cache_key: ProfilingCacheKey
+    ) -> None:
+        """Forget one in-memory winner whose tactic is blocklisted.
+
+        Removes the winner, its provenance and its shortlist from the
+        partition of ``identity`` (see :meth:`_winner_cache`) and remembers
+        the key so the miss is reported as ``blocklisted_tactic``.  Caller
+        holds ``self._lock``.
+        """
+        if cache_key in winners:
+            del winners[cache_key]
+        self._profiling_cache_policies.pop((identity, cache_key), None)
+        self._profiling_cache_selections.pop((identity, cache_key), None)
+        self._profiling_cache_candidates.pop((identity, cache_key), None)
+        ranked = (
+            self._ranked_tactics_cache
+            if identity is None
+            else self._ranked_tactics_partitions.get(identity)
+        )
+        if ranked:
+            ranked.pop(cache_key, None)
+        self._blocklisted_winner_keys.add((identity, cache_key))
+
+    def _sweep_blocklisted_winners(self) -> None:
+        """Forget cached winners listed by a blocklist loaded after them.
+
+        Runs once per :attr:`TacticsBlocklist.generation`, from the next
+        lookup or save, so the order in which the blocklist and the winners
+        arrive does not change what is served or written: in-memory winners
+        of every partition are evicted and loaded cache-file entries are
+        dropped as :meth:`load_configs` drops them when the blocklist comes
+        first.  Managed-store entries stay on disk and are rejected at
+        lookup.  Caller holds ``self._lock``.
+        """
+        blocklist = self._blocklist
+        generation = blocklist.generation
+        if generation == self._blocklist_swept_generation:
+            return
+        self._blocklist_swept_generation = generation
+        if not blocklist.is_loaded:
+            return
+        evicted = 0
+        partitions: list[tuple[tuple | None, dict]] = [(None, self.profiling_cache)]
+        partitions.extend(self._winner_partitions.items())
+        for identity, winners in partitions:
+            for cache_key in list(winners):
+                tactic, _ = winners[cache_key]
+                if blocklist.is_blocked(
+                    cache_key.custom_op, cache_key.runner_class_name, tactic
+                ):
+                    self._evict_blocklisted_winner(winners, identity, cache_key)
+                    evicted += 1
+        if evicted:
+            logger.warning(
+                f"[Autotuner]: Dropped {evicted} in-memory winner(s) whose "
+                f"tactic is in the tactics blocklist ({blocklist.loaded_path}). "
+                "They will be re-tuned when autotuning is enabled."
+            )
+        self._drop_blocklisted_file_configs("previously loaded cache files")
 
     def _drop_blocklisted_file_configs(
         self, source: str, keys: Iterable[str] | None = None
@@ -2757,6 +2882,7 @@ class AutoTuner:
         winner, so treat an uncovered winner as a miss.
         """
         with self._lock:
+            self._sweep_blocklisted_winners()
             report = self._v2_local.replay_report
             require_profiling_policy |= self._v2_local.strict_replay
             rejections: list[str] | None = [] if report is not None else None
@@ -2795,19 +2921,20 @@ class AutoTuner:
                             rejections.append("policy_mismatch")
                         continue
                     tactic, stored_profile = winners[cache_key]
-                    if not self._tactic_still_valid(
+                    rejection = self._cached_winner_rejection(
                         r,
                         inputs,
                         tactic,
                         custom_op,
                         "memory",
                         validation_profile=validation_profile,
-                    ):
-                        if (
-                            rejections is not None
-                            and "invalid_tactic" not in rejections
-                        ):
-                            rejections.append("invalid_tactic")
+                        rejections=rejections,
+                    )
+                    if rejection is not None:
+                        if rejection == "blocklisted_tactic":
+                            self._evict_blocklisted_winner(
+                                winners, winner_identity, cache_key
+                            )
                         # Fall through: another runner, a disk source, or
                         # (in tuning mode) a re-profile may still serve.
                         continue
@@ -2830,6 +2957,12 @@ class AutoTuner:
                             tactic=tactic,
                         )
                     return True, r_id, tactic, stored_profile
+                elif (
+                    rejections is not None
+                    and "blocklisted_tactic" not in rejections
+                    and (winner_identity, cache_key) in self._blocklisted_winner_keys
+                ):
+                    rejections.append("blocklisted_tactic")
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
@@ -2858,31 +2991,23 @@ class AutoTuner:
                             ):
                                 rejections.append("runner_mismatch")
                             continue
-                        if self._blocklist.is_blocked(custom_op, runner_name, tactic):
-                            # The blocklist was loaded after this cache file
-                            # (load_configs already drops listed entries).
-                            self._drop_blocklisted_file_configs(
-                                "previously loaded cache files"
-                            )
-                            if (
-                                rejections is not None
-                                and "blocklisted_tactic" not in rejections
-                            ):
-                                rejections.append("blocklisted_tactic")
-                            continue
-                        if not self._tactic_still_valid(
+                        rejection = self._cached_winner_rejection(
                             runners[r_id],
                             inputs,
                             tactic,
                             custom_op,
                             "config file",
                             validation_profile=validation_profile,
-                        ):
-                            if (
-                                rejections is not None
-                                and "invalid_tactic" not in rejections
-                            ):
-                                rejections.append("invalid_tactic")
+                            rejections=rejections,
+                        )
+                        if rejection is not None:
+                            if rejection == "blocklisted_tactic":
+                                # The blocklist was loaded after this cache
+                                # file (load_configs already drops listed
+                                # entries).
+                                self._drop_blocklisted_file_configs(
+                                    "previously loaded cache files"
+                                )
                             continue
                         if (
                             profiling_candidates is not None
@@ -2967,19 +3092,22 @@ class AutoTuner:
                         ):
                             rejections.append("runner_mismatch")
                         continue
-                    if not self._tactic_still_valid(
-                        runners[r_id],
-                        inputs,
-                        tactic,
-                        custom_op,
-                        "managed cache",
-                        validation_profile=validation_profile,
+                    if (
+                        self._cached_winner_rejection(
+                            runners[r_id],
+                            inputs,
+                            tactic,
+                            custom_op,
+                            "managed cache",
+                            validation_profile=validation_profile,
+                            rejections=rejections,
+                        )
+                        is not None
                     ):
-                        if (
-                            rejections is not None
-                            and "invalid_tactic" not in rejections
-                        ):
-                            rejections.append("invalid_tactic")
+                        # Rejected before promotion.  The store keeps its
+                        # entry (a retune in tuning mode overwrites it through
+                        # the normal publish path) and the decoded memo above
+                        # keeps the warm miss off the filesystem.
                         continue
                     if (
                         profiling_candidates is not None
@@ -3035,19 +3163,19 @@ class AutoTuner:
                         continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
-                        if not self._tactic_still_valid(
-                            runners[r_id],
-                            inputs,
-                            file_tactic,
-                            custom_op,
-                            "bundled config",
-                            validation_profile=validation_profile,
+                        if (
+                            self._cached_winner_rejection(
+                                runners[r_id],
+                                inputs,
+                                file_tactic,
+                                custom_op,
+                                "bundled config",
+                                validation_profile=validation_profile,
+                                rejections=rejections,
+                            )
+                            is not None
                         ):
-                            if (
-                                rejections is not None
-                                and "invalid_tactic" not in rejections
-                            ):
-                                rejections.append("invalid_tactic")
+                            # Package files are never rewritten.
                             continue
                         if report is not None:
                             report._record(
@@ -4048,6 +4176,7 @@ class AutoTuner:
         policy = self._profiling_policy(tuning_config)
         identity = self._winner_cache_identity()
         self._winner_cache()[key] = (tactic, profile)
+        self._blocklisted_winner_keys.discard((identity, key))
         self._profiling_cache_policies[(identity, key)] = policy
         candidate_keys = None
         if profiling_candidates is not None:
@@ -5235,6 +5364,7 @@ class AutoTuner:
             AutoTuner.get().save_configs("/path/to/config.json")
         """
         with self._lock:
+            self._sweep_blocklisted_winners()
             seq_at_snapshot = self._dirty_seq
             configs: dict[str, Any] = {}
             namespaced_records = copy.deepcopy(self._namespaced_records)
@@ -5760,6 +5890,7 @@ class AutoTuner:
             self._file_config_selections.clear()
             self._invalidated_file_keys.clear()
             self._blocklisted_file_keys.clear()
+            self._blocklisted_winner_keys.clear()
             self._excluded_file_keys.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
