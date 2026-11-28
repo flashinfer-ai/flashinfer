@@ -26,6 +26,7 @@ This package provides high-performance normalization kernels:
 
 import functools
 import os
+import threading
 import warnings
 from typing import Literal, Optional, Tuple, Union
 
@@ -275,6 +276,32 @@ def get_norm_module():
     implementation and no CuTe DSL alternative.
     """
     return gen_norm_module().build_and_load()
+
+
+_weightless_cute_weights: dict[tuple[int, torch.dtype, int], torch.Tensor] = {}
+_weightless_cute_weights_lock = threading.Lock()
+
+
+def _cute_weight_and_bias(input: torch.Tensor, weight: Optional[torch.Tensor]):
+    if weight is not None:
+        return weight, 0.0
+    device_index = input.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (device_index, input.dtype, input.shape[-1])
+    if key not in _weightless_cute_weights:
+        # A fill captured in one graph does not initialize this tensor for eager
+        # calls or other graphs. Use the CUDA kernel for a capture-time miss.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        with _weightless_cute_weights_lock:
+            if key not in _weightless_cute_weights:
+                zero_weight = torch.zeros(
+                    input.shape[-1], dtype=input.dtype, device=f"cuda:{device_index}"
+                )
+                torch.cuda.synchronize(device_index)
+                _weightless_cute_weights[key] = zero_weight
+    return _weightless_cute_weights[key], 1.0
 
 
 def _normalize_scale_tensor(
@@ -1237,21 +1264,23 @@ def _rmsnorm_sigmoid_gate_fake(
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
-    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+    ``out[i] = (input[i] / RMS(input)) * weight[i]`` if ``weight`` is provided,
+    otherwise ``out[i] = input[i] / RMS(input)``.
 
     Parameters
     ----------
     input: torch.Tensor
         Input tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
@@ -1275,7 +1304,7 @@ def rmsnorm(
 def _rmsnorm_impl(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
@@ -1284,13 +1313,28 @@ def _rmsnorm_impl(
     if _use_cuda_norm(input.device):
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
+        cute_args = _cute_weight_and_bias(input, weight)
+        if cute_args is None:
+            get_norm_module().rmsnorm(out, input, None, eps, enable_pdl)
+            return
+        cute_weight, weight_bias = cute_args
         if input.dim() == 3:
             qk_rmsnorm_cute(
-                input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
+                input,
+                cute_weight,
+                out,
+                eps,
+                weight_bias=weight_bias,
+                enable_pdl=enable_pdl,
             )
         else:
             rmsnorm_cute(
-                input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
+                input,
+                cute_weight,
+                out,
+                eps,
+                weight_bias=weight_bias,
+                enable_pdl=enable_pdl,
             )
 
 
@@ -1298,7 +1342,7 @@ def _rmsnorm_impl(
 def _rmsnorm_impl_fake(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
@@ -1365,7 +1409,7 @@ def _rmsnorm_quant_fake(
 def fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -1375,7 +1419,8 @@ def fused_add_rmsnorm(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+    ``input[i] = (residual[i] / RMS(residual)) * weight[i]`` if ``weight`` is
+    provided, otherwise ``input[i] = residual[i] / RMS(residual)``.
 
     Parameters
     ----------
@@ -1383,8 +1428,9 @@ def fused_add_rmsnorm(
         Input tensor, shape (batch_size, hidden_size).
     residual: torch.Tensor
         Residual tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
@@ -1396,8 +1442,18 @@ def fused_add_rmsnorm(
     if _use_cuda_norm(input.device):
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
+        cute_args = _cute_weight_and_bias(input, weight)
+        if cute_args is None:
+            get_norm_module().fused_add_rmsnorm(input, residual, None, eps, enable_pdl)
+            return
+        cute_weight, weight_bias = cute_args
         fused_add_rmsnorm_cute(
-            input, residual, weight, eps, weight_bias=0.0, enable_pdl=enable_pdl
+            input,
+            residual,
+            cute_weight,
+            eps,
+            weight_bias=weight_bias,
+            enable_pdl=enable_pdl,
         )
 
 
@@ -1405,7 +1461,7 @@ def fused_add_rmsnorm(
 def _fused_add_rmsnorm_fake(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
