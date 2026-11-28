@@ -28,6 +28,14 @@ def profile_deepseek_mla_decode(
     head_dim_ckv = 512
     head_dim_kpe = 64
     page_size = 1
+    # Validate that the requested configuration is supported by the SM120 sparse MLA kernels.
+    # The (batch_size, num_heads) pair must be in the set of compiled kernel instances.
+    # Currently, the (32, 256) top-k kernel is missing; add a check to give a clear error.
+    if num_heads == 256 and batch_size == 32:
+        raise ValueError(
+            "Unsupported (batch_size, num_heads) combination (32, 256) for SM120 MLA decode kernels. "
+            "Please use a different configuration (e.g., batch_size=64, num_heads=128) or add the missing kernel instance."
+        )
     q_nope = torch.randn(
         batch_size * 1, num_heads, head_dim_ckv, dtype=torch.half, device="cuda"
     )
