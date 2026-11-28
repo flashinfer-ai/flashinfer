@@ -136,12 +136,13 @@ def prepare_tp_moe_fp4_experts(
     return fused_moe.prepare_weights(
         plan=weight_plan,
         weights=fused_moe.PackedWeights(
-            w13=w1_fp4,
-            w2=w2_fp4,
-            w13_block_scales=w1_blockscale,
-            w2_block_scales=w2_blockscale,
-            w13_global_scales=w1_global_scale,
-            w2_global_scales=w2_global_scale,
+            # Preparation may repack in place; references retain source layouts.
+            w13=w1_fp4.clone(),
+            w2=w2_fp4.clone(),
+            w13_block_scales=w1_blockscale.clone(),
+            w2_block_scales=w2_blockscale.clone(),
+            w13_global_scales=w1_global_scale.clone(),
+            w2_global_scales=w2_global_scale.clone(),
             input_scale=input_scale,
             intermediate_scale=intermediate_scale,
         ),

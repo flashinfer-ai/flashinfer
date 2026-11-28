@@ -12,13 +12,10 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.moe.fused_moe._impl import (
-    plan_b12x_fp4_moe_weights,
     prewarm_w4a16_fc2_e8m0,
     prepare_w4a16_fc2_e8m0,
-    prepare_b12x_fp4_moe_weights,
     run_w4a16_fc2_e8m0,
 )
-from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a16_f32,
@@ -46,6 +43,9 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_w4a16_modelopt_native_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_packed_weights,
+)
+from b12x.moe._shared.kernels.w4a16.route_pack import (
+    compile_w4a16_route_pack_launches,
 )
 from b12x.testing.reference.helpers import (
     make_tp_moe_fp4_binding,
@@ -1307,6 +1307,17 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
                 element_dtype="bf16",
             )
         )
+        route_pack_launches = (
+            None
+            if tc_decode
+            else compile_w4a16_route_pack_launches(
+                tokens=m,
+                topk=topk,
+                block_size=fused_launch.moe_block_size,
+                num_experts=experts,
+                ordinal=device.index,
+            )
+        )
         actual = run_w4a16_moe(
             x,
             prepared,
@@ -1324,6 +1335,7 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
             expert_offsets=buffers.expert_offsets,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            route_pack_launches=route_pack_launches,
         ).clone()
         expected = moe_reference_w4a16_fp4_e8m0_k32(
             x,
@@ -3265,29 +3277,23 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
     reference_weights = tuple(t.clone() for t in weights)
     w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
-    weight_plan = plan_b12x_fp4_moe_weights(
-        quant_modes="w4a16",
-        source_format="modelopt_nvfp4",
-        activation=activation,
-        params_dtype=torch.bfloat16,
-        num_experts=experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
-    )
-    prepared = prepare_b12x_fp4_moe_weights(
-        plan=weight_plan,
+    # Uniform A16 on ModelOpt NVFP4 prepares the MMA-packed layout.
+    prepared = prepare_tp_moe_fp4_experts(
+        a=torch.empty((1, hidden_size), dtype=torch.bfloat16, device="cuda"),
+        a1_gscale=a_gscale,
         w1_fp4=w13,
         w1_blockscale=w13_blockscale,
-        w1_global_scale=w13_global_scale,
-        a1_gscale=a_gscale,
+        w1_alphas=w13_global_scale,
+        a2_gscale=a_gscale,
         w2_fp4=w2,
         w2_blockscale=w2_blockscale,
-        w2_global_scale=w2_global_scale,
-        a2_gscale=a_gscale,
-        params_dtype=torch.bfloat16,
+        w2_alphas=w2_global_scale,
+        activation=activation,
+        quant_mode="w4a16",
     )
-    assert prepared.representation_for("w4a16") is not None
+    representation = prepared._impl.representation_for("w4a16")
+    assert representation is not None
+    assert representation.weight_layout == "packed"
 
     cases = [
         (1, 1, 1, torch.int32, 0.25),
@@ -3563,6 +3569,13 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
         hidden_size=hidden_size,
         element_dtype="bf16",
     )
+    route_pack_launches = compile_w4a16_route_pack_launches(
+        tokens=capacity_m,
+        topk=topk,
+        block_size=block_size_m,
+        num_experts=experts,
+        ordinal=x.device.index,
+    )
     output = torch.empty_like(x)
 
     def _run(output_buffer: torch.Tensor) -> torch.Tensor:
@@ -3585,6 +3598,7 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
             expert_counts=buffers.expert_counts,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            route_pack_launches=route_pack_launches,
         )
 
     actual = _run(output)
