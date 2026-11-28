@@ -289,6 +289,75 @@ def test_deepseekv3_routing(
     )
 
 
+@pytest.mark.parametrize("num_tokens", [1, 128, 1025])
+@pytest.mark.parametrize(
+    "bias_base,bias_step,bias_dtype",
+    [(20.14, 0.00002, torch.float32), (20.0, 0.125, torch.bfloat16)],
+)
+def test_deepseekv3_routing_preserves_bias_precision(
+    num_tokens, bias_base, bias_step, bias_dtype
+):
+    """The grouped router must select experts with the FP32 bias, not a BF16 copy."""
+    expert = torch.arange(256, device="cuda", dtype=torch.float32)
+    logits = (-5 + expert * 0.00004).repeat(num_tokens, 1)
+    # FP32 differences disappear if the bias is cast to the BF16 output dtype.
+    bias = (bias_base - expert * bias_step).to(bias_dtype)
+    run_and_check(
+        RoutingMethodType.DeepSeekV3,
+        lambda: routing_reference_no_aux(logits, bias, 8, 8, 4, 2.5, 8),
+        logits,
+        8,
+        8,
+        routing_bias=bias,
+        n_group=8,
+        topk_group=4,
+        routed_scaling_factor=2.5,
+    )
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    "routing_method,num_experts,n_group,topk_group,scale",
+    [
+        (RoutingMethodType.DeepSeekV3, 256, 8, 4, 2.5),
+        (RoutingMethodType.DeepSeekV3, 384, 1, 1, 2.5),
+        (RoutingMethodType.MiniMax2, 256, 1, 1, 1.0),
+    ],
+)
+def test_sigmoid_routing_normalizes_negative_logits(
+    use_cuda_graph, routing_method, num_experts, n_group, topk_group, scale
+):
+    """Logits of -20 must keep nonzero sigmoid scores, so the weights normalize."""
+    logits = torch.full((128, num_experts), -20.0, device="cuda")
+    bias = -torch.arange(num_experts, device="cuda", dtype=torch.float32) / 8
+
+    def run():
+        return trtllm_gen_routing(
+            logits,
+            bias,
+            routing_method,
+            8,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=scale,
+        )
+
+    result = run()
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = run()
+        graph.replay()
+    expected_ids = torch.arange(8, device="cuda").expand(128, 8)
+    torch.testing.assert_close(result.topk_ids.long().sort(dim=1).values, expected_ids)
+    torch.testing.assert_close(
+        result.topk_weights,
+        torch.full_like(result.topk_weights, scale / 8),
+        rtol=0,
+        atol=0,
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 150])
 @pytest.mark.parametrize("num_experts,top_k", [(64, 4), (256, 8)])
 @pytest.mark.parametrize("tile_tokens_dim", [8, 32])
