@@ -507,9 +507,9 @@ def _prims_ts_sparse_pattern_trace(
 
 def _prims_ts_trace_scale_values(kwargs, names, *, bound):
     """Resolve scale bindings without inspecting device-resident values."""
-    from flashinfer.attention.prims_ts._scales import normalize_scale
+    from flashinfer.attention.prims_ts.common.scales import normalize_scale
 
-    state = getattr(kwargs.get("self"), "_plan_state", None) if bound else None
+    state = getattr(kwargs.get("self"), "plan_state", None) if bound else None
     device = getattr(state, "device", None)
     if device is None:
         query = kwargs.get("q", kwargs.get("query"))
@@ -1052,7 +1052,7 @@ def _require_prims_ts_block_sparse_wrapper_state(
             "Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
-    state = getattr(wrapper, "_plan_state", None)
+    state = getattr(wrapper, "plan_state", None)
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     return state
@@ -1289,7 +1289,7 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
     out = kwargs.get("out")
     requested_out_dtype = kwargs.get("out_dtype")
     if plan_state is None:
-        plan_state = getattr(kwargs.get("self"), "_plan_state", None)
+        plan_state = getattr(kwargs.get("self"), "plan_state", None)
     if isinstance(out, torch.Tensor):
         out_dtype = out.dtype
     elif isinstance(requested_out_dtype, torch.dtype):
@@ -1788,7 +1788,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
-    state = getattr(wrapper, "_plan_state", None)
+    state = getattr(wrapper, "plan_state", None)
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     plan_owns_seq_lens = getattr(state, "planned_seq_lens_kv_device", None) is not None
@@ -2273,7 +2273,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
-    state = getattr(wrapper, "_plan_state", None)
+    state = getattr(wrapper, "plan_state", None)
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     packed_query = bool(state.packed_query)

@@ -32,9 +32,9 @@ from flashinfer.attention.prims_ts import (
     BatchPrefillTSWrapper,
     VCAttentionConfig,
     batch_prefill,
-    vc_attention as vca,
 )
-from flashinfer.attention.prims_ts.vc_attention.quantization import (
+from flashinfer.attention.prims_ts.variants import vc_attention as vca
+from flashinfer.attention.prims_ts.variants.vc_attention.quantization import (
     vc_quantize_int8,
     vc_quantize_repair_int8,
     VC_KMEANS_ITERS,
@@ -108,7 +108,7 @@ def _quantize_blocks(
     """Divide ``[B, S, H, D]`` by its ``[B, H, nb]`` block scale and round to
     E4M3 or, for INT8 codes, to the nearest integer in ``[-127, 127]``."""
     b, s, h, d = x.shape
-    per_token = vca._per_token_scales(scale, s, block)  # [B, S, H]
+    per_token = vca.per_token_scales(scale, s, block)  # [B, S, H]
     scaled = x.float() / per_token.unsqueeze(-1)
     if qk_dtype is torch.int8:
         return torch.round(scaled).clamp_(-127, 127).to(torch.int8)
@@ -117,7 +117,7 @@ def _quantize_blocks(
 
 def _pad_tokens(x: torch.Tensor, block: int) -> torch.Tensor:
     """Zero-pad the token axis (dim 1) of ``[B, S, H, D]`` up to a block multiple."""
-    pad = vca._blocks(x.shape[1], block) * block - x.shape[1]
+    pad = vca.blocks(x.shape[1], block) * block - x.shape[1]
     if pad == 0:
         return x
     return torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
@@ -152,7 +152,7 @@ def _reference_quantize(
     k_p = torch.gather(k, 1, gather_idx)
     v_p = torch.gather(v.float(), 1, gather_idx)
 
-    num_kv_tiles = vca._blocks(s_k, vca.VC_K_BLOCK_SIZE)
+    num_kv_tiles = vca.blocks(s_k, vca.VC_K_BLOCK_SIZE)
     v_pad = _pad_tokens(v_p, vca.VC_K_BLOCK_SIZE).view(
         b, num_kv_tiles, vca.VC_K_BLOCK_SIZE, h, d
     )
@@ -223,7 +223,7 @@ def _reference_quantize_fp8(
     k_scale = _block_amax_scale(k_p, vca.VC_K_BLOCK_SIZE, qk_dtype)
     q8 = _quantize_blocks(q_f, q_scale, vca.VC_K_BLOCK_SIZE, qk_dtype)
     k8 = _quantize_blocks(k_p, k_scale, vca.VC_K_BLOCK_SIZE, qk_dtype)
-    num_kv_tiles = vca._blocks(s_k, vca.VC_K_BLOCK_SIZE)
+    num_kv_tiles = vca.blocks(s_k, vca.VC_K_BLOCK_SIZE)
     v_pad = _pad_tokens(v_p, vca.VC_K_BLOCK_SIZE).view(
         b, num_kv_tiles, vca.VC_K_BLOCK_SIZE, h, d
     )
@@ -599,7 +599,7 @@ def test_vc_kernel_config_rejects_invalid_profiles():
     """The kernel config owns the VC recipe rules."""
     from cutlass import BFloat16, Float32, Float8E4M3FN
 
-    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import FmhaTs
+    from flashinfer.attention.prims_ts.variants.context.kernel.kernel import FmhaTs
 
     arguments = dict(
         in_qk_dtype=BFloat16,
@@ -667,7 +667,7 @@ def test_vc_run_rejects_mismatched_operands():
             v_dtype=None,
             out_dtype=None,
         )
-        geometry = defaults._plan_state.geometry
+        geometry = defaults.plan_state.geometry
         assert (geometry.pv_dtype, geometry.out_dtype) == (_FP8, torch.bfloat16)
     with pytest.raises(ValueError, match="k_scale must have shape"):
         qk8.run(
@@ -829,11 +829,11 @@ def test_vc_preprocessor_step_schedule():
     )
     step1 = prep.prepare(k, v, denoise_step=(1, 40))
     assert torch.equal(step1.perm, perm0)  # no refresh at step 1
-    perm_ptr = prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr()
+    perm_ptr = prep.groupings[(1, 1024, 2, None)]["perm"].data_ptr()
     step4 = prep.prepare(k, v.flip(1), denoise_step=(4, 40))
     assert not torch.equal(step4.perm, perm0)  # refreshed at step 4
     # The new grouping lands in the existing buffer so a captured CUDA graph reads it.
-    assert prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr() == perm_ptr
+    assert prep.groupings[(1, 1024, 2, None)]["perm"].data_ptr() == perm_ptr
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)
@@ -862,7 +862,7 @@ def test_vc_preprocessor_step_schedule():
     plain = runner_prep.prepare(k, v, mode="plain")
     assert not plain.demean and torch.equal(plain.perm, warm.perm)
     assert torch.equal(runner_prep.prepare(k, v, mode="cold").perm, perm0)
-    assert runner_prep._last_step is None
+    assert runner_prep.last_step is None
     static_v = v.clone()
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())

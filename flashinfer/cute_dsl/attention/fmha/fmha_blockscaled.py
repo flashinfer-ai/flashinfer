@@ -265,10 +265,9 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             raise ValueError(f"Unsupported p_exp_mode: {p_exp_mode!r}")
         self.p_exp_mode = p_exp_mode
         if p_exp_mode == "expcast":
-            from flashinfer.attention.prims_ts.kernels.fmha_context.helpers import (
+            from flashinfer.attention.prims_ts.variants.context.kernel.device.expcast import (
                 expcast_e4m3_quad_relu,
-                f16x2_sum4,
-            )
+                f16x2_sum4)
 
             self.expcast_encode = expcast_e4m3_quad_relu
             self.expcast_sum = f16x2_sum4

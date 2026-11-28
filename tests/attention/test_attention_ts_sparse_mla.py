@@ -12,8 +12,12 @@ import functools
 import pytest
 import torch
 
-from flashinfer.attention.prims_ts import mla_decode as mla_decode_module
-from flashinfer.attention.prims_ts.kernels.mla_decode import sparse_policy
+from flashinfer.attention.prims_ts.variants import mla_decode as mla_decode_module
+import flashinfer.attention.prims_ts.variants.mla_decode.launch as mla_launch
+import flashinfer.attention.prims_ts.variants.mla_decode.sparse_plan as mla_sparse
+from flashinfer.attention.prims_ts.variants.mla_decode.kernel import (
+    sparse_selection as sparse_policy,
+)
 
 pytest.importorskip("cutlass", minversion="4.7.0")
 triton = pytest.importorskip("triton")
@@ -36,6 +40,19 @@ pytestmark = pytest.mark.skipif(
 
 
 # Reference: FP64 math, explicit masks, and an unchanged FP8 rounding bound.
+_MLA_MODULES = (mla_decode_module, mla_launch, mla_sparse)
+
+
+def _patch_mla(monkeypatch, name, value):
+    """Patch a helper in every split module that looks it up."""
+    patched = False
+    for module in _MLA_MODULES:
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, value)
+            patched = True
+    assert patched, name
+
+
 def _reference(
     query,
     kv_cache,
@@ -188,7 +205,7 @@ def prepare_sparse_mla_indices(
     out reuses addresses and supports preparation in graph-lifetime tests.
     Scales and attention_sinks are passed directly to run(); this adapter does not copy them.
     """
-    state = wrapper._state
+    state = wrapper.state
     if state is None:
         raise ValueError("a prepared attention plan is required")
     rows = query.numel() // (state["num_qo_heads"] * query.shape[-1])
@@ -462,20 +479,20 @@ def test_rope_quant_graph(
 
 
 def _plan_with_deferred_compilation(wrapper, *args, **kwargs):
-    cache_info = mla_decode_module._get_compiled_mla_decode.cache_info()
+    cache_info = mla_decode_module.get_compiled_mla_decode.cache_info()
     wrapper.plan(*args, **kwargs, compile=False)
-    spec = wrapper._state["compile_spec"]
-    assert wrapper._state["compiled"] is None
-    assert mla_decode_module._get_compiled_mla_decode.cache_info() == cache_info
+    spec = wrapper.state["compile_spec"]
+    assert wrapper.state["compiled"] is None
+    assert mla_decode_module.get_compiled_mla_decode.cache_info() == cache_info
     with pytest.raises(RuntimeError, match=r"plan\(compile=True\)"):
         wrapper.run(None, None, None, None, validate=False)
     wrapper.plan(*args, **kwargs)
-    compiled = wrapper._state["compiled"]
-    assert compiled is not None and wrapper._state["compile_spec"] == spec
+    compiled = wrapper.state["compiled"]
+    assert compiled is not None and wrapper.state["compile_spec"] == spec
     wrapper.plan(*args, **kwargs, compile=False)
-    assert wrapper._state["compiled"] is None
+    assert wrapper.state["compiled"] is None
     wrapper.plan(*args, **kwargs)
-    assert wrapper._state["compiled"] is compiled
+    assert wrapper.state["compiled"] is compiled
 
 
 @pytest.mark.parametrize("block", [32, 128])
@@ -926,8 +943,7 @@ def test_large_query_native_graph(dtype):
 
 @pytest.mark.parametrize("scheduler", ["static", "clc"])
 def test_keep_ab_runtime_task_cache(scheduler, monkeypatch):
-    from flashinfer.attention.prims_ts import mla_decode
-    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.sparse_selection import (
         SparseMlaProfile,
     )
 
@@ -945,14 +961,12 @@ def test_keep_ab_runtime_task_cache(scheduler, monkeypatch):
         kv_tile_size=64,
         page_pipeline_stages=1,
     )
-    monkeypatch.setattr(
-        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
-    )
-    compile_kernel = mla_decode._get_compiled_mla_decode
+    _patch_mla(monkeypatch, "select_sparse_mla_profile", lambda **kwargs: profile)
+    compile_kernel = mla_launch.get_compiled_mla_decode
     configs = []
 
     def checked_compile(spec):
-        cfg = spec.kernel._make_config()
+        cfg = spec.kernel.make_config()
         assert cfg.kernel_variant == "keeps_mma_ab"
         assert cfg.num_insts_kv == 1
         assert cfg.tile_size_q == cfg.tile_size_kv == 64
@@ -967,7 +981,7 @@ def test_keep_ab_runtime_task_cache(scheduler, monkeypatch):
         configs.append(cfg)
         return compile_kernel(spec)
 
-    monkeypatch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+    _patch_mla(monkeypatch, "get_compiled_mla_decode", checked_compile)
     # Keep the independent oracle and changed-metadata replay gates unchanged.
     test_native_graph(torch.bfloat16, sms + 1, 1, 64, 513, True, False, True)
     assert configs
@@ -996,22 +1010,19 @@ _WS_GATHER_PROFILE = dict(
 @pytest.mark.parametrize("q_in_kv", [False, True])
 def test_keep_ab_ws_gather_graph(q_in_kv, monkeypatch):
     """Q staged in two K/V ring slices lets the WS schedule retain ten D128 stages."""
-    from flashinfer.attention.prims_ts import mla_decode
-    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.sparse_selection import (
         SparseMlaProfile,
     )
 
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     options = dict(ws_q_in_kv=True, reuse_kv_stages=10) if q_in_kv else {}
     profile = SparseMlaProfile(**_WS_GATHER_PROFILE, **options)
-    monkeypatch.setattr(
-        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
-    )
-    compile_kernel = mla_decode._get_compiled_mla_decode
+    _patch_mla(monkeypatch, "select_sparse_mla_profile", lambda **kwargs: profile)
+    compile_kernel = mla_launch.get_compiled_mla_decode
     configs = []
 
     def checked_compile(spec):
-        cfg = spec.kernel._make_config()
+        cfg = spec.kernel.make_config()
         assert cfg.kernel_variant == "keeps_mma_ab"
         assert cfg.ws_pv and cfg.ws_tma_output
         assert cfg.q_in_kv == q_in_kv
@@ -1020,7 +1031,7 @@ def test_keep_ab_ws_gather_graph(q_in_kv, monkeypatch):
         configs.append(cfg)
         return compile_kernel(spec)
 
-    monkeypatch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+    _patch_mla(monkeypatch, "get_compiled_mla_decode", checked_compile)
     # Keep the independent oracle and changed-metadata replay gates unchanged.
     test_native_graph(torch.float8_e4m3fn, sms + 1, 1, 64, 513, True, False, True)
     assert configs
@@ -1050,15 +1061,12 @@ def test_keep_ab_ws_gather_profile_rejected(overrides, message, monkeypatch):
     """Profile options a schedule cannot honor fail at plan time."""
     from dataclasses import replace
 
-    from flashinfer.attention.prims_ts import mla_decode
-    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.sparse_selection import (
         SparseMlaProfile,
     )
 
     profile = replace(SparseMlaProfile(**_WS_GATHER_PROFILE), **overrides)
-    monkeypatch.setattr(
-        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
-    )
+    _patch_mla(monkeypatch, "select_sparse_mla_profile", lambda **kwargs: profile)
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     w = BatchSparseMLADecodePagedTSWrapper()
     with pytest.raises(ValueError, match=message):
@@ -1083,19 +1091,16 @@ def test_keep_ab_ws_tma_store_rejects_two_cta_output_quant(monkeypatch):
     MlaOutputQuant's shared output is the two-CTA box layout, so the WS TMA
     quantized store must refuse it instead of writing past the warp's slice.
     """
-    from flashinfer.attention.prims_ts import mla_decode
-    from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.output_quant import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.device.output_quant import (
         MlaOutputQuant,
     )
-    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.sparse_selection import (
         SparseMlaProfile,
     )
 
     assert not MlaOutputQuant.stages_ws_sw128_rows
     profile = SparseMlaProfile(**_WS_GATHER_PROFILE)
-    monkeypatch.setattr(
-        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
-    )
+    _patch_mla(monkeypatch, "select_sparse_mla_profile", lambda **kwargs: profile)
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     w = BatchSparseMLADecodePagedTSWrapper()
     with pytest.raises(ValueError, match="stages_ws_sw128_rows"):
@@ -1116,8 +1121,7 @@ def test_keep_ab_ws_tma_store_rejects_two_cta_output_quant(monkeypatch):
 
 def test_retained_nvfp4_keep_ab_rejects_v_split(monkeypatch):
     """Retained NVFP4 Keep-AB runs WS N256 PV passes, which cannot split V."""
-    from flashinfer.attention.prims_ts import mla_decode
-    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.sparse_selection import (
         SparseMlaProfile,
     )
 
@@ -1131,9 +1135,7 @@ def test_retained_nvfp4_keep_ab_rejects_v_split(monkeypatch):
         reuse_kv=True,
         kv_tile_size=128,
     )
-    monkeypatch.setattr(
-        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
-    )
+    _patch_mla(monkeypatch, "select_sparse_mla_profile", lambda **kwargs: profile)
     w = BatchSparseMLADecodePagedTSWrapper()
     with pytest.raises(ValueError, match="requires one V owner"):
         w.plan(
@@ -1354,11 +1356,11 @@ def _pdl_outputs(run_test, check_config, profile, wait_after_prologue):
     from dataclasses import replace
 
     from flashinfer.attention.prims_ts import mla_decode
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.latency_1cta.kernel import (
         ThroughputLatencyMlaDecodeTs,
     )
 
-    compile_kernel = mla_decode._get_compiled_mla_decode
+    compile_kernel = mla_decode.get_compiled_mla_decode
     waits_after_prologue = ThroughputLatencyMlaDecodeTs.waits_after_prologue
     configs, outputs, first = [], [], {}
 
@@ -1369,9 +1371,9 @@ def _pdl_outputs(run_test, check_config, profile, wait_after_prologue):
         spec = replace(
             spec,
             kernel=kernel,
-            kernel_signature=mla_decode._mla_kernel_compile_signature(kernel),
+            kernel_signature=mla_decode.mla_kernel_compile_signature(kernel),
         )
-        cfg = spec.kernel._make_config()
+        cfg = spec.kernel.make_config()
         check_config(cfg)
         configs.append(cfg)
         traced = []
@@ -1407,9 +1409,9 @@ def _pdl_outputs(run_test, check_config, profile, wait_after_prologue):
     with pytest.MonkeyPatch.context() as patch:
         if profile is not None:
             patch.setattr(
-                mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+                mla_sparse, "select_sparse_mla_profile", lambda **kwargs: profile
             )
-        patch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+        patch.setattr(mla_decode, "get_compiled_mla_decode", checked_compile)
         patch.setattr(BatchSparseMLADecodePagedTSWrapper, "run", recording_run)
         run_test()
     assert configs and outputs and first["launches"]
@@ -1445,7 +1447,7 @@ def _early_start_paths(spec, compiled, args, attempts=3):
     with pytest.MonkeyPatch.context() as trace:
         trace.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
         trace.setattr(prims, "griddepcontrol", without_wait)
-        twin = mla_decode._get_compiled_mla_decode.__wrapped__(spec)
+        twin = mla_decode.get_compiled_mla_decode.__wrapped__(spec)
     # Load the twin (lazy module loading) before any launch that must overlap.
     twin(*args)
     torch.cuda.synchronize()
@@ -1491,7 +1493,7 @@ def test_pdl_wait_after_prologue_graph(schedule):
     grid started late, the arms could not tell a misplaced wait from a correct
     one, and the case is skipped as inconclusive.
     """
-    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.sparse_selection import (
         SparseMlaProfile,
     )
 
@@ -2327,7 +2329,7 @@ def test_tensor_fp8_nvfp4_rescale_threshold_graph(heads):
 def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads, capacity):
     """One host-scale plan serves varying row counts; graphs retain captured scales."""
     from unittest.mock import patch
-    import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
+    import flashinfer.attention.prims_ts.variants.mla_decode as mla_decode_module
 
     torch.manual_seed(127)
     topk = 129
@@ -2346,8 +2348,8 @@ def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads, capacity):
     owners = []
     with patch.object(
         mla_decode_module,
-        "_get_compiled_mla_decode",
-        wraps=mla_decode_module._get_compiled_mla_decode,
+        "get_compiled_mla_decode",
+        wraps=mla_launch.get_compiled_mla_decode,
     ) as compile_calls:
         wrapper.plan(
             "cuda",
@@ -2438,9 +2440,8 @@ def test_quantized_kv_reuses_compiled_kernel_across_row_buckets(
     monkeypatch, cache_format
 ):
     """Row buckets that select the same profile reuse one compiled kernel."""
-    import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
-    compile_kernel = mla_decode_module._get_compiled_mla_decode
+    compile_kernel = mla_launch.get_compiled_mla_decode
     kernels = []
 
     def record_kernel(spec):
@@ -2449,7 +2450,7 @@ def test_quantized_kv_reuses_compiled_kernel_across_row_buckets(
         kernels.append(compiled)
         return compiled
 
-    monkeypatch.setattr(mla_decode_module, "_get_compiled_mla_decode", record_kernel)
+    _patch_mla(monkeypatch, "get_compiled_mla_decode", record_kernel)
     clusters = torch.cuda.get_device_properties("cuda").multi_processor_count // 2
     for rows in (clusters, clusters + 1, 2 * clusters + 1):
         test_d512_nvfp4_sources_graph(
@@ -2694,7 +2695,7 @@ def test_sparse_d576_rejected(change, match):
 def test_sparse_d576_compile_capacity_bucket():
     """Capacities in one 128-key tile bucket resolve to one compiled kernel."""
     signatures = {
-        mla_decode_module._resolve_sparse_mla_plan(
+        mla_sparse.resolve_sparse_mla_plan(
             torch.device("cuda"),
             150,
             64,
@@ -2759,8 +2760,8 @@ def test_sparse_d576_rejects_d512_plan_options(option, match):
 def test_sparse_mla_global_scales_graph_replay(monkeypatch):
     """Global tensor scales preserve independent FP8 and NVFP4 source scaling."""
     kinds = (True, False, True)
-    monkeypatch.setattr(
-        mla_decode_module,
+    _patch_mla(
+        monkeypatch,
         "select_sparse_mla_profile",
         lambda **_: sparse_policy.SparseMlaProfile(
             family="2cta",

@@ -94,7 +94,7 @@ in `extra_key_files`. `version.py` and `_build_meta.py` are excluded so caches
 can survive checkout changes.
 
 Task-scheduled attention uses this cache through
-`flashinfer/attention/prims_ts/_compile_cache.py`. Its keys cover compile specs,
+`flashinfer/attention/prims_ts/compile_cache.py`. Its keys cover compile specs,
 options, embedded device-capacity constants, and the attention source tree,
 including shared preparation, masks, and reductions. `_hardware.py` caches
 occupancy queries per device and cluster size.

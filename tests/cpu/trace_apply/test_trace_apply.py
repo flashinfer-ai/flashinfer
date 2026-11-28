@@ -1244,7 +1244,7 @@ def test_prims_ts_invalid_scale_falls_back(
         "block_sparse" if bound else "decode", bound, scales
     )
     if bound:
-        state = api.__self__._plan_state
+        state = api.__self__.plan_state
         state.device = torch.device("cuda:0")
         state.use_kv_valid_bits = False
         state.dummy_kv_valid_bits = None

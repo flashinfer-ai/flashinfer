@@ -138,7 +138,7 @@ def _prims_ts_decode_supports_head_dim(head_dim, q_dtype, *, is_nvfp4_kv):
     """Return whether PrimTS decode supports ``head_dim`` for these dtypes.
 
     H64/128/192/256 support every dtype above. H512 is qualified only for FP8 Q
-    with NVFP4 K/V (``_validate_headdim_512``); other H512 dtypes have not been
+    with NVFP4 K/V (``validate_headdim_512``); other H512 dtypes have not been
     validated yet.
     """
     return head_dim in (64, 128, 192, 256) or (

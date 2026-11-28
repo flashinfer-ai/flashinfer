@@ -106,10 +106,10 @@ def _plan_cp(
         lse_mode="base2",
         zero_empty_rows=zero_empty_rows,
     )
-    assert wrapper._plan_state is not None
-    assert wrapper._plan_state.cp_world == cp_world
-    assert wrapper._plan_state.cp_interleave_size == cp_interleave_size
-    assert callable(wrapper._plan_state.compiled)
+    assert wrapper.plan_state is not None
+    assert wrapper.plan_state.cp_world == cp_world
+    assert wrapper.plan_state.cp_interleave_size == cp_interleave_size
+    assert callable(wrapper.plan_state.compiled)
     assert _policy_dict(wrapper)["kernel"] in (
         "throughput_latency_1cta",
         "throughput_2cta",
@@ -367,7 +367,7 @@ def _run_cp_ranks(
         cp_world=cp_world,
         cp_interleave_size=cp_interleave_size,
     )
-    compiled = wrapper._plan_state.compiled
+    compiled = wrapper.plan_state.compiled
     global_lengths = torch.tensor(
         [global_length], dtype=torch.int32, device=case.query.device
     )
@@ -390,7 +390,7 @@ def _run_cp_ranks(
             policy=_policy_dict(wrapper),
             bf16_single_tile=case.query.dtype == torch.bfloat16,
         )
-        assert wrapper._plan_state.compiled is compiled
+        assert wrapper.plan_state.compiled is compiled
         outputs.append(output)
         stats.append(lse)
         all_bounds.append(bounds)
@@ -608,9 +608,9 @@ def _exercise_cp_graph(
             zero_empty_rows=False,
             cp_interleave_size=cp_interleave_size,
         )
-        assert no_init._plan_state.compiled is not wrapper._plan_state.compiled
+        assert no_init.plan_state.compiled is not wrapper.plan_state.compiled
         assert (
-            no_init._plan_state.workspace_layout == wrapper._plan_state.workspace_layout
+            no_init.plan_state.workspace_layout == wrapper.plan_state.workspace_layout
         )
         output, stats = _run_cp(
             no_init, case, global_lengths, cp_rank=cp_rank, qo_indptr=qo_indptr

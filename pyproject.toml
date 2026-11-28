@@ -233,7 +233,8 @@ exclude = [
   "flashinfer-cubin/",
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
-  "flashinfer/attention/prims_ts/kernels/",
+  "flashinfer/attention/prims_ts/device/",
+  "flashinfer/attention/prims_ts/variants/[a-z_]+/kernel/",
   # Imported CuTe DSL kernels are kept byte-faithful to their source.
   "flashinfer/experimental/attn_scores/kernels/selective_topk/",
   "3rdparty/",

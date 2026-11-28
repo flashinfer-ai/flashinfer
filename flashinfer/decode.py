@@ -180,11 +180,11 @@ def __getattr__(name: str):
 
     if name in _PRIMS_TS_LAZY_EXPORTS:
         if name in _PRIMS_TS_Q_TOKEN_KV_BLOCK_SPARSE_LAZY_EXPORTS:
-            from .attention.prims_ts import q_token_kv_block_sparse_metadata
+            from .attention.prims_ts.variants import q_token_kv_block_sparse_metadata
 
             value = getattr(q_token_kv_block_sparse_metadata, name)
         else:
-            from .attention.prims_ts import decode
+            from .attention.prims_ts.variants import decode
 
             value = getattr(decode, name)
         globals()[name] = value

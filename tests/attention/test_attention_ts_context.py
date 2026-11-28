@@ -36,23 +36,42 @@ pytest.importorskip(
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 
-import flashinfer.attention.prims_ts.context as context_module
-from flashinfer.attention.prims_ts.kernels import tcgen05_compat
+import flashinfer.attention.prims_ts.variants.context as context_module
+import flashinfer.attention.prims_ts.variants.context.compile as context_compile
+import flashinfer.attention.prims_ts.variants.context.geometry as context_geometry
+import flashinfer.attention.prims_ts.variants.context.validation as context_validation
+from flashinfer.attention.prims_ts.device import tcgen05 as tcgen05_compat
 from flashinfer.attention.prims_ts import (
     BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
     batch_prefill,
     batch_prefill_with_paged_kv_cache,
 )
-from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
+from flashinfer.attention.prims_ts.variants.context.kernel.kernel import (
     FmhaTs,
     build_fmha_task_manager,
 )
-from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
-    FmhaConfig,
-)
+from flashinfer.attention.prims_ts.variants.context.kernel.config import FmhaConfig
 from flashinfer.quantization import mxfp8_quantize_bshd
 from flashinfer.utils import is_sm100a_supported
+
+
+_CONTEXT_MODULES = (
+    context_module,
+    context_validation,
+    context_geometry,
+    context_compile,
+)
+
+
+def _patch_context(monkeypatch, name, value):
+    """Patch a context helper in every split module that looks it up."""
+    patched = False
+    for module in _CONTEXT_MODULES:
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, value)
+            patched = True
+    assert patched, name
 
 
 _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
@@ -635,7 +654,7 @@ def _capture_context_graph(
     redistribute tokens across requests.
     """
 
-    geometry = wrapper._plan_state.geometry
+    geometry = wrapper.plan_state.geometry
 
     # Capture capacity-sized grids without reading device metadata on the host.
     def launch() -> torch.Tensor:
@@ -853,7 +872,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert not hasattr(BatchPrefillPagedTSWrapper, "plan_live")
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
-    assert context_module._PagedContextPlanState.__dataclass_params__.frozen is True
+    assert context_module.PagedContextPlanState.__dataclass_params__.frozen is True
 
 
 @pytest.mark.parametrize(
@@ -953,7 +972,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     assert run_parameters["variable_window_cta_starts"].default is None
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
-    assert context_module._ContextPlanState.__dataclass_params__.frozen is True
+    assert context_module.ContextPlanState.__dataclass_params__.frozen is True
 
 
 def _row_strided_value(value: torch.Tensor, padding: int) -> torch.Tensor:
@@ -1016,14 +1035,14 @@ def test_attention_ts_context_strided_v_reuse_and_graph(packed):
     expected = _context_reference(case)
     atol, rtol = 0.01, 0.02
     torch.testing.assert_close(compact_out.float(), expected, atol=atol, rtol=rtol)
-    state = wrapper._plan_state
-    cache_before = context_module._get_compiled_context.cache_info()
+    state = wrapper.plan_state
+    cache_before = context_compile.get_compiled_context.cache_info()
     for padding in (64, 192):
         padded_case = replace(case, v=_row_strided_value(case.v, padding))
         actual = _run_wrapper(wrapper, padded_case)
         torch.testing.assert_close(actual, compact_out, atol=0, rtol=0)
-        assert wrapper._plan_state is state
-    assert context_module._get_compiled_context.cache_info() == cache_before
+        assert wrapper.plan_state is state
+    assert context_compile.get_compiled_context.cache_info() == cache_before
     # The one-shot adapter has its own geometry validation and must accept V.
     torch.testing.assert_close(
         _run_one_shot(padded_case).float(), expected, atol=atol, rtol=rtol
@@ -1153,9 +1172,9 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         calls["resolve"] = (args, kwargs)
         return geometry
 
-    monkeypatch.setattr(
-        context_module,
-        "_resolve_paged_geometry",
+    _patch_context(
+        monkeypatch,
+        "resolve_paged_geometry",
         resolve,
     )
     monkeypatch.setattr(context_module, "BatchPrefillPagedTSWrapper", StubWrapper)
@@ -1210,23 +1229,19 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
 def _enable_paged_one_shot_cpu_validation(monkeypatch) -> None:
     """Retain value validation while substituting CPU storage in unit tests."""
 
-    monkeypatch.setattr(context_module, "_validate_base_tensors", lambda *_a: None)
-    monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
+    _patch_context(monkeypatch, "validate_base_tensors", lambda *_a: None)
+    _patch_context(monkeypatch, "validate_device", lambda _device: 0)
+    _patch_context(monkeypatch, "validate_tensor", lambda *_a, **_k: None)
+    _patch_context(monkeypatch, "validate_indptr_tensor", lambda *_a, **_k: None)
+    _patch_context(
+        monkeypatch, "validate_paged_metadata_tensor", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_resolve_cuda_device",
+    _patch_context(
+        monkeypatch,
+        "resolve_context_device",
         lambda _device: (torch.device("cpu"), 0),
     )
-    monkeypatch.setattr(
-        context_module, "_validate_paged_runtime_inputs", lambda *_a, **_k: None
-    )
+    _patch_context(monkeypatch, "validate_paged_runtime_inputs", lambda *_a, **_k: None)
 
 
 def test_attention_ts_context_paged_one_shot_validates_fixed_table(
@@ -1241,7 +1256,7 @@ def test_attention_ts_context_paged_one_shot_validates_fixed_table(
     block_tables = torch.tensor(((4, -1, -1), (1, 3, 0)), dtype=torch.int32)
     seq_lens_kv = torch.tensor((17, 65), dtype=torch.int32)
 
-    geometry = context_module._resolve_paged_geometry(
+    geometry = context_geometry.resolve_paged_geometry(
         q,
         k_cache,
         v_cache,
@@ -1280,7 +1295,7 @@ def test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata(
     v_cache = torch.empty_like(k_cache)
 
     with pytest.raises(ValueError, match=match):
-        context_module._resolve_paged_geometry(
+        context_geometry.resolve_paged_geometry(
             q,
             k_cache,
             v_cache,
@@ -1306,7 +1321,7 @@ def test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata(
 def test_attention_ts_context_variable_window_validates_nondecreasing_ends(
     monkeypatch, end_values, error
 ) -> None:
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
+    _patch_context(monkeypatch, "validate_tensor", lambda *_args: None)
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
         packed_query=False,
@@ -1319,12 +1334,12 @@ def test_attention_ts_context_variable_window_validates_nondecreasing_ends(
     ends = torch.tensor(end_values, dtype=torch.int32)
     if error is not None:
         with pytest.raises(ValueError, match=f"nondecreasing.*{error}"):
-            context_module._validate_variable_window_bounds(
+            context_validation.validate_variable_window_bounds(
                 starts, ends, geometry=geometry
             )
     else:
         flat_starts, flat_ends, values = (
-            context_module._validate_variable_window_bounds(
+            context_validation.validate_variable_window_bounds(
                 starts, ends, geometry=geometry
             )
         )
@@ -1336,7 +1351,7 @@ def test_attention_ts_context_variable_window_validates_nondecreasing_ends(
 def test_attention_ts_context_validates_precomputed_variable_window_cta_starts(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
+    _patch_context(monkeypatch, "validate_tensor", lambda *_args: None)
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
         batch_size=2,
@@ -1346,7 +1361,7 @@ def test_attention_ts_context_validates_precomputed_variable_window_cta_starts(
     token_start_values = tuple(range(257)) + tuple(range(256, -1, -1))
     cta_starts = torch.tensor(((0, 256), (1, 0)), dtype=torch.int32)
 
-    validated = context_module._validate_variable_window_cta_starts(
+    validated = context_validation.validate_variable_window_cta_starts(
         cta_starts,
         token_start_values=token_start_values,
         geometry=geometry,
@@ -1355,25 +1370,25 @@ def test_attention_ts_context_validates_precomputed_variable_window_cta_starts(
     assert validated.data_ptr() == cta_starts.data_ptr()
     assert validated.shape == (4,)
     with pytest.raises(ValueError, match=r"entry \[1, 0\] is 2, expected 1"):
-        context_module._validate_variable_window_cta_starts(
+        context_validation.validate_variable_window_cta_starts(
             torch.tensor(((0, 256), (2, 0)), dtype=torch.int32),
             token_start_values=token_start_values,
             geometry=geometry,
         )
     with pytest.raises(ValueError, match=r"must have shape \(2, 2\)"):
-        context_module._validate_variable_window_cta_starts(
+        context_validation.validate_variable_window_cta_starts(
             torch.zeros(4, dtype=torch.int32),
             token_start_values=token_start_values,
             geometry=geometry,
         )
     with pytest.raises(ValueError, match="must have dtype torch.int32"):
-        context_module._validate_variable_window_cta_starts(
+        context_validation.validate_variable_window_cta_starts(
             torch.zeros((2, 2), dtype=torch.float32),
             token_start_values=token_start_values,
             geometry=geometry,
         )
     with pytest.raises(ValueError, match="must have compact"):
-        context_module._validate_variable_window_cta_starts(
+        context_validation.validate_variable_window_cta_starts(
             torch.zeros((2, 4), dtype=torch.int32)[:, ::2],
             token_start_values=token_start_values,
             geometry=geometry,
@@ -1383,7 +1398,7 @@ def test_attention_ts_context_validates_precomputed_variable_window_cta_starts(
 def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None:
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
-    wrapper._plan_state = context_module._ContextPlanState(
+    wrapper.plan_state = context_module.ContextPlanState(
         geometry=SimpleNamespace(
             packed_query=False, mask_type="dense", vc=None, qk_dtype=torch.bfloat16
         ),
@@ -1427,7 +1442,7 @@ def test_attention_ts_context_paged_run_keeps_lifecycle_check_without_validation
 
 def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper = BatchPrefillPagedTSWrapper()
-    wrapper._plan_state = context_module._PagedContextPlanState(
+    wrapper.plan_state = context_module.PagedContextPlanState(
         geometry=SimpleNamespace(device=torch.device("cpu"), out_dtype=torch.float32),
         softmax_scale=torch.empty(1),
         output_scale=torch.empty(1),
@@ -1464,7 +1479,7 @@ def _validate_paged_metadata_on_cpu(
 ) -> None:
     """Exercise metadata value checks without requiring a CUDA device."""
 
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
+    _patch_context(monkeypatch, "validate_tensor", lambda *_a, **_k: None)
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
         batch_size=2,
@@ -1489,7 +1504,7 @@ def _validate_paged_metadata_on_cpu(
         runtime_block_tables = backing[:, : compact_block_tables.shape[1]]
     else:
         runtime_block_tables = compact_block_tables
-    context_module._validate_paged_runtime_metadata(
+    context_validation.validate_paged_runtime_metadata(
         torch.tensor(qo_indptr, dtype=torch.int32),
         runtime_block_tables,
         torch.tensor(seq_lens_kv, dtype=torch.int32),
@@ -1584,10 +1599,10 @@ def test_attention_ts_context_paged_validation_enforces_row_strided_table(
 ) -> None:
     """The native table admits row padding but rejects overlapping rows."""
 
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
+    _patch_context(monkeypatch, "validate_tensor", lambda *_a, **_k: None)
     backing = torch.zeros((2, 2, 3), dtype=torch.int32)
     row_padded = backing[:, 0, :]
-    context_module._validate_block_tables_tensor(
+    context_validation.validate_block_tables_tensor(
         row_padded,
         device=torch.device("cpu"),
         batch_size=2,
@@ -1601,7 +1616,7 @@ def test_attention_ts_context_paged_validation_enforces_row_strided_table(
         stride=(2, 1),
     )
     with pytest.raises(ValueError, match=r"stride\(0\) >= C"):
-        context_module._validate_block_tables_tensor(
+        context_validation.validate_block_tables_tensor(
             overlapping_rows,
             device=torch.device("cpu"),
             batch_size=2,
@@ -1610,7 +1625,7 @@ def test_attention_ts_context_paged_validation_enforces_row_strided_table(
 
     nonunit_columns = torch.zeros((3, 2), dtype=torch.int32).transpose(0, 1)
     with pytest.raises(ValueError, match=r"stride\(1\) == 1"):
-        context_module._validate_block_tables_tensor(
+        context_validation.validate_block_tables_tensor(
             nonunit_columns,
             device=torch.device("cpu"),
             batch_size=2,
@@ -1620,10 +1635,10 @@ def test_attention_ts_context_paged_validation_enforces_row_strided_table(
     oversized_row_stride = torch.as_strided(
         torch.zeros(3, dtype=torch.int32),
         size=(1, 3),
-        stride=(context_module._INT32_MAX + 1, 1),
+        stride=(context_validation.INT32_MAX + 1, 1),
     )
     with pytest.raises(NotImplementedError, match="row stride must fit"):
-        context_module._validate_block_tables_tensor(
+        context_validation.validate_block_tables_tensor(
             oversized_row_stride,
             device=torch.device("cpu"),
             batch_size=1,
@@ -1897,7 +1912,7 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
     """Heavy-first order follows causal task-domain geometry, not shape."""
 
     assert (
-        context_module._uses_heavy_first_static_causal_raster(
+        context_geometry.uses_heavy_first_static_causal_raster(
             mask_type=mask_type,
             window_left=window_left,
             has_q_offset=has_q_offset,
@@ -1908,9 +1923,7 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
 
 def test_attention_ts_context_uses_ldtm_stat_default_is_off():
     """FmhaTs stays off unless requested; the runner enables it on SM103/SM107."""
-    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
-        FmhaConfig,
-    )
+    from flashinfer.attention.prims_ts.variants.context.kernel.config import FmhaConfig
 
     assert FmhaConfig().uses_ldtm_stat is False
 
@@ -1946,7 +1959,7 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
 
         expected = expected and hasattr(prims, "tcgen05_ld_red")
     assert (
-        context_module._default_uses_ldtm_stat(torch.cuda.current_device(), 8, 8)
+        context_geometry.default_uses_ldtm_stat(torch.cuda.current_device(), 8, 8)
         is expected
     )
 
@@ -1959,23 +1972,23 @@ def test_attention_ts_context_sm107_defaults_follow_the_path():
     device_index = torch.cuda.current_device()
     capability = torch.cuda.get_device_capability()
     sm107 = capability == (10, 7)
-    assert context_module._default_two_cta_umma(device_index, 16) is (
+    assert context_geometry.default_two_cta_umma(device_index, 16) is (
         sm107 or capability == (10, 3)
     )
-    assert context_module._default_two_cta_umma(device_index, 8) is (
+    assert context_geometry.default_two_cta_umma(device_index, 8) is (
         capability == (10, 3)
     )
-    assert context_module._default_umma_fp8_k64(device_index, 16) is sm107
-    assert context_module._default_umma_fp8_k64(device_index, 8) is False
-    assert context_module._default_kv_ring_stages(device_index, 8, 8) == (
+    assert context_geometry.default_umma_fp8_k64(device_index, 16) is sm107
+    assert context_geometry.default_umma_fp8_k64(device_index, 8) is False
+    assert context_geometry.default_kv_ring_stages(device_index, 8, 8) == (
         6 if sm107 else 0
     )
-    assert context_module._default_kv_ring_stages(device_index, 16, 8) == (
+    assert context_geometry.default_kv_ring_stages(device_index, 16, 8) == (
         4 if sm107 else 0
     )
-    assert context_module._default_kv_ring_stages(device_index, 16, 16) == 0
+    assert context_geometry.default_kv_ring_stages(device_index, 16, 16) == 0
     if sm107:
-        assert context_module._default_uses_ldtm_stat(device_index, 16, 8) is False
+        assert context_geometry.default_uses_ldtm_stat(device_index, 16, 8) is False
 
 
 @pytest.mark.parametrize("uses_ldtm_stat", (False, True))
@@ -2047,7 +2060,7 @@ def test_attention_ts_context_paged_clc_policy_is_structural(
     """Paged CLC selection follows topology and live-domain requirements."""
 
     assert (
-        context_module._paged_context_uses_clc_scheduler(
+        context_geometry.paged_context_uses_clc_scheduler(
             is_persistent=is_persistent,
             single_qkv_instance=single_qkv_instance,
             is_causal=is_causal,
@@ -2088,7 +2101,7 @@ def test_attention_ts_context_contiguous_clc_policy_is_structural(
     """Contiguous CLC follows topology and causal-domain structure."""
 
     assert (
-        context_module._contiguous_context_uses_clc_scheduler(
+        context_geometry.contiguous_context_uses_clc_scheduler(
             single_qkv_instance=single_qkv_instance,
             head_paired=head_paired,
             packed_query=packed_query,
@@ -2133,7 +2146,7 @@ def test_attention_ts_context_contiguous_persistence_follows_wave_count(
     """Near-uniform immutable domains persist only beyond one CTA wave."""
 
     assert (
-        context_module._contiguous_context_uses_persistent_scheduler(
+        context_geometry.contiguous_context_uses_persistent_scheduler(
             single_qkv_instance=single_qkv_instance,
             head_paired=head_paired,
             packed_query=packed_query,
@@ -2470,13 +2483,13 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
 
 @pytest.mark.parametrize("page_size", (4, 8, 16, 32, 64, 128))
 def test_attention_ts_context_accepts_public_page_sizes(page_size: int):
-    assert context_module._validate_page_size(page_size) == page_size
+    assert context_validation.validate_context_page_size(page_size) == page_size
 
 
 @pytest.mark.parametrize("page_size", (0, 2, 256))
 def test_attention_ts_context_rejects_unsupported_page_sizes(page_size: int):
     with pytest.raises(NotImplementedError, match="supports page_size"):
-        context_module._validate_page_size(page_size)
+        context_validation.validate_context_page_size(page_size)
 
 
 @pytest.mark.parametrize(
@@ -2517,8 +2530,8 @@ def test_attention_ts_context_paged_supported_page_sizes_accuracy(
     )
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["page_size"] == page_size
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["page_size"] == page_size
     out = _run_paged_wrapper(wrapper, case, metadata)
     _assert_context_correct(out, case.reference)
 
@@ -2544,8 +2557,8 @@ def test_attention_ts_context_paged_zero_fills_nan_v_tail():
     _poison_invalid_paged_v_tails(case)
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
     output = torch.full_like(case.reference.q, float("inf"))
     assert _run_paged_wrapper(wrapper, case, metadata, out=output) is output
     _assert_context_correct(output, case.reference)
@@ -2608,14 +2621,14 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
 ):
     """Metadata-free planning never infers uniform or zero-offset lengths."""
 
-    monkeypatch.setattr(
-        context_module,
-        "_resolve_cuda_device",
+    _patch_context(
+        monkeypatch,
+        "resolve_context_device",
         lambda _device: (torch.device("cpu"), 0),
     )
-    monkeypatch.setattr(
-        context_module,
-        "_resolve_paged_context_scheduler",
+    _patch_context(
+        monkeypatch,
+        "resolve_paged_context_scheduler",
         lambda _geometry: "static_persistent",
     )
     common = dict(
@@ -2632,15 +2645,15 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         window_left=-1,
         out_dtype=torch.bfloat16,
     )
-    causal_geometry = context_module._resolve_paged_plan_geometry(
+    causal_geometry = context_geometry.resolve_paged_plan_geometry(
         **common,
         mask_type="causal",
     )
-    dense_geometry = context_module._resolve_paged_plan_geometry(
+    dense_geometry = context_geometry.resolve_paged_plan_geometry(
         **common,
         mask_type="dense",
     )
-    zero_tail_geometry = context_module._resolve_paged_plan_geometry(
+    zero_tail_geometry = context_geometry.resolve_paged_plan_geometry(
         **common,
         mask_type="causal",
         paged_v_tail_is_zero=True,
@@ -2655,11 +2668,11 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
     assert dense_geometry.paged_v_tail_is_zero is False
     assert dense_geometry.packed_dense_k_mask is True
     assert zero_tail_geometry.paged_v_tail_is_zero is True
-    assert context_module._paged_context_compile_spec(causal_geometry) != (
-        context_module._paged_context_compile_spec(dense_geometry)
+    assert context_compile.paged_context_compile_spec(causal_geometry) != (
+        context_compile.paged_context_compile_spec(dense_geometry)
     )
-    assert context_module._paged_context_compile_spec(causal_geometry) != (
-        context_module._paged_context_compile_spec(zero_tail_geometry)
+    assert context_compile.paged_context_compile_spec(causal_geometry) != (
+        context_compile.paged_context_compile_spec(zero_tail_geometry)
     )
 
 
@@ -2801,7 +2814,7 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
     def fail_compile(*args, **kwargs):
         pytest.fail("paged variable-window validation reached kernel compilation")
 
-    monkeypatch.setattr(context_module, "_get_compiled_paged_context", fail_compile)
+    _patch_context(monkeypatch, "get_compiled_paged_context", fail_compile)
     wrapper = BatchPrefillPagedTSWrapper()
     with pytest.raises(
         NotImplementedError,
@@ -2826,13 +2839,13 @@ def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypat
     """Fixed-table plans bound each row, not aggregate batch K/V storage."""
 
     batch_size = 17
-    monkeypatch.setattr(context_module, "_CONTEXT_PADDED_EXTENT_MAX", 128)
-    monkeypatch.setattr(
-        context_module,
-        "_resolve_cuda_device",
+    _patch_context(monkeypatch, "CONTEXT_PADDED_EXTENT_MAX", 128)
+    _patch_context(
+        monkeypatch,
+        "resolve_context_device",
         lambda _device: (torch.device("cpu"), 0),
     )
-    geometry = context_module._resolve_paged_plan_geometry(
+    geometry = context_geometry.resolve_paged_plan_geometry(
         device="cuda:0",
         batch_size=batch_size,
         max_q_len=1,
@@ -2852,12 +2865,12 @@ def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypat
     assert not hasattr(geometry, "max_num_pages_per_seq_kv")
     assert (
         geometry.batch_size * geometry.max_kv_len
-        > context_module._CONTEXT_PADDED_EXTENT_MAX
+        > context_validation.CONTEXT_PADDED_EXTENT_MAX
     )
 
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
+    _patch_context(monkeypatch, "validate_tensor", lambda *_a, **_k: None)
     runtime_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
-    context_module._validate_paged_runtime_metadata(
+    context_validation.validate_paged_runtime_metadata(
         runtime_indptr,
         torch.zeros((batch_size, 3), dtype=torch.int32),
         torch.ones(batch_size, dtype=torch.int32),
@@ -2871,8 +2884,10 @@ def test_attention_ts_context_reserves_int32_work_tile_padding():
     """Packed extents leave room for the largest padded Q work tile."""
 
     safe_max = 2**31 - 256
-    assert safe_max == context_module._CONTEXT_PADDED_EXTENT_MAX
-    assert context_module._validate_padded_data_extent(safe_max, "total_q") == safe_max
+    assert safe_max == context_validation.CONTEXT_PADDED_EXTENT_MAX
+    assert (
+        context_validation.validate_padded_data_extent(safe_max, "total_q") == safe_max
+    )
 
     with pytest.raises(
         NotImplementedError,
@@ -2881,13 +2896,13 @@ def test_attention_ts_context_reserves_int32_work_tile_padding():
             r"coordinates fit in a signed int32"
         ),
     ):
-        context_module._validate_padded_data_extent(safe_max + 1, "total_q")
+        context_validation.validate_padded_data_extent(safe_max + 1, "total_q")
 
-    context_module._validate_query_work_tile_span(
+    context_validation.validate_query_work_tile_span(
         SimpleNamespace(q_tile_m=128, work_tile_q_seq_tiles=2)
     )
     with pytest.raises(RuntimeError, match=r"assumes at most 256 Q rows.*got 384"):
-        context_module._validate_query_work_tile_span(
+        context_validation.validate_query_work_tile_span(
             SimpleNamespace(q_tile_m=128, work_tile_q_seq_tiles=3)
         )
 
@@ -3291,8 +3306,8 @@ def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
         _assert_context_correct(actual, case)
         wrappers.append(wrapper)
 
-    first_state = wrappers[0]._plan_state
-    second_state = wrappers[1]._plan_state
+    first_state = wrappers[0].plan_state
+    second_state = wrappers[1].plan_state
     assert first_state is not None
     assert second_state is not None
     assert first_state.compiled is second_state.compiled
@@ -3322,8 +3337,8 @@ def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes(
         _assert_context_correct(actual, case.reference)
         wrappers.append(wrapper)
 
-    first_state = wrappers[0]._plan_state
-    second_state = wrappers[1]._plan_state
+    first_state = wrappers[0].plan_state
+    second_state = wrappers[1].plan_state
     assert first_state is not None
     assert second_state is not None
     assert first_state.compiled is second_state.compiled
@@ -3377,15 +3392,15 @@ def test_attention_ts_context_variable_window_graph_reloads_runtime_bounds():
             validate=False,
         )
     assert captured is graph_out
-    assert wrapper._plan_state is not None
-    assert wrapper._plan_state.variable_window_cta_starts.tolist() == [128]
+    assert wrapper.plan_state is not None
+    assert wrapper.plan_state.variable_window_cta_starts.tolist() == [128]
 
     starts.zero_()
     graph_out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 
-    assert wrapper._plan_state.variable_window_cta_starts.tolist() == [0]
+    assert wrapper.plan_state.variable_window_cta_starts.tolist() == [0]
     expected = _variable_window_reference(case, starts, ends)
     _assert_context_correct(graph_out, case, expected=expected)
 
@@ -3635,8 +3650,8 @@ def test_attention_ts_context_uniform_aligned_packed_dense_accuracy():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["uniform_packed_lengths"] is False
     _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
@@ -3658,8 +3673,8 @@ def test_attention_ts_context_uniform_packed_offsets_accuracy():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["uniform_packed_lengths"] is False
     _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
@@ -3682,8 +3697,8 @@ def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["uniform_packed_lengths"] is False
     _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
@@ -3987,8 +4002,8 @@ def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
         max_kv_len=max(case.reference.k_lengths),
     ).cfg
     assert cfg.stages_page_offsets_in_smem is stages_page_offsets
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
     output = _run_paged_wrapper(wrapper, case, metadata)
     _assert_context_correct(output, case.reference)
@@ -4031,8 +4046,8 @@ def test_attention_ts_context_d128_paged_s16k_runtime(qkv_dtype: torch.dtype):
     )
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "nonpersistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "nonpersistent"
     output = _run_paged_wrapper(wrapper, case, metadata)
     _assert_context_correct(output, case.reference)
 
@@ -4208,10 +4223,10 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
         _poison_invalid_paged_v_tails(case)
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "static_persistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "static_persistent"
     if kv_length == 993:
-        assert wrapper._plan_state.geometry.max_kv_len == 993
+        assert wrapper.plan_state.geometry.max_kv_len == 993
         resolved_v_dtype = v_dtype if v_dtype is not None else qk_dtype
         cfg = FmhaTs(
             in_qk_dtype=BFloat16 if qk_dtype == torch.bfloat16 else Float8E4M3FN,
@@ -4253,8 +4268,8 @@ def test_attention_ts_context_d256_fp8_paged_dense_crosses_page_windows():
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
 
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "static_persistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "static_persistent"
     output = _run_paged_wrapper(wrapper, case, metadata)
     _assert_context_correct(output, case.reference)
 
@@ -4358,8 +4373,8 @@ def _check_paged_head_paired_window(
         for page in metadata.block_tables[0, : first_key // case.page_size].tolist():
             case.k_cache[page].fill_(float("nan"))
             case.v_cache[page].fill_(float("nan"))
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
     output = _run_paged_wrapper(wrapper, case, metadata)
     _assert_context_correct(output, case.reference)
 
@@ -4437,10 +4452,10 @@ def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
 
-    assert wrapper._plan_state is not None
-    assert wrapper._plan_state.geometry.uniform_packed_lengths is False
-    assert wrapper._plan_state.geometry.has_q_offset is True
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    assert wrapper.plan_state is not None
+    assert wrapper.plan_state.geometry.uniform_packed_lengths is False
+    assert wrapper.plan_state.geometry.has_q_offset is True
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
     assert (q_lengths != k_lengths) is expected_q_offset
 
     direct_out = torch.full_like(
@@ -4499,8 +4514,8 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
         extra_page_columns=1,
         row_stride_multiplier=2,
     )
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
     cfg = FmhaTs(
         in_qk_dtype=BFloat16,
@@ -4627,7 +4642,7 @@ def test_attention_ts_context_d256_fixed_causal_single_tile_runtime():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
+    assert wrapper.plan_state is not None
     output = _run_wrapper(wrapper, case)
     _assert_context_correct(output, case)
 
@@ -4781,8 +4796,8 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
         assert reference.qo_indptr is not None
         qo_indptr = reference.qo_indptr
 
-    assert wrapper._plan_state is not None
-    policy = wrapper._plan_state.policy
+    assert wrapper.plan_state is not None
+    policy = wrapper.plan_state.policy
     assert dict(policy)["scheduler"] == "clc_dynamic_persistent"
     graph_out = torch.full_like(q, float("nan"), dtype=reference.out_dtype)
     graph = _capture_context_graph(
@@ -4872,10 +4887,10 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert wrapper._plan_state.geometry.has_q_offset is True
-    assert dict(wrapper._plan_state.policy)["pairing"] == "query"
-    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
+    assert wrapper.plan_state is not None
+    assert wrapper.plan_state.geometry.has_q_offset is True
+    assert dict(wrapper.plan_state.policy)["pairing"] == "query"
+    assert dict(wrapper.plan_state.policy)["uniform_packed_lengths"] is False
 
     graph_out = torch.full_like(case.q, float("nan"), dtype=case.out_dtype)
     graph = _capture_context_graph(
@@ -5041,8 +5056,8 @@ def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
     )
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    assert wrapper.plan_state is not None
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
     output = torch.full_like(case.reference.q, float("nan"))
     assert _run_paged_wrapper(wrapper, case, metadata, out=output) is output
     _assert_context_correct(output, case.reference)
@@ -5403,22 +5418,22 @@ def test_attention_ts_context_two_cta_matches_single_cta(
     if pv_dtype is _FP8 and case.v.dtype is not _FP8:
         case = replace(case, v=case.v.to(_FP8))
 
-    monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: True
+    _patch_context(
+        monkeypatch, "default_two_cta_umma", lambda device_index, qk_bits: True
     )
     two_cta = BatchPrefillTSWrapper()
-    context_module._context_compile_spec.cache_clear()
+    context_compile.context_compile_spec.cache_clear()
     _plan_wrapper(two_cta, case)
-    assert two_cta._plan_state is not None
-    assert dict(two_cta._plan_state.policy)["scheduler"] == "nonpersistent"
+    assert two_cta.plan_state is not None
+    assert dict(two_cta.plan_state.policy)["scheduler"] == "nonpersistent"
     out_two_cta = _run_wrapper(two_cta, case)
     _assert_context_correct(out_two_cta, case)
 
-    monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: False
+    _patch_context(
+        monkeypatch, "default_two_cta_umma", lambda device_index, qk_bits: False
     )
     single_cta = BatchPrefillTSWrapper()
-    context_module._context_compile_spec.cache_clear()
+    context_compile.context_compile_spec.cache_clear()
     _plan_wrapper(single_cta, case)
     out_single_cta = _run_wrapper(single_cta, case)
     # Same per-row arithmetic in both forms; only the MMA M extent and the K/V
@@ -5427,7 +5442,7 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         out_two_cta.float(), out_single_cta.float(), atol=2e-3, rtol=1e-2
     )
 
-    context_module._context_compile_spec.cache_clear()
+    context_compile.context_compile_spec.cache_clear()
 
 
 @pytest.mark.arch_blackwell
@@ -5719,8 +5734,8 @@ def test_variable_window_prefill_statistics(
 )
 def test_context_dense_two_cta_lse_and_sinks(dtype, pv_dtype, monkeypatch):
     """Paired query tiles publish dense output/LSE with sinks and partial rows."""
-    monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: True
+    _patch_context(
+        monkeypatch, "default_two_cta_umma", lambda device_index, qk_bits: True
     )
     torch.manual_seed(117)
     q = (torch.randn(2, 521, 3, 128, device="cuda") * 0.2).to(dtype)
@@ -5757,19 +5772,21 @@ def test_context_dense_two_cta_lse_and_sinks(dtype, pv_dtype, monkeypatch):
 @_REQUIRES_CONTEXT_GPU
 def test_paged_swa_d192_full_head_stage(monkeypatch, qkv_dtype, out_dtype):
     """Full-head staging handles strided paged SWA without changing its mask."""
-    from flashinfer.attention.prims_ts.kernels.fmha_context import fmha_kernel
+    from flashinfer.attention.prims_ts.variants.context.kernel import (
+        kernel as fmha_kernel,
+    )
 
-    configure = fmha_kernel._configure_head_dim_staging
+    configure = fmha_kernel.configure_head_dim_staging
 
     def full_stage(cfg):
         configure(cfg, head_dim_per_stage=192)
 
-    monkeypatch.setattr(fmha_kernel, "_configure_head_dim_staging", full_stage)
-    context_module._get_compiled_paged_context.cache_clear()
+    monkeypatch.setattr(fmha_kernel, "configure_head_dim_staging", full_stage)
+    context_compile.get_compiled_paged_context.cache_clear()
     try:
         _check_paged_head_paired_window(192, True, qkv_dtype, 777, 511, out_dtype)
     finally:
-        context_module._get_compiled_paged_context.cache_clear()
+        context_compile.get_compiled_paged_context.cache_clear()
 
 
 def live_bound(host_value: int, read_live) -> int:
@@ -5907,8 +5924,8 @@ def test_attention_ts_paged_context_compile_reuse_across_batch_and_q_sizes(
         _assert_context_correct(actual, case.reference)
         wrappers.append(wrapper)
 
-    first_state = wrappers[0]._plan_state
-    second_state = wrappers[1]._plan_state
+    first_state = wrappers[0].plan_state
+    second_state = wrappers[1].plan_state
     assert first_state is not None
     assert second_state is not None
     assert first_state.compiled is second_state.compiled

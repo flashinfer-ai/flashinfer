@@ -121,7 +121,7 @@ def __getattr__(name: str):
         globals()[name] = value
         return value
     if name in _PRIMS_TS_LAZY_EXPORTS:
-        from ..attention.prims_ts import mla_decode as prims_ts_mla_decode
+        from ..attention.prims_ts.variants import mla_decode as prims_ts_mla_decode
 
         value = getattr(prims_ts_mla_decode, name)
         globals()[name] = value

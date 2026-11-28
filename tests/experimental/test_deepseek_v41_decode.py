@@ -50,7 +50,7 @@ class DecodeBuffers:
 
     @property
     def views(self):
-        from flashinfer.experimental.deepseek_v41.prims_ts._workspace import (
+        from flashinfer.experimental.deepseek_v41.prims_ts.workspace import (
             workspace_views,
         )
 
@@ -359,9 +359,9 @@ def test_prepare_buffers_before_capture(monkeypatch):
     prims_ts_gate()
     args = make_fp8_case(1, 64)
     buffers = DecodeBuffers.allocate(args[0], 64)
-    from flashinfer.experimental.deepseek_v41.prims_ts import _workspace
+    from flashinfer.experimental.deepseek_v41.prims_ts import workspace
 
-    _workspace.device_sm_count.cache_clear()
+    workspace.device_sm_count.cache_clear()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(ValueError, match="warm.*before CUDA Graph capture"):
         buffers.call(args[0], args[1], args[2], args[5])
@@ -681,7 +681,7 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
     import cutlass.cute as cute
     import cutlass.utils as utils
     from cutlass.cute.runtime import from_dlpack
-    from flashinfer.experimental.deepseek_v41.prims_ts.kernel import _make_fp8_attention
+    from flashinfer.experimental.deepseek_v41.prims_ts.kernel import make_fp8_attention
     from flashinfer.experimental.deepseek_v41.prims_ts.resources import (
         MixedFp8SmemKvResource,
     )
@@ -692,8 +692,8 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
     ):
         pytest.skip("native BF16-register conversion requires bundled CUDA >= 13.2")
 
-    attention = _make_fp8_attention(512, 1, native_fp4)
-    cfg = attention._make_config()
+    attention = make_fp8_attention(512, 1, native_fp4)
+    cfg = attention.make_config()
     assert cfg.qkv_dtype == "e4m3" and cfg.tile_size_kv == 128
     assert cfg.head_dim_per_stage_kv == 128 and cfg.kv_stages == 8
     assert not hasattr(cfg, "sparse_request_kv_scale")
@@ -758,7 +758,7 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
                 # two cached-page slots and every retained D128 stage.
                 stage = staging.subview(128 + (page_slot * 4 + stage_idx) * stage_bytes)
                 if cutlass.const_expr(source == "main"):
-                    resource._load_fp4_stage(
+                    resource.load_fp4_stage(
                         pool,
                         stage,
                         cached,
@@ -766,7 +766,7 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
                         page_id_slot=page_slot,
                     )
                 else:
-                    resource._load_swa_stage(
+                    resource.load_swa_stage(
                         stage,
                         cached,
                         stage_idx=stage_idx,
@@ -1342,7 +1342,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     )
 
     recorded, launches = [], []
-    factory, compile_kernel = adapter_kernel._make_fp8_attention, prims_ts._compile
+    factory, compile_kernel = adapter_kernel.make_fp8_attention, prims_ts.compile
 
     def record(*args):
         attention = factory(*args)
@@ -1361,8 +1361,8 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("ordinary FP8 must not compile Frost")
 
-    monkeypatch.setattr(adapter_kernel, "_make_fp8_attention", record)
-    monkeypatch.setattr(prims_ts, "_compile", record_compile)
+    monkeypatch.setattr(adapter_kernel, "make_fp8_attention", record)
+    monkeypatch.setattr(prims_ts, "compile", record_compile)
     monkeypatch.setattr(frost, "_compile", forbidden)
     compile_kernel.cache_clear()
     args = make_fp8_case(1, compressed)
@@ -1383,7 +1383,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     ]
     assert len(bf16_buffers) == 1 and bf16_buffers[0].data_ptr() == out.data_ptr()
     assert packet[-2:] == (float(torch.tensor(512**-0.5)), 1.0)
-    cfg = attention._make_config()
+    cfg = attention.make_config()
     assert cfg.qkv_dtype == "e4m3" and cfg.is_fp8_qkv()
     assert (
         cfg.tile_size_q,
@@ -1421,12 +1421,12 @@ def test_fp8_main_common_units_rounding_saturation_underflow_changed_graph(
         2,
     ):
         pytest.skip("native BF16-register conversion requires bundled CUDA >= 13.2")
-    compile_kernel = prims_ts._compile
+    compile_kernel = prims_ts.compile
 
     def compile_branch(*args, **kwargs):
         return compile_kernel(*args, **kwargs, native_fp4=native_fp4)
 
-    monkeypatch.setattr(prims_ts, "_compile", compile_branch)
+    monkeypatch.setattr(prims_ts, "compile", compile_branch)
     q, swa, _, wi, ci, sink = make_fp8_case(2, 192)
     wi.fill_(-1)
     swa.view(torch.uint8).fill_(127)
@@ -1528,12 +1528,12 @@ def test_fp8_swa_fp4_conversion_fallback(monkeypatch):
     prims_ts_gate()
     from flashinfer.experimental.deepseek_v41 import prims_ts
 
-    compile_kernel = prims_ts._compile
+    compile_kernel = prims_ts.compile
 
     def fallback(*args, **kwargs):
         return compile_kernel(*args, **kwargs, native_fp4=False)
 
-    monkeypatch.setattr(prims_ts, "_compile", fallback)
+    monkeypatch.setattr(prims_ts, "compile", fallback)
     args = make_fp8_case(4, 512)
     args[3][0].fill_(-1)
     out, lse, _ = decode_case(*args)
@@ -1584,7 +1584,7 @@ def test_fp8_swa_empty_poison_and_mode_guards(monkeypatch):
     with pytest.raises(ValueError, match="Prims-TS decode requires E4M3 Q"):
         decode_case(*legacy)
 
-    prims_ts._compile.cache_clear()
+    prims_ts.compile.cache_clear()
     graph = torch.cuda.CUDAGraph()
     with (
         torch.cuda.graph(graph),
@@ -1688,11 +1688,11 @@ def test_fp8_joint_canonical_graph_nodes(compressed, has_sink):
     """
     import cuda.bindings.driver as cuda
 
-    from flashinfer.experimental.deepseek_v41.prims_ts import _partition
+    from flashinfer.experimental.deepseek_v41.prims_ts import partition
 
     prims_ts_gate()
     q, swa, main, wi, ci, sink = make_fp8_case(2, compressed)
-    kv_splits, _ = _partition(2, compressed, q.device.index)
+    kv_splits, _ = partition(2, compressed, q.device.index)
     nodes_expected = 1 if kv_splits == 1 else 2
     if not has_sink:
         sink = None
@@ -1778,7 +1778,7 @@ def test_fp8_kv_split_partitions_changed_graph(
 
     q, swa, main, wi, ci, sink = make_fp8_case(batch, compressed)
     forced = {}
-    monkeypatch.setattr(prims_ts, "_partition", lambda *args: forced["value"])
+    monkeypatch.setattr(prims_ts, "partition", lambda *args: forced["value"])
     results = {}
     for partition in partitions:
         forced["value"] = partition

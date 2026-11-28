@@ -3,7 +3,7 @@
 """Host entry points and JIT dispatch for V4.1 Prims-TS decode.
 
 Native attention configuration and ABI adaptation live in kernel.py; KV staging
-and inline metadata views live in resources.py and _sparse_views.py. GPU modules
+and inline metadata views live in resources.py and sparse_views.py. GPU modules
 are imported only during compilation so workspace queries stay lightweight.
 """
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from ._workspace import (
+from .workspace import (
     PARTIAL_SLOT_BYTES,
     bind_inputs,
     device_sm_count,
@@ -22,8 +22,17 @@ from ._workspace import (
 )
 
 
+# Relative partition costs, in BK128 tiles walked by one CTA, fitted to a B200
+# sweep of every (KV split, V split) pair (148 SMs, warm graphs, B 1-96, K 128-512):
+# fewer V owners leave more PV, correction and output work per CTA, and a KV
+# split adds BF16 partials plus the reducer. The scores reproduce every measured
+# winner, e.g. B16/K512 picks S3V2 (11.04 us) over S5V1 (11.35) and S1V4 (12.06).
+V_OWNER_COST = {4: 0.0, 2: 0.9, 1: 2.5}
+KV_SPLIT_COST = 1.2
+
+
 @functools.cache
-def _compile(
+def compile(
     device_index,
     compressed_k,
     *,
@@ -54,17 +63,17 @@ def _compile(
 
     require_cute_dsl_arch(device_index)
 
-    from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+    from ....attention.prims_ts.variants.mla_decode.kernel.latency_1cta import (
         kernel as native_kernel,
     )
     from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ....cute_dsl import fp4_common
     from .. import hca_v41_primitives
-    from . import _sparse_views, _workspace, resources
+    from . import resources, sparse_views, workspace
     from . import kernel as adapter_kernel
 
     sm_count = device_sm_count(device_index)
-    attention = adapter_kernel._make_fp8_attention(
+    attention = adapter_kernel.make_fp8_attention(
         compressed_k, sm_count, native_fp4, head_dim_ctas, kv_splits, persistent
     )
     decode_kernel = adapter_kernel.Fp8SwaDecodeKernel(attention, kv_splits)
@@ -144,8 +153,8 @@ def _compile(
         ),
         extra_key_files=(
             __file__,
-            _workspace.__file__,
-            _sparse_views.__file__,
+            workspace.__file__,
+            sparse_views.__file__,
             adapter_kernel.__file__,
             resources.__file__,
             hca_v41_primitives.__file__,
@@ -153,52 +162,6 @@ def _compile(
             *sorted(native_root.rglob("*.py")),
         ),
     )
-
-
-# Relative partition costs, in BK128 tiles walked by one CTA, fitted to a B200
-# sweep of every (KV split, V split) pair (148 SMs, warm graphs, B 1-96, K 128-512):
-# fewer V owners leave more PV, correction and output work per CTA, and a KV
-# split adds BF16 partials plus the reducer. The scores reproduce every measured
-# winner, e.g. B16/K512 picks S3V2 (11.04 us) over S5V1 (11.35) and S1V4 (12.06).
-_V_OWNER_COST = {4: 0.0, 2: 0.9, 1: 2.5}
-_KV_SPLIT_COST = 1.2
-
-
-@functools.cache
-def _partition(batch, compressed_k, device_index):
-    """(KV splits, V owners) per request, scored over every fitting pair.
-
-    Pure in its arguments (the SM count is a cached device fact), so it is
-    memoized to keep eager calls from rescoring every pair.
-
-    KV splits divide the tile loads and FP4 conversion; every V owner still
-    loads and converts the whole K tile, so a V split divides only PV,
-    correction and output work. Split grids must fit one wave; an unsplit
-    grid may take several. Ties keep fewer splits.
-    """
-    sm_count = device_sm_count(device_index)
-    tiles = kv_tiles(compressed_k)
-    slots = partial_slots(batch, compressed_k)
-    best = None
-    for splits in sorted({-(-tiles // per_split) for per_split in range(1, tiles + 1)}):
-        if splits > 1 and batch * splits > slots:
-            continue
-        for owners in (4, 2, 1):
-            if batch * splits * owners > sm_count and (splits > 1 or owners > 1):
-                continue
-            cost = (
-                -(-tiles // splits)
-                + _V_OWNER_COST[owners]
-                + (_KV_SPLIT_COST if splits > 1 else 0.0)
-            )
-            if best is None or cost < best[0]:
-                best = (cost, splits, owners)
-    return best[1], best[2]
-
-
-def _persistent(batch, kv_splits, device_index):
-    """Walk requests persistently once an unsplit grid exceeds one wave."""
-    return kv_splits == 1 and batch > device_sm_count(device_index)
 
 
 def decode_mixed(
@@ -233,16 +196,16 @@ def decode_mixed(
     )
     views = bound.views
     with torch.cuda.device(query.device):
-        kv_splits, head_dim_ctas = _partition(
+        kv_splits, head_dim_ctas = partition(
             bound.batch, bound.compressed_k, query.device.index
         )
-        kernel = _compile(
+        kernel = compile(
             query.device.index,
             bound.compressed_k,
             has_sink=bound.sinks is not None,
             head_dim_ctas=head_dim_ctas,
             kv_splits=kv_splits,
-            persistent=_persistent(bound.batch, kv_splits, query.device.index),
+            persistent=persistent(bound.batch, kv_splits, query.device.index),
         )
         partials = (
             views.partials[: bound.batch * kv_splits * PARTIAL_SLOT_BYTES]
@@ -293,3 +256,40 @@ def decode_window(
         sinks,
         kv_layout,
     )
+
+
+@functools.cache
+def partition(batch, compressed_k, device_index):
+    """(KV splits, V owners) per request, scored over every fitting pair.
+
+    Pure in its arguments (the SM count is a cached device fact), so it is
+    memoized to keep eager calls from rescoring every pair.
+
+    KV splits divide the tile loads and FP4 conversion; every V owner still
+    loads and converts the whole K tile, so a V split divides only PV,
+    correction and output work. Split grids must fit one wave; an unsplit
+    grid may take several. Ties keep fewer splits.
+    """
+    sm_count = device_sm_count(device_index)
+    tiles = kv_tiles(compressed_k)
+    slots = partial_slots(batch, compressed_k)
+    best = None
+    for splits in sorted({-(-tiles // per_split) for per_split in range(1, tiles + 1)}):
+        if splits > 1 and batch * splits > slots:
+            continue
+        for owners in (4, 2, 1):
+            if batch * splits * owners > sm_count and (splits > 1 or owners > 1):
+                continue
+            cost = (
+                -(-tiles // splits)
+                + V_OWNER_COST[owners]
+                + (KV_SPLIT_COST if splits > 1 else 0.0)
+            )
+            if best is None or cost < best[0]:
+                best = (cost, splits, owners)
+    return best[1], best[2]
+
+
+def persistent(batch, kv_splits, device_index):
+    """Walk requests persistently once an unsplit grid exceeds one wave."""
+    return kv_splits == 1 and batch > device_sm_count(device_index)

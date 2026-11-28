@@ -580,11 +580,11 @@ def test_template_axes_covered(func, template, label):
 def test_attention_ts_trace_constraints_match_cache_axes():
     """Live PrimTS trace schemas are wired to APIs and use valid constraints."""
     from flashinfer.api_logging import _TRACE_DISPATCHERS
-    from flashinfer.attention.prims_ts.decode import (
+    from flashinfer.attention.prims_ts.variants.decode import (
         BatchDecodePagedTSWrapper,
         batch_decode_with_paged_kv_cache,
     )
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         BatchMLADecodePagedTSWrapper,
         batch_mla_decode_with_paged_kv_cache,
     )
@@ -672,7 +672,7 @@ def test_attention_ts_trace_constraints_match_cache_axes():
 
 def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     from flashinfer.api_logging import _TRACE_DISPATCHERS
-    from flashinfer.attention.prims_ts.block_sparse import (
+    from flashinfer.attention.prims_ts.variants.block_sparse import (
         BlockSparseTSWrapper,
         block_sparse_attention,
     )
@@ -756,7 +756,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     dense_trace = prims_ts_block_sparse_trace_dispatch(use_block_sparse=False)
     assert dense_trace is one_shot_traces["prims_ts_block_sparse_dense"]
     dense_wrapper = SimpleNamespace(
-        _plan_state=SimpleNamespace(
+        plan_state=SimpleNamespace(
             use_block_sparse=False, sparse_format="bsr", use_proxy_routes=False
         )
     )
@@ -794,7 +794,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
             is one_shot_template
         )
         wrapper = SimpleNamespace(
-            _plan_state=SimpleNamespace(
+            plan_state=SimpleNamespace(
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
             )
@@ -1012,11 +1012,11 @@ def test_prims_ts_block_sparse_goldens_match_templates(
 
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     """Trace allocating and caller-workspace calls plus both reusable wrappers."""
-    from flashinfer.attention.prims_ts.decode import (
+    from flashinfer.attention.prims_ts.variants.decode import (
         BatchDecodePagedTSWrapper,
         batch_decode_with_paged_kv_cache,
     )
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         BatchMLADecodePagedTSWrapper,
         batch_mla_decode_with_paged_kv_cache,
     )
@@ -1057,7 +1057,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     }
 
     fmha_wrapper = BatchDecodePagedTSWrapper()
-    fmha_wrapper._plan_state = SimpleNamespace(
+    fmha_wrapper.plan_state = SimpleNamespace(
         page_size=page_size,
         storage_page_size=page_size,
         packed_query=False,
@@ -1101,7 +1101,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         "mask_type": "causal",
     }
     mla_wrapper = BatchMLADecodePagedTSWrapper()
-    mla_wrapper._plan_state = SimpleNamespace(
+    mla_wrapper.plan_state = SimpleNamespace(
         packed_query=False,
         mask_type="causal",
         max_q_len=seq_len_q,
@@ -1198,7 +1198,7 @@ def test_attention_ts_trace_semantic_and_storage_pages(
     semantic_page_size, storage_page_size, combined
 ):
     """Each FMHA surface retains native or encoded page geometry in its trace."""
-    from flashinfer.attention.prims_ts.decode import (
+    from flashinfer.attention.prims_ts.variants.decode import (
         BatchDecodePagedTSWrapper,
         batch_decode_with_paged_kv_cache,
     )
@@ -1297,7 +1297,7 @@ def test_attention_ts_trace_semantic_and_storage_pages(
                 assert definition["inputs"][name]["shape"] == shape
 
     wrapper = BatchDecodePagedTSWrapper()
-    wrapper._plan_state = SimpleNamespace(
+    wrapper.plan_state = SimpleNamespace(
         page_size=semantic_page_size,
         storage_page_size=storage_page_size,
         packed_query=False,
@@ -1332,7 +1332,7 @@ def test_attention_ts_trace_semantic_and_storage_pages(
         )
         assert eval(page_constraint, {}, {"page_size": semantic_page_size})
 
-    wrapper._plan_state.storage_page_size += semantic_page_size
+    wrapper.plan_state.storage_page_size += semantic_page_size
     with pytest.raises(ValueError, match="does not match the wrapper plan"):
         fi_trace(wrapper.run, **wrapper_kwargs)
 
@@ -1345,7 +1345,7 @@ def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
     storage_page_size,
 ):
     """Trace selection must reject invalid extents before dumping a definition."""
-    from flashinfer.attention.prims_ts.decode import (
+    from flashinfer.attention.prims_ts.variants.decode import (
         batch_decode_with_paged_kv_cache,
     )
 
@@ -1378,7 +1378,7 @@ def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
 def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state(out_dtype):
     """An omitted out override must retain the wrapper plan's output dtype."""
-    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+    from flashinfer.attention.prims_ts.variants.decode import BatchDecodePagedTSWrapper
     from flashinfer.fi_trace import fi_trace
 
     batch_size, num_qo_heads, num_kv_heads = 2, 8, 2
@@ -1396,7 +1396,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state(out_dt
     block_tables = torch.arange(num_pages, dtype=torch.int32).reshape(batch_size, -1)
 
     wrapper = BatchDecodePagedTSWrapper()
-    wrapper._plan_state = SimpleNamespace(
+    wrapper.plan_state = SimpleNamespace(
         page_size=page_size,
         storage_page_size=page_size,
         packed_query=False,
@@ -1428,8 +1428,8 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state(out_dt
 
 def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
     """Bound traces enforce required metadata for each length owner."""
-    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.decode import BatchDecodePagedTSWrapper
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         BatchMLADecodePagedTSWrapper,
     )
     from flashinfer.fi_trace import fi_trace
@@ -1439,7 +1439,7 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
     seq_lens_kv = torch.tensor((page_size, 2 * page_size), dtype=torch.int32)
 
     fmha_wrapper = BatchDecodePagedTSWrapper()
-    fmha_wrapper._plan_state = SimpleNamespace(
+    fmha_wrapper.plan_state = SimpleNamespace(
         page_size=page_size,
         storage_page_size=page_size,
         packed_query=True,
@@ -1473,9 +1473,9 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
             fi_trace(fmha_wrapper.run, **incomplete_kwargs)
     fmha_definition = fi_trace(fmha_wrapper.run, **fmha_kwargs)
 
-    fmha_wrapper._plan_state = SimpleNamespace(
+    fmha_wrapper.plan_state = SimpleNamespace(
         **{
-            **vars(fmha_wrapper._plan_state),
+            **vars(fmha_wrapper.plan_state),
             "planned_seq_lens_kv_device": seq_lens_kv,
         }
     )
@@ -1494,7 +1494,7 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
     assert "_plan_seq_lens_" in plan_owned_definition["name"]
 
     mla_wrapper = BatchMLADecodePagedTSWrapper()
-    mla_wrapper._plan_state = SimpleNamespace(
+    mla_wrapper.plan_state = SimpleNamespace(
         packed_query=True,
         mask_type="causal",
         max_q_len=3,
@@ -1522,8 +1522,8 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
 
 def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     """Same-shaped plans must not collide in name-based auto-dump deduplication."""
-    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.decode import BatchDecodePagedTSWrapper
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         BatchMLADecodePagedTSWrapper,
     )
     from flashinfer.fi_trace import fi_trace
@@ -1582,7 +1582,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_definitions = []
     for state, run_seq_lens in fmha_variants:
-        fmha_wrapper._plan_state = SimpleNamespace(**state)
+        fmha_wrapper.plan_state = SimpleNamespace(**state)
         fmha_definitions.append(
             fi_trace(
                 fmha_wrapper.run,
@@ -1629,7 +1629,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     mla_wrapper = BatchMLADecodePagedTSWrapper()
     mla_definitions = []
     for state in mla_variants:
-        mla_wrapper._plan_state = SimpleNamespace(**state)
+        mla_wrapper.plan_state = SimpleNamespace(**state)
         mla_definitions.append(fi_trace(mla_wrapper.run, **mla_kwargs))
     assert len({definition["name"] for definition in mla_definitions}) == len(
         mla_definitions
@@ -1646,7 +1646,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
 
 def test_prims_ts_mla_cp_trace_contract() -> None:
     """CP traces retain causal semantics and distinguish static/runtime metadata."""
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         BatchMLADecodePagedTSWrapper,
         batch_mla_decode_with_paged_kv_cache,
     )
@@ -1669,7 +1669,7 @@ def test_prims_ts_mla_cp_trace_contract() -> None:
         for registered in prims_ts_decode_mla_one_shot_trace_dispatch.templates
     )
     wrapper = BatchMLADecodePagedTSWrapper()
-    wrapper._plan_state = SimpleNamespace(
+    wrapper.plan_state = SimpleNamespace(
         packed_query=False,
         mask_type="causal",
         max_q_len=8,
@@ -1680,8 +1680,8 @@ def test_prims_ts_mla_cp_trace_contract() -> None:
         cp_interleave_size=1,
     )
     ordinary = fi_trace(wrapper.run, **kwargs)
-    wrapper._plan_state.cp_world = 8
-    wrapper._plan_state.cp_interleave_size = 128
+    wrapper.plan_state.cp_world = 8
+    wrapper.plan_state.cp_interleave_size = 128
     bounded = fi_trace(wrapper.run, **kwargs, cp_rank=7)
     assert ordinary["name"] != bounded["name"]
     assert bounded["axes"]["causal"]["value"] == 1
@@ -1718,7 +1718,7 @@ def test_prims_ts_mla_cp_trace_contract() -> None:
     ):
         assert_template_constraints_valid(template, label=template.name_prefix)
 
-    wrapper._plan_state.zero_empty_rows = False
+    wrapper.plan_state.zero_empty_rows = False
     opt_out = fi_trace(wrapper.run, **kwargs, cp_rank=7)
     opt_out_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
         **one_shot_kwargs,

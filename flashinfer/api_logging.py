@@ -2218,10 +2218,20 @@ _TRACE_FI_API_ALIASES = {
 }
 
 
+# PrimTS attention features live under ``prims_ts/variants/`` but keep their
+# public module paths, so their trace tags keep the paths without ``variants``.
+_TRACE_FI_API_PREFIX_ALIASES = (
+    ("flashinfer.attention.prims_ts.variants.", "flashinfer.attention.prims_ts."),
+)
+
+
 def _trace_fi_api_for(original: Callable) -> str:
     module = getattr(original, "__module__", "") or ""
     qualname = getattr(original, "__qualname__", "") or ""
     fi_api = f"{module}.{qualname}" if module else qualname
+    for prefix, public_prefix in _TRACE_FI_API_PREFIX_ALIASES:
+        if fi_api.startswith(prefix):
+            fi_api = public_prefix + fi_api[len(prefix) :]
     return _TRACE_FI_API_ALIASES.get(fi_api, fi_api)
 
 

@@ -40,50 +40,65 @@ from cutlass.cute.runtime import make_ptr
 from cutlass import utils as cutlass_utils
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
 
+import flashinfer.attention.prims_ts.variants.decode as decode_package
+import flashinfer.attention.prims_ts.variants.decode.launch as decode_launch
+import flashinfer.attention.prims_ts.variants.decode.plan as decode_plan
+import flashinfer.attention.prims_ts.variants.decode.validation as decode_validation
+from flashinfer.attention.prims_ts.variants.decode.kernel import (
+    selection as decode_selection,
+)
 from flashinfer.attention.prims_ts import (
     BatchDecodePagedTSWrapper,
     batch_decode_with_paged_kv_cache,
 )
-from flashinfer.attention.prims_ts.decode import (
-    _DECODE_MAX_KV_LEN,
-    _DECODE_MAX_KV_TILE_SIZE,
-    _DecodePlanState,
-    _get_compiled_decode,
-    _make_decode_workspace_layout,
-    _resolve_decode_launch_spec,
-    _validate_prims_ts_q_token_kv_block_sparse_group_layout,
-    _validate_q_token_kv_block_sparse_route_offsets_cpu,
-    _validate_decode_query_head_extent,
-    _validate_decode_policy_kv_tile_size,
-    _validate_dtype_pair,
-    _validate_block_table_metadata,
-    _validate_head_geometry,
-    _validate_max_kv_len,
-    _validate_storage_page_size,
+from flashinfer.attention.prims_ts.variants.decode.validation import (
+    DECODE_MAX_KV_LEN,
+    DECODE_MAX_KV_TILE_SIZE,
+    validate_decode_query_head_extent,
+    validate_decode_policy_kv_tile_size,
+    validate_dtype_pair,
+    validate_head_geometry,
+    validate_max_kv_len,
+    validate_storage_page_size,
 )
-from flashinfer.attention.prims_ts.split_kv_mode_policy import select_split_kv_modes
-from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
+from flashinfer.attention.prims_ts.variants.decode.plan import DecodePlanState
+from flashinfer.attention.prims_ts.variants.decode.launch import (
+    get_compiled_decode,
+    make_decode_workspace_layout,
+    resolve_decode_launch_spec,
+)
+from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata.grouping import (
+    validate_group_layout,
+    validate_route_offsets_cpu,
+)
+from flashinfer.attention.prims_ts.common.paged_kv import validate_block_table_metadata
+from flashinfer.attention.prims_ts.common.split_kv_mode import select_split_kv_modes
+from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
 )
-from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-from flashinfer.attention.prims_ts.kernels import tcgen05_compat
-from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
-    FmhaDecodeConfig,
+from flashinfer.attention.prims_ts.variants.decode.kernel import (
+    config as fmha_decode_config,
+)
+from flashinfer.attention.prims_ts.device import tcgen05 as tcgen05_compat
+from flashinfer.attention.prims_ts.variants.decode.kernel.config import FmhaDecodeConfig
+from flashinfer.attention.prims_ts.variants.decode.kernel.selection import (
     make_decode_config,
 )
-from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+from flashinfer.attention.prims_ts.variants.decode.kernel.device.constants import (
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
 )
-from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
-    _build_decode_gen_schedule,
-    _decode_min_blocks_per_mp,
+from flashinfer.attention.prims_ts.variants.decode.kernel.schedule import (
+    build_decode_gen_schedule,
+)
+from flashinfer.attention.prims_ts.variants.decode.kernel.kernel import (
+    decode_min_blocks_per_mp,
     build_decode_task_manager,
 )
-from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_kv_tile_idx import (
-    _runtime_last_valid_page_idx,
-    _runtime_total_kv_tiles,
+from flashinfer.attention.prims_ts.variants.decode.kernel.device.kv_tile_idx import (
+    runtime_last_valid_page_idx,
+    runtime_total_kv_tiles,
 )
 from flashinfer.decode import (
     get_prims_ts_batch_decode_workspace_size,
@@ -93,6 +108,35 @@ from flashinfer.decode import (
     validate_q_token_kv_block_sparse_group_size as validate_prims_ts_q_token_kv_block_sparse_group_size,
 )
 from flashinfer.utils import is_sm100a_supported
+
+
+_DECODE_MODULES = (decode_package, decode_launch, decode_plan, decode_validation)
+
+
+def _patch_decode_config(monkeypatch, name, value):
+    """Patch a decode-config helper in every module that looks it up."""
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config,
+        selection,
+        warp_roles,
+    )
+
+    patched = False
+    for module in (config, selection, warp_roles):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, value)
+            patched = True
+    assert patched, name
+
+
+def _patch_decode(monkeypatch, name, value):
+    """Patch a helper in every split module that looks it up."""
+    patched = False
+    for module in _DECODE_MODULES:
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, value)
+            patched = True
+    assert patched, name
 
 
 @pytest.mark.parametrize(
@@ -146,12 +190,9 @@ def test_prims_ts_q_token_kv_block_sparse_fixed_group_validation(
     )
     if expected_group_size is None:
         with pytest.raises(ValueError):
-            _validate_prims_ts_q_token_kv_block_sparse_group_layout(*args)
+            validate_group_layout(*args)
     else:
-        assert (
-            _validate_prims_ts_q_token_kv_block_sparse_group_layout(*args)
-            == expected_group_size
-        )
+        assert validate_group_layout(*args) == expected_group_size
 
 
 def test_prims_ts_q_token_kv_block_sparse_fixed_group_validation_is_public() -> None:
@@ -287,7 +328,7 @@ def test_q_token_kv_block_sparse_cpu_route_offsets_must_be_safe_before_upload(
     group_size: int,
 ) -> None:
     with pytest.raises(ValueError):
-        _validate_q_token_kv_block_sparse_route_offsets_cpu(
+        validate_route_offsets_cpu(
             route_offsets,
             num_query_tokens=num_query_tokens,
             group_size=group_size,
@@ -334,10 +375,10 @@ _FP8_NUM_KV_INSTANCES = 2
 
 def _mock_decode_hardware(monkeypatch):
     """Keep host dispatch tests independent of a live CUDA context."""
-    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.variants.decode import launch as decode_launch
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
-    monkeypatch.setattr(decode_module, "get_device_sm_count", lambda _device: 152)
+    monkeypatch.setattr(decode_launch, "get_device_sm_count", lambda _device: 152)
     monkeypatch.setattr(
         cutlass_utils,
         "HardwareInfo",
@@ -361,13 +402,13 @@ def _runtime_int32_kv_ceil_div_kernel(
 
     index, _, _ = cute.arch.block_idx()
     seq_len_kv = Int32(values[index])
-    output[index * Int32(2)] = _runtime_total_kv_tiles(
+    output[index * Int32(2)] = runtime_total_kv_tiles(
         cfg,
         seq_len_kv,
         Int32(1),
         Int32(0),
     )
-    output[index * Int32(2) + Int32(1)] = _runtime_last_valid_page_idx(
+    output[index * Int32(2) + Int32(1)] = runtime_last_valid_page_idx(
         cfg,
         seq_len_kv,
     )
@@ -1705,7 +1746,7 @@ def _run_case(
     validate: bool = True,
     kv_scale_factors=None,
 ):
-    if seq_lens_kv is None and wrapper._plan_state.planned_seq_lens_kv_device is None:
+    if seq_lens_kv is None and wrapper.plan_state.planned_seq_lens_kv_device is None:
         seq_lens_kv = case.seq_lens_kv
     return wrapper.run(
         case.q,
@@ -1836,8 +1877,8 @@ def _exercise_public_paths(
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
     if case.q.dtype == _FP8:
-        policy = dict(wrapper._policy)
-        state = wrapper._plan_state
+        policy = dict(wrapper.policy)
+        state = wrapper.plan_state
         assert state is not None
         case = _with_reference(
             case,
@@ -1852,7 +1893,7 @@ def _exercise_public_paths(
             ),
         )
     runtime_seq_lens_kv = (
-        seq_lens_kv if wrapper._plan_state.planned_seq_lens_kv_device is None else None
+        seq_lens_kv if wrapper.plan_state.planned_seq_lens_kv_device is None else None
     )
     eager = _run_case(
         wrapper,
@@ -1891,7 +1932,7 @@ def _exercise_public_paths(
     torch.cuda.synchronize()
     _assert_case_correct(graph_out, case)
     torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     if (
         qo_indptr is None
         and runtime_seq_lens_kv is not None
@@ -2016,7 +2057,7 @@ def _exercise_auto_case(
         max_q_len=max_q_len,
         dynamic_kv=dynamic_kv,
     )
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     _assert_auto_policy(policy, {}, device=case.q.device)
     _exercise_public_paths(
         wrapper,
@@ -2041,10 +2082,7 @@ def _exercise_explicit_profile_case(
 ) -> dict[str, object]:
     """Run a public path with ``explicit_profile`` pinned over automatic selection."""
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
-    original_make_decode_config = fmha_decode_config.make_decode_config
+    original_make_decode_config = decode_selection.make_decode_config
 
     def _make_explicit_config(*args, **kwargs):
         source = kwargs.get("args")
@@ -2053,13 +2091,13 @@ def _exercise_explicit_profile_case(
         )
         return original_make_decode_config(*args, **kwargs)
 
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "make_decode_config",
         _make_explicit_config,
     )
-    decode_module._resolve_decode_launch_spec.cache_clear()
-    decode_module._get_compiled_decode.cache_clear()
+    decode_launch.resolve_decode_launch_spec.cache_clear()
+    decode_launch.get_compiled_decode.cache_clear()
     try:
         return _exercise_auto_case(
             case,
@@ -2068,8 +2106,8 @@ def _exercise_explicit_profile_case(
             exercise_all_paths=exercise_all_paths,
         )
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
-        decode_module._get_compiled_decode.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
+        decode_launch.get_compiled_decode.cache_clear()
 
 
 def _exercise_explicit_kv256_case(
@@ -2258,26 +2296,26 @@ def test_attention_ts_decode_paged_wide_head_group_graph(dtype, page_size):
 def test_attention_ts_decode_storage_page_size_contract() -> None:
     """An encoded fragment must divide its physical cache page."""
 
-    assert _validate_storage_page_size(4, 4) == 4
-    assert _validate_storage_page_size(4, 16) == 16
+    assert validate_storage_page_size(4, 4) == 4
+    assert validate_storage_page_size(4, 16) == 16
     with pytest.raises(ValueError, match="divisible by page_size"):
-        _validate_storage_page_size(4, 18)
-    assert _validate_storage_page_size(8, 32) == 32
-    assert _validate_storage_page_size(16, 32) == 32
+        validate_storage_page_size(4, 18)
+    assert validate_storage_page_size(8, 32) == 32
+    assert validate_storage_page_size(16, 32) == 32
     with pytest.raises(ValueError, match="divisible by page_size"):
-        _validate_storage_page_size(16, 24)
+        validate_storage_page_size(16, 24)
     with pytest.raises(TypeError, match="must be a positive integer"):
-        _validate_storage_page_size(4, True)
+        validate_storage_page_size(4, True)
 
 
 def test_attention_ts_decode_dtype_pair_guards() -> None:
     """Reject unsupported mixes while allowing transformed KV and FP8 PV."""
 
-    _validate_dtype_pair(
+    validate_dtype_pair(
         torch.bfloat16, torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16
     )
     with pytest.raises(NotImplementedError, match=r"attention-ts decode supports"):
-        _validate_dtype_pair(
+        validate_dtype_pair(
             torch.float16, torch.float8_e4m3fn, torch.float16, torch.float16
         )
     for q_dtype, v_dtype in (
@@ -2286,32 +2324,32 @@ def test_attention_ts_decode_dtype_pair_guards() -> None:
         (torch.bfloat16, torch.float16),
     ):
         with pytest.raises(NotImplementedError, match=r"attention-ts decode supports"):
-            _validate_dtype_pair(q_dtype, q_dtype, v_dtype, torch.float16)
+            validate_dtype_pair(q_dtype, q_dtype, v_dtype, torch.float16)
 
 
 @pytest.mark.parametrize("kv_dtype", (torch.float8_e4m3fn, torch.uint8))
 def test_attention_ts_decode_common_kv_dtype_alias(kv_dtype):
-    from flashinfer.attention.prims_ts.decode import _resolve_kv_dtypes
+    from flashinfer.attention.prims_ts.common.attention_args import resolve_kv_dtypes
 
-    assert _resolve_kv_dtypes(torch.bfloat16, None, None, kv_dtype) == (
+    assert resolve_kv_dtypes(torch.bfloat16, None, None, kv_dtype) == (
         kv_dtype,
         kv_dtype,
     )
-    assert _resolve_kv_dtypes(torch.bfloat16, kv_dtype, kv_dtype, kv_dtype) == (
+    assert resolve_kv_dtypes(torch.bfloat16, kv_dtype, kv_dtype, kv_dtype) == (
         kv_dtype,
         kv_dtype,
     )
     with pytest.raises(ValueError, match="must agree"):
-        _resolve_kv_dtypes(torch.bfloat16, torch.bfloat16, None, kv_dtype)
+        resolve_kv_dtypes(torch.bfloat16, torch.bfloat16, None, kv_dtype)
     with pytest.raises(ValueError, match="must agree"):
-        _resolve_kv_dtypes(torch.bfloat16, None, torch.bfloat16, kv_dtype)
+        resolve_kv_dtypes(torch.bfloat16, None, torch.bfloat16, kv_dtype)
 
 
 def test_attention_ts_decode_public_query_geometry_guards() -> None:
     """Reject unsafe Q extents and head ratios above 128."""
 
     int32_max = 2**31 - 1
-    _validate_decode_query_head_extent(
+    validate_decode_query_head_extent(
         batch_size=int32_max,
         num_qo_heads=1,
         max_q_len=1,
@@ -2320,18 +2358,18 @@ def test_attention_ts_decode_public_query_geometry_guards() -> None:
         NotImplementedError,
         match=r"batch_size \* max_q_len \* num_qo_heads.*signed int32",
     ):
-        _validate_decode_query_head_extent(
+        validate_decode_query_head_extent(
             batch_size=int32_max + 1,
             num_qo_heads=1,
             max_q_len=1,
         )
 
     for supported_ratio in range(1, 129):
-        _validate_head_geometry(supported_ratio, 1)
+        validate_head_geometry(supported_ratio, 1)
     with pytest.raises(ValueError, match="must be divisible"):
-        _validate_head_geometry(127, 2)
+        validate_head_geometry(127, 2)
     with pytest.raises(ValueError, match=r"1 <= Hq/Hkv <= 128"):
-        _validate_head_geometry(129, 1)
+        validate_head_geometry(129, 1)
 
 
 @pytest.mark.parametrize(
@@ -2361,18 +2399,16 @@ def test_attention_ts_decode_fp8_head_ratio_buckets(
     _mock_decode_hardware(monkeypatch)
 
     from contextlib import nullcontext
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 152 // cluster_size,
     )
-    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_launch.resolve_decode_launch_spec.cache_clear()
     try:
-        spec = decode_module._resolve_decode_launch_spec(
+        spec = decode_launch.resolve_decode_launch_spec(
             0,
             256,
             head_ratio,
@@ -2391,7 +2427,7 @@ def test_attention_ts_decode_fp8_head_ratio_buckets(
             -1,
         )
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
 
     policy = dict(spec.policy)
     assert policy["mma_variant"] == expected_mma
@@ -2402,35 +2438,35 @@ def test_attention_ts_decode_fp8_head_ratio_buckets(
 def test_attention_ts_decode_reserves_int32_kv_tile_padding() -> None:
     """The public K/V bound leaves room for the final exclusive tile endpoint."""
 
-    safe_max = 2**31 - _DECODE_MAX_KV_TILE_SIZE
-    assert safe_max == _DECODE_MAX_KV_LEN
-    assert _validate_max_kv_len(safe_max, "max_kv_len") == safe_max
-    assert safe_max + _DECODE_MAX_KV_TILE_SIZE - 1 == 2**31 - 1
+    safe_max = 2**31 - DECODE_MAX_KV_TILE_SIZE
+    assert safe_max == DECODE_MAX_KV_LEN
+    assert validate_max_kv_len(safe_max, "max_kv_len") == safe_max
+    assert safe_max + DECODE_MAX_KV_TILE_SIZE - 1 == 2**31 - 1
     assert (
-        safe_max + _DECODE_MAX_KV_TILE_SIZE - 1
-    ) // _DECODE_MAX_KV_TILE_SIZE * _DECODE_MAX_KV_TILE_SIZE <= 2**31 - 1
+        safe_max + DECODE_MAX_KV_TILE_SIZE - 1
+    ) // DECODE_MAX_KV_TILE_SIZE * DECODE_MAX_KV_TILE_SIZE <= 2**31 - 1
     assert (
-        safe_max + 1 + _DECODE_MAX_KV_TILE_SIZE - 1
-    ) // _DECODE_MAX_KV_TILE_SIZE * _DECODE_MAX_KV_TILE_SIZE == 2**31
+        safe_max + 1 + DECODE_MAX_KV_TILE_SIZE - 1
+    ) // DECODE_MAX_KV_TILE_SIZE * DECODE_MAX_KV_TILE_SIZE == 2**31
 
     with pytest.raises(
         NotImplementedError,
         match=rf"max_kv_len must be <= {safe_max}.*signed int32",
     ):
-        _validate_max_kv_len(safe_max + 1, "max_kv_len")
+        validate_max_kv_len(safe_max + 1, "max_kv_len")
 
-    _validate_decode_policy_kv_tile_size(
-        type("Config", (), {"tile_size_kv": _DECODE_MAX_KV_TILE_SIZE})()
+    validate_decode_policy_kv_tile_size(
+        type("Config", (), {"tile_size_kv": DECODE_MAX_KV_TILE_SIZE})()
     )
-    unsupported_tile_size = _DECODE_MAX_KV_TILE_SIZE * 2
+    unsupported_tile_size = DECODE_MAX_KV_TILE_SIZE * 2
     with pytest.raises(
         RuntimeError,
         match=(
-            rf"K/V tile no larger than {_DECODE_MAX_KV_TILE_SIZE}"
+            rf"K/V tile no larger than {DECODE_MAX_KV_TILE_SIZE}"
             rf".*got {unsupported_tile_size}"
         ),
     ):
-        _validate_decode_policy_kv_tile_size(
+        validate_decode_policy_kv_tile_size(
             type("Config", (), {"tile_size_kv": unsupported_tile_size})()
         )
 
@@ -2443,12 +2479,12 @@ def test_attention_ts_decode_workspace_layout_uses_explicit_reducer_mode() -> No
         (2, 3, 4, 5),
         (2, 3, 5),
     )
-    separate = _make_decode_workspace_layout(
+    separate = make_decode_workspace_layout(
         scratch_shapes,
         torch.float8_e4m3fn,
         use_separate_reduction_kernel=True,
     )
-    inline = _make_decode_workspace_layout(
+    inline = make_decode_workspace_layout(
         scratch_shapes,
         torch.float8_e4m3fn,
         use_separate_reduction_kernel=False,
@@ -2534,8 +2570,8 @@ def test_attention_ts_decode_register_reallocation_fits_initial_cta_pool(
     transformed_tmem: bool,
 ) -> None:
     """Padding, active tasks and transforms must fit the initial CTA pool."""
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
-        _active_warp_roles,
+    from flashinfer.attention.prims_ts.variants.decode.kernel.warp_roles import (
+        active_warp_roles,
     )
 
     mixed_precision = q_dtype != kv_dtype
@@ -2558,7 +2594,7 @@ def test_attention_ts_decode_register_reallocation_fits_initial_cta_pool(
     threads = config.threads_per_cta
     requested = 0
     warpgroup_budgets: dict[int, set[int]] = {}
-    for role in _active_warp_roles(config):
+    for role in active_warp_roles(config):
         if role.is_padding:
             budget = config.padding_task_num_registers(
                 role.preferred_warp_idx, role.num_warps
@@ -2597,7 +2633,7 @@ def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> N
             num_kv_heads=1,
             head_dim=64,
             page_size=page_size,
-            max_kv_len=_DECODE_MAX_KV_LEN,
+            max_kv_len=DECODE_MAX_KV_LEN,
             device=device,
         )
         > 0
@@ -2608,7 +2644,7 @@ def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> N
     block_tables = paged_kv_indices.view(1, 1)
     last_page_len = torch.tensor((page_size,), dtype=torch.int32, device=device)
     seq_lens_kv = last_page_len.clone()
-    unsafe_max = _DECODE_MAX_KV_LEN + 1
+    unsafe_max = DECODE_MAX_KV_LEN + 1
 
     with pytest.raises(
         NotImplementedError, match=r"padded FMHA decode K/V coordinates"
@@ -2751,12 +2787,12 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
 
-    assert _DecodePlanState.__dataclass_params__.frozen is True
+    assert DecodePlanState.__dataclass_params__.frozen is True
     assert {"batch_size", "max_kv_len", "max_q_len", "seq_lens_kv"}.issubset(
         inspect.signature(BatchDecodePagedTSWrapper.plan).parameters
     )
     request_fields = {"qo_indptr", "block_tables"}
-    assert request_fields.isdisjoint(_DecodePlanState.__dataclass_fields__)
+    assert request_fields.isdisjoint(DecodePlanState.__dataclass_fields__)
 
 
 _FORBIDDEN_DECODE_TUNING_PARAMETERS = frozenset(
@@ -2883,7 +2919,7 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
 
     # A successful plan publishes one frozen state. A minimal stand-in keeps
     # this trace dispatcher contract test CPU-only.
-    wrapper._plan_state = type(
+    wrapper.plan_state = type(
         "_TraceDecodePlanState",
         (),
         {
@@ -3060,7 +3096,7 @@ def _build_decode_resources(cfg):
             smem_allocator,
             tmem_allocator,
             _correction_resources,
-        ) = _build_decode_gen_schedule(
+        ) = build_decode_gen_schedule(
             cfg,
             total_kv_tiles=cfg.total_kv_tiles,
             # Resource construction stores but does not dereference this marker.
@@ -3218,8 +3254,8 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
     # This BS8/Hkv1 geometry resolves to fused split-KV on GB300. Starting
     # from nonzero workspace bytes proves preparation owns the sole explicit
     # counter initialization.
-    assert plan._workspace.split_kv_counter.numel() > 1
-    assert not torch.count_nonzero(plan._workspace.split_kv_counter).item()
+    assert plan.workspace.split_kv_counter.numel() > 1
+    assert not torch.count_nonzero(plan.workspace.split_kv_counter).item()
 
     dynamic_q = case.q.clone()
     eager_out = torch.empty_like(representative_out)
@@ -3233,7 +3269,7 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
         is eager_out
     )
     _assert_case_correct(eager_out, case)
-    assert not torch.count_nonzero(plan._workspace.split_kv_counter).item()
+    assert not torch.count_nonzero(plan.workspace.split_kv_counter).item()
 
     graph_out = torch.empty_like(representative_out)
     graph = torch.cuda.CUDAGraph()
@@ -3248,7 +3284,7 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
     graph.replay()
     torch.cuda.synchronize()
     _assert_case_correct(graph_out, case)
-    assert not torch.count_nonzero(plan._workspace.split_kv_counter).item()
+    assert not torch.count_nonzero(plan.workspace.split_kv_counter).item()
 
     with pytest.raises(ValueError, match="query must preserve"):
         plan.run(
@@ -3365,8 +3401,8 @@ def test_q_token_membership_keep_word16():
     import cutlass.cute as cute
     from cutlass import Int32, Uint32
     from cutlass.cute.runtime import from_dlpack
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_resources import (
-        _q_token_membership_keep_word16,
+    from flashinfer.attention.prims_ts.variants.decode.kernel.resources.smem_resources import (
+        q_token_membership_keep_word16,
     )
 
     rows, queries, expected = [], [], []
@@ -3398,7 +3434,7 @@ def test_q_token_membership_keep_word16():
         i = cute.arch.thread_idx()[0] + cute.arch.block_idx()[0] * 128
         if i < output.shape[0]:
             output[i] = Int32(
-                _q_token_membership_keep_word16(
+                q_token_membership_keep_word16(
                     Uint32(words[i, 0]),
                     Uint32(words[i, 1]),
                     Uint32(words[i, 2]),
@@ -3428,13 +3464,14 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
 ) -> None:
     """Merge grouped BF16 rows with the standard split-KV reducer."""
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config as fmha_decode_config,
+    )
 
     kv_tokens = max(2528, splits * 256 + 32)
     storage_page_size = 16
     issuers = 8
-    cfg = fmha_decode_config.make_decode_config(
+    cfg = decode_selection.make_decode_config(
         headdim=256,
         args={
             "use_keeps_mma_ab": True,
@@ -3472,7 +3509,7 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
     )
     assert cfg.splits_kv == splits
     assert cfg.use_separate_reduction_kernel
-    spec = decode_module._decode_launch_spec_from_config(
+    spec = decode_launch.decode_launch_spec_from_config(
         cfg,
         batch_size=1,
         num_qo_heads=12,
@@ -3483,12 +3520,12 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
             fmha_decode_config.get_max_active_clusters_for_cluster_size(1)
         ),
     )
-    monkeypatch.setattr(
-        decode_module,
-        "_resolve_decode_launch_spec",
+    _patch_decode(
+        monkeypatch,
+        "resolve_decode_launch_spec",
         lambda *_args, **_kwargs: spec,
     )
-    decode_module._get_compiled_decode.cache_clear()
+    decode_launch.get_compiled_decode.cache_clear()
 
     case = _make_decode_case(
         kv_lens=(kv_tokens,),
@@ -3543,7 +3580,7 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
     )
     workspace = torch.zeros(workspace_size, dtype=torch.uint8, device="cuda")
     try:
-        plan, prepared_output = decode_module._prepare_prims_ts_batch_decode_plan(
+        plan, prepared_output = decode_plan.prepare_batch_decode_plan(
             case.q,
             packed_cache,
             workspace,
@@ -3570,7 +3607,7 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         )
         torch.cuda.synchronize()
     finally:
-        decode_module._get_compiled_decode.cache_clear()
+        decode_launch.get_compiled_decode.cache_clear()
 
     assert result is output
     _assert_case_correct(output, case)
@@ -3586,8 +3623,9 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
 ) -> None:
     """Apply each packed page-membership bit to the corresponding Q token."""
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config as fmha_decode_config,
+    )
 
     storage_page_size = 16
     kv_lens = tuple(kv_tokens - 32 * batch_idx for batch_idx in range(batch_size))
@@ -3607,7 +3645,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
         "load_warp_idx": 16,
         "load_num_warps": 8,
     }
-    cfg = fmha_decode_config.make_decode_config(
+    cfg = decode_selection.make_decode_config(
         headdim=256,
         args=config_args,
         seq_len_q=4,
@@ -3626,7 +3664,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
         mask_type="causal",
         auto_tuner=False,
     )
-    spec = decode_module._decode_launch_spec_from_config(
+    spec = decode_launch.decode_launch_spec_from_config(
         cfg,
         batch_size=batch_size,
         num_qo_heads=12,
@@ -3637,12 +3675,12 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
             fmha_decode_config.get_max_active_clusters_for_cluster_size(1)
         ),
     )
-    monkeypatch.setattr(
-        decode_module,
-        "_resolve_decode_launch_spec",
+    _patch_decode(
+        monkeypatch,
+        "resolve_decode_launch_spec",
         lambda *_args, **_kwargs: spec,
     )
-    decode_module._get_compiled_decode.cache_clear()
+    decode_launch.get_compiled_decode.cache_clear()
 
     case = _make_decode_case(
         kv_lens=kv_lens,
@@ -3744,7 +3782,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
     )
     workspace = torch.zeros(workspace_size, dtype=torch.uint8, device="cuda")
     try:
-        plan, prepared_output = decode_module._prepare_prims_ts_batch_decode_plan(
+        plan, prepared_output = decode_plan.prepare_batch_decode_plan(
             case.q,
             packed_cache,
             workspace,
@@ -3771,7 +3809,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
         )
         torch.cuda.synchronize()
     finally:
-        decode_module._get_compiled_decode.cache_clear()
+        decode_launch.get_compiled_decode.cache_clear()
 
     reference = torch.empty_like(output, dtype=torch.float32)
     for batch_idx in range(batch_size):
@@ -3899,18 +3937,18 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     )
     assert cfg.uses_two_inst_tmem_p
     resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
-    s0 = resources["tmemS0"]._alloc
-    s1 = resources["tmemS1"]._alloc
-    p0 = resources["smemP0"]._tmem_alloc
-    p1 = resources["smemP1"]._tmem_alloc
-    output = resources["tmemO"]._alloc
+    s0 = resources["tmemS0"].alloc
+    s1 = resources["tmemS1"].alloc
+    p0 = resources["smemP0"].tmem_alloc
+    p1 = resources["smemP1"].tmem_alloc
+    output = resources["tmemO"].alloc
 
     for name in ("tmemSoftmaxLocal0", "tmemSoftmaxLocal1"):
         stats = resources[name]
         if cfg.keeps_stats_via_smem:
-            assert stats._alloc is None
+            assert stats.alloc is None
         else:
-            assert stats._alloc is not None
+            assert stats.alloc is not None
     if cfg.streams_tmem_p_fragments:
         # Streamed P fragments overlay S from its first column so every
         # 16-column P store lands on consumed scores; O leads the layout.
@@ -3924,8 +3962,8 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
         assert p1.offset == s1.offset + cfg.tmem_stats_cols
         assert output.offset >= s1.offset + s1.num_columns
     else:
-        stats0 = resources["tmemSoftmaxLocal0"]._alloc
-        stats1 = resources["tmemSoftmaxLocal1"]._alloc
+        stats0 = resources["tmemSoftmaxLocal0"].alloc
+        stats1 = resources["tmemSoftmaxLocal1"].alloc
         assert p0.offset == s0.offset
         assert p1.offset == s1.offset
         assert stats0.offset == s1.offset + s1.num_columns
@@ -3938,8 +3976,8 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     assert p0.offset + p0.num_columns <= s0.offset + s0.num_columns
     assert s1.offset <= p1.offset
     assert p1.offset + p1.num_columns <= s1.offset + s1.num_columns
-    assert resources["smemP0"]._alloc is None
-    assert resources["smemP1"]._alloc is None
+    assert resources["smemP0"].alloc is None
+    assert resources["smemP1"].alloc is None
     assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
@@ -3952,11 +3990,11 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
     resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
 
     assert cfg.keeps_stats_via_smem
-    assert resources["tmemSoftmaxLocal0"]._alloc is None
-    assert resources["tmemSoftmaxLocal1"]._alloc is None
-    assert resources["tmemO"]._alloc.offset == 0
-    assert resources["smemP0"]._tmem_alloc.offset == resources["tmemS0"]._alloc.offset
-    assert resources["smemP1"]._tmem_alloc.offset == resources["tmemS1"]._alloc.offset
+    assert resources["tmemSoftmaxLocal0"].alloc is None
+    assert resources["tmemSoftmaxLocal1"].alloc is None
+    assert resources["tmemO"].alloc.offset == 0
+    assert resources["smemP0"].tmem_alloc.offset == resources["tmemS0"].alloc.offset
+    assert resources["smemP1"].tmem_alloc.offset == resources["tmemS1"].alloc.offset
 
     # One score generation advances both P-ready parity and the matching
     # two-stage O completion credit exactly once per instance. These structural
@@ -3970,8 +4008,8 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
         p = resources[name]
         assert p.pipeline_config is None
         assert p.tmem_o_ref is resources["tmemO"]
-        assert isinstance(p._fragment_ready_alloc, SmemAllocation)
-        assert p._fragment_ready_alloc.size_bytes == (
+        assert isinstance(p.fragment_ready_alloc, SmemAllocation)
+        assert p.fragment_ready_alloc.size_bytes == (
             cfg.num_softmax_score_fragments * 8
         )
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
@@ -4167,7 +4205,7 @@ def test_attention_ts_decode_kv256_uses_dedicated_fragment_exchange(
 ) -> None:
     """Direct KV256 correction owns a compact exchange outside the K/V ring."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_corr import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.resources.tmem_corr import (
         TmemCorrResource,
     )
 
@@ -4183,7 +4221,7 @@ def test_attention_ts_decode_kv256_uses_dedicated_fragment_exchange(
     # The tail exchanges 128 float4 stats plus one padded D32 fragment per
     # logical output row, so the buffer no longer has to alias the K/V ring
     # and the load warp can stream the next tile while correction finishes.
-    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 11_264
+    assert tmem_corr1.kv_tile_256_exchange_entries() * 4 == 11_264
     assert exchange_alloc.size_bytes == 11_264
 
     if not persistent:
@@ -4208,7 +4246,7 @@ def test_attention_ts_decode_kv256_split_uses_compact_exchange(
 ) -> None:
     """Both KV256 split reducers exchange only 64 logical output rows."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_corr import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.resources.tmem_corr import (
         TmemCorrResource,
     )
 
@@ -4229,7 +4267,7 @@ def test_attention_ts_decode_kv256_split_uses_compact_exchange(
     )
     exchange_alloc = tmem_corr1.get_smem_requirements()[-1]
 
-    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 11_264
+    assert tmem_corr1.kv_tile_256_exchange_entries() * 4 == 11_264
     assert exchange_alloc.size_bytes == 11_264
 
 
@@ -4237,10 +4275,10 @@ def test_attention_ts_decode_kv256_register_launch_bound_is_amortized() -> None:
     """Only long KV256 mainloops pay for dynamic register hand-off."""
 
     cfg = _make_contiguous_kv256_config()
-    assert _decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv) == 0
-    assert _decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv + 1) == 1
+    assert decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv) == 0
+    assert decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv + 1) == 1
     # Runtime KV lengths cannot amortize, so they always keep the bound.
-    assert _decode_min_blocks_per_mp(cfg, None) == 1
+    assert decode_min_blocks_per_mp(cfg, None) == 1
 
 
 def test_attention_ts_decode_kv256_register_budget_matches_launch_bound() -> None:
@@ -4302,20 +4340,20 @@ def test_attention_ts_decode_q64_keeps_p_in_smem_within_capacity(
     )
     assert not cfg.uses_tmem_p
     resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
-    s0 = resources["tmemS0"]._alloc
-    s1 = resources["tmemS1"]._alloc
-    output = resources["tmemO"]._alloc
+    s0 = resources["tmemS0"].alloc
+    s1 = resources["tmemS1"].alloc
+    output = resources["tmemO"].alloc
     for name in ("tmemSoftmaxLocal0", "tmemSoftmaxLocal1"):
         stats = resources[name]
         if cfg.keeps_stats_via_smem:
-            assert stats._alloc is None
+            assert stats.alloc is None
         else:
-            assert stats._alloc is not None
+            assert stats.alloc is not None
     if cfg.keeps_stats_via_smem:
         assert output.offset == 0
     else:
-        stats0 = resources["tmemSoftmaxLocal0"]._alloc
-        stats1 = resources["tmemSoftmaxLocal1"]._alloc
+        stats0 = resources["tmemSoftmaxLocal0"].alloc
+        stats1 = resources["tmemSoftmaxLocal1"].alloc
         assert stats0.offset == 0
         assert stats1.offset == stats0.offset + stats0.num_columns
         assert output.offset == stats1.offset + stats1.num_columns
@@ -4324,9 +4362,9 @@ def test_attention_ts_decode_q64_keeps_p_in_smem_within_capacity(
     assert s1.offset + s1.num_columns == cfg.tmem_total_cols
     for name in ("smemP0", "smemP1"):
         p = resources[name]
-        assert isinstance(p._alloc, SmemAllocation)
-        assert p._alloc.size_bytes == cfg.smem_p_tile_bytes
-        assert p._tmem_alloc is None
+        assert isinstance(p.alloc, SmemAllocation)
+        assert p.alloc.size_bytes == cfg.smem_p_tile_bytes
+        assert p.tmem_alloc is None
     assert "tmemStatsDone0" not in resources
     assert "tmemStatsDone1" not in resources
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
@@ -4348,18 +4386,18 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_separate_stats(
     )
     assert cfg.uses_staged_one_inst_tmem_p
     resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
-    s = resources["tmemS0"]._alloc
-    p = resources["smemP0"]._tmem_alloc
+    s = resources["tmemS0"].alloc
+    p = resources["smemP0"].tmem_alloc
 
     assert cfg.keeps_stats_via_smem
-    assert resources["tmemSoftmaxLocal0"]._alloc is None
-    assert isinstance(resources["tmemSoftmaxLocal0"]._smem_alloc, SmemAllocation)
+    assert resources["tmemSoftmaxLocal0"].alloc is None
+    assert isinstance(resources["tmemSoftmaxLocal0"].smem_alloc, SmemAllocation)
     assert p.offset == s.offset + cfg.tmem_stats_cols
 
     # Same-warp MMA A reads precede later MMA D writes to the aliased slot.
     # The softmax-local pipeline independently protects the SMEM statistics.
     assert cfg.mma_num_warps == 1
-    assert resources["smemP0"]._alloc is None
+    assert resources["smemP0"].alloc is None
     assert s.offset <= p.offset
     assert p.offset + p.num_columns <= s.offset + s.num_columns
     assert cfg.tmem_total_cols <= tmem_allocator.total_tmem_columns <= 512
@@ -4406,7 +4444,7 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
     assert cfg.tmem_transformed_kv_slot_cols == (
         cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_hd_stages_per_slot
     )
-    assert transformed._alloc.num_columns == (
+    assert transformed.alloc.num_columns == (
         cfg.tmem_transformed_kv_slot_cols * cfg.transformed_kv_stages
     )
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
@@ -4467,7 +4505,7 @@ def test_attention_ts_decode_nvfp4_d512_q8_groups_transformed_slots() -> None:
     # Explicit two-group override still resolves (the edit 1 layout).
     assert config(transform_kv_num_warps=8).transform_kv_num_warps == 8
     resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
-    assert resources["tmemTransformedKv"]._alloc.num_columns == (
+    assert resources["tmemTransformedKv"].alloc.num_columns == (
         cfg.tmem_transformed_kv_slot_cols * cfg.transformed_kv_stages
     )
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
@@ -4584,16 +4622,12 @@ def test_attention_ts_decode_whole_tile_nvfp4_stage_requires_full_slices() -> No
     ),
 )
 def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, out_dtype):
-    from flashinfer.attention.prims_ts import decode as decode_module
-
-    decode_module._validate_dtype_pair(q_dtype, kv_dtype, kv_dtype, out_dtype)
+    decode_validation.validate_dtype_pair(q_dtype, kv_dtype, kv_dtype, out_dtype)
 
 
 def test_attention_ts_rejects_unsupported_fp16_q_fp8_kv():
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     with pytest.raises(NotImplementedError, match=r"BF16 Q \+ FP8 K/V"):
-        decode_module._validate_dtype_pair(
+        decode_validation.validate_dtype_pair(
             torch.float16,
             torch.float8_e4m3fn,
             torch.float8_e4m3fn,
@@ -4642,13 +4676,11 @@ def test_attention_ts_decode_mixed_wide_heads_use_swaps_fallback(
 ):
     """Wide mixed-precision groups must avoid unsupported D256 Keeps profiles."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
-    monkeypatch.setattr(
-        fmha_decode_config, "_select_auto_launch_mode", lambda **_kwargs: "static"
+    _patch_decode_config(
+        monkeypatch, "select_auto_launch_mode", lambda **_kwargs: "static"
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda _cluster_size: 148,
     )
@@ -4696,22 +4728,20 @@ def test_attention_ts_decode_rejects_mismatched_o_stages_and_kv_insts():
 
 
 def test_attention_ts_nvfp4_cache_contract():
-    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.common import paged_kv
 
     packed = torch.empty((2, 1, 64, 32), dtype=torch.uint8)
     scales = torch.empty((2, 1, 64, 4), dtype=torch.float8_e4m3fn)
-    normalized = decode_module._normalize_paged_kv_cache(
+    normalized = paged_kv.normalize_paged_kv_cache(
         (packed, packed),
         expected_device=packed.device,
         logical_head_dim=64,
     )
     assert normalized[5] == 64
-    k_sf, v_sf, k_sf_strides, v_sf_strides = (
-        decode_module._normalize_paged_kv_scale_factors(
-            (scales, scales),
-            k_cache=packed,
-            logical_head_dim=64,
-        )
+    k_sf, v_sf, k_sf_strides, v_sf_strides = paged_kv.normalize_paged_kv_scale_factors(
+        (scales, scales),
+        k_cache=packed,
+        logical_head_dim=64,
     )
     assert k_sf is scales
     assert v_sf is scales
@@ -4720,13 +4750,13 @@ def test_attention_ts_nvfp4_cache_contract():
     # they must be token-contiguous; a transposed token-major view is not.
     token_major = torch.empty((2, 64, 2, 4), dtype=torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="token-contiguous"):
-        decode_module._normalize_paged_kv_scale_factors(
+        paged_kv.normalize_paged_kv_scale_factors(
             (token_major.transpose(1, 2),) * 2,
             k_cache=torch.empty((2, 2, 64, 32), dtype=torch.uint8),
             logical_head_dim=64,
         )
     with pytest.raises(ValueError, match="requires kv_scale_factors"):
-        decode_module._normalize_paged_kv_scale_factors(
+        paged_kv.normalize_paged_kv_scale_factors(
             None,
             k_cache=packed,
             logical_head_dim=64,
@@ -4850,7 +4880,7 @@ def run_mixed_precision_decode_case(
         # FP8-P rounding follows each split's local max. Model the actual
         # schedule after dequantizing NVFP4, just as homogeneous FP8 tests do.
         kv_dtype_key = "float4_e2m1fn" if kv_dtype == torch.uint8 else "float8_e4m3fn"
-        reference_spec = _resolve_decode_launch_spec(
+        reference_spec = resolve_decode_launch_spec(
             torch.cuda.current_device(),
             batch_size,
             num_qo_heads,
@@ -4978,7 +5008,7 @@ def test_attention_ts_decode_nvfp4_padded_scale_page_stride(out_dtype):
     q_dtype = _FP8
     kv_dtype = torch.uint8
     # FP8-P rounding follows each split's local max; model the planned split.
-    reference_spec = _resolve_decode_launch_spec(
+    reference_spec = resolve_decode_launch_spec(
         torch.cuda.current_device(),
         batch_size,
         num_qo_heads,
@@ -5066,11 +5096,9 @@ def test_attention_ts_decode_mixed_precision_more_loaders_than_pages(
     monkeypatch, q_dtype, kv_dtype, out_dtype
 ):
     """Inactive loader warps must not duplicate payload or scale-factor copies."""
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
-    decode_module._resolve_decode_launch_spec.cache_clear()
-    original_make_decode_config = fmha_decode_config.make_decode_config
+    decode_launch.resolve_decode_launch_spec.cache_clear()
+    original_make_decode_config = decode_selection.make_decode_config
 
     def make_multiwarp_config(*args, **kwargs):
         # Config sources are layered; the last layer takes precedence.
@@ -5086,11 +5114,11 @@ def test_attention_ts_decode_mixed_precision_more_loaders_than_pages(
         assert cfg.tile_size_kv // cfg.num_tokens_per_page < cfg.load_num_warps
         return cfg
 
-    monkeypatch.setattr(fmha_decode_config, "make_decode_config", make_multiwarp_config)
-    monkeypatch.setattr(
-        decode_module,
-        "_resolve_decode_launch_spec",
-        decode_module._resolve_decode_launch_spec.__wrapped__,
+    _patch_decode_config(monkeypatch, "make_decode_config", make_multiwarp_config)
+    _patch_decode(
+        monkeypatch,
+        "resolve_decode_launch_spec",
+        decode_launch.resolve_decode_launch_spec.__wrapped__,
     )
     case, kv_scale_factors = _make_mixed_precision_decode_case(
         batch_size=1,
@@ -5233,8 +5261,6 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
 
     from unittest.mock import Mock
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     q = torch.empty((1, 8, 64), dtype=torch.bfloat16)
     storage_head_dim = 32 if k_dtype == torch.uint8 else 64
     cache = torch.empty((1, 1, 32, storage_head_dim), dtype=k_dtype)
@@ -5248,7 +5274,7 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
     block_tables = torch.zeros((1, 1), dtype=torch.int32)
     workspace = torch.empty(128, dtype=torch.int8)
     wrapper = Mock()
-    wrapper._require_plan_state.return_value = SimpleNamespace(
+    wrapper.require_plan_state.return_value = SimpleNamespace(
         workspace_layout=SimpleNamespace(
             partial_stats=SimpleNamespace(byte_offset=0, byte_size=0),
             split_kv_counter=SimpleNamespace(byte_size=0),
@@ -5256,19 +5282,17 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
     )
     workspace_size = Mock(return_value=workspace.numel())
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        decode_module, "BatchDecodePagedTSWrapper", Mock(return_value=wrapper)
+    _patch_decode(monkeypatch, "BatchDecodePagedTSWrapper", Mock(return_value=wrapper))
+    _patch_decode(
+        monkeypatch, "get_prims_ts_batch_decode_workspace_size", workspace_size
     )
-    monkeypatch.setattr(
-        decode_module, "get_prims_ts_batch_decode_workspace_size", workspace_size
+    _patch_decode(
+        monkeypatch, "validate_block_table_metadata", lambda *_: (q.device, 1, 1)
     )
-    monkeypatch.setattr(
-        decode_module, "_validate_block_table_metadata", lambda *_: (q.device, 1, 1)
-    )
-    monkeypatch.setattr(decode_module, "_validate_q", lambda *_, **__: None)
-    monkeypatch.setattr(
-        decode_module,
-        "_normalize_paged_kv_cache_views",
+    _patch_decode(monkeypatch, "validate_q", lambda *_, **__: None)
+    _patch_decode(
+        monkeypatch,
+        "normalize_paged_kv_cache_views",
         lambda *_, **__: (cache, v_cache, 1, 1, 32, 64),
     )
 
@@ -5310,10 +5334,8 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
 ) -> None:
     """The trusted run path canonicalizes and launches without validators."""
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     wrapper = BatchDecodePagedTSWrapper()
-    wrapper._plan_state = type(
+    wrapper.plan_state = type(
         "_TrustedDecodePlanState",
         (),
         {
@@ -5342,20 +5364,20 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
     def fail_validation(*_args, **_kwargs):
         raise AssertionError("explicit validation must be skipped")
 
-    monkeypatch.setattr(
-        decode_module,
-        "_validate_block_table_metadata",
+    _patch_decode(
+        monkeypatch,
+        "validate_block_table_metadata",
         fail_validation,
     )
-    monkeypatch.setattr(decode_module, "_prepare_decode_runtime", fail_validation)
-    monkeypatch.setattr(
-        decode_module,
-        "_validate_decode_run_metadata_values",
+    _patch_decode(monkeypatch, "prepare_decode_runtime", fail_validation)
+    _patch_decode(
+        monkeypatch,
+        "validate_decode_run_metadata_values",
         fail_validation,
     )
-    monkeypatch.setattr(
-        decode_module,
-        "_prepare_decode_runtime_unchecked",
+    _patch_decode(
+        monkeypatch,
+        "prepare_decode_runtime_unchecked",
         lambda *_args, **_kwargs: runtime,
     )
 
@@ -5364,7 +5386,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
             fail_validation()
         return output
 
-    monkeypatch.setattr(decode_module, "_launch_decode", launch)
+    _patch_decode(monkeypatch, "launch_decode", launch)
 
     assert (
         wrapper.run(
@@ -5384,10 +5406,8 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
 ) -> None:
     """Validation control is Boolean and Q offsets follow the planned mode."""
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     wrapper = BatchDecodePagedTSWrapper()
-    wrapper._plan_state = type(
+    wrapper.plan_state = type(
         "_DecodeQModePlanState",
         (),
         {
@@ -5404,15 +5424,15 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
     with pytest.raises(TypeError, match="validate must be a bool"):
         wrapper.run(*args, validate=1)
 
-    monkeypatch.setattr(
-        decode_module,
-        "_validate_block_table_metadata",
+    _patch_decode(
+        monkeypatch,
+        "validate_block_table_metadata",
         lambda *_args, **_kwargs: (torch.device("cuda:0"), 2, 1),
     )
     with pytest.raises(ValueError, match="qo_indptr is required"):
         wrapper.run(*args)
 
-    wrapper._plan_state = type(
+    wrapper.plan_state = type(
         "_DecodeQModePlanState",
         (),
         {
@@ -5449,7 +5469,7 @@ def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() ->
     )
     wrapper = BatchDecodePagedTSWrapper()
     wrapper.plan(case.q.device, 1, 8, 1, 64, 16, 128)
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     assert policy["kv_prefix_mode"] == "dynamic"
     assert policy["kv_lengths_mode"] == "dynamic"
 
@@ -5573,7 +5593,7 @@ def test_attention_ts_decode_block_table_structure_accepts_padded_rows() -> None
 
     assert block_tables.shape == (2, 2)
     assert block_tables.stride() == (4, 1)
-    assert _validate_block_table_metadata(block_tables, seq_lens_kv) == (
+    assert validate_block_table_metadata(block_tables, seq_lens_kv) == (
         seq_lens_kv.device,
         2,
         2,
@@ -5581,13 +5601,13 @@ def test_attention_ts_decode_block_table_structure_accepts_padded_rows() -> None
 
     noncompact_rows = backing[:, ::2]
     with pytest.raises(ValueError, match="contiguous within each row"):
-        _validate_block_table_metadata(noncompact_rows, seq_lens_kv)
+        validate_block_table_metadata(noncompact_rows, seq_lens_kv)
 
     overlapping_rows = torch.empty(3, dtype=torch.int32, device=device).as_strided(
         (2, 2), (1, 1)
     )
     with pytest.raises(ValueError, match="rows must not overlap"):
-        _validate_block_table_metadata(overlapping_rows, seq_lens_kv)
+        validate_block_table_metadata(overlapping_rows, seq_lens_kv)
 
 
 @pytest.mark.parametrize(
@@ -5701,18 +5721,16 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
 def test_attention_ts_decode_device_resolution_does_not_validate(
     monkeypatch, device, expected
 ):
-    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.common import tensors
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
 
     def unexpected_validation(*_args, **_kwargs):
         pytest.fail("device resolution must not check runtime CUDA support")
 
-    monkeypatch.setattr(
-        decode_module, "_validate_runtime_device", unexpected_validation
-    )
+    monkeypatch.setattr(tensors, "validate_runtime_device", unexpected_validation)
     monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_validation)
-    resolved, device_index = decode_module._resolve_cuda_device(device)
+    resolved, device_index = tensors.resolve_cuda_device(device)
     assert resolved == torch.device(expected)
     assert device_index == resolved.index
 
@@ -5767,9 +5785,11 @@ def test_attention_ts_decode_auto_launch_persists_only_above_one_sm_wave(
 ):
     """A partial second CTA wave is the general persistence boundary."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
-        _select_auto_launch_mode,
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config as fmha_decode_config,
+    )
+    from flashinfer.attention.prims_ts.variants.decode.kernel.selection import (
+        select_auto_launch_mode,
     )
 
     class _FourSmHardware:
@@ -5778,7 +5798,7 @@ def test_attention_ts_decode_auto_launch_persists_only_above_one_sm_wave(
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
     modes = tuple(
-        _select_auto_launch_mode(
+        select_auto_launch_mode(
             batch_size=ctas,
             num_heads_kv=1,
             seq_len_kv=128,
@@ -5804,7 +5824,9 @@ def test_attention_ts_decode_auto_split_threshold_scales_with_kv_tile(
 ) -> None:
     """Equivalent scheduled KV work reaches split at either tile width."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config as fmha_decode_config,
+    )
 
     class _FourSmHardware:
         def get_device_multiprocessor_count(self) -> int:
@@ -5813,7 +5835,7 @@ def test_attention_ts_decode_auto_split_threshold_scales_with_kv_tile(
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
 
     modes = tuple(
-        fmha_decode_config._select_auto_launch_mode(
+        decode_selection.select_auto_launch_mode(
             batch_size=1,
             num_heads_kv=1,
             seq_len_kv=seq_len_kv,
@@ -5834,7 +5856,7 @@ def test_attention_ts_decode_config_accepts_arbitrary_positive_q_length(
     """The public fixed-Q geometry is not restricted to power-of-two lengths."""
 
     from cutlass import BFloat16
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.selection import (
         make_decode_config,
     )
 
@@ -5946,15 +5968,13 @@ def test_attention_ts_decode_config_requires_positive_head_counts(
 def _make_auto_kv_tile_config(monkeypatch, **overrides):
     """Resolve one automatic KV-tile candidate without compiling a kernel."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_select_auto_launch_mode",
+    _patch_decode_config(
+        monkeypatch,
+        "select_auto_launch_mode",
         lambda **_kwargs: "static",
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda _cluster_size: 148,
     )
@@ -5974,7 +5994,7 @@ def _make_auto_kv_tile_config(monkeypatch, **overrides):
         "mask_type": "dense",
         "auto_tuner": True,
     }
-    return fmha_decode_config.make_decode_config(**{**kwargs, **overrides})
+    return decode_selection.make_decode_config(**{**kwargs, **overrides})
 
 
 def test_attention_ts_decode_cluster_preserves_resident_fanout(monkeypatch):
@@ -5983,12 +6003,12 @@ def test_attention_ts_decode_cluster_preserves_resident_fanout(monkeypatch):
 
     _mock_decode_hardware(monkeypatch)
     monkeypatch.setattr(torch.cuda, "device", lambda *_a, **_k: nullcontext())
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda size: 152 // size,
     )
-    spec = _resolve_decode_launch_spec.__wrapped__(
+    spec = resolve_decode_launch_spec.__wrapped__(
         0,
         32,
         16,
@@ -6196,17 +6216,15 @@ def test_attention_ts_decode_auto_kv_tile_policy(
 ) -> None:
     """Cover KV/Q composition at utilization and compatibility boundaries."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
     events = []
     launch_kv_tiles = []
     launch_persistent_flags = []
     q_cost_kv_tiles = []
     grouped_q_selections = []
-    original_q_selector = fmha_decode_config._apply_auto_grouped_q_mma_config
-    original_kv_promoter = fmha_decode_config._try_apply_auto_kv256_profile
-    original_launch_selector = fmha_decode_config._apply_auto_launch_mode
-    original_make_q_recipe = fmha_decode_config.make_grouped_q_launch_candidate
+    original_q_selector = decode_selection.apply_auto_grouped_q_mma_config
+    original_kv_promoter = decode_selection.try_apply_auto_kv256_profile
+    original_launch_selector = decode_selection.apply_auto_launch_mode
+    original_make_q_recipe = decode_selection.make_grouped_q_launch_candidate
 
     def _spy_q_selector(*args, **kwargs):
         events.append("q")
@@ -6230,24 +6248,24 @@ def test_attention_ts_decode_auto_kv_tile_policy(
         launch_persistent_flags.append(args[0].use_persistent_scheduler)
         return original_launch_selector(*args, **kwargs)
 
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_apply_auto_grouped_q_mma_config",
+    _patch_decode_config(
+        monkeypatch,
+        "apply_auto_grouped_q_mma_config",
         _spy_q_selector,
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_try_apply_auto_kv256_profile",
+    _patch_decode_config(
+        monkeypatch,
+        "try_apply_auto_kv256_profile",
         _spy_kv_promoter,
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "make_grouped_q_launch_candidate",
         _spy_make_q_recipe,
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_apply_auto_launch_mode",
+    _patch_decode_config(
+        monkeypatch,
+        "apply_auto_launch_mode",
         _spy_launch_selector,
     )
     cfg = _make_auto_kv_tile_config(monkeypatch, **overrides)
@@ -6287,7 +6305,7 @@ def test_attention_ts_decode_auto_config_selection_is_device_agnostic(monkeypatc
 def test_attention_ts_decode_split_work_floor_is_explicit() -> None:
     """Specialized bounded routes may lower the dense split-work floor."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.selection import (
         select_splits_kv,
     )
 
@@ -6379,7 +6397,7 @@ def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
         max_q_len=sq,
     )
     if not split_kv:
-        assert not dict(wrapper._policy)["use_split_kv"]
+        assert not dict(wrapper.policy)["use_split_kv"]
 
     from flashinfer.fi_trace import fi_trace
 
@@ -6439,28 +6457,25 @@ def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> No
 
     from contextlib import nullcontext
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_select_auto_launch_mode",
+    _patch_decode_config(
+        monkeypatch,
+        "select_auto_launch_mode",
         lambda **_kwargs: "gmem_reduction",
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "select_splits_kv",
         lambda **_kwargs: 4,
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 148 // cluster_size,
     )
     make_config_calls = []
     kv_q_candidates = []
-    original_make_decode_config = fmha_decode_config.make_decode_config
-    original_kv_promoter = fmha_decode_config._try_apply_auto_kv256_profile
+    original_make_decode_config = decode_selection.make_decode_config
+    original_kv_promoter = decode_selection.try_apply_auto_kv256_profile
 
     def _record_make_decode_config(*args, **kwargs):
         cfg = original_make_decode_config(*args, **kwargs)
@@ -6471,20 +6486,20 @@ def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> No
         kv_q_candidates.append(q_candidate)
         return original_kv_promoter(*args, q_candidate=q_candidate, **kwargs)
 
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "make_decode_config",
         _record_make_decode_config,
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_try_apply_auto_kv256_profile",
+    _patch_decode_config(
+        monkeypatch,
+        "try_apply_auto_kv256_profile",
         _record_kv_promoter,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
-    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_launch.resolve_decode_launch_spec.cache_clear()
     try:
-        public_spec = decode_module._resolve_decode_launch_spec(
+        public_spec = decode_launch.resolve_decode_launch_spec(
             0,
             1,
             16,
@@ -6503,7 +6518,7 @@ def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> No
             -1,
         )
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
 
     assert len(make_config_calls) == 2
     grouped_cfg, head_band_cfg = make_config_calls
@@ -6540,18 +6555,15 @@ def _resolve_q_token_kv_block_sparse_policy_for_test(
 
     from contextlib import nullcontext
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 148 // cluster_size,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
-    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_launch.resolve_decode_launch_spec.cache_clear()
     try:
-        return decode_module._resolve_decode_launch_spec(
+        return decode_launch.resolve_decode_launch_spec(
             0,
             batch_size,
             num_qo_heads,
@@ -6573,7 +6585,7 @@ def _resolve_q_token_kv_block_sparse_policy_for_test(
             split_kv=split_kv,
         )
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -6607,10 +6619,10 @@ def test_attention_ts_decode_q_token_kv_block_sparse_policy_is_structural(
 ) -> None:
     """Fixed G must fit Q capacity, useful KV work, and one split service wave."""
     _mock_decode_hardware(monkeypatch)
-    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
+    from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata.selection import (
         MAX_SPLITS_KV,
     )
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.device.constants import (
         MIN_LOOP_ITERS_PER_SPLIT,
     )
 
@@ -6712,11 +6724,12 @@ def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_q_token_kv_bloc
 
     from contextlib import nullcontext
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config as fmha_decode_config,
+    )
 
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 148 // cluster_size,
     )
@@ -6727,9 +6740,9 @@ def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_q_token_kv_bloc
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
-    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_launch.resolve_decode_launch_spec.cache_clear()
     try:
-        spec = decode_module._resolve_decode_launch_spec(
+        spec = decode_launch.resolve_decode_launch_spec(
             0,
             1,
             12,
@@ -6749,7 +6762,7 @@ def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_q_token_kv_bloc
             16,
         )
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
 
     assert spec.config.has_storage_subpages
     assert not spec.config.uses_scattered_page_route
@@ -6766,11 +6779,12 @@ def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(
 
     from contextlib import nullcontext
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config as fmha_decode_config,
+    )
 
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 148 // cluster_size,
     )
@@ -6781,9 +6795,9 @@ def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
-    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_launch.resolve_decode_launch_spec.cache_clear()
     try:
-        spec = decode_module._resolve_decode_launch_spec(
+        spec = decode_launch.resolve_decode_launch_spec(
             0,
             3,
             32,
@@ -6802,7 +6816,7 @@ def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(
             -1,
         )
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
 
     cfg = spec.config
 
@@ -6823,23 +6837,22 @@ def test_attention_ts_decode_split_workspace_is_plan_invariant(monkeypatch) -> N
 
     from contextlib import nullcontext
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+    from flashinfer.attention.prims_ts.variants import decode as decode_module
 
     sm_count = 152
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: sm_count // cluster_size,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
-    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_launch.resolve_decode_launch_spec.cache_clear()
     specs = []
     try:
         # Fused, separate and cluster splits of several fanouts, then no split.
         for seq_len_q in (2, 4):
             for batch_size in (1, 2, 3, 4, 5, 8, 26, 39):
-                spec = decode_module._resolve_decode_launch_spec(
+                spec = decode_launch.resolve_decode_launch_spec(
                     0,
                     batch_size,
                     16,
@@ -6884,7 +6897,7 @@ def test_attention_ts_decode_split_workspace_is_plan_invariant(monkeypatch) -> N
             > 0
         )
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
     assert specs
     compact_fanouts = {
         spec.requested_splits for spec in specs if spec.config.uses_compact_split_grid
@@ -6892,7 +6905,7 @@ def test_attention_ts_decode_split_workspace_is_plan_invariant(monkeypatch) -> N
     assert len(compact_fanouts) > 1
 
     layouts = [
-        decode_module._make_decode_workspace_layout(
+        decode_launch.make_decode_workspace_layout(
             spec.scratch_shapes,
             torch.float16,
             use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
@@ -6904,7 +6917,7 @@ def test_attention_ts_decode_split_workspace_is_plan_invariant(monkeypatch) -> N
     buffer = torch.zeros(
         max(layout.total_bytes for layout in layouts), dtype=torch.uint8
     )
-    views = [decode_module._bind_decode_workspace(buffer, layout) for layout in layouts]
+    views = [decode_launch.bind_decode_workspace(buffer, layout) for layout in layouts]
     assert len({view.split_kv_counter.data_ptr() for view in views}) == 1
     state_begin = min(
         tensor.data_ptr()
@@ -6978,14 +6991,14 @@ def test_attention_ts_decode_plans_share_one_zeroed_workspace():
             )
         expected = private.run(query, (k, v), lengths, table)
         plans.append((shared, (query, (k, v), lengths, table), expected))
-    assert len({dict(plan[0]._policy)["splits_kv"] for plan in plans}) > 1
+    assert len({dict(plan[0].policy)["splits_kv"] for plan in plans}) > 1
 
     for index in (0, 1, 0, 2, 3, 2, 1, 3, 0):
         shared, args, expected = plans[index]
         assert torch.equal(shared.run(*args), expected)
     torch.cuda.synchronize()
     for shared, _, _ in plans:
-        assert not torch.any(shared._plan_state.workspace.split_kv_counter)
+        assert not torch.any(shared.plan_state.workspace.split_kv_counter)
 
 
 def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
@@ -6993,15 +7006,13 @@ def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
 ) -> None:
     """Keep explicit KV materialization independent of the SQ1 Q policy."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_select_auto_launch_mode",
+    _patch_decode_config(
+        monkeypatch,
+        "select_auto_launch_mode",
         lambda **_kwargs: "static",
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 148 // cluster_size,
     )
@@ -7021,8 +7032,8 @@ def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
         mask_type="dense",
         auto_tuner=True,
     )
-    implicit = fmha_decode_config.make_decode_config(**common)
-    explicit = fmha_decode_config.make_decode_config(
+    implicit = decode_selection.make_decode_config(**common)
+    explicit = decode_selection.make_decode_config(
         **common,
         args={"tile_size_kv": 128},
     )
@@ -7110,11 +7121,11 @@ def test_attention_ts_decode_effective_mma_precision(
 ):
     """KV storage width must not select transformed MMA or P precision."""
     from cutlass.experimental import primitives as prims
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_common import (
-        _mma_k_step_pv,
-        _mma_k_step_qk,
-        _mma_kind_for_pv,
-        _mma_kind_for_qk,
+    from flashinfer.attention.prims_ts.variants.decode.kernel.device.mma_kinds import (
+        mma_k_step_pv,
+        mma_k_step_qk,
+        mma_kind_for_pv,
+        mma_kind_for_qk,
     )
 
     cfg = FmhaDecodeConfig(
@@ -7128,12 +7139,12 @@ def test_attention_ts_decode_effective_mma_precision(
     )
     assert cfg.qk_dtype == q_dtype
     assert cfg.pv_dtype == pv_dtype
-    assert _mma_k_step_qk(cfg) == qk_step
-    assert _mma_k_step_pv(cfg) == pv_step
-    assert _mma_kind_for_qk(cfg) == (
+    assert mma_k_step_qk(cfg) == qk_step
+    assert mma_k_step_pv(cfg) == pv_step
+    assert mma_kind_for_qk(cfg) == (
         prims.Tcgen05MMAKind.F8F6F4 if qk_step == 32 else prims.Tcgen05MMAKind.F16
     )
-    assert _mma_kind_for_pv(cfg) == (
+    assert mma_kind_for_pv(cfg) == (
         prims.Tcgen05MMAKind.F8F6F4 if pv_step == 32 else prims.Tcgen05MMAKind.F16
     )
     assert cfg.smem_p_tile_bytes == p_bytes
@@ -7329,7 +7340,7 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
         )
     )
 
-    original_make_decode_config = fmha_decode_config.make_decode_config
+    original_make_decode_config = decode_selection.make_decode_config
     explicit_profile = {
         "use_keeps_mma_ab": use_keeps_mma_ab,
         "tile_size_q": tile_size_q,
@@ -7344,14 +7355,14 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
         )
         return original_make_decode_config(*args, **kwargs)
 
-    monkeypatch.setattr(fmha_decode_config, "make_decode_config", _make_explicit_config)
-    _resolve_decode_launch_spec.cache_clear()
-    _get_compiled_decode.cache_clear()
+    _patch_decode_config(monkeypatch, "make_decode_config", _make_explicit_config)
+    resolve_decode_launch_spec.cache_clear()
+    get_compiled_decode.cache_clear()
     try:
         _exercise_auto_case(case, exercise_all_paths=True)
     finally:
-        _resolve_decode_launch_spec.cache_clear()
-        _get_compiled_decode.cache_clear()
+        resolve_decode_launch_spec.cache_clear()
+        get_compiled_decode.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -7384,8 +7395,8 @@ def test_attention_ts_decode_mixed_kv_dtype_auto_selects_mma_layout(
 
     from contextlib import nullcontext
 
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 148 // cluster_size,
     )
@@ -7396,9 +7407,9 @@ def test_attention_ts_decode_mixed_kv_dtype_auto_selects_mma_layout(
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
-    _resolve_decode_launch_spec.cache_clear()
+    resolve_decode_launch_spec.cache_clear()
     try:
-        spec = _resolve_decode_launch_spec(
+        spec = resolve_decode_launch_spec(
             0,
             batch_size,
             32,
@@ -7417,7 +7428,7 @@ def test_attention_ts_decode_mixed_kv_dtype_auto_selects_mma_layout(
             -1,
         )
     finally:
-        _resolve_decode_launch_spec.cache_clear()
+        resolve_decode_launch_spec.cache_clear()
 
     assert spec.config.use_keeps_mma_ab is expected_use_keeps_mma_ab
     assert spec.config.tile_size_q == expected_tile_size_q
@@ -7469,12 +7480,10 @@ def test_attention_ts_decode_q_cost_uses_kv128_with_explicit_kv256(
 ) -> None:
     """Keep explicit KV materialization downstream of the TileQ cost model."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
     q_cost_kv_tiles = []
     selected_q_candidates = []
-    original_make_q_recipe = fmha_decode_config.make_grouped_q_launch_candidate
-    original_kv_promoter = fmha_decode_config._try_apply_auto_kv256_profile
+    original_make_q_recipe = decode_selection.make_grouped_q_launch_candidate
+    original_kv_promoter = decode_selection.try_apply_auto_kv256_profile
 
     def _record_q_cost_kv_tile(*args, **kwargs):
         q_cost_kv_tiles.append(kwargs["tile_size_kv"])
@@ -7484,14 +7493,14 @@ def test_attention_ts_decode_q_cost_uses_kv128_with_explicit_kv256(
         selected_q_candidates.append(q_candidate)
         return original_kv_promoter(*args, q_candidate=q_candidate, **kwargs)
 
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "make_grouped_q_launch_candidate",
         _record_q_cost_kv_tile,
     )
-    monkeypatch.setattr(
-        fmha_decode_config,
-        "_try_apply_auto_kv256_profile",
+    _patch_decode_config(
+        monkeypatch,
+        "try_apply_auto_kv256_profile",
         _record_q_winner,
     )
 
@@ -7532,7 +7541,9 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
     """Packed-Q and sliding-window grids persist only above one CTA wave."""
 
     from cutlass import BFloat16
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+    from flashinfer.attention.prims_ts.variants.decode.kernel import (
+        config as fmha_decode_config,
+    )
 
     class _FourSmHardware:
         def get_device_multiprocessor_count(self) -> int:
@@ -7544,8 +7555,8 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
     # Pin Q8/KV128 so this tests launch-mode persistence at a fixed Q grid.
     # Joint grouped-Q selection has its own occupancy search.
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 4 // cluster_size,
     )
@@ -7571,9 +7582,9 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
         attention_window_size=128 if sliding_window else 0,
         auto_tuner=True,
     )
-    one_wave = fmha_decode_config.make_decode_config(batch_size=1, **common)
+    one_wave = decode_selection.make_decode_config(batch_size=1, **common)
     # Five requests exceed four SMs even if a wider tile groups all Q rows.
-    multi_wave = fmha_decode_config.make_decode_config(batch_size=5, **common)
+    multi_wave = decode_selection.make_decode_config(batch_size=5, **common)
 
     assert one_wave.use_persistent_scheduler is False
     assert multi_wave.use_persistent_scheduler is True
@@ -7740,7 +7751,7 @@ def _check_window_grouped_graph_live_metadata(
         window_left=window_left,
         split_kv=False,
     )
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     reference_kwargs = dict(
         num_insts_kv=int(policy["num_insts_kv"]),
         q_tokens_per_cta=(
@@ -7836,7 +7847,7 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
         _plan_case(case, max_kv_len=256, dynamic_kv=False)
 
     wrapper = _plan_case(case, max_kv_len=257)
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     assert policy["use_persistent_scheduler"] is True
     assert policy["kv_lengths_mode"] == "dynamic"
 
@@ -7902,7 +7913,7 @@ def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(kv_len: int):
         seed=31103,
     )
     wrapper = _plan_case(case, max_kv_len=kv_len)
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     assert policy["tile_size_q"] == 8
     assert policy["groups_tokens_heads_q"] is True
     assert policy["use_persistent_scheduler"] is False
@@ -8163,7 +8174,7 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
         qo_indptr=qo_indptr,
         max_q_len=max_q_len,
     )
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     assert policy["packed_query"] is True
     assert policy["max_q_len"] == max_q_len
     assert policy["window_left"] == 127
@@ -8402,8 +8413,8 @@ def test_attention_ts_decode_compact_variable_k_acceptance(
     assert bool((seq_lens_kv[1:] % page_size != 0).all().item())
 
     wrapper = _plan_case(case, max_kv_len=max(case_kwargs["kv_lens"]))
-    policy = dict(wrapper._policy)
-    assert policy["splits_kv"] == wrapper._plan_state.requested_splits
+    policy = dict(wrapper.policy)
+    assert policy["splits_kv"] == wrapper.plan_state.requested_splits
     _assert_auto_policy(policy, expected_policy, device=case.q.device)
 
     _exercise_public_paths(
@@ -8485,11 +8496,9 @@ def test_attention_ts_decode_q64_kv256_split_launch(
 ) -> None:
     """Exercise KV256 split-KV across distinct reducers and fanout shapes."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-
     if forced_mode is not None:
-        monkeypatch.setattr(
-            fmha_decode_config,
+        _patch_decode_config(
+            monkeypatch,
             "select_split_kv_modes",
             lambda **_kwargs: (forced_mode,),
         )
@@ -8768,8 +8777,8 @@ def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
         _assert_case_correct(output, case)
         wrappers.append(wrapper)
 
-    first_state = wrappers[0]._require_plan_state()
-    second_state = wrappers[1]._require_plan_state()
+    first_state = wrappers[0].require_plan_state()
+    second_state = wrappers[1].require_plan_state()
     assert first_state.compiled_main is second_state.compiled_main
     assert first_state.compiled_reducer is second_state.compiled_reducer
 
@@ -8814,7 +8823,7 @@ def test_attention_ts_decode_head_dim_gqa_product(
     assert bool((seq_lens_kv % page_size != 0).all().item())
 
     wrapper = _plan_case(case, max_kv_len=max_kv_len)
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     _assert_auto_policy(policy, {}, device=case.q.device)
     if policy["groups_tokens_heads_q"]:
         assert int(policy["tile_size_q"]) >= num_qo_heads_per_kv
@@ -9632,10 +9641,10 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
         )
 
     run()
-    prepared = wrapper._prepared_plan
-    assert (prepared._attention_plan._compiled_reducer is not None) == split_kv
+    prepared = wrapper.prepared_plan
+    assert (prepared.attention_plan.compiled_reducer is not None) == split_kv
     if not shared:
-        lengths = prepared._metadata_plan.seq_lens.view(batch, hkv)
+        lengths = prepared.metadata_plan.seq_lens.view(batch, hkv)
         assert bool(torch.all(lengths[:, 1] > lengths[:, 0]))
     check()
     graph = torch.cuda.CUDAGraph()
@@ -9655,7 +9664,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
 )
 @pytest.mark.parametrize("shared", (False, True))
 def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
-    from flashinfer.attention.prims_ts.block_sparse import (
+    from flashinfer.attention.prims_ts.variants.block_sparse import (
         BlockSparseTSWrapper,
         BlockSparsePagedTSWrapper,
         block_sparse_attention,
@@ -9801,7 +9810,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
 @pytest.mark.parametrize("dtype", (torch.bfloat16,))
 def test_dense_encoded_eight_token_fragments(dtype):
     """The common paged loader also accepts eight-token encoded fragments."""
-    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+    from flashinfer.attention.prims_ts.variants.decode import BatchDecodePagedTSWrapper
     from flashinfer.fi_trace import fi_trace
 
     torch.manual_seed(4173)
@@ -9988,7 +9997,7 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
 
         output = run()
         check(output, case)
-        assert wrapper._plan_state.workspace_buffer.data_ptr() == workspace.data_ptr()
+        assert wrapper.plan_state.workspace_buffer.data_ptr() == workspace.data_ptr()
     out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -10135,11 +10144,11 @@ def test_attention_ts_decode_final_statistics(
         )
 
     out, lse = run(return_lse=True)
-    state = wrapper._plan_state
+    state = wrapper.plan_state
     counts = (1, state.config.splits_kv, 2) if state.config.use_split_kv else (1,)
     for count in counts:
         if state.config.use_split_kv:
-            wrapper._plan_state = replace(state, requested_splits=count)
+            wrapper.plan_state = replace(state, requested_splits=count)
         run(out=out, lse=lse)
         torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.05)
         torch.testing.assert_close(lse, expected, atol=0.015, rtol=0.002)
@@ -10213,7 +10222,7 @@ def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
         use_attention_sinks=True,
         split_kv=False,
     )
-    assert dict(wrapper._policy)["use_persistent_scheduler"] is True
+    assert dict(wrapper.policy)["use_persistent_scheduler"] is True
 
     # Tasks without skip_if still visit these tiles; they must not wait on the
     # sink barrier that the skipping tasks never reach.
@@ -10334,7 +10343,7 @@ def test_attention_ts_decode_paged_keeps_partial_query_groups(
             mask_type="causal",
         ),
     )
-    original = fmha_decode_config.make_decode_config
+    original = decode_selection.make_decode_config
 
     def configured(*args, **kwargs):
         profile = dict(
@@ -10355,14 +10364,14 @@ def test_attention_ts_decode_paged_keeps_partial_query_groups(
         )
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
-    _resolve_decode_launch_spec.cache_clear()
-    _get_compiled_decode.cache_clear()
+    _patch_decode_config(monkeypatch, "make_decode_config", configured)
+    resolve_decode_launch_spec.cache_clear()
+    get_compiled_decode.cache_clear()
     try:
         _exercise_auto_case(case, exercise_all_paths=True, dynamic_kv=True)
     finally:
-        _resolve_decode_launch_spec.cache_clear()
-        _get_compiled_decode.cache_clear()
+        resolve_decode_launch_spec.cache_clear()
+        get_compiled_decode.cache_clear()
 
 
 @pytest.mark.parametrize("kv_len", (8193, 163840, 1048576))
@@ -10425,7 +10434,7 @@ def test_attention_ts_decode_fp8_speculative_runtime_reduction(out_dtype):
 @_REQUIRES_PRIMTS_GPU
 def test_decode_global_scales_graph_and_prepared(monkeypatch):
     """Device scales stay live through the standalone reducer and prepared API."""
-    original = fmha_decode_config.make_decode_config
+    original = decode_selection.make_decode_config
 
     def configured(*args, **kwargs):
         profile = dict(
@@ -10443,8 +10452,8 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
         )
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
-    _resolve_decode_launch_spec.cache_clear()
+    _patch_decode_config(monkeypatch, "make_decode_config", configured)
+    resolve_decode_launch_spec.cache_clear()
     try:
         generator = torch.Generator(device="cuda").manual_seed(81)
         dtype = torch.bfloat16
@@ -10477,7 +10486,7 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
             out_dtype=out.dtype,
             **scales,
         )
-        assert wrapper._plan_state.config.use_separate_reduction_kernel
+        assert wrapper.plan_state.config.use_separate_reduction_kernel
         args = (q, (k, v), lengths, table)
 
         def check(sm, output):
@@ -10496,7 +10505,7 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
             scale.mul_(1.5)
         graph.replay()
         check(0.1875, 1.125)
-        workspace = wrapper._plan_state.workspace_buffer
+        workspace = wrapper.plan_state.workspace_buffer
         batch_decode_with_paged_kv_cache(
             q,
             (k, v),
@@ -10527,7 +10536,7 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
         prepared_graph.replay()
         check(0.09375, 0.5625)
     finally:
-        _resolve_decode_launch_spec.cache_clear()
+        resolve_decode_launch_spec.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -10601,10 +10610,8 @@ def _resolve_d512_decode_policy(
     """Resolve the automatic D512 launch spec on a mocked 148-SM SM100 device."""
     from contextlib import nullcontext
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-
-    monkeypatch.setattr(
-        fmha_decode_config,
+    _patch_decode_config(
+        monkeypatch,
         "get_max_active_clusters_for_cluster_size",
         lambda cluster_size: 148 // cluster_size,
     )
@@ -10617,10 +10624,10 @@ def _resolve_d512_decode_policy(
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
     # Split plans clamp the fanout to the device SM count.
-    monkeypatch.setattr(decode_module, "get_device_sm_count", lambda _device: 148)
-    decode_module._resolve_decode_launch_spec.cache_clear()
+    _patch_decode(monkeypatch, "get_device_sm_count", lambda _device: 148)
+    decode_launch.resolve_decode_launch_spec.cache_clear()
     try:
-        spec = decode_module._resolve_decode_launch_spec(
+        spec = decode_launch.resolve_decode_launch_spec(
             0,
             batch_size,
             num_heads_q,
@@ -10640,7 +10647,7 @@ def _resolve_d512_decode_policy(
         )
         return spec if return_spec else spec.config
     finally:
-        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_launch.resolve_decode_launch_spec.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -10763,14 +10770,14 @@ def test_attention_ts_decode_d512_fp8_kv_grouped_keeps(
         seed=9602,
     )
     wrapper = _plan_case(case, max_kv_len=max(kv_lens), lse_mode="base2")
-    policy = dict(wrapper._policy)
+    policy = dict(wrapper.policy)
     assert policy["mma_variant"] == "keeps_mma_ab"
     assert int(policy["tile_size_q"]) == 64
     # The FP8 oracle models P quantization per split and per K/V instance
     # stream, so build it from the planned partition.
     case = _with_reference(
         case,
-        splits_kv=wrapper._plan_state.requested_splits,
+        splits_kv=wrapper.plan_state.requested_splits,
         num_insts_kv=int(policy["num_insts_kv"]),
         q_tokens_per_cta=int(policy["tile_size_q"]) // 8,
     )
@@ -10923,7 +10930,6 @@ def test_attention_ts_decode_large_tile_size_q(
     use_keeps_mma_ab: bool,
 ) -> None:
     """Q48/Q64/Q128 NVFP4 tiles preserve every row through tails and split merge."""
-    from flashinfer.attention.prims_ts import decode as decode_module
 
     def make_config():
         return make_decode_config(
@@ -10958,7 +10964,7 @@ def test_attention_ts_decode_large_tile_size_q(
             make_config()
         return
     cfg = make_config()
-    spec = decode_module._decode_launch_spec_from_config(
+    spec = decode_launch.decode_launch_spec_from_config(
         cfg,
         batch_size=2,
         num_qo_heads=heads_q_per_kv,
@@ -10969,8 +10975,8 @@ def test_attention_ts_decode_large_tile_size_q(
             1
         ),
     )
-    monkeypatch.setattr(
-        decode_module, "_resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
+    _patch_decode(
+        monkeypatch, "resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
     )
     case, scale_factors = _make_mixed_precision_decode_case(
         batch_size=2,
@@ -11105,7 +11111,7 @@ def test_attention_ts_decode_nvfp4_d512_even_odd_order_opt_in(
 def test_attention_ts_decode_large_grouped_nvfp4_grid(queries: int, page: int):
     """Padded Q1 and large grouped grids share public workspace and graph paths."""
     batch, heads_q, heads_kv, dim, context = 64, 32, 4, 256, 2048
-    spec = _resolve_decode_launch_spec(
+    spec = resolve_decode_launch_spec(
         torch.cuda.current_device(),
         batch,
         heads_q,
