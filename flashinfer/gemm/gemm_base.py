@@ -3932,6 +3932,20 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
+def _fp4_gemm_stream_k_flag_set() -> bool:
+    """Whether FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 is set (read on every call)."""
+    return os.environ.get("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "0") == "1"
+
+
+@functools.cache
+def _fp4_unit_alpha(device: torch.device) -> torch.Tensor:
+    """A cached 1.0 for CUTLASS FP4 GEMM calls without alpha."""
+    one = torch.ones(1, dtype=torch.float32, device=device)
+    # Wait for the fill once, so a call on another stream never reads it early.
+    torch.cuda.current_stream(device).synchronize()
+    return one
+
+
 def _create_cutlass_fp4_gemm_module(
     module: Any,
     op_name: str,
@@ -3951,10 +3965,7 @@ def _create_cutlass_fp4_gemm_module(
         # can differ in the last bits from the data-parallel tactics. When the
         # autotuner picks by timing, the output then depends on which tactic won;
         # this option limits the choice to data-parallel tactics.
-        return (
-            is_stream_k_tactic is not None
-            and os.environ.get("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "0") == "1"
-        )
+        return is_stream_k_tactic is not None and _fp4_gemm_stream_k_flag_set()
 
     def cutlass_fp4_gemm_runner():
         class CutlassFp4GemmRunner(TunableRunner):
@@ -4021,6 +4032,17 @@ def _create_cutlass_fp4_gemm_module(
                     a_descale = a_descale.view(torch.uint8)
                 if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
                     b_descale = b_descale.view(torch.uint8)
+                if alpha is None:
+                    # alpha is optional in mm_fp4, but the C++ op needs a tensor. The
+                    # cached 1.0 cannot be created during CUDA graph capture: its
+                    # synchronize is not allowed there, and its fill would run only
+                    # when that graph replays. So each capture fills its own.
+                    with torch.cuda.device(a.device):
+                        capturing = torch.cuda.is_current_stream_capturing()
+                    if capturing:
+                        alpha = torch.ones(1, dtype=torch.float32, device=a.device)
+                    else:
+                        alpha = _fp4_unit_alpha(a.device)
                 module.fp4_gemm(
                     a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer, tactic
                 )
@@ -11130,7 +11152,7 @@ def _heuristic_func_mm_fp4(
     batch_invariant: bool = False,
 ):
     r"""
-    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
+    Heuristic function for mm_fp4 backend selection: orders the suitable backends for auto.
     Note: trtllm is not considered in the backend selection because it requires a specific
     input quantization (swizzling/shuffling) that differs from the preparation used
     for cudnn and cutlass backends.
@@ -11141,6 +11163,9 @@ def _heuristic_func_mm_fp4(
     - If cuda version is 13 and cudnn version is 9.15 or greater:
       - On SM103 (B300) - use cutlass (faster based on benchmarks).
       - On SM100 (B200) - use cudnn (faster based on benchmarks).
+    - On SM12x with FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1, cutlass alone whenever it
+      is suitable. The batch-invariant and per-token alpha rules are checked first,
+      so they still decide those calls; every rule below comes after this one.
 
     A per-token alpha overrides all of the above: of the stable backends only the
     CuTe-DSL SM100 kernel has a per-row alpha epilogue, and any other backend
@@ -11184,6 +11209,15 @@ def _heuristic_func_mm_fp4(
         if use_nvfp4
         else cuda_version.major >= 13
     )
+    # FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 limits CUTLASS to data-parallel
+    # tactics (no stream-K split of K), so its output does not depend on which
+    # tactic the autotuner picks. The flag does not cover b12x or cuDNN, whose
+    # results can differ from CUTLASS in the last bits. So on SM12x with the flag
+    # set, auto offers CUTLASS alone when CUTLASS is among the suitable backends.
+    # If it is not (MXFP4, use_8x4_sf_layout=True, or a non-contiguous out),
+    # auto chooses as it does without the flag.
+    if major == 12 and _fp4_gemm_stream_k_flag_set() and "cutlass" in suitable_backends:
+        return ["cutlass"]
     if is_sm120 and b12x_cuda_supported:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
@@ -11468,7 +11502,9 @@ def mm_fp4(
     alpha: Optional[torch.Tensor]
         Global scale tensor, float scalar, or a float32 tensor of ``m``
         elements holding one dequant scale per row of ``a`` (activations
-        quantized with a dynamic per-token NVFP4 global scale). The per-token
+        quantized with a dynamic per-token NVFP4 global scale). ``None``
+        means 1.0 for the ``"cutlass"``, ``"cudnn"``, ``"b12x"`` and
+        ``"cute-dsl"`` backends. The per-token
         form is implemented by the ``"cute-dsl"`` backend on SM100/SM103
         (``backend="auto"`` selects it) and by the experimental ``"cake"``
         backend (explicit opt-in, or a tuned ``"auto"`` candidate; see
@@ -11488,7 +11524,10 @@ def mm_fp4(
 
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "cake", "auto"]
         Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
-        ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
+        ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. With
+        ``FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1`` on SM12x (SM120, SM121),
+        ``"auto"`` offers only ``"cutlass"`` when CUTLASS can run the call, and
+        otherwise chooses as it does without the flag. On other
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
         based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
         ``"cute-dsl"`` backends are never auto-selected because they require

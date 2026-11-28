@@ -956,6 +956,136 @@ def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
         )
 
 
+def test_mm_fp4_auto_sm12x_disable_stream_k_matches_cutlass(monkeypatch):
+    # Regression anchor for an env flag, which the fuzzer cannot express. With
+    # FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 on SM12x, mm_fp4(backend="auto") must
+    # give the autotuner the same runners as backend="cutlass", so b12x and cuDNN
+    # cannot win a tuning run.
+    from flashinfer.autotuner import AutoTuner
+
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("The flag narrows auto on SM12x only.")
+    m, n, k = 16, 4096, 4096
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    offered = []
+    choose_one = AutoTuner.choose_one
+
+    def spy(self, custom_op, runners, *args, **kwargs):
+        offered.append([type(r).__name__ for r in runners])
+        return choose_one(self, custom_op, runners, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", spy)
+
+    def run(backend):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        mm_fp4(a_fp4, b_fp4.T, a_s, b_s.T, alpha, torch.bfloat16, out, backend=backend)
+        torch.cuda.synchronize()
+        return out, offered.pop()
+
+    _, cutlass_runners = run("cutlass")
+    if run("auto")[1] == cutlass_runners:
+        pytest.skip("Without the flag, auto already offers CUTLASS alone on this host.")
+    monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "1")
+    out_auto, auto_runners = run("auto")
+    out_cutlass, cutlass_runners = run("cutlass")
+    assert auto_runners == cutlass_runners
+    # Untuned, both run the CUTLASS default tactic, so the bits must match.
+    assert torch.equal(out_auto, out_cutlass)
+
+
+def test_mm_fp4_cutlass_without_alpha(monkeypatch):
+    # Regression anchor: alpha is optional for mm_fp4, but the CUTLASS C++ op
+    # needs a tensor and raised a TypeError on None. With the stream-K flag, auto
+    # on SM12x offers CUTLASS alone, so the call must work through auto as well.
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported("cutlass", major * 10 + minor):
+        pytest.skip("No CUTLASS FP4 GEMM on this GPU.")
+    m, n, k = 16, 4096, 4096
+    _, _, a_fp4, a_s, b_fp4, b_s, _ = _nvfp4_operands(m, n, k)
+    one = torch.ones(1, device="cuda", dtype=torch.float32)
+    # Every call runs with the flag, so a stream-K tactic tuned earlier in the
+    # session cannot make the reference differ from the calls without alpha.
+    monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "1")
+
+    def run(alpha, backend):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        mm_fp4(a_fp4, b_fp4.T, a_s, b_s.T, alpha, torch.bfloat16, out, backend=backend)
+        torch.cuda.synchronize()
+        return out
+
+    ref = run(one, "cutlass")
+    assert torch.equal(run(None, "cutlass"), ref)
+    if is_sm12x_supported(torch.device("cuda")):
+        assert torch.equal(run(None, "auto"), ref)
+
+
+def test_mm_fp4_cutlass_without_alpha_in_cuda_graph(monkeypatch):
+    # Regression anchor for alpha=None under CUDA graphs, which the fuzzer cannot
+    # express. With the unit-alpha cache empty, each captured call must fill its
+    # own 1.0. Creating the cached one during capture would fail on its
+    # synchronize, and its fill would belong to that graph alone.
+    from flashinfer.gemm import gemm_base
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported("cutlass", major * 10 + minor):
+        pytest.skip("No CUTLASS FP4 GEMM on this GPU.")
+    m, n, k = 16, 4096, 4096
+    _, _, a_fp4, a_s, b_fp4, b_s, _ = _nvfp4_operands(m, n, k)
+    one = torch.ones(1, device="cuda", dtype=torch.float32)
+    # With the flag, a stream-K tactic tuned earlier cannot change the reference.
+    monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "1")
+    ref = mm_fp4(a_fp4, b_fp4.T, a_s, b_s.T, one, torch.bfloat16, backend="cutlass")
+    gemm_base._fp4_unit_alpha.cache_clear()
+    outs, graphs = [], []
+    for _ in range(2):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            mm_fp4(
+                a_fp4, b_fp4.T, a_s, b_s.T, None, torch.bfloat16, out, backend="cutlass"
+            )
+        outs.append(out)
+        graphs.append(graph)
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize()
+    assert torch.equal(outs[1], ref) and torch.equal(outs[0], ref)
+
+
+def test_mm_fp4_cutlass_without_alpha_on_two_streams(monkeypatch):
+    # Regression anchor: the cached 1.0 is created on one stream and read on
+    # another. Stream A is held busy, so without a wait at creation the call on
+    # stream B would read the 1.0 before A has filled it.
+    from flashinfer.gemm import gemm_base
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported("cutlass", major * 10 + minor):
+        pytest.skip("No CUTLASS FP4 GEMM on this GPU.")
+    m, n, k = 16, 4096, 4096
+    _, _, a_fp4, a_s, b_fp4, b_s, _ = _nvfp4_operands(m, n, k)
+    one = torch.ones(1, device="cuda", dtype=torch.float32)
+    monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "1")
+    ref = mm_fp4(a_fp4, b_fp4.T, a_s, b_s.T, one, torch.bfloat16, backend="cutlass")
+    gemm_base._fp4_unit_alpha.cache_clear()
+    torch.cuda.synchronize()
+    stream_a, stream_b = torch.cuda.Stream(), torch.cuda.Stream()
+    out_a = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    out_b = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with torch.cuda.stream(stream_a):
+        # torch.cuda._sleep is private, but it is how PyTorch's own stream tests
+        # keep a stream busy; it delays the fill on stream A.
+        torch.cuda._sleep(200_000_000)
+        mm_fp4(
+            a_fp4, b_fp4.T, a_s, b_s.T, None, torch.bfloat16, out_a, backend="cutlass"
+        )
+    with torch.cuda.stream(stream_b):
+        mm_fp4(
+            a_fp4, b_fp4.T, a_s, b_s.T, None, torch.bfloat16, out_b, backend="cutlass"
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(out_b, ref) and torch.equal(out_a, ref)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
 
