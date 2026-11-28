@@ -26,6 +26,7 @@ from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import (
     CakeStepFunRunner,
     CuteDslRunner,
+    FireflyNvfp4Runner,
     MoERunner,
     PrimsTsRunner,
     TrtllmFp4RoutedRunner,
@@ -39,6 +40,7 @@ _PER_TOKEN_RUNNERS = {
     BatchInvariantFp4Runner,
     CakeStepFunRunner,
     CuteDslRunner,
+    FireflyNvfp4Runner,
     PrimsTsRunner,
     TrtllmFp4RoutedRunner,
 }

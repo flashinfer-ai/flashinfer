@@ -2724,6 +2724,80 @@ class CuteDslConfig:
 
 
 @dataclass(frozen=True)
+class FireflyNvfp4Config:
+    """Firefly: NVFP4×NVFP4 routed MoE on SM100 / SM103 in CuTe DSL
+    (experimental backend :mod:`flashinfer.experimental.firefly`).
+
+    Pre-routed packs only (``PackedPrecomputed`` or ``UnpackedPrecomputed``;
+    ids outside this rank's experts, negative ids included, are skipped):
+    ``uint8 [M, H/2]`` values and linear ``float8_e4m3fn [M, H/16]`` block
+    scales, with ``float32 [M]`` per-token scales under
+    ``QuantConfig(per_token_scale=True)``, or a unit global scale under
+    ``per_token_scale=False`` / ``None`` (per-tensor: fold a calibrated
+    activation scale into the view's ``w1_gs``, as into other backends'
+    ``w1_alpha``); BF16 output, ``do_finalize=True`` (fused or not). Activations:
+    SwiGLU (alpha, beta, limit), SwiGLUStep, GeGLU, GeGLUTanh, SiTU without
+    ``clamp_limit``, ReLU2. Expert parallelism; no NVFP4 4over6 recipe.
+    Shapes: H % 256 == 0, I % 128 == 0, 1 <= top_k <= min(E, 32), E <= 1024.
+    Each token's ``topk_ids`` must name distinct experts, as a top-k selection
+    does (not checked: repeated ids cause no out-of-bounds access, but their
+    result is unspecified).
+    The GEMM2 input is quantized with block scales only (no per-token scale),
+    except on the per-token direct path, where it also gets one: M <= 4 with a
+    gated activation, I = 512 or 768 and H >= 512.
+
+    The weight view differs from ``cute_dsl``'s: build it with
+    :meth:`prepare_weights` and register it under ``"firefly_nvfp4"``. Never
+    part of the default backend list; opting in is listing
+    ``FireflyNvfp4Config()`` among the candidates (warns once as an
+    experimental backend).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        # datacenter Blackwell with tcgen05 (firefly.moe.SUPPORTED_ARCHS)
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+    ):
+        """Build the ``firefly_nvfp4`` weight view from canonical BF16 weights.
+
+        ``w1_bf16`` is ``[E, 2I, H]`` with the rows [up, gate] for a gated
+        activation (``[E, I, H]`` for ReLU2), ``w2_bf16`` ``[E, H, I]``; the
+        same arguments as :meth:`CuteDslConfig.prepare_weights` (``nvfp4_4over6``
+        must resolve to ``None``). One global scale per expert from its amax.
+        Register the result with ``MoEWeightPack.prepare_for("firefly_nvfp4", ...)``.
+        """
+        from ..experimental.firefly.weights import prepare_view
+
+        return prepare_view(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            nvfp4_4over6=nvfp4_4over6,
+        )
+
+    def __repr__(self) -> str:
+        return "FireflyNvfp4Config()"
+
+
+@dataclass(frozen=True)
 class SM12xFp8Config:
     """SM120/SM121 CuTe-DSL DeepSeek FP8 backend."""
 
@@ -3818,6 +3892,7 @@ BackendConfigType = Union[
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    FireflyNvfp4Config,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
@@ -3866,6 +3941,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    FireflyNvfp4Config,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
