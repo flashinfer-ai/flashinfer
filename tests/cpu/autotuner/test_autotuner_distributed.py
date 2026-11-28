@@ -450,6 +450,8 @@ def test_preparation_memory_error_falls_back_on_every_rank(tmp_path, failure_pha
                 GLOO_STORE_FILE=store_file,
                 FAILURE_PHASE=failure_phase,
                 TORCH_DISTRIBUTED_DEBUG="DETAIL",
+                # Lockstep: every rank prepares every runner.
+                FLASHINFER_AUTOTUNE_SPLIT="0",
             )
             procs.append(
                 subprocess.Popen(
@@ -889,6 +891,8 @@ def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
                 WORLD_SIZE=str(world_size),
                 CASE_ROOT=str(tmp_path),
                 TORCH_DISTRIBUTED_DEBUG="DETAIL",
+                # These workers count lockstep profiling calls.
+                FLASHINFER_AUTOTUNE_SPLIT="0",
             )
             processes.append(
                 subprocess.Popen(
@@ -903,6 +907,195 @@ def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
             output, _ = process.communicate(timeout=max(0, deadline - time.monotonic()))
             assert process.returncode == 0, output
             assert "cache agreement OK" in output
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for process in processes:
+            process.communicate()
+
+
+@pytest.mark.cpu_only
+def test_split_deal_is_deterministic_balanced_and_sticky():
+    """Each rank gets ``ceil(pairs / world)`` at most, the same in every
+    process, and a tactic keeps its rank when the tactic list shrinks."""
+    from flashinfer.autotuner.autotuner import _deal_tactics
+
+    class Runner:
+        pass
+
+    tactics = [(tile, stages) for tile in (64, 128, 256) for stages in range(7)]
+    for world in (2, 3, 4, 8):
+        load = [0] * world
+        owners = _deal_tactics(Runner(), tactics, load)
+        assert owners == _deal_tactics(Runner(), tactics, [0] * world)
+        assert sorted(load) == sorted(owners.count(r) for r in range(world))
+        assert max(load) == -(-len(tactics) // world)
+        # A second runner fills the remaining capacity of the shape.
+        _deal_tactics(Runner(), tactics[:5], load)
+        assert max(load) == -(-(len(tactics) + 5) // world)
+        # A subset (another shape) keeps most tactics on their rank.
+        subset = tactics[::2]
+        kept = _deal_tactics(Runner(), subset, [0] * world)
+        same = sum(o == owners[2 * i] for i, o in enumerate(kept))
+        assert same >= len(subset) // 2, (world, same)
+
+
+_SPLIT_WORKER_SRC = r"""
+import datetime, os
+import torch
+import torch.distributed as dist
+from flashinfer.autotuner import (AutoTuner, TunableRunner, TuningConfig, autotune,
+                                  get_autotune_process_group, set_autotune_process_group)
+from flashinfer.autotuner.autotuner import _TuningGroupError
+
+rank = int(os.environ["RANK"])
+world = int(os.environ["WORLD_SIZE"])
+dist.init_process_group("gloo", init_method="file://" + os.environ["STORE"],
+                        rank=rank, world_size=world, timeout=datetime.timedelta(seconds=30))
+torch.cuda.is_current_stream_capturing = lambda: False
+case = ""
+calls = []  # (runner, tactic, reduced over the tune group)
+# B0 is the fastest pair; A1 and B4 tie at 4.0.
+TIMES = {**{("A", t): 3.0 + t for t in range(6)}, **{("B", t): 2.0 + t / 2 for t in range(6)}}
+PAIRS = sorted(TIMES)
+# The 8 fastest (the default finalists), in enumeration order.
+TOP8 = [("A", 0), ("A", 1)] + [("B", t) for t in range(6)]
+
+class A(TunableRunner):
+    def get_valid_tactics(self, inputs, profile):
+        return [0] if case == "mismatch" and rank == 1 else list(range(6))
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        return inputs[0]
+
+class B(A):
+    pass
+
+def profile(self, runner, inputs, tactic, config, **kwargs):
+    # Mirrors _profile_single_kernel: a failure still joins the reduce.
+    pair = (type(runner).__name__, tactic)
+    reduced = get_autotune_process_group() is not None
+    calls.append((*pair, reduced))
+    fail = (case == "failure" and pair == ("A", 3)) or (
+        case == "failure" and pair == ("B", 0) and rank == world - 1)
+    local = float("inf") if fail else TIMES[pair]
+    if case == "bias" and pair == ("B", 0) and not reduced:
+        local += 0.6  # this pair's owner measures it slow
+    if reduced:
+        t = torch.tensor([local], dtype=torch.float64)
+        dist.all_reduce(t, group=get_autotune_process_group())
+        local = t.item() / get_autotune_process_group().size()
+    if fail:
+        raise RuntimeError("simulated tactic failure")
+    return local
+
+AutoTuner._profile_single_kernel = profile
+singles = [dist.new_group([r], backend="gloo") for r in range(world)]
+
+def tune(config=TuningConfig(), **group_kwargs):
+    group = group_kwargs.pop("group", dist.group.WORLD)
+    AutoTuner._instance = AutoTuner()
+    calls.clear()
+    set_autotune_process_group(group, **group_kwargs)
+    runners = [A(), B()]
+    try:
+        with autotune(True):
+            runner, tactic = AutoTuner.get().choose_one("test::split", runners, config, [torch.zeros(8, 8)])
+            count = len(calls)
+            assert AutoTuner.get().choose_one("test::split", runners, config, [torch.zeros(8, 8)]) == (runner, tactic)
+            assert len(calls) == count, "a warm hit profiled again"
+    finally:
+        set_autotune_process_group(None)
+    winners = [None] * world
+    dist.all_gather_object(winners, (type(runner).__name__, tactic))
+    assert len(set(winners)) == 1, winners
+    return winners[0]
+
+def check_split(finalists):
+    local = [(r, t) for r, t, reduced in calls if not reduced]
+    everyone = [None] * world
+    dist.all_gather_object(everyone, local)
+    timed = [p for share in everyone for p in share]
+    assert sorted(timed) == PAIRS, timed  # every pair once, on one rank
+    assert max(map(len, everyone)) == -(-len(PAIRS) // world), everyone
+    reduced = [(r, t) for r, t, red in calls if red]
+    assert reduced == finalists, reduced  # re-timed on every rank, in order
+
+try:
+    for case in ("default", "lockstep", "lockstep_env", "config", "single", "no_group",
+                 "bias", "failure", "mismatch"):
+        os.environ.pop("FLASHINFER_AUTOTUNE_SPLIT", None)
+        if case == "default":
+            assert tune() == ("B", 0)
+            check_split(TOP8)
+        elif case in ("lockstep", "lockstep_env", "config", "single"):
+            kwargs = {"lockstep": {"split": False}, "config": {"config": TuningConfig(split_profiling=False)},
+                      "single": {"group": singles[rank]}}.get(case, {})
+            if case == "lockstep_env":
+                os.environ["FLASHINFER_AUTOTUNE_SPLIT"] = "0"
+            assert tune(**kwargs) == ("B", 0)
+            assert calls == [(*p, True) for p in PAIRS], calls  # exactly lockstep
+        elif case == "no_group":
+            AutoTuner._instance = AutoTuner()
+            calls.clear()
+            with autotune(True):
+                _, tactic = AutoTuner.get().choose_one("test::split", [A(), B()], TuningConfig(), [torch.zeros(8, 8)])
+            assert tactic == 0 and calls == [(*p, False) for p in PAIRS], calls
+        elif case == "bias":
+            # One finalist keeps the merged argmin; more re-time it on every rank.
+            assert tune(split_finalists=1) == ("B", 1)
+            check_split([("B", 1)])
+            assert tune() == ("B", 0)
+            check_split(TOP8)
+        elif case == "failure":
+            # A3 fails where it is timed; B0 fails on the last rank only.
+            assert tune() == ("B", 1)
+        elif case == "mismatch":
+            try:
+                tune()
+            except _TuningGroupError:
+                assert not calls
+            else:
+                raise AssertionError("mismatched candidates must fail on every rank")
+        dist.barrier()
+        print("OK", rank, case, flush=True)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("world_size", [2, 3, 4])
+def test_split_profiling_agrees_and_opts_out(tmp_path, world_size):
+    """Split mode (the default) times each pair on one rank and agrees on the
+    winner; ``split=False``, ``FLASHINFER_AUTOTUNE_SPLIT=0``,
+    ``TuningConfig.split_profiling=False`` and one-rank groups stay lockstep."""
+    processes = []
+    deadline = time.monotonic() + 120
+    try:
+        for rank in range(world_size):
+            env = dict(
+                os.environ,
+                RANK=str(rank),
+                WORLD_SIZE=str(world_size),
+                STORE=str(tmp_path / "rendezvous"),
+            )
+            env.pop("FLASHINFER_AUTOTUNE_SPLIT", None)
+            env.pop("FLASHINFER_AUTOTUNE_SPLIT_FINALISTS", None)
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _SPLIT_WORKER_SRC],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+        for rank, process in enumerate(processes):
+            output, _ = process.communicate(timeout=max(1, deadline - time.monotonic()))
+            assert process.returncode == 0, f"rank {rank}:\n{output}"
+            assert f"OK {rank} mismatch" in output, output
     finally:
         for process in processes:
             if process.poll() is None:
