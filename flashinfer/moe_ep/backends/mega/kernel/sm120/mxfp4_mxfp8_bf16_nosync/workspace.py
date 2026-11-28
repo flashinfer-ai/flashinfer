@@ -44,7 +44,7 @@ def _align(value: int, alignment: int) -> int:
 
 
 def pool_row_bytes(hidden: int) -> int:
-    """An expert-pool row: the MXFP8 token, its UE8M0 scales and the source's (token * 8 + k), padded to 16 bytes."""
+    """One source-token row: MXFP8 values, UE8M0 scales and route metadata."""
     return hidden + _align(hidden // 32 + 4, 16)
 
 
@@ -61,37 +61,39 @@ def buffer_layout(
     [total, x, x_sf, topk_idx, topk_weights, pool, recv_cnt, recv_flag, comb, comb_flag,
     route, route_flag, inter, inter_s, ctr, stage_row, inbox, stage_comb, comb_gin, slotmap,
     stage_slot, cidx]. Every region sits at the same offset on every rank; pool / recv_* /
-    route* are written by the other ranks, comb by the expert ranks, the rest only locally.
-    The last seven regions (empty without NIC pairs) serve GIN, which sends a token once per
+    route* and the P2P slotmap are written by source ranks, comb by expert ranks;
+    the remaining regions are local.
+    P2P sends one row per (source rank, source token); slotmap maps each local
+    (source rank, expert, slot) to the source's (token, k).
+    The remaining GIN regions serve GIN, which sends a token once per
     rank: the token row staged for and received from GIN ranks, the partials staged for and
     received from GIN ranks, the slot tables received from and staged for GIN ranks (both
     packed in the expert rank's (local expert, slot) order), and the packed row of each
     (token, k)."""
     epr = experts // ranks
-    rows = (
-        epr * ranks * capacity
-    )  # an expert pool slot per (local expert, source rank, token)
+    expert_rows = epr * ranks * capacity
     row_bytes = pool_row_bytes(hidden)
+    route_map_ints = experts * capacity
     sizes = (
         capacity * hidden,
         capacity * (hidden // 32),
         capacity * topk * 8,
         capacity * topk * 4,
-        rows * row_bytes,
+        ranks * capacity * row_bytes,
         ranks * epr * 4,
         ranks * 4,
         capacity * topk * hidden * 2,
         ranks * 4,
         2 * ranks * (1 + capacity * topk) * 4,  # two halves, by epoch parity
         ranks * 4,
-        rows * intermediate,
-        rows * (intermediate // 128) * 4,
+        expert_rows * intermediate,
+        expert_rows * (intermediate // 128) * 4,
         COUNTER_INTS * 4,
         capacity * row_bytes if gin else 0,
         ranks * capacity * row_bytes if gin else 0,
         ranks * capacity * topk * hidden * 2 if gin else 0,
         ranks * capacity * topk * hidden * 2 if gin else 0,
-        ranks * capacity * topk * 4 if gin else 0,
+        route_map_ints * 4 + (ranks * capacity * topk * 4 if gin else 0),
         ranks * capacity * topk * 4 if gin else 0,
         capacity * topk * 4 if gin else 0,
     )
@@ -308,6 +310,9 @@ class NosyncWorkspace:
             float(swiglu_limit),
             self.gin,
             tokens_per_item or 0,
+            weights.w13_gate_up_interleaved,
+            weights.scale_layout == "canonical",
+            weights.scale_layout == "deepgemm",
         )
 
     def error(self) -> int:

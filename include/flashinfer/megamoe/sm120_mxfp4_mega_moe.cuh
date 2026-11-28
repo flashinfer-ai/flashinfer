@@ -15,7 +15,7 @@
  */
 // SM120 (RTX PRO 6000 / 6000D class) MXFP4 MegaMoE for decode-size batches over PCIe P2P, one
 // persistent kernel per rank: routing exchange -> dispatch (the staged MXFP8 rows, 16 B P2P stores
-// into the destination expert pool) -> FC1 + clamped SwiGLU (swap-AB W4A8 mma.sync) -> FC2 -> P2P
+// into the per-source token inbox) -> FC1 + clamped SwiGLU (swap-AB W4A8 mma.sync) -> FC2 -> P2P
 // push of each (token, k) partial back to its source rank -> top-k combine. No cross-rank barrier:
 // every source writes an epoch-tagged flag into the consumer's memory (st.release.sys) after its
 // data, the consumer polls its own memory (ld.acquire.sys); there are no remote atomics.
@@ -91,7 +91,7 @@ constexpr size_t kPf0Bytes = size_t(64)
 constexpr int kUnroll = 4;           // K64 steps in flight per warp
 constexpr int kMaxWorld = 8;         // ranks: one PCIe host
 constexpr int kMaxEl = 256;          // local experts per rank
-constexpr int kMaxTopk = 8;          // routes per token (pool metadata packs token * 8 + k)
+constexpr int kMaxTopk = 8;          // routes per token (route metadata packs token * 8 + k)
 constexpr uint64_t kSpinNs =
     30000000000ull;  // spin timeout: startup warm-ups can skew ranks by seconds
 
@@ -120,7 +120,8 @@ constexpr int kSigRoute = 0, kSigDispatch = kMaxWorld, kSigComb = 2 * kMaxWorld,
               kGinSignals = 3 * kMaxWorld;
 
 struct Peers {
-  uint8_t* pool[kMaxWorld];        // [EL][W][TCAP] rows of pool_row_bytes(H)   (dest-owned)
+  uint8_t* pool[kMaxWorld];        // [W][TCAP] P2P token rows of pool_row_bytes(H) (dest-owned)
+  int* p2p_map[kMaxWorld];         // [W][EL][TCAP] source (token * 8 + k)
   int* recv_cnt[kMaxWorld];        // [W][EL]
   int* recv_flag[kMaxWorld];       // [W] epoch
   __nv_bfloat16* comb[kMaxWorld];  // [TCAP][TOPK][H]                    (src-owned)
@@ -154,10 +155,10 @@ struct Args {
   const int64_t* topk_ids;  // [T][TOPK] global expert ids, -1 = masked route
   const float* topk_w;      // [T][TOPK]
   __nv_bfloat16* out;       // [T][H]
-  const uint8_t* l1;        // [EL][2I][H/2] packed E2M1 W13, row-major, gate/up rows interleaved
+  const uint8_t* l1;        // [EL][2I][H/2] packed E2M1 W13, interleaved or gate/up-contiguous
   const uint8_t* l2;        // [EL][H][I/2] packed E2M1 W2, row-major
-  const uint8_t* l1s;       // [EL][2I/16][H/128][16] UE8M0 x4 words of W13
-  const uint8_t* l2s;       // [EL][H/16][I/128][16] UE8M0 x4 words of W2
+  const uint8_t* l1s;       // UE8M0 W13 scales in kernel, canonical or DeepGEMM MN-major layout
+  const uint8_t* l2s;       // UE8M0 W2 scales in kernel, canonical or DeepGEMM MN-major layout
   size_t l1_stride, l2_stride, l1s_stride, l2s_stride;  // bytes per expert
   uint8_t* inter;                                       // [EL][W*TCAP][I] e4m3 (local)
   uint32_t* inter_s;                                    // [EL][W*TCAP][I/128]
@@ -167,7 +168,16 @@ struct Args {
   Gin gin;
   int T, H, I, EL, W, TOPK, TCAP, rank;
   float swiglu_limit;
+  bool w13_gate_up_interleaved = true;
+  bool scales_are_canonical = false;
+  bool scales_are_deepgemm = false;
 };
+
+__device__ __forceinline__ int w13_row(int row, int intermediate) {
+  if (intermediate == 0) return row;
+  const int block = row / 16, j = row % 16;
+  return block * 8 + j % 8 + (j >= 8 ? intermediate : 0);
+}
 
 __device__ __forceinline__ const uint8_t* w13_of(const Args& a, int el) {
   return a.l1 + size_t(el) * a.l1_stride;
@@ -296,23 +306,38 @@ __device__ __forceinline__ uint32_t spread4(uint32_t w, uint32_t half_selector) 
 // and reads activation bytes 8c..8c+7: the same K permutation on both operands (file comment).
 // [kc_begin, kc_end) restricts K to a range of K64 chunks (split-K); both multiples of kUnroll.
 template <int NH>
-__device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const uint8_t* W,
-                                          const uint32_t* WS, int nblocks, int nb0, int K,
-                                          const uint8_t* const (&xrow)[NH],
-                                          const uint32_t* const (&xsrow)[NH], int lane,
-                                          int kc_begin = 0, int kc_end = -1) {
+__device__ __forceinline__ void item_gemm(
+    float (&acc)[kNbPerWarp][NH][4], const uint8_t* W, const uint32_t* WS, int nblocks, int nb0,
+    int K, const uint8_t* const (&xrow)[NH], const uint32_t* const (&xsrow)[NH], int lane,
+    int w13_intermediate = 0, int kc_begin = 0, int kc_end = -1, bool canonical_scales = false,
+    int canonical_intermediate = 0, bool deepgemm_scales = false) {
   const int g = lane / 4, c = lane % 4;
   const int kch = K / 64, kq = K / 128;
   const uint4* wp[kNbPerWarp][2];  // rows g, g + 8 of block nb0 + j, at this lane's 16 bytes
   const uint32_t* sp[kNbPerWarp];
+  const uint8_t* canonical_sp[kNbPerWarp];
+  const uint8_t* deepgemm_sp[kNbPerWarp];
 #pragma unroll
   for (int j = 0; j < kNbPerWarp; ++j) {
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
-      wp[j][r] =
-          reinterpret_cast<const uint4*>(W + size_t((nb0 + j) * 16 + g + 8 * r) * (K / 2)) + c;
+    for (int r = 0; r < 2; ++r) {
+      const int row = w13_row((nb0 + j) * 16 + g + 8 * r, w13_intermediate);
+      wp[j][r] = reinterpret_cast<const uint4*>(W + size_t(row) * (K / 2)) + c;
+    }
+    const int scale_row = w13_row((nb0 + j) * 16 + g + (lane & 1) * 8, canonical_intermediate);
+    canonical_sp[j] = reinterpret_cast<const uint8_t*>(WS) + scale_row * (K / 32);
+    deepgemm_sp[j] = reinterpret_cast<const uint8_t*>(WS) +
+                     w13_row((nb0 + j) * 16 + g + (lane & 1) * 8,
+                             w13_intermediate != 0 ? w13_intermediate : canonical_intermediate) *
+                         4;
     sp[j] = WS + size_t(nb0 + j) * kq * 16 + g + (lane & 1) * 8;
   }
+  auto scales_at = [&](int j, int k128) {
+    if (deepgemm_scales)
+      return __ldg(reinterpret_cast<const uint32_t*>(deepgemm_sp[j] + size_t(k128) * nblocks * 64));
+    if (!canonical_scales) return __ldg(sp[j] + k128 * 16);
+    return __ldg(reinterpret_cast<const uint32_t*>(canonical_sp[j] + k128 * 4));
+  };
   const uint2* xp[NH];
 #pragma unroll
   for (int h = 0; h < NH; ++h) xp[h] = reinterpret_cast<const uint2*>(xrow[h]) + c;
@@ -323,7 +348,8 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
   if (kc_end < 0) kc_end = kch;
   // lanes 0..15 prefetch row lane of the block kPfAhead bytes ahead, one 128-byte line (an
   // iteration's K256) per iteration
-  const char* pf = reinterpret_cast<const char*>(W) + size_t(nb0 * 16 + (lane & 15)) * (K / 2);
+  const char* pf = reinterpret_cast<const char*>(W) +
+                   size_t(w13_row(nb0 * 16 + (lane & 15), w13_intermediate)) * (K / 2);
   // 8-token items (one MMA per weight fragment) leave the loop waiting on DRAM: the next step's
   // weights and scales are loaded into a second buffer while this step's MMAs run. The buffer takes
   // the kernel to ~168 registers, one CTA per SM (the grid follows the occupancy). P2P build only:
@@ -344,7 +370,7 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
 #pragma unroll
       for (int s = 0; s < (kUnroll + 1) / 2; ++s)
 #pragma unroll
-        for (int j = 0; j < kNbPerWarp; ++j) sf[j][s] = __ldg(sp[j] + (k0 / 2 + s) * 16);
+        for (int j = 0; j < kNbPerWarp; ++j) sf[j][s] = scales_at(j, k0 / 2 + s);
     };
     if (kc_begin < kc_end) load(kc_begin, wq, sfa);
     for (int k0 = kc_begin; k0 < kc_end; k0 += kUnroll) {
@@ -419,7 +445,7 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
 #pragma unroll
     for (int q = 0; q < (kUnroll + 1) / 2; ++q)
 #pragma unroll
-      for (int j = 0; j < kNbPerWarp; ++j) sfa[j][q] = __ldg(sp[j] + (k0 / 2 + q) * 16);
+      for (int j = 0; j < kNbPerWarp; ++j) sfa[j][q] = scales_at(j, k0 / 2 + q);
 #pragma unroll
     for (int u = 0; u < kUnroll; ++u) {
       const int kc = k0 + u;
@@ -604,23 +630,22 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
         d4[1] = s4[1];
         s_sc[threadIdx.x] = a.x_sf[size_t(t) * (H / 32) + threadIdx.x];
       }
-      if (warp < TOPK) {  // warp k: destination row of copy k (slot = tokens t' < t routed to the
-                          // same expert)
-        const int e = route_at(a, t, warp);  // < 0: masked route, nothing to send
+      if (warp < TOPK) {  // warp k: route k and its destination rank
+        const int e = route_at(a, t, warp);
         int slot = 0;
         for (int u = lane; u < t * TOPK; u += 32) slot += (route_at(a, u / TOPK, u % TOPK) == e);
 #pragma unroll
         for (int o = 16; o; o >>= 1) slot += __shfl_xor_sync(0xffffffffu, slot, o);
 #if MEGAMOE_SM120_GIN_DEVICE
-        if (e >= 0 && is_gin(a, e / EL)) {  // slot table entry: packed (el, slot) -> this token
-          int pre = 0;                      // this rank's routes to lower experts of that rank
+        if (e >= 0 && is_gin(a, e / EL)) {
+          int pre = 0;
           for (int u = lane; u < a.T * TOPK; u += 32) {
             const int e2 = route_at(a, u / TOPK, u % TOPK);
             pre += (e2 >= 0 && e2 / EL == e / EL && e2 % EL < e % EL);
           }
 #pragma unroll
           for (int o = 16; o; o >>= 1) pre += __shfl_xor_sync(0xffffffffu, pre, o);
-          if (lane == 0) {  // the same packed index places this copy's partial on the way back
+          if (lane == 0) {
             a.gin.stage_slot[(e / EL) * TCAP * TOPK + pre + slot] = t;
             a.gin.cidx[t * TOPK + warp] = pre + slot;
           }
@@ -631,9 +656,12 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
             s_rowk[warp] = -1;
           } else {
             const int dst = e / EL, el = e % EL;
-            const int row = (el * W + a.rank) * TCAP + slot;
-            s_rowk[warp] = row;
+            s_rowk[warp] = a.rank * TCAP + t;
             s_dstk[warp] = dst;
+#if MEGAMOE_SM120_GIN_DEVICE
+            if (!is_gin(a, dst))
+#endif
+              a.peers.p2p_map[dst][(a.rank * EL + el) * TCAP + slot] = t * 8 + warp;
           }
         }
       }
@@ -653,6 +681,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           dst = a.gin.stage_row + size_t(t) * RX;
         } else {
           if (s_rowk[k] < 0 || is_gin(a, s_dstk[k])) continue;
+          bool first = true;
+          for (int j = 0; j < k; ++j) first &= !(s_rowk[j] >= 0 && s_dstk[j] == s_dstk[k]);
+          if (!first) continue;
           dst = a.peers.pool[s_dstk[k]] + size_t(s_rowk[k]) * RX;
         }
         if (q < H / 16)
@@ -754,8 +785,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #pragma unroll
       for (int q = 0; q < kPer; ++q) {
         const int u = base + q * blockDim.x + threadIdx.x;
-        if (e[q] >= 0 && e[q] / EL == a.rank)
-          atomicAdd(&m.cnt[u / RS][e[q] % EL], 1);  // e < 0: padding
+        if (e[q] >= 0 && e[q] / EL == a.rank) atomicAdd(&m.cnt[u / RS][e[q] % EL], 1);
       }
     }
 #if MEGAMOE_SM120_GIN_DEVICE
@@ -809,12 +839,18 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
       while (m.tiles_prefix[el + 1] <= tile_g) ++el;
       const int nb0 = (rb * kRowsPerItem) / 16 + warp * kNbPerWarp;
       const int blk_bytes = (H / 64) * 32 * 16;
+      const int intermediate = a.w13_gate_up_interleaved ? 0 : I;
+      const int num_halves = a.w13_gate_up_interleaved ? 1 : 2;
+      const size_t half_bytes = blk_bytes / num_halves;
+      const size_t half_budget = kPfBytes / num_halves;
 #pragma unroll
       for (int jb = 0; jb < kNbPerWarp; ++jb) {
-        const char* base =
-            reinterpret_cast<const char*>(w13_of(a, el) + size_t(nb0 + jb) * 16 * (H / 2));
-        for (int off = lane * 128; off < min(kPfBytes, blk_bytes); off += 32 * 128)
-          asm volatile("prefetch.global.L2 [%0];" ::"l"(base + off));
+        for (int half = 0; half < num_halves; ++half) {
+          const char* base = reinterpret_cast<const char*>(
+              w13_of(a, el) + size_t(w13_row((nb0 + jb) * 16 + half * 8, intermediate)) * (H / 2));
+          for (int off = lane * 128; off < min(half_budget, half_bytes); off += 32 * 128)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(base + off));
+        }
       }
     }
   }
@@ -902,16 +938,21 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
         for (int h = 0; h < NH; ++h) {
           int w, i;
           token_src(m, el, jt[h], W, w, i);
-          const size_t row = (size_t(el) * W + w) * TCAP + i;
-          xr[h] = pool + row * RX;
 #if MEGAMOE_SM120_GIN_DEVICE
-          if (is_gin(a, w))
+          if (is_gin(a, w)) {
             xr[h] = a.gin.inbox +
                     (size_t(w) * TCAP + a.gin.slotmap[w * TCAP * TOPK + s_pw[w] + i]) * RX;
+          } else
 #endif
+          {
+            const int meta = a.peers.p2p_map[a.rank][(w * EL + el) * TCAP + i];
+            xr[h] = pool + (size_t(w) * TCAP + meta / 8) * RX;
+          }
           xs[h] = reinterpret_cast<const uint32_t*>(xr[h] + H);
         }
-        item_gemm<NH>(acc, w13_of(a, el), ws13_of(a, el), 2 * I / 16, nb0, H, xr, xs, lane);
+        item_gemm<NH>(acc, w13_of(a, el), ws13_of(a, el), 2 * I / 16, nb0, H, xr, xs, lane,
+                      a.w13_gate_up_interleaved ? 0 : I, 0, -1, a.scales_are_canonical, I,
+                      a.scales_are_deepgemm);
         // SwiGLU: acc rows g (gate) / g+8 (up) of block nb -> inter col nb*8+g; tokens 2c, 2c+1
         constexpr int kItemInter = kRowsPerItem / 2;  // inter cols per item (multiple of 32)
         constexpr int kGroups = kItemInter / 32;
@@ -957,7 +998,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           xr[h] = a.inter + r * I;
           xs[h] = a.inter_s + r * (I / 128);
         }
-        item_gemm<NH>(acc, w2_of(a, el), ws2_of(a, el), H / 16, nb0, I, xr, xs, lane);
+        item_gemm<NH>(acc, w2_of(a, el), ws2_of(a, el), H / 16, nb0, I, xr, xs, lane, 0, 0, -1,
+                      a.scales_are_canonical, 0, a.scales_are_deepgemm);
 #pragma unroll
         for (int jb = 0; jb < kNbPerWarp; ++jb) {
           const int col = (warp * kNbPerWarp + jb) * 16 + g;  // 0..kRowsPerItem-1 within the item
@@ -991,8 +1033,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           else
 #endif
           {
-            const int meta = *reinterpret_cast<const int*>(
-                pool + ((size_t(el) * W + w) * TCAP + i) * RX + H + H / 32);
+            const int meta = a.peers.p2p_map[a.rank][(w * EL + el) * TCAP + i];
             dst = a.peers.comb[w] + (size_t(meta / 8) * TOPK + meta % 8) * H;
           }
           *reinterpret_cast<uint4*>(dst + rb * kRowsPerItem + q * 8) =
