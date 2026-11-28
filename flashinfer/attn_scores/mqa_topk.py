@@ -41,6 +41,21 @@ class FP8MQATopKWrapper:
     these conditions are checked on replay.
     Length policies use physical K rows, including the queries' compressed keys.
 
+    .. note::
+       Kimi-K3.1-Pro and GLM-5.3 share H32/D128/K2048/ratio-1. Shape inference
+       selects GLM-5.3. Naming Kimi selects a distinct policy only for
+       token-scaled FP8 with ``math_mode="relu_strict"``.
+
+    .. note::
+       ``logits_dtype`` defines score ordering, including conversion ties,
+       but does not always select internal storage. Kimi FP8 ``relu_strict``
+       uses FP32; full-domain DS-V4.1-Flash MXFP4 ``native_bf16`` uses BF16.
+       Budget scratch using the effective dtype: an FP32 tensor uses twice
+       the bytes of an equally sized FP16/BF16 tensor, though total workspace
+       need not double. The raw engine exposes ``requested_logits_dtype``
+       and ``effective_logits_dtype``. These full-domain storage rules do
+       not apply to candidate consumption.
+
     ``weights_dtype`` defaults to ``torch.float32``. Selective scoring also accepts
     ``torch.bfloat16`` for every supported QK, logits and arithmetic mode.
     Weights must match the planned dtype; BF16 weights may have padded rows
@@ -48,14 +63,15 @@ class FP8MQATopKWrapper:
     Input storage dtype does not select head accumulation precision.
 
     Selective ``math_mode=None`` resolves to ``relu_fast`` for FP8/MXFP4 and
-    ``relu_strict`` for MXFP8. Fast mode
+    ``relu_strict`` for MXFP8. Candidate publication and consumption default
+    to ``relu_strict`` and reject explicit ``relu_fast``. Fast mode
     checks bounds on device every replay: weights must be finite and zero or
     have magnitude at least 2**-125, and MXFP4 scale bytes must be <= 159.
     Violations set an error bit and return -1 rows.
 
     ``math_mode="native_bf16"`` and ``math_mode="native_fp16"`` are opt-in
-    modes for H4/H32/H64 FP8, MXFP8 or MXFP4 inputs, requiring the
-    matching logits dtype.
+    modes for H4/H32/H64 FP8, MXFP8 or MXFP4 inputs. Head arithmetic and
+    logits storage are independent: each mode accepts FP32, FP16 or BF16 logits.
     QK dots accumulate in FP32. ReLU results and weights are rounded to the
     native dtype, followed by four native FMA chains and the rounded tree
     ``(c0+c2)+(c1+c3)``. FP8 native_fp16 first divides QK by 512 and multiplies
@@ -66,6 +82,17 @@ class FP8MQATopKWrapper:
     output. MXFP4 block scales are applied within the dot product.
     Native modes have their own rounding, underflow and overflow behavior;
     they differ from FP32 head accumulation in ``relu_strict``/``relu_fast``.
+
+    ``publish_candidate_blocks=True`` additionally enables DS-V4.1 layer-20
+    publication for ratio-1 MXFP4 scoring. Read ``candidate_blocks``
+    and ``candidate_valid_lens`` after ``run``; the return value remains token
+    TopK. ``candidate_capacity=2048`` instead consumes a row-specific candidate
+    table through ``run(candidate_blocks=...)``. Both modes require DS-V4.1
+    ratio-1 MXFP4 scoring and cannot be enabled together. They support FP32,
+    native BF16 and native FP16 head reduction with any supported logits dtype.
+    Other layers keep the default full-domain token-only behavior.
+    Consumer K1 validates candidate IDs before reading K on every replay.
+    Invalid active rows return -1 and set ``repair_error & 0x20``.
 
     Construct outside capture, plan once per step, and run once per layer.
     Prepare every K/scale binding before capture. Keep this wrapper and all
@@ -96,6 +123,8 @@ class FP8MQATopKWrapper:
         logits_dtype=torch.float32,
         weights_dtype=torch.float32,
         model_config=None,
+        publish_candidate_blocks: bool = False,
+        candidate_capacity: int = 0,
     ):
         if strategy != "selective":
             raise ValueError("continuous TopK supports selective only")
@@ -120,6 +149,8 @@ class FP8MQATopKWrapper:
             logits_dtype=logits_dtype,
             weights_dtype=weights_dtype,
             model_config=model_config,
+            publish_candidate_blocks=publish_candidate_blocks,
+            candidate_capacity=candidate_capacity,
         )
         self._capacity_plan = _continuous_plan_type("cutedsl")(**options)
         self._compression_ratio = compression_ratio
@@ -158,6 +189,10 @@ class FP8MQATopKWrapper:
             in original tokens for the single request.
         num_query_rows : int, optional
             Extent of the supplied Q storage. Defaults to ``max_chunk_size``.
+            Capture a separate run for each supplied row count. The live query
+            prefix may change on replay within that extent. Token-only
+            K1–K3 can limit their launch to those rows. Candidate publication
+            and consumption use the full prepared capacity.
         next_n : int, optional
             Assert that the request has exactly this many query rows.
         host_length_hints : tuple[torch.Tensor, torch.Tensor], optional
@@ -189,8 +224,12 @@ class FP8MQATopKWrapper:
         k_scale: torch.Tensor,
         out: torch.Tensor | None = None,
         q_scale: torch.Tensor | None = None,
+        candidate_blocks: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Score continuous K directly; no KV packing, page lookup or gather.
+        """Select token TopK from continuous K storage.
+
+        Full-domain scoring reads K directly. Candidate consumption gathers
+        keys from the supplied block table and returns request-local indices.
 
         Parameters
         ----------
@@ -214,6 +253,19 @@ class FP8MQATopKWrapper:
             Required for MXFP4 and MXFP8: contiguous CUDA int32 ``[Q, H]``
             or UE8M0 uint8 ``[Q, H, 4]`` block scales. Must be None for FP8.
 
+        candidate_blocks : torch.Tensor, optional
+            Required with ``candidate_capacity=2048``: contiguous CUDA int32
+            ``[Q, 2048]`` block IDs, sorted and unique in each live prefix.
+            Blocks contain eight keys. The prefix has
+            ``min(ceil(visible_keys / 8), 2048)`` entries, includes the latest
+            visible block, and is followed by INT32_MAX padding. Every live
+            block must address the supplied K pool. Use the candidate buffer
+            from ``input_buffers()`` or a buffer disjoint from plan storage and
+            bound inputs. The caller must satisfy these device-value preconditions.
+            K1 rejects invalid active rows with -1 output and sets repair_error
+            bit 0x20, which remains set across layers until the next plan() call.
+            A wrapper with ``publish_candidate_blocks=True`` produces this format.
+
         Returns
         -------
         torch.Tensor
@@ -221,7 +273,13 @@ class FP8MQATopKWrapper:
             Storage is shared across calls unless ``out`` is supplied.
         """
         return self._capacity_plan.run(
-            q, weights, k, k_scale=k_scale, out=out, q_scale=q_scale
+            q,
+            weights,
+            k,
+            k_scale=k_scale,
+            out=out,
+            q_scale=q_scale,
+            candidate_blocks=candidate_blocks,
         )
 
     def prepare_pool(self, k, *, k_scale):
@@ -232,8 +290,23 @@ class FP8MQATopKWrapper:
         return self._capacity_plan.clear_pools()
 
     def input_buffers(self):
-        """Stable Q/weight/prefix buffers (plus q_scale for MXFP4/MXFP8)."""
+        """Stable Q/weight/prefix buffers, plus scales and candidate IDs when enabled."""
         return self._capacity_plan.input_buffers()
+
+    @property
+    def candidate_blocks(self):
+        """Published int32[Q,2048] block IDs, sorted with INT32_MAX padding.
+
+        Available after preparing a publisher pool. Blocks contain eight keys;
+        the latest visible block is always included. Storage is shared across
+        layers and graph replays, like the token TopK output.
+        """
+        return self._capacity_plan.candidate_blocks
+
+    @property
+    def candidate_valid_lens(self):
+        """Live token counts in the published candidate domain, per query."""
+        return self._capacity_plan.candidate_valid_lens
 
     @property
     def strategy(self):

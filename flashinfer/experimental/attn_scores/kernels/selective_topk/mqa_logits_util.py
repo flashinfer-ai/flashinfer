@@ -28,9 +28,15 @@ class KernelLaunch:
     arguments: testing.JitArguments
     logits: torch.Tensor
 
-    def run(self) -> None:
-        """Dispatch the prepared kernel once."""
-        self.compiled_fn(*self.arguments.args, **self.arguments.kwargs)
+    candidate_arg_index: int | None = None
+
+    def run(self, candidate_k_block_ids=None) -> None:
+        """Dispatch with an optional live candidate-table binding."""
+        args = self.arguments.args
+        if candidate_k_block_ids is not None and self.candidate_arg_index is not None:
+            i = self.candidate_arg_index
+            args = (*args[:i], candidate_k_block_ids, *args[i + 1 :])
+        self.compiled_fn(*args, **self.arguments.kwargs)
 
 
 # SMEM b32 load/store wrappers — `cute.arch.ld_shared / st_shared` are not

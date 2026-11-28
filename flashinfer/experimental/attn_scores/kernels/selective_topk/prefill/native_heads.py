@@ -10,11 +10,17 @@
 # limitations under the License.
 
 """Four head chains with compile-time FP32 or packed native arithmetic."""
+
 import cutlass
 import cutlass.cute as cute
 from .native_lowp_math import (
-    native_pack, native_pack_relu, native_fp8_pack, native_fp8_pack_relu,
-    native_fma, native_add, native_sum_fp32,
+    native_pack,
+    native_pack_relu,
+    native_fp8_pack,
+    native_fp8_pack_relu,
+    native_fma,
+    native_add,
+    native_sum_fp32,
 )
 
 
@@ -51,13 +57,20 @@ def native_head_fma4(x, w, acc, dtype: cutlass.Constexpr, fp8: cutlass.Constexpr
 
 
 @cute.jit
-def native_weight_pair(weights, index, stage, dtype: cutlass.Constexpr,
-                       fp8: cutlass.Constexpr = False):
+def native_weight_pair(
+    weights, index, stage, dtype: cutlass.Constexpr, fp8: cutlass.Constexpr = False
+):
     # Load two BF16 weights with one packed 32-bit shared load.
     # Weight storage and head arithmetic remain independent specializations.
-    if cutlass.const_expr(weights.element_type == cutlass.BFloat16 and dtype == cutlass.BFloat16):
-        pointer = weights.iterator + index * weights.stride[0] + stage * weights.stride[1]
-        packed = cute.make_tensor(cute.recast_ptr(pointer, dtype=cutlass.Uint32), cute.make_layout(1))
+    if cutlass.const_expr(
+        weights.element_type == cutlass.BFloat16 and dtype == cutlass.BFloat16
+    ):
+        pointer = (
+            weights.iterator + index * weights.stride[0] + stage * weights.stride[1]
+        )
+        packed = cute.make_tensor(
+            cute.recast_ptr(pointer, dtype=cutlass.Uint32), cute.make_layout(1)
+        )
         result = packed[0]
     else:
         a = cutlass.Float32(weights[(index, stage)])

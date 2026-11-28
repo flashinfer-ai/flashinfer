@@ -35,6 +35,21 @@ def benchmark():
 
 
 @pytest.mark.parametrize(
+    "model,explicit,expected",
+    [
+        (None, None, 1),
+        (None, 4, 4),
+        ("Kimi-K3.1-Pro", None, 1),
+        ("DS-V4.1-Flash", None, 2),
+        ("DS-V4.1-Flash", 1, 1),
+        ("DS-V4-Flash", None, 4),
+    ],
+)
+def test_benchmark_compression_ratio(benchmark, model, explicit, expected):
+    assert benchmark._compression_ratio(model, explicit) == expected
+
+
+@pytest.mark.parametrize(
     ("native_first", "failure"),
     [
         (155.81251525878906, None),
@@ -363,7 +378,18 @@ def test_continuous_public_dispatch_and_signatures(monkeypatch):
         "k_scale",
         "out",
         "q_scale",
+        "candidate_blocks",
     )
+    for name, default in (
+        ("publish_candidate_blocks", False),
+        ("candidate_capacity", 0),
+    ):
+        parameter = inspect.signature(public).parameters[name]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default == default
+    parameter = inspect.signature(public.run).parameters["candidate_blocks"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
     op = public(
         max_context_length=8192,
         max_chunk_size=64,
@@ -375,6 +401,9 @@ def test_continuous_public_dispatch_and_signatures(monkeypatch):
         logits_dtype=torch.bfloat16,
     )
     assert seen["logits_dtype"] == torch.bfloat16
+    assert seen["publish_candidate_blocks"] is False
+    assert seen["candidate_capacity"] == 0
+    assert op.run(1, 2, 3, k_scale=4)[1]["candidate_blocks"] is None
     assert op.plan(1, 2) == (
         (1, 2),
         {"num_query_rows": None, "next_n": None, "host_length_hints": None},
@@ -388,6 +417,56 @@ def test_continuous_public_dispatch_and_signatures(monkeypatch):
     assert op.run(1, 2, 3, k_scale=4, q_scale=5)[1]["k_scale"] == 4
     for name in ("page_size", "block_table", "kv_layout", "num_pages"):
         assert name not in inspect.signature(public).parameters
+
+
+@pytest.mark.parametrize(
+    ("publish_candidate_blocks", "candidate_capacity"), [(True, 0), (False, 2048)]
+)
+def test_candidate_public_dispatch(
+    monkeypatch, publish_candidate_blocks, candidate_capacity
+):
+    import flashinfer
+    from flashinfer.experimental import attn_scores
+
+    seen = {}
+    blocks = torch.empty((8, 2048), dtype=torch.int32)
+    valid_lens = torch.empty(8, dtype=torch.int32)
+    output = torch.empty((8, 512), dtype=torch.int32)
+
+    class Plan:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.candidate_blocks = blocks
+            self.candidate_valid_lens = valid_lens
+
+        def run(self, *args, **kwargs):
+            seen["run"] = kwargs
+            return output
+
+    monkeypatch.setattr(attn_scores, "_continuous_plan_type", lambda backend: Plan)
+    op = flashinfer.FP8MQATopKWrapper(
+        max_context_length=32768,
+        max_chunk_size=8,
+        max_batch_size=1,
+        device="cuda",
+        num_heads=32,
+        top_k=512,
+        compression_ratio=1,
+        qkv_dtype="mxfp4",
+        logits_dtype=torch.bfloat16,
+        math_mode="native_bf16",
+        model_config="DS-V4.1-Flash",
+        publish_candidate_blocks=publish_candidate_blocks,
+        candidate_capacity=candidate_capacity,
+    )
+    assert seen["publish_candidate_blocks"] is publish_candidate_blocks
+    assert seen["candidate_capacity"] == candidate_capacity
+    candidate_input = blocks if candidate_capacity else None
+    assert op.run(1, 2, 3, k_scale=4, candidate_blocks=candidate_input) is output
+    assert seen["run"]["candidate_blocks"] is candidate_input
+    if publish_candidate_blocks:
+        assert op.candidate_blocks is blocks
+        assert op.candidate_valid_lens is valid_lens
 
 
 def test_selective_warning_and_lazy_import_in_fresh_process():

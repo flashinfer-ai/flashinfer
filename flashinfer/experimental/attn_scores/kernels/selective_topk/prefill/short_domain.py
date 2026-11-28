@@ -20,10 +20,16 @@ class ShortDomainSetup:
 
     @cute.jit
     def launch(self, scales, weights, thresholds, counts, samples, queue, m, n, stream):
-        flat_weights = cute.make_tensor(weights.iterator, cute.make_layout(m * self.heads))
-        self.kernel(scales, flat_weights, thresholds, counts, samples, queue, m, n).launch(
+        flat_weights = cute.make_tensor(
+            weights.iterator, cute.make_layout(m * self.heads)
+        )
+        self.kernel(
+            scales, flat_weights, thresholds, counts, samples, queue, m, n
+        ).launch(
             grid=(cute.ceil_div(max(m * self.heads, n), 256), 1, 1),
-            block=(256, 1, 1), stream=stream, use_pdl=self.pdl,
+            block=(256, 1, 1),
+            stream=stream,
+            use_pdl=self.pdl,
         )
 
     @cute.kernel
@@ -32,7 +38,7 @@ class ShortDomainSetup:
         index = cute.arch.block_idx()[0] * 256 + cute.arch.thread_idx()[0]
         offset = cute.ceil_div(m, 32) * 32
         if index < m:
-            thresholds[index] = cutlass.Float32(float('-inf'))
+            thresholds[index] = cutlass.Float32(float("-inf"))
             counts[index] = 0
             # K3's exact fallback remains valid without a sampled upper bound.
             samples[index, samples.shape[1] - 30] = samples.element_type(0)
@@ -54,38 +60,81 @@ class ShortDomainSetup:
 
 class ShortDomainFP8(ShortDomainSetup):
     @cute.jit
-    def __call__(self, k, scales, q, weights, logits, starts, ends,
-                 thresholds, counts, samples, out, queue,
-                 m: cutlass.Int32, n: cutlass.Int32, stream: cuda.CUstream):
+    def __call__(
+        self,
+        k,
+        scales,
+        q,
+        weights,
+        logits,
+        starts,
+        ends,
+        thresholds,
+        counts,
+        samples,
+        out,
+        queue,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
         self.launch(scales, weights, thresholds, counts, samples, queue, m, n, stream)
 
 
 class ShortDomainFP4(ShortDomainSetup):
     @cute.jit
-    def __call__(self, k, scales, q, q_scales, weights, logits, starts, ends,
-                 thresholds, counts, samples, out, queue,
-                 m: cutlass.Int32, n: cutlass.Int32, stream: cuda.CUstream):
+    def __call__(
+        self,
+        k,
+        scales,
+        q,
+        q_scales,
+        weights,
+        logits,
+        starts,
+        ends,
+        thresholds,
+        counts,
+        samples,
+        out,
+        queue,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
         self.launch(scales, weights, thresholds, counts, samples, queue, m, n, stream)
 
 
 @cute.jit
-def candidate_bounds(candidates, row, bank, local, bank_count, span, hist,
-                     dtype: cutlass.Constexpr, packed: cutlass.Constexpr,
-                     threads: cutlass.Constexpr, bank_threads: cutlass.Constexpr,
-                     barrier_id: cutlass.Constexpr):
+def candidate_bounds(
+    candidates,
+    row,
+    bank,
+    local,
+    bank_count,
+    span,
+    hist,
+    dtype: cutlass.Constexpr,
+    packed: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    bank_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+):
     tid = cute.arch.thread_idx()[0]
     lane = cute.arch.lane_idx()
     warp = tid // 32
     minimum = cutlass.Uint32(0xFFFFFFFF)
     maximum = cutlass.Uint32(0)
     for offset in cutlass.range(local, bank_count, bank_threads):
-        score = candidate_score(candidates[row, 8 + bank * span + offset], dtype, packed)
+        score = candidate_score(
+            candidates[row, 8 + bank * span + offset], dtype, packed
+        )
         if score == score:
             key = score_key(score)
             minimum = min(minimum, key)
             maximum = max(maximum, key)
-    minimum = cute.arch.warp_redux_sync(minimum, 'umin')
-    maximum = cute.arch.warp_redux_sync(maximum, 'umax')
+    minimum = cute.arch.warp_redux_sync(minimum, "umin")
+    maximum = cute.arch.warp_redux_sync(maximum, "umax")
     if lane == 0:
         hist[warp] = cutlass.Int32(minimum)
         hist[warp + 32] = cutlass.Int32(maximum)
@@ -95,10 +144,10 @@ def candidate_bounds(candidates, row, bank, local, bank_count, span, hist,
     if lane < threads // 32:
         minimum = cutlass.Uint32(hist[lane])
         maximum = cutlass.Uint32(hist[lane + 32])
-    minimum = cute.arch.warp_redux_sync(minimum, 'umin')
-    maximum = cute.arch.warp_redux_sync(maximum, 'umax')
-    lower = cutlass.Float32(float('inf'))
-    upper = cutlass.Float32(float('-inf'))
+    minimum = cute.arch.warp_redux_sync(minimum, "umin")
+    maximum = cute.arch.warp_redux_sync(maximum, "umax")
+    lower = cutlass.Float32(float("inf"))
+    upper = cutlass.Float32(float("-inf"))
     if minimum != cutlass.Uint32(0xFFFFFFFF):
         lower = key_score(maximum)
         upper = key_score(minimum)

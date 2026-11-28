@@ -9,15 +9,14 @@ from cutlass.utils.smem_allocator import SmemAllocator
 
 
 class SelectivePrefillMetadata:
-    """Reduce live contract violations, then publish fail-closed row bounds.
-
-    Step validation already supplies a contiguous prefix of active rows and
-    monotone causal ends. Padding therefore needs the last live end, not a
-    prefix scan. A separate launch makes all contract flags visible before any
-    row is published; flags are overwritten on every layer and replay.
+    """Validate the active prefix before publishing row bounds.
+    Validation launches normally so all input bounds are ready. With PDL, publication
+    may preload those bounds but must wait before reading flags or updating outputs.
     """
 
-    def __init__(self, heads, qwen, fast, block_scaled, check_ctas=256, top_k=512):
+    def __init__(
+        self, heads, qwen, fast, block_scaled, check_ctas=256, top_k=512, pdl=True
+    ):
         self.top_k = top_k
         self.heads = heads
         self.qwen = qwen
@@ -25,6 +24,8 @@ class SelectivePrefillMetadata:
         self.block_scaled = block_scaled
         self.check = qwen or fast
         self.check_ctas = check_ctas
+        # Without validate there is no predecessor in this module to depend on.
+        self.pdl = self.check and bool(pdl)
 
     @cute.jit
     def __call__(
@@ -43,13 +44,18 @@ class SelectivePrefillMetadata:
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.check):
+            # Not a dependent launch (see the class docstring): publish relies on it.
             self.validate(weights, scales, q_scales, active, physical_kv, flags).launch(
-                grid=(self.check_ctas, 1, 1), block=(256, 1, 1), stream=stream
+                grid=(self.check_ctas, 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+                use_pdl=False,
             )
         self.publish(active, row_ends, starts, ends, score_ends, flags, error).launch(
             grid=(cute.ceil_div(ends.shape[0], 32), 1, 1),
             block=(32, 1, 1),
             stream=stream,
+            use_pdl=self.pdl,
         )
 
     @cute.kernel
@@ -66,6 +72,8 @@ class SelectivePrefillMetadata:
         lane = tid % 32
         warp = tid // 32
         block, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_launch_dependents()
         bad = cutlass.Int32(0)
         # Eight warps per CTA cover live weights/scales without the long
         # strided loop of a single-warp CTA. Publish one flag per CTA.
@@ -133,6 +141,14 @@ class SelectivePrefillMetadata:
     ):
         lane, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.pdl):
+            # Wait before reading validation flags or reusing row outputs still owned by K4.
+            pre_row = block * 32 + lane
+            pre_live = active[0]
+            pre_end = cutlass.Int32(0)
+            if pre_row < ends.shape[0]:
+                pre_end = cutlass.Int32(row_ends[min(pre_row, max(pre_live - 1, 0))])
+            cute.arch.griddepcontrol_wait()
         bad = cutlass.Int32(0)
         if cutlass.const_expr(self.check):
             for offset in cutlass.range_constexpr(cute.ceil_div(self.check_ctas, 32)):
@@ -142,8 +158,12 @@ class SelectivePrefillMetadata:
             bad = cute.arch.warp_redux_sync(bad, "max")
         row = block * 32 + lane
         if row < ends.shape[0]:
-            live = active[0]
-            end = row_ends[min(row, max(live - 1, 0))]
+            if cutlass.const_expr(self.pdl):
+                live = pre_live
+                end = pre_end
+            else:
+                live = active[0]
+                end = row_ends[min(row, max(live - 1, 0))]
             starts[row] = cutlass.Int32(0) if row < live or bad != 0 else end
             bound = end if bad == 0 else cutlass.Int32(0)
             ends[row] = bound
