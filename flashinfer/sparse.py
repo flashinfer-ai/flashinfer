@@ -477,6 +477,8 @@ class BlockSparseAttentionWrapper:
         self.M: Optional[int] = None
         self.N: Optional[int] = None
         self._cake_vsa_plan: Optional[dict] = None
+        self._kpage_plan = None
+        self._plan_valid = False
 
     def reset_workspace_buffer(
         self,
@@ -540,6 +542,8 @@ class BlockSparseAttentionWrapper:
         q_scale: Optional[torch.Tensor] = None,
         k_scale: Optional[torch.Tensor] = None,
         v_scale: Optional[torch.Tensor] = None,
+        kpage: bool = False,
+        q_block_lens: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -614,7 +618,8 @@ class BlockSparseAttentionWrapper:
             Per-head block-level attention mask, dtype bool.  Shape may be either
             ``(num_qo_heads, MB, NB)`` or ``(num_kv_heads, MB, NB)``.
             ``block_mask[h, i, j] = True`` means the Q-block ``i`` attends to KV-block ``j``
-            for head ``h``.  For GQA (``num_qo_heads > num_kv_heads``), when providing
+            for head ``h``. With KPage, each QO head keeps its own pattern.
+            For ordinary blk128 GQA (``num_qo_heads > num_kv_heads``), when providing
             ``(num_qo_heads, MB, NB)``, the first QO-head from each KV-head group is used
             (sparsity must be the same across QO-heads that share a KV-head).
             Supported by the ``cake``, ``vsa_sm100_blk128``, ``vsa_sm100_blk64``,
@@ -622,11 +627,12 @@ class BlockSparseAttentionWrapper:
             ``indptr``/``indices`` are not required and will be ignored.
         kv_block_lens : torch.Tensor, optional
             Number of valid tokens in every KV block, shape ``(NB,)``. Entries
-            must be in ``[1, C]``. Supported by the ``cake`` block-64 route;
+            must be in ``[1, C]`` (``[0, C]`` with KPage). Supported by KPage
+            and the ``cake`` block-64 route;
             when omitted, every block is treated as having ``C`` valid tokens.
         q2k_indices : torch.Tensor, optional
             Direct per-head KV-block selections, contiguous int32 with shape
-            ``(num_qo_heads, MB, topk)``. Supported by the ``cake`` block-64
+            ``(num_qo_heads, MB, topk)``. Supported by KPage and the ``cake`` block-64
             route and mutually exclusive with ``block_mask`` and BSR metadata.
         q2k_num : torch.Tensor, optional
             Number of valid entries in each direct selection row, contiguous
@@ -657,6 +663,23 @@ class BlockSparseAttentionWrapper:
             Sage FP8 quantization scale for ``v``, shape ``(num_qo_heads, head_dim)``,
             float32. See ``q_scale``.
 
+        kpage : bool
+            Experimental CuTe DSL KPage execution for ``vsa_sm100_blk64`` or
+            ``vsa_sm100_blk128``. Default False preserves ordinary VSA. Builds
+            the page layout during plan, reusing it for subsequent runs. Requires
+            SM100/SM103, BF16 Q/K/V/output, and head_dim=128. Metadata changes
+            (including in-place edits) require another plan. blk64 is MHA-only
+            with M/N multiples of 64; blk128 supports GQA and sequence tails.
+            KPage requires kv_splits=None/1, use_clc=None, and no FP8 scales.
+        q_block_lens : torch.Tensor, optional
+            KPage blk128 only: int32 CUDA tensor of shape ``(ceil(M / 128),)``.
+            Valid query prefix length per block; defaults to full blocks clipped
+            at M. KV prefix lengths use ``kv_block_lens``. Empty attention rows
+            are allowed (O=0, LSE=-inf); padding query output rows are zero.
+            Native ``q2k_indices`` also accept ``(1, num_qo_heads, ceil(M/R), K)``
+            and int32 dtype on the workspace device; ``q2k_num`` contains the
+            active counts, or all K slots are active when omitted.
+
         Notes
         -----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -671,6 +694,63 @@ class BlockSparseAttentionWrapper:
             The ``vsa_sm100_blk64`` backend does not support GQA/MQA: it has no
             KV-head mapping and requires ``num_kv_heads == num_qo_heads``.
         """
+        # A failed replan must not leave a stale executable KPage/ordinary plan.
+        self._plan_valid = False
+        self._kpage_plan = None
+        if not isinstance(kpage, bool):
+            raise TypeError("kpage must be a bool")
+        if q_block_lens is not None and not kpage:
+            raise ValueError("q_block_lens requires kpage=True")
+        if kpage:
+            if self._backend not in ("vsa_sm100_blk64", "vsa_sm100_blk128"):
+                raise ValueError(
+                    "kpage=True requires vsa_sm100_blk64 or vsa_sm100_blk128"
+                )
+            warn_experimental_backend_once("BlockSparseAttentionWrapper", "kpage")
+            from .experimental.vsa_kpage.adapter import prepare
+
+            plan = prepare(
+                backend=self._backend,
+                device=self.device,
+                indptr=indptr,
+                indices=indices,
+                block_mask=block_mask,
+                q2k_indices=q2k_indices,
+                q2k_num=q2k_num,
+                kv_block_lens=kv_block_lens,
+                q_block_lens=q_block_lens,
+                M=M,
+                N=N,
+                R=R,
+                C=C,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                q_data_type=canonicalize_torch_dtype(q_data_type),
+                kv_data_type=canonicalize_torch_dtype(
+                    q_data_type if kv_data_type is None else kv_data_type
+                ),
+                o_data_type=canonicalize_torch_dtype(o_data_type),
+                mask=mask,
+                packed_mask=packed_mask,
+                causal=causal,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                sm_scale=sm_scale,
+                kv_splits=kv_splits,
+                use_clc=use_clc,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            self._kpage_plan = plan
+            self.M, self.N, self.R, self.C = M, N, R, C
+            self._o_dtype = torch.bfloat16
+            self._sm_scale = sm_scale
+            self._plan_valid = True
+            return
+
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -737,6 +817,7 @@ class BlockSparseAttentionWrapper:
             self.R = R
             self.C = C
             self._sm_scale = sm_scale
+            self._plan_valid = True
             return
 
         # ---- cuTile backend (pure cuda.tile Python kernel) ------------------------
@@ -852,6 +933,7 @@ class BlockSparseAttentionWrapper:
             self._sparse_actual_seq_lens_kv = (nnz_per_row * C).to(torch.int32)
             self._sparse_block_tables = block_tables
             self._sparse_actual_seq_offset = actual_seq_offset
+            self._plan_valid = True
             return
 
         # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
@@ -957,6 +1039,7 @@ class BlockSparseAttentionWrapper:
             self.R = R
             self.C = C
             self._sm_scale = sm_scale
+            self._plan_valid = True
             return
 
         # ---- VSA blk64 backend (BSA CuTe-DSL kernel, SM100/SM103) -----------------
@@ -1089,6 +1172,7 @@ class BlockSparseAttentionWrapper:
             self._vsa_q_scale = q_scale
             self._vsa_k_scale = k_scale
             self._vsa_v_scale = v_scale
+            self._plan_valid = True
             return
 
         # ---- VSA SM120 blk64 backend (persistent Cake program) --------------------
@@ -1163,6 +1247,7 @@ class BlockSparseAttentionWrapper:
             self.R = R
             self.C = C
             self._sm_scale = sm_scale
+            self._plan_valid = True
             return
 
         if block_mask is not None:
@@ -1343,6 +1428,7 @@ class BlockSparseAttentionWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._plan_valid = True
 
     begin_forward = plan
 
@@ -1422,6 +1508,19 @@ class BlockSparseAttentionWrapper:
             * The attention output, shape: ``[M, num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
         """
+        if not self._plan_valid:
+            raise RuntimeError("a successful plan() must be called before run()")
+        if self._kpage_plan is not None:
+            if any(s is not None for s in (scale_q, scale_k, scale_v)):
+                raise ValueError("KPage does not accept FP8 scale tensors")
+            if enable_pdl is True:
+                raise ValueError("KPage does not support enable_pdl=True")
+            from .experimental.vsa_kpage.adapter import run
+
+            return run(
+                self._kpage_plan, q, k, v, out=out, lse=lse, return_lse=return_lse
+            )
+
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
 

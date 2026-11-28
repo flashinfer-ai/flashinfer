@@ -1,0 +1,357 @@
+THIRD-PARTY SOFTWARE LICENSES AND NOTICES
+=========================================
+
+cudnn-frontend bundles, derives from, or fetches at build time the
+following third-party open source software. Runtime Python package
+dependencies installed separately from PyPI are declared in
+pyproject.toml and are not reproduced here.
+
+-------------------------------------------------------------------------------
+1. nlohmann/json
+   https://github.com/nlohmann/json
+
+Bundled (vendored) at include/cudnn_frontend/thirdparty/nlohmann/. The
+vendored copy retains its original license file (LICENSE.MIT) alongside
+the source.
+
+License: MIT License
+
+MIT License
+
+Copyright (c) 2013-2022 Niels Lohmann
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+2. FlashAttention (Dao-AILab/flash-attention)
+   https://github.com/Dao-AILab/flash-attention
+
+Portions of the CuTe DSL attention kernels under
+python/cudnn/block_sparse_attention/ and
+python/cudnn/deepseek_sparse_attention/ and
+python/cudnn/flex_attention/, along with selected low-level
+utilities under python/cudnn/hstu/hstu_attention/_kernels/, are derived from
+FlashAttention. Those files retain their original author copyright notices
+(Tri Dao; Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+Pradeep Ramani, Tri Dao; Wentao Guo, Ted Zadouri, Tri Dao; and external
+contributor Jerry Chen) in their file headers.
+
+License: BSD 3-Clause License
+
+BSD 3-Clause License
+
+Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the copyright holder nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+-------------------------------------------------------------------------------
+3. NVIDIA CUTLASS
+   https://github.com/NVIDIA/cutlass
+
+Portions of the CuTe DSL GEMM kernels under python/cudnn/ (gemm/cutedsl/*
+covering the dense, grouped, and discrete_grouped families,
+native_sparse_attention, and related utilities) are derived from CUTLASS
+CuTe DSL examples. The descriptor definitions in
+python/cudnn/hstu/hstu_attention/_kernels/mma_sm100_desc.py are ported from CUTLASS
+C++ headers. The static persistent tile scheduler under
+python/cudnn/_cutlass_helpers/ is adapted from the BSD-licensed CUTLASS example;
+its source header records the upstream commit and local changes. The upstream
+code retains BSD-3-Clause; local modifications are licensed under Apache-2.0.
+CUTLASS is also consumed at runtime as the nvidia-cutlass-dsl PyPI
+package (optional dependency).
+
+License: BSD 3-Clause License
+
+Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Certain files within this repository are subject to separate licensing terms:
+
+- The files located in the `python/CuTeDSL` directory are licensed under the
+  NVIDIA End User License Agreement (EULA). Please refer to
+  https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
+  for the full terms.
+
+-------------------------------------------------------------------------------
+4. NVIDIA Megatron-LM
+   https://github.com/NVIDIA/Megatron-LM
+
+The fused CSA/HCA Compressor CuTe DSL kernels under python/cudnn/csa/
+(and their tests/benchmarks) were ported from Megatron-LM
+(NVIDIA/Megatron-LM#5984). Megatron-LM is an NVIDIA project under the
+same Apache 2.0 license, so the ported code carries NVIDIA copyright.
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+-------------------------------------------------------------------------------
+5. QuACK (quack-kernels)
+   https://github.com/Dao-AILab/quack
+
+Selected helper routines in the block-sparse attention CuTe DSL utilities
+(python/cudnn/block_sparse_attention/csrc/utils/) are adapted from
+quack-kernels 0.4.1 and maintained locally. Those files retain the
+'QuACK team' copyright notice in their headers.
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+-------------------------------------------------------------------------------
+6. labml.ai Annotated Deep Learning Paper Implementations
+   https://github.com/labmlai/annotated_deep_learning_paper_implementations
+
+The RoPE reference implementation in test/python/rope/graph/test_apply_rope.py is
+derived from labml.ai's annotated implementations, as noted in that
+file.
+
+License: MIT License
+
+The MIT License (MIT)
+
+Copyright (c) 2020 Varuna Jayasiri
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+7. dlpack
+   https://github.com/dmlc/dlpack
+
+Fetched at build time (v1.1, python/CMakeLists.txt) or used from the
+system, for the Python bindings' tensor-exchange interface.
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+-------------------------------------------------------------------------------
+8. nanobind
+   https://github.com/wjakob/nanobind
+
+Build-time dependency (v3.0.1 or newer 3.x) used to build the Python bindings.
+
+License: BSD-style 3-Clause License
+
+Copyright (c) 2022 Wenzel Jakob <wenzel.jakob@epfl.ch>, All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Please also refer to the file .github/CONTRIBUTING.md, which clarifies licensing of
+external contributions to this project including patches, pull requests, etc.
+
+-------------------------------------------------------------------------------
+9. Catch2
+   https://github.com/catchorg/Catch2
+
+Fetched at build time (v3.3.2, samples/CMakeLists.txt) for the C++
+samples and tests only; not part of distributed artifacts.
+
+License: Boost Software License 1.0
+
+Boost Software License - Version 1.0 - August 17th, 2003
+
+Permission is hereby granted, free of charge, to any person or organization
+obtaining a copy of the software and accompanying documentation covered by
+this license (the "Software") to use, reproduce, display, distribute,
+execute, and transmit the Software, and to prepare derivative works of the
+Software, and to permit third-parties to whom the Software is furnished to
+do so, all subject to the following:
+
+The copyright notices in the Software and this entire statement, including
+the above license grant, this restriction and the following disclaimer,
+must be included in all copies of the Software, in whole or in part, and
+all derivative works of the Software, unless such copies or derivative
+works are solely in the form of machine-executable object code generated by
+a source language processor.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
+FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+10. FlashMLA (deepseek-ai/FlashMLA)
+    https://github.com/deepseek-ai/FlashMLA
+
+The following SM100 sparse-prefill CuTe DSL kernels are derived from the
+FlashMLA head64 and small-top-k head128 Prefill kernels, pinned to commit
+b7643bd54521f563b839b98289b5cd048c062ba2:
+
+- python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head64.py
+- python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head128_small_topk.py
+
+The SM90 sparse-prefill CuTe DSL kernel is adapted primarily from FlashMLA's
+Hopper sparse-prefill implementation, pinned to commit
+4f38f29ef6793c228363e4af5be66d44e81167ba:
+
+- python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm90.py
+
+The derived kernel files retain the upstream copyright notice. The SM90 port
+adds wider H coverage, arbitrary logical K boundary handling, bounded symbolic
+compilation, and an allocation-free CUDA Graph prepared-execution contract.
+
+License: MIT License
+
+MIT License
+
+Copyright (c) 2025 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+11. FastVideo (hao-ai-lab/FastVideo)
+    https://github.com/hao-ai-lab/FastVideo
+
+The Triton NVFP4 fake-quantization and attention-backward kernels in
+python/cudnn/sdpa/bwd/qat/_nvfp4.py and
+python/cudnn/sdpa/bwd/qat/_kernels.py are derived from FastVideo, pinned to
+commit e9bbaca07d511b2ee7e16474dae6f923426223dc. FastVideo distributes the
+source files under Apache License 2.0.
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)
+
+The FastVideo implementation in turn adapts Triton's fused-attention tutorial
+and MXFP numerical conversion helpers:
+
+    https://github.com/triton-lang/triton
+
+License: MIT License
+
+Copyright 2018-2020 Philippe Tillet
+Copyright 2020-2022 OpenAI
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
