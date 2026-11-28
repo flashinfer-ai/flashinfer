@@ -334,8 +334,11 @@ def ld_shared_b32(smem_ptr, *, loc=None, ip=None) -> Int32:
             Int32.mlir_type,
             [smem_addr.ir_value(loc=loc, ip=ip)],
             "ld.shared.b32 $0, [$1];",
-            "=r,r",
-            has_side_effects=False,
+            "=r,r,~{memory}",
+            # Not a pure value: the bytes are produced by TMA behind an
+            # mbarrier wait and by st_shared_b32. Side effects + memory clobber
+            # stop MLIR CSE/DCE and LLVM from treating it as re-orderable.
+            has_side_effects=True,
             loc=loc,
             ip=ip,
         )
