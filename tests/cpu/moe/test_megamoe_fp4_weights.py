@@ -27,7 +27,11 @@ def test_decoder_addresses_preserve_nibbles_and_scales(weight_format):
                     0, 256, (2, n, k // 2), dtype=torch.uint8, generator=generator
                 ),
                 torch.randint(
-                    0, 255, (2, n, k // group), dtype=torch.uint8, generator=generator
+                    0 if group == 16 else 122,
+                    255 if group == 16 else 134,
+                    (2, n, k // group),
+                    dtype=torch.uint8,
+                    generator=generator,
                 ),
             )
         )

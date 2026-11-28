@@ -87,6 +87,9 @@ if (warp_idx == 0 and cute::elect_one_sync()) {
 // as a dense per-128 layout so no framework allocation change is needed.
 // =====================================================================
 #include <flashinfer/megamoe/detail/buffers.inl>
+const auto map_combine = [&](const auto& ptr, const uint32_t& dst_rank_idx) {
+  return sym_buffer.map(ptr, dst_rank_idx);
+};
 
 // =====================================================================
 // GEMM data types and shape constants
@@ -742,8 +745,10 @@ if (warp_idx < kNumDispatchWarps) {
           }
         }
 
-        // Round-robin rank selection (identical to SM100)
-
+        // Round-robin rank selection (identical to SM100); one node, so every
+        // source rank is local.
+        constexpr uint32_t remote_rows = 0;
+        const auto rank_is_remote = [](const uint32_t&) { return false; };
 #include <flashinfer/megamoe/detail/dispatch_rank_selection.inl>
         const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
             current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
@@ -1543,6 +1548,9 @@ if (warp_idx < kNumDispatchWarps) {
       return;
     }
 
+    const float task_global_scale = (kBlockIsL2 or l1_global_scales == nullptr)
+                                        ? 1.0f
+                                        : __ldg(l1_global_scales + local_expert_idx);
 #include <flashinfer/megamoe/detail/fused_epilogue.inl>
   };
   const auto run_math_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
@@ -1582,8 +1590,9 @@ if (warp_idx < kNumDispatchWarps) {
   // dispatch may now safely clean workspace state.
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-// These are function fragments: sizing declarations must precede the combine body.
-// clang-format off
+  // These are function fragments: sizing declarations must precede the combine body.
+  // clang-format off
+constexpr bool kLocalCombineStripe8 = false;
 #include <flashinfer/megamoe/detail/combine_config.inl>
 #include <flashinfer/megamoe/detail/combine.inl>
   // clang-format on

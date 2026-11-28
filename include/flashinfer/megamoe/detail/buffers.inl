@@ -1,8 +1,14 @@
 // Shared host/device buffer ABI; shape constants remain visible to SMEM sizing.
 constexpr auto fp8_token_layout = layout::Data(kHidden);
+#if defined(FI_MEGAMOE_BUFFERS_WITH_REMOTE_NODES)
+const auto buffers = layout::MegaMoEBuffers(
+    sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kHidden,
+    kIntermediateHidden, kNumMaxPoolTokens, kNumPaddedSFPoolTokens, kNumRemoteNodes);
+#else
 const auto buffers = layout::MegaMoEBuffers(
     sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kHidden,
     kIntermediateHidden, kNumMaxPoolTokens, kNumPaddedSFPoolTokens);
+#endif
 const auto workspace = buffers.workspace;
 const auto input_token_buffer = buffers.input_token_buffer;
 const auto input_sf_buffer = buffers.input_sf_buffer;

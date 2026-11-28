@@ -57,9 +57,7 @@ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96
 static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
-// D40's dev-m dynamic scheduler owns two global task counters.  Keep the
-// complete 128-byte scheduler-state ABI used by every accepted D40 run; the
-// big-M static split kernels simply leave these counters unused.
+// Two shared mailbox stages, each with full/empty barriers and one TaskInfo.
 static constexpr int kSM90InterleavedSchedulerSMEMBytes = 96;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M
@@ -98,7 +96,7 @@ struct Workspace {
   uint32_t num_max_pool_tokens;
   uint32_t num_max_pool_blocks;
 
-  // Grid/NVLink state plus the two dev-m dynamic task counters.  Expert
+  // Grid/NVLink state plus the two dynamic task counters. Expert
   // counters begin at the next 128-byte cache line so the hot task counters
   // do not share an L2 sector with communication state.
   static constexpr uint64_t kNumBarrierSignalBytes = 128;
@@ -127,9 +125,10 @@ struct Workspace {
     // Expert send/recv count
     num_bytes += num_experts * sizeof(uint64_t) * 2;
 
-    // Expert recv count sum (two sets: launch parity for the rotated push pool),
-    // each set padded to whole 128 B lines (remote sys-scope tickets land here)
-    num_bytes += math::align<uint64_t>(num_experts_per_rank * sizeof(uint64_t), 128) * 2;
+    // Expert recv count sum (three sets: launch parity for the rotated push
+    // pool, then the sources on other nodes), each set padded to whole 128 B
+    // lines (remote sys-scope tickets land here)
+    num_bytes += math::align<uint64_t>(num_experts_per_rank * sizeof(uint64_t), 128) * 3;
 
     // L1 arrival count (padded to even entry count for `uint64_t` alignment of L2 mask)
     num_bytes += math::align(num_max_pool_blocks, 2u) * sizeof(uint32_t);
@@ -181,8 +180,19 @@ struct Workspace {
   CUTLASS_DEVICE
   uint32_t* get_l2_task_count_ptr() const { return math::advance_ptr<uint32_t>(base, 32u); }
 
+  // Inter-node early return of the MXFP4 fused kernel:
+  // [36..39] FC2 tasks of the blocks that hold rows pulled from other nodes
+  //          completed on this rank (gpu-scope release per task; reset in the cleanup)
+  CUTLASS_DEVICE
+  uint32_t* get_remote_l2_done_ptr() const { return math::advance_ptr<uint32_t>(base, 36u); }
+
+  // [40..43] adaptive local FC1 bootstrap cursor; high bit closes the queue,
+  // low bits are the stable claimed N-task prefix. Reset after math completes.
+  CUTLASS_DEVICE
+  uint32_t* get_bootstrap_l1_count_ptr() const { return math::advance_ptr<uint32_t>(base, 40u); }
+
   // Counter-based words (second 64 B sector of the signal line, away from the
-  // dev-m task counters that gpu-scope atomics hammer all kernel long):
+  // task counters updated by GPU-scope atomics throughout the kernel):
   // [64..67] int push DONE count (monotonic; remote red.release.sys, +1 per rank per launch)
   // [68..71] push epoch (launches completed; SM0 bumps it in the cleanup; DONE target =
   //          ranks * (epoch + 1); also the pool parity slot)
@@ -203,6 +213,11 @@ struct Workspace {
   // here, so the host can tell a protocol stall from any other launch failure.
   CUTLASS_DEVICE
   uint32_t* get_spin_debug_ptr() const { return math::advance_ptr<uint32_t>(base, 76u); }
+
+  // [92..95] ranks of this node whose remote-dependent FC2 tasks are all done (one
+  //          sys-scope release per rank per launch; reset in the cleanup)
+  CUTLASS_DEVICE
+  int* get_remote_rows_ready_ptr() const { return math::advance_ptr<int>(base, 92u); }
 
   CUTLASS_DEVICE
   uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
@@ -235,9 +250,17 @@ struct Workspace {
            (parity & 1u) * get_recv_count_sum_set_stride() + expert_idx;
   }
 
+  // Third set: the counts of the sources on other nodes, published by their
+  // mirror on this node (the two-wave schedule lays the local wave out from
+  // the first set and the remote wave from this one).
+  CUTLASS_DEVICE
+  uint64_t* get_expert_recv_count_remote_sum_ptr(const uint32_t& expert_idx = 0) const {
+    return get_expert_recv_count_sum_ptr(get_recv_count_sum_set_stride() * 2) + expert_idx;
+  }
+
   CUTLASS_DEVICE
   uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
-    const auto base = get_expert_recv_count_sum_ptr(get_recv_count_sum_set_stride() * 2);
+    const auto base = get_expert_recv_count_sum_ptr(get_recv_count_sum_set_stride() * 3);
     return reinterpret_cast<uint32_t*>(base) + pool_block_idx;
   }
 
@@ -337,6 +360,130 @@ struct Buffer {
   }
 };
 
+// Regions a rank adds for every node it cannot reach over NVLink. Rank S and
+// its mirror on the other node exchange tokens through these: S packs the rows
+// that have an expert on that node into `outbound`, puts them into the mirror's
+// `inbox`, the mirror's owners pull from the inbox as from a local source and
+// store their FC2 rows into the mirror's `outbox` (the `combine` region of S as
+// the mirror's node sees it); the mirror reduces the outbox into
+// `return_outbound` and puts it into S's `return_inbox`. The inbox repeats the
+// byte layout of the four input buffers, so a puller addresses it with one
+// offset per source rank; the outbox repeats the combine buffer's layout.
+// With no remote node every size is zero and the single-node ABI is unchanged.
+struct RemoteRegions {
+  uint32_t num_remote_nodes, num_experts_per_node, capacity, topk;
+  uint64_t input_block_bytes, combine_block_bytes, row_bf16_bytes;
+  void* base;
+
+  // Header of an inbox / outbound block: the number of packed tokens, then per
+  // expert of the receiving node its count, then per expert a fixed-stride list
+  // of `capacity` entries `slot * topk + k` (the index pass writes it in place,
+  // so nothing is compacted before the put).
+  static constexpr uint32_t kHeaderControlBytes = 128;
+
+  CUTLASS_HOST_DEVICE
+  RemoteRegions(void* base, uint32_t num_remote_nodes, uint32_t num_experts_per_node,
+                uint32_t capacity, uint32_t topk, uint32_t hidden, uint64_t input_block_bytes,
+                uint64_t combine_block_bytes)
+      : num_remote_nodes(num_remote_nodes),
+        num_experts_per_node(num_experts_per_node),
+        capacity(capacity),
+        topk(topk),
+        input_block_bytes(input_block_bytes),
+        combine_block_bytes(combine_block_bytes),
+        row_bf16_bytes(static_cast<uint64_t>(hidden) * sizeof(uint16_t)),
+        base(base) {}
+
+  CUTLASS_HOST_DEVICE uint64_t header_bytes() const {
+    return math::align<uint64_t>(
+        kHeaderControlBytes + num_experts_per_node * sizeof(uint32_t) +
+            static_cast<uint64_t>(num_experts_per_node) * capacity * sizeof(uint32_t),
+        128);
+  }
+  CUTLASS_HOST_DEVICE uint64_t inbox_bytes() const { return header_bytes() + input_block_bytes; }
+  CUTLASS_HOST_DEVICE uint64_t return_bytes() const {
+    return math::align<uint64_t>(capacity * row_bf16_bytes, 128);
+  }
+  CUTLASS_HOST_DEVICE uint64_t slot_map_bytes() const {
+    return math::align<uint64_t>(capacity * sizeof(int32_t) + 128, 128);
+  }
+  // Per remote node: inbox, outbound, outbox, return inbox, return outbound,
+  // slot map with control words.
+  CUTLASS_HOST_DEVICE uint64_t bytes_per_node() const {
+    return inbox_bytes() * 2 + math::align<uint64_t>(combine_block_bytes, 128) +
+           return_bytes() * 2 + slot_map_bytes();
+  }
+  CUTLASS_HOST_DEVICE uint64_t get_num_bytes() const {
+    return math::align<uint64_t>(bytes_per_node() * num_remote_nodes, 16);
+  }
+  CUTLASS_HOST_DEVICE void* get_end_ptr() const { return math::advance_ptr(base, get_num_bytes()); }
+
+  CUTLASS_HOST_DEVICE void* node_base(const uint32_t& node) const {
+    return math::advance_ptr(base, bytes_per_node() * node);
+  }
+  // Inbox: the input block the mirror filled, then the header, so that the
+  // scales, routing and header leave in one put after the rows.
+  CUTLASS_HOST_DEVICE void* inbox_input_block(const uint32_t& node) const {
+    return node_base(node);
+  }
+  CUTLASS_HOST_DEVICE void* inbox_header(const uint32_t& node) const {
+    return math::advance_ptr(node_base(node), input_block_bytes);
+  }
+  // Outbound: what this rank sends to that node, same shape as the inbox.
+  CUTLASS_HOST_DEVICE void* outbound_input_block(const uint32_t& node) const {
+    return math::advance_ptr(node_base(node), inbox_bytes());
+  }
+  CUTLASS_HOST_DEVICE void* outbound_header(const uint32_t& node) const {
+    return math::advance_ptr(outbound_input_block(node), input_block_bytes);
+  }
+  // Outbox: FC2 rows of the mirror's packed tokens, combine-buffer layout.
+  CUTLASS_HOST_DEVICE void* outbox(const uint32_t& node) const {
+    return math::advance_ptr(node_base(node), inbox_bytes() * 2);
+  }
+  CUTLASS_HOST_DEVICE void* return_inbox(const uint32_t& node) const {
+    return math::advance_ptr(outbox(node), math::align<uint64_t>(combine_block_bytes, 128));
+  }
+  CUTLASS_HOST_DEVICE void* return_outbound(const uint32_t& node) const {
+    return math::advance_ptr(return_inbox(node), return_bytes());
+  }
+  // `packed_slot_of_token[capacity]` (-1 = no expert on that node), then the
+  // packed-token counter in the trailing 128 bytes.
+  CUTLASS_HOST_DEVICE int32_t* packed_slot_map(const uint32_t& node) const {
+    return static_cast<int32_t*>(math::advance_ptr(return_outbound(node), return_bytes()));
+  }
+  // Control words in the aligned trailing 128 bytes after the slot map: byte
+  // [0] packed tokens, [8] inbox flag, [16] return flag (both carriers use these
+  // monotonic window-local flags), [24] launch epoch (node 0's block only).
+  CUTLASS_HOST_DEVICE uint32_t* packed_token_count(const uint32_t& node) const {
+    return static_cast<uint32_t*>(math::advance_ptr(
+        packed_slot_map(node), math::align<uint64_t>(capacity * sizeof(int32_t), 128)));
+  }
+  CUTLASS_HOST_DEVICE uint64_t* inbox_flag(const uint32_t& node) const {
+    return reinterpret_cast<uint64_t*>(packed_token_count(node) + 2);
+  }
+  CUTLASS_HOST_DEVICE uint64_t* return_flag(const uint32_t& node) const {
+    return reinterpret_cast<uint64_t*>(packed_token_count(node) + 4);
+  }
+  CUTLASS_HOST_DEVICE uint32_t* launch_epoch() const { return packed_token_count(0) + 6; }
+  // Header: control word [0] packed tokens, then per expert of the receiving
+  // node its count, then per expert its list of `capacity` entries.
+  CUTLASS_HOST_DEVICE uint32_t* header_control(void* header) const {
+    return static_cast<uint32_t*>(header);
+  }
+  CUTLASS_HOST_DEVICE uint32_t* header_expert_counts(void* header) const {
+    return static_cast<uint32_t*>(math::advance_ptr(header, kHeaderControlBytes));
+  }
+  CUTLASS_HOST_DEVICE uint32_t* header_list(void* header, const uint32_t& expert) const {
+    return header_expert_counts(header) + num_experts_per_node +
+           static_cast<uint64_t>(expert) * capacity;
+  }
+  // The list of `expert` of `node` that this rank's index pass fills, in the
+  // outbound header.
+  CUTLASS_HOST_DEVICE uint32_t* outbound_list(const uint32_t& node, const uint32_t& expert) const {
+    return header_list(outbound_header(node), expert);
+  }
+};
+
 // One allocation ABI shared by NVFP4 fused/split and MXFP4 fused. Activation
 // scales reserve per-64 capacity for L2; BN256 kernels use its dense per-128
 // prefix. The combine region is indexed by the original token and top-k slot.
@@ -345,11 +492,13 @@ struct MegaMoEBuffers {
   Buffer input_token_buffer, input_sf_buffer, input_topk_idx_buffer, input_topk_weights_buffer;
   Buffer l1_token_buffer, l1_sf_buffer, l1_topk_weights_buffer;
   Buffer l2_token_buffer, l2_sf_buffer, combine_token_buffer;
+  // Inter-node inbox / outbox regions; empty with one node.
+  RemoteRegions remote;
 
   CUTLASS_HOST_DEVICE
   MegaMoEBuffers(void* base, uint32_t ranks, uint32_t experts, uint32_t capacity, uint32_t topk,
                  uint32_t hidden, uint32_t intermediate, uint32_t pool_tokens,
-                 uint32_t sf_pool_tokens)
+                 uint32_t sf_pool_tokens, uint32_t num_remote_nodes = 0)
       : workspace(base, ranks, experts, capacity, topk),
         input_token_buffer(Data(hidden), 1, capacity, workspace.get_end_ptr()),
         input_sf_buffer(Data(hidden / 32, false), 1, capacity, input_token_buffer.get_end_ptr()),
@@ -357,7 +506,10 @@ struct MegaMoEBuffers {
                               input_sf_buffer.get_end_ptr()),
         input_topk_weights_buffer(Data(topk * sizeof(float), false), 1, capacity,
                                   input_topk_idx_buffer.get_end_ptr()),
-        l1_token_buffer(Data(hidden), 1, pool_tokens, input_topk_weights_buffer.get_end_ptr()),
+        l1_token_buffer(
+            Data(hidden), 1, pool_tokens,
+            reinterpret_cast<void*>(math::align<uint64_t>(
+                reinterpret_cast<uint64_t>(input_topk_weights_buffer.get_end_ptr()), 16))),
         l1_sf_buffer(Data(hidden / 32, false), 1, sf_pool_tokens, l1_token_buffer.get_end_ptr()),
         l1_topk_weights_buffer(Data(sizeof(float), false), 1, pool_tokens,
                                l1_sf_buffer.get_end_ptr()),
@@ -365,7 +517,12 @@ struct MegaMoEBuffers {
         l2_sf_buffer(Data(intermediate / 16, false), 1, sf_pool_tokens,
                      l2_token_buffer.get_end_ptr()),
         combine_token_buffer(Data(hidden * sizeof(uint16_t)), topk, capacity,
-                             l2_sf_buffer.get_end_ptr()) {}
+                             l2_sf_buffer.get_end_ptr()),
+        remote(combine_token_buffer.get_end_ptr(), num_remote_nodes,
+               ranks / (num_remote_nodes + 1) * (experts / ranks), capacity, topk, hidden,
+               reinterpret_cast<uint64_t>(l1_token_buffer.get_base_ptr()) -
+                   reinterpret_cast<uint64_t>(input_token_buffer.get_base_ptr()),
+               combine_token_buffer.get_num_bytes()) {}
 };
 
 }  // namespace flashinfer::megamoe::layout

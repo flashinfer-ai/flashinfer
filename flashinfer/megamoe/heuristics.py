@@ -9,6 +9,7 @@ Shapes outside those buckets use the generic scheduling policy.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional, Tuple
 
 # SM90 shared-memory capacity, and the mailbox the interleaved scheduler
@@ -192,6 +193,23 @@ class FusedPlan:
     num_padded_sf_pool_tokens: int
 
 
+def _mxfp4_prepared_smem_bytes(
+    block_m: int, stages: int, num_experts: int, hidden: int, weight_tile_bytes: int
+) -> int:
+    """Bound the prepared BN256 swap-AB rings, combine scratch and mailboxes."""
+    cd = align(block_m * 256 * 2 + block_m * 8 * 4, 1024)
+    gemm = (
+        align(num_experts * 4, 1024)
+        + align(hidden, 1024)
+        + cd
+        + stages * (block_m * 128 + 2 * weight_tile_bytes + align(block_m * 4, 128))
+    )
+    combine = 3 * 8 * hidden * 2 // (1 if hidden <= 4096 else 2)
+    barriers = (2 + 2 * stages + 16) * 8
+    return max(gemm, combine) + barriers + INTERLEAVED_SCHEDULER_SMEM_BYTES
+
+
+@lru_cache(maxsize=256)
 def select_mxfp4_fused_plan(
     num_sms: int,
     num_ranks: int,
@@ -201,10 +219,20 @@ def select_mxfp4_fused_plan(
     intermediate_hidden: int,
     num_max_tokens_per_rank: int,
     num_tokens: int,
+    num_logical_experts: Optional[int] = None,
+    *,
+    weight_tile_bytes: int = 8704,
 ) -> FusedPlan:
     """Select MXFP4 tile geometry, pipeline depth and decode-warp partition.
 
     Chunk-major weight tiles are independent of the selected BLOCK_N.
+    ``num_logical_experts`` is the routed expert count when ``num_experts``
+    also counts redundant expert slots: the token block is sized by the rows
+    a routed expert receives, which the slots split but do not add to.
+    Canonical plans require hidden >= 2 * intermediate_hidden and
+    intermediate_hidden <= 8192.
+    Noncanonical storage uses bounded H20 swap-AB plans, with explicit combine
+    alignment and shared-memory checks; it never changes the weight format.
     """
     if num_sms <= 1:
         raise ValueError("num_sms must be greater than one")
@@ -226,30 +254,94 @@ def select_mxfp4_fused_plan(
     if not 0 < num_tokens <= num_max_tokens_per_rank:
         raise ValueError("num_tokens must be in (0, num_max_tokens_per_rank]")
     epr = num_experts // num_ranks
+    if num_logical_experts is None:
+        num_logical_experts = num_experts
+    elif not 0 < num_logical_experts <= num_experts:
+        raise ValueError("num_logical_experts must be in (0, num_experts]")
+
+    if weight_tile_bytes not in (8704, 8448, 16384):
+        raise ValueError("MXFP4 weight records must contain 8704, 8448 or 16384 bytes")
+
+    if weight_tile_bytes == 8704:
+        if hidden < 2 * intermediate_hidden:
+            raise ValueError(
+                "canonical MXFP4 requires hidden >= 2 * intermediate_hidden"
+            )
+        if intermediate_hidden > 8192:
+            raise ValueError("canonical MXFP4 requires intermediate_hidden <= 8192")
+        if 3 * 8 * hidden * 2 // (1 if hidden <= 4096 else 2) > SMEM_CAPACITY:
+            raise ValueError("canonical MXFP4 plan exceeds SM90 shared-memory capacity")
+
+    if hidden > 4096 and hidden % 512:
+        raise ValueError("MXFP4 combine requires hidden divisible by 512 above 4096")
 
     def max_tokens(bm):
-        return bm * num_experts // (num_ranks * num_topk)
+        return bm * num_logical_experts // (num_ranks * num_topk)
 
-    limit = max_tokens(24) * H20_NUM_SMS // num_sms
-    bm = next((b for b in (8, 24, 32) if num_tokens <= max_tokens(b) * 7 // 10), 32)
-    if num_tokens <= 1:
-        epw, stages = 24, 8
-    elif num_tokens <= 8:
-        epw, stages = 16, 8
-    elif num_tokens <= 16:
-        epw, stages = 24, 8
+    if weight_tile_bytes != 8704:
+        supported_tokens: tuple[int, ...]
+        if weight_tile_bytes == 8448:
+            supported_tokens = (1, 2, 4, 8) if num_ranks == 8 else (1, 4, 8)
+        else:
+            supported_tokens = (1, 4, 8, 16, 32, 64)
+            if num_ranks == 8:
+                supported_tokens = (1, 2, 4, 8, 16, 32, 64, 128)
+        if (
+            num_sms != H20_NUM_SMS
+            or num_ranks not in (8, 16)
+            or num_tokens not in supported_tokens
+            or num_logical_experts != num_experts
+        ):
+            raise ValueError(
+                f"noncanonical MXFP4 storage ({weight_tile_bytes}-byte records) "
+                "requires H20, EP8 or EP16, "
+                f"M in {supported_tokens}, without expert slots"
+            )
+        if hidden < 2 * intermediate_hidden or intermediate_hidden > 8192:
+            raise ValueError(
+                "noncanonical MXFP4 storage requires hidden >= 2 * "
+                "intermediate_hidden and intermediate_hidden <= 8192"
+            )
+        if weight_tile_bytes == 8448 and num_max_tokens_per_rank <= 2 and hidden % 2048:
+            raise ValueError(
+                "compact MXFP4 with capacity <= 2 requires hidden divisible by 2048"
+            )
+        epw, swap = 16, True
+        rs = weight_tile_bytes == 8448
+        if rs or num_tokens <= 16:
+            bm, stages = 8, 4 if num_tokens <= 2 else 6
+        else:
+            bm, stages = {32: (16, 6), 64: (24, 5), 128: (32, 4)}[num_tokens]
+        if (
+            _mxfp4_prepared_smem_bytes(
+                bm, stages, num_experts, hidden, weight_tile_bytes
+            )
+            > SMEM_CAPACITY
+        ):
+            raise ValueError(
+                "noncanonical MXFP4 plan exceeds SM90 shared-memory capacity"
+            )
     else:
-        epw, stages = 48, 8
-    swap = num_tokens <= max(16, limit)
-    rs = swap
-    if num_sms > H20_NUM_SMS and bm < 16 and num_tokens <= 16:
-        rs = False
-    if swap and bm >= 16:
-        rs = False
-    if not swap:
-        bm, stages = 64, 3
-    elif not rs:
-        stages = 4 if bm == 8 else 3
+        limit = max_tokens(24) * H20_NUM_SMS // num_sms
+        bm = next((b for b in (8, 24, 32) if num_tokens <= max_tokens(b) * 7 // 10), 32)
+        if num_tokens <= 1:
+            epw, stages = 24, 8
+        elif num_tokens <= 8:
+            epw, stages = 16, 8
+        elif num_tokens <= 16:
+            epw, stages = 24, 8
+        else:
+            epw, stages = 48, 8
+        swap = num_tokens <= max(16, limit)
+        rs = swap
+        if num_sms > H20_NUM_SMS and bm < 16 and num_tokens <= 16:
+            rs = False
+        if swap and bm >= 16:
+            rs = False
+        if not swap:
+            bm, stages = 64, 3
+        elif not rs:
+            stages = 4 if bm == 8 else 3
     epw = min(epw, epr)
     while epr % epw:
         epw -= 1

@@ -610,6 +610,7 @@ if (warp_idx == 0) {
       kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <=
       static_cast<uint32_t>(reinterpret_cast<uint8_t*>(barrier_start_ptr) - smem_buffer));
 
+  constexpr bool kLocalCombineStripe8 = false;
 #include <flashinfer/megamoe/detail/combine.inl>
 
   finish_no_dispatch_cleanup();
