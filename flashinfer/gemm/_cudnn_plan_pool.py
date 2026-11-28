@@ -1,0 +1,414 @@
+"""Opt-in worker processes that build cuDNN execution plans in parallel.
+
+cuDNN plan building holds the GIL and cuDNN refuses its own multithreaded
+builds, so autotuning builds every candidate plan of a graph one at a time
+(flashinfer-ai/flashinfer#9409). With ``FLASHINFER_CUDNN_PLAN_BUILD_WORKERS=N``
+the candidates of one graph are split across N worker processes, each of which
+loads ``_cudnn_plan_build.py`` without torch, builds its share, and returns
+serialized single-plan graphs.
+
+A candidate whose plan a worker cannot build is still returned (without a
+plan) so the tuned tactic set matches the in-process one, where it fails at
+profiling. Any failure (spawn, crash, timeout, error, no plan built at all, or
+workers disagreeing on the candidate list) returns ``None`` so the caller
+builds in-process as before, and turns the pool off for the rest of the
+process.
+"""
+
+import atexit
+import contextlib
+import logging
+import os
+import pathlib
+import pickle
+import selectors
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+from ._cudnn_plan_build import (
+    _FRAME_HEADER,
+    Bf16OverrideGraphSpec,
+    spec_to_wire,
+    write_frame,
+)
+
+logger = logging.getLogger(__name__)
+
+ENV_VAR = "FLASHINFER_CUDNN_PLAN_BUILD_WORKERS"
+_WORKER_SCRIPT = pathlib.Path(__file__).with_name("_cudnn_plan_build.py")
+# Libraries the worker's cuDNN must resolve the same way the parent's did.
+_LIB_PREFIXES = ("libcudnn", "libcublas", "libcudart", "libnvrtc", "libnvJitLink")
+# How much of a failed worker's stderr the warning carries.
+_STDERR_TAIL_BYTES = 2048
+
+
+class _WorkerFailure(Exception):
+    pass
+
+
+def _loaded_library_dirs() -> list:
+    dirs = []
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                path = line.rsplit(None, 1)[-1]
+                if not path.startswith("/"):
+                    continue
+                name = os.path.basename(path)
+                directory = os.path.dirname(path)
+                if name.startswith(_LIB_PREFIXES) and directory not in dirs:
+                    dirs.append(directory)
+    except OSError:
+        pass
+    return dirs
+
+
+def _visible_device_entry(device_index: int) -> str:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return str(device_index)
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    if device_index >= len(entries):
+        raise _WorkerFailure(
+            f"device {device_index} is not in CUDA_VISIBLE_DEVICES={visible!r}"
+        )
+    return entries[device_index]
+
+
+def _stderr_tail(log) -> str:
+    try:
+        size = log.seek(0, os.SEEK_END)
+        log.seek(max(0, size - _STDERR_TAIL_BYTES))
+        return log.read().decode(errors="replace").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def _read_frame(proc: subprocess.Popen, deadline: float):
+    """Read one frame from ``proc.stdout`` before ``deadline`` (monotonic)."""
+    fd = proc.stdout.fileno()
+    buf = b""
+    need = _FRAME_HEADER.size
+    size = None
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while True:
+            if len(buf) >= need:
+                if size is None:
+                    (size,) = _FRAME_HEADER.unpack(buf[:need])
+                    need += size
+                    continue
+                return pickle.loads(buf[_FRAME_HEADER.size : need])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _WorkerFailure("timed out")
+            if not selector.select(remaining):
+                raise _WorkerFailure("timed out")
+            chunk = os.read(fd, max(need - len(buf), 65536))
+            if not chunk:
+                raise _WorkerFailure(f"worker exited (code {proc.poll()})")
+            buf += chunk
+
+
+class CudnnPlanBuildPool:
+    """A fixed number of plan-build workers per CUDA device, started lazily."""
+
+    def __init__(
+        self,
+        num_workers: int,
+        timeout_s: float = 120.0,
+        worker_cmd=None,
+        idle_s: float = 30.0,
+    ):
+        self.num_workers = num_workers
+        self.timeout_s = timeout_s
+        self._worker_cmd = worker_cmd or [sys.executable, "-I", str(_WORKER_SCRIPT)]
+        self._workers: dict = {}  # device_index -> list[Popen]
+        # Worker stderr goes to a file, not a pipe: cuDNN output moved to
+        # stderr by the worker could fill an undrained pipe and block it.
+        self._stderr_logs: dict = {}  # pid -> temporary file
+        self._lock = threading.Lock()
+        self._broken = False
+        self.last_responses: list = []
+        # Each worker holds ~800 MB and a CUDA context; tuning comes in bursts,
+        # so release them once idle and respawn on the next build.
+        self.idle_s = idle_s
+        self._idle_timer: threading.Timer | None = None
+        self._last_use = 0.0
+        # Echoed by workers; a reply for another request means the pipes are
+        # out of step, so its plans must not be used.
+        self._next_request_id = 0
+        # A forked child inherits this object (possibly with the lock held by
+        # another thread of the parent); only the creating process uses it.
+        self._owner_pid = os.getpid()
+
+    @property
+    def broken(self) -> bool:
+        return self._broken
+
+    def _all_processes(self) -> list:
+        return [p for procs in self._workers.values() for p in procs]
+
+    def _spawn(self, device_index: int) -> list:
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = _visible_device_entry(device_index)
+        lib_dirs = _loaded_library_dirs()
+        if lib_dirs:
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                lib_dirs + [p for p in [env.get("LD_LIBRARY_PATH")] if p]
+            )
+        procs: list = []
+        try:
+            for _ in range(self.num_workers):
+                log = tempfile.TemporaryFile()  # noqa: SIM115 - closed with its worker in _stop
+                try:
+                    proc = subprocess.Popen(
+                        self._worker_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=log,
+                        env=env,
+                    )
+                except BaseException:
+                    log.close()
+                    raise
+                self._stderr_logs[proc.pid] = log
+                procs.append(proc)
+        except BaseException:
+            # Not yet in self._workers, so _fail could not stop these.
+            self._stop(kill=True, procs=procs)
+            raise
+        return procs
+
+    def _read_reply(self, proc, deadline: float):
+        try:
+            return _read_frame(proc, deadline)
+        except _WorkerFailure as exc:
+            log = self._stderr_logs.get(proc.pid)
+            tail = _stderr_tail(log) if log is not None else ""
+            if tail:
+                raise _WorkerFailure(f"{exc}; worker stderr: ...{tail}") from None
+            raise
+
+    def build(self, spec: Bf16OverrideGraphSpec, device_index: int, heur_modes):
+        """Return ``(candidates, [(tactic, serialized_plan), ...], build_here)``, or ``None``.
+
+        ``candidates`` is every tactic in plan-index order; the plans follow
+        that order and omit candidates that could not be built. ``build_here``
+        lists tactics whose plans built in a worker but could not be exported;
+        the caller builds those itself.
+        """
+        if os.getpid() != self._owner_pid:
+            return None
+        with self._lock:
+            if self._broken:
+                return None
+            try:
+                result = self._build(spec, device_index, list(heur_modes))
+            except BaseException as exc:  # noqa: BLE001 - never fail a tuning run
+                # An interrupt between sending requests and reading every reply
+                # leaves replies queued for the next build, so the workers go
+                # too; only real errors are swallowed.
+                self._fail(exc)
+                if not isinstance(exc, Exception):
+                    raise
+                return None
+            self._last_use = time.monotonic()
+            self._schedule_idle_stop()
+            return result
+
+    def disable(self, reason) -> None:
+        """Stop the workers and build in-process from now on (e.g. a result failed to load)."""
+        if os.getpid() != self._owner_pid:
+            return
+        with self._lock:
+            if not self._broken:
+                self._fail(reason)
+
+    def _schedule_idle_stop(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+        self._idle_timer = threading.Timer(self.idle_s, self._idle_stop)
+        self._idle_timer.daemon = True
+        self._idle_timer.start()
+
+    def _idle_stop(self) -> None:
+        with self._lock:
+            if self._broken or time.monotonic() - self._last_use < self.idle_s:
+                return
+            self._stop(kill=False)
+            self._workers.clear()
+
+    def _build(self, spec, device_index, heur_modes):
+        procs = self._workers.get(device_index)
+        if procs is None:
+            procs = self._workers[device_index] = self._spawn(device_index)
+        wire = spec_to_wire(spec)
+        self._next_request_id += 1
+        request_id = self._next_request_id
+        for shard_index, proc in enumerate(procs):
+            write_frame(
+                proc.stdin,
+                {
+                    "request_id": request_id,
+                    "device_index": device_index,
+                    "spec": wire,
+                    "heur_modes": heur_modes,
+                    "shard": (shard_index, len(procs)),
+                },
+            )
+        deadline = time.monotonic() + self.timeout_s
+        responses = [self._read_reply(proc, deadline) for proc in procs]
+        self.last_responses = responses
+        if any(r.get("request_id") != request_id for r in responses):
+            raise _WorkerFailure("reply for another request")
+
+        candidates = responses[0]["candidates"]
+        by_index = {}
+        build_here = set()
+        for response in responses:
+            if response.get("error"):
+                raise _WorkerFailure(response["error"])
+            if response["device_index"] != device_index:
+                raise _WorkerFailure("worker answered for another device")
+            if response["candidates"] != candidates:
+                raise _WorkerFailure("workers disagree on the candidate plans")
+            for index, tactic, blob in response["plans"]:
+                if not 0 <= index < len(candidates) or candidates[index] != tactic:
+                    raise _WorkerFailure("plan does not match its candidate")
+                by_index[index] = (tactic, blob)
+            for index in response.get("in_process", ()):
+                if not 0 <= index < len(candidates):
+                    raise _WorkerFailure("plan does not match its candidate")
+                build_here.add(index)
+        # No plan at all points at the workers' environment rather than at
+        # individual engines, so build in-process instead.
+        if not by_index and not build_here:
+            raise _WorkerFailure(f"built none of {len(candidates)} candidate plans")
+        return (
+            candidates,
+            [by_index[index] for index in sorted(by_index)],
+            [candidates[index] for index in sorted(build_here)],
+        )
+
+    def _fail(self, exc) -> None:
+        self._broken = True
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+        logger.warning(
+            "[cuDNN plan workers]: %s; building cuDNN plans in-process for the "
+            "rest of this process",
+            exc,
+        )
+        self._stop(kill=True)
+
+    def _stop(self, kill: bool, procs=None) -> None:
+        procs = self._all_processes() if procs is None else procs
+        for proc in procs:
+            try:
+                if kill:
+                    proc.kill()
+                else:
+                    proc.stdin.close()
+            except OSError:
+                pass
+        # One deadline for all workers, not one per worker.
+        deadline = time.monotonic() + 5
+        for proc in procs:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            for stream in (
+                proc.stdin,
+                proc.stdout,
+                self._stderr_logs.pop(proc.pid, None),
+            ):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
+
+    def shutdown(self) -> None:
+        if os.getpid() != self._owner_pid:
+            return
+        with self._lock:
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+            self._stop(kill=False)
+            self._workers.clear()
+
+
+_pool = None
+_pool_resolved = False
+
+
+def _release_inherited_pipes(pool) -> None:
+    # The child's copies of the workers' stdin pipes would keep them from
+    # seeing EOF when the parent stops them. Point the descriptors at
+    # /dev/null instead of closing them: the inherited file objects close
+    # them again later, which must not hit a reused descriptor number.
+    devnull = os.open(os.devnull, os.O_RDWR)
+    try:
+        for proc in pool._all_processes():
+            for stream in (proc.stdin, proc.stdout):
+                with contextlib.suppress(OSError, ValueError, AttributeError):
+                    os.dup2(devnull, stream.fileno())
+    finally:
+        os.close(devnull)
+
+
+def _reset_after_fork() -> None:
+    # The workers and pipes belong to the parent; a forked child starts over
+    # (and re-reads the environment variable) on its first tuning call.
+    global _pool, _pool_resolved
+    if _pool is not None:
+        with contextlib.suppress(OSError):
+            _release_inherited_pipes(_pool)
+    _pool = None
+    _pool_resolved = False
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
+
+
+def _shutdown_pool() -> None:
+    # Looks the pool up at exit, so a forked child (whose pool is reset) does
+    # not touch the parent's.
+    if _pool is not None:
+        _pool.shutdown()
+
+
+atexit.register(_shutdown_pool)
+
+
+def get_cudnn_plan_build_pool():
+    """The process-wide pool, or ``None`` when ``FLASHINFER_CUDNN_PLAN_BUILD_WORKERS`` is 0/unset."""
+    global _pool, _pool_resolved
+    if _pool_resolved:
+        return _pool
+    _pool_resolved = True
+    raw = os.environ.get(ENV_VAR, "").strip()
+    if not raw:
+        return None
+    try:
+        workers = int(raw)
+    except ValueError:
+        workers = -1
+    if workers < 0:
+        logger.warning("Ignoring %s=%r: expected a non-negative integer", ENV_VAR, raw)
+        return None
+    if workers == 0:
+        return None
+    cpus = os.cpu_count()
+    if cpus and workers > cpus:
+        # Workers are per tuned device and ~800 MB each; more than the CPUs
+        # cannot build faster.
+        logger.warning("Capping %s=%d at %d (CPU count)", ENV_VAR, workers, cpus)
+        workers = cpus
+    _pool = CudnnPlanBuildPool(workers)
+    return _pool
