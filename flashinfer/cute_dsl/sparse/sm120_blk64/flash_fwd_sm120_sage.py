@@ -512,6 +512,8 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
                 n_tile_idx,
             )
 
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
             K_pipeline.consumer_release(K_consumer_state)
             K_consumer_state.advance()
 
@@ -564,6 +566,8 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
                 smem_tiled_copy_V,
             )
             _accumulate_o_block_fp8(tOrO, tOrO_block)
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
             V_pipeline.consumer_release(V_consumer_state)
             V_consumer_state.advance()
 
