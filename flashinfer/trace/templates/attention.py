@@ -4690,14 +4690,15 @@ def _trtllm_batch_decode_mla_sparse_reference(
     seq_lens,
     max_seq_len,
     sparse_mla_top_k,
+    sparse_mla_top_k_lens=None,
     **kwargs,
 ):
-    """Reference for sparse top-k page MLA decode.
+    """Reference for sparse top-k token MLA decode.
 
     This reference models only the attention output, not optional LSE output.
     ``return_lse_base`` is accepted in kwargs and does not affect it.
     """
-    del workspace_buffer, qk_nope_head_dim, seq_lens, max_seq_len, sparse_mla_top_k
+    del workspace_buffer, qk_nope_head_dim, max_seq_len, sparse_mla_top_k
     batch_size, q_len, num_heads, head_dim_qk = query.shape
     assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
     bmm1_scale = kwargs.get("bmm1_scale", 1.0)
@@ -4708,6 +4709,14 @@ def _trtllm_batch_decode_mla_sparse_reference(
         bmm2_scale = float(bmm2_scale.item())
     if kv_cache.dim() == 4:
         kv_cache = kv_cache.squeeze(1)
+    kv_flat = kv_cache.reshape(-1, head_dim_qk).to(torch.float32)
+    topk_lengths = sparse_mla_top_k_lens
+    if topk_lengths is not None:
+        topk_lengths = topk_lengths.reshape(batch_size, q_len)
+    elif qk_rope_head_dim == 64 and seq_lens is not None:
+        # QK576 bounds selected slots by each query's causal KV length.
+        positions = torch.arange(q_len, dtype=seq_lens.dtype, device=seq_lens.device)
+        topk_lengths = (seq_lens[:, None] - q_len + positions + 1).clamp_min(0)
     output = torch.zeros(
         (batch_size, q_len, num_heads, kv_lora_rank),
         dtype=query.dtype,
@@ -4715,12 +4724,17 @@ def _trtllm_batch_decode_mla_sparse_reference(
     )
     for b in range(batch_size):
         for t in range(q_len):
-            pages = block_tables[b, t].to(torch.long)
-            valid = (pages >= 0) & (pages < kv_cache.shape[0])
-            pages = pages[valid]
-            if pages.numel() == 0:
+            tokens = block_tables[b, t].to(torch.long)
+            valid = (tokens >= 0) & (tokens < kv_flat.shape[0])
+            if topk_lengths is not None:
+                valid &= (
+                    torch.arange(tokens.numel(), device=query.device)
+                    < topk_lengths[b, t]
+                )
+            tokens = tokens[valid]
+            if tokens.numel() == 0:
                 continue
-            flat = kv_cache[pages].reshape(-1, head_dim_qk).to(torch.float32)
+            flat = kv_flat[tokens]
             kn = flat[:, :kv_lora_rank]
             kp = flat[:, kv_lora_rank:]
             q = query[b, t].to(torch.float32)
@@ -4803,6 +4817,7 @@ def _trtllm_batch_decode_mla_sparse_init(
     *,
     batch_size: int,
     q_len_per_request: int,
+    num_query_rows: int | None = None,
     num_heads: int = 128,
     head_dim_qk: int = 576,
     kv_lora_rank: int = 512,
@@ -4814,9 +4829,12 @@ def _trtllm_batch_decode_mla_sparse_init(
     sparse_mla_top_k: int = 2048,
     workspace_size: int = 256 << 20,
     device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for sparse top-k ``trtllm_batch_decode_with_kv_cache_mla``."""
+    if num_query_rows is not None and num_query_rows != batch_size * q_len_per_request:
+        raise ValueError("num_query_rows must equal batch_size * q_len_per_request")
     torch.manual_seed(seed)
     num_pages = max(num_pages, 1)
     query = (
@@ -4829,7 +4847,7 @@ def _trtllm_batch_decode_mla_sparse_init(
             device=device,
         )
         / 4.0
-    ).to(torch.float8_e4m3fn)
+    ).to(dtype)
     kv_cache = (
         torch.randn(
             num_pages,
@@ -4840,19 +4858,19 @@ def _trtllm_batch_decode_mla_sparse_init(
             device=device,
         )
         / 4.0
-    ).to(torch.float8_e4m3fn)
-    page_ids = (
-        torch.arange(sparse_mla_top_k, dtype=torch.int32, device=device) % num_pages
+    ).to(dtype)
+    token_ids = torch.arange(sparse_mla_top_k, dtype=torch.int32, device=device) % (
+        num_pages * page_size
     )
     block_tables = (
-        page_ids.view(1, 1, sparse_mla_top_k)
+        token_ids.view(1, 1, sparse_mla_top_k)
         .expand(batch_size, q_len_per_request, sparse_mla_top_k)
         .contiguous()
     )
     seq_len = page_size * min(num_pages, sparse_mla_top_k)
     seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
     workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)
-    return {
+    inputs = {
         "query": query,
         "kv_cache": kv_cache,
         "workspace_buffer": workspace_buffer,
@@ -4867,6 +4885,32 @@ def _trtllm_batch_decode_mla_sparse_init(
         "bmm2_scale": 1.0,
         "is_var_seq": False,
     }
+    if num_query_rows is not None:
+        lengths = torch.full(
+            (num_query_rows,),
+            sparse_mla_top_k,
+            dtype=torch.int32,
+            device=device,
+        )
+        lengths[1::2] = sparse_mla_top_k // 2
+        inputs["sparse_mla_top_k_lens"] = lengths
+        # Only cuDNN accepts explicit lengths at QK576. Auto skips it below
+        # the 128-row crossover in flashinfer.mla._cudnn_sparse.
+        if head_dim_qk == 576 and num_query_rows < 128:
+            inputs["backend"] = "cudnn"
+    return inputs
+
+
+_trtllm_batch_decode_mla_sparse_init._trace_init_const_axes = (  # type: ignore[attr-defined]
+    "num_heads",
+    "head_dim_qk",
+    "kv_lora_rank",
+    "qk_rope_head_dim",
+    "qk_nope_head_dim",
+    "kv_pad_dim",
+    "page_size",
+    "sparse_mla_top_k",
+)
 
 
 def _trtllm_batch_decode_mla_ragged_init(
@@ -5132,9 +5176,9 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
     op_type="mla_paged",
     name_prefix="trtllm_batch_decode_mla_sparse",
     description=(
-        "SM100+ TRT-LLM MLA paged decode with NSA-style sparse top-k page "
+        "Sparse MLA paged attention (TRTLLM-GEN or eligible cuDNN DSA) with top-k token "
         "selection (DSV3.2 / GLM-5). Selected when sparse_mla_top_k > 0. "
-        "block_tables is a sparse top-k page index of shape [num_seqs, "
+        "block_tables contains physical token indices of shape [num_seqs, "
         "q_len_per_request, sparse_mla_top_k] rather than the dense "
         "[batch_size, max_pages_per_seq] layout. The trace and reference "
         "currently model only the attention output, not the optional LSE output."
@@ -5155,7 +5199,7 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
         "page_size": Const(abbrev="ps"),
         "sparse_mla_top_k": Const(
             abbrev="topk",
-            description="Number of top-k pages selected per query token.",
+            description="Number of top-k token slots selected per query token.",
         ),
         "workspace_size": Var(description="Workspace buffer length in bytes."),
     },
@@ -5180,15 +5224,15 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
             ["batch_size", "q_len_per_request", "sparse_mla_top_k"],
             dtype="int32",
             description=(
-                "Sparse top-k page index: for each (sequence, query token), "
-                "the IDs of the top_k pages selected by the NSA indexer."
+                "Sparse top-k token index: for each (sequence, query token), "
+                "physical rows of the flattened KV pool selected by the indexer."
             ),
         ),
         "seq_lens": Tensor(["batch_size"], dtype="int32"),
         "max_seq_len": Scalar("int32"),
         "sparse_mla_top_k": Scalar(
             "int32",
-            description="Number of top-k pages selected per query token; >0 selects this template.",
+            description="Number of top-k token slots selected per query token; >0 selects this template.",
         ),
         "bmm1_scale": Scalar(
             "float32",
@@ -5224,7 +5268,44 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
             dtype_from="query",
         ),
     },
-    tags=["status:verified", "stage:decode", "backend:trtllm", "mla", "sparse"],
+    tags=[
+        "status:verified",
+        "stage:decode",
+        "backend:trtllm",
+        "backend:cudnn",
+        "mla",
+        "sparse",
+    ],
+    reference=_trtllm_batch_decode_mla_sparse_reference,
+    init=_trtllm_batch_decode_mla_sparse_init,
+)
+
+
+# Trace Apply uses the definition name and ordered inputs to call positional
+# solutions. Give explicit lengths a separate definition to preserve that ABI.
+trtllm_batch_decode_mla_sparse_with_lengths_trace = TraceTemplate(
+    op_type=trtllm_batch_decode_mla_sparse_trace.op_type,
+    name_prefix="trtllm_batch_decode_mla_sparse_with_lengths",
+    description=trtllm_batch_decode_mla_sparse_trace.description,
+    axes={
+        **trtllm_batch_decode_mla_sparse_trace.axes,
+        "num_query_rows": Var(description="Total fixed-layout query rows."),
+    },
+    inputs={
+        **trtllm_batch_decode_mla_sparse_trace.inputs,
+        "sparse_mla_top_k_lens": Tensor(
+            ["num_query_rows"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Active selected slots per query row, flattened in batch-major "
+                "order. Overrides the QK576 causal prefix derived from seq_lens."
+            ),
+        ),
+    },
+    outputs=trtllm_batch_decode_mla_sparse_trace.outputs,
+    tags=trtllm_batch_decode_mla_sparse_trace.tags,
+    constraints=["num_query_rows == batch_size * q_len_per_request"],
     reference=_trtllm_batch_decode_mla_sparse_reference,
     init=_trtllm_batch_decode_mla_sparse_init,
 )
@@ -5238,6 +5319,8 @@ def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
         )
     sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
     if sparse_mla_top_k > 0:
+        if kwargs.get("sparse_mla_top_k_lens") is not None:
+            return trtllm_batch_decode_mla_sparse_with_lengths_trace
         return trtllm_batch_decode_mla_sparse_trace
     if kwargs.get("cum_seq_lens_q") is None:
         return trtllm_batch_decode_mla_dense_trace
@@ -5248,6 +5331,7 @@ trtllm_batch_decode_mla_trace_dispatch.templates = [  # type: ignore[attr-define
     trtllm_batch_decode_mla_dense_trace,
     trtllm_batch_decode_mla_ragged_trace,
     trtllm_batch_decode_mla_sparse_trace,
+    trtllm_batch_decode_mla_sparse_with_lengths_trace,
 ]
 
 

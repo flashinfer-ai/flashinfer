@@ -306,6 +306,55 @@ PageAttention for MLA
     the bytes of ``nvfp4_quantize_append_sparse_mla_cache`` applied to the
     BF16-rounded roped rows.
 
+cuDNN Token-Sparse MLA
+----------------------
+
+:func:`trtllm_prefill_with_kv_cache_mla` and
+:func:`trtllm_batch_decode_with_kv_cache_mla` accept ``backend="cudnn"`` for
+cuDNN Frontend's ``DSA.SparseAttentionForward``. Install
+``nvidia-cudnn-frontend[cutedsl]>=1.32.0``. This backend supports SM100/SM103,
+BF16 queries and KV, 64 local query heads, latent rank 512, and absorbed QK
+dimension 576 (RoPE) or 512 (NoPE). Tensor-parallel shapes with fewer local
+heads and FP8 calls retain the existing backend under ``backend="auto"``.
+
+``backend="auto"`` prefers cuDNN when an eligible sparse call has at least
+128 total query rows. Fixed queries count ``batch_size * q_len_per_request``;
+compact queries count ``total_q``. This includes both large decode batches and
+prefill chunks. Explicit ``backend="cudnn"`` also allows smaller calls.
+Missing cuDNN support or incompatible features retain the existing auto path.
+The 128-row policy is based on SM100 measurements; SM103 is supported by the
+upstream kernel but has not been performance-qualified for this policy.
+
+``block_tables`` contains physical token indices into the flattened packed KV
+pool, with one selected list per query row. Invalid indices are masked. Duplicate
+indices count as separate softmax slots. For QK576, when
+``sparse_mla_top_k_lens`` is omitted and ``seq_lens`` is supplied, cuDNN uses
+at most the first ``max(seq_lens[b] - q_len + t + 1, 0)`` slots of the list
+for query position ``t`` (zero-based) in request ``b``. The request's query
+length ``q_len`` is ``q_len_per_request`` for fixed queries and comes from
+``cum_seq_lens_q`` for compact queries. This bound applies to slot positions
+in the list. The caller must encode request boundaries and causality in the
+listed physical token IDs.
+
+An explicit ``sparse_mla_top_k_lens`` tensor supplies the active prefix
+length for each query row and overrides the QK576 bound from ``seq_lens``.
+QK512 uses all valid slots when explicit lengths are omitted. The backend
+views contiguous Q/KV without gathering the cache and handles selected
+widths not divisible by 64. Empty selections return zero output and
+positive-infinity LSE.
+
+Pass the model's attention scale as ``bmm1_scale`` (for example, ``1/16`` for
+GLM-5.3). ``bmm2_scale`` must be 1. Sinks, DCP, explicit PDL, skip-softmax,
+and TRTLLM counter buffers are unsupported. LSE defaults to base 2, matching
+TRTLLM-GEN. Under ``auto``, compact queries preserve the previous natural-log
+LSE default. Set ``return_lse_base="basee"`` or ``"base2"`` for explicit units.
+
+Warm each shape configuration eagerly before CUDA Graph capture. The caller's
+workspace supplies statistics scratch: ``total_q * 64 * 8`` bytes, or half
+that when LSE storage is supplied/requested. Use independent workspaces for
+overlapping executions. Benchmark this path with
+``python benchmarks/bench_cudnn_sparse_mla.py``.
+
 .. note::
 
     With ``backend="cute-dsl"``, pass ``hca_swa_indices`` as absolute rows into
