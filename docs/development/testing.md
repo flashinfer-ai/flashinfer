@@ -4,7 +4,9 @@ Use the targeted commands in [AGENTS.md](../../AGENTS.md) for routine changes.
 This reference covers:
 
 - [CPU-only PR lane](#cpu-only-pr-lane)
+- [Test markers](#test-markers)
 - [Runner scheduling](#sharded-test-runner)
+- [Full parameter matrices](#full-parameter-matrices)
 - [Resource telemetry](#resource-telemetry)
 - [Collection and completion reports](#collection-and-completion-reports)
 - [MXFP8 startup benchmark](#mxfp8-startup-benchmark)
@@ -16,6 +18,40 @@ Every public run that executes tests also runs all of `tests/cpu` in the
 "CPU Unittest" lane on a CPU runner, regardless of selected targets. These tests
 must not require a GPU; GPU lanes exclude them. Docs-only PRs run no tests, and
 `workflow_dispatch` with `skip_gpu` also drops the CPU lane.
+
+Mark GPU-free tests with `cpu_only` (registered in `pytest.ini`). The marker is
+an identifier for readers and tooling: it does not change collection, selection,
+or execution, and the lane's no-GPU requirement is still a review convention
+rather than something a plugin enforces.
+
+## Test markers
+
+Markers declare what a test module needs. `tests/conftest.py`
+(`pytest_collection_modifyitems`) turns a requirement marker into a skip when
+the current host cannot satisfy it, so the lane schedules and skips correctly
+instead of failing on an unsupported machine. A test that guards itself with the
+`flashinfer.utils` helpers instead (see [Architecture guards](#architecture-guards))
+can still carry the marker: it tells CI what the file needs even when the skip
+comes from the test body.
+
+| Marker | Requires | Behavior when unmet |
+| --- | --- | --- |
+| `gpu` | at least one CUDA GPU | **nothing** -- descriptive only; guard the test yourself (see [Architecture guards](#architecture-guards)) |
+| `gpu_2`, `gpu_4`, `gpu_8` | that many ranks, or that many visible GPUs | skipped when `WORLD_SIZE` is unset, and when both the visible GPU count and the launched rank count are below the requirement |
+| `arch_hopper` | exactly sm_90 | skipped on any other compute capability |
+| `arch_blackwell` | sm_100 or sm_103 | skipped when the capability is below `(10, 0)` or at `(10, 7)` and above |
+| `arch_rubin` | exactly sm_107 | skipped elsewhere, and when the installed CuTe DSL cannot natively target sm_107 |
+| `arch_sm120` | sm_120 or sm_121 | skipped when the major version is not 12 |
+| `nvep` | an install with a `moe_ep` backend | skipped when no backend was built |
+| `node_exclusive`, `gpu_exclusive`, `host_memory_heavy` | scheduling hint | no skip; see [Scheduling and memory](#scheduling-and-memory) |
+| `long_running` | scheduling hint | no skip; the sharded runner prioritizes this source's runnable units |
+| `shard_group(name)` | scheduling hint | no skip; keeps nodes from one source in one pytest batch |
+| `cpu_only` | no GPU | no skip or selection change (see above) |
+
+`FAIL_ON_DISTRIBUTED_SKIP=1` turns the missing-launcher skip of a `gpu_2` /
+`gpu_4` / `gpu_8` test into an error. Runners that exist only to execute
+multi-rank tests set it so that a launcher regression fails loudly instead of
+silently skipping the whole lane.
 
 ## Sharded test runner
 
@@ -56,6 +92,32 @@ wall times with matching scope and cache conditions.
 Capacity reports include the host-heavy/node-exclusive serial floor, but use
 worker counts without topology or measured memory capacity. Treat their GPU
 contention estimates as optimistic.
+
+## Full parameter matrices
+
+Tests that sweep several axes use `parametrize_product` from
+`tests/infra/test_helpers/parametrize.py`: each axis lists its candidate values
+and the test supplies the `regular` subset of cases to run. Without a flag
+pytest collects that subset; with `--full` it collects the Cartesian product of
+every axis.
+
+```bash
+pytest tests/attention/test_batch_decode_kernels.py   # curated subset
+pytest tests/ --full                                  # full product, for every test that uses it
+```
+
+Nightly builds inject `--full` through `PYTEST_ADDOPTS` (see
+`scripts/infra/task_test_nightly_build.sh`), so the nightly matrix is the full
+product. Use `--full` to reproduce a nightly-only failure locally; keep routine
+PR iteration on the regular subset.
+
+`--full` is registered twice -- in `tests/infra/test_helpers/parametrize.py` and
+in `scripts/infra/test_sharding/pytest_plugin.py`. The plugin has to accept it
+for collection and execution subprocesses that do not have `tests/conftest.py`
+on their conftest discovery path, where an unrecognized `PYTEST_ADDOPTS=--full`
+would abort the run. Both registrations pass an explicit `dest`, because
+pytest 9.2 and later rejects a second option that maps to an already-used
+destination.
 
 ## Resource telemetry
 
