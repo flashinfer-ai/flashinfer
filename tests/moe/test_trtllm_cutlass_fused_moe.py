@@ -4989,5 +4989,367 @@ def test_vectorized_kernel_rejects_misaligned_input():
         )
 
 
+# ---------------------------------------------------------------------------
+# Device-side token count (num_active_tokens) and fp32 output
+# ---------------------------------------------------------------------------
+_NAT_FILL = 7.0
+_NAT_HIDDEN, _NAT_INTER, _NAT_EXPERTS, _NAT_TOP_K = 256, 256, 8, 2
+
+
+def _num_active_tokens_case(
+    num_rows, num_active, *, seed=0, ep_size=2, ep_rank=1, bias=False
+):
+    """A bf16 expert-parallel case for the device token count. Rows at or beyond ``num_active``
+    carry stale routing ids that name a local expert, so a kernel that reads them does extra
+    work and writes those rows. The last live row routes only to the other rank's experts, so
+    the finalize has to handle a live token without a local expert."""
+    torch.manual_seed(seed)
+    local = _NAT_EXPERTS // ep_size
+    x = torch.randn(num_rows, _NAT_HIDDEN, dtype=torch.bfloat16, device="cuda") / 5
+    w31 = (
+        torch.randn(
+            local, 2 * _NAT_INTER, _NAT_HIDDEN, dtype=torch.bfloat16, device="cuda"
+        )
+        / 5
+    )
+    w2 = (
+        torch.randn(local, _NAT_HIDDEN, _NAT_INTER, dtype=torch.bfloat16, device="cuda")
+        / 5
+    )
+    router_logits = torch.randn(
+        num_rows, _NAT_EXPERTS, dtype=torch.float32, device="cuda"
+    )
+    routing_weights, selected_experts = compute_routing(router_logits, _NAT_TOP_K)
+    selected_experts = selected_experts.to(torch.int32)
+    other_rank = (ep_rank + 1) % ep_size
+    selected_experts[num_active - 1] = (
+        torch.arange(_NAT_TOP_K, dtype=torch.int32, device="cuda") + other_rank * local
+    )
+    selected_experts[num_active:] = ep_rank * local
+    kwargs = dict(quant_scales=None, ep_size=ep_size, ep_rank=ep_rank)
+    if bias:
+        kwargs["fc1_expert_biases"] = (
+            torch.randn(local, 2 * _NAT_INTER, dtype=torch.bfloat16, device="cuda") / 5
+        )
+        kwargs["fc2_expert_biases"] = (
+            torch.randn(local, _NAT_HIDDEN, dtype=torch.bfloat16, device="cuda") / 5
+        )
+    return dict(
+        x=x,
+        selected_experts=selected_experts,
+        routing_weights=routing_weights,
+        w31=w31,
+        w2=w2,
+        count=torch.tensor([num_active], dtype=torch.int32, device="cuda"),
+        num_active=num_active,
+        kwargs=kwargs,
+    )
+
+
+def _nat_call(case, output_dtype, out, rows=None, **overrides):
+    """Run the kernel on the first ``rows`` rows of the case (all when None) into ``out``."""
+    n = case["x"].shape[0] if rows is None else rows
+    fused_moe.cutlass_fused_moe(
+        case["x"][:n].contiguous(),
+        case["selected_experts"][:n].contiguous(),
+        case["routing_weights"][:n].contiguous(),
+        case["w31"],
+        case["w2"],
+        output_dtype,
+        output=out,
+        **dict(case["kwargs"], **overrides),
+    )
+    return out
+
+
+def _nat_bounded(case, output_dtype, **overrides):
+    """The bounded call: the whole buffer with ``num_active_tokens``, output pre-filled."""
+    out = torch.full(case["x"].shape, _NAT_FILL, dtype=output_dtype, device="cuda")
+    return _nat_call(
+        case, output_dtype, out, num_active_tokens=case["count"], **overrides
+    )
+
+
+def _nat_reference(case, **overrides):
+    """The unbounded kernel on the live prefix alone, bf16, unfused finalize, pre-filled."""
+    n = case["num_active"]
+    out = torch.full((n, _NAT_HIDDEN), _NAT_FILL, dtype=torch.bfloat16, device="cuda")
+    return _nat_call(
+        case, torch.bfloat16, out, rows=n, use_fused_finalize=False, **overrides
+    )
+
+
+def _nat_check(case, out, ref, *, enable_alltoall=False):
+    """The contract: live rows match the unbounded kernel, rows past the count are untouched,
+    and a live row without a local expert is zeroed (left alone under all-to-all)."""
+    n = case["num_active"]
+    torch.testing.assert_close(out[:n].to(torch.bfloat16), ref, rtol=1e-2, atol=1e-2)
+    assert torch.equal(out[n:], torch.full_like(out[n:], _NAT_FILL)), (
+        "rows past the count written"
+    )
+    expected = _NAT_FILL if enable_alltoall else 0.0
+    assert torch.equal(out[n - 1], torch.full_like(out[n - 1], expected))
+
+
+@pytest.mark.parametrize("num_rows,num_active", [(128, 50), (512, 300)])
+@pytest.mark.parametrize("enable_alltoall", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_num_active_tokens(num_rows, num_active, enable_alltoall, bias):
+    """Rows at or beyond ``num_active_tokens`` are ignored (stale routing ids included) and left
+    untouched, the live rows match the unbounded kernel, and the fp32 output is the bf16 output's
+    accumulation before its final rounding: both bounded calls take the default tactic and the
+    unfused finalize. (128, 50) takes the fused single-block expert-map prologue, (512, 300) the
+    three-step one. Biases are read in the GEMM dtype for both output dtypes."""
+    case = _num_active_tokens_case(num_rows, num_active, bias=bias)
+    ref = _nat_reference(case, enable_alltoall=enable_alltoall, profile_ids=[-1, -1])
+    out_bf16 = _nat_bounded(
+        case, torch.bfloat16, enable_alltoall=enable_alltoall, profile_ids=[-1, -1]
+    )
+    out_fp32 = _nat_bounded(
+        case, torch.float32, enable_alltoall=enable_alltoall, profile_ids=[-1, -1]
+    )
+    _nat_check(case, out_bf16, ref, enable_alltoall=enable_alltoall)
+    _nat_check(case, out_fp32, ref, enable_alltoall=enable_alltoall)
+    assert torch.equal(out_fp32[:num_active].to(torch.bfloat16), out_bf16[:num_active])
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_num_active_tokens_cuda_graph_replay():
+    """One captured graph replayed at two counts over rewritten inputs: each replay equals the
+    eager bounded call, rows between the second and the first count keep the first replay's
+    values, rows past the first count keep the fill. The count tensor is the fixed-address int32
+    scalar the API is for, and the workspace is the pre-sized buffer a graph needs."""
+    num_rows, first, second = 512, 300, 100
+    case = _num_active_tokens_case(num_rows, first)
+    workspace = torch.empty(
+        fused_moe.cutlass_fused_moe_workspace_size(
+            num_rows,
+            _NAT_HIDDEN,
+            _NAT_INTER,
+            _NAT_EXPERTS,
+            _NAT_TOP_K,
+            x_dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
+            output_dtype=torch.float32,
+            ep_size=2,
+            ep_rank=1,
+            use_fused_finalize=False,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    out = torch.full(
+        (num_rows, _NAT_HIDDEN), _NAT_FILL, dtype=torch.float32, device="cuda"
+    )
+    overrides = dict(
+        num_active_tokens=case["count"],
+        workspace_buffer=workspace,
+        profile_ids=[-1, -1],
+    )
+    for _ in range(2):  # runner construction and allocator warm-up outside the capture
+        _nat_call(case, torch.float32, out, **overrides)
+    torch.cuda.synchronize()
+    out.fill_(_NAT_FILL)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _nat_call(case, torch.float32, out, **overrides)
+    torch.cuda.synchronize()
+
+    def rewrite_inputs(seed, num_active):
+        fresh = _num_active_tokens_case(num_rows, num_active, seed=seed)
+        for name in ("x", "selected_experts", "routing_weights", "w31", "w2"):
+            case[name].copy_(fresh[name])
+        case["count"].fill_(num_active)
+        case["num_active"] = num_active
+
+    rewrite_inputs(1, first)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, _nat_bounded(case, torch.float32, profile_ids=[-1, -1]))
+    after_first = out.clone()
+
+    rewrite_inputs(2, second)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = _nat_bounded(case, torch.float32, profile_ids=[-1, -1])
+    assert torch.equal(out[:second], expected[:second])
+    assert torch.equal(out[second:], after_first[second:])
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_num_active_tokens_every_gemm2_tactic():
+    """With the count every GEMM2 tactic the runner offers leaves the rows past the count alone,
+    and no runner with the fused finalize is built for a bounded call: the FINALIZE epilogue,
+    which zero-fills the whole output, is not in the tactic list it can select from."""
+    case = _num_active_tokens_case(128, 50)
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner_dict = get_cutlass_fused_moe_module(
+        f"{major * 10 + minor}"
+    ).MoERunner.runner_dict
+    runners_before = set(runner_dict)
+    ref = _nat_reference(case, profile_ids=[-1, -1])
+    _nat_check(case, _nat_bounded(case, torch.bfloat16, profile_ids=[-1, -1]), ref)
+    # (x, weight, output, deepseek_fp8, w4_group, mxfp8_act, packed, fused_finalize, humming)
+    runner = runner_dict[
+        (
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
+    ]
+    gemm1_count = runner.get_gemm1_tactic_count()
+    gemm2_count = runner.get_gemm2_tactic_count()
+    assert gemm2_count > 0
+    ran, rejected = 0, []
+    for tactic in range(gemm2_count):
+        try:
+            out = _nat_bounded(
+                case, torch.bfloat16, profile_ids=[-1, gemm1_count + tactic]
+            )
+            torch.cuda.synchronize()
+        except (
+            RuntimeError
+        ) as err:  # a tactic this shape cannot run says nothing about the count
+            rejected.append((tactic, str(err).splitlines()[0][:120]))
+            continue
+        ran += 1
+        _nat_check(case, out, ref)
+    assert ran, rejected
+    new_runners = set(runner_dict) - runners_before
+    assert all(key[7] is False for key in new_runners), new_runners
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_num_active_tokens_autotune():
+    """Autotuning a bounded fp32 call profiles the unfused runner (GEMM2 buffers in the GEMM
+    dtype) and keeps the contract; the call outside the tuning context reuses the winner."""
+    case = _num_active_tokens_case(512, 300)
+    ref = _nat_reference(case)
+    with autotune(True):
+        _nat_check(case, _nat_bounded(case, torch.float32), ref)
+    _nat_check(case, _nat_bounded(case, torch.float32), ref)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10],
+    reason="MXFP8xMXFP8 is only supported on SM100 for now",
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_num_active_tokens_mxfp8_fp32_output():
+    """MXFP8 activations with the count and fp32 output: the GEMMs produce bf16 and the finalize
+    stores the fp32 accumulation. Live rows match the unbounded bf16 kernel, rows past the count
+    are untouched, and fp32 rounded to bf16 equals the bounded bf16 output."""
+    torch.manual_seed(0)
+    num_rows, num_active = 256, 100
+    hidden, inter, e, top_k = _NAT_HIDDEN, _NAT_INTER, _NAT_EXPERTS, _NAT_TOP_K
+    x = torch.randn(num_rows, hidden, dtype=torch.bfloat16, device="cuda")
+    w1 = torch.randn((e, 2 * inter, hidden), device="cuda", dtype=torch.bfloat16) / 10
+    w2 = torch.randn((e, hidden, inter), device="cuda", dtype=torch.bfloat16) / 10
+    mxfp8_w1, w1_scale = quant_mxfp8_batches(w1, e)
+    mxfp8_w2, w2_scale = quant_mxfp8_batches(w2, e)
+    quant_scales = [
+        pack_mxfp8_scales_u8_to_int32_batches(w1_scale, 2 * inter, hidden),
+        torch.ones(e, device="cuda", dtype=torch.float32),
+        pack_mxfp8_scales_u8_to_int32_batches(w2_scale, hidden, inter),
+        torch.ones(e, device="cuda", dtype=torch.float32),
+    ]
+    router_logits = torch.randn(num_rows, e, dtype=torch.float32, device="cuda")
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    selected_experts = selected_experts.to(torch.int32)
+    selected_experts[num_active:] = 3  # stale ids past the count name an expert
+    count = torch.tensor([num_active], dtype=torch.int32, device="cuda")
+
+    def run(rows, output_dtype, **overrides):
+        # A prefix quantizes to the same fp8 values row by row; its block scales come from its
+        # own quantization, in the swizzled layout the kernel expects for that many rows.
+        x_fp8, x_sf = mxfp8_quantize(x[:rows].contiguous(), True, 32)
+        out = torch.full((rows, hidden), _NAT_FILL, dtype=output_dtype, device="cuda")
+        fused_moe.cutlass_fused_moe(
+            x_fp8,
+            selected_experts[:rows].contiguous(),
+            routing_weights[:rows].contiguous(),
+            mxfp8_w1.contiguous(),
+            mxfp8_w2.contiguous(),
+            output_dtype,
+            quant_scales=quant_scales,
+            input_sf=x_sf,
+            use_mxfp8_act_scaling=True,
+            output=out,
+            profile_ids=[-1, -1],
+            **overrides,
+        )
+        return out
+
+    ref = run(num_active, torch.bfloat16, use_fused_finalize=False)
+    out_bf16 = run(num_rows, torch.bfloat16, num_active_tokens=count)
+    out_fp32 = run(num_rows, torch.float32, num_active_tokens=count)
+    for out in (out_bf16, out_fp32):
+        torch.testing.assert_close(
+            out[:num_active].to(torch.bfloat16), ref, rtol=1e-2, atol=1e-2
+        )
+        assert torch.equal(
+            out[num_active:], torch.full_like(out[num_active:], _NAT_FILL)
+        )
+    assert torch.equal(out_fp32[:num_active].to(torch.bfloat16), out_bf16[:num_active])
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_num_active_tokens_rejections():
+    """The contract checks on the count and on fp32 output fire before any kernel work."""
+    case = _num_active_tokens_case(128, 50)
+    count = case["count"]
+
+    def call(output_dtype=torch.bfloat16, **overrides):
+        out = torch.empty(case["x"].shape, dtype=output_dtype, device="cuda")
+        return _nat_call(case, output_dtype, out, **overrides)
+
+    with pytest.raises(ValueError, match="use_fused_finalize=True cannot be combined"):
+        call(num_active_tokens=count, use_fused_finalize=True)
+    with pytest.raises(ValueError, match="use_fused_finalize=True cannot be combined"):
+        call(output_dtype=torch.float32, use_fused_finalize=True)
+    with pytest.raises(
+        ValueError, match="backend='cake' does not take num_active_tokens"
+    ):
+        call(num_active_tokens=count, backend="cake")
+    with pytest.raises(ValueError, match="not supported in min_latency_mode"):
+        call(num_active_tokens=count, min_latency_mode=True)
+    with pytest.raises(ValueError, match="Invalid dtype of num_active_tokens"):
+        call(num_active_tokens=count.to(torch.int64))
+    with pytest.raises(ValueError, match="Invalid device of num_active_tokens"):
+        call(num_active_tokens=count.cpu())
+    with pytest.raises(ValueError, match="Invalid shape of num_active_tokens"):
+        call(num_active_tokens=torch.tensor([50, 50], dtype=torch.int32, device="cuda"))
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_fp32_output_rejects_quantized_activations():
+    """fp32 output is a finalize-side conversion of the bf16/fp16 runners and of the MXFP8
+    runner; a per-tensor fp8 runner rejects it when it is built, before any kernel work."""
+    m, hidden, inter, e, top_k = 8, 128, 128, 2, 1
+    x = torch.zeros((m, hidden), dtype=torch.float8_e4m3fn, device="cuda")
+    w31 = torch.zeros((e, 2 * inter, hidden), dtype=torch.float8_e4m3fn, device="cuda")
+    w2 = torch.zeros((e, hidden, inter), dtype=torch.float8_e4m3fn, device="cuda")
+    per_expert = torch.ones(e, dtype=torch.float32, device="cuda")
+    scalar = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="float32 output is supported for"):
+        fused_moe.cutlass_fused_moe(
+            x,
+            torch.zeros((m, top_k), dtype=torch.int32, device="cuda"),
+            torch.ones((m, top_k), dtype=torch.float32, device="cuda"),
+            w31,
+            w2,
+            torch.float32,
+            quant_scales=[per_expert, scalar, per_expert, scalar],
+            output=torch.empty((m, hidden), dtype=torch.float32, device="cuda"),
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
