@@ -1693,6 +1693,14 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 cute.arch.barrier(barrier_id=self._BAR_MMA, number_of_threads=128)
                 for q in cutlass.range_constexpr(q_tiles):
                     cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
+                if cutlass.const_expr(
+                    (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+                ):
+                    cute.arch.inline_ptx(
+                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                    )
+                else:
+                    cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_empty_mbar)
 
                 if cutlass.const_expr(self._kv_fp8):
@@ -1816,6 +1824,15 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                                             rC[None, m, n],
                                         )
 
+                        if cutlass.const_expr(
+                            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor)
+                            >= (13, 4)
+                        ):
+                            cute.arch.inline_ptx(
+                                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                            )
+                        else:
+                            cute.arch.fence_proxy("async.shared", space="cta")
                         cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                         # Mask keys past the causal limit and the sequence

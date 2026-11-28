@@ -421,6 +421,14 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
         qsf_r[qi][nt] = kFp4 ? sqsf[qi * kNumHeads + nt * 8 + g] : 0u;
       }
     }
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+    asm volatile(
+        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::
+            : "memory");
+#else
+    fence_proxy_async();
+#endif
     mbar_arrive(empty_q + qb);
     float* lg = p.logits + static_cast<int64_t>(u * kNextN) * p.logits_stride;
     uint64_t lg_pol = 0;
@@ -451,6 +459,14 @@ __global__ void __launch_bounds__(kNumWsThreads, 1)
 #pragma unroll
         for (int ks = 0; ks < kKSteps; ++ks)
           ldmatrix_x4(kf[ks], kt + F::swz(a_row, ks * 2 + a_chunk_hi));
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        asm volatile(
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::
+                : "memory");
+#else
+        fence_proxy_async();
+#endif
         mbar_arrive(empty_k + st);
         const int key_0 = (t0 + i) * kBlockKV + warp * 16 + g, key_1 = key_0 + 8;
         // DeepGEMM's arithmetic, so the scores are bit-identical to its logits.
