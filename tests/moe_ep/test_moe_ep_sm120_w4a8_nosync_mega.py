@@ -14,6 +14,7 @@ Run with plain Python (workers are spawned here):
 """
 
 import argparse
+import dataclasses
 import datetime
 import os
 import warnings
@@ -394,11 +395,532 @@ def _sm120_gpus(n):
 _CUTEDSL = os.environ.get("FLASHINFER_TEST_SM120_CUTEDSL") == "1"
 
 
+def _check_borrowed_input_contract(pack, transformed, hidden, intermediate):
+    from flashinfer.moe_ep import preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync.weights import (
+        validate_transformed_mega_weights,
+    )
+
+    kwargs = dict(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        interleave_w13=False,
+        scale_layout="canonical",
+    )
+    validate_transformed_mega_weights(
+        transformed,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        local_experts=pack.w13.shape[0],
+    )
+
+    def offset(tensor, num_bytes):
+        raw = tensor.view(torch.uint8)
+        padded = torch.empty(
+            raw.numel() + num_bytes, dtype=raw.dtype, device=raw.device
+        )
+        view = padded[num_bytes:].view(tensor.dtype).view(tensor.shape)
+        view.copy_(tensor)
+        return view
+
+    aligned = offset(pack.w13, 16)
+    borrowed = preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+        dataclasses.replace(pack, w13=aligned), **kwargs
+    )
+    assert borrowed.w13.data_ptr() == aligned.data_ptr()
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+            dataclasses.replace(pack, w13=offset(pack.w13, 1)), **kwargs
+        )
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+            dataclasses.replace(pack, w13_scale=offset(pack.w13_scale, 1)), **kwargs
+        )
+    for name, tensor in (("w13", pack.w13), ("w13_scale", pack.w13_scale)):
+        raw = tensor.view(torch.uint8)
+        expanded = raw.new_empty(raw.numel() * 2)
+        noncontiguous = expanded.as_strided(
+            tensor.shape,
+            (tensor.stride(0), tensor.stride(1) * 2, tensor.stride(2)),
+        ).view(tensor.dtype)
+        noncontiguous.copy_(tensor)
+        with pytest.raises(ValueError, match="contiguous"):
+            preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+                dataclasses.replace(pack, **{name: noncontiguous}), **kwargs
+            )
+    with pytest.raises(ValueError, match="pre-interleaved fp4"):
+        preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+            pack, fp4=(pack.w13, pack.w2), **kwargs
+        )
+
+
+def _weight_layout_worker(
+    rank,
+    duplicate_destinations=False,
+    dedup_compact=False,
+    capacity_override: int | None = None,
+):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        PrequantizedMoEWeights,
+        Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig,
+        preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync.weights import (
+        validate_transformed_mega_weights,
+    )
+
+    ep = 4
+    torch.cuda.set_device(rank)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29649")
+    dist.init_process_group(
+        "nccl", rank=rank, world_size=ep, device_id=torch.device("cuda", rank)
+    )
+    hidden, intermediate, experts, topk = 512, 256, 256, 6
+    generator = torch.Generator(device="cuda").manual_seed(7919 + rank)
+    raw1, ref1 = _weights(experts // ep, 2 * intermediate, hidden, generator)
+    raw2, ref2 = _weights(experts // ep, hidden, intermediate, generator)
+    args = _args(ep=ep)
+    capacity = (
+        capacity_override
+        if capacity_override is not None
+        else (16 if dedup_compact else 128)
+    )
+    output = torch.empty(capacity, hidden, dtype=torch.bfloat16, device="cuda")
+    for interleave, scale_layout in (
+        (True, "kernel"),
+        (False, "deepgemm"),
+        (False, "canonical"),
+        (True, "deepgemm"),
+        (True, "canonical"),
+    ):
+        raw_scales = [raw1[1], raw2[1]]
+        scales = [
+            (
+                sf.view(torch.int32).transpose(1, 2).contiguous().transpose(1, 2)
+                if scale_layout == "deepgemm"
+                else sf.view(torch.float8_e8m0fnu)
+            )
+            for sf in raw_scales
+        ]
+        pack = PrequantizedMoEWeights(
+            w13=raw1[0].view(torch.float4_e2m1fn_x2),
+            w2=raw2[0].view(torch.float4_e2m1fn_x2),
+            w13_scale=scales[0],
+            w2_scale=scales[1],
+        )
+        transformed = preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+            pack,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            interleave_w13=interleave,
+            scale_layout=scale_layout,
+        )
+        if not interleave:
+            assert transformed.w13.data_ptr() == raw1[0].data_ptr()
+        for name, source in zip(("w13_scale", "w2_scale"), scales, strict=True):
+            pointer = getattr(transformed, name).data_ptr()
+            if scale_layout == "kernel":
+                assert pointer != source.data_ptr()
+            else:
+                assert pointer == source.data_ptr()
+        if rank == 0:
+            validate_transformed_mega_weights(
+                transformed,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                local_experts=experts // ep,
+            )
+            if scale_layout == "deepgemm":
+                uint8_scale = transformed.w13_scale
+                checked = preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+                    dataclasses.replace(pack, w13_scale=uint8_scale),
+                    hidden_size=hidden,
+                    intermediate_size=intermediate,
+                    interleave_w13=interleave,
+                    scale_layout=scale_layout,
+                )
+                assert checked.w13_scale.data_ptr() == uint8_scale.data_ptr()
+                invalid_scale = uint8_scale.as_strided(
+                    uint8_scale.shape,
+                    (
+                        uint8_scale.stride(0),
+                        1,
+                        uint8_scale.stride(2),
+                    ),
+                )
+                with pytest.raises(ValueError, match="DeepGEMM stride"):
+                    preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+                        dataclasses.replace(pack, w13_scale=invalid_scale),
+                        hidden_size=hidden,
+                        intermediate_size=intermediate,
+                        interleave_w13=interleave,
+                        scale_layout=scale_layout,
+                    )
+                with pytest.raises(ValueError, match="stride"):
+                    validate_transformed_mega_weights(
+                        dataclasses.replace(
+                            transformed,
+                            w13_scale=transformed.w13_scale.as_strided(
+                                transformed.w13_scale.shape,
+                                (
+                                    transformed.w13_scale.stride(0),
+                                    1,
+                                    transformed.w13_scale.stride(2),
+                                ),
+                            ),
+                        ),
+                        hidden_size=hidden,
+                        intermediate_size=intermediate,
+                        local_experts=experts // ep,
+                    )
+            if scale_layout == "canonical" and not interleave:
+                _check_borrowed_input_contract(pack, transformed, hidden, intermediate)
+            with pytest.raises(ValueError, match="gate/up-contiguous FP4"):
+                preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+                    pack,
+                    hidden_size=hidden,
+                    intermediate_size=intermediate,
+                    interleave_w13=False,
+                )
+        layer = MoEEpLayer(
+            bootstrap=BootstrapConfig(
+                world_size=ep, rank=rank, device=rank, process_group=dist.group.WORLD
+            ),
+            fleet_params=FleetParams(
+                num_experts=experts,
+                max_tokens_per_rank=capacity,
+                token_hidden_size=hidden,
+            ),
+            weights=pack,
+            backend=MegaConfig(
+                megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
+                    intermediate_size=intermediate, top_k=topk, transport="p2p"
+                ),
+                quantize_input=True,
+                preprocess_weights=False,
+                transformed_weights=transformed,
+            ),
+        )
+        layer.warmup()
+        dedup_layer = None
+        if dedup_compact:
+            dedup_layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(
+                    world_size=ep,
+                    rank=rank,
+                    device=rank,
+                    process_group=dist.group.WORLD,
+                ),
+                fleet_params=FleetParams(
+                    num_experts=experts,
+                    max_tokens_per_rank=capacity,
+                    token_hidden_size=hidden,
+                ),
+                weights=pack,
+                backend=MegaConfig(
+                    megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
+                        intermediate_size=intermediate,
+                        top_k=topk,
+                        transport="p2p",
+                        dedup_replicated_inputs=True,
+                    ),
+                    quantize_input=True,
+                    preprocess_weights=False,
+                    transformed_weights=transformed,
+                ),
+            )
+            dedup_layer.warmup()
+        bounds = (
+            (1, capacity)
+            if capacity_override is not None
+            else ((1, 16) if dedup_compact else (1, 12, 128))
+        )
+        for bound in bounds:
+            rows = (
+                bound if dedup_compact else (bound, 0, max(bound // 2, 1), 1)[rank % 4]
+            )
+            input_generator = (
+                torch.Generator(device="cuda").manual_seed(7919 + bound)
+                if dedup_compact
+                else generator
+            )
+            x = torch.randn(
+                rows,
+                hidden,
+                device="cuda",
+                generator=input_generator,
+                dtype=torch.bfloat16,
+            )
+            ids, weights = _routing(args, rows, experts, topk, input_generator)
+            if dedup_compact:
+                ids.copy_(torch.arange(topk, device=ids.device))
+            if duplicate_destinations:
+                ids.copy_(
+                    rank * (experts // ep) + torch.arange(topk, device=ids.device)
+                )
+            t = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
+            if dedup_compact:
+                owned = (
+                    torch.arange(rows, device=ids.device)
+                    .remainder(ep)
+                    .eq(rank)
+                    .unsqueeze(1)
+                )
+                compact_weights = weights.masked_fill(~owned, 0)
+                compact_t = MoEEpTensors(
+                    hidden_states=x,
+                    topk_ids=ids.masked_fill(~owned, -1),
+                    topk_weights=compact_weights,
+                )
+                partial = dedup_layer.forward(compact_t).clone()
+                expected = layer.forward(t).clone()
+                leader = owned.squeeze(1)
+                assert not partial[~leader].any()
+                assert torch.equal(partial[leader], expected[leader])
+                actual = partial.clone()
+                dist.all_reduce(actual)
+                assert torch.equal(actual, expected)
+
+                compact_output = torch.empty_like(output)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    dedup_layer.stage_inputs(compact_t, compile_tokens_per_rank=bound)
+                    dedup_layer.compute_staged(output=compact_output)
+                x.copy_(
+                    torch.randn(
+                        rows,
+                        hidden,
+                        device="cuda",
+                        generator=input_generator,
+                        dtype=torch.bfloat16,
+                    )
+                )
+                weights.copy_(
+                    torch.rand(rows, topk, device="cuda", generator=input_generator)
+                )
+                compact_weights.copy_(weights.masked_fill(~owned, 0))
+                expected = layer.forward(t).clone()
+                compact_output.zero_()
+                graph.replay()
+                torch.cuda.synchronize()
+                actual = compact_output[:rows].clone()
+                dist.all_reduce(actual)
+                assert torch.equal(actual, expected)
+                assert layer._kernel.protocol_error(layer._workspace) == 0
+                assert dedup_layer._kernel.protocol_error(dedup_layer._workspace) == 0
+                del graph
+                if rank == 0:
+                    print(
+                        f"PASS dedup compact layout={scale_layout} M={bound}: "
+                        "original and reduced partial outputs, graph replay exact",
+                        flush=True,
+                    )
+                continue
+            layer.stage_inputs(t, compile_tokens_per_rank=bound)
+            layer.compute_staged(output=output)
+            torch.cuda.synchronize()
+            if duplicate_destinations and scale_layout == "kernel" and bound == 128:
+                from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync.workspace import (
+                    pool_row_bytes,
+                )
+
+                workspace = layer._workspace
+                route_map = workspace._view(19, (ep, experts // ep, 128), torch.int32)
+                source_ids = [None] * ep
+                dist.all_gather_object(source_ids, ids.cpu())
+                for source, routes in enumerate(source_ids):
+                    expected_routes = {}
+                    for token, expert_ids in enumerate(routes.tolist()):
+                        for k, expert in enumerate(expert_ids):
+                            if expert // (experts // ep) == rank:
+                                expected_routes.setdefault(
+                                    expert % (experts // ep), []
+                                ).append(token * 8 + k)
+                    for expert, expected_meta in expected_routes.items():
+                        actual_meta = (
+                            route_map[source, expert, : len(expected_meta)]
+                            .cpu()
+                            .tolist()
+                        )
+                        assert actual_meta == expected_meta, (
+                            rank,
+                            source,
+                            expert,
+                            actual_meta[:16],
+                            expected_meta[:16],
+                        )
+                pool = workspace._view(
+                    5, (ep, 128, pool_row_bytes(hidden)), torch.uint8
+                )
+                assert torch.equal(pool[rank, :rows, :hidden], workspace.x[:rows])
+                assert torch.equal(
+                    pool[rank, :rows, hidden : hidden + hidden // 32],
+                    workspace.x_sf[:rows],
+                )
+            expected = _reference(
+                x.float(),
+                _effective_routes(ids, experts),
+                weights,
+                ref1,
+                ref2,
+                rank,
+                experts // ep,
+                128,
+            )
+            assert _rel(output[:rows], expected) < 5e-3, (
+                interleave,
+                scale_layout,
+                bound,
+                rank,
+            )
+            assert layer._kernel.protocol_error(layer._workspace) == 0
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                layer.stage_inputs(t, compile_tokens_per_rank=bound)
+                layer.compute_staged(output=output)
+            x.copy_(
+                torch.randn(
+                    rows,
+                    hidden,
+                    device="cuda",
+                    generator=generator,
+                    dtype=torch.bfloat16,
+                )
+            )
+            if not duplicate_destinations:
+                ids.copy_(
+                    torch.randint(
+                        0, experts, ids.shape, device="cuda", generator=generator
+                    )
+                )
+            weights.copy_(torch.rand(rows, topk, device="cuda", generator=generator))
+            expected = _reference(
+                x.float(),
+                _effective_routes(ids, experts),
+                weights,
+                ref1,
+                ref2,
+                rank,
+                experts // ep,
+                128,
+            )
+            output.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert _rel(output[:rows], expected) < 5e-3
+            assert layer._kernel.protocol_error(layer._workspace) == 0
+            del graph
+        if rank == 0:
+            print(
+                f"PASS layout FP4 interleaved={interleave} scales={scale_layout}: "
+                "storage contract, uneven DP and changed-input graph replay",
+                flush=True,
+            )
+        layer.destroy()
+        if dedup_layer is not None:
+            dedup_layer.destroy()
+    dist.destroy_process_group()
+
+
+def test_sm120_nosync_p2p_workspace_layout():
+    """P2P shares token rows and keeps route metadata in a bounded local map."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync.workspace import (
+        buffer_layout,
+        pool_row_bytes,
+    )
+
+    ranks, experts, capacity, topk = 8, 384, 128, 6
+    hidden, intermediate = 5120, 2304
+    offsets = buffer_layout(ranks, experts, capacity, topk, hidden, intermediate)
+    assert offsets[6] - offsets[5] == ranks * capacity * pool_row_bytes(hidden)
+    route_map_bytes = experts * capacity * 4
+    assert offsets[20] - offsets[19] == route_map_bytes
+    gin_offsets = buffer_layout(
+        ranks, experts, capacity, topk, hidden, intermediate, gin=True
+    )
+    assert gin_offsets[20] - gin_offsets[19] == (
+        route_map_bytes + ranks * capacity * topk * 4
+    )
+    compact = buffer_layout(
+        ranks,
+        experts,
+        capacity,
+        topk,
+        hidden,
+        intermediate,
+        dedup_replicated_inputs=True,
+    )
+    rows = experts // ranks * capacity
+    assert compact[13] - compact[12] == rows * intermediate
+    assert compact[14] - compact[13] == rows * (intermediate // 128) * 4
+    assert compact[1:6] == offsets[1:6]
+    assert compact[6] - compact[5] == capacity * pool_row_bytes(hidden)
+    assert compact[0] == 24_080_128
+
+
+def test_sm120_nosync_dedup_layout_requires_p2p():
+    from flashinfer.moe_ep import Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
+
+    with pytest.raises(ValueError, match="requires P2P"):
+        Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
+            intermediate_size=256,
+            top_k=2,
+            transport="auto",
+            dedup_replicated_inputs=True,
+        )
+
+
+def test_sm120_nosync_p2p_shared_token_rows():
+    """Routes from one token to one rank share a row without losing route metadata."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    torch.multiprocessing.spawn(_weight_layout_worker, args=(True,), nprocs=4)
+
+
+def test_sm120_nosync_dedup_compact_workspace():
+    """Unique TP leaders match the original layout exactly, including a full expert pool."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    torch.multiprocessing.spawn(
+        _weight_layout_worker, args=(False, True), nprocs=4, join=True
+    )
+
+
+def test_sm120_nosync_dedup_workspace_192():
+    """A larger capacity preserves leader masking and exact original outputs."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    torch.multiprocessing.spawn(
+        _weight_layout_worker, args=(False, True, 192), nprocs=4, join=True
+    )
+
+
+def test_sm120_nosync_weight_layouts():
+    """Default and borrowed weight layouts preserve numerics across DP and graph replay."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    torch.multiprocessing.spawn(_weight_layout_worker, nprocs=4, join=True)
+
+
 @pytest.mark.parametrize("ep", [2, 4, 8])
 def test_sm120_nosync(ep):
     if not _sm120_gpus(ep):
         pytest.skip(f"requires {ep} SM120 GPUs")
     _run(_args(ep=ep))
+
+
+def test_sm120_nosync_wrapper_192():
+    """NosyncOptions runs 192 tokens and uses the larger base backend at 193."""
+    if not _sm120_gpus(2):
+        pytest.skip("requires 2 SM120 GPUs")
+    _run(_args(ep=2, capacity=193, threshold=192, tokens=[192, 193], repeats=1))
 
 
 @pytest.mark.parametrize("routing", ["hot", "empty", "invalid"])

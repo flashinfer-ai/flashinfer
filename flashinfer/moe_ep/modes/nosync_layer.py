@@ -41,8 +41,9 @@ __all__ = ["MoEEpNosyncLayer", "NosyncOptions"]
 class NosyncOptions:
     """Run calls of at most ``max_tokens_per_rank`` tokens per rank on the nosync kernel.
 
-    ``max_tokens_per_rank`` (at most 128, the range where the kernel is measured faster than
-    the cake and cutedsl backends) must be the same on every rank. ``transport`` and
+    ``max_tokens_per_rank`` (at most 192, with 128 the measured performance boundary and
+    default) must be the same on every rank. Larger capacities need explicit validation;
+    ``transport`` and
     ``tokens_per_item`` are the nosync kernel's
     (:class:`~flashinfer.moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`); ``transport``
     ``None`` (default) takes the per-pair table the configured cake backend resolved
