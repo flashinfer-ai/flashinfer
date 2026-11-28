@@ -125,8 +125,8 @@ def ref_attention(
 
 
 @pytest.mark.skipif(
-    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
-    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+    get_compute_capability(torch.device(device="cuda"))[0] not in [8, 9, 10, 12],
+    reason="XQA is only supported on SM8x, SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
     "seq_len",
