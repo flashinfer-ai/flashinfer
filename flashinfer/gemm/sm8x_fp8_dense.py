@@ -108,36 +108,46 @@ def _aligned(t: torch.Tensor, align: int) -> torch.Tensor:
     return t.reshape(-1)
 
 
-def _group_rows(
-    starts: torch.Tensor,
-    ends: torch.Tensor,
-    rows: int,
+def _route_ints(
+    rows: int, groups: int, r: int, max_blocks: int
+) -> Tuple[int, int, int]:
+    """The int32 sizes of ``_route_rows``' ``meta``, ``rowmap`` and ``workspace``."""
+    return 1 + 2 * max_blocks, max_blocks * r, (-(-rows // 2048) + 1) * groups
+
+
+def _route_rows(
+    ids: torch.Tensor,
+    groups: int,
     r: int,
     max_blocks: int,
     meta: torch.Tensor,
     rowmap: torch.Tensor,
-    perm: Optional[torch.Tensor] = None,
+    workspace: torch.Tensor,
 ) -> None:
-    """``meta`` and ``rowmap`` of ``gemm_f8`` routing rows ``starts[i] .. ends[i]`` (disjoint,
-    clamped to ``0 .. rows``; ``perm``: rows ``perm[starts[i]] .. perm[ends[i] - 1]``) to batch
-    ``i`` in blocks of ``r`` rows, on the device (no host sync)."""
-    groups = int(starts.shape[0])
-    s = starts.clamp(0, rows)
-    sizes = (ends.clamp(0, rows) - s).clamp_(min=0)
-    nbg = (sizes + r - 1) // r
-    end = nbg.cumsum(0)
-    blk = torch.arange(max_blocks, device=s.device)
-    e = torch.searchsorted(end, blk, right=True).clamp_(max=groups - 1)
-    local = blk - end[e] + nbg[e]
-    cnt = (sizes[e] - local * r).clamp_(0, r)
-    j = torch.arange(r, device=s.device)
-    meta[:1].copy_(end[-1:])
-    meta[1 : 1 + max_blocks].copy_(e)
-    meta[1 + max_blocks :].copy_(cnt)
-    row = s[e, None] + local[:, None] * r + j
-    if perm is not None:
-        row = perm[row.clamp_(max=rows - 1)]
-    rowmap.view(max_blocks, r).copy_(torch.where(j < cnt[:, None], row, -1))
+    """``meta`` and ``rowmap`` of ``gemm_f8`` / ``gemm_fp4`` routing row ``f`` to group
+    ``ids[f]`` (int32; -1 or from ``groups``: nowhere) in blocks of ``r`` rows, the groups in
+    order and a group's rows in theirs: the W4A16 prep's routing, on the device (no host
+    sync). ``max_blocks``: at least ``q + (rows - q) // r``, ``q = min(groups, rows)``; the
+    blocks past the routed ones are left unwritten (the GEMMs stop at ``meta[0]``)."""
+    _w4a16_moe_sm80_module(None, False, None, False).prep(
+        ids, meta, rowmap, workspace, groups, r, max_blocks, None, None, None, False, None,
+        None, 0, None, None, None, None, None,
+    )  # fmt: skip
+
+
+def _indptr_ids(ip: torch.Tensor, rows: int) -> torch.Tensor:
+    """Row ``t``'s group ``i`` (``ip[i] <= t < ip[i + 1]``, ``ip`` nondecreasing), the rows
+    outside ``ip[0] .. ip[-1]`` routed nowhere: ``_route_rows``' ``ids``."""
+    t = torch.arange(rows, dtype=ip.dtype, device=ip.device)
+    return torch.searchsorted(ip, t, right=True, out_int32=True).sub_(1)
+
+
+def _span_ids(starts: torch.Tensor, ends: torch.Tensor, rows: int) -> torch.Tensor:
+    """Row ``t``'s group ``i`` (``starts[i] <= t < ends[i]``; ``starts`` nondecreasing, each
+    range ending by the next one's start), else -1: ``_route_rows``' ``ids``."""
+    t = torch.arange(rows, dtype=starts.dtype, device=starts.device)
+    g = torch.searchsorted(starts, t, right=True).sub_(1)
+    return torch.where(t < ends[g], g, -1).int()
 
 
 def _run_fp8(
@@ -209,27 +219,28 @@ def _run_fp8(
     rows, max_blocks = batches * m, batches * -(-m // r)
     if routed:  # each group's last block partial: at most M / r + groups
         max_blocks = m // r + groups
-    ints = (1 + 2 * max_blocks, max_blocks * r)
-    meta, rowmap = torch.empty(sum(ints), dtype=torch.int32, device=a.device).split(
-        ints
-    )
+    elif masked_m is not None:  # the routing's bound, for any batch's rows
+        max_blocks = batches + (rows - batches) // r
+    ints = _route_ints(rows, groups, r, max_blocks)
+    meta, rowmap, workspace = torch.empty(
+        sum(ints), dtype=torch.int32, device=a.device
+    ).split(ints)
     act = torch.empty((rows, kp), dtype=torch.bfloat16, device=a.device)
     module = _w4a16_moe_sm80_module(None, False, None, False)
     module.prep_f8(
         x.reshape(-1), act, meta, rowmap, batches, k, r, max_blocks, _FMT[a.dtype]
     )
+    ids = None
     if m_indptr is not None:  # the offsets made nondecreasing: disjoint groups
-        ip = torch.cummax(m_indptr.clamp(0, m).long(), 0).values
-        _group_rows(ip[:-1], ip[1:], m, r, max_blocks, meta, rowmap)
-    elif m_keys is not None:  # rows ordered by key, keys outside 0 .. groups - 1 last
-        keys = torch.where((m_keys >= 0) & (m_keys < groups), m_keys, groups).long()
-        sk, perm = torch.sort(keys, stable=True)
-        ip = torch.searchsorted(sk, torch.arange(groups + 1, device=a.device))
-        _group_rows(ip[:-1], ip[1:], m, r, max_blocks, meta, rowmap, perm)
-    elif masked_m is not None:
-        st = torch.arange(batches, device=a.device) * m
-        ends = st + masked_m.long().clamp(0, m)
-        _group_rows(st, ends, rows, r, max_blocks, meta, rowmap)
+        ids = _indptr_ids(torch.cummax(m_indptr.clamp(0, m), 0).values, m)
+    elif m_keys is not None:  # keys outside 0 .. groups - 1 routed nowhere
+        ids = m_keys.clamp(-1, groups).int()
+    elif masked_m is not None:  # batch i's first masked_m[i] rows
+        t = torch.arange(m, dtype=torch.int32, device=a.device)
+        i = torch.arange(batches, dtype=torch.int32, device=a.device)
+        ids = torch.where(t < masked_m[:, None], i[:, None], -1).view(-1)
+    if ids is not None:
+        _route_rows(ids, groups, r, max_blocks, meta, rowmap, workspace)
     direct = n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
     target = (
         out.view(rows, n)
@@ -861,7 +872,7 @@ def _run_rows_fp4(
     r: int,
     fmt: Optional[int] = None,
 ) -> None:
-    """``out`` rows ``starts[i] .. ends[i]`` (clamped, disjoint) ``= alpha[i] (a @ b[i]^T)`` on
+    """``out`` rows ``starts[i] .. ends[i]`` (``_span_ids``) ``= alpha[i] (a @ b[i]^T)`` on
     ``gemm_fp4``: ``b`` ``(groups, N, K / 2)`` FP4, its 128x4-swizzled scales (flat) group
     ``i``'s at ``i pad(N, 128)`` rows; ``a`` restored to BF16 exactly in its blocks' row order,
     packed FP4 by the prep (``fmt`` 0: NVFP4 with its scales, 5: MXFP4 without them, times
@@ -873,20 +884,23 @@ def _run_rows_fp4(
     if rows == 0 or groups == 0 or n == 0:
         return
     max_blocks = rows // r + groups  # each group's last block partial
-    ints = (1 + 2 * max_blocks, max_blocks * r, -(-rows // 2048) + 1)
+    ints = _route_ints(rows, groups, r, max_blocks)
     meta, rowmap, workspace = torch.empty(
         sum(ints), dtype=torch.int32, device=a.device
     ).split(ints)
+    rowmap.fill_(-1)  # gathered whole below: the unrouted blocks' rows too
     module = _w4a16_moe_sm80_module(None, False, None, False)
     asf = _aligned(a_scale.view(torch.uint8), 4)
-    if fmt is not None:  # in token order, its blocks replaced by the groups' below
+    ids = _span_ids(starts, ends, rows)
+    if fmt is None:
+        _route_rows(ids, groups, r, max_blocks, meta, rowmap, workspace)
+    else:  # restored in token order by the prep routing the rows
         tok = torch.empty((rows, k), dtype=torch.bfloat16, device=a.device)
         module.prep(
-            torch.zeros((rows, 1), dtype=torch.int32, device=a.device), meta, rowmap,
-            workspace, 1, r, max_blocks, _aligned(a.view(torch.uint8), 16).view(rows, -1),
-            asf, tok, True, None, None, fmt, None, None, None, None, None,
+            ids, meta, rowmap, workspace, groups, r, max_blocks,
+            _aligned(a.view(torch.uint8), 16).view(rows, -1), asf, tok, True, None, None,
+            fmt, None, None, None, None, None,
         )  # fmt: skip
-    _group_rows(starts, ends, rows, r, max_blocks, meta, rowmap)
     idx, e5 = rowmap.clamp(min=0), a.dtype == torch.float8_e5m2
     if fmt is None:
         act = a.view(torch.uint8).index_select(0, idx).view(a.dtype)
