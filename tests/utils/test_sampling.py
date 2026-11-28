@@ -4441,6 +4441,144 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
     assert samples.shape == normalized_prob.shape
 
 
+def _per_row_threshold_calls(probs, top_k, top_p, min_p):
+    """One call per entry point that takes a per-row top_k, top_p or min_p tensor."""
+    s = flashinfer.sampling
+    return {
+        "top_k_renorm_probs": lambda: s.top_k_renorm_probs(probs, top_k),
+        "top_k_mask_logits": lambda: s.top_k_mask_logits(probs, top_k),
+        "top_p_renorm_probs": lambda: s.top_p_renorm_probs(probs, top_p),
+        "top_k_sampling": lambda: s.top_k_sampling_from_probs(probs, top_k),
+        "top_p_sampling": lambda: s.top_p_sampling_from_probs(probs, top_p),
+        "min_p_sampling": lambda: s.min_p_sampling_from_probs(probs, min_p),
+        "joint_top_k": lambda: s.top_k_top_p_sampling_from_probs(
+            probs, top_k, 0.9, filter_apply_order="joint"
+        ),
+        "joint_top_p": lambda: s.top_k_top_p_sampling_from_probs(
+            probs, 10, top_p, filter_apply_order="joint"
+        ),
+    }
+
+
+@pytest.mark.parametrize("other_device", ["cpu", "cuda:1"])
+@pytest.mark.parametrize("api", list(_per_row_threshold_calls(None, None, None, None)))
+def test_check_tensor_param_device(api, other_device):
+    """A per-row threshold tensor that is not on the device of the input is refused.
+
+    The kernels read the tensor on the device of the input. A tensor on the CPU
+    reached them as a host pointer, and the call ended in an illegal memory access.
+    """
+    if other_device == "cuda:1" and torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device")
+    batch_size, vocab_size = 8, 1000
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    def calls(device):
+        return _per_row_threshold_calls(
+            probs,
+            torch.full((batch_size,), 10, device=device),
+            torch.full((batch_size,), 0.9, device=device),
+            torch.full((batch_size,), 0.05, device=device),
+        )
+
+    with pytest.raises(ValueError, match="must be on the same device"):
+        calls(other_device)[api]()
+
+    # The same tensors on the device of the input are accepted, and the kernel runs.
+    out = calls(probs.device)[api]()
+    torch.cuda.synchronize()
+    assert out.shape[0] == batch_size
+
+
+def _indices_calls(probs, indices):
+    """One call per entry point that takes an ``indices`` tensor."""
+    s = flashinfer.sampling
+    return {
+        "sampling_from_logits": lambda: s.sampling_from_logits(probs, indices=indices),
+        "sampling_from_probs": lambda: s.sampling_from_probs(probs, indices=indices),
+        "top_p_sampling": lambda: s.top_p_sampling_from_probs(
+            probs, 0.9, indices=indices
+        ),
+        "top_k_sampling": lambda: s.top_k_sampling_from_probs(
+            probs, 10, indices=indices
+        ),
+        "min_p_sampling": lambda: s.min_p_sampling_from_probs(
+            probs, 0.05, indices=indices
+        ),
+        "joint_top_k_top_p": lambda: s.top_k_top_p_sampling_from_probs(
+            probs, 10, 0.9, indices=indices, filter_apply_order="joint"
+        ),
+    }
+
+
+@pytest.mark.parametrize("other_device", ["cpu", "cuda:1"])
+@pytest.mark.parametrize("api", list(_indices_calls(None, None)))
+def test_sampling_indices_device(api, other_device):
+    """An ``indices`` tensor that is not on the device of the input is refused.
+
+    The kernels read ``indices`` on the device of the input, as they read a
+    per-row threshold.
+    """
+    if other_device == "cuda:1" and torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device")
+    batch_size, vocab_size = 8, 1000
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    def call(device):
+        indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+        return _indices_calls(probs, indices)[api]()
+
+    with pytest.raises(ValueError, match="indices must be on the same device"):
+        call(other_device)
+
+    # The same tensor on the device of the input is accepted, and the kernel runs.
+    out = call(probs.device)
+    torch.cuda.synchronize()
+    assert out.shape == (batch_size,)
+
+
+@pytest.mark.parametrize("other_device", ["cpu", "cuda:1"])
+@pytest.mark.parametrize(
+    "counter",
+    ["maybe_output_accepted_token_num", "maybe_output_emitted_draft_token_num"],
+)
+def test_chain_speculative_sampling_counter_device(counter, other_device):
+    """A counter tensor that is not on the device of ``draft_probs`` is refused.
+
+    The kernel adds to both counters on the device of ``draft_probs``.
+    """
+    if other_device == "cuda:1" and torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device")
+    batch_size, num_speculate_tokens, vocab_size = 8, 3, 1000
+    pre_norm_draft_prob = torch.rand(
+        batch_size, num_speculate_tokens, vocab_size, device="cuda:0"
+    )
+    draft_probs = pre_norm_draft_prob / pre_norm_draft_prob.sum(dim=-1, keepdim=True)
+    draft_token_ids = torch.randint(
+        vocab_size, (batch_size, num_speculate_tokens), device="cuda:0"
+    )
+    pre_norm_target_prob = torch.rand(
+        batch_size, num_speculate_tokens + 1, vocab_size, device="cuda:0"
+    )
+    target_probs = pre_norm_target_prob / pre_norm_target_prob.sum(dim=-1, keepdim=True)
+
+    def call(device):
+        counters = {counter: torch.zeros(batch_size, dtype=torch.int32, device=device)}
+        return flashinfer.sampling.chain_speculative_sampling(
+            draft_probs, draft_token_ids, target_probs, **counters
+        )
+
+    with pytest.raises(ValueError, match=f"{counter} must be on the same device"):
+        call(other_device)
+
+    # The same counter on the device of draft_probs is accepted, and the kernel runs.
+    output_token_ids, _, _ = call(draft_probs.device)
+    torch.cuda.synchronize()
+    assert output_token_ids.shape == (batch_size, num_speculate_tokens + 1)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 def test_sampling_from_probs_seed_offset_reproducibility(batch_size, vocab_size):

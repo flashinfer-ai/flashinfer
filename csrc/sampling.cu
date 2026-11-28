@@ -59,6 +59,14 @@ inline SeedOffsetStrides validate_seed_offset_tensors(const Optional<TensorView>
           maybe_offset_arr.has_value() && maybe_offset_arr.value().size(0) > 1 ? 1U : 0U};
 }
 
+// The kernels read `indices` on the device of the input tensor.
+inline void check_indices_device(const Optional<TensorView>& maybe_indices, const TensorView& input,
+                                 const char* input_name) {
+  if (maybe_indices.has_value()) {
+    check_same_device(maybe_indices.value(), input, "indices", input_name);
+  }
+}
+
 void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
              Optional<TensorView> maybe_temperature_arr, double temperature_val, bool enable_pdl) {
   CHECK_INPUT(workspace_buffer);
@@ -90,6 +98,7 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
+  check_indices_device(maybe_indices, logits, "logits");
   const auto rng_strides =
       validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, logits, output.size(0));
 
@@ -128,6 +137,7 @@ void sampling_from_probs(TensorView probs, TensorView output, TensorView valid,
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
+  check_indices_device(maybe_indices, probs, "probs");
   const auto rng_strides =
       validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, output.size(0));
 
@@ -169,6 +179,7 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
+  check_indices_device(maybe_indices, probs, "probs");
   const auto rng_strides =
       validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, output.size(0));
 
@@ -216,6 +227,7 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
+  check_indices_device(maybe_indices, probs, "probs");
   const auto rng_strides =
       validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, output.size(0));
 
@@ -263,6 +275,7 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
+  check_indices_device(maybe_indices, probs, "probs");
   const auto rng_strides =
       validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, output.size(0));
 
@@ -311,6 +324,7 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output, Tensor
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
+  check_indices_device(maybe_indices, probs, "probs");
   const auto rng_strides =
       validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, output.size(0));
 
@@ -356,6 +370,11 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   CHECK_INPUT(target_probs);
   CHECK_DEVICE(draft_token_ids, draft_probs);
   CHECK_DEVICE(target_probs, draft_probs);
+  // The kernel adds to both counters on the device of draft_probs.
+  check_same_device(output_accepted_token_num, draft_probs, "maybe_output_accepted_token_num",
+                    "draft_probs");
+  check_same_device(output_emitted_draft_token_num, draft_probs,
+                    "maybe_output_emitted_draft_token_num", "draft_probs");
   const auto rng_strides = validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr,
                                                         draft_probs, draft_probs.size(0));
 
