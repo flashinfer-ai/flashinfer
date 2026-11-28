@@ -13,7 +13,7 @@ Inputs bf16 / f16 / fp32 (one class per format: the 16-bit inputs are exact wide
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 
@@ -73,7 +73,34 @@ def device_sm_count(device) -> int:
     return _sm_count_cache[key]
 
 
+_get_compiled_kernel: Optional[Callable[..., Any]] = None
+_device_support_pdl: Optional[Callable[[torch.device], bool]] = None
+
+
+def _compiled_kernel(*key):
+    """``mx_kernel.get_compiled_kernel`` imported on first use (the kernel module pulls in the CuTe DSL) and kept: an
+    import statement inside a function costs about half a microsecond per call."""
+    global _get_compiled_kernel
+    if _get_compiled_kernel is None:
+        from .mx_kernel import get_compiled_kernel
+
+        _get_compiled_kernel = get_compiled_kernel
+    return _get_compiled_kernel(*key)
+
+
+def _pdl_default(device) -> bool:
+    """``enable_pdl=None`` follows the device (``flashinfer.utils.device_support_pdl``, imported on first use)."""
+    global _device_support_pdl
+    if _device_support_pdl is None:
+        from ...utils import device_support_pdl
+
+        _device_support_pdl = device_support_pdl
+    return _device_support_pdl(device)
+
+
 def _rows(t: torch.Tensor, K: int, name: str) -> torch.Tensor:
+    if t.dim() == 2 and t.stride(1) == 1 and t.shape[1] == K:
+        return t  # already the kernel's (rows, K) form: no view, no check to repeat
     try:
         t2 = t.view(-1, K)
     except RuntimeError:
@@ -103,8 +130,6 @@ def mx_quantize(
     names: ``"128x4"`` (rows padded to 128, scale columns to 4, padding zero), ``"8x4"`` (rows padded to 8, columns to 4)
     or ``"linear"`` (``M x K/32``). Bitwise identical for every ``config`` in :func:`mx_schedule.all_valid_configs`, for
     every batch composition, every SM count and the three layouts."""
-    from .mx_kernel import get_compiled_kernel
-
     if x.dtype not in _DTYPE_STR:
         raise ValueError(f"input dtype {x.dtype} not supported (bf16 / f16 / fp32)")
     swizzled = layout_name(swizzled)
@@ -145,11 +170,13 @@ def mx_quantize(
         "codes row stride must be a multiple of 16 bytes"
     )
     assert nb >= 1
-    kernel = get_compiled_kernel(
+    kernel = _compiled_kernel(
         _DTYPE_STR[x.dtype], K, config, fmt, rule, swizzled, bool(enable_pdl)
     )
     kernel(x2, codes, sf, M, K, padded_M)
-    return codes.view(*x.shape[:-1], kbytes), sf
+    if x.dim() != 2:
+        codes = codes.view(*x.shape[:-1], kbytes)
+    return codes, sf
 
 
 def mxfp8_quantize_batch_invariant(
@@ -173,8 +200,6 @@ def mxfp8_quantize_batch_invariant(
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class (dtype,
     K not a multiple of 32, layout, device, architecture); it never falls back."""
-    from ...utils import device_support_pdl
-
     check_device(input.device, CLASS_MXFP8, MXFP8_QUANT_ARCHS)
     if input.dtype not in _DTYPE_STR:
         raise unsupported(
@@ -229,7 +254,7 @@ def mxfp8_quantize_batch_invariant(
         # tensor): the 16-byte vector loads need both; the copy is a placement, not numerics
         x2 = x2.clone(memory_format=torch.contiguous_format)
     if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
+        enable_pdl = _pdl_default(input.device)
     if (
         x2.shape[0] == 0
     ):  # no rows: nothing to launch; the outputs keep their documented shapes
@@ -245,7 +270,10 @@ def mxfp8_quantize_batch_invariant(
     codes, sf = mx_quantize(
         x2, MXFP8, layout, config=config, enable_pdl=bool(enable_pdl), sm_count=sm_count
     )
-    return codes.view(torch.float8_e4m3fn).view(*input.shape[:-1], padded_k), sf
+    codes = codes.view(torch.float8_e4m3fn)
+    if input.dim() != 2:
+        codes = codes.view(*input.shape[:-1], padded_k)
+    return codes, sf
 
 
 def mxfp4_quantize_batch_invariant(
@@ -267,8 +295,6 @@ def mxfp4_quantize_batch_invariant(
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class (dtype,
     K not a multiple of 32, a row beyond the enumerated space, layout, device, architecture); it never falls back."""
-    from ...utils import device_support_pdl
-
     check_device(a.device, CLASS_MXFP4, MXFP8_QUANT_ARCHS)
     if a.dtype not in _DTYPE_STR:
         raise unsupported(
@@ -306,7 +332,7 @@ def mxfp4_quantize_batch_invariant(
     ):
         x2 = x2.clone(memory_format=torch.contiguous_format)
     if enable_pdl is None:
-        enable_pdl = device_support_pdl(a.device)
+        enable_pdl = _pdl_default(a.device)
     if x2.shape[0] == 0:
         codes = torch.empty((*a.shape[:-1], K // 2), dtype=torch.uint8, device=a.device)
         sf = torch.empty(
@@ -316,9 +342,9 @@ def mxfp4_quantize_batch_invariant(
     codes, sf = mx_quantize(
         x2, MXFP4, layout, config=config, enable_pdl=bool(enable_pdl), sm_count=sm_count
     )
-    return codes.view(*a.shape[:-1], K // 2), sf.view(
-        -1, padded_sf_cols(K, BLOCK, layout)
-    )
+    if a.dim() != 2:
+        codes = codes.view(*a.shape[:-1], K // 2)
+    return codes, sf.view(-1, padded_sf_cols(K, BLOCK, layout))
 
 
 def format_of(name: str) -> MXFormat:
