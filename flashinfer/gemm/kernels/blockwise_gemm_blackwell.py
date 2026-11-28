@@ -1283,7 +1283,8 @@ class BlockwiseGemmKernel:
 
                     # load scaleA/scaleB
                     cute.copy(tiled_copy_sfa, tAgSFA_k, tAsSFA_pipe, pred=tApSFA)
-                    cute.copy(tiled_copy_sfb, tBgSFB_k, tBsSFB_pipe, pred=tBpSFB)
+                    if lane_idx == 0:
+                        cute.copy(tiled_copy_sfb, tBgSFB_k, tBsSFB_pipe, pred=tBpSFB)
 
                     scale_pipeline.producer_commit(scale_producer_state)
 
@@ -1617,6 +1618,9 @@ class BlockwiseGemmKernel:
                         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
+                        # Wait for async tcgen05.ld to finish copy to tTR_rAcc
+                        cute.arch.fence_view_async_tmem_load()
+
                         #
                         # Update accumulator by scale factor
                         #
@@ -1833,6 +1837,9 @@ class BlockwiseGemmKernel:
                     #
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                    # Wait for async tcgen05.ld to finish copy to tTR_rAcc
+                    cute.arch.fence_view_async_tmem_load()
 
                     #
                     # Convert to C type
