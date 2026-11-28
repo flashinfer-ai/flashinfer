@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Dtype contract of ``merge_state`` and ``merge_state_in_place``.
+Dtype contract of ``merge_state``, ``merge_state_in_place`` and ``merge_states``.
 
 The kernels are instantiated for the dtype of the first attention output and
 read the logsumexp values as float32 and the mask as one byte per sequence.
@@ -21,6 +21,10 @@ A tensor of any other dtype used to be reinterpreted bit-for-bit, or (for the
 in-place ``s``) converted into a temporary that received the merged logsumexp
 instead of the caller's tensor. These cases must raise, and must leave the
 in-place state untouched; the read-only logsumexp inputs are still converted.
+
+The Python wrappers convert the read-only logsumexp inputs and allocate the
+outputs themselves, so the FFI checks behind them are also exercised directly
+through ``get_cascade_module()``.
 """
 
 import math
@@ -29,6 +33,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.cascade import get_cascade_module
 
 _SEQ_LEN = 9
 _NUM_HEADS = 4
@@ -154,3 +159,96 @@ def test_merge_state_in_place_byte_mask(mask_dtype):
     _assert_merged(v[keep], s[keep], v_ref[keep], s_ref[keep])
     assert torch.equal(v[~keep], v_before[~keep])
     assert torch.equal(s[~keep], s_before[~keep])
+
+
+def _ffi_dtype_error(name, anchor=None):
+    """Message of the FFI check that rejects ``name``."""
+    if anchor is not None:
+        return f"{name} dtype must match {anchor} dtype"
+    return rf"Inconsistency of Tensor type: {name}(?!\w)"
+
+
+def _assert_unchanged(args, before):
+    for name, tensor in args.items():
+        assert torch.equal(tensor, before[name]), f"{name} was modified"
+
+
+@pytest.mark.parametrize(
+    "name, dtype, anchor",
+    [
+        ("s_a", torch.float16, None),
+        ("s_a", torch.float64, None),
+        ("s_b", torch.float16, None),
+        ("s_b", torch.float64, None),
+        ("s_merged", torch.float16, None),
+        ("s_merged", torch.float64, None),
+        ("v_merged", torch.bfloat16, "v_a"),
+        ("v_merged", torch.float32, "v_a"),
+    ],
+)
+def test_ffi_merge_state_rejects_dtype(name, dtype, anchor):
+    v_a, s_a = _make_state(torch.float16, 0)
+    v_b, s_b = _make_state(torch.float16, 1)
+    args = {
+        "v_a": v_a,
+        "s_a": s_a,
+        "v_b": v_b,
+        "s_b": s_b,
+        "v_merged": torch.zeros_like(v_a),
+        "s_merged": torch.zeros_like(s_a),
+    }
+    args[name] = args[name].to(dtype)
+    before = {k: t.clone() for k, t in args.items()}
+
+    with pytest.raises(RuntimeError, match=_ffi_dtype_error(name, anchor)):
+        get_cascade_module().merge_state(*args.values())
+
+    _assert_unchanged(args, before)
+
+
+@pytest.mark.parametrize("name", ["s", "s_other"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
+def test_ffi_merge_state_in_place_rejects_non_float32_lse(name, dtype):
+    v, s = _make_state(torch.float16, 0)
+    v_other, s_other = _make_state(torch.float16, 1)
+    args = {"v": v, "s": s, "v_other": v_other, "s_other": s_other}
+    args[name] = args[name].to(dtype)
+    before = {k: t.clone() for k, t in args.items()}
+
+    with pytest.raises(RuntimeError, match=_ffi_dtype_error(name)):
+        get_cascade_module().merge_state_in_place(*args.values(), None)
+
+    _assert_unchanged(args, before)
+
+
+@pytest.mark.parametrize(
+    "name, dtype, anchor",
+    [
+        ("s", torch.float16, None),
+        ("s", torch.float64, None),
+        ("s_merged", torch.float16, None),
+        ("s_merged", torch.float64, None),
+        ("v_merged", torch.bfloat16, "v"),
+        ("v_merged", torch.float32, "v"),
+    ],
+)
+def test_ffi_merge_states_rejects_dtype(name, dtype, anchor):
+    num_states = 3
+    gen = torch.Generator(device=_DEVICE).manual_seed(0)
+    v = torch.randn(
+        _SEQ_LEN, num_states, _NUM_HEADS, _HEAD_DIM, generator=gen, device=_DEVICE
+    ).to(torch.float16)
+    s = torch.randn(_SEQ_LEN, num_states, _NUM_HEADS, generator=gen, device=_DEVICE)
+    args = {
+        "v": v,
+        "s": s,
+        "v_merged": torch.zeros_like(v[:, 0]),
+        "s_merged": torch.zeros_like(s[:, 0]),
+    }
+    args[name] = args[name].to(dtype)
+    before = {k: t.clone() for k, t in args.items()}
+
+    with pytest.raises(RuntimeError, match=_ffi_dtype_error(name, anchor)):
+        get_cascade_module().merge_states(*args.values())
+
+    _assert_unchanged(args, before)
