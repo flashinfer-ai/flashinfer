@@ -138,7 +138,14 @@ class FrostLowLatencyRunner(MoERunner):
                 "frost_low_latency requires SM80, SM86, SM87, SM89, SM90, SM100, "
                 "SM103, SM107 or SM120"
             )
-        if not self._supports_tc and self.config.routing.top_k > 32:
+        # SM8x takes the SM100-family MX top_k <= E range: FMA routes beyond
+        # 32 per token run in chunks reduced by the Tensor Core combine.
+        wide_mx = (
+            arch in ((8, 0), (8, 6), (8, 7), (8, 9))
+            and self.config.quant.activation is QuantFormat.MXFP8
+            and self.config.routing.top_k <= self.config.routing.num_experts
+        )
+        if not self._supports_tc and self.config.routing.top_k > 32 and not wide_mx:
             raise NotImplementedError("Frost FMA requires top_k <= 32")
         if (
             self.config.quant.activation is QuantFormat.MXFP8
@@ -635,7 +642,7 @@ class FrostLowLatencyRunner(MoERunner):
             if self._supports_mx_tc
             else []
         )
-        if self.config.routing.top_k <= 32:
+        if self.config.routing.top_k <= 32 or not self._supports_tc:
             tactics.append(("ffma", 1))
         return tactics
 
