@@ -251,6 +251,13 @@ def _get_compiled_ssd_kernel(
     return compiled
 
 
+# Backends selectable on SSDCombined. "auto" (the default) behaves exactly
+# like "cute" except where the dispatch surface of the "specialized" backend
+# (agent-generated SM120 kernel; see flashinfer/mamba/specialized/) applies;
+# an explicitly selected backend is never silently swapped.
+SSD_BACKENDS = ("auto", "specialized", "cute", "cake")
+
+
 class SSDCombined:
     """Mamba2 SSD combined forward pass with cached host-side state.
 
@@ -280,6 +287,30 @@ class SSDCombined:
     the chunk-128 form) and, in varlen mode, ``initial_states=None`` with the
     sequence count from ``cu_seqlens``, ``seq_chunk_cumsum`` or ``num_seqs``.
 
+    Backend selection (``backend`` argument, see ``SSD_BACKENDS``): the
+    default ``"auto"`` behaves exactly like ``"cute"`` on datacenter
+    Blackwell; on SM120 (where neither the CuTe nor the Cake kernels can
+    run) it routes to the ``"specialized"`` backend — an agent-generated
+    SM120 prefill kernel — when the geometry and call form match its
+    dispatch surface (``flashinfer/mamba/specialized/
+    ssd_prefill_sm120_workload.json``), and keeps today's refusal
+    otherwise.  An explicitly selected backend is never silently swapped.
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the specialized
+    backend (checked at construction for routing and again at call time).
+
+    The specialized backend's call contract is stricter than the generic
+    dtype table above: bf16 ``x``/``dt``/``B``/``C``/``D``/``dt_bias``
+    (fp32 ``A``), ``D`` and ``dt_bias`` required (``D`` per head, no hdim),
+    ``dt_softplus=True``, the default ``dt_limit``, no ``z``, no initial
+    states, ``return_final_states=False``, and a single sequence per call.
+    It writes and returns the token-major ``[1, seqlen, nheads, headdim]``
+    output directly (never the CuTe chunked buffer).  The module JIT-builds
+    for ``sm_120a`` on first use, which requires a CUDA >= 13.3 toolkit.
+    For CUDA-graph capture, warm each head-count variant on the capture
+    device first — one eager ``run`` call, or
+    ``flashinfer.mamba.specialized.ssd_prefill_sm120.warmup(nheads,
+    device)`` — because an unwarmed variant never dispatches under capture.
+
     Usage::
 
         ssd = SSDCombined(chunk_size=128, nheads=8, headdim=64,
@@ -302,11 +333,93 @@ class SSDCombined:
         has_varlen: bool = False,
         has_z: bool = False,
         seq_idx_dtype=torch.int64,
-        backend: str = "cute",
+        backend: str = "auto",
     ):
         from ..utils import get_compute_capability
 
-        major, minor = get_compute_capability(torch.device("cuda"))
+        # Key the (cached) capability lookup by the current ordinal: an
+        # unindexed torch.device("cuda") would share one cache entry across
+        # every current device in a mixed-architecture process.
+        major, minor = get_compute_capability(
+            torch.device("cuda", torch.cuda.current_device())
+        )
+        if backend not in SSD_BACKENDS:
+            raise ValueError(
+                f"SSDCombined backend must be one of {SSD_BACKENDS}, got {backend!r}"
+            )
+        if backend == "auto":
+            # "auto" behaves exactly like "cute" (today's default) except
+            # where the dispatch surface of the "specialized" backend
+            # (agent-generated SM120 kernel; see flashinfer/mamba/specialized/)
+            # applies; an explicitly selected backend is never silently
+            # swapped, and off-surface SM120 keeps today's refusal below.
+            if (major, minor) == (12, 0):
+                from .specialized.ssd_prefill_sm120 import (
+                    construction_supported,
+                )
+
+                if (
+                    construction_supported(
+                        chunk_size=chunk_size,
+                        nheads=nheads,
+                        headdim=headdim,
+                        dstate=dstate,
+                        ngroups=ngroups,
+                        io_dtype=io_dtype,
+                        has_d=has_d,
+                        d_has_hdim=d_has_hdim,
+                        has_z=has_z,
+                        has_initial_states=has_initial_states,
+                    )
+                    is None
+                ):
+                    backend = "specialized"
+            if backend == "auto":
+                backend = "cute"
+        if backend == "specialized":
+            from .specialized.ssd_prefill_sm120 import construction_supported
+
+            reason = construction_supported(
+                chunk_size=chunk_size,
+                nheads=nheads,
+                headdim=headdim,
+                dstate=dstate,
+                ngroups=ngroups,
+                io_dtype=io_dtype,
+                has_d=has_d,
+                d_has_hdim=d_has_hdim,
+                has_z=has_z,
+                has_initial_states=has_initial_states,
+            )
+            if reason is None and (major, minor) != (12, 0):
+                reason = "compute_capability"
+            if reason is not None:
+                # Never silently swapped: an explicit "specialized" that
+                # cannot serve this geometry raises instead of falling back
+                # to another backend.
+                raise NotImplementedError(
+                    "backend='specialized' cannot serve this SSDCombined "
+                    f"geometry (reason: {reason}); it serves the SM120 "
+                    "single-sequence bf16 prefill surface declared in "
+                    "flashinfer/mamba/specialized/"
+                    "ssd_prefill_sm120_workload.json"
+                )
+            self.chunk_size = chunk_size
+            self.nheads = nheads
+            self.headdim = headdim
+            self.dstate = dstate
+            self.ngroups = ngroups
+            self._has_d = has_d
+            self._d_has_hdim = d_has_hdim
+            self._has_init_states = has_initial_states
+            self._has_varlen = has_varlen
+            self._has_z = has_z
+            self._io_torch_dtype = io_dtype
+            self._state_torch_dtype = state_dtype
+            self._backend = "specialized"
+            self._seq_cumsum_key = None
+            self._seq_cumsum_buf = None
+            return
         # The SSD CuTe-DSL kernel uses tcgen05 MMA (MmaF16BF16Op), which is only
         # available on datacenter Blackwell (SM100/SM103/SM110). Consumer/workstation
         # Blackwell (SM120/SM121) lacks tcgen05, so reject it here with a clear message
@@ -331,10 +444,6 @@ class SSDCombined:
         self._state_torch_dtype = state_dtype
         self._backend = backend
 
-        if backend not in ("cute", "cake"):
-            raise ValueError(
-                f"SSDCombined backend must be 'cute' or 'cake', got {backend!r}"
-            )
         if backend == "cake":
             from .cake_ssd_combined import CakeSSDCombined
 
@@ -801,6 +910,48 @@ class SSDCombined:
             pool with ``final_state_slots``); the CuTe backend returns a view
             of the chunked ``out`` buffer.
         """
+        if self._backend == "specialized":
+            from .specialized.ssd_prefill_sm120 import maybe_run_specialized
+
+            extras_none = (
+                seq_idx is None
+                and chunk_indices is None
+                and chunk_offsets is None
+                and seq_chunk_cumsum is None
+                and not update_seq_chunk_cumsum
+                and checkpoint_token_indices is None
+                and checkpoint_state_slots is None
+                and checkpoint_states is None
+            )
+            served, fallback_reason = maybe_run_specialized(
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                out=out,
+                return_final_states=return_final_states,
+                num_seqs=num_seqs,
+                cu_seqlens=cu_seqlens,
+                extras_none=extras_none,
+                geo=(self.chunk_size, self.nheads, self.headdim, self.dstate),
+            )
+            if served is not None:
+                return served
+            # Fail-closed: no composable in-tree SSD path exists on SM120, so
+            # an unservable call raises with the recorded reason instead of
+            # being silently swapped to another backend.
+            raise NotImplementedError(
+                "backend='specialized' cannot serve this SSDCombined.run "
+                f"call (reason: {fallback_reason}); the dispatch surface is "
+                "flashinfer/mamba/specialized/ssd_prefill_sm120_workload.json"
+            )
         # Keep backend-independent public validation ahead of dispatch so Cake
         # and CuTe expose the same exception type and message for shared API
         # errors.  Backend-specific domain checks remain in their runners.

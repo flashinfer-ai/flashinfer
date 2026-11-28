@@ -307,3 +307,35 @@ and its schedule. A cuDNN-first wrapper may fall back while refreshing the
 metadata retained by its old cuDNN captures. Validate both starting orders and
 Q64/Q65 partition changes and transitions across the actual-work floor,
 including numerical output and LSE after replay.
+
+## SM120 specialized SSD prefill recovery
+
+The specialized single-sequence SSD backend keeps its existing geometry and
+runtime sequence-length contract. It checks precision before accepting output,
+including carried-state cancellation across internal windows. Rejected halves
+use certified recovery or the ordered FP64 recurrence; the final output remains
+BF16. The raw-reference and packed-reference tests use a 2% peak-normalized
+bound for each half, without adding an absolute-error floor.
+
+The framework path obtains temporary storage from the caller's Torch allocator
+on the submitting stream. The owning FFI tensor remains live through all
+submissions; the allocator supplies eager and captured-graph lifetime. A custom
+factory must preserve the current context, stream, and active capture identity.
+These producer guarantees apply to framework tensors, not arbitrary forged
+DLPack descriptors. The strict caller-workspace entry retains its original
+1032 bytes per head, placement, backing-range, alignment and alias checks.
+
+Parallel tile recovery requests a suffix of at most 64 MiB when its layout
+fits. It retains whole-history state, adds the actual tile-join mismatch to
+the conservative error bound, and recomputes any uncertified half from the
+original operands. More than four routed halves use the original recovery;
+sequence lengths whose layout does not fit also use that recovery. Failure to
+allocate the optional suffix can use the original small workspace before any
+kernel submission. Conversion errors, unrelated failures, and failure of the
+small allocation propagate.
+
+Storage is per invocation, with no global workspace pool. Each simultaneously
+retained graph or in-flight call can retain its own suffix; the per-call limit
+does not bound aggregate graph memory or establish serving KV-cache headroom.
+The first accepted primary submission binds the native module to its CUDA
+device and context, including when a later repair submission fails.
