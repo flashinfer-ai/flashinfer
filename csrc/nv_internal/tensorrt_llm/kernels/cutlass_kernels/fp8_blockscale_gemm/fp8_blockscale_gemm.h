@@ -111,6 +111,8 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
   size_t getWorkspaceSize(size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1,
                           size_t num_problems = 1) override;
 
+  void setExpectedM(size_t expected_m) { expected_m_ = expected_m; }
+
   size_t getFP8DataSize(int shape_m, int shape_n, bool is_act) override;
   size_t getActScaleSize(int shape_m, int shape_k) override;
   size_t getWeightScaleSize(int shape_n, int shape_k) override;
