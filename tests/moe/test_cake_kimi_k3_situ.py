@@ -221,6 +221,12 @@ def test_cake_situ_rejects_unsupported_dispatch(options, message):
         _workspace_size(**options)
 
 
+def test_cake_situ_workspace_size_default_output_dtype():
+    # An omitted output_dtype resolves to the BF16 output the Cake route requires for
+    # its BF16 inputs, as it did before the default followed the input dtype.
+    assert _workspace_size() == _workspace_size(output_dtype=torch.bfloat16)
+
+
 def test_cake_situ_workspace_size_holds_every_smaller_shape():
     # The per-shape layout is not monotonic in the token count (32 and 64 force
     # tile-N16 and need more scratch than the tile-N8 counts after them), but
