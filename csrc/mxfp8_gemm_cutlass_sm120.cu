@@ -124,39 +124,31 @@ void mxfp8_gemm_sm120_impl(TensorView mat1, TensorView mat2, TensorView mat1Scal
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
   }
 
-  // SM120 MXFP8 kernel hardcodes the scale layout to the hardware-native swizzled format
-  // (Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA/SFB). Only 1D swizzled scale
-  // (layout_128x4 from mxfp8_quantize) is supported; 2D linear scale causes the kernel to
-  // misinterpret scale data and produce wrong results.
-  TVM_FFI_ICHECK_EQ(mat1Scale.ndim(), 1)
-      << "SM120 MXFP8 only supports swizzled (1D) scale format. "
-         "Use SfLayout.layout_128x4 when calling mxfp8_quantize.";
-  TVM_FFI_ICHECK_EQ(mat2Scale.ndim(), 1)
-      << "SM120 MXFP8 only supports swizzled (1D) scale format. "
-         "Use SfLayout.layout_128x4 when calling mxfp8_quantize.";
-
-  // Validate swizzled scale sizes.
+  // One F8_128x4 swizzled block per batch (tile_atom_to_shape_SFA/SFB with L = b), 3D or flat 1D.
   constexpr int64_t sfVecSize = 32;
-  auto scale_len = [&](int64_t dim) { return (dim + sfVecSize - 1) / sfVecSize; };
-  auto swizzled_len = [&](int64_t rows, int64_t cols) {
-    auto pad_up = [](int64_t value, int64_t multiple) {
-      return (value + multiple - 1) / multiple * multiple;
-    };
-    return pad_up(rows, 128) * pad_up(cols, 4);
+  auto pad_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
   };
-  {
-    const int64_t k_scales = scale_len(k);
-    const int64_t rows_a = (mat1.ndim() == 2) ? m : b * m;
-    const int64_t rows_b = (mat1.ndim() == 2) ? n : b * n;
-    int64_t expected_a = swizzled_len(rows_a, k_scales);
-    int64_t expected_b = swizzled_len(rows_b, k_scales);
-    TVM_FFI_ICHECK_EQ(mat1Scale.size(0), expected_a)
-        << "mxfp8_gemm_sm120: mat1Scale size mismatch, expected " << expected_a << ", got "
-        << mat1Scale.size(0);
-    TVM_FFI_ICHECK_EQ(mat2Scale.size(0), expected_b)
-        << "mxfp8_gemm_sm120: mat2Scale size mismatch, expected " << expected_b << ", got "
-        << mat2Scale.size(0);
-  }
+  const int64_t k_scales = pad_up((k + sfVecSize - 1) / sfVecSize, 4);
+  auto check_scale = [&](TensorView const& scale, int64_t rows, const char* name) {
+    const int64_t rows_pad = pad_up(rows, 128);
+    if (scale.ndim() == 3) {
+      TVM_FFI_ICHECK(scale.size(0) == b && scale.size(1) == rows_pad && scale.size(2) == k_scales)
+          << "mxfp8_gemm_sm120: " << name << " shape mismatch, expected [" << b << ", " << rows_pad
+          << ", " << k_scales << "], got [" << scale.size(0) << ", " << scale.size(1) << ", "
+          << scale.size(2) << "]";
+    } else {
+      TVM_FFI_ICHECK_EQ(scale.ndim(), 1)
+          << "SM120 MXFP8 only supports the F8_128x4 swizzled scale format as a 1D or 3D "
+             "[batch, rows_pad, k_pad] tensor. Use SfLayout.layout_128x4 when calling "
+             "mxfp8_quantize.";
+      TVM_FFI_ICHECK_EQ(scale.size(0), b * rows_pad * k_scales)
+          << "mxfp8_gemm_sm120: " << name << " size mismatch, expected " << b * rows_pad * k_scales
+          << ", got " << scale.size(0);
+    }
+  };
+  check_scale(mat1Scale, m, "mat1Scale");
+  check_scale(mat2Scale, n, "mat2Scale");
 
   constexpr int alignment = 32;
   TVM_FFI_ICHECK_EQ(k % alignment, 0)
