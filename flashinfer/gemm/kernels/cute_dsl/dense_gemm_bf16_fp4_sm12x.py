@@ -848,6 +848,18 @@ class Sm12xDenseGemmBf16Fp4Kernel:
                                 accumulators,
                             )
                             if k_block_idx == num_k_blocks - 1:
+                                if cutlass.const_expr(
+                                    (
+                                        cutlass.CUDA_VERSION.major,
+                                        cutlass.CUDA_VERSION.minor,
+                                    )
+                                    >= (13, 4)
+                                ):
+                                    cute.arch.inline_ptx(
+                                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                                    )
+                                else:
+                                    cute.arch.fence_proxy("async.shared", space="cta")
                                 mainloop_pipeline.consumer_release(
                                     mainloop_consumer_state
                                 )
@@ -867,6 +879,18 @@ class Sm12xDenseGemmBf16Fp4Kernel:
                         else:
                             # 1-stage prefetch: dequant(k+1) while gemm(k).
                             if k_block_idx == num_k_blocks - 1:
+                                if cutlass.const_expr(
+                                    (
+                                        cutlass.CUDA_VERSION.major,
+                                        cutlass.CUDA_VERSION.minor,
+                                    )
+                                    >= (13, 4)
+                                ):
+                                    cute.arch.inline_ptx(
+                                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                                    )
+                                else:
+                                    cute.arch.fence_proxy("async.shared", space="cta")
                                 mainloop_pipeline.consumer_release(
                                     mainloop_consumer_state
                                 )
@@ -946,11 +970,29 @@ class Sm12xDenseGemmBf16Fp4Kernel:
                             accumulators,
                         )
                         if k_block_idx == num_k_blocks - 1:
+                            if cutlass.const_expr(
+                                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor)
+                                >= (13, 4)
+                            ):
+                                cute.arch.inline_ptx(
+                                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                                )
+                            else:
+                                cute.arch.fence_proxy("async.shared", space="cta")
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
                             mainloop_consumer_state.advance()
                     else:
                         # 1-stage prefetch path for last K-tile.
                         if k_block_idx == num_k_blocks - 1:
+                            if cutlass.const_expr(
+                                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor)
+                                >= (13, 4)
+                            ):
+                                cute.arch.inline_ptx(
+                                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                                )
+                            else:
+                                cute.arch.fence_proxy("async.shared", space="cta")
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
                             mainloop_consumer_state.advance()
 
