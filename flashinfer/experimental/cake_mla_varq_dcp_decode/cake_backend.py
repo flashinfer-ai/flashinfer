@@ -85,6 +85,10 @@ DEFAULT_UNIT_MIN = 4
 DEFAULT_UNIT_RATIO = (1, 1)  # U = max(unit_min, ceil(tiles_per_cluster * num / den))
 LONG_ITEM_TILES = 32  # items at least this long take U = share / 2
 NO_SPLIT_MAX_TILES = 8  # items this short never split
+# Partition mode merges an item in-kernel: each CTA stages the partial rows of
+# every unit of the item in one 188-row shared-memory view, 4 rows per unit
+# once an item has 17 or more units.  47 units is the most that view holds.
+PARTITION_MAX_UNITS_PER_ITEM = 47
 WORKSPACE_ALIGNMENT = 256
 LOG2E = 1.4426950408889634
 
@@ -280,6 +284,12 @@ def plan_varq_dcp_decode(
         grid_clusters = resident
         partial_slots = grid_clusters
         max_tickets = 0
+        # The kernel gives an item at most ceil(tiles / unit_min) units; a unit
+        # of at least ceil(max_local_tiles / PARTITION_MAX_UNITS_PER_ITEM) tiles
+        # keeps every item within the merge staging.
+        unit_min = max(
+            unit_min, _ceil_div(max_local_tiles, PARTITION_MAX_UNITS_PER_ITEM)
+        )
     return {
         "tiles_max": tiles_max,
         "items": items,
