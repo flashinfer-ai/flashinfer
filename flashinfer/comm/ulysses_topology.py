@@ -49,6 +49,10 @@ PCIE_HYBRID_WORLD_SIZE = 8
 PCIE_AUTO_RDMA_WORLD_SIZES = (4, 8)
 _PCIE_RDMA_PORT = 1
 _PCIE_GID_INDICES_ENV = "FLASHINFER_ULYSSES_PCIE_GID_INDICES"
+# Address families of the RoCE v2 GIDs the RDMA routes accept; see
+# _rocev2_gid_family.
+_GID_FAMILY_IPV4 = "ipv4"
+_GID_FAMILY_IPV6 = "ipv6"
 
 ULYSSES_BACKENDS = ("auto", "nvlink", "pcie", "nccl")
 
@@ -92,6 +96,9 @@ class UlyssesRankTopology:
     # override are gathered separately: the decision layer must detect two
     # ranks whose environments disagree.
     gid_index: int = -1
+    # "ipv4" or "ipv6" for the selected GID; each rank picks its family
+    # independently, so only the decision layer can see a mixed group.
+    gid_family: str = ""
     gid_indices_override: Optional[Tuple[int, ...]] = None
     gid_error: Optional[str] = None
 
@@ -167,22 +174,48 @@ def _parse_pcie_gid_indices_override() -> Optional[Tuple[int, ...]]:
     return indices
 
 
-def _probe_rocev2_ipv4_gid(
+def _rocev2_gid_family(address: ipaddress.IPv6Address) -> Optional[str]:
+    """Address family of a GID a cross-rank RoCE v2 QP can route to, or None.
+
+    Link-local IPv6 (fe80::/10) is not usable: every RoCE port carries a
+    MAC-derived link-local default GID even with no IP configured, and it does
+    not cross an L3 hop, so it would plan a route that cannot connect.
+    Unique-local IPv6 (fc00::/7) is usable: RoCE fabrics commonly number their
+    NICs from a ULA prefix. Keep this in sync with ``RoutableGidFamily`` in
+    ``csrc/ulysses_pcie_transport.cuh``, which revalidates the choice natively.
+    """
+    ipv4 = address.ipv4_mapped
+    if ipv4 is not None:
+        return None if ipv4.is_unspecified else _GID_FAMILY_IPV4
+    if (
+        address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+    ):
+        return None
+    return _GID_FAMILY_IPV6
+
+
+def _probe_rocev2_gid(
     nic_name: str,
     requested_index: Optional[int] = None,
     *,
     sysfs_root: Path = Path("/sys"),
-) -> int:
-    """Pick the GID table index of an IPv4-mapped RoCE v2 entry on port 1.
+) -> Tuple[int, str]:
+    """Pick a routable RoCE v2 GID table index on port 1 and its address family.
 
-    Automatic selection takes the lowest usable index; the rank-ordered
-    override chooses among usable entries, and native initialization
-    revalidates the index against the live GID table before creating QPs.
+    Automatic selection prefers IPv4-mapped entries, so a dual-stack NIC keeps
+    the index it was given before IPv6 support, and takes the lowest usable
+    index of that family; an IPv6-only NIC falls back to its lowest
+    non-link-local IPv6 entry. The rank-ordered override chooses among usable
+    entries of either family, and native initialization revalidates the index
+    against the live GID table before creating QPs.
     """
     port_root = (
         sysfs_root / "class" / "infiniband" / nic_name / "ports" / str(_PCIE_RDMA_PORT)
     )
-    candidates = []
+    candidates: Dict[int, str] = {}
     try:
         entries = sorted(
             (e for e in (port_root / "gids").iterdir() if e.name.isdigit()),
@@ -200,22 +233,25 @@ def _probe_rocev2_ipv4_gid(
             )
         except (OSError, ipaddress.AddressValueError):
             continue
-        ipv4 = address.ipv4_mapped
-        if gid_type == "RoCE v2" and ipv4 is not None and not ipv4.is_unspecified:
-            candidates.append(int(entry.name, 10))
+        family = _rocev2_gid_family(address)
+        if gid_type == "RoCE v2" and family is not None:
+            candidates[int(entry.name, 10)] = family
     if requested_index is not None:
         if requested_index in candidates:
-            return requested_index
+            return requested_index, candidates[requested_index]
         raise RuntimeError(
             f"{_PCIE_GID_INDICES_ENV} selects index {requested_index} for "
-            f"{nic_name} port {_PCIE_RDMA_PORT}, which is not a usable IPv4 "
-            f"RoCE v2 entry (usable: {candidates or 'none'})"
+            f"{nic_name} port {_PCIE_RDMA_PORT}, which is not a usable RoCE v2 "
+            f"entry (usable: {sorted(candidates) or 'none'})"
         )
-    if not candidates:
-        raise RuntimeError(
-            f"no usable IPv4 RoCE v2 GID found for {nic_name} port {_PCIE_RDMA_PORT}"
-        )
-    return candidates[0]
+    for family in (_GID_FAMILY_IPV4, _GID_FAMILY_IPV6):
+        matching = [index for index, found in candidates.items() if found == family]
+        if matching:
+            return min(matching), family
+    raise RuntimeError(
+        f"no usable RoCE v2 GID (IPv4-mapped or non-link-local IPv6) found for "
+        f"{nic_name} port {_PCIE_RDMA_PORT}"
+    )
 
 
 def _probe_pcie_route(
@@ -286,7 +322,7 @@ def probe_ulysses_rank_topology(
     probe_pcie : bool
         Also walk sysfs for the NUMA node, mlx5 NIC and RoCE v2 GID this rank
         would use on the PCIe backend, filling ``numa_node``, ``nic_name``,
-        ``gid_index`` and ``pcie_error``/``gid_error``. Only
+        ``gid_index``/``gid_family`` and ``pcie_error``/``gid_error``. Only
         ``backend="pcie"`` consumes these; pass ``False`` to skip the walk.
 
     Returns
@@ -357,7 +393,7 @@ def probe_ulysses_rank_topology(
                                 f"rank {rank} is outside the {_PCIE_GID_INDICES_ENV} "
                                 "rank-ordered list"
                             )
-                        topo.gid_index = _probe_rocev2_ipv4_gid(
+                        topo.gid_index, topo.gid_family = _probe_rocev2_gid(
                             topo.nic_name,
                             None if override is None else override[rank],
                         )
@@ -433,6 +469,16 @@ def _rdma_route_error(
         return (
             f"selected GID indices {gid_indices} do not match "
             f"{_PCIE_GID_INDICES_ENV}={overrides[0]}"
+        )
+    # One RoCE v2 header carries both GIDs, so every rank must source from the
+    # same address family. Each rank prefers IPv4 but falls back to IPv6 on
+    # its own, so a group mixing dual-stack and IPv6-only NICs shows up here.
+    families = [t.gid_family for t in by_rank]
+    if len(set(families)) > 1:
+        return (
+            f"ranks selected RoCE v2 GIDs of different address families "
+            f"({families}); an IPv4 GID cannot reach an IPv6 one — set "
+            f"{_PCIE_GID_INDICES_ENV} to entries of one family on every rank"
         )
     # Per-rank NIC selection is independent, so two GPUs can land on the same
     # device; only the full rank-ordered plan can detect it.

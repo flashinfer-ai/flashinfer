@@ -128,6 +128,26 @@ inline void CheckVerbs(int status, const char* operation) {
   TVM_FFI_ICHECK_EQ(status, 0) << operation << ": " << std::strerror(status > 0 ? status : errno);
 }
 
+enum class GidFamily { kUnusable, kIpv4, kIpv6 };
+
+// Address family of a GID a cross-rank RoCE v2 QP can route to. Mirrors
+// _rocev2_gid_family in flashinfer/comm/ulysses_topology.py: a non-zero
+// IPv4-mapped address, or any IPv6 address other than unspecified, loopback,
+// multicast and link-local (every RoCE port carries a MAC-derived fe80::/10
+// default GID that does not cross an L3 hop).
+inline GidFamily RoutableGidFamily(const uint8_t* raw) {
+  const auto is_zero = [](uint8_t byte) { return byte == 0; };
+  if (std::all_of(raw, raw + 10, is_zero) && raw[10] == 0xff && raw[11] == 0xff) {
+    return std::all_of(raw + 12, raw + 16, is_zero) ? GidFamily::kUnusable : GidFamily::kIpv4;
+  }
+  const bool unspecified_or_loopback =
+      std::all_of(raw, raw + 15, is_zero) && (raw[15] == 0 || raw[15] == 1);
+  const bool multicast = raw[0] == 0xff;
+  const bool link_local = raw[0] == 0xfe && (raw[1] & 0xc0) == 0x80;
+  if (unspecified_or_loopback || multicast || link_local) return GidFamily::kUnusable;
+  return GidFamily::kIpv6;
+}
+
 class ScopedCudaDevice {
  public:
   explicit ScopedCudaDevice(int device) noexcept : target_(device) {
@@ -301,13 +321,9 @@ class Transport {
         << "selected GID is no longer RoCE v2";
     TVM_FFI_ICHECK_NE(gid_entry.ndev_ifindex, 0)
         << "selected GID no longer has an associated netdev";
-    const auto* raw = gid_entry.gid.raw;
-    const bool ipv4_mapped = std::all_of(raw, raw + 10, [](uint8_t byte) { return byte == 0; }) &&
-                             raw[10] == 0xff && raw[11] == 0xff;
-    const bool ipv4_nonzero =
-        std::any_of(raw + 12, raw + 16, [](uint8_t byte) { return byte != 0; });
-    TVM_FFI_ICHECK(ipv4_mapped && ipv4_nonzero)
-        << "selected GID is no longer a non-zero IPv4-mapped address";
+    TVM_FFI_ICHECK(RoutableGidFamily(gid_entry.gid.raw) != GidFamily::kUnusable)
+        << "selected GID is no longer a routable address (non-zero IPv4-mapped or "
+           "non-link-local IPv6)";
 
     if (port_out != nullptr) *port_out = port;
     if (gid_out != nullptr) std::memcpy(gid_out, &gid_entry.gid, sizeof(gid_entry.gid));
@@ -809,6 +825,15 @@ class Transport {
           << "selected RDMA port MTU changed after connection metadata exchange";
       TVM_FFI_ICHECK_EQ(std::memcmp(current_gid.raw, local.gid, sizeof(local.gid)), 0)
           << "selected GID changed after connection metadata exchange";
+      // One RoCE v2 header carries both GIDs, so a peer that published a GID of
+      // the other address family is unreachable. The planner already rejects a
+      // mixed group; this keeps a bypassed plan from failing at the first WR.
+      const GidFamily local_family = RoutableGidFamily(local.gid);
+      for (int peer = 0; peer < world_size; ++peer) {
+        if (qps[peer] == nullptr) continue;
+        TVM_FFI_ICHECK(RoutableGidFamily(peers[peer].gid) == local_family)
+            << "peer " << peer << " published a RoCE v2 GID of a different address family";
+      }
       for (int peer = 0; peer < world_size; ++peer) {
         auto* qp = qps[peer];
         if (qp == nullptr) continue;
