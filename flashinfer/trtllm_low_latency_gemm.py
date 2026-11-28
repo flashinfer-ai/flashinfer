@@ -173,6 +173,14 @@ def trtllm_low_latency_gemm(
     --------
     >>> import torch
     >>> from flashinfer import mm_fp8, prepare_low_latency_gemm_weights
+    >>> def to_float8(x, dtype=torch.float8_e4m3fn):
+    ...     finfo = torch.finfo(dtype)
+    ...     min_val, max_val = x.aminmax()
+    ...     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    ...     scale = finfo.max / amax
+    ...     x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    ...     return x_scl_sat.to(dtype), scale.float().reciprocal()
+    >>>
     >>> m = 16
     >>> n = 2560
     >>> k = 32768
@@ -180,12 +188,13 @@ def trtllm_low_latency_gemm(
     >>> a_fp8, a_inv_s = to_float8(a, dtype=torch.float8_e4m3fn)
     >>> b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
     >>> b_fp8, b_inv_s = to_float8(b, dtype=torch.float8_e4m3fn)
-    >>> prepared_b = prepare_low_latency_gemm_weights(b_fp8, _cache_permute_indices)
+    >>> permutation_indices_cache = {}
+    >>> prepared_b = prepare_low_latency_gemm_weights(b_fp8, permutation_indices_cache)
     >>> prepared_b.shape
-    torch.Size([256, 16, 128])
+    torch.Size([256, 2560, 128])
     >>> global_scale = a_inv_s * b_inv_s
     >>> out = torch.zeros([m, n], device="cuda", dtype=torch.bfloat16)
-    >>> mm_fp8(a_fp8, prepared_b, global_scale, out)
+    >>> mm_fp8(a_fp8, prepared_b, global_scale, out=out)
     >>> out.shape
     torch.Size([16, 2560])
     """
