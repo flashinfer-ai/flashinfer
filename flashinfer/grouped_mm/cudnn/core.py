@@ -18,8 +18,10 @@ backend-agnostic.
 """
 
 import functools
+import logging
+import os
 from enum import Enum
-from typing import Optional
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -62,6 +64,49 @@ _CUDNN_MOE_EXPLICIT_OFFSETS_MIN_VERSION = 92800  # 9.28.0
 _CUDNN_MOE_SM107_BF16_FIX_VERSION = 92900  # 9.29.0
 
 
+class _BadCudnnEngine(NamedTuple):
+    """One cuDNN engine known to give wrong results for one grouped GEMM graph.
+
+    The entry applies when the device's compute capability major is in
+    ``sm_majors`` and ``cudnn_first_bad <= cudnn.backend_version() <
+    cudnn_first_fixed``. ``cudnn_first_fixed`` is ``None`` while no fixed
+    release is known. When NVIDIA ships a fix, fill in ``cudnn_first_fixed``
+    and post the evidence on the linked issue. Keep the entry: users can still
+    install the broken releases. An entry can be removed only once FlashInfer's
+    minimum supported cuDNN is at or above its ``cudnn_first_fixed``.
+    """
+
+    graph: str  # graph name, e.g. "moe_block_scale_mxfp8"
+    engine: str  # plan-name substring, matched the way deselect_engines matches
+    sm_majors: Tuple[int, ...]
+    cudnn_first_bad: int  # inclusive
+    cudnn_first_fixed: Optional[int]  # exclusive; None = no fix known yet
+    issue: str
+
+
+_BAD_CUDNN_ENGINES: Tuple[_BadCudnnEngine, ...] = (
+    # eng0 reads the token scales of every group after the first from the wrong
+    # rows on compute capability 10.x. The issue lists the cuDNN and cuBLAS
+    # builds known to be affected.
+    #
+    # cuDNN offers eng0 for this graph only when it loads cuBLASLt 13.8 or later.
+    # The CUDA 13.0 wheels ship cuBLAS 13.1. Excluding an engine that is not
+    # offered changes nothing, so the entry needs no cuBLASLt bound.
+    #
+    # The entry starts at the oldest cuDNN this graph supports, because every
+    # release examined misreads.
+    _BadCudnnEngine(
+        graph="moe_block_scale_mxfp8",
+        engine="eng0",
+        sm_majors=(10,),
+        cudnn_first_bad=_CUDNN_MOE_MIN_VERSION,
+        cudnn_first_fixed=None,
+        issue="https://github.com/NVIDIA/cudnn-frontend/issues/2081",
+    ),
+)
+_CUDNN_BAD_ENGINES_ENV = "FLASHINFER_CUDNN_EXCLUDE_BAD_ENGINES"
+
+
 class _CUDNN_UIDs(Enum):
     """Tensor UIDs for cuDNN MOE graphs (unique namespace)."""
 
@@ -79,6 +124,9 @@ class _CUDNN_UIDs(Enum):
 # ---------------------------------------------------------------------------
 
 _cudnn_handles: dict = {}
+_bad_engine_logged: set = set()
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -405,28 +453,220 @@ def _run_cudnn_moe_grouped_gemm(
     return out
 
 
+def _segmented_token_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
+    """Upper bound on the rows of the per-group padded token scales cuDNN's MoE kernels read.
+
+    Mirrors cuDNN frontend's ``segmented_row_scale_capacity_rows``. Let ``active =
+    min(total_rows, num_groups)``. Padding every non-empty group to whole 128-row
+    blocks needs at most ``active + (total_rows - active) // 128`` blocks. For
+    example, 128 tokens in 2 groups need at most 2 + 126 // 128 = 2 blocks (256
+    rows). The bound does not depend on the group lengths, so the buffer is sized
+    without reading ``m_indptr`` on the host.
+    """
+    active = min(total_rows, num_groups)
+    return 128 * (active + (total_rows - active) // 128)
+
+
+def _segment_token_descale_on_device(
+    a_descale: torch.Tensor, m_indptr: torch.Tensor, cum_m: int, k_blocks: int
+) -> torch.Tensor:
+    """Re-lay the token scales; the caller has made ``a_descale``'s device current.
+
+    See :func:`_segment_token_descale_per_group`.
+    """
+    import triton
+
+    from ...triton.kernels.grouped_scale import segment_scale_128x4_per_group_kernel
+
+    cols = ((k_blocks + 3) // 4) * 4
+    col_words = cols // 4
+    padded_rows = (cum_m + 127) // 128 * 128
+    if tuple(a_descale.shape) != (padded_rows, cols):
+        raise ValueError(
+            f"a_descale must hold the 128x4-swizzled scales of {cum_m} rows: "
+            f"shape ({padded_rows}, {cols}), got {tuple(a_descale.shape)}"
+        )
+    rows = padded_rows
+    num_groups = m_indptr.numel() - 1
+    cap = _segmented_token_scale_capacity_rows(cum_m, num_groups)
+    # cuDNN runs the last group to cum_m (see _cudnn_moe_first_token_offset), so
+    # its scales are re-laid out up to cum_m too.
+    ends = m_indptr.to(dtype=torch.int32)
+    ends = torch.cat((ends[:-1], ends.new_full((1,), cum_m))).contiguous()
+    src = a_descale.contiguous().view(torch.uint8)
+    if src.storage_offset() % 4:
+        src = src.clone()  # an int32 view needs a 4-byte aligned start
+    src = src.view(torch.int32)
+    # Each call owns its buffer. The GEMM reads it after the re-layout kernel writes
+    # it, and another call could overwrite a shared buffer in between.
+    dst = torch.empty(cap * col_words, dtype=torch.int32, device=a_descale.device)
+    block_c = min(32, triton.next_power_of_2(col_words))
+    grid = (cap // 128, triton.cdiv(col_words, block_c))
+    segment_scale_128x4_per_group_kernel[grid](
+        src,
+        dst,
+        ends,
+        num_groups,
+        rows,
+        num_col_words=col_words,
+        BLOCK_G=max(16, triton.next_power_of_2(num_groups)),
+        BLOCK_C=block_c,
+    )
+    return dst.view(torch.uint8).view(cap, cols).view(a_descale.dtype)
+
+
+def _segment_token_descale_per_group(
+    a_descale: torch.Tensor, m_indptr: torch.Tensor, cum_m: int, k_blocks: int
+) -> torch.Tensor:
+    """Re-lay A's token scales into the per-group padded layout cuDNN's MoE kernels read.
+
+    ``grouped_mm_fp4`` / ``grouped_mm_mxfp8`` take ``a_descale`` in the F8_128x4 layout
+    over all tokens as one matrix. That is what the quantizers produce (the layout is
+    described in ``segment_scale_128x4_per_group_kernel``). cuDNN's MoE grouped
+    block-scale kernels (SM100 and SM12x) instead read the F8_128x4 layout padded to
+    whole 128-row blocks *per group*. The groups are concatenated in order. Group
+    ``g`` starts at block ``sum(ceil(len_j / 128) for j < g)``, where ``len_j`` is
+    group ``j``'s row count. Its rows are addressed group-locally. For example, with
+    segments ``[16, 48, 64]`` group 1 starts at padded row 128, not at row 16.
+
+    The two layouts are the same only when every group starts on a multiple of 128
+    rows. For any other ``m_indptr``, the whole-matrix layout makes cuDNN read the
+    wrong scales or read past the buffer. It then returns wrong values without an
+    error.
+
+    A Triton kernel does the re-layout. Each program writes one destination 128-row
+    block and finds its group by reading ``m_indptr`` on the device. No group length
+    is read on the host, so the call is safe under CUDA graph capture. Padding rows
+    are zero. The last group runs to ``cum_m``, as in cuDNN's offsets.
+
+    Raises ``ValueError`` unless ``a_descale`` has exactly the shape
+    ``(round_up(cum_m, 128), round_up(k_blocks, 4))``. Returns a tensor of ``a_descale``'s dtype with
+    ``_segmented_token_scale_capacity_rows(cum_m, m_indptr.numel() - 1)`` rows and
+    ``round_up(k_blocks, 4)`` columns.
+    """
+    # The Triton launch uses the current device's stream, so make the operands'
+    # device current.
+    with torch.cuda.device(a_descale.device):
+        return _segment_token_descale_on_device(a_descale, m_indptr, cum_m, k_blocks)
+
+
+def _bind_as_declared(blob: torch.Tensor, declared: torch.Tensor) -> torch.Tensor:
+    """A no-copy view of ``blob`` with ``declared``'s shape and dense strides.
+
+    The graph declares the logical token scales. cuDNN reads the scale buffer only
+    through its base pointer, and the re-laid-out buffer is never smaller. So the
+    buffer is bound through a view with the declared shape. Binding a tensor of a different
+    shape makes cuDNN take its per-call shape-override path, which adds about 25 ms
+    of host time per execute. The view keeps the blob alive.
+    """
+    return blob.reshape(-1)[: declared.numel()].view(declared.shape)
+
+
+def _executable_plan_indices(
+    plan_names: List[str], excluded_engines: Tuple[str, ...]
+) -> Tuple[int, ...]:
+    """Indices of the plans whose name contains none of ``excluded_engines``.
+
+    Same rule as the frontend's ``deselect_engines`` (name substring), so the
+    indices left are exactly the ones ``execute_plan_at_index`` accepts.
+    """
+    return tuple(
+        index
+        for index, name in enumerate(plan_names)
+        if not any(engine in name for engine in excluded_engines)
+    )
+
+
+def _bad_engines_for(
+    graph: str,
+    compute_capability: Tuple[int, int],
+    backend_version: int,
+    env_value: Optional[str],
+) -> Tuple[str, ...]:
+    """Engines to leave out of ``graph`` for this compute capability and cuDNN.
+
+    ``env_value`` is the value of ``FLASHINFER_CUDNN_EXCLUDE_BAD_ENGINES``
+    (``None`` when unset). It overrides the table:
+
+    - ``0``: exclude nothing (to check whether a newer cuDNN fixed an engine).
+    - ``1``: exclude every engine listed for ``graph``, on any device and version.
+    - unset or anything else: apply the table.
+    """
+    if env_value == "0":
+        return ()
+    engines = []
+    for entry in _BAD_CUDNN_ENGINES:
+        if entry.graph != graph or entry.engine in engines:
+            continue
+        if env_value == "1" or (
+            compute_capability[0] in entry.sm_majors
+            and entry.cudnn_first_bad <= backend_version
+            and (
+                entry.cudnn_first_fixed is None
+                or backend_version < entry.cudnn_first_fixed
+            )
+        ):
+            engines.append(entry.engine)
+    return tuple(engines)
+
+
+def _block_scale_excluded_engines(
+    device: torch.device, token_is_fp4: bool
+) -> Tuple[str, ...]:
+    """Engines to exclude from the block-scale graph on ``device``.
+
+    ``token_is_fp4`` selects the FP4 or the MXFP8 graph; see :func:`_bad_engines_for`.
+    """
+    return _bad_engines_for(
+        "moe_block_scale_fp4" if token_is_fp4 else "moe_block_scale_mxfp8",
+        get_compute_capability(device),
+        cudnn.backend_version(),
+        os.environ.get(_CUDNN_BAD_ENGINES_ENV, "").strip() or None,
+    )
+
+
+def _log_bad_engine_exclusion_once(
+    excluded_engines: Tuple[str, ...], num_plans: int
+) -> None:
+    """Log once per (engines, cuDNN version) that ``num_plans`` plans were left out."""
+    key = (excluded_engines, cudnn.backend_version())
+    if key in _bad_engine_logged:
+        return
+    _bad_engine_logged.add(key)
+    logger.info(
+        "cuDNN grouped GEMM: leaving out %d plan(s) of engine(s) %s on cuDNN %d "
+        "(listed in _BAD_CUDNN_ENGINES, or %s=1); set %s=0 to keep them.",
+        num_plans,
+        ", ".join(excluded_engines),
+        key[1],
+        _CUDNN_BAD_ENGINES_ENV,
+        _CUDNN_BAD_ENGINES_ENV,
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def _build_cudnn_moe_block_scale_grouped_gemm_graph(
-    handle,
-    token_shape,
-    token_stride,
-    token_cudnn_dtype,
-    token_descale_shape,
-    token_descale_stride,
-    token_descale_cudnn_dtype,
-    weight_shape,
-    weight_stride,
-    weight_cudnn_dtype,
-    weight_descale_shape,
-    weight_descale_stride,
-    weight_descale_cudnn_dtype,
-    fto_shape,
-    fto_stride,
-    alpha_cudnn_dtype,
-    output_cudnn_dtype,
-    block_size,
-    policy=None,
-):
+    handle: Any,
+    token_shape: Tuple[int, ...],
+    token_stride: Tuple[int, ...],
+    token_cudnn_dtype: Any,
+    token_descale_shape: Tuple[int, ...],
+    token_descale_stride: Tuple[int, ...],
+    token_descale_cudnn_dtype: Any,
+    weight_shape: Tuple[int, ...],
+    weight_stride: Tuple[int, ...],
+    weight_cudnn_dtype: Any,
+    weight_descale_shape: Tuple[int, ...],
+    weight_descale_stride: Tuple[int, ...],
+    weight_descale_cudnn_dtype: Any,
+    fto_shape: Tuple[int, ...],
+    fto_stride: Tuple[int, ...],
+    alpha_cudnn_dtype: Any,
+    output_cudnn_dtype: Any,
+    block_size: int,
+    policy: Any = None,
+    excluded_engines: Tuple[str, ...] = (),
+) -> Tuple[Any, int, Tuple[int, ...]]:
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
@@ -522,10 +762,36 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+    def plan_names() -> List[str]:
+        return [
+            graph.get_plan_name_at_index(index)
+            for index in range(graph.get_execution_plan_count())
+        ]
+
+    if excluded_engines:
+        # Fail before check_support and build_plans when every offered plan is excluded.
+        offered = plan_names()
+        if offered and not _executable_plan_indices(offered, excluded_engines):
+            raise RuntimeError(
+                f"cuDNN offers only plans of {', '.join(excluded_engines)} for this "
+                "grouped GEMM, and they give wrong results here (see "
+                f"_BAD_CUDNN_ENGINES); set {_CUDNN_BAD_ENGINES_ENV}=0 to run them anyway"
+            )
+        # Keeps the engines out of the heuristic choice (tactic -1); the indexed
+        # plans are filtered below. See _BAD_CUDNN_ENGINES.
+        graph.deselect_engines(list(excluded_engines))
     graph.check_support()
     graph.build_plans(policy)
 
-    return graph, graph.get_workspace_size()
+    # deselect_engines does not remove entries from the frontend's plan list, and
+    # executing an excluded index raises. Expose contiguous tactic indices over
+    # only the executable plans.
+    names = plan_names()
+    plan_indices = _executable_plan_indices(names, excluded_engines)
+    if len(plan_indices) < len(names):
+        _log_bad_engine_exclusion_once(excluded_engines, len(names) - len(plan_indices))
+    return graph, graph.get_workspace_size(), plan_indices
 
 
 def _cudnn_moe_block_scale_grouped_gemm_plan_count(
@@ -545,15 +811,18 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
     E4M3/E5M2 ``a``) or :func:`_run_cudnn_moe_block_scale_grouped_gemm_fp4`
     (packed FP4 ``a``) executes for ``tactic >= 0``, so the valid tactic
     indices for these operand shapes, strides and dtypes are exactly
-    ``range(count)``. Like the plain query, it compiles every plan once and is
-    refused while a CUDA graph is being captured.
+    ``range(count)``. Plans of the engines excluded for this setup (see
+    ``_bad_engines_for``) are not counted. Like the plain query, it compiles every
+    plan once and is refused while a CUDA graph is being captured.
     """
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, a.shape[0])
-    if a.dtype in (torch.uint8, torch.float4_e2m1fn_x2):
+    token_is_fp4 = a.dtype in (torch.uint8, torch.float4_e2m1fn_x2)
+    if token_is_fp4:
         token_shape, token_stride = _get_real_fp4_shape_from_packed_uint8(token_3d)
         weight_shape, weight_stride = _get_real_fp4_shape_from_packed_uint8(weight_3d)
         token_cudnn_dtype = weight_cudnn_dtype = cudnn.data_type.FP4_E2M1
@@ -568,7 +837,7 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
             return cudnn.data_type.FP8_E8M0
         return _to_cudnn_dtype(descale.dtype)
 
-    graph, _ = _build_cudnn_moe_block_scale_grouped_gemm_graph(
+    _, _, plan_indices = _build_cudnn_moe_block_scale_grouped_gemm_graph(
         _get_handle(a.device),
         token_shape,
         token_stride,
@@ -588,8 +857,9 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
         _to_cudnn_dtype(out_dtype),
         block_size=block_size,
         policy=cudnn.build_plan_policy.ALL,
+        excluded_engines=_block_scale_excluded_engines(a.device, token_is_fp4),
     )
-    return graph.get_execution_plan_count()
+    return len(plan_indices)
 
 
 def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
@@ -619,7 +889,19 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     _, n, _ = b.shape
 
     token_3d = a.unsqueeze(0)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
+    # The graph declares the logical token-scale shape, but cuDNN's kernel reads the
+    # per-group padded layout. Bind the re-laid-out scales under the declared shape.
+    token_descale_runtime = _bind_as_declared(
+        _segment_token_descale_per_group(
+            a_descale,
+            m_indptr,
+            cum_m,
+            a.shape[1] // 32,  # MXFP8: one UE8M0 scale per 32
+        ),
+        a_descale,
+    ).unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, cum_m)
@@ -633,7 +915,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         else cudnn.build_plan_policy.ALL
     )
 
-    graph, ws = _build_cudnn_moe_block_scale_grouped_gemm_graph(
+    graph, ws, plan_indices = _build_cudnn_moe_block_scale_grouped_gemm_graph(
         handle,
         token_3d.shape,
         token_3d.stride(),
@@ -653,6 +935,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         out_cudnn_dtype,
         block_size=32,
         policy=policy,
+        excluded_engines=_block_scale_excluded_engines(a.device, token_is_fp4=False),
     )
 
     if out is None:
@@ -661,7 +944,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
 
     variant_pack = {
         _CUDNN_UIDs.TOKEN.value: token_3d,
-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
+        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
         _CUDNN_UIDs.WEIGHT.value: weight_3d,
         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
@@ -680,10 +963,11 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
-        plan_count = graph.get_execution_plan_count()
-        if tactic >= plan_count:
+        if not 0 <= tactic < len(plan_indices):
             return None
-        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
+        graph.execute_plan_at_index(
+            variant_pack, workspace, plan_indices[tactic], handle=handle
+        )
     return out
 
 
@@ -723,7 +1007,19 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     _, n, _ = b.shape
 
     token_3d = a.unsqueeze(0)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
+    # The graph declares the logical token-scale shape, but cuDNN's kernel reads the
+    # per-group padded layout. Bind the re-laid-out scales under the declared shape.
+    token_descale_runtime = _bind_as_declared(
+        _segment_token_descale_per_group(
+            a_descale,
+            m_indptr,
+            cum_m,
+            a.shape[1] * 2 // block_size,  # packed FP4: two per byte
+        ),
+        a_descale,
+    ).unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, cum_m)
@@ -744,7 +1040,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
         else cudnn.build_plan_policy.ALL
     )
 
-    graph, ws = _build_cudnn_moe_block_scale_grouped_gemm_graph(
+    graph, ws, plan_indices = _build_cudnn_moe_block_scale_grouped_gemm_graph(
         handle,
         token_logical_shape,
         token_logical_stride,
@@ -764,6 +1060,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
         out_cudnn_dtype,
         block_size=block_size,
         policy=policy,
+        excluded_engines=_block_scale_excluded_engines(a.device, token_is_fp4=True),
     )
 
     if out is None:
@@ -772,7 +1069,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
 
     variant_pack = {
         _CUDNN_UIDs.TOKEN.value: token_3d,
-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
+        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
         _CUDNN_UIDs.WEIGHT.value: weight_3d,
         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
@@ -791,8 +1088,9 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
-        plan_count = graph.get_execution_plan_count()
-        if tactic >= plan_count:
+        if not 0 <= tactic < len(plan_indices):
             return None
-        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
+        graph.execute_plan_at_index(
+            variant_pack, workspace, plan_indices[tactic], handle=handle
+        )
     return out
