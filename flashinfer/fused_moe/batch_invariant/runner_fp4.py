@@ -53,7 +53,7 @@ from ..api import (
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
 from . import spec as S
-from .api_fp4 import MXFP4, NVFP4, Fp4Pair
+from .pair_fp4 import MXFP4, NVFP4, Fp4Pair
 from .runner import MOE_BF16_ARCHS, _PackedInputs, routing_term
 
 #: The backend's key: the name of its weight view and of its autotuner records.
