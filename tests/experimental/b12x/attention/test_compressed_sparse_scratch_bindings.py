@@ -33,8 +33,8 @@ from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLABinding,
     B12XCompressedSparseMLAScratchCaps,
 )
-from b12x.attention.compressed_sparse_mla import (
-    plan as plan_compressed_sparse_mla_scratch,
+from b12x.attention.compressed_sparse_mla._scratch import (
+    plan_compressed_sparse_mla_scratch,
 )
 from b12x.attention.sparse_mla._scratch import (
     B12XSparseMLABinding,
@@ -119,6 +119,19 @@ def test_compressed_sparse_mla_bind_is_views_only(monkeypatch, cache_format) -> 
     lengths = torch.ones((4,), dtype=torch.int32)
     page_table = torch.ones((1, 2), dtype=torch.int32).expand(4, -1)
 
+    # Materialization initializes split-control words. The live binding itself
+    # must only create views over this already initialized caller storage.
+    prepared_scratch = plan.bind(
+        scratch=scratch,
+        q=q,
+        swa_indices=indices,
+        swa_lengths=lengths,
+        indexed_indices=indices,
+        indexed_lengths=lengths,
+        indexed_page_table=page_table,
+    ).scratch
+    before = scratch.clone()
+
     def reject_allocation(*args, **kwargs):
         raise AssertionError("bind must not allocate tensor storage")
 
@@ -126,8 +139,7 @@ def test_compressed_sparse_mla_bind_is_views_only(monkeypatch, cache_format) -> 
         guarded.setattr(torch, "empty", reject_allocation)
         guarded.setattr(torch, "zeros", reject_allocation)
         guarded.setattr(torch, "full", reject_allocation)
-        binding = plan.bind(
-            scratch=scratch,
+        binding = prepared_scratch.bind(
             q=q,
             swa_indices=indices,
             swa_lengths=lengths,
@@ -135,10 +147,10 @@ def test_compressed_sparse_mla_bind_is_views_only(monkeypatch, cache_format) -> 
             indexed_lengths=lengths,
             indexed_page_table=page_table,
         )
-    assert torch.all(scratch == 165)
+    torch.testing.assert_close(scratch, before, rtol=0, atol=0)
     # Mutation through the consumer-visible final LSE is within caller storage.
     binding.scratch.final_lse.zero_()
-    assert torch.count_nonzero(scratch != 165).item() == 4 * 8 * 4
+    assert torch.count_nonzero(scratch != before).item() == 4 * 8 * 4
 
 
 def test_indexer_paged_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
@@ -840,11 +852,13 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
         dtype=torch.uint8,
     )
     calls = {}
+    prepared = object()
 
     def fail_stage(**kwargs):
         raise AssertionError("binding path should not stage compressed MLA inputs")
 
     def fake_forward(**kwargs):
+        assert kwargs["prepared"] is prepared
         calls["q_all"] = kwargs["q_all"]
         calls["swa_indices"] = kwargs["swa_indices"]
         calls["swa_lengths"] = kwargs["swa_topk_lengths"]
@@ -859,13 +873,14 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
         compressed_sparse_mla_impl, "_use_sm120_sparse_mla", lambda **_: True
     )
     monkeypatch.setattr(
-        compressed_sparse_mla_kernel, "run_unified_decode", fake_forward
+        compressed_sparse_mla_kernel, "run_prepared_unified_decode", fake_forward
     )
 
     out = compressed_sparse_mla_impl.compressed_sparse_mla_decode_forward(
         binding=binding,
         swa_k_cache=swa_cache,
         sm_scale=1.0,
+        prepared=prepared,
     )
 
     assert calls["q_all"].data_ptr() == q.data_ptr()
