@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import TORCH_DIST
-from ......core.validation.common import MoEEpArchError, MoEEpConfigError
+from ......core.validation.common import (
+    MoEEpArchError,
+    MoEEpConfigError,
+    validate_mega_fleet_params,
+)
 from .config import Sm100_KimiK3_MegaMoeConfig
 
 if TYPE_CHECKING:
@@ -50,18 +54,26 @@ class KimiK3MegaKernelBackend(MegaKernelBackend):
     ) -> None:
         import torch
 
-        for name, value, expected in (
-            ("num_experts", fleet_params.num_experts, 896),
-            ("token_hidden_size", fleet_params.token_hidden_size, 3584),
+        for name, value in (
+            ("num_experts", fleet_params.num_experts),
+            ("token_hidden_size", fleet_params.token_hidden_size),
+            ("world_size", bootstrap.world_size),
         ):
-            if type(value) is not int or value != expected:
-                raise MoEEpConfigError(f"Kimi K3 requires {name}={expected}")
-        if type(bootstrap.world_size) is not int or bootstrap.world_size not in (
-            1,
-            8,
-            16,
-        ):
-            raise MoEEpConfigError("Kimi K3 supports world_size 1, 8 or 16")
+            if type(value) is not int or value <= 0:
+                raise MoEEpConfigError(f"{name} must be a positive integer")
+        # Compact activation-scale rows must stay 16-byte aligned for the
+        # router's bulk copies. MXFP4 weight TMA also needs K aligned to 128.
+        mxfp4 = self._config.quant_kind == "mxfp4_mxfp8"
+        validate_mega_fleet_params(
+            fleet_params,
+            bootstrap.world_size,
+            intermediate_size=self._config.intermediate_size,
+            top_k=self._config.top_k,
+            alignment=128 if mxfp4 else 64,
+            hidden_alignment=512 if mxfp4 else 256,
+        )
+        if self._config.top_k > fleet_params.num_experts:
+            raise MoEEpConfigError("top_k must not exceed num_experts")
         if (
             type(fleet_params.max_tokens_per_rank) is not int
             or not 1 <= fleet_params.max_tokens_per_rank <= 65536
@@ -69,7 +81,12 @@ class KimiK3MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "max_tokens_per_rank must be an integer in [1, 65536]"
             )
-        if fleet_params.max_tokens_per_rank * self._config.top_k * 3584 >= 2**31:
+        if (
+            fleet_params.max_tokens_per_rank
+            * self._config.top_k
+            * fleet_params.token_hidden_size
+            >= 2**31
+        ):
             raise MoEEpConfigError(
                 "max_tokens_per_rank exceeds the int32 combine-plane index limit"
             )
@@ -143,7 +160,9 @@ class KimiK3MegaKernelBackend(MegaKernelBackend):
             "topk_weights": t.topk_weights,
         }
         if t.topk_ids.shape != (tokens, self._config.top_k):
-            raise MoEEpConfigError("topk_ids must have shape [tokens, 16]")
+            raise MoEEpConfigError(
+                f"topk_ids must have shape [tokens, {self._config.top_k}]"
+            )
         if t.topk_ids.dtype not in (torch.int32, torch.int64):
             raise MoEEpConfigError("topk_ids must have dtype int32 or int64")
         if t.topk_weights.shape != t.topk_ids.shape:
