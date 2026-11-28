@@ -1606,7 +1606,17 @@ def cutlass_fused_moe(
         GEMM2 weights for each expert.
 
     output_dtype : torch.dtype
-        Desired output data type.
+        Desired output data type; any dtype not listed for the mode raises.
+
+        - 16-bit activations and weights of the same dtype: that dtype, or
+          ``torch.float32``, for which the GEMMs stay 16-bit and the output is the
+          routing sum in FP32 (so partial outputs, e.g. of expert groups, can be added
+          without rounding each one to 16 bits first).
+        - FP8, MXFP8 and NVFP4 modes, and MXFP4 weights with FP8 or MXFP8 activations:
+          ``torch.float16`` or ``torch.bfloat16`` (not an FP8 output). Humming-style
+          MXFP4 x FP8, which quantizes 16-bit inputs online: the input dtype only.
+        - 16-bit activations with FP8, INT4 or MXFP4 (W4A16) weights: the activation
+          dtype.
 
     quant_scales : List[torch.Tensor]
         Quantization scales for the operation.
@@ -1988,7 +1998,7 @@ def cutlass_fused_moe_workspace_size(
     *,
     x_dtype: torch.dtype,
     weight_dtype: torch.dtype,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: Optional[torch.dtype] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
     tp_size: int = 1,
     tp_rank: int = 0,
@@ -2031,7 +2041,9 @@ def cutlass_fused_moe_workspace_size(
     x_dtype, weight_dtype : torch.dtype
         Input and weight dtypes, used to select the kernel runner.
     output_dtype : torch.dtype, optional
-        Output dtype (default: ``torch.bfloat16``).
+        The ``output_dtype`` the :func:`cutlass_fused_moe` calls will pass. Default: ``x_dtype``
+        for 16-bit inputs (the runner refuses another 16-bit output for them), otherwise
+        ``torch.bfloat16``.
     use_fused_finalize : Optional[bool]
         Must match the value :func:`cutlass_fused_moe` resolves to. ``None``
         (default) follows the same rule: fused unless
@@ -2051,6 +2063,11 @@ def cutlass_fused_moe_workspace_size(
     """
     if use_fused_finalize is None:
         use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
+    if output_dtype is None:
+        # Before the Cake branch, whose helpers check output_dtype (BF16) from these locals.
+        output_dtype = (
+            x_dtype if x_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        )
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_workspace_size
 

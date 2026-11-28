@@ -128,6 +128,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFPX = false,
       kernels::Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(DLDataType output_type) {
+    mOutputTypeDispatched = true;
     switch (encode_dlpack_dtype(output_type)) {
       case int64_code:  // INT64 == FP4
       case float8_e4m3fn_code:
@@ -181,12 +182,30 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mInnerDimMultiplier = 1;
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
+    // 16-bit activations and weights may also output FP32 (the per-expert GEMM outputs stay
+    // 16-bit; the finalize sums in FP32 and writes FP32).
+    bool const unquantized_16bit =
+        mActivationDtype == mWeightDtype &&
+        (mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16);
+    mFp32FinalOutput = unquantized_16bit && mOutputDtype == dl_float32;
     if (mActivationDtype == dl_float16 && mWeightDtype == dl_float16) {
-      mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, half>>();
+      if (mFp32FinalOutput) {
+        mKernelRunner =
+            std::make_shared<kernels::CutlassMoeFCRunner<half, half, float, half, half>>();
+      } else {
+        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, half>>();
+      }
     }
 #ifdef ENABLE_BF16
     else if (mActivationDtype == dl_bfloat16 && mWeightDtype == dl_bfloat16) {
-      mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
+      if (mFp32FinalOutput) {
+        mKernelRunner =
+            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16, float,
+                                                         __nv_bfloat16, __nv_bfloat16>>();
+      } else {
+        mKernelRunner =
+            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
+      }
     }
 #ifdef ENABLE_FP8
     else if (mActivationDtype == dl_bfloat16 && mWeightDtype == dl_float8_e4m3fn) {
@@ -317,10 +336,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << ", Weight: " << DLDataTypeToString(mWeightDtype)
           << ", Output: " << DLDataTypeToString(mOutputDtype);
     }
+    // The paths above that do not dispatch on the output type build a runner whose output is the
+    // activation type (or FP32, see mFp32FinalOutput). Reject any other output type instead of
+    // writing activation-type values into the output buffer.
+    if (!mOutputTypeDispatched) {
+      TVM_FFI_ICHECK(mOutputDtype == mActivationDtype || mFp32FinalOutput)
+          << "Output type " << DLDataTypeToString(mOutputDtype) << " is not supported for "
+          << DLDataTypeToString(mActivationDtype) << " activations and "
+          << DLDataTypeToString(mWeightDtype)
+          << " weights (supported: " << DLDataTypeToString(mActivationDtype)
+          << (unquantized_16bit ? ", float32" : "") << ")";
+    }
 
     // Must be set before enumerating tactics below: it gates whether GEMM2 finalize-fusion
     // tactics are produced (mayHaveFinalizeFused) and the corresponding workspace sizing.
-    mKernelRunner->use_fused_finalize_ = mUseFusedFinalize;
+    // The fused finalize epilogue writes the 16-bit GEMM type: an FP32 final output never uses it.
+    mKernelRunner->use_fused_finalize_ = mUseFusedFinalize && !mFp32FinalOutput;
 
     mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
     // Get tactics for both GEMM1 and GEMM2, combine them
@@ -386,8 +417,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
       CHECK_CONTIGUOUS(fc1_expert_biases.value());
       CHECK_CONTIGUOUS(fc2_expert_biases.value());
-      CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
-      CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
+      CHECK_INPUT_TYPE(fc1_expert_biases.value(), biasDtype());
+      CHECK_INPUT_TYPE(fc2_expert_biases.value(), biasDtype());
 
       CHECK_DIM(2, fc1_expert_biases.value());
       CHECK_DIM(2, fc2_expert_biases.value());
@@ -561,8 +592,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
       CHECK_CONTIGUOUS(fc1_expert_biases.value());
       CHECK_CONTIGUOUS(fc2_expert_biases.value());
-      CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
-      CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
+      CHECK_INPUT_TYPE(fc1_expert_biases.value(), biasDtype());
+      CHECK_INPUT_TYPE(fc2_expert_biases.value(), biasDtype());
       CHECK_DIM(2, fc1_expert_biases.value());
       CHECK_DIM(2, fc2_expert_biases.value());
       TVM_FFI_ICHECK_EQ(fc1_expert_weights.size(0), fc1_expert_biases.value().size(0))
@@ -937,6 +968,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUseWfp4Afp8Humming = false;
   bool mUsePackedWeights = false;
   bool mUseFusedFinalize = true;
+  // FP32 final output over 16-bit activations and weights (see the constructor).
+  bool mFp32FinalOutput = false;
+  // Set by switch_output_type: the runner was built for the requested output type.
+  bool mOutputTypeDispatched = false;
+  DLDataType biasDtype() const { return mFp32FinalOutput ? mActivationDtype : mOutputDtype; }
   kernels::Sm90Wfp4Afp8ScaleMode mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;

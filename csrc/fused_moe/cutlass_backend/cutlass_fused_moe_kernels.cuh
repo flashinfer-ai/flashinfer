@@ -3559,7 +3559,7 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode, class Enable>
 void CutlassMoeFCRunner<
     T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
-    Enable>::gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+    Enable>::gemm1(MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX,
                                  Sm90Wfp4Afp8Mode>& gemm_runner,
                    DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
                    T* const output, void* const intermediate_result,
@@ -3620,7 +3620,8 @@ void CutlassMoeFCRunner<
     TLLM_CHECK(!use_fp4 || fc1_fp4_act_flat);
     TLLM_CHECK(!use_fp4 || fc2_fp4_act_flat);
 
-    bool has_different_gemm_output_type = using_tma_ws_gemm1 && !std::is_same_v<T, OutputType>;
+    bool has_different_gemm_output_type =
+        using_tma_ws_gemm1 && !std::is_same_v<T, UnfusedGemmOutputType>;
     bool const has_intermediate = has_different_gemm_output_type || is_gated_activation;
     TLLM_CHECK_WITH_INFO(use_fused_activation_epilogue || has_intermediate || input != output,
                          "Input and output buffers are overlapping");
@@ -3638,14 +3639,14 @@ void CutlassMoeFCRunner<
       TLLM_CHECK(alpha_scale_ptr_array != nullptr);
     }
 
-    auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
+    auto universal_input = GroupedGemmInput<T, WeightType, BackBoneType, BackBoneType>{
         input,
         total_tokens_including_expert,
         /*weights*/ nullptr,
         /*scales*/ nullptr,
         /*zeros*/ nullptr,
         /*biases*/ nullptr,
-        /*C*/ static_cast<OutputType*>(gemm_output),
+        /*C*/ static_cast<BackBoneType*>(gemm_output),
         alpha_scale_ptr_array,
         /*occupancy*/ nullptr,
         fc1_activation_type,
@@ -3700,7 +3701,7 @@ void CutlassMoeFCRunner<
     alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
                                                    quant_params.fp8.dequant_fc1, stream);
 
-    auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
+    auto universal_input = GroupedGemmInput<T, WeightType, BackBoneType, BackBoneType>{
         input,
         total_tokens_including_expert,
         fc1_expert_weights,
@@ -3739,7 +3740,7 @@ void CutlassMoeFCRunner<
       alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
                                                      quant_params.groupwise.fc1.alpha, stream);
     }
-    auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
+    auto universal_input = GroupedGemmInput<T, WeightType, BackBoneType, BackBoneType>{
         input,
         total_tokens_including_expert,
         fc1_expert_weights,
@@ -3750,7 +3751,7 @@ void CutlassMoeFCRunner<
             ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_zeros)
             : nullptr,
         fc1_expert_biases,
-        reinterpret_cast<OutputType*>(output),
+        reinterpret_cast<BackBoneType*>(output),
         alpha_scale_ptr_array,
         /*occupancy*/ nullptr,
         fc1_activation_type,
@@ -3778,7 +3779,7 @@ void CutlassMoeFCRunner<
     }
     // Run the GEMM with activation function overridden with `Identity`, we do the activation
     // separately
-    auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
+    auto universal_input = GroupedGemmInput<T, WeightType, BackBoneType, BackBoneType>{
         input,
         total_tokens_including_expert,
         fc1_expert_weights,
@@ -3789,7 +3790,7 @@ void CutlassMoeFCRunner<
             ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_zeros)
             : nullptr,
         fc1_expert_biases,
-        static_cast<OutputType*>(use_ampere_activation_fusion ? output : intermediate_result),
+        static_cast<BackBoneType*>(use_ampere_activation_fusion ? output : intermediate_result),
         alpha_scale_ptr_array,
         /*occupancy*/ nullptr,
         use_ampere_activation_fusion ? fc1_activation_type.activation_type
@@ -3823,7 +3824,7 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
                         Sm90Wfp4Afp8Mode, Enable>::
-    gemm2(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
+    gemm2(MoeGemmRunner<T, WeightType, BackBoneType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
               gemm_runner,
           DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
           void* const gemm_output, OutputType* const final_output,
@@ -3891,7 +3892,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 
   bool fuse_lora_bias = use_lora && !(use_fp8 || using_tma_ws_gemm2);
   // Note: expanded_num_rows, to check this value, it's greater than num_rows * num_experts_per_node
-  auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
+  auto universal_input = GroupedGemmInput<T, WeightType, BackBoneType, BackBoneType>{
       input,
       total_tokens_including_expert,
       fc2_expert_weights,
@@ -3902,7 +3903,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
           ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc2.weight_zeros)
           : nullptr,
       fuse_lora_bias ? static_cast<ScaleBiasType*>(fc2_lora) : nullptr,
-      static_cast<OutputType*>(gemm_output),
+      static_cast<BackBoneType*>(gemm_output),
       alpha_scale_ptr_array,
       /*occupancy*/ nullptr,
       ActivationType::Identity,
@@ -4643,7 +4644,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   int const blocks = (num_experts_per_node + threads - 1) / threads;
 
   auto* kernel_instance =
-      &computeStridesTmaWarpSpecializedKernel<T, WeightType, OutputType, ScaleBiasType>;
+      &computeStridesTmaWarpSpecializedKernel<T, WeightType, BackBoneType, ScaleBiasType>;
 
   cudaLaunchConfig_t config;
   config.gridDim = blocks;
@@ -4791,7 +4792,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
         gemm2_config_->epilogue_fusion_type ==
         cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
     bool using_fused_finalize = use_fused_finalize_ && gemm2_using_finalize_fusion &&
-                                !use_sm90_mixed_input_gemm && !use_lora;
+                                !use_sm90_mixed_input_gemm && !use_lora && !fp32_final_output;
     TLLM_CHECK_WITH_INFO(
         using_fused_finalize == gemm2_using_finalize_fusion,
         "GEMM2 tactic requests finalize fusion, but the runner is not configured to use it");
