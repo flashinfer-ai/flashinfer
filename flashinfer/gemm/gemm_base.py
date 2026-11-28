@@ -71,6 +71,7 @@ from ..autotuner import (
     cake_auto_candidate_open,
     is_in_profile_measurement,
 )
+from ..autotuner.initializers import autotuner_initializer_empty
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
@@ -11246,6 +11247,10 @@ def _cake_per_token_auto_candidate():
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
+    tensor_initializers=(
+        (6, autotuner_initializer_empty),
+        (9, autotuner_initializer_empty),
+    ),
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -11277,6 +11282,10 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
 _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
+    tensor_initializers=(
+        (6, autotuner_initializer_empty),
+        (9, autotuner_initializer_empty),
+    ),
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
