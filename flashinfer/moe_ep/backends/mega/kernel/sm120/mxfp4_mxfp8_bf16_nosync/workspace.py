@@ -308,6 +308,9 @@ class NosyncWorkspace:
             float(swiglu_limit),
             self.gin,
             tokens_per_item or 0,
+            weights.w13_gate_up_interleaved,
+            weights.scale_layout == "canonical",
+            weights.scale_layout == "deepgemm",
         )
 
     def error(self) -> int:
