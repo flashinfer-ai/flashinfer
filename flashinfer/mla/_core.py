@@ -5500,6 +5500,7 @@ def _mla_with_kv_cache_impl(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    fill_empty_kv_rows: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Execute MLA decode or prefill through the selected backend:
     TRTLLM-GEN, CuteDSL, XQA, Cake, or SM120/SM121 sparse kernels.
@@ -5555,7 +5556,10 @@ def _mla_with_kv_cache_impl(
     seq_lens : Optional[torch.Tensor]
         Per-request physical KV sequence lengths for dense and TRTLLM-GEN
         paths. With DCP these are rank-local lengths and continue to control
-        paging, memory bounds, and split-KV. For
+        paging, memory bounds, and split-KV. Requests with ``seq_lens == 0``
+        are skipped by the ``trtllm-gen`` kernel (their ``out`` rows are left
+        untouched, ``lse = -inf``); see ``fill_empty_kv_rows`` to have them
+        written as the empty-attention identity instead. For
         SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
         ``None``, every column in ``block_tables`` is active.
@@ -5655,6 +5659,17 @@ def _mla_with_kv_cache_impl(
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
         supported by monolithic CuTeDSL and by the ``cake`` Kimi-K3 FP8 route.
+    fill_empty_kv_rows : bool = False
+        When True, requests with ``seq_lens == 0`` (for example a DCP rank
+        that owns no KV slice of a request, or an exhausted KV chunk) are
+        written as the empty-attention identity, ``out = 0`` and
+        ``lse = -inf``, so a downstream merge of partial states ignores them
+        without reading stale memory. Off by default: such rows are padding
+        for most callers, and the kernel leaves their ``out`` untouched.
+        Requires ``return_lse=True``; only meaningful for the ``trtllm-gen``
+        backend on dense MLA decode without attention sinks (``cute-dsl``
+        already writes the identity unconditionally). Not supported with
+        sparse MLA or compact variable-length Q.
     return_lse_base : Optional[Literal["basee", "base2"]] = None
         Logarithm base of LSE values, including values written to a supplied
         ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, ``sparse`` and
@@ -5868,6 +5883,17 @@ def _mla_with_kv_cache_impl(
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if max_q_len is not None and cum_seq_lens_q is None:
         raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
+    if fill_empty_kv_rows:
+        if not return_lse:
+            raise ValueError("fill_empty_kv_rows requires return_lse=True")
+        if sinks is not None:
+            raise ValueError("fill_empty_kv_rows is not supported with attention sinks")
+        if sparse_mla_top_k > 0:
+            raise ValueError("fill_empty_kv_rows is not supported with sparse MLA")
+        if cum_seq_lens_q is not None:
+            raise ValueError(
+                "fill_empty_kv_rows is not supported with compact variable-length Q"
+            )
 
     is_nope_mla = (
         kv_lora_rank == nope_mla_dimensions.kv_lora_rank
@@ -6319,6 +6345,7 @@ def _mla_with_kv_cache_impl(
                     lse=lse,
                     return_lse_base=return_lse_base,
                     use_fp16_softmax=use_fp16_softmax,
+                    fill_empty_kv_rows=fill_empty_kv_rows,
                 )
             )
         if "cute-dsl" in built_names:
@@ -6813,6 +6840,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    fill_empty_kv_rows: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """See :func:`_mla_with_kv_cache_impl` for parameter documentation."""
     return _mla_with_kv_cache_impl(
@@ -6849,6 +6877,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        fill_empty_kv_rows=fill_empty_kv_rows,
     )
 
 
@@ -7485,6 +7514,7 @@ def trtllm_prefill_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    fill_empty_kv_rows: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Run MLA with decode-compatible semantics for prefill callers.
 
@@ -7538,6 +7568,7 @@ def trtllm_prefill_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        fill_empty_kv_rows=fill_empty_kv_rows,
     )
 
 

@@ -315,6 +315,7 @@ def test_planned_trtllm_launch_lse_scale(with_lse, base_e):
     backend._sparse_mla_top_k = 0
     backend._uses_shared_paged_kv_idx = True
     backend._use_fp16_softmax = None
+    backend._fill_empty_kv_rows = False
     backend._multi_ctas_kv_counter_buffer = object()
     backend._block_tables = torch.zeros(BATCH_SIZE, 4, dtype=torch.int32)
     backend._seq_lens = torch.full((BATCH_SIZE,), SEQ_LEN, dtype=torch.int32)
@@ -353,7 +354,7 @@ def test_planned_trtllm_launch_lse_scale(with_lse, base_e):
         bmm2_scale=None,
     )
     (args,) = calls
-    assert len(args) == 36
+    assert len(args) == 37
     assert args[28] is lse
     assert args[29:] == (
         math.log(2) if base_e else 1.0,
@@ -363,6 +364,7 @@ def test_planned_trtllm_launch_lse_scale(with_lse, base_e):
         None,
         0,
         None,
+        False,
     )
 
 
