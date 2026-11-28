@@ -208,7 +208,9 @@ kernel_cake_grouped_fp8_fused_silu_quant_a548221c000bdefa7862(const __nv_bfloat1
         }
         float _fmax_1 = fmaxf(absmax, 1e-10f);
         float group_max = _fmax_1;
-        float scale = group_max / 448.0f;
+        float inv_448_hi = __uint_as_float(991054116);
+        float inv_448_lo = __uint_as_float(789727525);
+        float scale = __fmaf_rn(group_max, inv_448_hi, group_max * inv_448_lo);
         float inv_scale = 1.0f / scale;
         const float2 _scale2_4 = {inv_scale, inv_scale};
         #pragma unroll
