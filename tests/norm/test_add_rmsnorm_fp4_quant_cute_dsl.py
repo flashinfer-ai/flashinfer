@@ -239,6 +239,210 @@ class TestAddRMSNormFP4QuantCuteDSL:
             tight_pct=0.99,
         )
 
+    @pytest.mark.parametrize("batch_size", [1, 7, 128, 1000])
+    @pytest.mark.parametrize("hidden_size", [256, 2048, 8192])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_add_rmsnorm_fp4quant_weight_bias(self, batch_size, hidden_size, dtype):
+        """weight_bias=1.0 gives the Gemma-style (1 + w) norm."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
+            add_rmsnorm_fp4quant,
+        )
+
+        weight_bias = 1.0
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        # Gemma checkpoints store w near 0, so (1 + w) differs from w by ~1.
+        weight = 0.1 * torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        y_fp4 = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        block_scale = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+
+        # The bias is added in fp32, like GemmaRMSNorm's x * (1.0 + w.float()).
+        ref = llama_rms_norm(x + r, weight.float() + weight_bias, eps=eps)
+
+        add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            y_fp4,
+            block_scale,
+            eps=eps,
+            block_size=block_size,
+            weight_bias=weight_bias,
+        )
+
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        assert_close_with_tiered_tolerance(
+            y_dequant,
+            ref.float(),
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+            msg=f"weight_bias={weight_bias}",
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 128])
+    # 2048 runs the single-CTA kernel, 32768 the cluster kernel (cluster_n > 1 on
+    # SM100 and SM120), so every weight_bias branch is covered.
+    @pytest.mark.parametrize("hidden_size", [2048, 32768])
+    @pytest.mark.parametrize("block_size", [16, 32])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("with_y_out", [False, True])
+    def test_weight_bias_all_paths(
+        self, batch_size, hidden_size, block_size, dtype, with_y_out
+    ):
+        """weight_bias=1.0 on NVFP4 and MXFP4, single-CTA and cluster, with y_out."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
+            add_rmsnorm_fp4quant,
+        )
+
+        torch.manual_seed(42)
+        eps = 1e-6
+        weight_bias = 1.0
+        is_mxfp4 = block_size == 32
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = 0.1 * torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        y_fp4 = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        block_scale = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.uint8 if is_mxfp4 else torch.float8_e4m3fn,
+        )
+        y_out = (
+            torch.empty(batch_size, hidden_size, device="cuda", dtype=dtype)
+            if with_y_out
+            else None
+        )
+
+        ref = llama_rms_norm(x + r, weight.float() + weight_bias, eps=eps)
+
+        add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            y_fp4,
+            block_scale,
+            eps=eps,
+            block_size=block_size,
+            scale_format="ue8m0" if is_mxfp4 else "e4m3",
+            y_out=y_out,
+            weight_bias=weight_bias,
+        )
+
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        assert_close_with_tiered_tolerance(
+            y_dequant,
+            ref.float(),
+            tight_rtol=0.3,
+            tight_atol=0.7 if is_mxfp4 else 0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+            msg=f"block_size={block_size}",
+        )
+        if y_out is not None:
+            torch.testing.assert_close(y_out.float(), ref.float(), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [256, 2048, 5120, 8192])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_nvfp4_weight_bias_matches_gemma_separate(
+        self, batch_size, hidden_size, dtype
+    ):
+        """weight_bias=1.0 matches gemma_fused_add_rmsnorm + fp4_quantize."""
+        from flashinfer import fp4_quantize
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+        from flashinfer.norm import gemma_fused_add_rmsnorm
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = 0.1 * torch.randn(hidden_size, device="cuda", dtype=dtype)
+        global_scale = compute_global_scale(x, r, weight.float() + 1.0, eps=eps)
+
+        # Separate path: in-place Gemma add + RMSNorm, then quantize.
+        x_sep, r_sep = x.clone(), r.clone()
+        gemma_fused_add_rmsnorm(x_sep, r_sep, weight, eps=eps)
+        y_fp4_sep, block_scale_sep = fp4_quantize(
+            x_sep,
+            global_scale,
+            sf_vec_size=block_size,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+        )
+
+        y_fp4 = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        block_scale = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            y_fp4,
+            block_scale,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+            weight_bias=1.0,
+        )
+
+        assert torch.equal(r, r_sep), "residual (input + residual) differs"
+        # The separate path rounds the normed values to dtype before quantizing,
+        # the fused kernel quantizes from fp32, so a few elements may differ.
+        fp4_match = (
+            (y_fp4.view(torch.uint8) == y_fp4_sep.view(torch.uint8))
+            .float()
+            .mean()
+            .item()
+        )
+        assert fp4_match > 0.95, f"only {fp4_match * 100:.1f}% of FP4 bytes match"
+        block_scale_sep = block_scale_sep.view(torch.float8_e4m3fn).view(batch_size, -1)
+        scale_match = (
+            (block_scale.float() == block_scale_sep.float()).float().mean().item()
+        )
+        assert scale_match > 0.95, (
+            f"only {scale_match * 100:.1f}% of block scales match"
+        )
+        assert_close_with_tiered_tolerance(
+            dequantize_fp4_output(y_fp4, block_scale, block_size, global_scale),
+            dequantize_fp4_output(y_fp4_sep, block_scale_sep, block_size, global_scale),
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+            msg="fused weight_bias=1.0 vs gemma separate",
+        )
+
     @pytest.mark.parametrize("batch_size", [1, 4, 3, 7, 128])
     @pytest.mark.parametrize("seq_len", [16, 64, 128, 37])
     @pytest.mark.parametrize("hidden_size", [128, 256, 1536, 4096, 8192])

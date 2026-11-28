@@ -116,6 +116,41 @@ def _load_8_half2_from_smem(
     return x_h2, w_h2
 
 
+# weight_bias (Gemma-style (1 + w) norms) is added in fp32 to the widened weight,
+# as in GemmaRMSNorm.forward_native (x * (1.0 + w.float())); bf16 would round w away.
+@cute.jit
+def _add_weight_bias_16(w_f32: cute.Tensor, weight_bias: Float32) -> cute.Tensor:
+    """Return 16 float32 weights plus weight_bias."""
+    out = cute.make_rmem_tensor((16,), Float32)
+    for i in cutlass.range_constexpr(16):
+        out[i] = w_f32[i] + weight_bias
+    return out
+
+
+@cute.jit
+def _y_and_max_abs_biased_16(
+    h_h2: cute.Tensor,
+    w_h2: cute.Tensor,
+    rstd: Float32,
+    weight_bias: Float32,
+    is_fp16: bool,
+):
+    """fp32 y = h * rstd * (w + weight_bias) and max_abs for 16 packed values.
+
+    Replaces the cluster-mode half2/bfloat2 h * w multiply when weight_bias is
+    set, since the packed multiply has no room for the fp32 bias.
+    """
+    if cutlass.const_expr(is_fp16):
+        h_f32 = half2_to_float16(h_h2, Float32(1.0))
+        w_f32 = half2_to_float16(w_h2, Float32(1.0))
+    else:
+        h_f32 = bfloat2_to_float16(h_h2, Float32(1.0))
+        w_f32 = bfloat2_to_float16(w_h2, Float32(1.0))
+    return compute_y_and_max_abs_f32(
+        h_f32, _add_weight_bias_16(w_f32, weight_bias), rstd
+    )
+
+
 # =============================================================================
 # Helpers for optional normed (bf16/fp16) output
 # =============================================================================
@@ -207,8 +242,10 @@ class AddRMSNormFP4QuantKernel:
         output_both_sf_layouts: bool = False,
         output_norm: bool = False,
         launch_config: tuple[int, int, int] | None = None,
+        weight_bias: float = 0.0,
     ):
         self.dtype = dtype
+        self.weight_bias = weight_bias
         self.H = H
         self.block_size = block_size
         self.output_swizzled = output_swizzled
@@ -780,6 +817,10 @@ class AddRMSNormFP4QuantKernel:
                             else:
                                 h_f32 = bfloat2_to_float16(h_h2, Float32(1.0))
                                 w_f32 = bfloat2_to_float16(w_h2, Float32(1.0))
+                            if cutlass.const_expr(self.weight_bias != 0.0):
+                                w_f32 = _add_weight_bias_16(
+                                    w_f32, Float32(self.weight_bias)
+                                )
                             y_f32, max_abs = compute_y_and_max_abs_f32(
                                 h_f32, w_f32, rstd
                             )
@@ -854,18 +895,26 @@ class AddRMSNormFP4QuantKernel:
                                 mR, mW, actual_row_idx, block_start, H
                             )
 
-                            if cutlass.const_expr(is_fp16):
+                            if cutlass.const_expr(self.weight_bias != 0.0):
+                                y_f32, max_abs = _y_and_max_abs_biased_16(
+                                    h_h2,
+                                    w_h2,
+                                    rstd,
+                                    Float32(self.weight_bias),
+                                    is_fp16,
+                                )
+                            elif cutlass.const_expr(is_fp16):
                                 hw_h2 = half2_mul_8(h_h2, w_h2)
                                 max_hw = half2_max_abs_8(hw_h2)
                                 max_xw = hmax_to_f32(max_hw)
                                 y_f32 = half2_to_float16(hw_h2, rstd)
+                                max_abs = max_xw * rstd
                             else:
                                 hw_h2 = bfloat2_mul_8(h_h2, w_h2)
                                 max_hw = bfloat2_max_abs_8(hw_h2)
                                 max_xw = bfloat2_hmax_to_f32(max_hw)
                                 y_f32 = bfloat2_to_float16(hw_h2, rstd)
-
-                            max_abs = max_xw * rstd
+                                max_abs = max_xw * rstd
 
                             # E4M3: global_scale is incorporated into block scale
                             scale_float = global_scale_val * max_abs * fp4_max_rcp
@@ -941,6 +990,10 @@ class AddRMSNormFP4QuantKernel:
                             w_f32_c0 = load_f32_16_from_smem(
                                 sW, row_in_block, block_start
                             )
+                            if cutlass.const_expr(self.weight_bias != 0.0):
+                                w_f32_c0 = _add_weight_bias_16(
+                                    w_f32_c0, Float32(self.weight_bias)
+                                )
                             y_f32_c0, max_abs_c0 = compute_y_and_max_abs_f32(
                                 h_f32_c0, w_f32_c0, rstd
                             )
@@ -952,6 +1005,10 @@ class AddRMSNormFP4QuantKernel:
                             w_f32_c1 = load_f32_16_from_smem(
                                 sW, row_in_block, block_start + Int32(16)
                             )
+                            if cutlass.const_expr(self.weight_bias != 0.0):
+                                w_f32_c1 = _add_weight_bias_16(
+                                    w_f32_c1, Float32(self.weight_bias)
+                                )
                             y_f32_c1, max_abs_c1 = compute_y_and_max_abs_f32(
                                 h_f32_c1, w_f32_c1, rstd
                             )
@@ -1051,7 +1108,23 @@ class AddRMSNormFP4QuantKernel:
                                 mR, mW, actual_row_idx, block_start + Int32(16), H
                             )
 
-                            if cutlass.const_expr(is_fp16):
+                            if cutlass.const_expr(self.weight_bias != 0.0):
+                                y_f32_c0, max_abs_c0 = _y_and_max_abs_biased_16(
+                                    h_h2_c0,
+                                    w_h2_c0,
+                                    rstd,
+                                    Float32(self.weight_bias),
+                                    is_fp16,
+                                )
+                                y_f32_c1, max_abs_c1 = _y_and_max_abs_biased_16(
+                                    h_h2_c1,
+                                    w_h2_c1,
+                                    rstd,
+                                    Float32(self.weight_bias),
+                                    is_fp16,
+                                )
+                                max_abs = fmax_f32(max_abs_c0, max_abs_c1)
+                            elif cutlass.const_expr(is_fp16):
                                 hw_h2_c0 = half2_mul_8(h_h2_c0, w_h2_c0)
                                 hw_h2_c1 = half2_mul_8(h_h2_c1, w_h2_c1)
                                 max_c0_h2 = half2_max_abs_8(hw_h2_c0)
@@ -1060,6 +1133,7 @@ class AddRMSNormFP4QuantKernel:
                                 max_xw = hmax_to_f32(max_hw)
                                 y_f32_c0 = half2_to_float16(hw_h2_c0, rstd)
                                 y_f32_c1 = half2_to_float16(hw_h2_c1, rstd)
+                                max_abs = max_xw * rstd
                             else:
                                 hw_h2_c0 = bfloat2_mul_8(h_h2_c0, w_h2_c0)
                                 hw_h2_c1 = bfloat2_mul_8(h_h2_c1, w_h2_c1)
@@ -1069,8 +1143,7 @@ class AddRMSNormFP4QuantKernel:
                                 max_xw = bfloat2_hmax_to_f32(max_hw)
                                 y_f32_c0 = bfloat2_to_float16(hw_h2_c0, rstd)
                                 y_f32_c1 = bfloat2_to_float16(hw_h2_c1, rstd)
-
-                            max_abs = max_xw * rstd
+                                max_abs = max_xw * rstd
 
                             # Compute scale factor (E4M3 or UE8M0)
                             if cutlass.const_expr(self.scale_format == "ue8m0"):
@@ -1186,6 +1259,7 @@ def _get_compiled_kernel(
     output_both_sf_layouts: bool = False,
     enable_pdl: bool = False,
     output_norm: bool = False,
+    weight_bias: float = 0.0,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -1205,6 +1279,7 @@ def _get_compiled_kernel(
         scale_format=scale_format,
         output_both_sf_layouts=output_both_sf_layouts,
         output_norm=output_norm,
+        weight_bias=weight_bias,
     )
 
     # Use symbolic size for dynamic M dimension
@@ -1339,6 +1414,7 @@ def add_rmsnorm_fp4quant(
     block_scale_unswizzled: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
     y_out: torch.Tensor | None = None,
+    weight_bias: float = 0.0,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ]:
@@ -1435,6 +1511,11 @@ def add_rmsnorm_fp4quant(
         When ``None`` (default), the normed values are not materialized and
         the generated kernel is identical to the baseline (the presence of
         ``y_out`` is a compile-time specialization).
+    weight_bias : float
+        Added to the weight in fp32 before it scales the normalized values:
+        ``y = RMSNorm(input + residual) * (weight + weight_bias)``. ``1.0``
+        gives Gemma-style ``(1 + weight)`` norms. Default ``0.0`` compiles the
+        unchanged kernel; a nonzero value is a compile-time specialization.
 
     Returns
     -------
@@ -1617,6 +1698,7 @@ def add_rmsnorm_fp4quant(
         output_both_sf_layouts,
         enable_pdl,
         output_norm,
+        float(weight_bias),
     )
     tensor_api(
         input_2d.contiguous(),
