@@ -1083,7 +1083,7 @@ def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
 
 _DSV3_2_DECODE_HEADS = [8, 16, 32, 64, 128]
 # Runtime-H decode-dsv3_2: arbitrary head counts (remainder-block pad path).
-_DSV3_2_DECODE_RUNTIME_HEADS = [12, 24]
+_DSV3_2_DECODE_RUNTIME_HEADS = [3, 12, 24]
 
 
 @pytest.mark.parametrize("num_heads", _DSV3_2_DECODE_HEADS)
@@ -1261,12 +1261,15 @@ def test_sparse_mla_sm120_v32_public_api_accepts_hnd_view() -> None:
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_v32_prefill_public_api_accepts_hnd_view() -> None:
+@pytest.mark.parametrize("num_heads", [3, 8])
+def test_sparse_mla_sm120_v32_prefill_public_api_accepts_hnd_view(
+    num_heads: int,
+) -> None:
     """SM120 v32 prefill accepts HND KV layout."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
-    num_tokens, num_heads, topk = 128, 8, 2048
+    num_tokens, topk = 128, 2048
     page_block_size = 64
     num_blocks = 64
     s_kv = num_blocks * page_block_size
@@ -1376,6 +1379,76 @@ def test_sparse_mla_sm120_prefill_dsv3_2(
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [1, 3, 6, 12, 17, 24, 33, 48, 65, 96, 127])
+def test_sparse_mla_sm120_prefill_dsv3_2_runtime_heads(num_heads: int) -> None:
+    """Runtime heads cover partial tiles, including sink and graph replay."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, topk, d_qk, d_v = 65, 128, 576, 512
+    kv_bf16 = torch.randn(2, 64, 1, d_qk, device=device, dtype=torch.bfloat16) / 10
+    kv_packed = quantize_kv_dsv3_2(kv_bf16)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10
+    )
+    indices = torch.randint(128, (num_tokens, topk), device=device, dtype=torch.int32)
+    lengths = torch.full((num_tokens,), 96, device=device, dtype=torch.int32)
+    lengths[0] = 0
+    sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+    sm_scale = d_qk**-0.5
+
+    output_storage = torch.full(
+        (num_tokens * num_heads * d_v + 8,), -7, dtype=torch.bfloat16, device=device
+    )
+    output = output_storage[:-8].view(num_tokens, num_heads, d_v)
+    lse_storage = torch.full(
+        (num_tokens, num_heads + 3), -7, dtype=torch.float32, device=device
+    )
+    out_lse = lse_storage[:, :num_heads]
+
+    def run(prefill_impl=None):
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv_packed,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            d_v=d_v,
+            topk_length=lengths,
+            attn_sink=sink,
+            prefill_impl=prefill_impl,
+        )
+
+    def check_reference():
+        ref_out, ref_lse = _ref_sparse_attn(
+            q, kv_dequant, indices, sm_scale, d_v, attn_sink=sink, topk_length=lengths
+        )
+        torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+        assert torch.all(output_storage[-8:] == -7)
+        assert torch.all(lse_storage[:, num_heads:] == -7)
+
+    run()
+    check_reference()
+    if num_heads in (3, 17, 65):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        q.neg_()
+        indices.copy_((indices + 1) % 128)
+        lengths.fill_(64)
+        sink.add_(0.25)
+        graph.replay()
+        check_reference()
+    if num_heads in (48, 96):
+        output.fill_(float("nan"))
+        out_lse.fill_(float("nan"))
+        run("mg")
+        check_reference()
 
 
 def test_sparse_mla_sm120_decode_glm_nsa_arbitrary_fp32() -> None:

@@ -65,8 +65,8 @@ using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
 // Template params (all constexpr):
 //   MT:              ModelType (DSV3_2 / DSV4 / GLM_NSA / GLM53_NOPE / DOTS3_SWA / DSV4_1)
 //   QkMode:              QkComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
-//   NUM_HEADS:       8, 16, 32, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates;
-//                    NUM_HEADS > HPB replicates one CTA per 16-head tile)
+//   NUM_HEADS:       fixed head count, or 0 for runtime heads. Each CTA handles
+//                    one 16-head tile and masks the last partial tile.
 //   PAGE_BLOCK_SIZE: footer geometry; inline models use cold's runtime row stride.
 //                    DSV4_1 gathers use cold's runtime page sizes.
 //
@@ -120,7 +120,10 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
   static_assert(KV::SCALE_FORMAT != ScaleFormat::ARBITRARY_FP32,
                 "the producer/consumer path implements only the batched W quantization");
 
-  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
+  const int num_heads = NUM_HEADS == 0 ? cold.num_heads : NUM_HEADS;
+  const int remaining_heads = num_heads - h_start;
+  const int valid_hpb = NUM_HEADS == 0 ? (remaining_heads < HPB ? remaining_heads : HPB)
+                                       : (NUM_HEADS < HPB ? NUM_HEADS : HPB);
   constexpr int QK_WARPS = Cfg::QK_WARPS;
   constexpr int QK_THREADS = Cfg::QK_THREADS;
   constexpr int XV_WARPS = Cfg::MATH_WARPS - QK_WARPS;
@@ -156,13 +159,13 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
   if (mwarp < QK_WARPS) {
     // ── Producer: QK + softmax + W quant ─────────────────────────
     const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
-    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
+    const bf16* q_base = Q + (size_t)s_i * num_heads * KV::D_QK + (size_t)h_start * KV::D_QK;
 
     if constexpr (QkMode == QkComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB,
+      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, valid_hpb,
                                           cold.mega.row(s_i));
     } else {
-      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, VALID_HPB,
+      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, valid_hpb,
                                          cold.mega.row(s_i));
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
@@ -386,7 +389,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
     }
     bar_sync_t<Fp8PrefillSync::QK, QK_THREADS>();
 
-    if (threadIdx.x < VALID_HPB) {
+    if (threadIdx.x < valid_hpb) {
       int h = threadIdx.x;
       float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
       if (attn_sink != nullptr) {
@@ -461,19 +464,21 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 
     float il0, il1;
     if (attn_sink != nullptr) {
-      float s0 = __ldg(attn_sink + h_start + gid) * LOG2E;
-      float peak0 = fmaxf(s0, sm.m_smem[gid]);
-      float weight0 = exp2f(sm.m_smem[gid] - peak0);
-      float denom0 = sm.l_smem[gid] * weight0 + exp2f(s0 - peak0);
-      il0 = sm.l_smem[gid] > 0.f ? weight0 / denom0 : 0.f;
-      if constexpr (VALID_HPB > 8) {
+      il0 = 0.f;
+      il1 = 0.f;
+      if (gid < valid_hpb) {
+        float s0 = __ldg(attn_sink + h_start + gid) * LOG2E;
+        float peak0 = fmaxf(s0, sm.m_smem[gid]);
+        float weight0 = exp2f(sm.m_smem[gid] - peak0);
+        float denom0 = sm.l_smem[gid] * weight0 + exp2f(s0 - peak0);
+        il0 = sm.l_smem[gid] > 0.f ? weight0 / denom0 : 0.f;
+      }
+      if (gid + 8 < valid_hpb) {
         float s1 = __ldg(attn_sink + h_start + gid + 8) * LOG2E;
         float peak1 = fmaxf(s1, sm.m_smem[gid + 8]);
         float weight1 = exp2f(sm.m_smem[gid + 8] - peak1);
         float denom1 = sm.l_smem[gid + 8] * weight1 + exp2f(s1 - peak1);
         il1 = sm.l_smem[gid + 8] > 0.f ? weight1 / denom1 : 0.f;
-      } else {
-        il1 = 0.f;
       }
     } else {
       il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
@@ -502,11 +507,11 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
     // Coalesced BF16 write: uint4 = 128-bit = 8 bf16 per store.
     {
       constexpr size_t h_stride = KV::D_V;
-      constexpr size_t token_stride = (size_t)NUM_HEADS * KV::D_V;
+      const size_t token_stride = (size_t)num_heads * KV::D_V;
       const size_t out_base = (size_t)s_i * token_stride + (size_t)h_start * h_stride;
       constexpr int BF16_PER_STORE = 8;
       constexpr int STORES_PER_HEAD = KV::D_V / BF16_PER_STORE;
-      for (int idx = threadIdx.x - QK_THREADS; idx < VALID_HPB * STORES_PER_HEAD;
+      for (int idx = threadIdx.x - QK_THREADS; idx < valid_hpb * STORES_PER_HEAD;
            idx += XV_THREADS) {
         int h = idx / STORES_PER_HEAD;
         int d8 = (idx - h * STORES_PER_HEAD) * BF16_PER_STORE;
@@ -527,7 +532,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
                                   1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
                               const int32_t* __restrict__ indices,
-                              const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
+                              const float* __restrict__ attn_sink,  // [num_heads], nullable
                               bf16* __restrict__ output, float* __restrict__ out_lse,
                               __grid_constant__ const PrefillColdParams cold) {
   const float sm_scale = cold.sm_scale;
@@ -550,16 +555,15 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
                            Cfg::SPLIT_QK_XV ? Cfg::MATH_WARPS - Cfg::QK_WARPS : Cfg::MATH_WARPS>;
   using L = SmemLayout<MT, QkMode, Cfg::BI, Cfg::MATH_WARPS>;
 
-  // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
-  static constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
-  // smem layout always allocates HPB heads (zero-padded for invalid slots);
-  // Q load and BF16 output / LSE write-back are gated by VALID_HPB to avoid
-  // reading/writing past the caller's [num_tokens, NUM_HEADS, ...] buffers.
-  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
-
-  const int s_i = blockIdx.x / REPLICATE_H;
-  const int h_tile = blockIdx.x % REPLICATE_H;
+  const int num_heads = NUM_HEADS == 0 ? cold.num_heads : NUM_HEADS;
+  const int replicate_h = (num_heads + HPB - 1) / HPB;
+  const int s_i = blockIdx.x / replicate_h;
+  const int h_tile = blockIdx.x % replicate_h;
   const int h_start = h_tile * HPB;
+  // The shared-memory tile is padded, but all global accesses use real heads.
+  const int remaining_heads = num_heads - h_start;
+  const int valid_hpb = NUM_HEADS == 0 ? (remaining_heads < HPB ? remaining_heads : HPB)
+                                       : (NUM_HEADS < HPB ? NUM_HEADS : HPB);
   if (s_i >= num_tokens) return;
 
   const int topk = cold.topk;
@@ -696,7 +700,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     const bool qk_warp = !Cfg::SPLIT_QK_XV || mwarp < Cfg::QK_WARPS;
     const int gid = lane >> 2, tid = lane & 3;
     const float sm_scale_log2e = sm_scale * LOG2E;
-    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
+    const bf16* q_base = Q + (size_t)s_i * num_heads * KV::D_QK + (size_t)h_start * KV::D_QK;
     const int32_t* idx_base = indices + (size_t)s_i * topk;
 
     // Candidate slice of this warp. Meaningful only for a QK warp: past
@@ -705,11 +709,11 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
 
     if constexpr (QkMode == QkComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB,
+      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, valid_hpb,
                                                  cold.mega.row(s_i));
     } else {
       quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                                VALID_HPB, cold.mega.row(s_i));
+                                                valid_hpb, cold.mega.row(s_i));
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
@@ -1041,19 +1045,21 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // The sink denominator and accumulator use the same max frame.
     float il0, il1;
     if (cold.attn_sink != nullptr) {
-      float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
-      float peak0 = fmaxf(s0, sm.m_smem[gid]);
-      float weight0 = exp2f(sm.m_smem[gid] - peak0);
-      float denom0 = sm.l_smem[gid] * weight0 + exp2f(s0 - peak0);
-      il0 = sm.l_smem[gid] > 0.f ? weight0 / denom0 : 0.f;
-      if constexpr (VALID_HPB > 8) {
+      il0 = 0.f;
+      il1 = 0.f;
+      if (gid < valid_hpb) {
+        float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
+        float peak0 = fmaxf(s0, sm.m_smem[gid]);
+        float weight0 = exp2f(sm.m_smem[gid] - peak0);
+        float denom0 = sm.l_smem[gid] * weight0 + exp2f(s0 - peak0);
+        il0 = sm.l_smem[gid] > 0.f ? weight0 / denom0 : 0.f;
+      }
+      if (gid + 8 < valid_hpb) {
         float s1 = __ldg(cold.attn_sink + h_start + gid + 8) * LOG2E;
         float peak1 = fmaxf(s1, sm.m_smem[gid + 8]);
         float weight1 = exp2f(sm.m_smem[gid + 8] - peak1);
         float denom1 = sm.l_smem[gid + 8] * weight1 + exp2f(s1 - peak1);
         il1 = sm.l_smem[gid + 8] > 0.f ? weight1 / denom1 : 0.f;
-      } else {
-        il1 = 0.f;
       }
     } else {
       il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
@@ -1097,11 +1103,11 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // Coalesced BF16 write: uint4 = 128-bit = 8 bf16 per store
     {
       constexpr size_t h_stride = KV::D_V;
-      constexpr size_t token_stride = (size_t)NUM_HEADS * KV::D_V;
+      const size_t token_stride = (size_t)num_heads * KV::D_V;
       const size_t out_base = (size_t)s_i * token_stride + (size_t)h_start * h_stride;
       constexpr int BF16_PER_STORE = 8;
       constexpr int STORES_PER_HEAD = KV::D_V / BF16_PER_STORE;  // 64 at D_V=512
-      for (int idx = threadIdx.x; idx < VALID_HPB * STORES_PER_HEAD; idx += Cfg::MATH_THREADS) {
+      for (int idx = threadIdx.x; idx < valid_hpb * STORES_PER_HEAD; idx += Cfg::MATH_THREADS) {
         int h = idx / STORES_PER_HEAD;
         int d8 = (idx - h * STORES_PER_HEAD) * BF16_PER_STORE;
         uint4 v = *reinterpret_cast<const uint4*>(&staging_bf16[h * BF16_STAGING_STRIDE + d8]);
@@ -1114,7 +1120,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     }
 
     // Write LSE (merged with attn_sink if present)
-    if (threadIdx.x < VALID_HPB) {
+    if (threadIdx.x < valid_hpb) {
       int h = threadIdx.x;
       float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
       if (cold.attn_sink != nullptr) {

@@ -128,6 +128,24 @@ DSV4_NVFP4_SUPPORT = {
 }
 
 
+@pytest.mark.parametrize(
+    "num_heads,prefill_variants",
+    [
+        (3, {1}),
+        (24, {2}),
+        (96, {2, 4}),
+        (32, {2}),
+        (64, {2, 4}),
+        (128, {2, 4}),
+    ],
+)
+def test_dsv32_prefill_head_candidates(sm120_module, num_heads, prefill_variants):
+    from flashinfer.mla._sparse_mla_sm120._policy import _candidates
+
+    candidates = _candidates(_MODEL_TYPE_DSV3_2, num_heads, 2048, 64, False)
+    assert candidates - {0} == prefill_variants
+
+
 def block_module_loading(monkeypatch):
     from flashinfer.jit.core import JitSpec
     from flashinfer.mla._sparse_mla_sm120 import _calibration as calibration

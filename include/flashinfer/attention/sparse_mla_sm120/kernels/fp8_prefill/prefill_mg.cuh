@@ -52,7 +52,7 @@ __device__ __forceinline__ void prefill_mg_impl(
     const uint8_t* __restrict__ KV_cache_extra,  // nullptr when !DUAL_CACHE
     const int32_t* __restrict__ indices_extra,   // nullptr when !DUAL_CACHE
     bf16* __restrict__ output, float* __restrict__ out_lse,
-    const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
+    const float* __restrict__ attn_sink,  // [num_heads], nullable
     const PrefillColdParams& cold) {
   constexpr int MG_N_HG = MG_N_HG_T;
   constexpr int MG_HEADS_PER_CTA = MG_N_HG_T * HPB;
@@ -78,14 +78,15 @@ __device__ __forceinline__ void prefill_mg_impl(
   using AddressReady =
       flashinfer::sparse_mla_sm120::pipeline::StoreHandoff<6, 7, IO_THREADS, MATH_THREADS>;
 
-  static_assert(NUM_HEADS % MG_HEADS_PER_CTA == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
-                "NUM_HEADS must fill MG_HEADS_PER_CTA, except a single padded head group");
-  static constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA - 1) / MG_HEADS_PER_CTA;
-  static constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
+  static_assert(
+      NUM_HEADS == 0 || NUM_HEADS % MG_HEADS_PER_CTA == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
+      "NUM_HEADS must fill MG_HEADS_PER_CTA, except a single padded head group");
+  const int num_heads = NUM_HEADS == 0 ? cold.num_heads : NUM_HEADS;
+  const int replicate_h = (num_heads + MG_HEADS_PER_CTA - 1) / MG_HEADS_PER_CTA;
   static constexpr bool USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA == 2);
 
-  const int s_i = blockIdx.x / REPLICATE_H;
-  const int h_tile = blockIdx.x % REPLICATE_H;
+  const int s_i = blockIdx.x / replicate_h;
+  const int h_tile = blockIdx.x % replicate_h;
   const int h_start = h_tile * MG_HEADS_PER_CTA;
   if (s_i >= num_tokens) return;
 
@@ -258,15 +259,20 @@ __device__ __forceinline__ void prefill_mg_impl(
     // ── Quantize Q for both groups ─────────────────────────────
 #pragma unroll
     for (int g = 0; g < MG_N_HG; g++) {
+      const int group_start = h_start + g * HPB;
+      const int remaining = num_heads - group_start;
+      const int valid_hpb = NUM_HEADS == 0
+                                ? (remaining <= 0 ? 0 : (remaining < HPB ? remaining : HPB))
+                                : (NUM_HEADS < HPB ? NUM_HEADS : HPB);
       const bf16* q_base_g =
-          Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)(h_start + g * HPB) * KV::D_QK;
+          Q + (size_t)s_i * num_heads * KV::D_QK + (size_t)(valid_hpb ? group_start : 0) * KV::D_QK;
       if constexpr (QkMode == QkComputeMode::BF16) {
         load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * KV::D_ROPE,
-                                              q_base_g, VALID_HPB, cold.mega.row(s_i));
+                                              q_base_g, valid_hpb, cold.mega.row(s_i));
       } else {
         quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8(g), sm.q_nope_sc(g),
                                              sm.q_rope() + g * HPB * KV::D_ROPE, q_base_g,
-                                             VALID_HPB, cold.mega.row(s_i));
+                                             valid_hpb, cold.mega.row(s_i));
       }
     }
 
@@ -753,22 +759,31 @@ __device__ __forceinline__ void prefill_mg_impl(
     bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_buf(0));
     constexpr int BF16_STAGING_STRIDE = KV::D_V;
     constexpr size_t h_stride = KV::D_V;
-    constexpr size_t token_stride = (size_t)NUM_HEADS * KV::D_V;
+    const size_t token_stride = (size_t)num_heads * KV::D_V;
 
 #pragma unroll
     for (int g = 0; g < MG_N_HG; g++) {
+      const int group_start = h_start + g * HPB;
+      const int remaining = num_heads - group_start;
+      const int valid_hpb = NUM_HEADS == 0
+                                ? (remaining <= 0 ? 0 : (remaining < HPB ? remaining : HPB))
+                                : (NUM_HEADS < HPB ? NUM_HEADS : HPB);
       // The sink denominator and accumulator use the same max frame.
       float il0, il1;
       if (cold.attn_sink != nullptr) {
         int h0 = h_start + g * HPB + gid;
-        float s0 = __ldg(cold.attn_sink + h0) * LOG2E;
-        float m0 = sm.m_smem()[g * SMG::ML_GRP_STRIDE + gid];
-        float l0 = sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid];
-        float weight0 = exp2f(-fabsf(s0 - m0));
-        float numerator0 = s0 > m0 ? weight0 : 1.f;
-        float d0 = s0 > m0 ? l0 * weight0 + 1.f : l0 + weight0;
-        il0 = l0 > 0.f ? numerator0 / d0 : 0.f;
-        if constexpr (VALID_HPB > 8) {
+        il0 = 0.f;
+        il1 = 0.f;
+        if (gid < valid_hpb) {
+          float s0 = __ldg(cold.attn_sink + h0) * LOG2E;
+          float m0 = sm.m_smem()[g * SMG::ML_GRP_STRIDE + gid];
+          float l0 = sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid];
+          float weight0 = exp2f(-fabsf(s0 - m0));
+          float numerator0 = s0 > m0 ? weight0 : 1.f;
+          float d0 = s0 > m0 ? l0 * weight0 + 1.f : l0 + weight0;
+          il0 = l0 > 0.f ? numerator0 / d0 : 0.f;
+        }
+        if (gid + 8 < valid_hpb) {
           float s1 = __ldg(cold.attn_sink + h0 + 8) * LOG2E;
           float m1 = sm.m_smem()[g * SMG::ML_GRP_STRIDE + gid + 8];
           float l1 = sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid + 8];
@@ -776,14 +791,12 @@ __device__ __forceinline__ void prefill_mg_impl(
           float numerator1 = s1 > m1 ? weight1 : 1.f;
           float d1 = s1 > m1 ? l1 * weight1 + 1.f : l1 + weight1;
           il1 = l1 > 0.f ? numerator1 / d1 : 0.f;
-        } else {
-          il1 = 0.f;
         }
       } else {
         il0 = (sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid] > 0.f)
                   ? (1.f / sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid])
                   : 0.f;
-        if constexpr (VALID_HPB > 8) {
+        if (valid_hpb > 8) {
           il1 = (sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid + 8] > 0.f)
                     ? (1.f / sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid + 8])
                     : 0.f;
@@ -817,11 +830,11 @@ __device__ __forceinline__ void prefill_mg_impl(
 
       // Coalesced write
       {
-        const int g_h_start = h_start + g * HPB;
+        const int g_h_start = group_start;
         const size_t out_base = (size_t)s_i * token_stride + (size_t)g_h_start * h_stride;
         constexpr int BF16_PER_STORE = 8;
         constexpr int STORES_PER_HEAD = KV::D_V / BF16_PER_STORE;
-        for (int idx = threadIdx.x; idx < VALID_HPB * STORES_PER_HEAD; idx += MATH_THREADS) {
+        for (int idx = threadIdx.x; idx < valid_hpb * STORES_PER_HEAD; idx += MATH_THREADS) {
           int h = idx / STORES_PER_HEAD;
           int d8 = (idx - h * STORES_PER_HEAD) * BF16_PER_STORE;
           uint4 v = *reinterpret_cast<const uint4*>(&staging_bf16[h * BF16_STAGING_STRIDE + d8]);
@@ -834,7 +847,7 @@ __device__ __forceinline__ void prefill_mg_impl(
       }
 
       // Write LSE for this group (merged with attn_sink if present)
-      if (threadIdx.x < VALID_HPB) {
+      if (threadIdx.x < valid_hpb) {
         int h = threadIdx.x;
         float lse = softmax_lse(sm.m_smem()[g * SMG::ML_GRP_STRIDE + h],
                                 sm.l_smem()[g * SMG::ML_GRP_STRIDE + h]);

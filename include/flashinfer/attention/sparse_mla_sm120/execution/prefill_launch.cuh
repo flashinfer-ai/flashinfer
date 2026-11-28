@@ -91,9 +91,9 @@ PrefillLaunchResult launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache,
   using Cfg = PrefillTileCfg<MT>;
   using Resources = Fp8PrefillResources<MT, QkMode, GatherSchedule>;
   constexpr size_t smem_bytes = Resources::SHARED_BYTES;
-  // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
-  constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
-  dim3 grid(cold.num_tokens * REPLICATE_H);
+  const int num_heads = NUM_HEADS == 0 ? cold.num_heads : NUM_HEADS;
+  const int replicate_h = (num_heads + HPB - 1) / HPB;
+  dim3 grid(cold.num_tokens * replicate_h);
   dim3 block(Resources::BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_kernel<MT, QkMode, NUM_HEADS, PAGE_BLOCK_SIZE, GatherSchedule>;
@@ -123,8 +123,9 @@ PrefillLaunchResult launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache
   static_assert(KVCacheTraits<MT>::SCALE_IN_KV_SMEM && KVCacheTraits<MT>::D_NOPE == D_V,
                 "swapAB prefill is DSV3_2 family only: inline scales, V spans the nope half");
   constexpr size_t smem_bytes = L::TOTAL;
-  constexpr int REPLICATE_H = NUM_HEADS / CT::HEADS_PER_CTA;
-  dim3 grid(cold.num_tokens * REPLICATE_H);
+  const int num_heads = NUM_HEADS == 0 ? cold.num_heads : NUM_HEADS;
+  const int replicate_h = (num_heads + CT::HEADS_PER_CTA - 1) / CT::HEADS_PER_CTA;
+  dim3 grid(cold.num_tokens * replicate_h);
   dim3 block(BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_swapab_kernel<MT, NUM_HEADS>;
@@ -148,10 +149,12 @@ PrefillLaunchResult launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache,
                                       const PrefillColdParams& cold) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
-  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
+  static_assert(NUM_HEADS == 0 || NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 ||
+                    (MG_N_HG_T == 1 && NUM_HEADS < HPB),
                 "NUM_HEADS must fill the MG head tile, except a padded NH=8 tile");
-  constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA_LOCAL - 1) / MG_HEADS_PER_CTA_LOCAL;
-  dim3 grid(cold.num_tokens * REPLICATE_H);
+  const int num_heads = NUM_HEADS == 0 ? cold.num_heads : NUM_HEADS;
+  const int replicate_h = (num_heads + MG_HEADS_PER_CTA_LOCAL - 1) / MG_HEADS_PER_CTA_LOCAL;
+  dim3 grid(cold.num_tokens * replicate_h);
   dim3 block(BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_mg_kernel<MT, QkMode, NUM_HEADS, PAGE_BLOCK_SIZE, MG_N_HG_T>;

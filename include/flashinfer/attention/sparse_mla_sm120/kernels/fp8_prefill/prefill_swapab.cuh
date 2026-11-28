@@ -52,7 +52,7 @@
 //
 // Template params (all constexpr):
 //   MT:        ModelType (DSV3_2 / GLM_NSA)
-//   NUM_HEADS: 64, 128
+//   NUM_HEADS: 64, 128, or 0 for runtime heads with a masked final tile
 //
 // topk is runtime (cold.topk): the indices row width, a whole number of BI
 // candidate tiles.
@@ -98,19 +98,20 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_swapab_kernel(const bf16* __restrict__ Q,
                                      const uint8_t* __restrict__ KV_cache,
                                      const int32_t* __restrict__ indices,
-                                     const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
+                                     const float* __restrict__ attn_sink,  // [num_heads], nullable
                                      bf16* __restrict__ output, float* __restrict__ out_lse,
                                      __grid_constant__ const PrefillColdParams cold) {
   using KV = KVCacheTraits<MT>;
   using CT = ComputeTraitsSwapAB<MT>;
   using L = SmemLayoutSwapAB<MT>;
 
-  static constexpr int REPLICATE_H = NUM_HEADS / CT::HEADS_PER_CTA;
+  const int num_heads = NUM_HEADS == 0 ? cold.num_heads : NUM_HEADS;
+  const int replicate_h = (num_heads + CT::HEADS_PER_CTA - 1) / CT::HEADS_PER_CTA;
   static constexpr int HPW = CT::HEADS_PER_WARP;
   static constexpr bool SOFT_SCALE = (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32);
 
-  const int s_i = blockIdx.x / REPLICATE_H;
-  const int h_start = (blockIdx.x % REPLICATE_H) * CT::HEADS_PER_CTA;
+  const int s_i = blockIdx.x / replicate_h;
+  const int h_start = (blockIdx.x % replicate_h) * CT::HEADS_PER_CTA;
   if (s_i >= cold.num_tokens) return;
 
   const int topk = cold.topk;
@@ -177,7 +178,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     // B fragment column n == gid, so this lane feeds head h_base + gid; the C
     // fragment hands back heads h_base + 2*tid and h_base + 2*tid + 1.
     const int h_base = h_start + mwarp * HPW;
-    const bf16* q_base = Q + ((size_t)s_i * NUM_HEADS + h_base + gid) * KV::D_QK;
+    int q_head = h_base + gid;
+    // All lanes participate in the Q-quantization shuffles. Dummy heads read
+    // an in-range row; their results are masked at the output.
+    if constexpr (NUM_HEADS == 0) q_head = q_head < num_heads ? q_head : 0;
+    const bf16* q_base = Q + ((size_t)s_i * num_heads + q_head) * KV::D_QK;
 
     QSwapABRegs<MT> q = quantize_q_to_regs_swapab<MT>(q_base, lane);
     KVRopePrefetch<MT> q_rope = prefetch_kv_rope<MT>(q_base + KV::D_NOPE, lane);
@@ -448,7 +453,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       const float m = empty ? -1e30f : warp_m[ih];
       lse[ih] = l > 0.f ? softmax_lse(m, l) : -INFINITY;
       il[ih] = l > 0.f ? 1.f / l : 0.f;
-      if (cold.attn_sink != nullptr) {
+      if (cold.attn_sink != nullptr && (NUM_HEADS != 0 || h_base + 2 * tid + ih < num_heads)) {
         const float sink_log2 = __ldg(cold.attn_sink + h_base + 2 * tid + ih) * LOG2E;
         if (l > 0.f) {
           const float peak = fmaxf(m, sink_log2);
@@ -466,11 +471,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     if (gid == 0) {
 #pragma unroll
       for (int ih = 0; ih < 2; ih++)
-        out_lse[(size_t)s_i * cold.out_lse_stride_elems + h_base + 2 * tid + ih] =
-            flashinfer::sparse_mla_sm120::scale_output_lse(lse[ih], cold.lse_scale);
+        if (NUM_HEADS != 0 || h_base + 2 * tid + ih < num_heads)
+          out_lse[(size_t)s_i * cold.out_lse_stride_elems + h_base + 2 * tid + ih] =
+              flashinfer::sparse_mla_sm120::scale_output_lse(lse[ih], cold.lse_scale);
     }
 
-    const size_t out_base = ((size_t)s_i * NUM_HEADS + h_base) * D_V;
+    const size_t out_base = ((size_t)s_i * num_heads + h_base) * D_V;
     constexpr int O_VECS_PER_CHUNK = CT::V_CHUNK / L::OUT_VEC;
 #pragma unroll
     for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
@@ -492,7 +498,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
         const int h = i / O_VECS_PER_CHUNK;
         const int d8 = (i - h * O_VECS_PER_CHUNK) * L::OUT_VEC;
         uint4 v = *reinterpret_cast<const uint4*>(&sm.o_buf[h * L::O_STAGE_STRIDE + d8]);
-        *reinterpret_cast<uint4*>(&output[out_base + (size_t)h * D_V + vc * CT::V_CHUNK + d8]) = v;
+        if (NUM_HEADS != 0 || h_base + h < num_heads)
+          *reinterpret_cast<uint4*>(&output[out_base + (size_t)h * D_V + vc * CT::V_CHUNK + d8]) =
+              v;
       }
     }
   }

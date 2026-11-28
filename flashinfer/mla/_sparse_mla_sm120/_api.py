@@ -42,7 +42,8 @@ entries. Actual metadata legality takes precedence over the selected phase.
 Explicit DSV4.1 FP8/BF16 without a matching profile uses decode CPB=1.
 
 Ordinary FP8 prefill requires whole 64-wide index tiles and family-specific
-heads; DOTS3_SWA additionally requires topk >= 513. Full-BF16 DSV4.1 prefill
+heads; DSv3.2 supports H=1..128. DOTS3_SWA additionally requires topk >= 513.
+Full-BF16 DSV4.1 prefill
 supports runtime H=1..128 and positive ragged topk. DSV4 NVFP4
 has a separately keyed envelope. The public config query and the dispatch
 envelope membership probes are pure-Python coarse pre-filters over
