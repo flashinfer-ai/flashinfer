@@ -31,7 +31,12 @@ from ..engine import (
     seal_kernels,
 )
 from ..capabilities import require_compiler
-from ..activations import ACTIVATIONS, activation_name
+from ..activations import (
+    ACTIVATIONS,
+    DEFAULT_LAUNCH_SCALARS,
+    activation_name,
+    launch_scalars,
+)
 from ..support import SUPPORTED_ARCHS, weight_view
 from ..compiler import require_moe_assembler
 from ..shortlist import capture_profiles
@@ -43,6 +48,18 @@ from ..tuning import prepared_state, ranked_tactics
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
 _TAG = "cudnn_frost-bf16-moe-v2"
+# Native executor slots: output, the output scale, SiTU's two scales and
+# swiglu_param's alpha, beta, limit and -limit (the executor's scalar buffer).
+_TAIL_SLOTS = {
+    "output": -1,
+    "scale": 0,
+    "gate_scale": 1,
+    "linear_scale": 2,
+    "swiglu_alpha": 3,
+    "swiglu_beta": 4,
+    "swiglu_limit": 5,
+    "swiglu_lower": 6,
+}
 _UNSUPPORTED = "cuDNN Frost BF16 MoE kernels require SM107a or SM120a"
 
 
@@ -188,6 +205,7 @@ class _Plans:
         executor_cache,
         fma_tactic=None,
         validate_fma_sources=None,
+        scalars=DEFAULT_LAUNCH_SCALARS,
     ):
         first = tuple(runtime.bind_kernel(k, device) for k in first)
         second = tuple(runtime.bind_kernel(k, device) for k in second)
@@ -198,7 +216,7 @@ class _Plans:
         module = _module(runtime._arch_for(device))
         for a, b in product(first, second):
             key = (_TAG, a.tactic, b.tactic)
-            executor_key = (hidden, intermediate, experts, topk, False, key)
+            executor_key = (hidden, intermediate, experts, topk, False, scalars, key)
             plan = executor_cache.get(executor_key)
             if plan is None:
                 factory = (
@@ -215,15 +233,11 @@ class _Plans:
                     a.workspace_bytes,
                     b.workspace_bytes,
                     a.gated,
-                    [
-                        {"output": -1, "scale": 0, "gate_scale": 1, "linear_scale": 2}[
-                            name
-                        ]
-                        for name in a.launch_tail
-                    ],
+                    [_TAIL_SLOTS[name] for name in a.launch_tail],
                     a.swap_ab,
                     b.swap_ab,
                     False,
+                    *scalars,
                 )
                 executor_cache[executor_key] = plan
             # Packed states retain Modules whose run Functions borrow them.
@@ -231,7 +245,15 @@ class _Plans:
             self.launches[key] = plan["run"]
             required = max(required, plan["workspace_size"](tokens))
         if fma_tactic is not None:
-            executor_key = (hidden, intermediate, experts, topk, False, fma_tactic)
+            executor_key = (
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                False,
+                scalars,
+                fma_tactic,
+            )
             plan = executor_cache.get(executor_key)
             if plan is None:
                 if validate_fma_sources is not None:
@@ -260,6 +282,7 @@ class _Plans:
                     False,
                     False,
                     True,
+                    *scalars,
                 )
                 if validate_fma_sources is not None:
                     validate_fma_sources()
@@ -326,6 +349,15 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
                 }
             )
         )
+        if not any(
+            kernel.arch == arch and kernel.activation == name
+            for kernel in runtime._discover(roots)
+        ):
+            # E.g. swiglu_param, whose scalar-parameterized sources are packaged
+            # for SM120 only.
+            raise NotImplementedError(
+                f"cuDNN Frost BF16 MoE has no {name} kernels for {arch}"
+            )
         require_graph_resource_retention()
         if arch == "sm_107a":
             require_moe_assembler()
@@ -358,6 +390,7 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
                 executor_cache,
                 metadata.fma_tactic,
                 metadata.validate_fma_sources,
+                launch_scalars(activation),
             ),
         )
         self._plans = self._engine.plans

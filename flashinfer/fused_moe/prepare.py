@@ -2045,6 +2045,82 @@ def prepare_cutlass_nvfp4_weights(
     }
 
 
+def _nvfp4_unswizzle_scales(scales: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Linear ``[..., rows, cols]`` bytes of 128x4-swizzled NVFP4 block scales.
+
+    The swizzled byte of ``(row, col)`` sits at ``[row // 128, col // 4,
+    row % 32, row % 128 // 32, col % 4]``.
+    """
+    padded = round_up(rows, _NVFP4_SF_SWIZZLE_ROWS)
+    lead = scales.shape[:-2]
+    return (
+        scales.view(torch.uint8)
+        .reshape(*lead, padded // 128, cols // 4, 32, 4, 4)
+        .transpose(-4, -2)
+        .reshape(*lead, padded, cols)[..., :rows, :]
+    )
+
+
+def _nvfp4_swizzle_scales(linear: torch.Tensor) -> torch.Tensor:
+    """128x4-swizzle linear ``[..., rows, cols]`` scale bytes, zero-padding rows to 128."""
+    *lead, rows, cols = linear.shape
+    padded = torch.zeros(
+        (*lead, round_up(rows, _NVFP4_SF_SWIZZLE_ROWS), cols),
+        dtype=torch.uint8,
+        device=linear.device,
+    )
+    padded[..., :rows, :] = linear
+    return (
+        padded.reshape(*lead, -1, 4, 32, cols // 4, 4)
+        .transpose(-4, -2)
+        .contiguous()
+        .reshape(padded.shape)
+    )
+
+
+def prepare_cudnn_frost_nvfp4_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation=None,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the ``cudnn_frost_nvfp4`` view: the CUTLASS NVFP4 view, with
+    per-branch FC1 block scales when the gated branches do not fill whole
+    128-row scale atoms.
+
+    The canonical view swizzles each expert's ``[up, gate]`` rows as one
+    matrix, while Frost reads up and gate as separate operands. When ``I`` is a
+    multiple of 128 the gate rows start on an atom boundary and the canonical
+    tensor is used as is. Otherwise (e.g. gpt-oss, ``I = 2880``) the gate half
+    starts mid-atom, so ``fc1_weight_block_scale`` becomes
+    ``uint8 [2, E, round_up(I, 128), H // 16]``: each branch swizzled on its
+    own, with zero padding rows. The quantized data are unchanged.
+    """
+    view = prepare_cutlass_nvfp4_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        device=device,
+    )
+    activation = _normalize_activation(activation)
+    if not activation.is_gated or intermediate_size % _NVFP4_SF_SWIZZLE_ROWS == 0:
+        return view
+    cols = hidden_size // _NVFP4_SF_VEC_SIZE
+    linear = _nvfp4_unswizzle_scales(
+        view["fc1_weight_block_scale"], 2 * intermediate_size, cols
+    )
+    branches = linear.reshape(num_local_experts, 2, intermediate_size, cols)
+    view["fc1_weight_block_scale"] = _nvfp4_swizzle_scales(branches.transpose(0, 1))
+    return view
+
+
 def _require_canonical_cutlass_bf16_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,

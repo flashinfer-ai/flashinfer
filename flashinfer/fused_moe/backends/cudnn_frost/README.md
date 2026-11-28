@@ -7,10 +7,12 @@ SHA-256 manifest, with no precompiled `.o` files. Required cuDNN Frost device he
 are included in each generated source. The deployed process does not import
 `cudnn-frontend`, construct a cuDNN Frost graph, or run the cuDNN Frost graph compiler.
 
-All packaged Tensor Core source families are generated from cuDNN Frontend
-`0d72d59efd21401c7e13d606584fef2544e45934`, including ordinary FC1/FC2,
-dedicated GATHER, and qualified NVFP4 COMBINE kernels. This revision is shared
-by BF16, NVFP4, MXFP8 and MXFP8 × MXFP4 on their packaged SM107a/SM120a paths.
+The packaged SM107a Tensor Core source families are generated from cuDNN
+Frontend `0d72d59efd21401c7e13d606584fef2544e45934`, including ordinary
+FC1/FC2, dedicated GATHER, and qualified NVFP4 COMBINE kernels; the SM120a
+families from its descendant `886d7176` (see the SM120 section below). Each
+revision is shared by BF16, NVFP4, MXFP8 and MXFP8 × MXFP4 on that
+architecture's packaged paths.
 The catalogs retain their existing tile, cluster, activation and routing-mode
 coverage. Geometry constants are reconstructed from the producer's source;
 device-dependent pipeline depths and descriptor workspace sizes are resolved
@@ -248,7 +250,9 @@ Per-expert `fc1_input_scale` and `fc2_input_scale` are runtime
 FP32 multipliers. FC1 applies its multiplier to the GEMM accumulators before
 activation, including both gate and up branches; FC2 applies its multiplier
 before BF16 output conversion. Bias, shared experts, expert parallelism,
-non-default activation parameters and logits-based routing are unsupported.
+non-default activation parameters (except SwiGLU's alpha/beta/limit on SM120,
+see [Launch-time SwiGLU parameters](#launch-time-swiglu-parameters-sm120)) and
+logits-based routing are unsupported.
 
 Automatic admission requires SM107a or SM120a, MXFP8 operands, BF16 finalized
 output, precomputed routing and legal artifacts for both stages. No
@@ -259,7 +263,8 @@ the next measured profile; native executors use the actual input shape at launch
 
 MXFP8, NVFP4 and MXFP8 × MXFP4 shapes without a table entry (including token
 counts beyond its largest profile) use a bounded heuristic pool. H/I must be
-positive multiples of 128, at most 2^20; `1 <= top_k <= E <= 1024`;
+positive multiples of 128 (of 64 for NVFP4 on SM120), at most 2^20;
+`1 <= top_k <= E <= 1024`;
 `1 <= T <= min(2^20, tune_max_num_tokens)`; expanded rows must satisfy the
 native int32 bound. Candidate selection checks each stage's artifact dimension
 and activation contracts; missing legal stages are reported during packing.
@@ -388,7 +393,12 @@ templates for different architectures can coexist in each dtype directory.
 All ten default activation contracts are included: gated `SwiGLU`, `GeGLU`,
 `GeGLUTanh`, `SwiGLUStep`, `SiTU`; non-gated `Identity`, `ReLU`, `ReLU2`,
 `GELU`, `SiLU`. SiTU binds gate/linear scales 4/25 in the generated auxiliary
-argument order; SwiGLUStep uses limit 7. FC1 fuses activation on FP32
+argument order; SwiGLUStep uses limit 7. SM120 additionally packages
+`swiglu_param` (`--op grouped_gemm1_swiglu_param`), SwiGLU with launch-time
+alpha/beta/limit. The exporter spells SwiGLUStep's up clamp as a slope-free
+`relu(lower_clip=-7, upper_clip=7)`: cuDNN's RELU_FWD lets a slope continue
+below `lower_clip`, which Frost implements since cuDNN Frontend `e0185b3b`, and
+both packaged revisions are later than that. FC1 fuses activation on FP32
 accumulators before the BF16 output conversion. The optional `scale` argument
 multiplies the activation output for every FC1, including non-gated variants.
 
@@ -533,8 +543,15 @@ script's complete routed MoE measurements.
 `nvfp4/runtime.py`, `nvfp4/moe.py` and `csrc/moe_nvfp4.cu` provide the
 corresponding NVFP4 × NVFP4 pipeline and `cudnn_frost_nvfp4` automatic
 candidate. Both operands contain two E2M1 values per byte, with E4M3 block
-scales per 16 logical K elements. Logical N and K must be divisible by 128;
-packing halves the tensor's last storage dimension, not its logical K.
+scales per 16 logical K elements. Logical N and K of the standalone grouped
+API must be divisible by 128; packing halves the tensor's last storage
+dimension, not its logical K. The MoE pipeline takes H and I in multiples of
+64 on SM120 (whole 4-column scale words, e.g. gpt-oss's 2880) and of 128 on
+SM107. Weight scales then pad each matrix to whole 128-row atoms:
+`fc2_weight_block_scale` is `[E, round_up(H, 128), I/16]`, and when a gated I
+is not a multiple of 128 the gate rows of the canonical `[up; gate]` matrix
+start mid-atom, so `CudnnFrostNvfp4Config.prepare_weights` stores
+`fc1_weight_block_scale` per branch as `[2, E, round_up(I, 128), H/16]`.
 The native pipeline gathers packed inputs, runs FC1/activation and intermediate
 NVFP4 quantization, runs FC2 with BF16 output, and reduces routed outputs in
 FP32 before the final BF16 conversion.
@@ -723,11 +740,37 @@ checked against the architecture, geometry and activation in the manifest.
 
 Set `MoEConfig(activation=...)` using the existing typed activation API.
 Non-default scalar parameters and per-expert overrides are rejected rather
-than silently ignored. In particular, selected SiTU uses gate scale 4 and
-linear scale 25; SwiGLUStep uses limit 7. FC1 applies the activation to FP32
-accumulators before storing BF16. Gated activations fuse two grouped GEMMs;
-non-gated activations use one. FC2 sources are shared across activations.
-The standalone `cudnn_frost_grouped_gemm1_swiglu` API remains SwiGLU-specific.
+than silently ignored, except SwiGLU's on SM120 (below). In particular,
+selected SiTU uses gate scale 4 and linear scale 25; SwiGLUStep uses limit 7.
+FC1 applies the activation to FP32 accumulators before storing BF16. Gated
+activations fuse two grouped GEMMs; non-gated activations use one. FC2 sources
+are shared across activations. The standalone
+`cudnn_frost_grouped_gemm1_swiglu` API remains SwiGLU-specific.
+
+### Launch-time SwiGLU parameters (SM120)
+
+`SwiGLU(alpha, beta, limit)` with any non-default value runs the
+`swiglu_param` sources, which read the parameters as FP32 scalar kernel
+inputs, so one kernel serves every model:
+
+```text
+g = min(gate, limit);  u = clamp(up, -limit, limit)
+out = g * sigmoid(alpha * g) * (u + beta) * scale
+```
+
+This is FlashInfer's SwiGLU contract (`tests/moe/utils.py`): e.g.
+DeepSeek-V4/V4.1-Flash, its DSpark draft head and GLM-5.3-Flash use
+`SwiGLU(limit=10)`; gpt-oss and MiniMax-M3 use
+`SwiGLU(alpha=1.702, beta=1, limit=7)`. The default `SwiGLU()` keeps its
+`swiglu` sources. `swiglu_param` is packaged for SM120 in every dtype, with
+the same tiles, orientations and output variants as `swiglu`; on SM107 the
+runner declines it with `NotImplementedError` instead of dropping the
+parameters. Its launch tail places `swiglu_limit`, `swiglu_alpha`,
+`swiglu_lower` and `swiglu_beta` (Frost's first-use order) before `scale`;
+the native executors write `alpha, beta, limit, -limit` to scalar slots during
+routing, so CUDA Graph replays keep them. `activations.py` maps an activation
+to its source name (`activation_name`) and its launch values
+(`launch_scalars`).
 
 The native executor carries the generated argument order, including SiTU's scalar
 inputs, for both normal and swap-AB layouts. Activation-specific source hashes
@@ -1033,12 +1076,15 @@ activation of the topology expands through its exact source fragments. Kernel
 IDs start with `sm120_cudnn_frost_`, and catalog and shortlist records carry
 `arch: sm_120a`.
 
-The current SM120 producer revision is listed at the start of this document.
-It includes TMA L2 promotion on every SM120 template and sizes the packed
-E2M1 side of a mixed pair at its 64-byte row in the SMEM footprint check,
-as `device.py` does here. It also masks K-padding scale bytes in block-scale
-mainloops and uses an unsigned ballot when finding the scheduler's winning
-lane. Each host
+The SM120 sources are exported from cuDNN Frontend `886d7176` (develop,
+2026-11-04), a descendant of the SM107 revision listed at the start of this
+document. It includes TMA L2 promotion on every SM120 template and sizes the
+packed E2M1 side of a mixed pair at its 64-byte row in the SMEM footprint
+check, as `device.py` does here. It also masks K-padding scale bytes in
+block-scale mainloops, uses an unsigned ballot when finding the scheduler's
+winning lane, clamps each MoE group to its routed rows, follows cuDNN's ReLU
+slope/clip definition and propagates NaN through ReLU-family epilogues. Each
+host
 zeroes its scheduler counter with a one-thread kernel before the PDL main
 launch, as the SM100 MoE hosts do, so the exported TVM-FFI function needs no
 caller-side reset. Like the SM107 sources, the schedulers take `G+1` explicit
@@ -1053,8 +1099,11 @@ after the tile constants; `extract_template` keeps their decorators.
 The frozen source of a tile does not depend on E, N or K: exports of one tile
 at several model geometries render identical templates and parameters and
 coalesce into one logical kernel. Every SM120 kernel therefore uses the
-catalog's generic contract (N and K multiples of 128, up to 1024 experts), as
-on SM107. MXFP8 and MXFP8 × MXFP4 FC1 also
+catalog's generic contract: N and K multiples of 32 (the kernels take whole
+32-element blocks and mask the K tail), up to 1024 experts; SM107 kernels
+need multiples of 128. Above the kernels, BF16 admits H/I in 32s and NVFP4 in
+64s, while MXFP8 and MXFP8 × MXFP4 keep 128s: their canonical weight scales
+are int32-packed per 128 K. MXFP8 and MXFP8 × MXFP4 FC1 also
 fuse the intermediate quantization (E4M3 data and segmented E8M0 scales, both
 through STG) in the normal orientation, for the tiles whose warp tile drains
 whole 32-column quantization blocks. cuDNN Frost cannot store packed FP4 on

@@ -7,6 +7,14 @@
       "swiglu_step",
       "situ"
     ],
+    "gated_param": [
+      "swiglu",
+      "geglu",
+      "geglu_tanh",
+      "swiglu_step",
+      "situ",
+      "swiglu_param"
+    ],
     "non_gated": [
       "gelu",
       "identity",
@@ -5160,7 +5168,7 @@
       ]
     },
     {
-      "activation_group": "gated",
+      "activation_group": "gated_param",
       "arch": "sm_120a",
       "stage": "fc1",
       "variants": [
@@ -5194,9 +5202,9 @@
               "56112e941b571de6",
               "7a4225debec6eddc",
               "2ed87fd309985059",
-              "4d401b076ec024cd",
+              "220136b3e0ca7cc7",
               "27d6d011a3008912",
-              "897db959e788d1d6",
+              "5092095203c53e38",
               "56112e941b571de6",
               "1dfc658c5c45d2e7",
               "d74c1b876c2737f8",
@@ -5213,6 +5221,18 @@
               "e3b0c44298fc1c14",
               "e3b0c44298fc1c14",
               "2f2e3279e3c767c7"
+            ],
+            "swiglu_param": [
+              "2754a26085d00492",
+              "3b18f23975a95a83",
+              "c2851a158d6a0bb3",
+              "8ce67ce32c873698",
+              "61e28c519656cc78",
+              "2135b8d3f20cfcda",
+              "2754a26085d00492",
+              "b932e17e4b585343",
+              "e75461c9caab2535",
+              "b8cedbdf6cc2fc79"
             ],
             "swiglu_step": [
               "e3b0c44298fc1c14",
@@ -5238,13 +5258,13 @@
             },
             "k": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "n": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "output_dtype": "bfloat16",
             "s": {
@@ -5258,7 +5278,7 @@
           "producer_template": "sm120_moe_grouped_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc1_gated_normal_bf16_stg.py",
-            "sha256": "4e565fa050212d00d821a4cff60896b5b9f157f28ebd15ce79a327d808f62905"
+            "sha256": "19d7c68d5cab2bee5d741418bec8d64110d74a62d34312613096106e93a8b19b"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -5493,10 +5513,10 @@
               "56112e941b571de6",
               "eb00231ff480d1e5",
               "2ed87fd309985059",
-              "4d401b076ec024cd",
+              "220136b3e0ca7cc7",
               "7bea654a536d6bf5",
               "27d6d011a3008912",
-              "897db959e788d1d6",
+              "5092095203c53e38",
               "56112e941b571de6",
               "1dfc658c5c45d2e7",
               "d74c1b876c2737f8",
@@ -5514,6 +5534,19 @@
               "e3b0c44298fc1c14",
               "e3b0c44298fc1c14",
               "d749578072d1c69f"
+            ],
+            "swiglu_param": [
+              "2754a26085d00492",
+              "d5f025c6d2c92c97",
+              "c2851a158d6a0bb3",
+              "8ce67ce32c873698",
+              "dc101805d6303043",
+              "61e28c519656cc78",
+              "2135b8d3f20cfcda",
+              "2754a26085d00492",
+              "b932e17e4b585343",
+              "e75461c9caab2535",
+              "de25376457a0ccc7"
             ],
             "swiglu_step": [
               "e3b0c44298fc1c14",
@@ -5540,13 +5573,13 @@
             },
             "k": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "n": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "output_dtype": "bfloat16",
             "s": {
@@ -5560,7 +5593,7 @@
           "producer_template": "sm120_moe_grouped_matmul_fwd_swap_ab.py",
           "source": {
             "path": "sources/sm120_fc1_gated_swap_bf16_stg.py",
-            "sha256": "150ec2c84d47bb062158940f554246949cea0a20330a161ce6dbc7a52dc3a26e"
+            "sha256": "841da895ec587c3167ea0598c1155c383812e80d01ae724d2bada103128426a1"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -5878,13 +5911,13 @@
             },
             "k": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "n": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "output_dtype": "bfloat16",
             "s": {
@@ -5898,7 +5931,7 @@
           "producer_template": "sm120_moe_grouped_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc1_non_gated_normal_bf16_stg.py",
-            "sha256": "7b148982d0690ca014d970da9559a8dd7abac9a01c24fc62fedbe4c392982a24"
+            "sha256": "b1dcf660922c676acd8aec4ddaaefaa7a24360df6894f8f72de3a38e72319833"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -6088,13 +6121,13 @@
             },
             "k": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "n": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "output_dtype": "bfloat16",
             "s": {
@@ -6108,7 +6141,7 @@
           "producer_template": "sm120_moe_grouped_matmul_fwd_swap_ab.py",
           "source": {
             "path": "sources/sm120_fc1_non_gated_swap_bf16_stg.py",
-            "sha256": "3d7078d835a61dce9c9851767addaa76662cf2225cc9fcc5b72fe29100e8c27f"
+            "sha256": "fbb5ed545c137449708b6c40751410d064c4e00eb1b88e0fe4111933df2b6ee7"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -6308,13 +6341,13 @@
             },
             "k": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "n": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "output_dtype": "bfloat16",
             "s": {
@@ -6328,7 +6361,7 @@
           "producer_template": "sm120_moe_grouped_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc2_non_gated_normal_bf16_stg.py",
-            "sha256": "6c877a37dd9f6a1608cb3fd6c4834564cf6dc22855234655e4e85971ff3b452e"
+            "sha256": "5eab8f079a76c5c4fce79dfe4dd8ca3a6303214ff8324df0d6c4488ec0061ca4"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -6442,13 +6475,13 @@
             },
             "k": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "n": {
               "max": 1048576,
-              "min": 128,
-              "multiple_of": 128
+              "min": 32,
+              "multiple_of": 32
             },
             "output_dtype": "bfloat16",
             "s": {
@@ -6462,7 +6495,7 @@
           "producer_template": "sm120_moe_grouped_matmul_fwd_swap_ab.py",
           "source": {
             "path": "sources/sm120_fc2_non_gated_swap_bf16_stg.py",
-            "sha256": "b62542a22ea2b2c0e2c039438079cd68d1c1e9a326975bd0d4d9367a597c494c"
+            "sha256": "a68666dff063236bf3d65450d76b4a5a9c54f4f66cbdc7c0b57bafb20a82fc25"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -6588,7 +6621,10 @@
     "1e0f88de1db195e1": "                                _op_1 = (cutlass.full_like(_c_1_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_1_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_1_a * cutlass.full_like(_c_1_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_1_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                _c_2_a = (_op_1).to(cutlass.Float32)\n                                _op_2 = (cutlass.full_like(_c_2_a, _aux_gate_scale_pre.to(cutlass.Float32))) * _c_2_a\n                                _c_3_a = (vec_f32).to(cutlass.Float32)\n                                _op_3 = cute.math.rcp(cutlass.full_like(_c_3_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_3_a * cutlass.full_like(_c_3_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                _c_4_a = (_op_2).to(cutlass.Float32)\n                                _c_4_b = (_op_3).to(cutlass.Float32)\n                                _op_4 = _c_4_a * _c_4_b\n                                _c_5_a = (vec_f32_1).to(cutlass.Float32)\n                                _op_5 = _c_5_a / (cutlass.full_like(_c_5_a, _aux_linear_scale_pre.to(cutlass.Float32)))\n                                _c_6_a = (_op_5).to(cutlass.Float32)\n                                _op_6 = (cutlass.full_like(_c_6_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_6_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_6_a * cutlass.full_like(_c_6_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_6_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                _c_7_a = (_op_6).to(cutlass.Float32)\n                                _op_7 = (cutlass.full_like(_c_7_a, _aux_linear_scale_pre.to(cutlass.Float32))) * _c_7_a\n                                _c_8_a = (_op_4).to(cutlass.Float32)\n                                _c_8_b = (_op_7).to(cutlass.Float32)\n                                _op_8 = _c_8_a * _c_8_b\n                                _c_9_a = (_op_8).to(cutlass.Float32)\n                                _op_9 = _c_9_a * (cutlass.full_like(_c_9_a, _aux_scale_pre.to(cutlass.Float32)))\n                                _r_9 = (_op_9).to(cutlass.BFloat16)\n                                _tap_0 = (_r_9).to(cutlass.BFloat16)\n",
     "201b9b3f6a65a887": "                                        _c_1_b = (vec_f32_1).to(cutlass.Float32)\n                                        _op_1 = _c_1_a * _c_1_b\n                                        _c_2_a = (_op_1).to(cutlass.Float32)\n                                        _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))\n                                        _r_2 = (_op_2).to(cutlass.BFloat16)\n                                        _tap_0 = (_r_2).to(cutlass.BFloat16)\n",
     "202cf2c641e8df8c": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_a_0, fake_a_1, fake_b_0, fake_c_tap_0, fake_gate_scale, fake_linear_scale, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
+    "2135b8d3f20cfcda": "                                        _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_swiglu_alpha_pre.to(cutlass.Float32)))\n                                        _c_2_a = (_op_1).to(cutlass.Float32)\n                                        _op_2 = cute.math.rcp(cutlass.full_like(_c_2_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_2_a * cutlass.full_like(_c_2_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                        _c_3_a = (_op_0).to(cutlass.Float32)\n                                        _c_3_b = (_op_2).to(cutlass.Float32)\n                                        _op_3 = _c_3_a * _c_3_b\n                                        _c_4_a = (vec_f32_1).to(cutlass.Float32)\n                                        _op_4 = cute.math.min(_c_4_a, (cutlass.full_like(_c_4_a, _aux_swiglu_limit_pre.to(cutlass.Float32))))\n                                        _c_5_a = (_op_4).to(cutlass.Float32)\n                                        _op_5 = cute.math.max(_c_5_a, (cutlass.full_like(_c_5_a, _aux_swiglu_lower_pre.to(cutlass.Float32))))\n                                        _c_6_a = (_op_5).to(cutlass.Float32)\n                                        _op_6 = _c_6_a + (cutlass.full_like(_c_6_a, _aux_swiglu_beta_pre.to(cutlass.Float32)))\n                                        _c_7_a = (_op_3).to(cutlass.Float32)\n                                        _c_7_b = (_op_6).to(cutlass.Float32)\n                                        _op_7 = _c_7_a * _c_7_b\n                                        _c_8_a = (_op_7).to(cutlass.Float32)\n                                        _op_8 = _c_8_a * (cutlass.full_like(_c_8_a, _aux_scale_pre.to(cutlass.Float32)))\n                                        _r_8 = (_op_8).to(cutlass.BFloat16)\n                                        _tap_0 = (_r_8).to(cutlass.BFloat16)\n",
     "21ad07e05fe83f8d": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_a_tma_workspace, fake_a_0, fake_b_0, fake_b_1, fake_c_tap_0, fake_gate_scale, fake_linear_scale, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
+    "220136b3e0ca7cc7": "                                            _th1 = _c_1_a\n                                            _thq1 = _th1 * _th1\n                                            _op_1 = cutlass._mlir_helpers.vector.where(cute.math.abs(_th1) < cutlass.full_like(_th1, cutlass.Float32(0.125)), _th1 + _th1 * _thq1 * (cutlass.full_like(_thq1, cutlass.Float32(-0.3333333333333333)) + _thq1 * (cutlass.full_like(_thq1, cutlass.Float32(0.13333333333333333)) + _thq1 * (cutlass.full_like(_thq1, cutlass.Float32(-0.05396825396825397))))), (cutlass.full_like(_th1, cutlass.Float32(1.0)) - cutlass.full_like(_th1, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_th1 * cutlass.full_like(_th1, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_th1, cutlass.Float32(1.0)), approx=True, ftz=True)))\n                                            _c_2_a = (_op_1).to(cutlass.Float32)\n                                            _op_2 = (cutlass.full_like(_c_2_a, _aux_gate_scale_pre.to(cutlass.Float32))) * _c_2_a\n                                            _c_3_a = (vec_f32).to(cutlass.Float32)\n                                            _op_3 = cute.math.rcp(cutlass.full_like(_c_3_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_3_a * cutlass.full_like(_c_3_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                            _c_4_a = (_op_2).to(cutlass.Float32)\n                                            _c_4_b = (_op_3).to(cutlass.Float32)\n                                            _op_4 = _c_4_a * _c_4_b\n                                            _c_5_a = (vec_f32_1).to(cutlass.Float32)\n                                            _op_5 = _c_5_a / (cutlass.full_like(_c_5_a, _aux_linear_scale_pre.to(cutlass.Float32)))\n                                            _c_6_a = (_op_5).to(cutlass.Float32)\n                                            _th6 = _c_6_a\n                                            _thq6 = _th6 * _th6\n                                            _op_6 = cutlass._mlir_helpers.vector.where(cute.math.abs(_th6) < cutlass.full_like(_th6, cutlass.Float32(0.125)), _th6 + _th6 * _thq6 * (cutlass.full_like(_thq6, cutlass.Float32(-0.3333333333333333)) + _thq6 * (cutlass.full_like(_thq6, cutlass.Float32(0.13333333333333333)) + _thq6 * (cutlass.full_like(_thq6, cutlass.Float32(-0.05396825396825397))))), (cutlass.full_like(_th6, cutlass.Float32(1.0)) - cutlass.full_like(_th6, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_th6 * cutlass.full_like(_th6, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_th6, cutlass.Float32(1.0)), approx=True, ftz=True)))\n                                            _c_7_a = (_op_6).to(cutlass.Float32)\n                                            _op_7 = (cutlass.full_like(_c_7_a, _aux_linear_scale_pre.to(cutlass.Float32))) * _c_7_a\n                                            _c_8_a = (_op_4).to(cutlass.Float32)\n                                            _c_8_b = (_op_7).to(cutlass.Float32)\n                                            _op_8 = _c_8_a * _c_8_b\n                                            _c_9_a = (_op_8).to(cutlass.Float32)\n                                            _op_9 = _c_9_a * (cutlass.full_like(_c_9_a, _aux_scale_pre.to(cutlass.Float32)))\n                                            _r_9 = (_op_9).to(cutlass.BFloat16)\n                                            _tap_0 = (_r_9).to(cutlass.BFloat16)\n",
+    "2754a26085d00492": "    swiglu_limit: cute.Tensor,\n    swiglu_alpha: cute.Tensor,\n    swiglu_lower: cute.Tensor,\n    swiglu_beta: cute.Tensor,\n",
     "27d6d011a3008912": "                                        _op_0 = _c_0_a / (cutlass.full_like(_c_0_a, _aux_gate_scale_pre.to(cutlass.Float32)))\n",
     "28e39a716817853e": "                                            _op_0 = _c_0_a * cute.math.rcp(cutlass.full_like(_c_0_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n",
     "2a58221a954782af": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_token_index, fake_a_0, fake_a_1, fake_b_0, fake_gate_scale, fake_linear_scale, fake_scale, fake_c_0, stream=_fake_stream, options=frost_compile_options)\n",
@@ -6597,14 +6633,16 @@
     "2f2e3279e3c767c7": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_a_tma_workspace, fake_a_0, fake_b_0, fake_b_1, fake_c_tap_0, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
     "30bcd14235a5b41f": "                    _op_0 = cute.math.max(_c_0_a, cutlass.full_like(_c_0_a, cutlass.Float32(0.0)), propagate_nan=True)\n                    _c_1_a = (_op_0).to(cutlass.Float32)\n                    _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))\n                    _r_1 = (_op_1).to(cutlass.BFloat16)\n                    vec_out = (_r_1).to(cutlass.BFloat16)\n",
     "39694a0c019c84b3": "                                        _op_0 = cute.math.max(_c_0_a, cutlass.full_like(_c_0_a, cutlass.Float32(0.0)), propagate_nan=True)\n                                        _c_1_a = (_op_0).to(cutlass.Float32)\n                                        _c_1_b = (_op_0).to(cutlass.Float32)\n                                        _op_1 = _c_1_a * _c_1_b\n                                        _c_2_a = (_op_1).to(cutlass.Float32)\n                                        _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))\n                                        _r_2 = (_op_2).to(cutlass.BFloat16)\n                                        _tap_0 = (_r_2).to(cutlass.BFloat16)\n",
+    "3b18f23975a95a83": "            _aux_swiglu_limit_ptr = swiglu_limit.iterator.raw_ptr()\n            _aux_swiglu_limit_pre = (_aux_swiglu_limit_ptr + 0).load()\n            _aux_swiglu_alpha_ptr = swiglu_alpha.iterator.raw_ptr()\n            _aux_swiglu_alpha_pre = (_aux_swiglu_alpha_ptr + 0).load()\n            _aux_swiglu_lower_ptr = swiglu_lower.iterator.raw_ptr()\n            _aux_swiglu_lower_pre = (_aux_swiglu_lower_ptr + 0).load()\n            _aux_swiglu_beta_ptr = swiglu_beta.iterator.raw_ptr()\n            _aux_swiglu_beta_pre = (_aux_swiglu_beta_ptr + 0).load()\n",
     "3bc9e968a5bc8c1d": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_token_index, fake_a_0, fake_a_1, fake_b_0, fake_scale, fake_c_0, stream=_fake_stream, options=frost_compile_options)\n",
     "3f3f09f806845f87": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_a_tma_workspace, fake_a_0, fake_b_0, fake_b_1, fake_gate_scale, fake_linear_scale, fake_scale, fake_c_0, stream=_fake_stream, options=frost_compile_options)\n",
     "44b6981accc03913": "                    _c_1_b = (vec_f32_1).to(cutlass.Float32)\n                    _op_1 = _c_1_a * _c_1_b\n                    _c_2_a = (_op_1).to(cutlass.Float32)\n                    _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))\n                    _r_2 = (_op_2).to(cutlass.BFloat16)\n                    vec_out = (_r_2).to(cutlass.BFloat16)\n",
     "487e7a9c66b50b8a": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_a_0, fake_a_1, fake_b_0, fake_gate_scale, fake_linear_scale, fake_scale, fake_c_0, stream=_fake_stream, options=frost_compile_options)\n",
     "4d1c6e8eb77500a7": "                    _e_x0 = _c_0_a\n                    _e_erf0 = cute.math.erf(_e_x0 * cutlass.full_like(_e_x0, cutlass.Float32(0.7071067811865475)))\n                    _op_0 = cutlass.full_like(_e_x0, cutlass.Float32(0.5)) * _e_x0 * (cutlass.full_like(_e_x0, cutlass.Float32(1.0)) + _e_erf0)\n                    _c_1_a = (_op_0).to(cutlass.Float32)\n                    _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))\n                    _r_1 = (_op_1).to(cutlass.BFloat16)\n                    vec_out = (_r_1).to(cutlass.BFloat16)\n",
-    "4d401b076ec024cd": "                                            _op_1 = (cutlass.full_like(_c_1_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_1_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_1_a * cutlass.full_like(_c_1_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_1_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                            _c_2_a = (_op_1).to(cutlass.Float32)\n                                            _op_2 = (cutlass.full_like(_c_2_a, _aux_gate_scale_pre.to(cutlass.Float32))) * _c_2_a\n                                            _c_3_a = (vec_f32).to(cutlass.Float32)\n                                            _op_3 = cute.math.rcp(cutlass.full_like(_c_3_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_3_a * cutlass.full_like(_c_3_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                            _c_4_a = (_op_2).to(cutlass.Float32)\n                                            _c_4_b = (_op_3).to(cutlass.Float32)\n                                            _op_4 = _c_4_a * _c_4_b\n                                            _c_5_a = (vec_f32_1).to(cutlass.Float32)\n                                            _op_5 = _c_5_a / (cutlass.full_like(_c_5_a, _aux_linear_scale_pre.to(cutlass.Float32)))\n                                            _c_6_a = (_op_5).to(cutlass.Float32)\n                                            _op_6 = (cutlass.full_like(_c_6_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_6_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_6_a * cutlass.full_like(_c_6_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_6_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                            _c_7_a = (_op_6).to(cutlass.Float32)\n                                            _op_7 = (cutlass.full_like(_c_7_a, _aux_linear_scale_pre.to(cutlass.Float32))) * _c_7_a\n                                            _c_8_a = (_op_4).to(cutlass.Float32)\n                                            _c_8_b = (_op_7).to(cutlass.Float32)\n                                            _op_8 = _c_8_a * _c_8_b\n                                            _c_9_a = (_op_8).to(cutlass.Float32)\n                                            _op_9 = _c_9_a * (cutlass.full_like(_c_9_a, _aux_scale_pre.to(cutlass.Float32)))\n                                            _r_9 = (_op_9).to(cutlass.BFloat16)\n                                            _tap_0 = (_r_9).to(cutlass.BFloat16)\n",
     "4d7126d684ddc92c": "                                _e_x0 = _c_0_a\n                                _e_erf0 = cute.math.erf(_e_x0 * cutlass.full_like(_e_x0, cutlass.Float32(0.7071067811865475)))\n                                _op_0 = cutlass.full_like(_e_x0, cutlass.Float32(0.5)) * _e_x0 * (cutlass.full_like(_e_x0, cutlass.Float32(1.0)) + _e_erf0)\n",
+    "5092095203c53e38": "                                        _th1 = _c_1_a\n                                        _thq1 = _th1 * _th1\n                                        _op_1 = cutlass._mlir_helpers.vector.where(cute.math.abs(_th1) < cutlass.full_like(_th1, cutlass.Float32(0.125)), _th1 + _th1 * _thq1 * (cutlass.full_like(_thq1, cutlass.Float32(-0.3333333333333333)) + _thq1 * (cutlass.full_like(_thq1, cutlass.Float32(0.13333333333333333)) + _thq1 * (cutlass.full_like(_thq1, cutlass.Float32(-0.05396825396825397))))), (cutlass.full_like(_th1, cutlass.Float32(1.0)) - cutlass.full_like(_th1, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_th1 * cutlass.full_like(_th1, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_th1, cutlass.Float32(1.0)), approx=True, ftz=True)))\n                                        _c_2_a = (_op_1).to(cutlass.Float32)\n                                        _op_2 = (cutlass.full_like(_c_2_a, _aux_gate_scale_pre.to(cutlass.Float32))) * _c_2_a\n                                        _c_3_a = (vec_f32).to(cutlass.Float32)\n                                        _op_3 = cute.math.rcp(cutlass.full_like(_c_3_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_3_a * cutlass.full_like(_c_3_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                        _c_4_a = (_op_2).to(cutlass.Float32)\n                                        _c_4_b = (_op_3).to(cutlass.Float32)\n                                        _op_4 = _c_4_a * _c_4_b\n                                        _c_5_a = (vec_f32_1).to(cutlass.Float32)\n                                        _op_5 = _c_5_a / (cutlass.full_like(_c_5_a, _aux_linear_scale_pre.to(cutlass.Float32)))\n                                        _c_6_a = (_op_5).to(cutlass.Float32)\n                                        _th6 = _c_6_a\n                                        _thq6 = _th6 * _th6\n                                        _op_6 = cutlass._mlir_helpers.vector.where(cute.math.abs(_th6) < cutlass.full_like(_th6, cutlass.Float32(0.125)), _th6 + _th6 * _thq6 * (cutlass.full_like(_thq6, cutlass.Float32(-0.3333333333333333)) + _thq6 * (cutlass.full_like(_thq6, cutlass.Float32(0.13333333333333333)) + _thq6 * (cutlass.full_like(_thq6, cutlass.Float32(-0.05396825396825397))))), (cutlass.full_like(_th6, cutlass.Float32(1.0)) - cutlass.full_like(_th6, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_th6 * cutlass.full_like(_th6, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_th6, cutlass.Float32(1.0)), approx=True, ftz=True)))\n                                        _c_7_a = (_op_6).to(cutlass.Float32)\n                                        _op_7 = (cutlass.full_like(_c_7_a, _aux_linear_scale_pre.to(cutlass.Float32))) * _c_7_a\n                                        _c_8_a = (_op_4).to(cutlass.Float32)\n                                        _c_8_b = (_op_7).to(cutlass.Float32)\n                                        _op_8 = _c_8_a * _c_8_b\n                                        _c_9_a = (_op_8).to(cutlass.Float32)\n                                        _op_9 = _c_9_a * (cutlass.full_like(_c_9_a, _aux_scale_pre.to(cutlass.Float32)))\n                                        _r_9 = (_op_9).to(cutlass.BFloat16)\n                                        _tap_0 = (_r_9).to(cutlass.BFloat16)\n",
     "56112e941b571de6": "    gate_scale: cute.Tensor,\n    linear_scale: cute.Tensor,\n",
+    "61e28c519656cc78": "                                        _op_0 = cute.math.min(_c_0_a, (cutlass.full_like(_c_0_a, _aux_swiglu_limit_pre.to(cutlass.Float32))))\n",
     "651d2fba69ef8f2a": "                                _op_0 = _c_0_a * (cutlass.full_like(_c_0_a, _aux_scale_pre.to(cutlass.Float32)))\n                                _r_0 = (_op_0).to(cutlass.BFloat16)\n                                _tap_0 = (_r_0).to(cutlass.BFloat16)\n",
     "665f4dbd94cb631b": "                                        _op_0 = _c_0_a * cute.math.rcp(cutlass.full_like(_c_0_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n",
     "6b03984131318a83": "                                        _g_x0 = _c_0_a\n                                        _g_inner0 = cutlass.full_like(_g_x0, cutlass.Float32(0.7978845608028654)) * (_g_x0 + cutlass.full_like(_g_x0, cutlass.Float32(0.044715)) * _g_x0 * _g_x0 * _g_x0)\n                                        _g_tanh0 = (cutlass.full_like(_g_inner0, cutlass.Float32(1.0)) - cutlass.full_like(_g_inner0, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_g_inner0 * cutlass.full_like(_g_inner0, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_g_inner0, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                        _op_0 = cutlass.full_like(_g_x0, cutlass.Float32(0.5)) * _g_x0 * (cutlass.full_like(_g_x0, cutlass.Float32(1.0)) + _g_tanh0)\n",
@@ -6620,7 +6658,7 @@
     "7aef8cb6adfbb711": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_a_tma_workspace, fake_token_index, fake_a_0, fake_b_0, fake_b_1, fake_c_tap_0, fake_gate_scale, fake_linear_scale, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
     "7bea654a536d6bf5": "                                _aux_gate_scale_ptr = gate_scale.iterator.raw_ptr()\n                                _aux_gate_scale_pre = (_aux_gate_scale_ptr + 0).load()\n                                _aux_linear_scale_ptr = linear_scale.iterator.raw_ptr()\n                                _aux_linear_scale_pre = (_aux_linear_scale_ptr + 0).load()\n",
     "87542e089a7bd42e": "                _aux_gate_scale_ptr = gate_scale.iterator.raw_ptr()\n                _aux_gate_scale_pre = (_aux_gate_scale_ptr + 0).load()\n                _aux_linear_scale_ptr = linear_scale.iterator.raw_ptr()\n                _aux_linear_scale_pre = (_aux_linear_scale_ptr + 0).load()\n",
-    "897db959e788d1d6": "                                        _op_1 = (cutlass.full_like(_c_1_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_1_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_1_a * cutlass.full_like(_c_1_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_1_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                        _c_2_a = (_op_1).to(cutlass.Float32)\n                                        _op_2 = (cutlass.full_like(_c_2_a, _aux_gate_scale_pre.to(cutlass.Float32))) * _c_2_a\n                                        _c_3_a = (vec_f32).to(cutlass.Float32)\n                                        _op_3 = cute.math.rcp(cutlass.full_like(_c_3_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_3_a * cutlass.full_like(_c_3_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                        _c_4_a = (_op_2).to(cutlass.Float32)\n                                        _c_4_b = (_op_3).to(cutlass.Float32)\n                                        _op_4 = _c_4_a * _c_4_b\n                                        _c_5_a = (vec_f32_1).to(cutlass.Float32)\n                                        _op_5 = _c_5_a / (cutlass.full_like(_c_5_a, _aux_linear_scale_pre.to(cutlass.Float32)))\n                                        _c_6_a = (_op_5).to(cutlass.Float32)\n                                        _op_6 = (cutlass.full_like(_c_6_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_6_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_6_a * cutlass.full_like(_c_6_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_6_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                        _c_7_a = (_op_6).to(cutlass.Float32)\n                                        _op_7 = (cutlass.full_like(_c_7_a, _aux_linear_scale_pre.to(cutlass.Float32))) * _c_7_a\n                                        _c_8_a = (_op_4).to(cutlass.Float32)\n                                        _c_8_b = (_op_7).to(cutlass.Float32)\n                                        _op_8 = _c_8_a * _c_8_b\n                                        _c_9_a = (_op_8).to(cutlass.Float32)\n                                        _op_9 = _c_9_a * (cutlass.full_like(_c_9_a, _aux_scale_pre.to(cutlass.Float32)))\n                                        _r_9 = (_op_9).to(cutlass.BFloat16)\n                                        _tap_0 = (_r_9).to(cutlass.BFloat16)\n",
+    "8ce67ce32c873698": "                                            _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_swiglu_alpha_pre.to(cutlass.Float32)))\n                                            _c_2_a = (_op_1).to(cutlass.Float32)\n                                            _op_2 = cute.math.rcp(cutlass.full_like(_c_2_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_2_a * cutlass.full_like(_c_2_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                            _c_3_a = (_op_0).to(cutlass.Float32)\n                                            _c_3_b = (_op_2).to(cutlass.Float32)\n                                            _op_3 = _c_3_a * _c_3_b\n                                            _c_4_a = (vec_f32_1).to(cutlass.Float32)\n                                            _op_4 = cute.math.min(_c_4_a, (cutlass.full_like(_c_4_a, _aux_swiglu_limit_pre.to(cutlass.Float32))))\n                                            _c_5_a = (_op_4).to(cutlass.Float32)\n                                            _op_5 = cute.math.max(_c_5_a, (cutlass.full_like(_c_5_a, _aux_swiglu_lower_pre.to(cutlass.Float32))))\n                                            _c_6_a = (_op_5).to(cutlass.Float32)\n                                            _op_6 = _c_6_a + (cutlass.full_like(_c_6_a, _aux_swiglu_beta_pre.to(cutlass.Float32)))\n                                            _c_7_a = (_op_3).to(cutlass.Float32)\n                                            _c_7_b = (_op_6).to(cutlass.Float32)\n                                            _op_7 = _c_7_a * _c_7_b\n                                            _c_8_a = (_op_7).to(cutlass.Float32)\n                                            _op_8 = _c_8_a * (cutlass.full_like(_c_8_a, _aux_scale_pre.to(cutlass.Float32)))\n                                            _r_8 = (_op_8).to(cutlass.BFloat16)\n                                            _tap_0 = (_r_8).to(cutlass.BFloat16)\n",
     "8ee3a1f20e3f0fef": "                                        _e_x0 = _c_0_a\n                                        _e_erf0 = cute.math.erf(_e_x0 * cutlass.full_like(_e_x0, cutlass.Float32(0.7071067811865475)))\n                                        _op_0 = cutlass.full_like(_e_x0, cutlass.Float32(0.5)) * _e_x0 * (cutlass.full_like(_e_x0, cutlass.Float32(1.0)) + _e_erf0)\n",
     "9a54610c2bff7920": "                                            _e_x0 = _c_0_a\n                                            _e_erf0 = cute.math.erf(_e_x0 * cutlass.full_like(_e_x0, cutlass.Float32(0.7071067811865475)))\n                                            _op_0 = cutlass.full_like(_e_x0, cutlass.Float32(0.5)) * _e_x0 * (cutlass.full_like(_e_x0, cutlass.Float32(1.0)) + _e_erf0)\n",
     "9ca6c91821d8f7c2": "                                        _op_0 = _c_0_a * cute.math.rcp(cutlass.full_like(_c_0_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                        _c_1_a = (_op_0).to(cutlass.Float32)\n                                        _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))\n                                        _r_1 = (_op_1).to(cutlass.BFloat16)\n                                        _tap_0 = (_r_1).to(cutlass.BFloat16)\n",
@@ -6628,19 +6666,26 @@
     "b1038e2dba7c4f07": "                                            _op_0 = _c_0_a * cute.math.rcp(cutlass.full_like(_c_0_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                                            _c_1_a = (_op_0).to(cutlass.Float32)\n                                            _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))\n                                            _r_1 = (_op_1).to(cutlass.BFloat16)\n                                            _tap_0 = (_r_1).to(cutlass.BFloat16)\n",
     "b130121bf40c4def": "                                            _g_x0 = _c_0_a\n                                            _g_inner0 = cutlass.full_like(_g_x0, cutlass.Float32(0.7978845608028654)) * (_g_x0 + cutlass.full_like(_g_x0, cutlass.Float32(0.044715)) * _g_x0 * _g_x0 * _g_x0)\n                                            _g_tanh0 = (cutlass.full_like(_g_inner0, cutlass.Float32(1.0)) - cutlass.full_like(_g_inner0, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_g_inner0 * cutlass.full_like(_g_inner0, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_g_inner0, cutlass.Float32(1.0)), approx=True, ftz=True))\n                                            _op_0 = cutlass.full_like(_g_x0, cutlass.Float32(0.5)) * _g_x0 * (cutlass.full_like(_g_x0, cutlass.Float32(1.0)) + _g_tanh0)\n",
     "b1e4ded98b0b6add": "                                _op_0 = cute.math.max(_c_0_a, cutlass.full_like(_c_0_a, cutlass.Float32(0.0)), propagate_nan=True)\n                                _c_1_a = (_op_0).to(cutlass.Float32)\n                                _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))\n                                _r_1 = (_op_1).to(cutlass.BFloat16)\n                                _tap_0 = (_r_1).to(cutlass.BFloat16)\n",
+    "b8cedbdf6cc2fc79": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_a_tma_workspace, fake_a_0, fake_b_0, fake_b_1, fake_c_tap_0, fake_swiglu_limit, fake_swiglu_alpha, fake_swiglu_lower, fake_swiglu_beta, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
+    "b932e17e4b585343": "        swiglu_limit,\n        swiglu_alpha,\n        swiglu_lower,\n        swiglu_beta,\n",
     "b9ea48e8214972b2": "                                            _op_0 = cute.math.max(_c_0_a, cutlass.full_like(_c_0_a, cutlass.Float32(0.0)), propagate_nan=True)\n                                            _c_1_a = (_op_0).to(cutlass.Float32)\n                                            _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))\n                                            _r_1 = (_op_1).to(cutlass.BFloat16)\n                                            _tap_0 = (_r_1).to(cutlass.BFloat16)\n",
     "bf848eb4a38a4cb4": "                    _op_1 = (cutlass.full_like(_c_1_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_1_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_1_a * cutlass.full_like(_c_1_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_1_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                    _c_2_a = (_op_1).to(cutlass.Float32)\n                    _op_2 = (cutlass.full_like(_c_2_a, _aux_gate_scale_pre.to(cutlass.Float32))) * _c_2_a\n                    _c_3_a = (vec_f32).to(cutlass.Float32)\n                    _op_3 = cute.math.rcp(cutlass.full_like(_c_3_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_3_a * cutlass.full_like(_c_3_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n                    _c_4_a = (_op_2).to(cutlass.Float32)\n                    _c_4_b = (_op_3).to(cutlass.Float32)\n                    _op_4 = _c_4_a * _c_4_b\n                    _c_5_a = (vec_f32_1).to(cutlass.Float32)\n                    _op_5 = _c_5_a / (cutlass.full_like(_c_5_a, _aux_linear_scale_pre.to(cutlass.Float32)))\n                    _c_6_a = (_op_5).to(cutlass.Float32)\n                    _op_6 = (cutlass.full_like(_c_6_a, cutlass.Float32(1.0)) - cutlass.full_like(_c_6_a, cutlass.Float32(2.0)) * cute.math.rcp(cute.math.exp2(_c_6_a * cutlass.full_like(_c_6_a, cutlass.Float32(2.8853900817779268)), fastmath=True) + cutlass.full_like(_c_6_a, cutlass.Float32(1.0)), approx=True, ftz=True))\n                    _c_7_a = (_op_6).to(cutlass.Float32)\n                    _op_7 = (cutlass.full_like(_c_7_a, _aux_linear_scale_pre.to(cutlass.Float32))) * _c_7_a\n                    _c_8_a = (_op_4).to(cutlass.Float32)\n                    _c_8_b = (_op_7).to(cutlass.Float32)\n                    _op_8 = _c_8_a * _c_8_b\n                    _c_9_a = (_op_8).to(cutlass.Float32)\n                    _op_9 = _c_9_a * (cutlass.full_like(_c_9_a, _aux_scale_pre.to(cutlass.Float32)))\n                    _r_9 = (_op_9).to(cutlass.BFloat16)\n                    vec_out = (_r_9).to(cutlass.BFloat16)\n",
     "c19027e18fa4927f": "                                _e_x0 = _c_0_a\n                                _e_erf0 = cute.math.erf(_e_x0 * cutlass.full_like(_e_x0, cutlass.Float32(0.7071067811865475)))\n                                _op_0 = cutlass.full_like(_e_x0, cutlass.Float32(0.5)) * _e_x0 * (cutlass.full_like(_e_x0, cutlass.Float32(1.0)) + _e_erf0)\n                                _c_1_a = (_op_0).to(cutlass.Float32)\n                                _op_1 = _c_1_a * (cutlass.full_like(_c_1_a, _aux_scale_pre.to(cutlass.Float32)))\n                                _r_1 = (_op_1).to(cutlass.BFloat16)\n                                _tap_0 = (_r_1).to(cutlass.BFloat16)\n",
     "c1fcf91531de08a1": "                                _op_0 = cute.math.max(_c_0_a, cutlass.full_like(_c_0_a, cutlass.Float32(0.0)), propagate_nan=True)\n                                _c_1_a = (_op_0).to(cutlass.Float32)\n                                _c_1_b = (_op_0).to(cutlass.Float32)\n                                _op_1 = _c_1_a * _c_1_b\n                                _c_2_a = (_op_1).to(cutlass.Float32)\n                                _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))\n                                _r_2 = (_op_2).to(cutlass.BFloat16)\n                                _tap_0 = (_r_2).to(cutlass.BFloat16)\n",
+    "c2851a158d6a0bb3": "                                            _op_0 = cute.math.min(_c_0_a, (cutlass.full_like(_c_0_a, _aux_swiglu_limit_pre.to(cutlass.Float32))))\n",
     "c8882d1b1215864f": "                    _op_0 = cute.math.max(_c_0_a, cutlass.full_like(_c_0_a, cutlass.Float32(0.0)), propagate_nan=True)\n                    _c_1_a = (_op_0).to(cutlass.Float32)\n                    _c_1_b = (_op_0).to(cutlass.Float32)\n                    _op_1 = _c_1_a * _c_1_b\n                    _c_2_a = (_op_1).to(cutlass.Float32)\n                    _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))\n                    _r_2 = (_op_2).to(cutlass.BFloat16)\n                    vec_out = (_r_2).to(cutlass.BFloat16)\n",
     "d0bf38bdc7f3c829": "                                _c_1_b = (vec_f32_1).to(cutlass.Float32)\n                                _op_1 = _c_1_a * _c_1_b\n                                _c_2_a = (_op_1).to(cutlass.Float32)\n                                _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))\n                                _r_2 = (_op_2).to(cutlass.BFloat16)\n                                _tap_0 = (_r_2).to(cutlass.BFloat16)\n",
+    "d5f025c6d2c92c97": "                                    _aux_swiglu_limit_ptr = swiglu_limit.iterator.raw_ptr()\n                                    _aux_swiglu_limit_pre = (_aux_swiglu_limit_ptr + 0).load()\n                                    _aux_swiglu_alpha_ptr = swiglu_alpha.iterator.raw_ptr()\n                                    _aux_swiglu_alpha_pre = (_aux_swiglu_alpha_ptr + 0).load()\n                                    _aux_swiglu_lower_ptr = swiglu_lower.iterator.raw_ptr()\n                                    _aux_swiglu_lower_pre = (_aux_swiglu_lower_ptr + 0).load()\n                                    _aux_swiglu_beta_ptr = swiglu_beta.iterator.raw_ptr()\n                                    _aux_swiglu_beta_pre = (_aux_swiglu_beta_ptr + 0).load()\n",
     "d749578072d1c69f": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_a_0, fake_a_1, fake_b_0, fake_c_tap_0, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
     "d74c1b876c2737f8": "    fake_gate_scale = cute.runtime.make_fake_tensor(cutlass.Float32, (1, 1, 1), stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()), assumed_align=4)\n    fake_linear_scale = cute.runtime.make_fake_tensor(cutlass.Float32, (1, 1, 1), stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()), assumed_align=4)\n",
     "da102211af750a6d": "                                            _op_0 = _c_0_a * (cutlass.full_like(_c_0_a, _aux_scale_pre.to(cutlass.Float32)))\n                                            _r_0 = (_op_0).to(cutlass.BFloat16)\n                                            _tap_0 = (_r_0).to(cutlass.BFloat16)\n",
+    "dc101805d6303043": "                                _aux_swiglu_limit_ptr = swiglu_limit.iterator.raw_ptr()\n                                _aux_swiglu_limit_pre = (_aux_swiglu_limit_ptr + 0).load()\n                                _aux_swiglu_alpha_ptr = swiglu_alpha.iterator.raw_ptr()\n                                _aux_swiglu_alpha_pre = (_aux_swiglu_alpha_ptr + 0).load()\n                                _aux_swiglu_lower_ptr = swiglu_lower.iterator.raw_ptr()\n                                _aux_swiglu_lower_pre = (_aux_swiglu_lower_ptr + 0).load()\n                                _aux_swiglu_beta_ptr = swiglu_beta.iterator.raw_ptr()\n                                _aux_swiglu_beta_pre = (_aux_swiglu_beta_ptr + 0).load()\n",
     "dc63a189abb0282b": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_token_index, fake_a_0, fake_a_1, fake_b_0, fake_c_tap_0, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
     "de009f30c7784f96": "                                            _op_0 = cute.math.max(_c_0_a, cutlass.full_like(_c_0_a, cutlass.Float32(0.0)), propagate_nan=True)\n                                            _c_1_a = (_op_0).to(cutlass.Float32)\n                                            _c_1_b = (_op_0).to(cutlass.Float32)\n                                            _op_1 = _c_1_a * _c_1_b\n                                            _c_2_a = (_op_1).to(cutlass.Float32)\n                                            _op_2 = _c_2_a * (cutlass.full_like(_c_2_a, _aux_scale_pre.to(cutlass.Float32)))\n                                            _r_2 = (_op_2).to(cutlass.BFloat16)\n                                            _tap_0 = (_r_2).to(cutlass.BFloat16)\n",
+    "de25376457a0ccc7": "    return cute.compile(_host, problem_size, fake_first_token_offset, fake_tma_workspace, fake_a_0, fake_a_1, fake_b_0, fake_c_tap_0, fake_swiglu_limit, fake_swiglu_alpha, fake_swiglu_lower, fake_swiglu_beta, fake_scale, stream=_fake_stream, options=frost_compile_options)\n",
     "e17d1851605245f0": "                                _r1 = _c_1_a\n                                _rk1 = cute.math.max(_r1, cutlass.full_like(_r1, cutlass.Float32(0.0)), propagate_nan=True) + cutlass.full_like(_r1, cutlass.Float32(1.0)) * cute.math.min(_r1, cutlass.full_like(_r1, cutlass.Float32(0.0)), propagate_nan=True)\n                                _ru1 = cute.math.min(_rk1, cutlass.full_like(_r1, cutlass.Float32(7.0)), propagate_nan=True)\n                                _op_1 = _ru1\n                                _c_2_a = (vec_f32_1).to(cutlass.Float32)\n                                _r2 = _c_2_a\n                                _rl2 = cute.math.max(_r2, cutlass.full_like(_r2, cutlass.Float32(-7.0)), propagate_nan=True)\n                                _ru2 = cute.math.min(_rl2, cutlass.full_like(_r2, cutlass.Float32(7.0)), propagate_nan=True)\n                                _op_2 = _ru2\n                                _c_3_a = (_op_1).to(cutlass.Float32)\n                                _c_3_b = (_op_2).to(cutlass.Float32)\n                                _op_3 = _c_3_a * _c_3_b\n                                _c_4_a = (_op_3).to(cutlass.Float32)\n                                _op_4 = _c_4_a * (cutlass.full_like(_c_4_a, _aux_scale_pre.to(cutlass.Float32)))\n                                _r_4 = (_op_4).to(cutlass.BFloat16)\n                                _tap_0 = (_r_4).to(cutlass.BFloat16)\n",
     "e3b0c44298fc1c14": "",
+    "e75461c9caab2535": "    fake_swiglu_limit = cute.runtime.make_fake_tensor(cutlass.Float32, (1, 1, 1), stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()), assumed_align=4)\n    fake_swiglu_alpha = cute.runtime.make_fake_tensor(cutlass.Float32, (1, 1, 1), stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()), assumed_align=4)\n    fake_swiglu_lower = cute.runtime.make_fake_tensor(cutlass.Float32, (1, 1, 1), stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()), assumed_align=4)\n    fake_swiglu_beta = cute.runtime.make_fake_tensor(cutlass.Float32, (1, 1, 1), stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()), assumed_align=4)\n",
     "e82fa158517f70a0": "                                        _r1 = _c_1_a\n                                        _rk1 = cute.math.max(_r1, cutlass.full_like(_r1, cutlass.Float32(0.0)), propagate_nan=True) + cutlass.full_like(_r1, cutlass.Float32(1.0)) * cute.math.min(_r1, cutlass.full_like(_r1, cutlass.Float32(0.0)), propagate_nan=True)\n                                        _ru1 = cute.math.min(_rk1, cutlass.full_like(_r1, cutlass.Float32(7.0)), propagate_nan=True)\n                                        _op_1 = _ru1\n                                        _c_2_a = (vec_f32_1).to(cutlass.Float32)\n                                        _r2 = _c_2_a\n                                        _rl2 = cute.math.max(_r2, cutlass.full_like(_r2, cutlass.Float32(-7.0)), propagate_nan=True)\n                                        _ru2 = cute.math.min(_rl2, cutlass.full_like(_r2, cutlass.Float32(7.0)), propagate_nan=True)\n                                        _op_2 = _ru2\n                                        _c_3_a = (_op_1).to(cutlass.Float32)\n                                        _c_3_b = (_op_2).to(cutlass.Float32)\n                                        _op_3 = _c_3_a * _c_3_b\n                                        _c_4_a = (_op_3).to(cutlass.Float32)\n                                        _op_4 = _c_4_a * (cutlass.full_like(_c_4_a, _aux_scale_pre.to(cutlass.Float32)))\n                                        _r_4 = (_op_4).to(cutlass.BFloat16)\n                                        _tap_0 = (_r_4).to(cutlass.BFloat16)\n",
     "eb00231ff480d1e5": "                                    _aux_gate_scale_ptr = gate_scale.iterator.raw_ptr()\n                                    _aux_gate_scale_pre = (_aux_gate_scale_ptr + 0).load()\n                                    _aux_linear_scale_ptr = linear_scale.iterator.raw_ptr()\n                                    _aux_linear_scale_pre = (_aux_linear_scale_ptr + 0).load()\n",
     "eb71869b46342011": "                    _op_0 = _c_0_a * cute.math.rcp(cutlass.full_like(_c_0_a, cutlass.Float32(1.0)) + cute.math.exp2(-_c_0_a * cutlass.full_like(_c_0_a, cutlass.Float32(1.4426950408889634)), fastmath=True), approx=True, ftz=True)\n",
@@ -7443,7 +7488,8 @@
   "producer": {
     "name": "cudnn_frost",
     "revisions": [
-      "0d72d59efd21401c7e13d606584fef2544e45934"
+      "0d72d59efd21401c7e13d606584fef2544e45934",
+      "886d7176dbe724a05f0c3955c0a87abb326afd59"
     ]
   },
   "schema_version": 4,

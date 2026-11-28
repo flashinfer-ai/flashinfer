@@ -13,8 +13,13 @@ def weight_view(weights, backend_key, canonical_key):
     return weights.get_view(key)
 
 
-def moe_geometry(config, act, *, hidden_size=None):
-    """Cheap native-plan bounds; artifact contracts are checked by the runner."""
+def moe_geometry(config, act, *, hidden_size=None, multiple=128):
+    """Cheap native-plan bounds; artifact contracts are checked by the runner.
+
+    ``multiple`` is the H/I granularity the dtype's weight layouts and kernels
+    need (128 unless a caller knows its layout and every packaged kernel accept
+    less, e.g. SM120 BF16).
+    """
     t = act.num_tokens
     h = act.hidden_states_q.shape[1] if hidden_size is None else hidden_size
     i = config.experts.intermediate_size
@@ -25,6 +30,6 @@ def moe_geometry(config, act, *, hidden_size=None):
         and t * k < 2**31 - 128 * e
         and 0 < h <= 1 << 20
         and 0 < i <= 1 << 20
-        and h % 128 == 0
-        and i % 128 == 0
+        and h % multiple == 0
+        and i % multiple == 0
     )

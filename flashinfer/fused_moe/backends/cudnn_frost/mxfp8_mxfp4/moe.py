@@ -17,7 +17,12 @@ from .....fused_moe.api import QuantFormat, RoutingInputMode
 from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from .....utils import get_compute_capability
 from .. import runtime as common
-from ..activations import ACTIVATIONS, activation_name
+from ..activations import (
+    ACTIVATIONS,
+    DEFAULT_LAUNCH_SCALARS,
+    activation_name,
+    launch_scalars,
+)
 from ..support import SUPPORTED_ARCHS, weight_view
 from .support import is_eligible
 from ..compiler import require_moe_assembler
@@ -226,6 +231,7 @@ class _Plans:
         swizzled=False,
         fma_tactic=None,
         validate_fma_sources=None,
+        scalars=DEFAULT_LAUNCH_SCALARS,
     ):
         self.plans, self.launches = {}, {}
         first = tuple(common.bind_kernel(k, device) for k in first)
@@ -235,7 +241,7 @@ class _Plans:
         module = _module(common._arch_for(device))
         for a, b in product(first, second):
             key = (_TAG, a.tactic, b.tactic)
-            executor_key = (hidden, intermediate, experts, topk, swizzled, key)
+            executor_key = (hidden, intermediate, experts, topk, swizzled, scalars, key)
             plan = executor_cache.get(executor_key)
             if plan is None:
                 factory = (
@@ -258,13 +264,22 @@ class _Plans:
                     b.swap_ab,
                     swizzled,
                     False,
+                    *scalars,
                 )
                 executor_cache[executor_key] = plan
             # Packed states retain Modules whose run Functions borrow them.
             self.plans[key], self.launches[key] = plan, plan["run"]
             required = max(required, plan["workspace_size"](tokens))
         if fma_tactic is not None:
-            executor_key = (hidden, intermediate, experts, topk, swizzled, fma_tactic)
+            executor_key = (
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                swizzled,
+                scalars,
+                fma_tactic,
+            )
             plan = executor_cache.get(executor_key)
             if plan is None:
                 if validate_fma_sources is not None:
@@ -302,6 +317,7 @@ class _Plans:
                     False,
                     swizzled,
                     True,
+                    *scalars,
                 )
                 if validate_fma_sources is not None:
                     validate_fma_sources()
@@ -427,6 +443,16 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(FrostRunnerMixin, MoERunner):
                 }
             )
         )
+        if not any(
+            kernel.fc1 and kernel.arch == arch and kernel.activation == name
+            for root in _artifact_roots()
+            for kernel in runtime.discover(root)
+        ):
+            # E.g. swiglu_param, whose scalar-parameterized sources are packaged
+            # for SM120 only.
+            raise NotImplementedError(
+                f"cuDNN Frost MXFP8 × MXFP4 MoE has no {name} kernels for {arch}"
+            )
         require_graph_resource_retention()
         # Only the SM107 sources patch tensor maps and need the assembler floor.
         if arch == "sm_107a":
@@ -462,6 +488,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(FrostRunnerMixin, MoERunner):
                 swizzled,
                 metadata.fma_tactic,
                 metadata.validate_fma_sources,
+                launch_scalars(activation),
             ),
         )
         self._plans = self._engine.plans
