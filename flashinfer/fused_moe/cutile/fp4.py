@@ -1162,6 +1162,7 @@ def _grouped_gemm_w4a16_impl(
     DECODE_TO_BF16: ConstBool,
     SHARDED_GLOBAL_SCALE: ConstBool,
     USE_INT64: ConstBool,
+    PERSISTENT: ConstBool,
 ):
     initial_m_block = ct.bid(0)
     n_block = ct.bid(1)
@@ -1174,7 +1175,11 @@ def _grouped_gemm_w4a16_impl(
     n_offsets = n_block * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
     num_k_tiles = (K_IN + TILE_K - 1) // TILE_K
     groups_per_tile = TILE_K // SCALE_BLOCK_SIZE
-    for iteration in range(num_iterations):
+    # Only the persistent grid gives a CTA several M blocks. Otherwise the grid
+    # covers every live block, and the loop is compiled out: tileiras 13.4
+    # ignores the occupancy hint on sm_120 when the gathers sit in a loop with
+    # a runtime trip count.
+    for iteration in range(num_iterations if PERSISTENT else 1):
         m_block = initial_m_block + iteration * grid_m
         if m_block * TILE_M < num_post_pad:
             m_offsets = m_block * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
@@ -1306,6 +1311,7 @@ def _grouped_gemm_w4a16(
     USE_NATIVE_FP4: ConstBool,
     DECODE_TO_BF16: ConstBool,
     SHARDED_GLOBAL_SCALE: ConstBool,
+    PERSISTENT: ConstBool,
 ):
     _grouped_gemm_w4a16_impl(
         X,
@@ -1334,6 +1340,7 @@ def _grouped_gemm_w4a16(
         DECODE_TO_BF16,
         SHARDED_GLOBAL_SCALE,
         False,
+        PERSISTENT,
     )
 
 
@@ -1364,6 +1371,7 @@ def _grouped_gemm_w4a16_i64(
     USE_NATIVE_FP4: ConstBool,
     DECODE_TO_BF16: ConstBool,
     SHARDED_GLOBAL_SCALE: ConstBool,
+    PERSISTENT: ConstBool,
 ):
     _grouped_gemm_w4a16_impl(
         X,
@@ -1392,6 +1400,7 @@ def _grouped_gemm_w4a16_i64(
         DECODE_TO_BF16,
         SHARDED_GLOBAL_SCALE,
         True,
+        PERSISTENT,
     )
 
 
@@ -1423,6 +1432,7 @@ def _grouped_gemm_w4a4_impl(
     INPUT_SORTED: ConstBool,
     OUTPUT_SORTED: ConstBool,
     USE_INT64: ConstBool,
+    PERSISTENT: ConstBool,
 ):
     initial_m_block = ct.bid(0)
     n_block = ct.bid(1)
@@ -1433,7 +1443,11 @@ def _grouped_gemm_w4a4_impl(
     num_iterations = (num_live_blocks - initial_m_block + grid_m - 1) // grid_m
     n_offsets = n_block * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
     num_k_tiles = (K_IN + TILE_K - 1) // TILE_K
-    for iteration in range(num_iterations):
+    # Only the persistent grid gives a CTA several M blocks. Otherwise the grid
+    # covers every live block, and the loop is compiled out: tileiras 13.4
+    # ignores the occupancy hint on sm_120 when the gathers sit in a loop with
+    # a runtime trip count.
+    for iteration in range(num_iterations if PERSISTENT else 1):
         m_block = initial_m_block + iteration * grid_m
         if m_block * TILE_M < num_post_pad:
             m_offsets = m_block * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
@@ -1549,6 +1563,7 @@ def _grouped_gemm_w4a4(
     SHARDED_GLOBAL_SCALE: ConstBool,
     INPUT_SORTED: ConstBool,
     OUTPUT_SORTED: ConstBool,
+    PERSISTENT: ConstBool,
 ):
     _grouped_gemm_w4a4_impl(
         X,
@@ -1577,6 +1592,7 @@ def _grouped_gemm_w4a4(
         INPUT_SORTED,
         OUTPUT_SORTED,
         False,
+        PERSISTENT,
     )
 
 
@@ -1607,6 +1623,7 @@ def _grouped_gemm_w4a4_i64(
     SHARDED_GLOBAL_SCALE: ConstBool,
     INPUT_SORTED: ConstBool,
     OUTPUT_SORTED: ConstBool,
+    PERSISTENT: ConstBool,
 ):
     _grouped_gemm_w4a4_impl(
         X,
@@ -1635,6 +1652,7 @@ def _grouped_gemm_w4a4_i64(
         INPUT_SORTED,
         OUTPUT_SORTED,
         True,
+        PERSISTENT,
     )
 
 
@@ -2037,7 +2055,10 @@ def _grouped_gemm(
         raise ValueError(
             f"GEMM output size {n} is not divisible by {global_scale_shards} global-scale shards."
         )
-    if k <= _PERSISTENT_MAX_K and num_assignment_rows >= _PERSISTENT_MIN_ASSIGNMENTS:
+    persistent = (
+        k <= _PERSISTENT_MAX_K and num_assignment_rows >= _PERSISTENT_MIN_ASSIGNMENTS
+    )
+    if persistent:
         n_blocks = (n + config.tile_n - 1) // config.tile_n
         grid_m = _persistent_grid_m(x, grid_m, n_blocks)
     launch_args: tuple[object, ...] = (
@@ -2093,6 +2114,7 @@ def _grouped_gemm(
         weight_global_scale.ndim == 2,
         input_sorted,
         output_sorted,
+        persistent,
     )
     ct.launch(
         torch.cuda.current_stream(x.device),
@@ -2142,7 +2164,10 @@ def _grouped_gemm_w4a16_launch(
             f"GEMM output size {n} is not divisible by {global_scale_shards} "
             "global-scale shards."
         )
-    if k <= _PERSISTENT_MAX_K and num_assignment_rows >= _PERSISTENT_MIN_ASSIGNMENTS:
+    persistent = (
+        k <= _PERSISTENT_MAX_K and num_assignment_rows >= _PERSISTENT_MIN_ASSIGNMENTS
+    )
+    if persistent:
         n_blocks = (n + config.tile_n - 1) // config.tile_n
         grid_m = _persistent_grid_m(x, grid_m, n_blocks)
 
@@ -2191,6 +2216,7 @@ def _grouped_gemm_w4a16_launch(
             use_native_fp4,
             decode_to_bf16,
             weight_global_scale.ndim == 2,
+            persistent,
         ),
     )
 
