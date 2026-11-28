@@ -18,8 +18,11 @@ is the random baseline.
 
 Columns:
 
-    us          median GPU time of gemv_bf16_fp4_gather (L2 flushed per iter)
-    torch us    gather + dequantize to bf16 + bmm + scatter_ in PyTorch
+    us          median time of gemv_bf16_fp4_gather, L2 flushed per iter;
+                CUDA events by default (includes launch overhead), kernel
+                time only with --cupti
+    torch us    gather + dequantize to bf16 + bmm + scatter_ in PyTorch,
+                timed the same way
     GB/s        M * J * (K/2 + K/16) bytes of rows requested / t
     max rel     max |kernel - fp32 reference| / max |reference|
 
