@@ -29,7 +29,11 @@ from ..shared_expert import (
     validate_shared_inputs,
 )
 from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, Sm107Mxfp8Kind
-from .staging import stage_mega_moe_inputs, validate_sm107_forward_inputs
+from .staging import (
+    stage_mega_moe_inputs,
+    try_stage_mxfp4_with_shared,
+    validate_sm107_forward_inputs,
+)
 from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
@@ -363,9 +367,17 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         BF16 inputs may fuse validation with quantization; prequantized inputs
         are validated before copying their payload and logical scale columns.
         """
-        stage_shared_inputs(t, workspace, quantize_input=quantize_input)
         if self._kernel_config.knobs == "auto":
             workspace._tuning_inputs = (t, quantize_input)
+        if (
+            quantize_input
+            and self._kernel_config.kind == "mxfp4"
+            and not self._kernel_config.batch_invariant
+            and try_stage_mxfp4_with_shared(t, workspace)
+        ):
+            workspace.note_staged_tokens(t.num_tokens)
+            return
+        stage_shared_inputs(t, workspace, quantize_input=quantize_input)
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
