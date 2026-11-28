@@ -61,7 +61,10 @@ using tvm::ffi::TensorView;
 
 namespace {
 
-constexpr int kExpectedNcclVersion = 23007;  // NCCL 2.30.7 (Device API: LSA + GIN)
+constexpr int kExpectedNcclVersion =
+    NCCL_VERSION_CODE;  // the headers this binding is compiled against
+static_assert(NCCL_VERSION_CODE >= 23007,
+              "Cake SM120 MegaMoE needs NCCL 2.30.7 or newer (Device API: LSA + GIN)");
 constexpr int64_t kTensorMapBytes = 128;
 
 inline void CheckCuda(cudaError_t status, const char* operation) {
@@ -160,8 +163,8 @@ class TransportSession {
     int runtime_version = 0;
     CheckNccl(ncclGetVersion(&runtime_version), "ncclGetVersion");
     TVM_FFI_ICHECK(runtime_version == kExpectedNcclVersion)
-        << "Cake SM120 MegaMoE requires NCCL 2.30.7 (" << kExpectedNcclVersion << "), observed "
-        << runtime_version;
+        << "Cake SM120 MegaMoE was built against NCCL " << kExpectedNcclVersion
+        << ", the loaded library is " << runtime_version;
     nccl_version_ = runtime_version;
 
     int current_device = -1;

@@ -1303,9 +1303,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 f"{KERNEL_NAME}: the EP process group is not a ProcessGroupNCCL exposing _comm_ptr"
             )
         version = tuple(int(v) for v in backend.get_runtime_nccl_version())
-        if version != (2, 30, 7):
+        if version < (2, 30, 7):
             raise RuntimeError(
-                f"{KERNEL_NAME} requires NCCL 2.30.7, torch loaded {version}"
+                f"{KERNEL_NAME} requires NCCL 2.30.7 or newer, torch loaded {version}"
             )
         pointer = int(backend._comm_ptr())
         if pointer <= 0:

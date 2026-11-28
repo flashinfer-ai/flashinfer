@@ -349,10 +349,20 @@ def gen_megamoe_sm90_mxfp4_module(
 
 
 def _sm120_nccl():
-    # NCCL 2.30.7 headers + library (the Device API GIN), located as for the moe_ep cake backend
+    # NCCL headers + library (the Device API GIN), located as for the moe_ep cake backend
     from flashinfer.moe_ep.shims.sm120.cake_mxfp4.cake_jit import nccl_installation
 
     return nccl_installation()
+
+
+def _sm120_nccl_uri_suffix() -> str:
+    # Modules that compile NCCL's Device API or link libnccl are built per NCCL, so a shared JIT cache rebuilds them
+    # when the process loads another NCCL.
+    import hashlib
+
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4.cake_jit import nccl_identity
+
+    return "_nccl" + hashlib.sha256(str(nccl_identity()).encode()).hexdigest()[:12]
 
 
 def gen_megamoe_sm120_mxfp4_module(
@@ -367,18 +377,23 @@ def gen_megamoe_sm120_mxfp4_module(
     ldflags: list[str] = []
     includes: list[str | Path] = [csrc, jit_env.FLASHINFER_CSRC_DIR]
     if gin_type is not None:
-        from flashinfer.moe_ep.shims.sm120.cake_mxfp4.cake_jit import GIN_BACKENDS
+        from flashinfer.moe_ep.shims.sm120.cake_mxfp4.cake_jit import (
+            GIN_BACKENDS,
+            nccl_check_header,
+        )
 
         names = {t: (name, flags) for name, (t, flags) in GIN_BACKENDS.items()}
         if gin_type not in names:
             raise ValueError(f"unsupported NCCL GIN type {gin_type}")
         backend, backend_flags = names[gin_type]
         include, library = _sm120_nccl()
-        uri += f"_gin_{backend}"
+        uri += f"_gin_{backend}" + _sm120_nccl_uri_suffix()
         cflags += [
             "-DFLASHINFER_MEGAMOE_SM120_GIN=1",
             "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE",
             *backend_flags,
+            "-include",
+            str(nccl_check_header()),
         ]
         ldflags = [str(library), f"-Wl,-rpath,{library.parent}"]
         includes.append(include)
@@ -400,7 +415,7 @@ def gen_megamoe_sm120_mxfp4_module(
 def gen_megamoe_sm120_gin_session_module() -> JitSpec:
     """SM120 MegaMoE NIC transport session: NCCL window, LSA peer pointers, device communicator."""
     include, library = _sm120_nccl()
-    uri = "megamoe_sm120_gin_session"
+    uri = "megamoe_sm120_gin_session" + _sm120_nccl_uri_suffix()
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / "megamoe_sm120_gin_session.cu"
