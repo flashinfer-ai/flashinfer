@@ -234,12 +234,17 @@ rmsnorm_trace = TraceTemplate(
 
 @torch.no_grad()
 def _fused_add_rmsnorm_reference(hidden_states, residual, weight):
-    """Fused Add + RMSNorm. Epsilon is fixed at 1e-6."""
+    """Fused Add + RMSNorm. Epsilon is fixed at 1e-6.
+
+    ``residual' = hidden_states + residual``
+    ``output = rmsnorm(residual', weight)``
+    Returns ``(output, residual')``, matching the declared outputs.
+    """
     EPS = 1e-6
     x = hidden_states.to(torch.float32) + residual.to(torch.float32)
     inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
     y = (x * inv_rms) * weight.to(torch.float32)
-    return y.to(hidden_states.dtype)
+    return y.to(hidden_states.dtype), x.to(hidden_states.dtype)
 
 
 def _fused_add_rmsnorm_init(
@@ -757,11 +762,17 @@ gemma_rmsnorm_trace = TraceTemplate(
 
 @torch.no_grad()
 def _gemma_fused_add_rmsnorm_reference(input, residual, weight):
-    """Gemma-style Fused Add + RMSNorm."""
+    """Gemma-style Fused Add + RMSNorm.
+
+    ``residual' = input + residual``
+    ``output = gemma_rmsnorm(residual', weight)``
+    Returns ``(output, residual')``, matching the declared outputs.
+    """
     EPS = 1e-6
     x = input.to(torch.float32) + residual.to(torch.float32)
     inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
-    return (x * inv_rms * (weight.to(torch.float32) + 1)).to(input.dtype)
+    y = x * inv_rms * (weight.to(torch.float32) + 1)
+    return y.to(input.dtype), x.to(input.dtype)
 
 
 def _gemma_fused_add_rmsnorm_init(

@@ -17,8 +17,8 @@ def test_fused_add_rmsnorm_reference_correctness(shape_kwargs):
     """flashinfer.fused_add_rmsnorm kernel vs reference.
 
     The kernel mutates input (→ norm output) and residual (→ residual + input).
-    The trace reference returns the normalized output only; we compare that
-    against the mutated input and verify the residual update by hand.
+    The trace reference returns both declared outputs as ``(output, residual)``;
+    we compare them against the mutated input and residual buffers.
     """
     import flashinfer
     from flashinfer.trace.templates.norm import fused_add_rmsnorm_trace
@@ -29,11 +29,13 @@ def test_fused_add_rmsnorm_reference_correctness(shape_kwargs):
     x_api = inputs["input"].clone()
     res_api = inputs["residual"].clone()
     flashinfer.fused_add_rmsnorm(x_api, res_api, inputs["weight"], eps=1e-6)
-    ref_norm = fused_add_rmsnorm_trace.reference(x_orig, res_orig, inputs["weight"])
-    _assert_finite(x_api, res_api, ref_norm)
+    ref_norm, ref_residual = fused_add_rmsnorm_trace.reference(
+        x_orig, res_orig, inputs["weight"]
+    )
+    _assert_finite(x_api, res_api, ref_norm, ref_residual)
     _check(
         fused_add_rmsnorm_trace,
-        (ref_norm, res_orig + x_orig),
+        (ref_norm, ref_residual),
         (x_api, res_api),
         atol=1e-3,
         rtol=1e-3,

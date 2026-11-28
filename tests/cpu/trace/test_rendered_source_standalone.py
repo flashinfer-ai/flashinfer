@@ -192,3 +192,60 @@ def test_paged_mqa_logits_json_init_and_reference_standalone(json_path, prefix):
     # artifact's output schema advertises.
     assert str(out.dtype).rsplit(".", 1)[-1] == doc["outputs"]["logits"]["dtype"]
     assert torch.isfinite(out.float()[out.float() > float("-inf")]).all()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "json_path,prefix,weight_bias",
+    [
+        (
+            FI_TRACE_OUT / "fused_add_rmsnorm_h5120.json",
+            "_fused_add_rmsnorm",
+            0.0,
+        ),
+        (
+            FI_TRACE_OUT / "gemma_fused_add_rmsnorm_h4608.json",
+            "_gemma_fused_add_rmsnorm",
+            1.0,
+        ),
+    ],
+    ids=["fused_add_rmsnorm", "gemma_fused_add_rmsnorm"],
+)
+def test_fused_add_rmsnorm_json_reference_returns_updated_residual(
+    json_path, prefix, weight_bias
+):
+    """The committed fused-add-RMSNorm JSONs must return every declared output.
+
+    The kernel writes two buffers (``input`` <- norm output, ``residual`` <-
+    ``residual + input``), so the schema declares ``output`` and ``residual``.
+    The reference used to compute the sum in a local and return only the norm
+    output, so consumers that exec() the JSON never saw the updated residual.
+    With input = 1 and residual = 2, the updated residual must be 3.
+    Regression for issue #9829.
+    """
+    doc = json.loads(json_path.read_text())
+    hidden_size = doc["axes"]["hidden_size"]["value"]
+
+    init_ns = _exec_in_fresh_namespace(doc["init"])
+    inputs = init_ns[f"{prefix}_init"](batch_size=2, device="cpu")
+    ref_ns = _exec_in_fresh_namespace(doc["reference"])
+    ref_fn = ref_ns[f"{prefix}_reference"]
+
+    hidden = torch.ones(2, hidden_size, dtype=inputs["input"].dtype)
+    residual = torch.full_like(hidden, 2.0)
+    weight = torch.ones(hidden_size, dtype=inputs["weight"].dtype)
+    result = ref_fn(hidden, residual, weight)
+
+    assert isinstance(result, tuple)
+    assert len(result) == len(doc["outputs"])
+    output, new_residual = result
+    for value, key in ((output, "output"), (new_residual, "residual")):
+        assert list(value.shape) == [2, hidden_size]
+        assert str(value.dtype).rsplit(".", 1)[-1] == doc["outputs"][key]["dtype"]
+    assert torch.equal(new_residual, torch.full_like(hidden, 3.0))
+    # rmsnorm of a constant row of 3s is 1 (times weight + weight_bias).
+    torch.testing.assert_close(
+        output.float(), torch.full((2, hidden_size), 1.0 + weight_bias)
+    )
+    # The reference is functional: it must not touch the caller's buffers.
+    assert torch.equal(residual, torch.full_like(hidden, 2.0))
