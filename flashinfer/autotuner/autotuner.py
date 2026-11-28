@@ -1195,15 +1195,25 @@ def autotune(
     # overwritten on exit is decided by save_configs at save time (it
     # re-reads the file, so a heal or replacement by another process is
     # re-evaluated).
-    if cache is not None:
+    cache_path = os.path.abspath(cache) if cache is not None else None
+    if cache_path is not None:
         with tuner._lock:
-            tuner._namespaced_records.clear()
-            tuner._dirty_namespaces.clear()
-            tuner._logged_file_hits.clear()
-        if os.path.isfile(cache):
-            tuner.load_configs(cache)
-        else:
-            tuner._observe_cache_generation(cache, None)
+            # The namespace belongs to this tuner, not an inherited task context.
+            preserve_records = (
+                tuner._active_legacy_cache_paths.get(cache_path, 0) > 0
+                and tuner._namespaced_cache_path == cache_path
+                and bool(tuner._dirty_namespaces)
+            )
+            if not preserve_records:
+                tuner._namespaced_records.clear()
+                tuner._dirty_namespaces.clear()
+                tuner._logged_file_hits.clear()
+                tuner._namespaced_cache_path = None
+                if os.path.isfile(cache):
+                    tuner.load_configs(cache)
+                else:
+                    tuner._observe_cache_generation(cache, None)
+                tuner._namespaced_cache_path = cache_path
 
     # Push skip_ops onto per-thread stack.  Each entry is the cumulative
     # union so that _effective_skip_ops is an O(1) read from the top.
@@ -1267,15 +1277,25 @@ def autotune(
             skip_ops_stack.pop()
         raise
 
+    if cache_path is not None:
+        with tuner._lock:
+            tuner._active_legacy_cache_paths[cache_path] = (
+                tuner._active_legacy_cache_paths.get(cache_path, 0) + 1
+            )
+
     try:
         with tuning_resources_scope() if tune_mode else contextlib.nullcontext():
             yield
     finally:
-        _tuning_scope.reset(scope_token)
         with tuner._lock:
+            if cache_path is not None:
+                tuner._active_legacy_cache_paths[cache_path] -= 1
+                if not tuner._active_legacy_cache_paths[cache_path]:
+                    del tuner._active_legacy_cache_paths[cache_path]
             if tune_mode:
                 tuner._active_tuning_contexts -= 1
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
+        _tuning_scope.reset(scope_token)
 
         # Pop the overrides we pushed (thread-local, no lock needed).
         if pushed:
@@ -2187,6 +2207,8 @@ class AutoTuner:
         self._dirty_seq = 0
         # Product-owned current-schema records persisted beside tactic records.
         self._namespaced_records: dict[str, dict[str, Any]] = {}
+        self._namespaced_cache_path: str | None = None
+        self._active_legacy_cache_paths: dict[str, int] = {}
         # Namespace index of JSON results, partitioned like managed winners.
         self._protocol_record_partitions: dict[tuple, dict[str, dict[str, Any]]] = {}
         self._protocol_cache_generation = 0
@@ -5514,6 +5536,7 @@ class AutoTuner:
                 with self._lock:
                     self._namespaced_records.clear()
                     self._dirty_namespaces.clear()
+                    self._namespaced_cache_path = os.path.abspath(path)
                     if severity in self._warned_cache_mismatch:
                         logger.debug(message)
                     else:
@@ -5528,6 +5551,7 @@ class AutoTuner:
                 raise ValueError("Autotuner namespaced records must be a JSON object")
             self._namespaced_records = copy.deepcopy(namespaced_records)
             self._dirty_namespaces.clear()
+            self._namespaced_cache_path = os.path.abspath(path)
             for key, value in configs.items():
                 runner_name = value[0]
                 tactic = _json_to_tactic(value[1])
