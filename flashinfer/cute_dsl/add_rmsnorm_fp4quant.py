@@ -364,7 +364,9 @@ class AddRMSNormFP4QuantKernel:
         if sm_version in (100, 103):
             config = kernel._compute_sm100_sm103_launch_config(H_per_cta, M)
             return cluster_n, *config
-        if sm_version == 107:
+        # SM120 gains from the SM107 config up to about 8M elements; above
+        # that the original fallback is as fast or faster.
+        if sm_version == 107 or (sm_version == 120 and H_per_cta * M < (1 << 23)):
             config = kernel._compute_sm107_launch_config(H_per_cta, dtype.width // 8)
             return cluster_n, *config
 
