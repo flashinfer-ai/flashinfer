@@ -6287,6 +6287,24 @@ def _cu_seqlens_contents(cu_seqlens: torch.Tensor) -> tuple:
     return contents
 
 
+def _record_cu_seqlens_contents(
+    cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor
+) -> None:
+    if cu_seqlens_cpu.device.type != "cpu":
+        raise ValueError("cu_seqlens_cpu must be a CPU tensor")
+    contents = tuple(int(x) for x in cu_seqlens_cpu.tolist())
+    if len(contents) != cu_seqlens.numel():
+        raise ValueError(
+            f"cu_seqlens_cpu has {len(contents)} entries, cu_seqlens has "
+            f"{cu_seqlens.numel()}"
+        )
+    try:
+        ver = cu_seqlens._version
+    except Exception:
+        ver = None
+    _CU_CONTENTS_MEMO[cu_seqlens.data_ptr()] = (weakref.ref(cu_seqlens), ver, contents)
+
+
 # ---------------------------------------------------------------------------
 # Single host entry: ONE callable that routes the plain engine vs
 # the two-kernel decomposition (DV2 chain) by a one-line occupancy rule
