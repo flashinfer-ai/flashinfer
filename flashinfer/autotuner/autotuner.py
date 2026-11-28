@@ -1626,7 +1626,7 @@ def _canonical_signature(value: Any) -> Any:
 @dataclass(frozen=True)
 class _ProfilingCandidates:
     runtime_keys: (
-        frozenset[tuple[str, int, tuple[Any, ...], tuple[Any, ...] | None]] | None
+        frozenset[tuple[str, int, tuple[Any, ...], tuple[Any, ...] | None, bool]] | None
     )
     file_keys: tuple[str, ...] | None
 
@@ -1642,27 +1642,39 @@ class _ProfilingCandidates:
         runners: list[TunableRunner],
         inputs: list[torch.Tensor],
         tactic_keys: list[tuple[Any, ...] | None] | None = None,
+        *,
+        race_default: bool = False,
     ) -> "_ProfilingCandidates | None":
         """Build coverage keys; ``tactic_keys`` reuses signatures read earlier."""
         if tactic_keys is None:
             tactic_keys = cls.tactic_keys(runners, inputs)
         if len(runners) == 1 and tactic_keys[0] is None:
             return None
-        runtime_keys = frozenset(
+        runner_keys = [
             (type(r).__name__, hash(r), r.get_cache_key_extras(inputs), tactic_key)
             for r, tactic_key in zip(runners, tactic_keys, strict=True)
-        )
+        ]
+        runtime_keys = {(*key, False) for key in runner_keys}
+        if race_default:
+            # Only the first runner's fallback races in a v2 comparison, so
+            # callers sharing a cache key must keep runner order stable.
+            runtime_keys.add((*runner_keys[0], True))
         file_keys = {
             str(
                 (name, extras)
-                if tactic_key is None
-                else (name, extras, _canonical_signature(tactic_key))
+                if tactic_key is None and not is_default
+                else (
+                    name,
+                    extras,
+                    None if tactic_key is None else _canonical_signature(tactic_key),
+                    is_default,
+                )
             )
-            for name, _, extras, tactic_key in runtime_keys
+            for name, _, extras, tactic_key, is_default in runtime_keys
         }
         # Persisted keys omit runtime hashes, so collisions make coverage ambiguous.
         return cls(
-            runtime_keys,
+            frozenset(runtime_keys),
             tuple(sorted(file_keys)) if len(file_keys) == len(runtime_keys) else None,
         )
 
@@ -3430,6 +3442,15 @@ class AutoTuner:
                 "All Given runners must be subclass of TunableRunner"
             )
 
+            # Default-candidate coverage (autotune_v2 contexts): the default
+            # path (runners[0], tactic=-1) always races as a candidate, so a
+            # tuned-and-persisted selection cannot lose to not tuning AT THE
+            # PROBE inputs.  It is not a full regression guard: if the
+            # synthetic probe misrepresents serving (routing distribution /
+            # EP-sharded M, the #3622/#3537 class), the comparison itself is
+            # off — representative probe construction is op-level work.
+            # Scoped to v2 so plain autotune() selection is byte-identical.
+            race_default = self._in_v2_context
             plan_error = None
             profiles = []
             profiling_candidates = None
@@ -3440,7 +3461,7 @@ class AutoTuner:
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
                 tactic_keys = _ProfilingCandidates.tactic_keys(runners, inputs)
                 profiling_candidates = _ProfilingCandidates.from_runners(
-                    runners, inputs, tactic_keys
+                    runners, inputs, tactic_keys, race_default=race_default
                 )
             except (_TuningGroupError, _StickyCudaError):
                 raise
@@ -3460,16 +3481,6 @@ class AutoTuner:
             runner_parameters = [
                 inspect.signature(r.forward).parameters for r in runners
             ]
-
-            # Default-candidate coverage (autotune_v2 contexts): the default
-            # path (runners[0], tactic=-1) always races as a candidate, so a
-            # tuned-and-persisted selection cannot lose to not tuning AT THE
-            # PROBE inputs.  It is not a full regression guard: if the
-            # synthetic probe misrepresents serving (routing distribution /
-            # EP-sharded M, the #3622/#3537 class), the comparison itself is
-            # off — representative probe construction is op-level work.
-            # Scoped to v2 so plain autotune() selection is byte-identical.
-            race_default = self._in_v2_context
 
             incomplete_winner: tuple[int, Any] | None = None
             pbar = None
@@ -3783,7 +3794,7 @@ class AutoTuner:
                             # Publish and look up coverage using the prepared runners'
                             # hashes, but the pool signatures read before enumeration.
                             profiling_candidates = _ProfilingCandidates.from_runners(
-                                runners, inputs, tactic_keys
+                                runners, inputs, tactic_keys, race_default=race_default
                             )
                             cache_key = self._get_cache_key(
                                 custom_op,

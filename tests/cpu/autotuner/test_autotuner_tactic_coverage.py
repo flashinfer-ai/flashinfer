@@ -177,10 +177,19 @@ def test_persisted_signature_text_is_canonical():
     expected = (
         "('SetRunner', (), (frozenset({"
         + ", ".join(map(repr, sorted(dtypes)))
-        + "}), ('rev', 2, frozenset({1, 3}))))"
+        + "}), ('rev', 2, frozenset({1, 3}))), False)"
     )
     # str(frozenset) follows the per-process hash seed; the persisted key must not.
     assert keys.file_keys == (expected,)
+    v2_keys = _ProfilingCandidates.from_runners(
+        [SetRunner([1])], [torch.zeros(1)], race_default=True
+    )
+    expected_default = (
+        "('SetRunner', (), (frozenset({"
+        + ", ".join(map(repr, sorted(dtypes)))
+        + "}), ('rev', 2, frozenset({1, 3}))), True)"
+    )
+    assert v2_keys.file_keys == (expected, expected_default)
 
 
 @pytest.mark.parametrize("mode", ["v1", "managed"])
@@ -213,6 +222,76 @@ def test_frozenset_and_tuple_signatures_stay_distinct_after_reload(
     with tuning(mode):
         assert tuner.choose_one("typed", [runner], config, inputs) == (runner, 2)
     assert (TypedRunner, 2) in calls
+
+
+@pytest.mark.parametrize("mode", ["v2", "managed"])
+@pytest.mark.parametrize("reload", [False, True])
+def test_reordered_runners_and_changed_signature_retune(
+    setup, monkeypatch, tmp_path, mode, reload
+):
+    tuner, _ = setup
+
+    class SecondPoolRunner(PoolRunner):
+        pass
+
+    first = PoolRunner([1])
+    second = SecondPoolRunner([3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    calls = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        calls.append((type(runner), tactic))
+        if isinstance(runner, SecondPoolRunner):
+            return {-1: 0.8, 3: 2.0, 2: 0.4}[tactic]
+        return {-1: 5.0, 1: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    with tuning(mode):
+        assert tuner.choose_one("combined", [first, second], config, inputs) == (
+            second,
+            3,
+        )
+    assert (SecondPoolRunner, -1) not in calls
+
+    path = tmp_path / "combined.json"
+    if reload:
+        if mode != "managed":
+            tuner.save_configs(str(path))
+        tuner = AutoTuner()
+        monkeypatch.setattr(AutoTuner, "_instance", tuner)
+        if mode != "managed":
+            assert tuner.load_configs(str(path))
+
+    second.tactics.append(2)
+    calls.clear()
+    with tuning(mode):
+        assert tuner.choose_one("combined", [second, first], config, inputs) == (
+            second,
+            2,
+        )
+        assert (SecondPoolRunner, -1) in calls
+        assert (SecondPoolRunner, 2) in calls
+        calls.clear()
+        assert tuner.choose_one("combined", [second, first], config, inputs) == (
+            second,
+            2,
+        )
+        assert calls == []
+
+    if reload:
+        if mode != "managed":
+            tuner.save_configs(str(path))
+        tuner = AutoTuner()
+        monkeypatch.setattr(AutoTuner, "_instance", tuner)
+        if mode != "managed":
+            assert tuner.load_configs(str(path))
+        calls.clear()
+        with tuning(mode):
+            assert tuner.choose_one("combined", [second, first], config, inputs) == (
+                second,
+                2,
+            )
+        assert calls == []
 
 
 @pytest.mark.parametrize("mode", ["v1", "managed"])

@@ -4229,7 +4229,7 @@ class _MlaStageOneWinnerRunner(TunableRunner):
                 inputs=self._inputs,
                 require_profiling_policy=True,
                 profiling_candidates=_ProfilingCandidates.from_runners(
-                    self._runners, self._inputs
+                    self._runners, self._inputs, race_default=tuner._in_v2_context
                 ),
                 validation_profile=profile,
             )
