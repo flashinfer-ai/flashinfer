@@ -916,10 +916,14 @@ except Exception:
 # ── GEMM fp4 (Blackwell SM100+: M×7168@2048×7168, block=16) ─────────────────
 try:
     M, K, N, BS4 = 128, 7168, 2048, 16
-    a_fp4 = torch.zeros(M, K, dtype=torch.uint8, device=device)
-    b_fp4 = torch.zeros(K, N, dtype=torch.uint8, device=device)
+    # Packed codes [M, K/2] and [N, K/2]. M and N are multiples of 128 and K/16
+    # is a multiple of 4, so each scale tensor is the whole 128x4 buffer. The
+    # scales are all ones, so their byte order does not matter. b and its
+    # scales are the transposed views mm_fp4 takes.
+    a_fp4 = torch.zeros(M, K // 2, dtype=torch.uint8, device=device)
+    b_fp4 = torch.zeros(N, K // 2, dtype=torch.uint8, device=device).T
     a_d4 = torch.ones(M, K // BS4, dtype=torch.float8_e4m3fn, device=device)
-    b_d4 = torch.ones(K, N // BS4, dtype=torch.float8_e4m3fn, device=device)
+    b_d4 = torch.ones(N, K // BS4, dtype=torch.float8_e4m3fn, device=device).T
     flashinfer.gemm.mm_fp4(a_fp4, b_fp4, a_d4, b_d4, block_size=BS4)
 except Exception:
     pass  # Requires Blackwell (SM100+)
