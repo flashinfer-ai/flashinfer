@@ -24,6 +24,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 from __future__ import annotations
 
 import functools
+import os
 import warnings
 import weakref
 from collections import OrderedDict
@@ -8856,6 +8857,283 @@ class SM12xFp8Runner(MoERunner):
             out=output,
         )
         return output
+
+
+# ---------------------------------------------------------------------------
+# Specialized SM120 FP8 block-scale runner - agent-generated kernels,
+# fixed tactic
+# ---------------------------------------------------------------------------
+
+
+def _specialized_jit_nvcc_release() -> Optional[tuple]:
+    """CUDA release of the compiler the JIT build will actually invoke
+    (``FLASHINFER_NVCC`` override, else ``$cuda_home/bin/nvcc``), or ``None``
+    when that compiler cannot be run. Never substitutes torch's CUDA build
+    version: this probe gates a source build, not the runtime."""
+    import re
+    import subprocess
+
+    nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+    if "$cuda_home" in nvcc:
+        try:
+            from ..jit.cpp_ext import get_cuda_path
+
+            nvcc = nvcc.replace("$cuda_home", str(get_cuda_path()))
+        except Exception:
+            return None
+    try:
+        txt = subprocess.check_output([nvcc, "--version"], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    match = re.search(r"release (\d+)\.(\d+)", txt)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
+class SpecializedFp8BlockRunner(MoERunner):
+    """Adapter for the specialized (agent-generated) SM120 DeepSeek FP8 kernels.
+
+    Calls the kernels' own module
+    (``flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120``) directly
+    — the kernels are not CUTLASS kernels and do not route through
+    ``cutlass_fused_moe`` — so ``MoELayer``'s ``backend=auto`` cross-backend
+    autotune times and dispatches them as a first-class named candidate. The
+    module's shipped dispatch surface stays authoritative: its workload
+    allowlist gates construction (contract + validated device profile) and
+    per-call acceptance (``num_tokens``), its kill switch
+    (``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``) rejects the backend at
+    ``check_support`` and again inside the launch, and every launch goes
+    through ``maybe_run_specialized`` so the module's guard order and
+    dispatch statistics apply unchanged.
+    """
+
+    backend_key = "specialized_fp8_block"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),)
+    supported_activation_classes = (SwiGLU,)
+    supports_expert_parallelism = False
+    required_weight_keys = (
+        "w13_weight",
+        "w13_weight_sf",
+        "w2_weight",
+        "w2_weight_sf",
+    )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+
+    @staticmethod
+    def _spec_module():
+        from .specialized import fp8_blockscale_moe_sm120
+
+        return fp8_blockscale_moe_sm120
+
+    def _check_activation_parameters(self) -> None:
+        default = SwiGLU()
+        activation = self.config.activation
+        if not isinstance(activation, SwiGLU) or (
+            activation.alpha,
+            activation.beta,
+            activation.limit,
+        ) != (
+            default.alpha,
+            default.beta,
+            default.limit,
+        ):
+            raise NotImplementedError(
+                "the specialized SM120 FP8 block-scale backend supports only "
+                "default SwiGLU parameters."
+            )
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        spec = self._spec_module()
+        # GPU-free checks first (kill switch, dispatch surface, contract), so
+        # a disabled or mis-configured backend is rejected without touching
+        # the device.
+        if os.environ.get(spec._DISABLE_ENV, "0") == "1":
+            raise RuntimeError(
+                "the specialized SM120 FP8 block-scale backend is disabled "
+                f"by {spec._DISABLE_ENV}=1."
+            )
+        allow = spec._load_allowlist()
+        if allow is None:
+            raise RuntimeError(
+                "the specialized SM120 FP8 block-scale dispatch surface "
+                "(workload allowlist) is unavailable."
+            )
+        routing = self.config.routing
+        contract = (
+            routing.num_experts,
+            routing.top_k,
+            self.config.experts.intermediate_size,
+        )
+        if contract != (spec._E, spec._TOPK, spec._I):
+            raise NotImplementedError(
+                "the specialized SM120 FP8 block-scale kernels serve only "
+                f"their generated contract num_experts={spec._E}, "
+                f"top_k={spec._TOPK}, intermediate_size={spec._I}; got "
+                f"num_experts={routing.num_experts}, top_k={routing.top_k}, "
+                f"intermediate_size={self.config.experts.intermediate_size}."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError(
+                "the specialized SM120 FP8 block-scale backend requires "
+                "do_finalize=True."
+            )
+        if not self.config.finalize.use_fused_finalize:
+            raise NotImplementedError(
+                "the specialized SM120 FP8 block-scale backend requires "
+                "use_fused_finalize=True (finalize is fused into its FC2 "
+                "accumulation)."
+            )
+        # The JIT build happens on the dispatch path (outside check_support),
+        # so the toolchain must be rejected here: the kernels use
+        # cvt.rn.bf16x2.e4m3x2, which needs PTX ISA 9.2 (CUDA 13.2+). CUDA
+        # 13.0/13.1 would otherwise pass candidate selection and fail at the
+        # first forward's JIT build with no handler. A cached module artifact
+        # needs no compiler and is accepted as-is; otherwise the compiler the
+        # build will actually invoke (FLASHINFER_NVCC override, else
+        # $cuda_home/bin/nvcc) is probed directly — never torch's CUDA build
+        # version, which get_cuda_version substitutes when nvcc is missing
+        # and which says nothing about the ability to build.
+        if not spec.gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
+            toolkit = _specialized_jit_nvcc_release()
+            if toolkit is None:
+                raise RuntimeError(
+                    "the specialized SM120 FP8 block-scale backend has no "
+                    "cached module artifact and the JIT compiler "
+                    "(FLASHINFER_NVCC, else $CUDA_HOME/bin/nvcc) is "
+                    "unavailable; the module cannot be built."
+                )
+            if toolkit < (13, 2):
+                raise NotImplementedError(
+                    "the specialized SM120 FP8 block-scale backend JIT-builds "
+                    "an sm_120a module that requires the CUDA 13.2+ toolkit "
+                    "(PTX ISA 9.2 for cvt.rn.bf16x2.e4m3x2); the JIT-selected "
+                    f"nvcc is CUDA {toolkit[0]}.{toolkit[1]}."
+                )
+        # Device guards, mirroring the module's shipped dispatch surface.
+        cc = tuple(get_compute_capability(self.device))
+        if not (allow["min_cc"] <= cc <= allow["max_cc"]):
+            raise RuntimeError(
+                "the specialized SM120 FP8 block-scale kernels require "
+                f"compute capability {allow['min_cc']}..{allow['max_cc']}, "
+                f"got {cc}."
+            )
+        props = torch.cuda.get_device_properties(self.device)
+        if props.multi_processor_count != allow["sm_count"]:
+            raise RuntimeError(
+                "the specialized SM120 FP8 block-scale kernels are validated "
+                f"only for the {allow['sm_count']}-SM device profile; got "
+                f"{props.multi_processor_count} SMs."
+            )
+
+    def _build(self) -> None:
+        # Bind the module only; the sm_120a device module JIT-builds on the
+        # first dispatch (never under CUDA-graph capture — the flat guard's
+        # warmed-variant rule enforces that).
+        self._spec = self._spec_module()
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        allow = self._spec._load_allowlist()
+        x = act.hidden_states_q
+        return (
+            allow is not None
+            and x.ndim == 2
+            and x.shape[1] == self._spec._H
+            and act.num_tokens in allow["tokens"]
+        )
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        self._validate_pack_contract(act)
+        if act.hidden_states_q.dtype is not torch.bfloat16:
+            raise TypeError(
+                "the specialized SM120 FP8 block-scale backend requires BF16 "
+                "hidden states."
+            )
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                "the specialized SM120 FP8 block-scale backend requires "
+                "hidden_states_scale to be None."
+            )
+        _validate_prerouted_inputs(
+            act,
+            act.hidden_states_q.shape[0],
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self.required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        x = act.hidden_states_q
+        # The launch re-validates every operand through the module's guard
+        # (maybe_run_specialized); the output buffer is zeroed there.
+        output = torch.empty(
+            x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
+        )
+        return [
+            x,
+            act.topk_ids,
+            act.topk_weights,
+            view["w13_weight"],
+            view["w13_weight_sf"],
+            view["w2_weight"],
+            view["w2_weight_sf"],
+            output,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError(
+                "the specialized SM120 FP8 block-scale backend supports only tactic -1."
+            )
+        x, ids, topk_weights, w13, w13_sf, w2, w2_sf, output = inputs
+        out, reason = self._spec.maybe_run_specialized(
+            input=x,
+            token_selected_experts=ids,
+            token_final_scales=topk_weights,
+            fc1_expert_weights=w13,
+            fc2_expert_weights=w2,
+            quant_scales=[w13_sf, w2_sf],
+            output=output,
+            context_ok=True,
+        )
+        if out is None:
+            # check_support and _accepts_shape admit only guard-passing
+            # calls, so a refusal here is a call-time state change (e.g. the
+            # kill switch flipped after layer construction); fail loudly
+            # rather than silently serve another kernel.
+            raise RuntimeError(
+                "the specialized SM120 FP8 block-scale backend refused the "
+                f"call: {reason}."
+            )
+        return out
 
 
 # ---------------------------------------------------------------------------
