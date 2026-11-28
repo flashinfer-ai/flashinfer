@@ -214,7 +214,7 @@ top_k_varlen_trace = TraceTemplate(
             )
         ),
         # the width axis is num_cols (the logits shape), distinct from the API's
-        # windowed-mode bound max_window_len (a scalar input below) and from
+        # length bound max_window_len (a scalar input below) and from
         # init()'s max_seq_len, which sizes the example buffer
         "num_cols": Const(abbrev="n", description="Logits row width (padded)."),
         "top_k": Const(abbrev="k", description="Number of top elements per row."),
@@ -268,10 +268,10 @@ top_k_varlen_trace = TraceTemplate(
             "int32",
             optional=True,
             description=(
-                "Windowed (prefill) mode: upper bound on every window length, in "
-                "columns (defaults to the logits width); fixed for a captured graph, "
-                "so it must hold at every replay. Refused with ValueError without "
-                "row_starts."
+                "Upper bound on every seq_lens entry, in its units (window columns "
+                "in windowed mode, KV tokens in decode mode; defaults to what the "
+                "logits width holds); fixed for a captured graph, so it must hold "
+                "at every replay."
             ),
         ),
         "page_table": Tensor(
