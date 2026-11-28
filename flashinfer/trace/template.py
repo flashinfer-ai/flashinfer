@@ -240,6 +240,16 @@ def standard_check(
     )
 
 
+def _get_tuple_part(val: Any, tuple_idx: int) -> Any:
+    # A paged KV cache may also come as one 5-D tensor with K/V stacked on dim 1.
+    # The 4-D page_size=1 form is not split: its page axis depends on kv_layout.
+    if isinstance(val, torch.Tensor) and val.ndim == 5 and val.shape[1] == 2:
+        val = val.unbind(1)
+    if isinstance(val, (tuple, list)) and len(val) > tuple_idx:
+        return val[tuple_idx]
+    return None
+
+
 def _get_tensor(
     kwargs: Dict[str, Any],
     param: str,
@@ -249,10 +259,7 @@ def _get_tensor(
     if val is None:
         return None
     if tuple_idx is not None:
-        if isinstance(val, (tuple, list)) and len(val) > tuple_idx:
-            val = val[tuple_idx]
-        else:
-            return None
+        val = _get_tuple_part(val, tuple_idx)
     return val if isinstance(val, torch.Tensor) else None
 
 
@@ -457,8 +464,8 @@ class Tensor:
         Python parameter name to look up in ``kwargs``.  Defaults to the
         key name in the ``inputs``/``outputs`` dict.
     tuple_idx:
-        When the parameter is a tuple (e.g. ``paged_kv_cache=(k, v)``),
-        the index into that tuple.
+        When the parameter is a tuple (e.g. ``paged_kv_cache=(k, v)``) or one
+        5-D tensor with the parts stacked on dim 1, the index of the part.
     dtype:
         For *outputs*: explicit dtype string such as ``"float32"``.
         For *inputs*: ignored — dtype is read from the actual tensor.

@@ -1204,7 +1204,8 @@ def test_nvfp4_kv_dequantize_paged_fi_trace():
 # ---------------------------------------------------------------------------
 
 
-def test_gqa_paged_decode_fi_trace():
+@pytest.mark.parametrize("combined", [False, True])
+def test_gqa_paged_decode_fi_trace(combined):
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 
     batch_size = 32
@@ -1221,11 +1222,16 @@ def test_gqa_paged_decode_fi_trace():
     v_cache = torch.randn(
         num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16
     )
+    # run() also takes the paged KV cache as one tensor with K/V stacked on dim 1.
+    paged_kv_cache = (
+        torch.stack([k_cache, v_cache], dim=1) if combined else (k_cache, v_cache)
+    )
 
     defn = BatchDecodeWithPagedKVCacheWrapper.run.fi_trace(
-        q=q, paged_kv_cache=(k_cache, v_cache)
+        q=q, paged_kv_cache=paged_kv_cache
     )
     _check_defn(defn, "gqa_paged", "BatchDecodeWithPagedKVCacheWrapper")
+    assert defn["name"] == "gqa_paged_decode_h32_kv8_d128_ps16"
     axes = defn["axes"]
     assert axes["num_qo_heads"]["value"] == num_qo_heads
     assert axes["num_kv_heads"]["value"] == num_kv_heads
@@ -1242,6 +1248,8 @@ def test_gqa_paged_decode_fi_trace():
         "num_kv_heads",
         "head_dim",
     ]
+    assert defn["inputs"]["k_cache"]["dtype"] == "bfloat16"
+    assert defn["inputs"]["v_cache"]["dtype"] == "bfloat16"
 
 
 # ---------------------------------------------------------------------------

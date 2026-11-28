@@ -1288,6 +1288,75 @@ def test_enable_apply_honors_out_kwarg():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("combined", [False, True])
+def test_enable_apply_paged_decode_combined_kv_cache(combined):
+    # run() also takes paged_kv_cache as one [num_pages, 2, page_size,
+    # num_kv_heads, head_dim] tensor, split on dim 1 by _unpack_paged_kv_cache.
+    from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+
+    tmpl = _live_template("flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run")
+    q = torch.randn(2, 32, 128, dtype=torch.bfloat16)
+    kv = torch.randn(4, 2, 16, 8, 128, dtype=torch.bfloat16)
+    k_cache, v_cache = kv[:, 0], kv[:, 1]
+    paged_kv_cache = kv if combined else (k_cache, v_cache)
+    ns = {"q": q, "paged_kv_cache": paged_kv_cache}
+    assert adapt.extract_input_dtypes(tmpl, ns) == {
+        ("q", "bfloat16"),
+        ("k_cache", "bfloat16"),
+        ("v_cache", "bfloat16"),
+    }
+    positional = dict(
+        zip(tmpl.inputs, adapt.ordered_input_values(tmpl, ns), strict=True)
+    )
+
+    calls = []
+
+    def solution(**inputs):
+        calls.append(inputs)
+        return torch.full_like(inputs["q"], SENTINEL)
+
+    ta.enable_apply({"gqa_paged_decode_h32_kv8_d128_ps16": solution})
+    out = object.__new__(BatchDecodeWithPagedKVCacheWrapper).run(q, paged_kv_cache)
+    assert torch.equal(out, torch.full_like(q, SENTINEL))
+    (inputs,) = calls
+    for key, ref in (("k_cache", k_cache), ("v_cache", v_cache)):
+        for got in (inputs[key], positional[key]):
+            assert got.data_ptr() == ref.data_ptr() and torch.equal(got, ref)
+    if combined:
+        # A lone K cache is not split on its page axis, and a 1-tuple has no V.
+        # Nor is the 4-D page_size=1 form: its page axis depends on kv_layout.
+        for cache in (k_cache, (k_cache,), kv[:, :, 0]):
+            candidate = adapt.build_candidate_kwargs(tmpl, {"paged_kv_cache": cache})
+            assert "v_cache" not in candidate
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("combined", [False, True])
+def test_enable_apply_inplace_append_writes_kv_cache_parts(combined):
+    # The in-place outputs are the K/V parts of paged_kv_cache and kv_cache_sf.
+    import flashinfer.page as page
+
+    kv = torch.zeros(4, 2, 16, 8, 32, dtype=torch.uint8)
+    sf = torch.zeros(4, 2, 16, 8, 4, dtype=torch.float8_e4m3fn)
+    caches = (kv, sf) if combined else ((kv[:, 0], kv[:, 1]), (sf[:, 0], sf[:, 1]))
+
+    def solution(paged_k_cache, paged_v_cache, k_scale_cache, v_scale_cache, **_):
+        parts = (paged_k_cache, paged_v_cache, k_scale_cache, v_scale_cache)
+        return tuple(torch.full_like(p, i) for i, p in enumerate(parts, 1))
+
+    name = (
+        "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kv8_d64_pd32_sd4_ps16"
+    )
+    ta.enable_apply({name: solution})
+    key = torch.randn(3, 8, 64, dtype=torch.bfloat16)
+    page.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        key, key, torch.arange(3), *caches, 1.0, 1.0
+    )
+    for i, part in enumerate((kv[:, 0], kv[:, 1], sf[:, 0], sf[:, 1]), 1):
+        assert bool((part == i).all())
+
+
+@pytest.mark.cpu_only
 def test_enable_apply_solution_object(tmp_path, monkeypatch):
     """A first-class Solution (loaded via the loader), not a raw callable."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))  # hermetic loader cache
