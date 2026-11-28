@@ -220,7 +220,7 @@ constexpr FLASHINFER_INLINE int get_mantissa_bits() {
  * https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
  */
 template <typename fp8_dtype, typename fp16_dtype>
-__device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
+__device__ void fast_dequant_f8f16x4(uint32_t* input, int2* output) {
   uint32_t q = *input;
   if constexpr (std::is_same_v<fp8_dtype, __nv_fp8_e5m2> && std::is_same_v<fp16_dtype, half>) {
     output->x = __byte_perm(0U, q, 0x5140);
@@ -276,7 +276,7 @@ struct vec_cast<nv_bfloat16, __nv_fp8_e4m3> {
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
         fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>((uint32_t*)&src[i * 4],
-                                                         (uint2*)&dst[i * 4]);
+                                                         (int2*)&dst[i * 4]);
       }
     }
   }
@@ -296,7 +296,7 @@ struct vec_cast<nv_bfloat16, __nv_fp8_e5m2> {
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
         fast_dequant_f8f16x4<__nv_fp8_e5m2, nv_bfloat16>((uint32_t*)&src[i * 4],
-                                                         (uint2*)&dst[i * 4]);
+                                                         (int2*)&dst[i * 4]);
       }
     }
   }
@@ -378,7 +378,7 @@ struct vec_cast<half, __nv_fp8_e4m3> {
       static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
-        fast_dequant_f8f16x4<__nv_fp8_e4m3, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
+        fast_dequant_f8f16x4<__nv_fp8_e4m3, half>((uint32_t*)&src[i * 4], (int2*)&dst[i * 4]);
       }
     }
 #endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
@@ -411,7 +411,7 @@ struct vec_cast<half, __nv_fp8_e5m2> {
       static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
-        fast_dequant_f8f16x4<__nv_fp8_e5m2, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
+        fast_dequant_f8f16x4<__nv_fp8_e5m2, half>((uint32_t*)&src[i * 4], (int2*)&dst[i * 4]);
       }
     }
 #endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
@@ -728,6 +728,8 @@ template <typename float_t, size_t vec_size>
 struct vec_t {
   FLASHINFER_INLINE float_t& operator[](size_t i);
   FLASHINFER_INLINE const float_t& operator[](size_t i) const;
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<float_t, G> lane(size_t lane_idx) const;
   FLASHINFER_INLINE void fill(float_t val);
   FLASHINFER_INLINE void load(const float_t* ptr);
   FLASHINFER_INLINE void store(float_t* ptr) const;
@@ -787,6 +789,11 @@ struct vec_t<__nv_fp8_e4m3, 1> {
   FLASHINFER_INLINE const __nv_fp8_e4m3& operator[](size_t i) const {
     return ((const __nv_fp8_e4m3*)(&data))[i];
   }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e4m3, G> lane(size_t lane_idx) const {
+    static_assert(1 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e4m3, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE __nv_fp8_e4m3* ptr() { return reinterpret_cast<__nv_fp8_e4m3*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e4m3 val);
   FLASHINFER_INLINE void load(const __nv_fp8_e4m3* ptr);
@@ -826,6 +833,11 @@ struct vec_t<__nv_fp8_e4m3, 2> {
   FLASHINFER_INLINE __nv_fp8_e4m3& operator[](size_t i) { return ((__nv_fp8_e4m3*)(&data))[i]; }
   FLASHINFER_INLINE const __nv_fp8_e4m3& operator[](size_t i) const {
     return ((const __nv_fp8_e4m3*)(&data))[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e4m3, G> lane(size_t lane_idx) const {
+    static_assert(2 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e4m3, G>*>(&data + G * lane_idx);
   }
   FLASHINFER_INLINE __nv_fp8_e4m3* ptr() { return reinterpret_cast<__nv_fp8_e4m3*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e4m3 val);
@@ -873,6 +885,11 @@ struct vec_t<__nv_fp8_e4m3, 4> {
   FLASHINFER_INLINE const __nv_fp8_e4m3& operator[](size_t i) const {
     return ((const __nv_fp8_e4m3*)(&data))[i];
   }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e4m3, G> lane(size_t lane_idx) const {
+    static_assert(4 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e4m3, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE __nv_fp8_e4m3* ptr() { return reinterpret_cast<__nv_fp8_e4m3*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e4m3 val);
   FLASHINFER_INLINE void load(const __nv_fp8_e4m3* ptr);
@@ -915,11 +932,16 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 4>::memcpy(__nv_fp8_e4m3* dst,
 
 template <>
 struct vec_t<__nv_fp8_e4m3, 8> {
-  uint2 data;
+  int2 data;
 
   FLASHINFER_INLINE __nv_fp8_e4m3& operator[](size_t i) { return ((__nv_fp8_e4m3*)(&data))[i]; }
   FLASHINFER_INLINE const __nv_fp8_e4m3& operator[](size_t i) const {
     return ((const __nv_fp8_e4m3*)(&data))[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e4m3, G> lane(size_t lane_idx) const {
+    static_assert(8 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e4m3, G>*>(&data + G * lane_idx);
   }
   FLASHINFER_INLINE __nv_fp8_e4m3* ptr() { return reinterpret_cast<__nv_fp8_e4m3*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e4m3 val);
@@ -951,16 +973,16 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 8>::fill(__nv_fp8_e4m3 val) {
 }
 
 FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 8>::load(const __nv_fp8_e4m3* ptr) {
-  data = *((uint2*)ptr);
+  data = *((int2*)ptr);
 }
 
 FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 8>::store(__nv_fp8_e4m3* ptr) const {
-  *((uint2*)ptr) = data;
+  *((int2*)ptr) = data;
 }
 
 FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 8>::memcpy(__nv_fp8_e4m3* dst,
                                                        const __nv_fp8_e4m3* src) {
-  *((uint2*)dst) = *((uint2*)src);
+  *((int2*)dst) = *((int2*)src);
 }
 
 // __nv_fp8_e4m3 x 16 or more
@@ -972,6 +994,12 @@ struct vec_t<__nv_fp8_e4m3, vec_size> {
   FLASHINFER_INLINE __nv_fp8_e4m3& operator[](size_t i) { return ((__nv_fp8_e4m3*)data)[i]; }
   FLASHINFER_INLINE const __nv_fp8_e4m3& operator[](size_t i) const {
     return ((const __nv_fp8_e4m3*)data)[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e4m3, G> lane(size_t lane_idx) const {
+    static_assert(vec_size % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e4m3, G>*>(&data[lane_idx / vec_size] +
+                                                             G * (lane_idx % vec_size));
   }
   FLASHINFER_INLINE __nv_fp8_e4m3* ptr() { return reinterpret_cast<__nv_fp8_e4m3*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e4m3 val) {
@@ -1059,6 +1087,11 @@ struct vec_t<__nv_fp8_e5m2, 1> {
   FLASHINFER_INLINE const __nv_fp8_e5m2& operator[](size_t i) const {
     return ((const __nv_fp8_e5m2*)(&data))[i];
   }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e5m2, G> lane(size_t lane_idx) const {
+    static_assert(1 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e5m2, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE __nv_fp8_e5m2* ptr() { return reinterpret_cast<__nv_fp8_e5m2*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e5m2 val);
   FLASHINFER_INLINE void load(const __nv_fp8_e5m2* ptr);
@@ -1098,6 +1131,11 @@ struct vec_t<__nv_fp8_e5m2, 2> {
   FLASHINFER_INLINE __nv_fp8_e5m2& operator[](size_t i) { return ((__nv_fp8_e5m2*)(&data))[i]; }
   FLASHINFER_INLINE const __nv_fp8_e5m2& operator[](size_t i) const {
     return ((const __nv_fp8_e5m2*)(&data))[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e5m2, G> lane(size_t lane_idx) const {
+    static_assert(2 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e5m2, G>*>(&data + G * lane_idx);
   }
   FLASHINFER_INLINE __nv_fp8_e5m2* ptr() { return reinterpret_cast<__nv_fp8_e5m2*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e5m2 val);
@@ -1146,6 +1184,11 @@ struct vec_t<__nv_fp8_e5m2, 4> {
   FLASHINFER_INLINE const __nv_fp8_e5m2& operator[](size_t i) const {
     return ((const __nv_fp8_e5m2*)(&data))[i];
   }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e5m2, G> lane(size_t lane_idx) const {
+    static_assert(4 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e5m2, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE __nv_fp8_e5m2* ptr() { return reinterpret_cast<__nv_fp8_e5m2*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e5m2 val);
   FLASHINFER_INLINE void load(const __nv_fp8_e5m2* ptr);
@@ -1188,11 +1231,16 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 4>::memcpy(__nv_fp8_e5m2* dst,
 
 template <>
 struct vec_t<__nv_fp8_e5m2, 8> {
-  uint2 data;
+  int2 data;
 
   FLASHINFER_INLINE __nv_fp8_e5m2& operator[](size_t i) { return ((__nv_fp8_e5m2*)(&data))[i]; }
   FLASHINFER_INLINE const __nv_fp8_e5m2& operator[](size_t i) const {
     return ((const __nv_fp8_e5m2*)(&data))[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e5m2, G> lane(size_t lane_idx) const {
+    static_assert(8 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e5m2, G>*>(&data + G * lane_idx);
   }
   FLASHINFER_INLINE __nv_fp8_e5m2* ptr() { return reinterpret_cast<__nv_fp8_e5m2*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e5m2 val);
@@ -1223,16 +1271,16 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 8>::fill(__nv_fp8_e5m2 val) {
 }
 
 FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 8>::load(const __nv_fp8_e5m2* ptr) {
-  data = *((uint2*)ptr);
+  data = *((int2*)ptr);
 }
 
 FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 8>::store(__nv_fp8_e5m2* ptr) const {
-  *((uint2*)ptr) = data;
+  *((int2*)ptr) = data;
 }
 
 FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 8>::memcpy(__nv_fp8_e5m2* dst,
                                                        const __nv_fp8_e5m2* src) {
-  *((uint2*)dst) = *((uint2*)src);
+  *((int2*)dst) = *((int2*)src);
 }
 
 // __nv_fp8_e5m2 x 16 or more
@@ -1245,6 +1293,12 @@ struct vec_t<__nv_fp8_e5m2, vec_size> {
   FLASHINFER_INLINE __nv_fp8_e5m2& operator[](size_t i) { return ((__nv_fp8_e5m2*)data)[i]; }
   FLASHINFER_INLINE const __nv_fp8_e5m2& operator[](size_t i) const {
     return ((const __nv_fp8_e5m2*)data)[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<__nv_fp8_e5m2, G> lane(size_t lane_idx) const {
+    static_assert(vec_size % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<__nv_fp8_e5m2, G>*>(&data[lane_idx / vec_size] +
+                                                             G * (lane_idx % vec_size));
   }
   FLASHINFER_INLINE __nv_fp8_e5m2* ptr() { return reinterpret_cast<__nv_fp8_e5m2*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp8_e5m2 val) {
@@ -1589,6 +1643,11 @@ struct vec_t<half, 1> {
 
   FLASHINFER_INLINE half& operator[](size_t i) { return ((half*)(&data))[i]; }
   FLASHINFER_INLINE const half& operator[](size_t i) const { return ((const half*)(&data))[i]; }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<half, G> lane(size_t lane_idx) const {
+    static_assert(1 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<half, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE half* ptr() { return reinterpret_cast<half*>(&data); }
   FLASHINFER_INLINE void fill(half val);
   FLASHINFER_INLINE void load(const half* ptr);
@@ -1624,6 +1683,11 @@ struct vec_t<half, 2> {
 
   FLASHINFER_INLINE half& operator[](size_t i) { return ((half*)(&data))[i]; }
   FLASHINFER_INLINE const half& operator[](size_t i) const { return ((const half*)(&data))[i]; }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<half, G> lane(size_t lane_idx) const {
+    static_assert(2 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<half, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE half* ptr() { return reinterpret_cast<half*>(&data); }
   FLASHINFER_INLINE void fill(half val);
   FLASHINFER_INLINE void load(const half* ptr);
@@ -1658,10 +1722,15 @@ FLASHINFER_INLINE void vec_t<half, 2>::memcpy(half* dst, const half* src) {
 
 template <>
 struct vec_t<half, 4> {
-  uint2 data;
+  int2 data;
 
   FLASHINFER_INLINE half& operator[](size_t i) { return ((half*)(&data))[i]; }
   FLASHINFER_INLINE const half& operator[](size_t i) const { return ((const half*)(&data))[i]; }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<half, G> lane(size_t lane_idx) const {
+    static_assert(4 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<half, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE half* ptr() { return reinterpret_cast<half*>(&data); }
   FLASHINFER_INLINE void fill(half val);
   FLASHINFER_INLINE void load(const half* ptr);
@@ -1686,12 +1755,12 @@ FLASHINFER_INLINE void vec_t<half, 4>::fill(half val) {
   *(half2*)(&data.y) = make_half2(val, val);
 }
 
-FLASHINFER_INLINE void vec_t<half, 4>::load(const half* ptr) { data = *((uint2*)ptr); }
+FLASHINFER_INLINE void vec_t<half, 4>::load(const half* ptr) { data = *((int2*)ptr); }
 
-FLASHINFER_INLINE void vec_t<half, 4>::store(half* ptr) const { *((uint2*)ptr) = data; }
+FLASHINFER_INLINE void vec_t<half, 4>::store(half* ptr) const { *((int2*)ptr) = data; }
 
 FLASHINFER_INLINE void vec_t<half, 4>::memcpy(half* dst, const half* src) {
-  *((uint2*)dst) = *((uint2*)src);
+  *((int2*)dst) = *((int2*)src);
 }
 
 // half x 8 or more
@@ -1702,6 +1771,12 @@ struct vec_t<half, vec_size> {
   int4 data[vec_size / 8];
   FLASHINFER_INLINE half& operator[](size_t i) { return ((half*)data)[i]; }
   FLASHINFER_INLINE const half& operator[](size_t i) const { return ((const half*)data)[i]; }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<half, G> lane(size_t lane_idx) const {
+    static_assert(vec_size % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<half, G>*>(&data[lane_idx / vec_size] +
+                                                    G * (lane_idx % vec_size));
+  }
   FLASHINFER_INLINE half* ptr() { return reinterpret_cast<half*>(&data); }
   FLASHINFER_INLINE void fill(half val) {
 #pragma unroll
@@ -1779,6 +1854,11 @@ struct vec_t<nv_bfloat16, 1> {
   FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
   }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<nv_bfloat16, G> lane(size_t lane_idx) const {
+    static_assert(1 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<nv_bfloat16, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE nv_bfloat16* ptr() { return reinterpret_cast<nv_bfloat16*>(&data); }
   FLASHINFER_INLINE void fill(nv_bfloat16 val);
   FLASHINFER_INLINE void load(const nv_bfloat16* ptr);
@@ -1816,6 +1896,11 @@ struct vec_t<nv_bfloat16, 2> {
   FLASHINFER_INLINE nv_bfloat16& operator[](size_t i) { return ((nv_bfloat16*)(&data))[i]; }
   FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<nv_bfloat16, G> lane(size_t lane_idx) const {
+    static_assert(2 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<nv_bfloat16, G>*>(&data + G * lane_idx);
   }
   FLASHINFER_INLINE nv_bfloat16* ptr() { return reinterpret_cast<nv_bfloat16*>(&data); }
   FLASHINFER_INLINE void fill(nv_bfloat16 val);
@@ -1856,11 +1941,16 @@ FLASHINFER_INLINE void vec_t<nv_bfloat16, 2>::memcpy(nv_bfloat16* dst, const nv_
 
 template <>
 struct vec_t<nv_bfloat16, 4> {
-  uint2 data;
+  int2 data;
 
   FLASHINFER_INLINE nv_bfloat16& operator[](size_t i) { return ((nv_bfloat16*)(&data))[i]; }
   FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<nv_bfloat16, G> lane(size_t lane_idx) const {
+    static_assert(4 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<nv_bfloat16, G>*>(&data + G * lane_idx);
   }
   FLASHINFER_INLINE nv_bfloat16* ptr() { return reinterpret_cast<nv_bfloat16*>(&data); }
   FLASHINFER_INLINE void fill(nv_bfloat16 val);
@@ -1886,16 +1976,14 @@ FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::fill(nv_bfloat16 val) {
   *(nv_bfloat162*)(&data.y) = make_bfloat162(val, val);
 }
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::load(const nv_bfloat16* ptr) {
-  data = *((uint2*)ptr);
-}
+FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::load(const nv_bfloat16* ptr) { data = *((int2*)ptr); }
 
 FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::store(nv_bfloat16* ptr) const {
-  *((uint2*)ptr) = data;
+  *((int2*)ptr) = data;
 }
 
 FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::memcpy(nv_bfloat16* dst, const nv_bfloat16* src) {
-  *((uint2*)dst) = *((uint2*)src);
+  *((int2*)dst) = *((int2*)src);
 }
 
 // nv_bfloat16 x 8 or more
@@ -1908,6 +1996,12 @@ struct vec_t<nv_bfloat16, vec_size> {
   FLASHINFER_INLINE nv_bfloat16& operator[](size_t i) { return ((nv_bfloat16*)data)[i]; }
   FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)data)[i];
+  }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<nv_bfloat16, G> lane(size_t lane_idx) const {
+    static_assert(vec_size % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<nv_bfloat16, G>*>(&data[lane_idx / vec_size] +
+                                                           G * (lane_idx % vec_size));
   }
   FLASHINFER_INLINE nv_bfloat16* ptr() { return reinterpret_cast<nv_bfloat16*>(&data); }
   FLASHINFER_INLINE void fill(nv_bfloat16 val) {
@@ -2228,6 +2322,11 @@ struct vec_t<float, 1> {
 
   FLASHINFER_INLINE float& operator[](size_t i) { return ((float*)(&data))[i]; }
   FLASHINFER_INLINE const float& operator[](size_t i) const { return ((const float*)(&data))[i]; }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<float, G> lane(size_t lane_idx) const {
+    static_assert(1 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<float, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE float* ptr() { return reinterpret_cast<float*>(&data); }
   FLASHINFER_INLINE void fill(float val);
   FLASHINFER_INLINE void load(const float* ptr);
@@ -2263,6 +2362,11 @@ struct vec_t<float, 2> {
 
   FLASHINFER_INLINE float& operator[](size_t i) { return ((float*)(&data))[i]; }
   FLASHINFER_INLINE const float& operator[](size_t i) const { return ((const float*)(&data))[i]; }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<float, G> lane(size_t lane_idx) const {
+    static_assert(2 % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<float, G>*>(&data + G * lane_idx);
+  }
   FLASHINFER_INLINE float* ptr() { return reinterpret_cast<float*>(&data); }
   FLASHINFER_INLINE void fill(float val);
   FLASHINFER_INLINE void load(const float* ptr);
@@ -2300,6 +2404,12 @@ struct vec_t<float, vec_size> {
 
   FLASHINFER_INLINE float& operator[](size_t i) { return ((float*)(data))[i]; }
   FLASHINFER_INLINE const float& operator[](size_t i) const { return ((const float*)(data))[i]; }
+  template <size_t G>
+  FLASHINFER_INLINE __device__ vec_t<float, G> lane(size_t lane_idx) const {
+    static_assert(vec_size % G == 0, "G must divide vec_size");
+    return *reinterpret_cast<const vec_t<float, G>*>(&data[lane_idx / vec_size] +
+                                                     G * (lane_idx % vec_size));
+  }
   FLASHINFER_INLINE float* ptr() { return reinterpret_cast<float*>(&data); }
   FLASHINFER_INLINE void fill(float val) {
 #pragma unroll
