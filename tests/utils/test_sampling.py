@@ -4484,6 +4484,64 @@ def test_sampling_from_logits_seed_offset_reproducibility(batch_size, vocab_size
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize("batch_size", [1, 99])
+@pytest.mark.parametrize("vocab_size", [1, 3, 111, 32000, 32001, 128256])
+def test_sampling_from_logits_half_precision_matches_float32(
+    batch_size, vocab_size, deterministic, dtype
+):
+    """Half-precision logits are read as stored and draw the float32 copy's samples."""
+    torch.manual_seed(42)
+    logits = (4 * torch.randn(batch_size, vocab_size, device="cuda:0")).to(dtype)
+    logits[torch.rand(batch_size, vocab_size, device="cuda:0") < 0.1] = float("-inf")
+    indices = torch.randint(
+        0, batch_size, (batch_size + 3,), device="cuda:0", dtype=torch.int64
+    )
+    # every other column of a wider tensor: a half-precision view that is not contiguous
+    strided = logits.repeat_interleave(2, dim=1)[:, ::2]
+    assert not strided.is_contiguous() or vocab_size == 1
+
+    # contiguous views that start 1, 2 and 3 elements into a buffer, so that the data
+    # pointer is not aligned for the kernel's widest half-precision load
+    shifted = []
+    for shift in (1, 2, 3):
+        buffer = torch.empty(shift + logits.numel(), device="cuda:0", dtype=dtype)
+        buffer[shift:] = logits.flatten()
+        shifted.append(buffer[shift:].view(batch_size, vocab_size))
+        assert shifted[-1].is_contiguous()
+
+    for half, kwargs in [
+        (logits, {}),
+        (logits, {"indices": indices}),
+        (strided, {}),
+        *[(view, {}) for view in shifted],
+    ]:
+        sample = partial(
+            flashinfer.sampling.sampling_from_logits,
+            deterministic=deterministic,
+            seed=12345,
+            offset=7,
+            **kwargs,
+        )
+        assert torch.equal(sample(half), sample(half.float()))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sampling_from_logits_half_precision_allocates_no_float32_copy(dtype):
+    batch_size, vocab_size = 64, 32000
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0").to(dtype)
+    # warm up: load the module and its workspace before measuring
+    flashinfer.sampling.sampling_from_logits(logits, seed=1, offset=0)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    allocated = torch.cuda.memory_allocated()
+    flashinfer.sampling.sampling_from_logits(logits, seed=1, offset=0)
+    torch.cuda.synchronize()
+    float32_copy_bytes = batch_size * vocab_size * 4
+    assert torch.cuda.max_memory_allocated() - allocated < float32_copy_bytes
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 def test_sampling_different_seed_offset_produces_different_results(vocab_size):
     """Test that different seed/offset values produce different samples."""

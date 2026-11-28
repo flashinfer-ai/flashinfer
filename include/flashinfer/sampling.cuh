@@ -746,9 +746,9 @@ struct LogitsArgMaxOp {
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
-          typename DType, typename IdType>
+          typename DType, typename IdType, typename LogitsT>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLogitsKernel(
-    DType* logits, IdType* output, IdType* indices, uint32_t d, uint64_t* seed_arr,
+    LogitsT* logits, IdType* output, IdType* indices, uint32_t d, uint64_t* seed_arr,
     uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride,
     uint32_t offset_stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -1889,13 +1889,16 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
 
 // RNG strides are 0 for broadcast tensors and 1 for per-output-row tensors.
 // Default to broadcast to preserve existing C++ callers.
-template <typename T, typename IdType>
+// T is the storage type of the logits and ComputeT the type the kernel computes in: each
+// element is widened to ComputeT on load, so half-precision logits need no float32 copy and
+// draw the same samples as that copy would.
+template <typename T, typename IdType, typename ComputeT = T>
 cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint32_t batch_size,
                                uint32_t d, bool deterministic, uint64_t* seed_arr,
                                uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
                                cudaStream_t stream = 0, uint32_t seed_stride = 0,
                                uint32_t offset_stride = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  const uint32_t vec_size = std::gcd(16 / sizeof(ComputeT), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
@@ -1903,13 +1906,14 @@ cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint3
     dim3 nthrs(BLOCK_THREADS);
     void* args[] = {&logits,   &output,     &indices,    &d,           &seed_arr,
                     &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
-    const uint32_t smem_size = sizeof(
-        typename BlockReduce<DataAndIndex<T, uint32_t>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
+    const uint32_t smem_size =
+        sizeof(typename BlockReduce<DataAndIndex<ComputeT, uint32_t>, BLOCK_THREADS,
+                                    REDUCE_ALGO>::TempStorage);
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
           auto kernel = SamplingFromLogitsKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,
-                                                 DETERMINISTIC, T, IdType>;
+                                                 DETERMINISTIC, ComputeT, IdType, T>;
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         })});
