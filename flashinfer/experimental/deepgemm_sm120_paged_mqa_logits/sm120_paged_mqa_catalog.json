@@ -2050,6 +2050,32 @@
         ]
       },
       "tables": {
+        "110": {
+          "h32:p128:n6:a6:c4k": [
+            [
+              256,
+              "sm120:fp8:h32:p128:n6:a6:mpf_bta_ha_sp_kf2q_ef_par"
+            ]
+          ],
+          "h64:p64:n1:a1:c16k": [
+            [
+              8,
+              "sm120:fp8:h64:p64:n1:a1:mx_bta_ha_wr_ef_par"
+            ]
+          ],
+          "h64:p64:n5:a3:c4k": [
+            [
+              256,
+              "sm120:fp8:h64:p64:n5:a5:atom5_mpf_bta_ha_k2q_ef_par"
+            ]
+          ],
+          "h64:p64:n6:a3:c4k": [
+            [
+              256,
+              "sm120:fp8:h64:p64:n6:a6:atom6_mpf_bta_ha_ef_par"
+            ]
+          ]
+        },
         "170": {
           "h32:p128:n1:a1:c16k": [
             [
