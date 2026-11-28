@@ -5810,21 +5810,15 @@ class _TrtllmRunnerBase(MoERunner):
                 "by the CUTLASS MXFP8 runners only."
             )
 
-    def check_support(self) -> None:
-        # Attach the SM8x pipeline only after every runner-level check, the
-        # subclasses' configuration and arch checks included, has passed.
-        self._support_checked = False
-        self._sm8x = None
-        self._check_support()
+    def _attach_sm8x(self, arch: int) -> None:
+        """Attach the SM8x pipeline where ``arch`` runs it; a runner calls this once
+        its configuration and arch checks have passed. A repeated check keeps the
+        attached (and possibly built) pipeline."""
         body = self._sm8x_body_class()
-        if body is not None:
-            from ..utils import get_compute_capability
-
-            major, minor = get_compute_capability(self.device)
-            if major * 10 + minor in body._supported_archs:
+        if body is not None and arch in body._supported_archs:
+            if type(self._sm8x) is not body:
                 self._sm8x = body(self.config, self.device)
-                self._sm8x.check_support()
-        self._support_checked = True
+            self._sm8x.check_support()
 
     def _sm8x_body_class(self) -> Any:
         """The ``sm8x_fp8_moe`` pipeline that runs this runner where the trtllm-gen
@@ -6502,6 +6496,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} is enabled only on validated "
                 f"SM100/SM103 targets, got sm{arch}."
             )
+        self._attach_sm8x(arch)
 
     def _sm8x_body_class(self) -> Any:
         from .api import QuantFormat
@@ -6891,6 +6886,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} is enabled only on validated "
                 f"SM100/SM103 targets, got sm{arch}."
             )
+        self._attach_sm8x(arch)
 
     def _sm8x_body_class(self) -> Any:
         from .sm8x_fp8_moe import Sm8xTrtllmFp8PerTensorMoE
