@@ -577,6 +577,15 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
       cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
         cute::gemm(mma, tCrA_gate(_, _, k_block), tCrB(_, _, k_block), tmp_accum);
       });
+      asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+          "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+          "fence.proxy.async.shared::cta;"
+#endif
+          ::
+              : "memory");
       ab_empty_mbar[read_stage].arrive();
       advance_read_stage();
       ab_full_mbar[read_stage].wait(ab_phase);
@@ -597,6 +606,15 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
     cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
       cute::gemm(mma, tCrA_gate(_, _, k_block), tCrB(_, _, k_block), tmp_accum);
     });
+    asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+        "fence.proxy.async.shared::cta;"
+#endif
+        ::
+            : "memory");
     ab_empty_mbar[read_stage].arrive();
     advance_read_stage();
     rescale_gate();
@@ -794,6 +812,15 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
 
     sf_full_mbar[read_stage].wait(sf_phase);
     copy_scale_s2r();
+    asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+        "fence.proxy.async.shared::cta;"
+#endif
+        ::
+            : "memory");
     sf_empty_mbar[read_stage].arrive();
     ab_full_mbar[read_stage].wait(ab_phase);
     copy_up_s2r(Int<0>{});
@@ -814,6 +841,15 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
         if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
           copy_gate_s2r(Int<k_block_idx + 1>{});
         } else {
+          asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+              "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+              "fence.proxy.async.shared::cta;"
+#endif
+              ::
+                  : "memory");
           ab_empty_mbar[read_stage].arrive();
           advance_read_stage();
           ab_full_mbar[read_stage].wait(ab_phase);
@@ -825,6 +861,15 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
 
       sf_full_mbar[read_stage].wait(sf_phase);
       copy_scale_s2r();
+      asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+          "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+          "fence.proxy.async.shared::cta;"
+#endif
+          ::
+              : "memory");
       sf_empty_mbar[read_stage].arrive();
     }
 
@@ -843,6 +888,15 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
       if constexpr (k_block_idx + 1 < K_BLOCK_MAX) {
         copy_gate_s2r(Int<k_block_idx + 1>{});
       } else {
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         ab_empty_mbar[read_stage].arrive();
         advance_read_stage();
       }

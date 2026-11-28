@@ -288,6 +288,15 @@ struct SM120BlockScaledGemmKernel {
         sf_full_mbar[sf_stage].wait(sf_phase);
         cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, sf_stage), tXrSFA);
         cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, sf_stage), tXrSFB);
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         sf_empty_mbar[sf_stage].arrive();
 
         cute::for_each(
@@ -299,6 +308,15 @@ struct SM120BlockScaledGemmKernel {
               ab_full_mbar[ab_stage].wait(ab_phase);
               cute::copy(s2r_copy_A, tXsA(_, _, _, Int<ab_stage>{}), tXrA);
               cute::copy(s2r_copy_B, tXsB(_, _, _, Int<ab_stage>{}), tXrB);
+              asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                  "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                  "fence.proxy.async.shared::cta;"
+#endif
+                  ::
+                      : "memory");
               ab_empty_mbar[ab_stage].arrive();
               if constexpr (ab_stage == KT::AB_Stages - 1) {
                 ab_phase ^= 1;
@@ -315,6 +333,15 @@ struct SM120BlockScaledGemmKernel {
       sf_full_mbar[sf_stage].wait(sf_phase);
       cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, sf_stage), tXrSFA);
       cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, sf_stage), tXrSFB);
+      asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+          "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+          "fence.proxy.async.shared::cta;"
+#endif
+          ::
+              : "memory");
       sf_empty_mbar[sf_stage].arrive();
 
       cute::for_each(
@@ -328,6 +355,15 @@ struct SM120BlockScaledGemmKernel {
             ab_full_mbar[ab_stage].wait(ab_phase);
             cute::copy(s2r_copy_A, tXsA(_, _, _, Int<ab_stage>{}), tXrA);
             cute::copy(s2r_copy_B, tXsB(_, _, _, Int<ab_stage>{}), tXrB);
+            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                "fence.proxy.async.shared::cta;"
+#endif
+                ::
+                    : "memory");
             ab_empty_mbar[ab_stage].arrive();
             if constexpr (ab_stage == KT::AB_Stages - 1) {
               ab_phase ^= 1;
