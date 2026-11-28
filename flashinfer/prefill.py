@@ -3816,6 +3816,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 fixed_split_size=fixed_split_size or -1,
                 disable_split_kv=disable_split_kv,
                 use_cuda_graph=self._use_cuda_graph,
+                window_left=window_left,
             )
             return (float_bytes, 0)
 
@@ -4677,7 +4678,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             _validate_sm120_prims_plan_options(
                 kv_layout=self._kv_layout,
-                required_kv_layout="HND",
+                required_kv_layout=(
+                    self._kv_layout
+                    if page_size == 1 and self._kv_layout in ("HND", "NHD")
+                    else "HND"
+                ),
                 custom_mask=custom_mask,
                 packed_custom_mask=packed_custom_mask,
                 pos_encoding_mode=pos_encoding_mode,
@@ -4718,6 +4723,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
                 use_cuda_graph=self._use_cuda_graph,
+                window_left=window_left,
             )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -5415,10 +5421,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not accept custom run arguments"
                 )
-            if sinks is not None:
-                raise NotImplementedError(
-                    "backend='cute-dsl-prims' does not support attention sinks"
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
@@ -5438,13 +5440,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "backend='cute-dsl-prims' requires HND K/V pools with shape "
                     "[num_pages, num_kv_heads, page_size, head_dim]"
                 )
+            assert self._prims_backend is not None
+            if self._kv_layout == "NHD" and self._prims_backend._page_size == 1:
+                if k_cache.shape[1] != 1:
+                    raise ValueError(
+                        "backend='cute-dsl-prims' with kv_layout='NHD' and "
+                        "page_size=1 requires K/V pools with shape "
+                        "[num_pages, 1, num_kv_heads, head_dim]; got "
+                        f"{tuple(k_cache.shape)}"
+                    )
+                k_cache = k_cache.squeeze(1).unsqueeze(2)
+                v_cache = v_cache.squeeze(1).unsqueeze(2)
             if out is None:
                 out = torch.empty(
                     q.shape,
                     dtype=self._cached_o_data_type,
                     device=q.device,
                 )
-            assert self._prims_backend is not None
             lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
             res = self._prims_backend.run_paged(
                 q,
@@ -5457,6 +5469,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                sinks=sinks,
             )
             if isinstance(res, tuple):
                 return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
@@ -6994,6 +7007,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_vo=head_dim_vo,
                 causal=causal,
                 sm_scale=sm_scale,
+                window_left=window_left,
             )
         elif self._backend == "cute-dsl":
             self._plan_info = None
@@ -7892,11 +7906,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not accept custom run arguments"
                 )
-            if getattr(self, "_sinks", None) is not None:
-                raise NotImplementedError(
-                    "attention sinks were set on the wrapper (_sinks) but "
-                    "backend='cute-dsl-prims' does not support attention sinks"
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
@@ -7915,6 +7924,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                # vLLM's metadata builder stashes attention sinks on the wrapper.
+                sinks=getattr(self, "_sinks", None),
             )
             return (
                 (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
