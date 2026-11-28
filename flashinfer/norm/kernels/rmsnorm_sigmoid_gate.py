@@ -18,13 +18,15 @@ try:
     import cutlass
     import cutlass.cute as cute
 
+    from ..utils import get_sm_version, max_cluster_n
+
     HAS_CUTEDSL = True
 except ImportError:  # pragma: no cover - exercised without nvidia-cutlass-dsl
     HAS_CUTEDSL = False
 
 
 HEAD_DIM = 64
-_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7), (12, 0))
 LOG2E = 1.4426950408889634
 INV_HEAD_DIM = 1.0 / HEAD_DIM
 
@@ -316,7 +318,10 @@ def _get_compiled(
     warps: int,
     cluster: int,
     enable_pdl: bool = False,
+    sm_version: int = 0,
 ):
+    # sm_version only keys the in-process cache per architecture; the on-disk
+    # cache is already scoped per architecture.
     shape = (cute.sym_int(), num_heads, HEAD_DIM)
     x = cute.runtime.make_fake_tensor(
         cutlass.BFloat16,
@@ -388,7 +393,9 @@ def rmsnorm_sigmoid_gate(
     if x.data_ptr() % 16 or gate.data_ptr() % 16:
         raise ValueError("x and gate must be 16-byte aligned")
     if torch.cuda.get_device_capability(x.device) not in _COMPUTE_CAPABILITIES:
-        raise ValueError("rmsnorm_sigmoid_gate requires an SM100, SM103, or SM107 GPU")
+        raise ValueError(
+            "rmsnorm_sigmoid_gate requires an SM100, SM103, SM107, or SM120 GPU"
+        )
     if x.numel() == 0:
         return
 
@@ -396,18 +403,21 @@ def rmsnorm_sigmoid_gate(
     lanes, warps, cluster = _launch_config(rows)
     rows_per_cta = 32 * warps // lanes
     tiles = (rows + rows_per_cta - 1) // rows_per_cta
-    cluster = min(cluster, tiles)
-
-    compiled = _get_compiled(
-        x.shape[1],
-        x.stride(0),
-        gate.stride(0),
-        lanes,
-        warps,
-        cluster,
-        enable_pdl,
-    )
-    compiled(x, gate, x, eps)
+    sm_version = get_sm_version(x.device)
+    # 16-CTA clusters are non-portable; some SM12x parts reject them.
+    with torch.cuda.device(x.device):  # probe, compile and launch for x's device
+        cluster = min(cluster, tiles, max_cluster_n(sm_version))
+        compiled = _get_compiled(
+            x.shape[1],
+            x.stride(0),
+            gate.stride(0),
+            lanes,
+            warps,
+            cluster,
+            enable_pdl,
+            sm_version,
+        )
+        compiled(x, gate, x, eps)
 
 
 def supports_rmsnorm_sigmoid_gate(
@@ -415,7 +425,7 @@ def supports_rmsnorm_sigmoid_gate(
     head_dim: int,
     device: torch.device | str | None = None,
 ) -> bool:
-    """Whether the SM100/SM103/SM107 fused kernel supports this dtype and head size."""
+    """Whether the SM100/SM103/SM107/SM120 fused kernel supports this dtype and head size."""
     if not HAS_CUTEDSL or dtype != torch.bfloat16 or head_dim != HEAD_DIM:
         return False
     if device is None:

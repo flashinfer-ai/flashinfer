@@ -24,7 +24,9 @@ BACKENDS = ("auto", "cake", "cute")
 
 def _skip_unless_supported(backend):
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM):
-        pytest.skip("RMSNorm sigmoid gate requires BF16 on SM100, SM103, or SM107")
+        pytest.skip(
+            "RMSNorm sigmoid gate requires BF16 on SM100, SM103, SM107, or SM120"
+        )
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM, backend=backend):
         pytest.skip(f"backend {backend!r} is not available on this device")
 
@@ -211,7 +213,9 @@ def test_rmsnorm_sigmoid_gate_rejects_cpu_tensors():
 
 def test_rmsnorm_sigmoid_gate_rejects_misaligned_tensors():
     if not supports_rmsnorm_sigmoid_gate(torch.bfloat16, HEAD_DIM):
-        pytest.skip("RMSNorm sigmoid gate requires BF16 on SM100, SM103, or SM107")
+        pytest.skip(
+            "RMSNorm sigmoid gate requires BF16 on SM100, SM103, SM107, or SM120"
+        )
     numel = NUM_HEADS * HEAD_DIM
     x = torch.empty(numel + 1, dtype=torch.bfloat16, device="cuda")[1:].view(
         1, NUM_HEADS, HEAD_DIM

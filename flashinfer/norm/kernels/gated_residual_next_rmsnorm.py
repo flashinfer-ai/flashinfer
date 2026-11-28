@@ -26,6 +26,7 @@ from cutlass import Float32, Int32, const_expr
 
 from ...cute_dsl.utils import mbarrier_wait_acquire_cluster
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from ..utils import get_sm_version
 
 H = 8192
 CLUSTER_N = 8
@@ -320,7 +321,10 @@ def _get_compiled(
     alpha_mode: int = 0,
     enable_pdl: bool = False,
     has_router: bool = False,
+    sm_version: int = 0,
 ):
+    # sm_version only keys the in-process cache per architecture; the on-disk
+    # cache is already scoped per architecture.
     sym_m = cute.sym_int()
     branch = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
@@ -423,28 +427,30 @@ def run(
         raise ValueError("router_input must be aligned contiguous FP32 like branch")
     if branch.shape[0] == 0:
         return
-    fn = _get_compiled(
-        float(post_eps),
-        float(next_eps),
-        float(next_gain_center),
-        post_weight is not None,
-        float(post_gain_center) if post_weight is not None else 0.0,
-        0 if alpha_scalar is None else 1 if alpha_scalar == 1.0 else 2,
-        enable_pdl,
-        router_input is not None,
-    )
-    fn(
-        branch,
-        residual,
-        alpha.unsqueeze(0),
-        beta.unsqueeze(0),
-        next_weight.unsqueeze(0),
-        residual_out,
-        ffn_input,
-        (post_weight if post_weight is not None else next_weight).unsqueeze(0),
-        router_input if router_input is not None else residual_out,
-        1.0 if alpha_scalar is None else float(alpha_scalar),
-    )
+    with torch.cuda.device(branch.device):
+        fn = _get_compiled(
+            float(post_eps),
+            float(next_eps),
+            float(next_gain_center),
+            post_weight is not None,
+            float(post_gain_center) if post_weight is not None else 0.0,
+            0 if alpha_scalar is None else 1 if alpha_scalar == 1.0 else 2,
+            enable_pdl,
+            router_input is not None,
+            get_sm_version(branch.device),
+        )
+        fn(
+            branch,
+            residual,
+            alpha.unsqueeze(0),
+            beta.unsqueeze(0),
+            next_weight.unsqueeze(0),
+            residual_out,
+            ffn_input,
+            (post_weight if post_weight is not None else next_weight).unsqueeze(0),
+            router_input if router_input is not None else residual_out,
+            1.0 if alpha_scalar is None else float(alpha_scalar),
+        )
 
 
 def gated_residual_next_rmsnorm(

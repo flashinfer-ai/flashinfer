@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
-"""Fused gated residual RMSNorm (CuTe DSL, SM100/SM103).
+"""Fused gated residual RMSNorm (CuTe DSL, SM100/SM103/SM107/SM120).
 
     x      = f32(branch)                        (MODE == 0)
     x      = f32(branch) * f32(norm_weight)     (MODE == 1, weight before the norm)
@@ -82,6 +82,7 @@ import torch
 from cutlass.utils import SmemAllocator
 
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from ..utils import get_sm_version
 
 EP = cute.nvgpu.CacheEvictionPriority
 FIRST = EP.EVICT_FIRST
@@ -416,7 +417,10 @@ def _get_compiled(
     mbpm,
     cx,
     enable_pdl,
+    sm_version=0,
 ):
+    # sm_version only keys the in-process cache per architecture; the on-disk
+    # cache is already scoped per architecture.
     sym_m = cute.sym_int()
     branch = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16, (sym_m, H), stride_order=(1, 0), assumed_align=16
@@ -508,19 +512,21 @@ def run(
     # split costs more than it saves -- the launch cannot start the row until a
     # single GPC has eight free SMs -- so wide splits are clustered pairwise.
     cx = s if s <= 4 else 2
-    fn = _get_compiled(
-        vec,
-        s,
-        mode_i,
-        lowreg,
-        float(gain_center),
-        float(eps),
-        mbpm,
-        cx,
-        bool(enable_pdl),
-    )
-    # Launch on the caller's current stream so the kernel is graph capturable.
-    fn(branch, stream, norm_weight, alpha, beta, output)
+    with torch.cuda.device(branch.device):
+        fn = _get_compiled(
+            vec,
+            s,
+            mode_i,
+            lowreg,
+            float(gain_center),
+            float(eps),
+            mbpm,
+            cx,
+            bool(enable_pdl),
+            get_sm_version(branch.device),
+        )
+        # Launch on the caller's current stream so the kernel is graph capturable.
+        fn(branch, stream, norm_weight, alpha, beta, output)
 
 
 def gated_residual_rmsnorm(

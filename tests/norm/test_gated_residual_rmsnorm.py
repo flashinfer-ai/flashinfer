@@ -19,7 +19,7 @@ BACKENDS = ("auto", "cake", "cute")
 def _skip_unless_supported(inputs, backend):
     if not supports_gated_residual_rmsnorm(*inputs):
         pytest.skip(
-            "gated residual RMSNorm requires BF16/FP32 tensors on SM100, SM103, or SM107"
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100, SM103, SM107, or SM120"
         )
     if not supports_gated_residual_rmsnorm(*inputs, backend=backend):
         pytest.skip(f"backend {backend!r} is not available on this device")
@@ -68,8 +68,8 @@ def _kwargs(weight_before_norm: bool):
 def test_gated_residual_rmsnorm_supports_supported_devices():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("SM100, SM103, or SM107 is required")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7), (12, 0)):
+        pytest.skip("SM100, SM103, SM107, or SM120 is required")
     inputs = _inputs(1)
     assert supports_gated_residual_rmsnorm(*inputs)
     assert supports_gated_residual_rmsnorm(
@@ -193,7 +193,7 @@ def test_gated_residual_rmsnorm_rejects_unsafe_layouts():
     inputs = list(_inputs(1))
     if not supports_gated_residual_rmsnorm(*inputs):
         pytest.skip(
-            "gated residual RMSNorm requires BF16/FP32 tensors on SM100, SM103, or SM107"
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100, SM103, SM107, or SM120"
         )
 
     strided_weight = torch.empty(2 * HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")[

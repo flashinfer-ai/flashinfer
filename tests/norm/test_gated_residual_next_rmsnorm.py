@@ -37,7 +37,9 @@ def _cake_admits(inputs, post_weight=None) -> bool:
 
 def _skip_unless_supported(inputs, backend, **kwargs):
     if not supports_gated_residual_next_rmsnorm(*inputs, **kwargs):
-        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
+        pytest.skip(
+            "gated residual next RMSNorm requires SM100, SM103, SM107, or SM120"
+        )
     if not supports_gated_residual_next_rmsnorm(*inputs, backend=backend, **kwargs):
         pytest.skip(f"backend {backend!r} is not available on this device")
     if backend == "cake" and not _cake_admits(inputs, kwargs.get("post_weight")):
@@ -382,7 +384,9 @@ def test_cake_dispatch_matches_the_served_rows(tensor_alpha, post_input_scale):
 def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
     inputs = list(_inputs(1))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
+        pytest.skip(
+            "gated residual next RMSNorm requires SM100, SM103, SM107, or SM120"
+        )
     strided_weight = torch.empty(2 * HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")[
         ::2
     ]
