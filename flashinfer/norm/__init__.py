@@ -27,7 +27,7 @@ This package provides high-performance normalization kernels:
 import functools
 import os
 import warnings
-from typing import Literal, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -205,6 +205,20 @@ def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool
     return False
 
 
+@functools.cache
+def _captured_arch_once(probe: Callable[[], Optional[str]]) -> Optional[str]:
+    """Ask ``probe`` for the DSL's captured compile target once and remember it.
+
+    ``_use_cuda_norm`` runs on every norm call, and the probe
+    (:func:`flashinfer.cute_dsl.availability._dsl_captured_arch`) resolves
+    ``cutlass`` and its DSL singleton each time it is asked. The target is
+    captured when ``cutlass`` is first imported and does not change in a process
+    that runs norm kernels, so one answer per probe is enough. The cache is keyed
+    by the probe itself, so a replaced probe (tests substitute it) is asked again.
+    """
+    return probe()
+
+
 def _use_cuda_norm(device: torch.device) -> bool:
     """Determine whether to use CUDA JIT norm kernels instead of CuTe DSL.
 
@@ -257,7 +271,7 @@ def _use_cuda_norm(device: torch.device) -> bool:
     # Check if DSL's captured compile target is compatible with this device
     # (handles mixed-architecture hosts where device 0 != target device)
     if _dsl_captured_arch is not None:
-        captured_arch = _dsl_captured_arch()
+        captured_arch = _captured_arch_once(_dsl_captured_arch)
         if captured_arch is not None and not _is_arch_compatible(
             captured_arch, device_cap
         ):
