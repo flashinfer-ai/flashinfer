@@ -13,6 +13,7 @@ The output directory is controlled by FLASHINFER_TRACE_DUMP_DIR.
 Requires a CUDA-capable GPU.
 
 Results:
+- mrope_cos_sin_cache_inplace_q2048_k1024_d128_r128_t24_h20_w20_i1_b1_f0_p1.json
 - ulysses_exchange_chunks_ws1_c256.json
 - ulysses_lowp_k_sum_v_amax_h8_d64.json
 - ulysses_lowp_q_grouped_amax_h8_d64_p8.json
@@ -545,6 +546,19 @@ flashinfer.apply_rope_with_cos_sin_cache(
 )
 flashinfer.apply_rope_with_cos_sin_cache_inplace(
     rope_positions, rope_query.clone(), rope_key.clone(), rope_D, rope_cos_sin
+)
+
+
+# Cached multimodal RoPE: native QKV views with three independent position axes.
+mrope_storage = torch.randn(117, 32 * 128, dtype=torch.bfloat16, device=device)
+flashinfer.apply_mrope_with_cos_sin_cache_inplace(
+    torch.randint(256, (3, 117), dtype=torch.int64, device=device),
+    mrope_storage[:, : 16 * 128],
+    mrope_storage[:, 16 * 128 : 24 * 128],
+    128,
+    torch.rand(256, 128, dtype=torch.bfloat16, device=device),
+    (24, 20, 20),
+    mrope_interleaved=True,
 )
 
 
