@@ -40,14 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_PACKET_OFF 0
-#define SMEM_PACKET_STAGE_BYTES 2048
-#define SMEM_PACKET_STRIDE 2048
-#define SMEM_TOTAL 2112
-#define THREADS 128
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -106,7 +98,7 @@ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -137,7 +129,7 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned long long* packet = reinterpret_cast<unsigned long long*>(smem_raw + 0);
     const int packet_addr = smem + 0;
 
@@ -150,13 +142,13 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
     int is_sender = blockIdx.z == 0;
     int sender_rank = ((is_sender != 0) ? cp_rank : peer);
     int receiver_rank = ((is_sender != 0) ? peer : cp_rank);
-    unsigned long long rank_stride_bytes = workspace_stride_in_u64 * 8;
-    unsigned long long fifo_region_bytes = 2097152 * (unsigned long long)max_channel_count;
-    unsigned long long info_plane_bytes = 1024 * (unsigned long long)max_channel_count;
+    unsigned long long rank_stride_bytes = workspace_stride_in_u64 * 8ull;
+    unsigned long long fifo_region_bytes = 2097152ull * (unsigned long long)max_channel_count;
+    unsigned long long info_plane_bytes = 1024ull * (unsigned long long)max_channel_count;
     unsigned long long fifo_rank_offset = (unsigned long long)receiver_rank * rank_stride_bytes;
-    unsigned long long fifo_offset = fifo_rank_offset + (unsigned long long)sender_rank * (unsigned long long)max_channel_count * 524288 + (unsigned long long)channel * 524288;
-    unsigned long long sender_info_offset = (unsigned long long)sender_rank * rank_stride_bytes + fifo_region_bytes + (unsigned long long)receiver_rank * (unsigned long long)max_channel_count * 256 + (unsigned long long)channel * 256;
-    unsigned long long receiver_info_offset = (unsigned long long)receiver_rank * rank_stride_bytes + fifo_region_bytes + info_plane_bytes + (unsigned long long)sender_rank * (unsigned long long)max_channel_count * 256 + (unsigned long long)channel * 256;
+    unsigned long long fifo_offset = fifo_rank_offset + (unsigned long long)sender_rank * (unsigned long long)max_channel_count * 524288ull + (unsigned long long)channel * 524288ull;
+    unsigned long long sender_info_offset = (unsigned long long)sender_rank * rank_stride_bytes + fifo_region_bytes + (unsigned long long)receiver_rank * (unsigned long long)max_channel_count * 256ull + (unsigned long long)channel * 256ull;
+    unsigned long long receiver_info_offset = (unsigned long long)receiver_rank * rank_stride_bytes + fifo_region_bytes + info_plane_bytes + (unsigned long long)sender_rank * (unsigned long long)max_channel_count * 256ull + (unsigned long long)channel * 256ull;
     unsigned int group_smem_addr = packet_addr + (unsigned int)(group * 512);
     int group_word_base = group * 64;
     if (elect_sync()) {
@@ -174,9 +166,9 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
         int fifo_index = -1;
         #pragma unroll 1
         for (int entry = channel; entry < entry_count; entry += run_channels) {
-            long long data_index = (long long)entry * 4 + (long long)peer;
+            long long data_index = (long long)entry * 4ll + (long long)peer;
             if (elect_sync()) {
-                cp_async_bulk_gmem2smem(group_smem_addr, partial_o + (data_index * 128), 256, ready_addr + (group) * 8);
+                cp_async_bulk_gmem2smem(group_smem_addr, partial_o + data_index * 128ll, 256, ready_addr + (group) * 8);
             }
             asm volatile(
                 "{\n\t"
@@ -184,7 +176,7 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
                 "setp.ne.b32 p, %0, 0;\n\t"
                 "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
                 "}"
-                :: "r"((lane_1 == 0) ? 1 : 0), "r"(group_smem_addr + 256), "l"(softmax_stats + (data_index * 2)));
+                :: "r"((lane_1 == 0) ? 1 : 0), "r"(group_smem_addr + 256), "l"(softmax_stats + data_index * 2ll));
             asm volatile("cp.async.commit_group;");
             mbarrier_arrive_expect_tx(ready_addr + (group) * 8, ((lane_1 == 0) ? 256 : 0));
             if (fifo_entry_block_base + 4 > 1024) {
@@ -193,9 +185,9 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
                     __syncwarp();
                     reinterpret_cast<volatile long long*>(workspace + sender_info_offset)[0] = head;
                 }
-                fifo_index = (int)(head % 4);
+                fifo_index = (int)(head % 4ll);
                 fifo_entry_block_base = 0;
-                while (head >= observed_tail + 4) {
+                while (head >= observed_tail + 4ll) {
                     observed_tail = reinterpret_cast<volatile long long*>(workspace + sender_info_offset)[1];
                 }
                 __syncwarp();
@@ -236,8 +228,9 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
                 : "r"(group_smem_addr + (unsigned int)(lane_1 * 16)));
             {
                 int4 _iv4 = make_int4(fifo_vec[0 + 0], fifo_vec[0 + 1], fifo_vec[0 + 2], fifo_vec[0 + 3]);
-                *reinterpret_cast<int4*>(workspace + (fifo_offset + (unsigned long long)fifo_index * 131072 + (unsigned long long)fifo_entry_block_base * 128 + (unsigned long long)lane_1 * 16) + 0) = _iv4;
+                *reinterpret_cast<int4*>(workspace + (fifo_offset + (unsigned long long)fifo_index * 131072ull + (unsigned long long)fifo_entry_block_base * 128ull + (unsigned long long)lane_1 * 16ull) + 0) = _iv4;
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
             fifo_entry_block_base += 4;
         }
@@ -261,7 +254,7 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
                     tail += 1;
                     need_release = 1;
                 }
-                fifo_index_1 = (int)(tail % 4);
+                fifo_index_1 = (int)(tail % 4ll);
                 fifo_entry_block_base_1 = 0;
                 __syncwarp();
             }
@@ -270,7 +263,7 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
             while (loaded_blocks < 4) {
                 int remaining_blocks = 4 - loaded_blocks;
                 if (elect_sync()) {
-                    cp_async_bulk_gmem2smem(group_smem_addr + (unsigned int)(loaded_blocks * 128), workspace + (fifo_offset + (unsigned long long)fifo_index_1 * 131072 + (unsigned long long)fifo_entry_block_base_1 * 128 + (unsigned long long)loaded_blocks * 128), remaining_blocks * 128, ready_addr + (group) * 8);
+                    cp_async_bulk_gmem2smem(group_smem_addr + (unsigned int)(loaded_blocks * 128), workspace + (fifo_offset + (unsigned long long)fifo_index_1 * 131072ull + (unsigned long long)fifo_entry_block_base_1 * 128ull + (unsigned long long)loaded_blocks * 128ull), remaining_blocks * 128, ready_addr + (group) * 8);
                 }
                 mbarrier_arrive_expect_tx(ready_addr + (group) * 8, ((lane_1 == 0) ? remaining_blocks * 128 : 0));
                 if (need_release != 0) {
@@ -291,13 +284,14 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
                     unsigned long long probe_flag = packet[group_word_base + probe_block * 16 + probe_flag_word];
                     matched = probe_flag == (unsigned long long)tail;
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 __syncwarp();
                 unsigned int valid_mask = __ballot_sync(0xFFFFFFFF, matched != 0);
                 int _find_first_set_0 = __ffs(~valid_mask);
                 int valid_blocks = _find_first_set_0 - 1;
                 loaded_blocks += valid_blocks;
             }
-            long long data_index_1 = (long long)entry_1 * 4 + (long long)peer;
+            long long data_index_1 = (long long)entry_1 * 4ll + (long long)peer;
             int out_flag_lane = (fifo_entry_block_base_1 & 15) / 2;
             int lo_word = group_word_base + lane_1 * 2;
             int hi_word = group_word_base + lane_1 * 2 + 1;
@@ -310,11 +304,12 @@ kernel_cake_dcp_alltoall_b8b8ebc8b91fd813f375(__nv_bfloat16* __restrict__ partia
             wire[0] = packet[lo_word];
             wire[1] = packet[hi_word];
             if (lane_1 < 16) {
-                reinterpret_cast<int4*>(reinterpret_cast<unsigned long long*>(partial_o_out) + (data_index_1 * 32 + (long long)(lane_1 * 2)))[0] = reinterpret_cast<int4*>(wire)[0];
+                reinterpret_cast<int4*>(reinterpret_cast<unsigned long long*>(partial_o_out) + (data_index_1 * 32ll + (long long)(lane_1 * 2)))[0] = reinterpret_cast<int4*>(wire)[0];
             }
             if (lane_1 == 16) {
                 *(reinterpret_cast<unsigned long long*>(reinterpret_cast<unsigned long long*>(softmax_stats_out)) + (data_index_1)) = wire[0];
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
             fifo_entry_block_base_1 += 4;
         }
