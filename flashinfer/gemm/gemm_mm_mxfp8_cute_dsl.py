@@ -22,9 +22,16 @@ import torch
 
 from ..autotuner import OptimizationProfile, TunableRunner
 from ..jit.cpp_ext import get_cuda_version
-from ..utils import get_device_sm_count, supported_compute_capability
+from ..utils import (
+    get_device_index,
+    get_device_sm_count,
+    supported_compute_capability,
+)
 from .gemm_mm_fp4_cute_dsl import (
+    _blockscaled_mxfp8_sm120_cache_key_files,
     _compile_block_scaled_gemm,
+    _mm_mxfp8_sm120_cache_key,
+    _mxfp8_sm120_kernel_disk_name,
     _prepare_alpha_for_launch,
 )
 
@@ -239,7 +246,7 @@ def _b12x_gemm_mxfp8_runner(
             sf_n = (n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = (
+            cache_key = _mm_mxfp8_sm120_cache_key(
                 sf_vec_size,
                 mma_tiler_mn,
                 cluster_shape_mn,
@@ -279,6 +286,10 @@ def _b12x_gemm_mxfp8_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
+                cache_module_name="mm_mxfp8_sm120",
+                device_index=get_device_index(a.device),
+                disk_kernel_name_fn=_mxfp8_sm120_kernel_disk_name,
+                cache_key_files_fn=_blockscaled_mxfp8_sm120_cache_key_files,
             )
 
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
@@ -293,6 +304,11 @@ def _b12x_gemm_mxfp8_runner(
                 kernel_a_sf.data_ptr(),
                 kernel_b_sf.data_ptr(),
                 alpha_for_launch,
+                # Optional SVDQuant operands: a kernel reloaded from the disk
+                # cache has no Python defaults, so pass them explicitly.
+                None,
+                None,
+                None,
             )
             return out
 
