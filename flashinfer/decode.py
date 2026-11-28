@@ -5778,6 +5778,10 @@ def fast_decode_plan(
     wrapper's buffers without copying, so they must already be on the wrapper's
     device; a ``ValueError`` is raised otherwise. Use
     :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
+    In CUDA graph mode the metadata is not copied either: it must also be on the
+    wrapper's device (``ValueError`` otherwise) and callers must keep it
+    consistent with the wrapper's preallocated buffers. The separate
+    ``global_override_indptr_cpu`` argument remains a CPU planning override.
     """
     # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
     indptr = indptr.contiguous()
@@ -5874,6 +5878,14 @@ def fast_decode_plan(
             "disable_split_kv is not supported by CUDA-core decode; "
             "use use_tensor_cores=True with backend='fa2'."
         )
+    if self.is_cuda_graph_enabled:
+        # The non-graph path is validated further down with its own message.
+        for name, tensor in (
+            ("indptr", indptr),
+            ("indices", indices),
+            ("last_page_len", last_page_len),
+        ):
+            check_shape_dtype_device(tensor, None, None, self.device, name)
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
     if q_len_per_req > 1 and not self.use_tensor_cores:
