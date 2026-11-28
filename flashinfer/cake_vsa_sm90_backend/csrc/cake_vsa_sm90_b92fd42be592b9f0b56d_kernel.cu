@@ -47,17 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_RED_OFF 0
-#define SMEM_RED_STAGE_BYTES 16
-#define SMEM_RED_STRIDE 16
-#define SMEM_VMAX_SMEM_OFF 16
-#define SMEM_VMAX_SMEM_STAGE_BYTES 2048
-#define SMEM_VMAX_SMEM_STRIDE 2048
-#define SMEM_TOTAL 2176
-#define THREADS 128
-
 #include <math_constants.h>
 
 
@@ -112,7 +101,7 @@ kernel_cake_vsa_sm90_b92fd42be592b9f0b56d(__nv_bfloat16* __restrict__ q_in, __nv
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red = reinterpret_cast<float*>(smem_raw + 0);
     const int red_addr = smem + 0;
     float* vmax_smem = reinterpret_cast<float*>(smem_raw + 16);
