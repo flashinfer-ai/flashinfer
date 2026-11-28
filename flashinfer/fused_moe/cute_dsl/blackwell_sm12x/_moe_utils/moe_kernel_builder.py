@@ -13,6 +13,8 @@
 # limitations under the License.
 """SM120 block-scaled GEMM phase configs and cooperative/warp-specialized builders."""
 
+import os
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.warp.mma as warp_mma
@@ -28,6 +30,18 @@ _SM12X_ARCHS = ("sm_120a", "sm_120f", "sm_121a", "sm_121f")
 
 
 def dsl_targets_sm12x() -> bool:
+    # The DSL resolves its arch from CUTE_DSL_ARCH or device 0 via cuInit. Module-level
+    # TACTICS tables call this at import, so answer from NVML until CUDA is up (#4889).
+    import torch
+
+    if not os.environ.get("CUTE_DSL_ARCH") and not torch.cuda.is_initialized():
+        from flashinfer.compilation_context import get_visible_device_capabilities
+
+        try:
+            caps = get_visible_device_capabilities()
+        except Exception:
+            return True
+        return bool(caps) and caps[0] in ((12, 0), (12, 1))
     try:
         from cutlass.cutlass_dsl import CuTeDSL
 

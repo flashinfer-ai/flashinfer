@@ -20,10 +20,101 @@ Global compilation context management for FlashInfer.
 import functools
 import os
 import platform
-import torch
 import logging
 
+import torch
+
 logger = logging.getLogger(__name__)
+
+
+def _visible_nvml_handles(pynvml) -> list:
+    """NVML handles of the CUDA-visible devices, in CUDA ordinal order.
+
+    NVML enumerates every GPU in the system and ignores
+    ``CUDA_VISIBLE_DEVICES``, so a CUDA ordinal is not an NVML index: with
+    ``CUDA_VISIBLE_DEVICES=1,0`` CUDA device 0 is NVML index 1. Entries are
+    either NVML indices or ``GPU-``/``MIG-`` UUIDs, and CUDA drops the first
+    entry it cannot resolve together with everything after it.
+
+    Without ``CUDA_VISIBLE_DEVICES`` the NVML order is used. That matches CUDA
+    for ``CUDA_DEVICE_ORDER=PCI_BUS_ID``; under the default ``FASTEST_FIRST``
+    the order can differ on heterogeneous hosts, but the set of devices — all
+    that :attr:`CompilationContext.TARGET_CUDA_ARCHS` needs — is the same.
+    """
+    all_handles = [
+        pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())
+    ]
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return all_handles
+    uuids = [_as_str(pynvml.nvmlDeviceGetUUID(h)) for h in all_handles]
+    handles = []
+    for entry in visible.split(","):
+        entry = entry.strip()
+        if entry.startswith("MIG-"):
+            try:
+                handles.append(pynvml.nvmlDeviceGetHandleByUUID(entry))
+            except pynvml.NVMLError:
+                break  # CUDA ignores this entry and all later ones
+        elif entry.startswith("GPU-"):
+            # CUDA accepts any unique UUID prefix; NVML lookups need the full UUID.
+            matches = [
+                h
+                for h, u in zip(all_handles, uuids, strict=True)
+                if u.startswith(entry)
+            ]
+            if len(matches) != 1:
+                break
+            handles.append(matches[0])
+        else:
+            try:
+                handles.append(all_handles[int(entry)])
+            except (ValueError, IndexError):
+                break
+    return handles
+
+
+def _as_str(value) -> str:
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def get_visible_device_capabilities() -> list[tuple[int, int]]:
+    """Return (major, minor) per CUDA-visible device without creating a context.
+
+    ``torch.cuda.get_device_capability`` calls ``_lazy_init`` and forces a CUDA
+    context. Import-time callers (JIT workspace naming, availability probes)
+    must not do that — it breaks frameworks that need to control when and where
+    the context is created (#4889). NVML answers the same question with no
+    context, so it is used until CUDA is initialized.
+    """
+    if torch.cuda.is_initialized():
+        return _torch_capabilities()
+
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception as e:  # pynvml missing or NVML unavailable (e.g. no libnvidia-ml)
+        logger.debug("NVML unavailable (%s); querying capabilities through torch", e)
+        return _torch_capabilities()
+    try:
+        caps = []
+        for handle in _visible_nvml_handles(pynvml):
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            caps.append((int(major), int(minor)))
+        return caps
+    except pynvml.NVMLError as e:
+        logger.debug("NVML query failed (%s); querying capabilities through torch", e)
+        return _torch_capabilities()
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def _torch_capabilities() -> list[tuple[int, int]]:
+    return [
+        torch.cuda.get_device_capability(device)
+        for device in range(torch.cuda.device_count())
+    ]
 
 
 @functools.cache
@@ -126,8 +217,7 @@ class CompilationContext:
                     )
         else:
             try:
-                for device in range(torch.cuda.device_count()):
-                    major, minor = torch.cuda.get_device_capability(device)
+                for major, minor in get_visible_device_capabilities():
                     self.TARGET_CUDA_ARCHS.add(self._normalize_cuda_arch(major, minor))
             except Exception as e:
                 try:
