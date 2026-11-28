@@ -1070,6 +1070,22 @@ def test_bmm_mxfp8_trace_init_quantizes_each_batch(
     assert inputs["dtype"] is torch.bfloat16
 
 
+def test_bmm_fp8_bias_init_standalone():
+    inputs = flashinfer.bmm_fp8.fi_init(
+        batch_size=2, M=8, N=32, K=64, bias=True, device="cpu"
+    )
+    bias = cast(torch.Tensor, inputs["bias"])
+    assert bias.shape == (32,)
+    assert bias.dtype == torch.bfloat16
+    defn = flashinfer.bmm_fp8.fi_trace(**inputs)
+    namespace = {}
+    exec(defn["init"], namespace)
+    # Only the Var axes: the definition binds N and K.
+    restored = namespace["_bmm_fp8_bias_init"](batch_size=2, M=8, device="cpu")
+    assert torch.equal(restored["bias"], bias)
+    assert flashinfer.bmm_fp8.fi_trace(**restored) == defn
+
+
 # ---------------------------------------------------------------------------
 # quantization
 # ---------------------------------------------------------------------------
