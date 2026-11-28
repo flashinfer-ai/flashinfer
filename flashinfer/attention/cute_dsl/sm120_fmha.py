@@ -219,11 +219,13 @@ def _validate_hnd_paged_pool(name: str, pool: torch.Tensor) -> None:
     if (
         tuple(pool.stride()[1:]) != expected_inner_strides
         or pool.stride(0) < min_page_stride
+        or (pool.stride(0) * pool.element_size()) % 16 != 0
     ):
         raise ValueError(
             f"{name} must use HND storage with compact [Hkv, page_size, D] "
-            "planes; a standalone pool or a K/V plane view from a combined "
-            f"cache is supported, got strides {pool.stride()}"
+            "planes and 16-byte aligned page stride; a standalone pool or a "
+            f"K/V plane view from a combined cache is supported, got strides "
+            f"{pool.stride()}"
         )
 
 
@@ -880,10 +882,10 @@ class SM120PrimsBatchPrefillBackend:
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
         )
-        if page_size not in (16, 32, 64, 128):
+        if page_size not in (1, 16, 32, 64, 128):
             raise ValueError(
                 "backend='cute-dsl-prims' supports page_size in "
-                f"{{16, 32, 64, 128}}; got {page_size}"
+                f"{{1, 16, 32, 64, 128}}; got {page_size}"
             )
         q_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
         if causal and bool(torch.any(q_lens > seqlens_kv_host)):
