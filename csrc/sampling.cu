@@ -65,6 +65,7 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
   CHECK_INPUT(logits);
   CHECK_INPUT(output);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  check_vector_load_alignment(logits, "logits");
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
 
@@ -82,12 +83,23 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
       << "OnlineSoftmax failed with error code " << cudaGetErrorString(status);
 }
 
+// The split-row launch of SM90 reads some inputs with scalar loads, which need no alignment.
+// Every other route of top-p, top-k and joint top-k/top-p sampling reads vector loads.
+template <sampling::SplitRowSamplingMode MODE, typename IdType>
+void check_probs_alignment_for_route(const TensorView& probs, uint32_t batch_size) {
+  if (!sampling::SplitRowSamplingReadsScalars<MODE, float, IdType>(
+          batch_size, static_cast<uint32_t>(probs.size(1)))) {
+    check_vector_load_alignment(probs, "probs");
+  }
+}
+
 void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorView> maybe_indices,
                           bool deterministic, Optional<TensorView> maybe_seed_arr,
                           uint64_t seed_val, Optional<TensorView> maybe_offset_arr,
                           uint64_t offset_val) {
   CHECK_INPUT(logits);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  check_vector_load_alignment(logits, "logits");
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
   const auto rng_strides =
@@ -123,6 +135,7 @@ void sampling_from_probs(TensorView probs, TensorView output, TensorView valid,
                          Optional<TensorView> maybe_offset_arr, uint64_t offset_val) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  check_vector_load_alignment(probs, "probs");
   CHECK_INPUT(valid);
   CHECK_DIM(1, valid);
   CHECK_DEVICE(valid, probs);
@@ -181,6 +194,8 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   auto stream = get_stream(probs.device());
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(output.dtype(), IdType, [&] {
+    check_probs_alignment_for_route<sampling::SplitRowSamplingMode::kTopP, IdType>(probs,
+                                                                                   batch_size);
     cudaError_t status = sampling::TopPSamplingFromProb<float, IdType>(
         static_cast<float*>(probs.data_ptr()), static_cast<IdType*>(output.data_ptr()),
         static_cast<bool*>(valid.data_ptr()),
@@ -228,6 +243,8 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   auto stream = get_stream(probs.device());
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(output.dtype(), IdType, [&] {
+    check_probs_alignment_for_route<sampling::SplitRowSamplingMode::kTopK, IdType>(probs,
+                                                                                   batch_size);
     cudaError_t status = sampling::TopKSamplingFromProb<float, IdType>(
         static_cast<float*>(probs.data_ptr()), static_cast<IdType*>(output.data_ptr()),
         static_cast<bool*>(valid.data_ptr()),
@@ -258,6 +275,7 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   CHECK_DEVICE(output, probs);
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
+  check_vector_load_alignment(probs, "probs");
   CHECK_INPUT(valid);
   CHECK_DIM(1, valid);
   CHECK_DEVICE(valid, probs);
@@ -325,6 +343,8 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output, Tensor
   auto stream = get_stream(probs.device());
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(output.dtype(), IdType, [&] {
+    check_probs_alignment_for_route<sampling::SplitRowSamplingMode::kTopKTopP, IdType>(probs,
+                                                                                       batch_size);
     cudaError_t status = sampling::TopKTopPSamplingFromProb<float, IdType>(
         static_cast<float*>(probs.data_ptr()),
         has_top_k_arr ? static_cast<IdType*>(maybe_top_k_arr.value().data_ptr()) : nullptr,
@@ -362,6 +382,8 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   CHECK_DIM(3, draft_probs);      // draft_probs: (batch_size, num_speculate_tokens, vocab_size)
   CHECK_DIM(2, draft_token_ids);  // draft_token_ids: (batch_size, num_speculate_tokens)
   CHECK_DIM(3, target_probs);  // target_probs: (batch_size, num_speculate_tokens + 1, vocab_size)
+  check_vector_load_alignment(draft_probs, "draft_probs");
+  check_vector_load_alignment(target_probs, "target_probs");
   unsigned int batch_size = draft_probs.size(0);
   unsigned int num_speculate_tokens = draft_probs.size(1);
   unsigned int vocab_size = draft_probs.size(2);

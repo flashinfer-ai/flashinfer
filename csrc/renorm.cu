@@ -42,6 +42,8 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   cudaError_t status;
   // Fallback to ternary search for small vocab where radix precision is insufficient
   if (vocab_size < sampling::air_top_p::NUM_BUCKETS) {
+    // Only this kernel reads probs with aligned vector loads; the radix kernels do not.
+    check_vector_load_alignment(probs, "probs");
     status = sampling::TopPRenormProb<float>(
         static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
         top_p_arr_ptr, batch_size, top_p_val, vocab_size, stream);
@@ -64,6 +66,7 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
   CHECK_INPUT(probs);
   CHECK_INPUT(row_states_buffer);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  check_vector_load_alignment(probs, "probs");
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
   check_tensor_param(maybe_top_k_arr, probs);
@@ -95,6 +98,7 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
   CHECK_INPUT(logits);
   CHECK_INPUT(row_states_buffer);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  check_vector_load_alignment(logits, "logits");
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
   check_tensor_param(maybe_top_k_arr, logits);

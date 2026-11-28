@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 import functools
+import math
+import os
 from numbers import Real
 from threading import Lock
 from types import SimpleNamespace
@@ -2157,6 +2159,10 @@ def min_p_sampling_from_probs(
 # Thresholds were empirically determined.
 _TOP_K_FIRST_FAST_PATH_MAX_K = 256
 _TOP_K_FIRST_FAST_PATH_MIN_VOCAB = 65536
+# Widest vector load of the top-k kernels, in bytes.
+_TOP_K_VECTOR_LOAD_BYTES = 16
+# Elements per vector load of the SM100 clusters top-k kernel, whatever the row length.
+_TOP_K_CLUSTERS_VEC_SIZE = 4
 
 
 def _top_k_first_fast_path_applicable(
@@ -2164,6 +2170,8 @@ def _top_k_first_fast_path_applicable(
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor],
     top_k_max: Optional[int] = None,
+    *,
+    deterministic: bool,
 ) -> bool:
     # A per-row top_k tensor qualifies only through the caller's top_k_max bound:
     # deriving the bound from top_k.max() would add a host sync on every call.
@@ -2175,14 +2183,43 @@ def _top_k_first_fast_path_applicable(
         and indices.device == x.device
         and indices.dtype in (torch.int32, torch.int64)
     )
-    return (
+    if not (
         valid_indices
         and (isinstance(top_k, int) or top_k.shape == (x.size(0),))
         and select_k is not None
         and 0 < select_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
         and x.size(-1) >= _TOP_K_FIRST_FAST_PATH_MIN_VOCAB
         and select_k < x.size(-1)
+    ):
+        return False
+    # The top-k kernel reads the input as stored and faults on an alignment it does not
+    # support. Such an input takes the original kernels, which refuse it with a
+    # ValueError. Dynamo cannot trace arithmetic on data_ptr(), so a traced call takes
+    # them as well.
+    if torch.compiler.is_dynamo_compiling():
+        return False
+    from .topk import TopKTieBreak, can_use_clusters_topk
+
+    if can_use_clusters_topk(
+        os.environ.get("FLASHINFER_TOPK_ALGO"),
+        x.device,
+        deterministic,
+        TopKTieBreak.NONE,
+        False,
+    ):
+        # A non-deterministic call on SM100 goes to the clusters kernel only. It reads
+        # _TOP_K_CLUSTERS_VEC_SIZE elements at once from every row, so its base and its
+        # row stride must both suit that width.
+        clusters_load_bytes = _TOP_K_CLUSTERS_VEC_SIZE * x.element_size()
+        return x.data_ptr() % clusters_load_bytes == 0 and not (
+            x.size(0) > 1 and x.stride(0) % _TOP_K_CLUSTERS_VEC_SIZE != 0
+        )
+    # The radix kernel reads each row with vector loads of up to 16 bytes from the base.
+    load_bytes = (
+        math.gcd(_TOP_K_VECTOR_LOAD_BYTES // x.element_size(), x.size(-1))
+        * x.element_size()
     )
+    return x.data_ptr() % load_bytes == 0
 
 
 def _top_k_first_fast_path(
@@ -2494,7 +2531,9 @@ def top_k_top_p_sampling_from_logits(
             "batch_invariant=True only (the operator's kernel takes none of them and allocates its output)"
         )
     if filter_apply_order == "top_k_first":
-        if _top_k_first_fast_path_applicable(logits, top_k, indices, top_k_max):
+        if _top_k_first_fast_path_applicable(
+            logits, top_k, indices, top_k_max, deterministic=deterministic
+        ):
             return _top_k_first_fast_path(
                 logits,
                 top_k,
@@ -2729,7 +2768,9 @@ def top_k_top_p_sampling_from_probs(
             "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
     if filter_apply_order == "top_k_first":
-        if _top_k_first_fast_path_applicable(probs, top_k, indices, top_k_max):
+        if _top_k_first_fast_path_applicable(
+            probs, top_k, indices, top_k_max, deterministic=deterministic
+        ):
             return _top_k_first_fast_path(
                 probs,
                 top_k,
