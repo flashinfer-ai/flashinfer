@@ -307,3 +307,12 @@ and its schedule. A cuDNN-first wrapper may fall back while refreshing the
 metadata retained by its old cuDNN captures. Validate both starting orders and
 Q64/Q65 partition changes and transitions across the actual-work floor,
 including numerical output and LSE after replay.
+
+### SM10x CuTe-DSL FMHA
+
+Only SM10x kernel implementations live in `flashinfer/cute_dsl/attention/fmha/sm100/`;
+the compiler, quantizer and helpers remain in `fmha/`. SM120 remains in `fmha/sm120/`.
+Merged softmax is enabled on SM103+ only. SM100 uses EX2-emulation count 32 for
+regular FMHA and native EX2 for block-scaled QK; SM103+ uses native EX2.
+PDL is runtime-only and excluded from artifact names and compiler/cache signatures.
+LSE and non-LSE remain separate specializations.
