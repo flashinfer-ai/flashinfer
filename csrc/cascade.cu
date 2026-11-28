@@ -37,6 +37,13 @@ void merge_state(TensorView v_a, TensorView s_a, TensorView v_b, TensorView s_b,
   CHECK_SHAPE(s_a, s_b);
   TVM_FFI_ICHECK_EQ(v_a.size(0), s_a.size(0));
   TVM_FFI_ICHECK_EQ(v_a.size(1), s_b.size(1));
+  // The kernel is instantiated for v_a's dtype and reads the LSEs as float32; any other
+  // dtype would be reinterpreted bit-for-bit instead of converted.
+  CHECK_SAME_DTYPE(v_b, v_a);
+  CHECK_SAME_DTYPE(v_merged, v_a);
+  CHECK_INPUT_TYPE(s_a, dl_float32);
+  CHECK_INPUT_TYPE(s_b, dl_float32);
+  CHECK_INPUT_TYPE(s_merged, dl_float32);
   unsigned int seq_len = v_a.size(0);
   unsigned int num_heads = v_a.size(1);
   unsigned int head_dim = v_a.size(2);
@@ -74,6 +81,13 @@ void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, Tensor
   CHECK_SHAPE(s, s_other);
   TVM_FFI_ICHECK_EQ(v.size(0), s.size(0));
   TVM_FFI_ICHECK_EQ(v.size(1), s.size(1));
+  // The kernel is instantiated for v's dtype and reads the LSEs as float32; any other
+  // dtype would be reinterpreted bit-for-bit instead of converted.
+  CHECK_SAME_DTYPE(v_other, v);
+  CHECK_INPUT_TYPE(s, dl_float32);
+  CHECK_INPUT_TYPE(s_other, dl_float32);
+  // The kernel reads one byte of mask per sequence.
+  CHECK_MAYBE_INPUT_TYPES(mask, dl_bool, dl_uint8);
   uint8_t* mask_ptr = nullptr;
   if (mask.has_value()) {
     CHECK_DIM(1, mask.value());
@@ -109,6 +123,9 @@ void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_
   TVM_FFI_ICHECK_EQ(v.size(0), s.size(0));
   TVM_FFI_ICHECK_EQ(v.size(1), s.size(1));
   TVM_FFI_ICHECK_EQ(v.size(2), s.size(2));
+  CHECK_SAME_DTYPE(v_merged, v);
+  CHECK_INPUT_TYPE(s, dl_float32);
+  CHECK_INPUT_TYPE(s_merged, dl_float32);
   unsigned int seq_len = v.size(0);
   unsigned int num_index_sets = v.size(1);
   unsigned int num_heads = v.size(2);

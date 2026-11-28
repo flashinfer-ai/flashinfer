@@ -50,13 +50,13 @@ def merge_state(
     ----------
     v_a : torch.Tensor
         The attention output from the KV segment ``A``, shape:
-        ``[seq_len, num_heads, head_dim]``.
+        ``[seq_len, num_heads, head_dim]``. Must be float16 or bfloat16.
     s_a : torch.Tensor
         The logsumexp value from the KV segment ``A`` is expected to be a float32 tensor,
         shape: ``[seq_len, num_heads]``.
     v_b : torch.Tensor
         The attention output from the KV segment ``B``,
-        shape: ``[seq_len, num_heads, head_dim]``.
+        shape: ``[seq_len, num_heads, head_dim]``. Must have the same dtype as ``v_a``.
     s_b : torch.Tensor
         The logsumexp value from the KV segment ``B``, expected to be a float32 tensor,
         shape: ``[seq_len, num_heads]``
@@ -120,21 +120,26 @@ def merge_state_in_place(
     ----------
     v : torch.Tensor
         The partial attention output to be updated in-place, shape:
-        ``(seq_len, num_heads, head_dim)``.
+        ``(seq_len, num_heads, head_dim)``. Must be float16 or bfloat16.
     s : torch.Tensor
-        The partial logsumexp value to be updated in-place, expected to be a float32
+        The partial logsumexp value to be updated in-place, must be a float32
         tensor, shape: ``(seq_len, num_heads)``.
     v_other : torch.Tensor
         The other attention output to be merged, shape:
-        ``(seq_len, num_heads, head_dim)``.
+        ``(seq_len, num_heads, head_dim)``. Must have the same dtype as ``v``.
     s_other : torch.Tensor
         The other logsumexp value to be merged, expected to be a float32 tensor,
         shape: ``(seq_len, num_heads)``.
     mask : Optional[torch.Tensor]
         A boolean mask tensor indicating whether each sequence's state should be merged.
         Useful for CUDA graphs. If not specified (default), the states of all
-        sequences are merged.
+        sequences are merged. Must be a bool or uint8 tensor,
         shape: ``[seq_len]``
+
+    Raises
+    ------
+    ValueError
+        If ``s`` is not a float32 tensor.
 
     Example
     -------
@@ -149,7 +154,12 @@ def merge_state_in_place(
     >>> s_other = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
     >>> flashinfer.merge_state_in_place(v, s, v_other, s_other)
     """
-    s = s.to(torch.float32)
+    # s is the output of the merge: converting it would hand the kernel a temporary
+    # copy and leave the caller's tensor holding the stale logsumexp.
+    if s.dtype != torch.float32:
+        raise ValueError(
+            f"merge_state_in_place updates s in-place, so s must be float32, got {s.dtype}"
+        )
     s_other = s_other.to(torch.float32)
     get_cascade_module().merge_state_in_place(v, s, v_other, s_other, mask)
 
