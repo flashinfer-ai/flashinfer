@@ -88,6 +88,71 @@ def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp
     assert "cuda_arch_flags = -DNDEBUG" not in ninja
 
 
+def _ninja_flags(ninja, name):
+    flags = []
+    for line in ninja.split(f"\n{name} = ", 1)[1].split("\n"):
+        line = line.strip()
+        if not line.endswith(" $"):
+            flags.append(line)
+            break
+        flags.append(line[:-2])
+    return flags
+
+
+@pytest.mark.cpu_only
+def test_generate_ninja_keeps_base_nvcc_flags_on_linux(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "is_windows", False)
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+    monkeypatch.delenv("CC", raising=False)
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+    # ninja and sccache key on the command line: the Linux nvcc line and the
+    # build.ninja variables stay as they were before the Windows port.
+    assert "common_cuda_flags" not in ninja
+    assert _ninja_flags(ninja, "cuda_cflags")[:3] == [
+        "$common_cflags",
+        "--compiler-options=-fPIC",
+        "--expt-relaxed-constexpr",
+    ]
+
+
+@pytest.mark.cpu_only
+def test_generate_ninja_writes_msvc_nvcc_flags_on_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "is_windows", True)
+    monkeypatch.setattr(cpp_ext.platform, "machine", lambda: "ARM64")
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+    monkeypatch.delenv("CC", raising=False)
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+    assert _ninja_flags(ninja, "common_cuda_flags")[:2] == [
+        "-DTORCH_EXTENSION_NAME=$name",
+        "--std=c++20",
+    ]
+    cuda_cflags = _ninja_flags(ninja, "cuda_cflags")
+    assert cuda_cflags[:2] == ["$common_cuda_flags", "--expt-relaxed-constexpr"]
+    assert "--compiler-options=-fPIC" not in cuda_cflags
+
+
 @pytest.mark.cpu_only
 def test_generate_ninja_forwards_libpath_to_host_linker_on_windows(
     monkeypatch, tmp_path
