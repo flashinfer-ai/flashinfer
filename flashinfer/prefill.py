@@ -10330,6 +10330,13 @@ def _check_paged_kv_non_interleaved(
             "Non-interleaved paged KV requires contiguous k_cache/v_cache: the kernel "
             "derives strides from shapes, not tensor strides."
         )
+    # The offset check below divides by the block size, so an empty cache
+    # (zero pages, page_size, heads or head_dim) must fail here.
+    if k_cache.numel() == 0:
+        raise ValueError(
+            "Non-interleaved paged KV requires non-empty k_cache/v_cache; got "
+            f"shape {tuple(k_cache.shape)}."
+        )
     block_bytes = k_cache[0].numel() * k_cache.element_size()
     delta_bytes = v_cache.data_ptr() - k_cache.data_ptr()
     if delta_bytes <= 0 or delta_bytes % block_bytes != 0:
@@ -10402,6 +10409,9 @@ def trtllm_fmha_v2_prefill(
           independent K and V block offsets relative to ``k_cache``'s base
           pointer (K and V must live in one allocation at block-aligned
           positions).
+
+          Both paged layouts need a power-of-two ``page_size`` and a KV cache
+          with the same dtype as Q; anything else raises ``ValueError``.
         - ``SEPARATE_Q_K_V``: ``qkv`` is ``(Q, K, V)`` where Q has shape
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
@@ -10556,6 +10566,17 @@ def trtllm_fmha_v2_prefill(
         # Paged KV NHD: [num_pages, page_size, H_kv, D]
         # Paged KV HND: [num_pages, H_kv, page_size, D]
         page_size = k_cache.shape[1 if "NHD" in input_layout else 2]
+        # The kernel maps tokens to pages with log2(page_size) and picks its
+        # kernel from query.dtype only; both mismatches return wrong output.
+        if page_size <= 0 or page_size & (page_size - 1):
+            raise ValueError(
+                f"{input_layout} requires a power-of-two page_size, got {page_size}."
+            )
+        if k_cache.dtype != query.dtype:
+            raise ValueError(
+                f"{input_layout} requires the KV cache dtype to match the query "
+                f"dtype, got query {query.dtype} and KV {k_cache.dtype}."
+            )
         head_dim_v = v_cache.shape[3]
     elif input_layout == "CONTIGUOUS_Q_KV":
         # Q is 3D: [tokens, H, D], KV is 4D: [tokens, 2, H_kv, D]
