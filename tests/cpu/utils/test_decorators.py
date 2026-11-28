@@ -1,9 +1,14 @@
 """Host-only contracts for backend and capability decorators."""
 
+import inspect
+
 import pytest
+import torch
 
 import flashinfer.api_logging as api_logging
+import flashinfer.utils as utils
 from flashinfer.utils import (
+    BackendSupportedError,
     supported_compute_capability,
     backend_requirement,
     experimental_backend,
@@ -172,6 +177,117 @@ def test_functools_wraps_preserves_metadata():
 
 
 @pytest.mark.cpu_only
+def test_validate_call_uses_execution_validation_without_executing():
+    checks = []
+    executions = []
+
+    def check(x, backend="native", *, scale=3):
+        checks.append((x, backend, scale))
+        return x > 0
+
+    check.is_compute_capability_supported = lambda cc: cc is None
+
+    @backend_requirement({"native": check})
+    def kernel(x, backend="native", *, scale=3):
+        executions.append(x)
+        return x * scale
+
+    assert inspect.signature(kernel.validate_call) == inspect.signature(kernel)
+    assert kernel.validate_call(2) is None
+    assert checks == [(2, "native", 3)]
+    assert executions == []
+    assert kernel.validate_call(2, "native", scale=4) is None
+    assert checks[-1] == (2, "native", 4)
+
+    for skip_check in (False, True):
+        with pytest.raises(ValueError, match="Problem size is not supported"):
+            kernel.validate_call(0, skip_check=skip_check)
+    with pytest.raises(BackendSupportedError, match="does not support backend"):
+        kernel.validate_call(2, backend="missing")
+    with pytest.raises(TypeError):
+        kernel.validate_call()
+    with pytest.raises(TypeError):
+        kernel.validate_call(2, x=3)
+    assert executions == []
+
+    with pytest.raises(ValueError, match="Problem size is not supported"):
+        kernel(0)
+    assert executions == []
+    assert kernel(2) == 6
+    before = len(checks)
+    assert kernel(0, skip_check=True) == 0
+    assert len(checks) == before
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("validate_on_call", [False, True])
+def test_complete_call_validator_owns_cpu_routing(monkeypatch, validate_on_call):
+    def unexpected(*args, **kwargs):
+        pytest.fail("complete call validation must not use generic CUDA/auto checks")
+
+    monkeypatch.setattr(utils, "get_compute_capability", unexpected)
+    checks = []
+    executions = []
+
+    # Metadata-only checkers need not accept the operation's call signature.
+    def metadata_only():
+        unexpected()
+
+    metadata_only.is_compute_capability_supported = lambda cc: cc >= 100
+
+    def call_check(input, backend="auto", *, alignment=32):
+        checks.append((input, backend, alignment))
+        if input.shape[-1] != alignment:
+            raise ValueError("invalid input width")
+
+    def original(input, backend="auto", *, alignment=32):
+        executions.append(input)
+        return "executed"
+
+    kernel = backend_requirement(
+        {"native": metadata_only},
+        call_check=call_check,
+        validate_on_call=validate_on_call,
+    )(original)
+    assert (kernel is original) is (not validate_on_call)
+    assert inspect.signature(kernel.validate_call) == inspect.signature(original)
+    assert kernel.is_backend_supported("native", 130) is True
+    assert kernel.is_backend_supported("native", 90) is False
+
+    valid = torch.empty((2, 32))
+    invalid = torch.empty((2, 16))
+    assert kernel.validate_call(valid) is None
+    assert checks == [(valid, "auto", 32)]
+    assert kernel.validate_call(invalid, "native", alignment=16) is None
+    assert checks[-1] == (invalid, "native", 16)
+    with pytest.raises(ValueError, match="invalid input width"):
+        kernel.validate_call(invalid)
+    if validate_on_call:
+        for skip_check in (False, True):
+            with pytest.raises(ValueError, match="invalid input width"):
+                kernel.validate_call(invalid, skip_check=skip_check)
+    else:
+        with pytest.raises(TypeError, match="skip_check"):
+            kernel.validate_call(valid, skip_check=True)
+    with pytest.raises(TypeError):
+        kernel.validate_call(valid, unexpected_argument=True)
+    assert executions == []
+
+    before = len(checks)
+    assert kernel(valid) == "executed"
+    assert len(checks) == before + int(validate_on_call)
+    if validate_on_call:
+        with pytest.raises(ValueError, match="invalid input width"):
+            kernel(invalid)
+    else:
+        before = len(checks)
+        assert kernel(invalid) == "executed"
+        assert len(checks) == before
+        with pytest.raises(TypeError, match="skip_check"):
+            kernel(valid, skip_check=True)
+
+
+@pytest.mark.cpu_only
 def test_experimental_backend_excluded_from_auto_unless_allowed(monkeypatch):
     """@experimental_backend checkers stay out of backend="auto" without the opt-in."""
     monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
@@ -198,10 +314,16 @@ def test_experimental_backend_excluded_from_auto_unless_allowed(monkeypatch):
         {"stable": _check_stable, "risky": _check_risky}, heuristic_func=_prefer_risky
     )
     def my_kernel(x, backend="auto"):
+        executions.append(x)
         return my_kernel.suitable_auto_backends[0] if backend == "auto" else backend
 
+    executions = []
     assert my_kernel.experimental_backends == frozenset({"risky"})
+    assert my_kernel.validate_call(1) is None
+    assert executions == []
+    assert my_kernel.suitable_auto_backends == ["stable"]
     assert my_kernel(1) == "stable"  # gate off: experimental skipped
+    assert my_kernel(1, backend="auto", skip_check=True) == "stable"
 
     # Explicit selection is always allowed; the first use of the pair warns once.
     with pytest.warns(UserWarning, match="risky"):
@@ -210,12 +332,23 @@ def test_experimental_backend_excluded_from_auto_unless_allowed(monkeypatch):
     monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     assert my_kernel(1) == "risky"  # gate on: heuristic may pick it
 
+    before = len(executions)
+    assert my_kernel.validate_call(1) is None
+    assert len(executions) == before
+    assert my_kernel(1, backend="auto", skip_check=True) == "risky"
+
 
 @pytest.mark.cpu_only
 def test_bypass_skips_backend_selection_and_checks():
     """A call the ``bypass`` predicate claims runs the function directly: no requirement check, no heuristic, no
     capability lookup. Every other call keeps the full selection."""
     calls = []
+    bypass_calls = []
+
+    def _bypass(*args, **kwargs):
+        own_mode = kwargs.get("own_mode", False)
+        bypass_calls.append(own_mode)
+        return own_mode
 
     def _check_a(x, backend="auto", own_mode=False):
         calls.append("check_a")
@@ -235,7 +368,7 @@ def test_bypass_skips_backend_selection_and_checks():
         {"a": _check_a},
         common_check=_common,
         heuristic_func=_heuristic,
-        bypass=lambda *args, **kwargs: kwargs.get("own_mode", False),
+        bypass=_bypass,
     )
     def my_kernel(x, backend="auto", *, own_mode=False):
         return "own" if own_mode else my_kernel.suitable_auto_backends[0]
@@ -246,5 +379,56 @@ def test_bypass_skips_backend_selection_and_checks():
     assert my_kernel(1, backend="b", own_mode=True, skip_check=True) == "own"
     assert calls == []
 
+    # Generic backend checks cannot certify a mode that owns its validation.
+    # Explicit preflight must neither execute it nor silently accept it.
+    for x in (0, 1):
+        with pytest.raises(NotImplementedError, match="mode owns input validation"):
+            my_kernel.validate_call(x, backend="b", own_mode=True)
+    assert calls == []
+
+    bypass_calls.clear()
     assert my_kernel(1) == "a"
+    assert bypass_calls == [False]
     assert calls == ["common", "check_a", "heuristic"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("option", ["common_check", "heuristic_func"])
+def test_complete_call_validator_rejects_ignored_options(option):
+    with pytest.raises(ValueError, match="call_check cannot be combined"):
+        backend_requirement(
+            {}, call_check=lambda **kwargs: None, **{option: lambda: True}
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("option", ["heuristic_func", "bypass"])
+def test_manual_validation_rejects_wrapper_only_options(option):
+    with pytest.raises(ValueError, match="validate_on_call=False cannot be combined"):
+        backend_requirement({}, validate_on_call=False, **{option: lambda: True})
+
+
+@pytest.mark.cpu_only
+def test_manual_validation_rejects_lost_experimental_backend_policy():
+    @experimental_backend
+    @supported_compute_capability([100])
+    def checker(x, backend="risky"):
+        return True
+
+    with pytest.raises(ValueError, match="experimental backends"):
+        backend_requirement({"risky": checker}, validate_on_call=False)(lambda x: x)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_public_gemm_preflight_defers_bypassed_mode(monkeypatch, out_dtype):
+    from flashinfer import mm_bf16
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("bypassed mode must not use generic backend admission")
+
+    monkeypatch.setattr(utils, "get_compute_capability", unexpected)
+    a = torch.empty((1, 32), dtype=torch.bfloat16)
+    b = torch.empty((32, 32), dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="mode owns input validation"):
+        mm_bf16.validate_call(a, b, out_dtype=out_dtype, batch_invariant=True)
