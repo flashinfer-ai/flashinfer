@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 import flashinfer
+import flashinfer.cake_fmha_super_nvfp4
 import flashinfer.decode
 
 # Try to import cudnn for version checking
@@ -107,6 +108,28 @@ def _get_prims_ts_module():
     from flashinfer.attention import prims_ts
 
     return prims_ts
+
+
+def _cake_super_nvfp4_unsupported_reason(
+    q_dtype, kv_dtype, out_dtype, num_qo_heads, num_kv_heads, head_dims, page_size
+):
+    """Return why cake (Nemotron 3.5 Super NVFP4 shapes only) skips a case, or None."""
+    import flashinfer.cake_fmha_super_nvfp4 as super_nvfp4
+
+    if kv_dtype != "nvfp4":
+        return "requires --kv_dtype nvfp4"
+    if q_dtype != torch.float8_e4m3fn or out_dtype != torch.float8_e4m3fn:
+        return "requires FP8 E4M3 query and output"
+    if (num_qo_heads, num_kv_heads) != (
+        super_nvfp4.NUM_QO_HEADS,
+        super_nvfp4.NUM_KV_HEADS,
+    ):
+        return f"requires {super_nvfp4.NUM_QO_HEADS} query and {super_nvfp4.NUM_KV_HEADS} KV heads"
+    if any(head_dim != super_nvfp4.HEAD_DIM for head_dim in head_dims):
+        return f"requires head dimension {super_nvfp4.HEAD_DIM}"
+    if page_size != super_nvfp4.PAGE_SIZE:
+        return f"requires page_size {super_nvfp4.PAGE_SIZE}"
+    return None
 
 
 def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype, *, is_nvfp4_kv):
@@ -384,8 +407,9 @@ def parse_attention_args(line, parser):
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
             "cute-dsl-prims",
+            "cake",
         ],
-        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. cake selects the Cake FMHA backend for the Nemotron 3.5 Super NVFP4-KV geometry. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -927,6 +951,21 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                     "does not support full-mask speculative decode",
                 )
 
+    if "cake" in backends:
+        reason = _cake_super_nvfp4_unsupported_reason(
+            q_dtype,
+            args.kv_dtype,
+            o_data_type,
+            num_qo_heads,
+            num_kv_heads,
+            (head_dim_qk, head_dim_vo),
+            page_size,
+        )
+        if reason is None and speculative_decode and spec_dec_mask_mode == "full":
+            reason = "uses implicit causal masking and does not support full-mask speculative decode"
+        if reason is not None:
+            _drop_backend(backends, "cake", reason)
+
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -1069,7 +1108,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
     gqa_multi_ctas_kv_counter_buffer = None
-    if "trtllm-native" in backends:
+    if "trtllm-native" in backends or "cake" in backends:
         counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
             batch_size, num_qo_heads, get_device_sm_count(device)
         )
@@ -1228,6 +1267,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         backend,
         q,
         kv_cache,
+        kv_cache_sf,
         k_cache,
         v_cache,
         workspace_buffer,
@@ -1238,10 +1278,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         out,
     ):
         if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen", "cudnn"]:
-            wrapper_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
             return backend_wrappers[backend].run(
                 q,
-                wrapper_kv,
+                kv_cache,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 q_len_per_req=s_qo,
@@ -1264,11 +1303,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 batch_offsets_o=ragged_q,
                 out=out,
             )
-        elif backend == "trtllm-native":
-            native_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
+        elif backend in ("trtllm-native", "cake"):
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q.contiguous(),
-                kv_cache=native_kv,
+                kv_cache=kv_cache,
                 workspace_buffer=workspace_buffer,
                 block_tables=block_tables,
                 seq_lens=actual_seq_lens_kv,
@@ -1276,9 +1314,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 kv_layout="HND",
-                backend="auto",
+                backend="cake" if backend == "cake" else "auto",
                 q_len_per_req=s_qo,
-                mask=speculative_mask,
+                mask=None if backend == "cake" else speculative_mask,
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
                 multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
@@ -1313,7 +1351,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     for cur_backend in backends:
         # Clear workspace buffer to prevent unexpected interactions between backends.
         workspace_buffer.zero_()
-        runtime_kv_cache = prims_ts_kv_cache if cur_backend == "prims-ts" else kv_cache
+        # CUDA graph timing rotates the cache and its block scales together.
+        if cur_backend == "prims-ts":
+            runtime_kv_cache = prims_ts_kv_cache
+            runtime_kv_cache_sf = None
+        else:
+            runtime_kv_cache = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
+            runtime_kv_cache_sf = kv_cache_sf
         runtime_out = backend_outputs[cur_backend]
         runtime_k_cache = k_cache if cur_backend == "cudnn-native" else None
         runtime_v_cache = v_cache if cur_backend == "cudnn-native" else None
@@ -1324,6 +1368,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                     cur_backend,
                     q,
                     runtime_kv_cache,
+                    runtime_kv_cache_sf,
                     runtime_k_cache,
                     runtime_v_cache,
                     runtime_workspace,
@@ -1342,11 +1387,12 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 reference_backend = "fa2"
 
         # Unified benchmark entry: prefer graph if compatible and not using CUPTI
-        def run_timed_backend(q_arg, kv_arg, k_arg, v_arg, out_arg):
+        def run_timed_backend(q_arg, kv_arg, kv_sf_arg, k_arg, v_arg, out_arg):
             return run_backend_wrapper(
                 cur_backend,
                 q_arg,
                 kv_arg,
+                kv_sf_arg,
                 k_arg,
                 v_arg,
                 workspace_buffer,
@@ -1368,6 +1414,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             input_args=(
                 q,
                 runtime_kv_cache,
+                runtime_kv_cache_sf,
                 runtime_k_cache,
                 runtime_v_cache,
                 runtime_out,
@@ -1646,6 +1693,20 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if "trtllm-fmha-v2" in backends and is_nvfp4_kv:
         print("[INFO] trtllm-fmha-v2 backend does not support NVFP4. Skipping.")
         backends.remove("trtllm-fmha-v2")
+    if "cake" in backends:
+        reason = _cake_super_nvfp4_unsupported_reason(
+            q_dtype,
+            args.kv_dtype,
+            o_data_type,
+            num_qo_heads,
+            num_kv_heads,
+            (head_dim_qk, head_dim_vo),
+            page_size,
+        )
+        if reason is None and not causal:
+            reason = "requires causal = True"
+        if reason is not None:
+            _drop_backend(backends, "cake", reason)
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -1857,7 +1918,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_bytes = 512 * 1024 * 1024
+    if "cake" in backends:
+        # Cake's Nemotron 3.5 Super prefill route needs this much.
+        workspace_bytes = max(
+            workspace_bytes,
+            flashinfer.cake_fmha_super_nvfp4.prefill_workspace_bytes(s_kv),
+        )
+    workspace_buffer = torch.empty(workspace_bytes, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -2050,6 +2118,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         backend,
         q,
         kv_cache,
+        kv_cache_sf,
         k_cache,
         v_cache,
         workspace_buffer,
@@ -2092,7 +2161,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
             )
-        elif backend == "trtllm-native":
+        elif backend in ("trtllm-native", "cake"):
             # Compute combined bmm1_scale: q_scale * k_scale * sm_scale
             # For FP8: all scales are float values
             _q_scale = q_scale if q_scale is not None else 1.0
@@ -2118,6 +2187,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
                 out_dtype=o_data_type,
+                backend="trtllm-gen" if backend == "trtllm-native" else backend,
             )
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call (similar to trtllm-native)
@@ -2211,6 +2281,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     cur_backend,
                     q,
                     runtime_kv_cache,
+                    kv_cache_sf,
                     runtime_k_cache,
                     runtime_v_cache,
                     runtime_workspace,
@@ -2231,11 +2302,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 reference_output = outputs[cur_backend]
                 reference_backend = "fa2"
 
-        def run_timed_backend(q_arg, kv_arg, k_arg, v_arg, out_arg):
+        def run_timed_backend(q_arg, kv_arg, kv_sf_arg, k_arg, v_arg, out_arg):
             return run_backend_wrapper(
                 cur_backend,
                 q_arg,
                 kv_arg,
+                kv_sf_arg,
                 k_arg,
                 v_arg,
                 workspace_buffer,
@@ -2260,6 +2332,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             input_args=(
                 q,
                 runtime_kv_cache,
+                kv_cache_sf,
                 runtime_k_cache,
                 runtime_v_cache,
                 runtime_out,

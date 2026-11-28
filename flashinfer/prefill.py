@@ -9889,23 +9889,21 @@ def trtllm_batch_context_with_kv_cache(
             lse=lse,
             kv_layout=kv_layout,
             workspace_buffer=workspace_buffer,
+            use_fp16_softmax=bool(use_fp16_softmax),
+            uses_spcompress=bool(uses_spcompress),
         )
         if skip_softmax_threshold_scale_factor == 1e-30:
             # The pinned public matrix uses 1e-30 as a numerically inert
             # skip-softmax probe. Both exact routes and compat_v1 consume the
             # disabled form at the FFI boundary.
             skip_softmax_threshold_scale_factor = None
-        # A device-scale program reads both scales through device pointers and
-        # converts the raw bmm1 scale to log2 form itself. The other context
-        # adapters consume host scalar scales: device scalar values are
-        # resolved only after route selection. bmm1 keeps the value of the
-        # FP32 log2 product converted back (the value these adapters always
-        # received).
-        if (
-            cake_route is None
-            or cake_route.program is None
-            or not cake_route.device_scales
-        ):
+        # A route that ``reads_device_scales`` reads both scales through device
+        # pointers and converts the raw bmm1 scale to log2 form itself. The
+        # other context adapters consume host scalar scales: device scalar
+        # values are resolved only after route selection. bmm1 keeps the value
+        # of the FP32 log2 product converted back (the value these adapters
+        # always received).
+        if cake_route is None or not cake_route.reads_device_scales:
             if isinstance(bmm1_scale, torch.Tensor):
                 bmm1_scale = float((bmm1_scale * log2e).item()) / log2e
             if isinstance(bmm2_scale, torch.Tensor):

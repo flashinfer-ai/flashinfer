@@ -55,6 +55,17 @@ and the installed wheel must execute this replay and then exercise selected
 routes on SM100a and SM103a; representative family tests and manifest-count
 accounting do not replace those gates.
 
+Calls with the attention geometry of Nemotron 3.5 Super with an NVFP4 KV cache
+on SM100a (FP8 query, NVFP4 K/V with E4M3 block scales, 32 query heads, 2 KV
+heads, head dimension 128, 128-token HND pages) take the ``decode_super_nvfp4``
+and ``context_super_nvfp4`` routes instead.  They are outside the registry and
+its replay: JIT-built kernels for that geometry, written for it rather than
+exported from the Cake source product.  Each call runs on one of them, or on
+the trtllm-gen FMHA kernels where those are as fast or the kernels do not serve
+the call; ``compat_v1``, a scalar reference kernel, is far too slow for this
+model.  The prefill kernel needs a ``workspace_buffer`` of at least
+:func:`flashinfer.cake_fmha_super_nvfp4.prefill_workspace_bytes`.
+
 The distributed-context-parallel feature remains additive.  Supplying
 ``causal_seqlens_kv_global`` to :func:`cake_batch_decode_with_kv_cache` selects
 the ``cake_fmha_dcp_spec`` profile; ordinary calls continue to select

@@ -54,6 +54,7 @@ from .cake_fmha_request_ordered import (
 from .cake_fmha_request_ordered import (
     _run_cake_fmha_request_ordered_paged_decode as _run_cake_fmha_request_ordered_paged_decode,
 )
+from . import cake_fmha_super_nvfp4 as _super_nvfp4
 from .utils import get_compute_capability, get_device_sm_count, log2e
 
 
@@ -91,6 +92,7 @@ class CakeFmhaDecodeRoute:
         "decode_quant_fp8_reduce",
         "decode_quant_fp8",
         "decode_quant_nvfp4",
+        "decode_super_nvfp4",
     ] = "decode_native_bf16"
     page_size: int = 16
     # Small-M hd256 speculative decode: one resident wave of Split-KV CTAs.
@@ -121,6 +123,8 @@ class CakeFmhaDecodeRoute:
     # The bmm1 (base 2) and bmm2 scales are FP32 device scalars the program
     # reads in the kernel (no host read).
     device_scales: bool = False
+    # ``decode_super_nvfp4``: its kernel, ``"mtp"``, ``"base"`` or ``"trtllm-gen"``.
+    super_nvfp4_kernel: str | None = None
 
 
 CakeFmhaContextComponent = Literal[
@@ -129,7 +133,13 @@ CakeFmhaContextComponent = Literal[
     "context_fp8",
     "context_fp8_hd256",
     "context_nvfp4",
+    "context_super_nvfp4",
 ]
+
+# Nemotron 3.5 Super NVFP4 routes (``flashinfer.cake_fmha_super_nvfp4``):
+# JIT-built, no build manifest.
+_SUPER_NVFP4_DECODE_COMPONENT: Literal["decode_super_nvfp4"] = "decode_super_nvfp4"
+_SUPER_NVFP4_CONTEXT_COMPONENT: Literal["context_super_nvfp4"] = "context_super_nvfp4"
 
 
 @dataclass(frozen=True)
@@ -148,12 +158,17 @@ class CakeFmhaContextRoute:
     return_lse: bool
     enable_sink: bool
     exact_profile: Literal["q511", "q257"] | None = None
-    # Both scales are device tensors (FP8 / NVFP4): the program reads them
-    # through device pointers instead of host scalars.
+    # Both scales are device tensors (FP8 / NVFP4): the scale form the program
+    # is selected for.
     device_scales: bool = False
     # The generated program serving the route (an identifier of
     # ``_CONTEXT_PROGRAMS``), or ``None`` for the component's JIT module.
     program: str | None = None
+    # The route takes device scales as given, with no host read; every other
+    # route needs host scalars.
+    reads_device_scales: bool = False
+    # ``context_super_nvfp4``: its kernel, ``"prefill"`` or ``"trtllm-gen"``.
+    super_nvfp4_kernel: str | None = None
 
 
 # These are the exact optimized routes in the pinned 57,280-cell matrix.  Keep
@@ -3126,6 +3141,12 @@ def cake_fmha_route_is_optimized(
 
     if route is None:
         return False
+    if route.component in (
+        _SUPER_NVFP4_DECODE_COMPONENT,
+        _SUPER_NVFP4_CONTEXT_COMPONENT,
+    ):
+        # Served by their own kernels or trtllm-gen, outside the registry.
+        return True
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == _ALIGNED_MTP_Q32_COMPONENT
@@ -5982,6 +6003,82 @@ def _decode_streamk_launch_args(
 _DECODE_PROGRAM_VALUES["decode_bf16"] = _decode_bf16_program_values
 
 
+def _select_super_nvfp4_decode_route(
+    device: torch.device,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    batch_size: int,
+    max_q_len: int | None,
+    max_seq_len: int,
+    window_left: int,
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    sinks: torch.Tensor | None,
+    uses_shared_paged_kv_idx: bool,
+    cum_seq_lens_q: torch.Tensor | None,
+    key_block_scales: torch.Tensor | None,
+    value_block_scales: torch.Tensor | None,
+    skip_softmax_threshold_scale_factor: float | None,
+    enable_block_sparse_attention: bool,
+    lse: torch.Tensor | None,
+    mask: torch.Tensor | None,
+    enable_pdl: bool | None,
+) -> CakeFmhaDecodeRoute | None:
+    """The ``decode_super_nvfp4`` route of a call, or ``None``."""
+
+    if max_q_len is None:
+        return None
+    kernel = _super_nvfp4.select_decode_route(
+        out=out,
+        query=query,
+        k_cache=key_cache,
+        v_cache=value_cache,
+        k_block_scales=key_block_scales,
+        v_block_scales=value_block_scales,
+        workspace_buffer=workspace_buffer,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        cum_seq_lens_q=cum_seq_lens_q,
+        batch_size=batch_size,
+        max_q_len=max_q_len,
+        max_kv_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        enable_pdl=bool(enable_pdl),
+        dense_causal=(
+            sinks is None
+            and lse is None
+            and mask is None
+            and window_left == -1
+            and not enable_block_sparse_attention
+            and not skip_softmax_threshold_scale_factor
+            and uses_shared_paged_kv_idx
+        ),
+    )
+    if kernel is None:
+        return None
+    return CakeFmhaDecodeRoute(
+        target=_cake_fmha_target(device),
+        batch_size=batch_size,
+        q_len=max_q_len,
+        num_q_heads=_super_nvfp4.NUM_QO_HEADS,
+        num_kv_heads=_super_nvfp4.NUM_KV_HEADS,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=isinstance(bmm1_scale, torch.Tensor),
+        retain_kv_l2=False,
+        component=_SUPER_NVFP4_DECODE_COMPONENT,
+        page_size=_super_nvfp4.PAGE_SIZE,
+        super_nvfp4_kernel=kernel,
+    )
+
+
 def select_cake_fmha_decode_route(
     device: torch.device,
     *,
@@ -6011,8 +6108,13 @@ def select_cake_fmha_decode_route(
     multi_ctas_kv_counter_buffer: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
     length_aware_schedule: bool = False,
+    max_q_len: int | None = None,
+    mask: torch.Tensor | None = None,
 ) -> CakeFmhaDecodeRoute | None:
     """Select an exact product decode route without broadening its contract.
+
+    ``max_q_len`` (a ragged call's ``q_len`` is ``None``) and ``mask`` serve
+    the ``decode_super_nvfp4`` route only.
 
     ``enable_pdl`` is the caller's launch mode; a generated program whose split-KV
     reducer waits on the decode grid serves only a call that asks for it.
@@ -6027,6 +6129,37 @@ def select_cake_fmha_decode_route(
     programs write no caller LSE).
     """
 
+    # Only an NVFP4 KV cache with an FP8 query can take the super_nvfp4 route.
+    super_nvfp4_route = None
+    if key_block_scales is not None and query.dtype == torch.float8_e4m3fn:
+        super_nvfp4_route = _select_super_nvfp4_decode_route(
+            device,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            out=out,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            batch_size=batch_size,
+            max_q_len=q_len if max_q_len is None else max_q_len,
+            max_seq_len=max_seq_len,
+            window_left=window_left,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            cum_seq_lens_q=cum_seq_lens_q,
+            key_block_scales=key_block_scales,
+            value_block_scales=value_block_scales,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_block_sparse_attention=enable_block_sparse_attention,
+            lse=lse,
+            mask=mask,
+            enable_pdl=enable_pdl,
+        )
+    if super_nvfp4_route is not None:
+        return super_nvfp4_route
     if q_len is None or q_len <= 0 or batch_size <= 0 or max_seq_len <= 0:
         return None
     if cum_seq_lens_q is not None or enable_block_sparse_attention:
@@ -7404,6 +7537,230 @@ def _run_cake_fmha_aligned_mtp_q32_decode(
         module.entry(*arguments)
 
 
+@dataclass(frozen=True)
+class CakeFmhaSuperNvfp4Module:
+    """The loaded Nemotron 3.5 Super NVFP4 kernels behind Cake's decode and
+    context interfaces (the arguments ``decode.py`` and ``prefill.py`` pass to
+    ``cake_paged_attention_decode`` / ``cake_paged_attention_context``)."""
+
+    route: CakeFmhaDecodeRoute | CakeFmhaContextRoute
+    module: Any
+
+    def cake_paged_attention_decode(
+        self,
+        out: torch.Tensor,
+        out_scale_factor: torch.Tensor | None,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        multi_ctas_kv_counter_buffer: torch.Tensor | None,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_seq_len: int,
+        bmm1_scale: float | torch.Tensor,
+        bmm2_scale: float | torch.Tensor,
+        o_sf_scale: float,
+        o_sf_vec_size: int,
+        o_sf_start_index: int,
+        batch_size: int,
+        window_left: int,
+        sparse_top_k: int,
+        sm_count: int,
+        enable_pdl: bool,
+        workspace_size: int,
+        attention_sinks: torch.Tensor | None,
+        cum_seq_lens_q: torch.Tensor | None,
+        key_block_scales: torch.Tensor,
+        value_block_scales: torch.Tensor,
+        skip_softmax_threshold_scale_factor: float | None,
+        uses_shared_paged_kv_idx: bool,
+        lse: torch.Tensor | None,
+        lse_stride_tokens: int,
+        lse_stride_heads: int,
+        enable_block_sparse_attention: bool,
+        sparse_mla_top_k_lens: torch.Tensor | None,
+    ) -> None:
+        """Launch a ``decode_super_nvfp4`` route on the current torch stream."""
+
+        kernel = getattr(self.route, "super_nvfp4_kernel", None)
+        if kernel not in (_super_nvfp4.DECODE_MTP, _super_nvfp4.DECODE_BASE):
+            raise RuntimeError(
+                f"Cake FMHA decode_super_nvfp4 module serves kernel {kernel!r}, "
+                "not a decode kernel"
+            )
+        _super_nvfp4.run_decode(
+            kernel,
+            out=out,
+            query=query,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            k_block_scales=key_block_scales,
+            v_block_scales=value_block_scales,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            enable_pdl=enable_pdl,
+        )
+
+    def cake_paged_attention_context(
+        self,
+        out: torch.Tensor,
+        out_scale_factor: torch.Tensor | None,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        multi_ctas_kv_counter_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        bmm1_scale: float | torch.Tensor,
+        bmm2_scale: float | torch.Tensor,
+        o_sf_scale: float,
+        o_sf_vec_size: int,
+        o_sf_start_index: int,
+        batch_size: int,
+        window_left: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        sm_count: int,
+        enable_pdl: bool | None,
+        workspace_size: int,
+        attention_sinks: torch.Tensor | None,
+        key_block_scales: torch.Tensor | None,
+        value_block_scales: torch.Tensor | None,
+        skip_softmax_threshold_scale_factor: float | None,
+        uses_shared_paged_kv_idx: bool,
+        use_fp16_softmax: bool,
+        uses_spcompress: bool,
+        is_causal: bool,
+        lse: torch.Tensor | None,
+        lse_stride_tokens: int,
+        lse_stride_heads: int,
+    ) -> None:
+        """Launch a ``context_super_nvfp4`` route on the current torch stream."""
+
+        kernel = getattr(self.route, "super_nvfp4_kernel", None)
+        if kernel != _super_nvfp4.PREFILL:
+            raise RuntimeError(
+                f"Cake FMHA context_super_nvfp4 module serves kernel {kernel!r}, "
+                "not the prefill kernel"
+            )
+        _super_nvfp4.run_prefill(
+            out=out,
+            query=query,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            k_block_scales=key_block_scales,
+            v_block_scales=value_block_scales,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+        )
+
+
+@dataclass(frozen=True)
+class CakeFmhaSuperNvfp4TrtllmGenModule:
+    """Runs a super_nvfp4 route on the trtllm-gen FMHA kernels behind Cake's
+    decode and context interfaces. The argument positions below are those of
+    :class:`CakeFmhaSuperNvfp4Module` and of the trtllm-gen bindings
+    (``trtllm_paged_attention_decode`` / ``trtllm_paged_attention_context``),
+    as ``decode.py`` and ``prefill.py`` call them."""
+
+    route: CakeFmhaDecodeRoute | CakeFmhaContextRoute
+
+    @staticmethod
+    def _pack_common_args(args: list[Any]) -> torch.Tensor:
+        out, key_cache, value_cache = args[0], args[3], args[4]
+        # TRT-LLM indexes output and metadata as packed, and derives both
+        # K and V data strides from K. Cake's API also accepts strided views.
+        # Preserve rows the kernel does not write, such as inactive graph rows.
+        args[0] = out.contiguous()
+        if key_cache.stride() != value_cache.stride():
+            args[3] = key_cache.contiguous()
+            args[4] = value_cache.contiguous()
+        args[7] = args[7].contiguous()  # block_tables
+        args[8] = args[8].contiguous()  # seq_lens
+        return out
+
+    def cake_paged_attention_decode(self, *args: Any) -> None:
+        from .decode import get_trtllm_gen_fmha_module
+
+        args_list = list(args)
+        out = self._pack_common_args(args_list)
+        if args_list[23] is not None:  # cum_seq_lens_q
+            args_list[23] = args_list[23].contiguous()
+        # trtllm-gen also takes lse_scale after ``lse`` (argument 28), then the
+        # BF16-query transform mode (0: none) and use_fp16_softmax at the end.
+        lse_index = 28
+        get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
+            *args_list[: lse_index + 1], 1.0, *args_list[lse_index + 1 :], 0, None
+        )
+        if args_list[0] is not out:
+            out.copy_(args_list[0])
+
+    def cake_paged_attention_context(self, *args: Any) -> None:
+        from .prefill import get_trtllm_gen_fmha_module
+
+        args_list = list(args)
+        out = self._pack_common_args(args_list)
+        args_list[18] = args_list[18].contiguous()  # cum_seq_lens_q
+        args_list[19] = args_list[19].contiguous()  # cum_seq_lens_kv
+        bmm1_scale = args_list[11]
+        if isinstance(bmm1_scale, torch.Tensor):
+            # Cake passes a device bmm1 scale raw; trtllm-gen reads its log2 form.
+            args_list[11] = bmm1_scale * log2e
+        window_left, is_causal = args_list[17], args_list[30]
+        # Cake serves a causal left window or none: the right window is then
+        # 0 or -1, and there are no per-token windows.
+        window_right = 0 if is_causal and window_left >= 0 else -1
+        get_trtllm_gen_fmha_module().trtllm_paged_attention_context(
+            *args_list[:18],
+            window_right,
+            *args_list[18:20],
+            None,
+            None,
+            *args_list[20:32],
+            1.0,
+            *args_list[32:],
+        )
+        if args_list[0] is not out:
+            out.copy_(args_list[0])
+
+
+def _load_cake_fmha_super_nvfp4_module(
+    device: torch.device, route: CakeFmhaDecodeRoute | CakeFmhaContextRoute
+) -> CakeFmhaSuperNvfp4Module | CakeFmhaSuperNvfp4TrtllmGenModule:
+    if route.target != _cake_fmha_target(device):
+        raise RuntimeError(
+            "Cake FMHA super_nvfp4 route target does not match the device"
+        )
+    if route.super_nvfp4_kernel == _super_nvfp4.TRTLLM_GEN:
+        return CakeFmhaSuperNvfp4TrtllmGenModule(route=route)
+    module = _super_nvfp4._module()
+    if module is None:
+        raise RuntimeError(
+            "Cake FMHA super_nvfp4 kernels failed to load after their route was "
+            "selected; see the earlier build error"
+        )
+    return CakeFmhaSuperNvfp4Module(route=route, module=module)
+
+
 def _resolve_cake_fmha_decode_module(
     device: torch.device, route: CakeFmhaDecodeRoute | None
 ) -> tuple[Any, bool]:
@@ -7423,6 +7780,8 @@ def _resolve_cake_fmha_decode_module(
     module exposing ``cake_paged_attention_decode``.
     """
 
+    if route is not None and route.component == _SUPER_NVFP4_DECODE_COMPONENT:
+        return _load_cake_fmha_super_nvfp4_module(device, route), True
     if route is not None:
         # A route's program was checked when it loaded: later launches reuse it.
         program_module = _DECODE_PROGRAM_MODULES.get(route)
@@ -8681,9 +9040,61 @@ def select_cake_fmha_context_route(
     lse: torch.Tensor | None,
     kv_layout: str = "HND",
     workspace_buffer: torch.Tensor | None = None,
+    use_fp16_softmax: bool = False,
+    uses_spcompress: bool = False,
 ) -> CakeFmhaContextRoute | None:
     """Select an exact product context route without broadening its contract."""
 
+    # Only an NVFP4 KV cache with an FP8 query can take the super_nvfp4 route.
+    super_nvfp4_kernel = None
+    if key_block_scales is not None and query.dtype == torch.float8_e4m3fn:
+        super_nvfp4_kernel = _super_nvfp4.select_prefill_route(
+            out=out,
+            query=query,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            k_block_scales=key_block_scales,
+            v_block_scales=value_block_scales,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            dense_causal=(
+                is_causal
+                and sinks is None
+                and lse is None
+                and window_left == -1
+                and _pinned_noop_skip_softmax_supported(
+                    skip_softmax_threshold_scale_factor
+                )
+                and uses_shared_paged_kv_idx
+                and not use_fp16_softmax
+                and not uses_spcompress
+            ),
+        )
+    if super_nvfp4_kernel is not None:
+        return CakeFmhaContextRoute(
+            target=_cake_fmha_target(device),
+            component=_SUPER_NVFP4_CONTEXT_COMPONENT,
+            num_m_blocks=0,
+            num_q_heads=_super_nvfp4.NUM_QO_HEADS,
+            num_kv_heads=_super_nvfp4.NUM_KV_HEADS,
+            pack_g=0,
+            page_size=_super_nvfp4.PAGE_SIZE,
+            l2_swizzle=0,
+            is_causal=True,
+            return_lse=False,
+            enable_sink=False,
+            device_scales=isinstance(bmm1_scale, torch.Tensor)
+            and isinstance(bmm2_scale, torch.Tensor),
+            reads_device_scales=True,
+            super_nvfp4_kernel=super_nvfp4_kernel,
+        )
     if batch_size <= 0 or max_q_len <= 0 or max_kv_len <= 0 or window_left != -1:
         return None
     if not _decode_quant_scale_supported(
@@ -9364,6 +9775,7 @@ def select_cake_fmha_context_route(
         exact_profile=exact_profile,
         device_scales=device_scales,
         program=program,
+        reads_device_scales=device_scales and program is not None,
     )
 
 
@@ -9967,6 +10379,8 @@ def get_cake_fmha_context_module(
 ):
     """Load an optimized context module, or the authenticated portable fallback."""
 
+    if route is not None and route.component == _SUPER_NVFP4_CONTEXT_COMPONENT:
+        return _load_cake_fmha_super_nvfp4_module(device, route)
     if route is None or not cake_fmha_route_is_optimized(route):
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):

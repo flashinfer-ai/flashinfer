@@ -5292,6 +5292,8 @@ def trtllm_batch_decode_with_kv_cache(
                 CakeFmhaAlignedHd64DecodeModule,
                 CakeFmhaAlignedMtpQ32DecodeModule,
                 CakeFmhaDecodeProgramModule,
+                CakeFmhaSuperNvfp4Module,
+                CakeFmhaSuperNvfp4TrtllmGenModule,
                 _resolve_cake_fmha_decode_module,
                 _run_cake_fmha_aligned_decode,
                 _run_cake_fmha_aligned_hd256_decode,
@@ -5336,6 +5338,8 @@ def trtllm_batch_decode_with_kv_cache(
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 enable_pdl=enable_pdl,
                 length_aware_schedule=length_aware_schedule,
+                max_q_len=max_q_len,
+                mask=mask,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
@@ -5448,7 +5452,19 @@ def trtllm_batch_decode_with_kv_cache(
                     bmm1_scale = float(bmm1_scale.item()) / log2e
                 if isinstance(bmm2_scale, torch.Tensor):
                     bmm2_scale = float(bmm2_scale.item())
-            if multi_ctas_kv_counter_buffer is None:
+            if multi_ctas_kv_counter_buffer is None and isinstance(
+                cake_module, CakeFmhaSuperNvfp4TrtllmGenModule
+            ):
+                # The trtllm-gen kernels take the cached buffer, as for
+                # backend="trtllm-gen"; the super_nvfp4 kernels need none.
+                multi_ctas_kv_counter_buffer = (
+                    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+                        None, batch_size, num_qo_heads, sm_count, query.device
+                    )
+                )
+            if multi_ctas_kv_counter_buffer is None and not isinstance(
+                cake_module, CakeFmhaSuperNvfp4Module
+            ):
                 # Same per-call contract as backend="trtllm-gen": a fresh
                 # zero-initialized buffer when the caller passes none. The
                 # Cake on-device load-balanced route keeps its self-resetting

@@ -5,6 +5,9 @@
 --routine BatchPrefillWithPagedKVCacheWrapper --backends prims-ts trtllm-native --page_size 32 --batch_size 1 --s_qo 1024 --s_kv 1024 --num_qo_heads 32 --num_kv_heads 4 --head_dim_qk 128 --head_dim_vo 128 -vv --refcheck --causal --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3 --case_tag "PrimTS-context-paged"
 --routine BatchPrefillWithRaggedKVCacheWrapper --backends prims-ts --batch_size 1 --s_qo 1024 --s_kv 1024 --num_qo_heads 32 --num_kv_heads 4 --head_dim_qk 256 --head_dim_vo 256 -vv --refcheck --causal --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3 --case_tag "PrimTS-context-ragged"
 
+# Nemotron 3.5 Super, NVFP4 KV cache (SM100)
+--routine BatchPrefillWithPagedKVCacheWrapper --backends trtllm-gen trtllm-native cake --page_size 128 --batch_size 1 --s_qo 16384 --s_kv 17408 --num_qo_heads 32 --num_kv_heads 2 --head_dim_qk 128 --head_dim_vo 128 -vv --refcheck --q_dtype fp8_e4m3 --kv_dtype nvfp4 --out_dtype fp8_e4m3 --generate_repro_command --causal --case_tag "CAKE-SUPER-NVFP4-prefill-KV17K"
+
 # Ragged prefill for DeepSeep-R1
 --routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 fa3 cutlass cudnn --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag "DeepSeek-R1"
 
@@ -13,6 +16,9 @@
 
 # PrimTS speculative FMHA decode
 --routine BatchDecodeWithPagedKVCacheWrapper --backends prims-ts trtllm-native --page_size 32 --batch_size 4 --s_qo 4 --s_kv 4096 --num_qo_heads 32 --num_kv_heads 4 --head_dim_qk 128 --head_dim_vo 128 -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --case_tag "PrimTS-FMHA-decode-SQ4"
+
+# Nemotron 3.5 Super, NVFP4 KV cache (SM100)
+--routine BatchDecodeWithPagedKVCacheWrapper --backends trtllm-gen trtllm-native cake --page_size 128 --batch_size 32 --s_qo 2 --s_kv 32768 --num_qo_heads 32 --num_kv_heads 2 --head_dim_qk 128 --head_dim_vo 128 -vv --refcheck --q_dtype fp8_e4m3 --kv_dtype nvfp4 --out_dtype fp8_e4m3 --generate_repro_command --case_tag "CAKE-SUPER-NVFP4-decode-mtp-SQ2"
 
 ## Attention MLA
 # DeepSeek-R1
