@@ -39,10 +39,10 @@ def test_mm_fp8(
     backend: str,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
-        pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
+    if compute_capability[0] not in [8, 10]:
+        pytest.skip("mm_fp8 is only supported on SM8x and Blackwell GPUs.")
     if backend == "cutedsl_low_latency":
-        if compute_capability[1] not in (0, 3, 7):
+        if compute_capability[0] == 10 and compute_capability[1] not in (0, 3, 7):
             pytest.skip("cutedsl_low_latency mm_fp8 requires SM100/SM103/SM107")
         if m > 8:
             pytest.skip("cutedsl_low_latency mm_fp8 requires M <= 8")
@@ -111,8 +111,8 @@ def test_mm_fp8_auto_routing(m: int, n: int, k: int, prepared: bool):
 
 def test_mm_fp8_trtllm_low_latency_rejects_unprocessed_weight():
     major, _ = get_compute_capability(torch.device(device="cuda"))
-    if major != 10:
-        pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
+    if major not in (8, 10):
+        pytest.skip("mm_fp8 is only supported on SM8x and Blackwell GPUs.")
     a = torch.zeros([4, 256], device="cuda").to(torch.float8_e4m3fn)
     b = torch.zeros([256, 256], device="cuda").to(torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="prepare_low_latency_gemm_weights"):

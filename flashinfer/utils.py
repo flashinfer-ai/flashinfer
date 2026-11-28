@@ -427,12 +427,12 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
 
 
 def _check_block_scale_quantization_support(device: torch.device, op_name: str) -> None:
-    # The CUDA quantization kernels have no implementation below SM100.
+    # The CUDA quantization kernels have no implementation below SM80.
     if device.type == "cuda":
         major, minor = get_compute_capability(device)
-        if major < 10:
+        if major < 8:
             raise RuntimeError(
-                f"{op_name} requires SM100 or newer; got SM{major}{minor}"
+                f"{op_name} requires SM80 or newer; got SM{major}{minor}"
             )
 
 

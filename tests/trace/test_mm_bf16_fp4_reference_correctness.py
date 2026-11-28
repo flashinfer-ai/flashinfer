@@ -51,6 +51,8 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
         )
     except Exception as exc:
         pytest.skip(f"mm_bf16_fp4 ({backend}) unavailable: {exc}")
+    if torch.cuda.get_device_capability()[0] == 8:
+        pytest.skip("SM8x W4A16 records have no trace template")
     # The prepared layouts are what the dispatch keys off, so a real prepared
     # call must resolve back to the template that describes it.
     assert mm_bf16_fp4_trace_dispatch(**inputs) is tpl

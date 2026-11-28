@@ -41,9 +41,9 @@ from ..jit import (
     sm103a_nvcc_flags,
     sm100a_nvcc_flags,
     sm100f_nvcc_flags,
-    sm90a_nvcc_flags,
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
+from ..jit.fp4_quantization import gen_fp4_quantization_sm80_module, sw_cvt_nvcc_flags
 from ..utils import (
     _check_block_scale_quantization_support,
     backend_requirement,
@@ -188,6 +188,9 @@ def _e2m1_and_ufp8sf_scale_to_float_cpu(
     # Map 4-bit codes to float via LUT
     float_vals = _get_e2m1_values(device)[fp4_vals.long()]  # [M, K]
 
+    # [M, K / sf_vec_size] scales, or flat as the host module takes them
+    ufp8_scale_tensor = ufp8_scale_tensor.reshape(m, k // sf_vec_size)
+
     # Decode UFP8 scale factors
     if ufp8_type == 1:
         # E4M3: interpret raw bytes as float8_e4m3fn
@@ -221,7 +224,7 @@ def gen_fp4_quantization_sm107_module() -> JitSpec:
 
 
 def gen_fp4_quantization_sm90_module() -> JitSpec:
-    return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
+    return gen_fp4_quantization_module(sw_cvt_nvcc_flags("90"), "90")
 
 
 def gen_fp4_quantization_sm110_module() -> JitSpec:
@@ -282,6 +285,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
+        **dict.fromkeys(("89", "87", "86", "80"), gen_fp4_quantization_sm80_module),
     }
 
     # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,
@@ -976,7 +980,7 @@ def silu_and_mul_nvfp4_quantize(
     r"""Apply SwiGLU and NVFP4 quantization in one CuTe-DSL kernel.
 
     Computes ``silu(input[..., :K]) * input[..., K:]`` before quantization.
-    Requires CuTe-DSL and an SM100+ GPU.
+    Requires CuTe-DSL and an SM80+ GPU.
 
     Parameters
     ----------
@@ -1022,12 +1026,12 @@ def silu_and_mul_nvfp4_quantize(
     k = input.shape[-1] // 2
     assert k % sf_vec_size == 0
 
-    # Reject pre-Blackwell GPUs before CuTe-DSL compilation.
+    # Reject unsupported GPUs before CuTe-DSL compilation.
     major, minor = get_compute_capability(input.device)
-    if major < 10:
+    if major < 8:
         raise RuntimeError(
-            "silu_and_mul_nvfp4_quantize requires a Blackwell GPU (SM100+, compute "
-            f"capability >= 10.0); got SM{major}{minor}."
+            "silu_and_mul_nvfp4_quantize requires an SM80+ GPU (compute capability "
+            f">= 8.0); got SM{major}{minor}."
         )
 
     from ..cute_dsl import is_cute_dsl_available
@@ -1148,8 +1152,8 @@ def fp4_quantize(
 
         - ``"auto"`` (default): the CUDA kernel, or the batch-invariant class
           under ``batch_invariant=True`` (which requires ``"auto"``).
-        - ``"cuda"``: stable CUDA kernel on SM100+.
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cuda"``: stable CUDA kernel on SM80+.
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
           Supported combinations:
 
           * ``sf_vec_size=16, sf_use_ue8m0=False``: all layouts,
@@ -1546,7 +1550,8 @@ def e2m1_and_ufp8sf_scale_to_float(
     ufp8_scale_tensor : torch.Tensor
         Scale-factor tensor in UFP8 format with dtype ``uint8``.
     global_scale_tensor : torch.Tensor, optional
-        Global scale factor of shape ``[1]`` and dtype ``float32``.
+        Global scale factor of shape ``[1]`` and dtype ``float32``.  On SM80
+        and newer it applies to E4M3 scales (``ufp8_type=1``) only.
     sf_vec_size : int
         Scale-factor vector size.  Defaults to ``16``.
     ufp8_type : int
@@ -1571,6 +1576,22 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.device("cuda:0")
     )  # select any cuda device to get a compute capability
     if major * 10 + minor < 90:
+        if major >= 8 and ufp8_type != 1:
+            # SM80 to SM89 dequantize both layouts here under the host op's
+            # contract, which applies the global scale to E4M3 scales only.
+            global_scale_tensor = None
+        if major >= 8 and is_sf_swizzled_layout:
+            # Untile the 128x4 or 8x4 scales into rows for the fallback.
+            rows = 8 if is_sf_8x4_layout else 128
+            m, sf_cols = e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2 // sf_vec_size
+            m_pad, cols_pad = round_up(m, rows), round_up(sf_cols, 4)
+            tile = (8, 4) if is_sf_8x4_layout else (32, 4, 4)
+            ufp8_scale_tensor = (
+                ufp8_scale_tensor.reshape(m_pad // rows, cols_pad // 4, *tile)
+                .transpose(1, 2 if is_sf_8x4_layout else 3)
+                .reshape(m_pad, cols_pad)[:m, :sf_cols]
+            )
+            is_sf_swizzled_layout = False
         # No kernel available; use pure-PyTorch fallback
         return _e2m1_and_ufp8sf_scale_to_float_cpu(
             e2m1_tensor,
@@ -1580,6 +1601,9 @@ def e2m1_and_ufp8sf_scale_to_float(
             ufp8_type,
             is_sf_swizzled_layout,
         )
+    if major < 10 and global_scale_tensor is None:
+        # As in the host fallback above: no global scale is 1.0.
+        global_scale_tensor = torch.ones(1, dtype=torch.float32)
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(
         device_arch
@@ -1696,8 +1720,8 @@ def nvfp4_quantize(
 
         - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
           under ``batch_invariant=True`` (which requires ``"auto"``).
-        - ``"cuda"``: stable CUDA kernel on SM100+.
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**);
+        - ``"cuda"``: stable CUDA kernel on SM80+.
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**);
           supports all ``sfLayout`` values
           (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
           and input dtypes fp16/bf16/float8_e4m3fn, but only
@@ -2042,8 +2066,8 @@ def mxfp4_quantize(
 
         - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
           under ``batch_invariant=True`` (which requires ``"auto"``).
-        - ``"cuda"``: stable CUDA kernel on SM100+.
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cuda"``: stable CUDA kernel on SM80+.
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM80+, **experimental**).
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Only used when
         ``backend == "cute-dsl"``.  Auto-detected from device capability
@@ -2601,7 +2625,7 @@ def get_fp4_kv_quantization_module():
 _NVFP4_BLOCK_SIZE = 16
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
     return True
 
@@ -2648,7 +2672,7 @@ def nvfp4_kv_dequantize(
     return output
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_paged_kv_dequant_check(*args, **kwargs):
     return True
 
@@ -2757,7 +2781,7 @@ def nvfp4_kv_dequantize_paged(
     )
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_quant_check(input, global_scale):
     return True
 
@@ -2770,14 +2794,15 @@ def nvfp4_kv_quantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""GPU quantization to the NVFP4 KV-cache format with linear block-scale layout.
 
-    Requires SM100+ (Blackwell) for the ``cvt.rn.satfinite.e2m1x2.f32`` PTX
-    instruction.
+    Requires SM80+. Below SM100 the E2M1 conversion runs in software, with
+    the same results as the ``cvt.rn.satfinite.e2m1x2.f32`` PTX instruction.
 
     Parameters
     ----------
     input : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype bf16 or fp16; ``K``
-        must be divisible by 16.
+        must be divisible by 16. It must be contiguous with a 4-byte aligned
+        data pointer; copy an offset view with ``input.clone()``.
     global_scale : torch.Tensor
         Global scale factor of shape ``[1]`` with dtype ``float32``, on the
         same CUDA device as ``input``.
@@ -2793,10 +2818,29 @@ def nvfp4_kv_quantize(
     M, K = input.shape
     if K % _NVFP4_BLOCK_SIZE != 0:
         raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
+    # The SM80-SM90 path: its kernel reads one float32 global scale and loads the
+    # input in 4-byte element pairs, which the module does not check.
+    sw_cvt = input.is_cuda and get_compute_capability(input.device)[0] < 10
+    if sw_cvt:
+        if input.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"input must have dtype torch.float16 or torch.bfloat16, got {input.dtype}"
+            )
+        if global_scale.dtype != torch.float32 or global_scale.numel() != 1:
+            raise ValueError("global_scale must be a float32 tensor with one element")
+        if global_scale.device != input.device:
+            raise ValueError("global_scale must be on the same device as input")
+        if input.data_ptr() % 4 != 0:
+            raise ValueError(
+                "input must be 4-byte aligned; copy an offset view with input.clone()"
+            )
     fp4_output = torch.empty((M, K // 2), dtype=torch.uint8, device=input.device)
     block_scales = torch.empty(
         (M, K // _NVFP4_BLOCK_SIZE), dtype=torch.uint8, device=input.device
     )
+    if sw_cvt and M == 0:
+        # No rows: the module would launch an empty grid.
+        return fp4_output, block_scales
     get_fp4_kv_quantization_module().nvfp4_kv_quant(
         input, global_scale, fp4_output, block_scales
     )

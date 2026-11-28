@@ -24,7 +24,7 @@ def direct_sm100_module(monkeypatch):
     monkeypatch.setattr(
         fp8_quantization,
         "gen_mxfp8_quantization_sm100_module",
-        lambda: SimpleNamespace(build_and_load=lambda: native),
+        lambda _: SimpleNamespace(build_and_load=lambda: native),
     )
     # Exercise the real exported factory without caching this test's native stub.
     return get_mxfp8_quantization_sm100_module.__wrapped__(), native
@@ -68,7 +68,7 @@ def test_mxfp8_sm100_direct_keeps_cpu_host(monkeypatch, direct_sm100_module):
     native.mxfp8_quantize.assert_not_called()
 
 
-@pytest.mark.parametrize("capability", [(8, 0), (9, 0)])
+@pytest.mark.parametrize("capability", [(7, 0), (7, 5)])
 @pytest.mark.parametrize("backend", ["auto", "cuda"])
 def test_mxfp8_quantize_rejects_unsupported_cuda_before_jit(
     monkeypatch, capability, backend
@@ -83,7 +83,7 @@ def test_mxfp8_quantize_rejects_unsupported_cuda_before_jit(
     monkeypatch.setattr(fp8_quantization, "get_mxfp8_quantization_sm100_module", loader)
     monkeypatch.setattr(fp8_quantization, "device_support_pdl", pdl_query)
 
-    with pytest.raises(RuntimeError, match="requires SM100 or newer"):
+    with pytest.raises(RuntimeError, match="requires SM80 or newer"):
         mxfp8_quantize(input, backend=backend)
 
     capability_query.assert_called_once_with(input.device)
@@ -96,17 +96,17 @@ def test_mxfp8_quantize_rejects_unsupported_real_cuda():
         pytest.skip("CUDA is not available")
     device = torch.device("cuda", torch.cuda.current_device())
     major, minor = torch.cuda.get_device_capability(device)
-    if major >= 10:
-        pytest.skip("Requires a CUDA device older than SM100")
+    if major >= 8:
+        pytest.skip("Requires a CUDA device older than SM80")
 
     input = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
     with pytest.raises(
-        RuntimeError, match=f"requires SM100 or newer, got SM{major}{minor}"
+        RuntimeError, match=f"requires SM80 or newer, got SM{major}{minor}"
     ):
         mxfp8_quantize(input, backend="cuda")
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0)])
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0)])
 @pytest.mark.parametrize("backend", ["auto", "cuda"])
 def test_mxfp8_quantize_keeps_supported_cuda_dispatch(monkeypatch, capability, backend):
     input = _fake_cuda_input()
@@ -119,7 +119,7 @@ def test_mxfp8_quantize_keeps_supported_cuda_dispatch(monkeypatch, capability, b
     monkeypatch.setattr(fp8_quantization, "get_mxfp8_quantization_sm100_module", loader)
 
     assert mxfp8_quantize(input, backend=backend, enable_pdl=False) == output
-    loader.assert_called_once_with()
+    loader.assert_called_once_with(*{8: ("80",), 9: ("90",)}.get(capability[0], ()))
     quantize.assert_called_once_with(
         input, fp8_quantization.SfLayout.layout_128x4, 32, False
     )

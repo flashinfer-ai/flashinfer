@@ -9,6 +9,11 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import vector
 from cutlass import cute, utils
 from cutlass._mlir.dialects import llvm
+from flashinfer.cute_dsl.fp4_common import (
+    cvt_e4m3_byte_to,
+    fp4_decode_2,
+    target_arch,
+)
 
 
 @cute.jit
@@ -43,6 +48,13 @@ def _add(a: cutlass.Float32, b: cutlass.Float32):
 
 @dsl_user_op
 def _fp4_quad(packed, *, loc=None, ip=None):
+    if target_arch() < (10, 0):
+        # No E2M1 conversion before SM100: fp4_decode_2 lowers it in software.
+        bits = packed.to(cutlass.Uint32)
+        halves = (fp4_decode_2(bits & 255), fp4_decode_2((bits >> 8) & 255))
+        return cutlass.Vector.from_elements(halves, cutlass.Uint32).bitcast(
+            cutlass.Float16
+        )
     decoded = cute.arch.cvt_f4e2m1x4_to_f16x4(
         packed.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
     )
@@ -102,10 +114,8 @@ def _kernel(
         for group in range((C + 31) // 32):
             sc = lane + group * 32
             if sc < C:
-                sx = (
-                    smid[route * 128 * C + (sc // 4) * 512 + sc % 4]
-                    .bitcast(cutlass.Float8E4M3FN)
-                    .to(cutlass.Float32)
+                sx = cvt_e4m3_byte_to(
+                    smid[route * 128 * C + (sc // 4) * 512 + sc % 4], cutlass.Float32
                 )
                 sfidx = (
                     expert * H * C
@@ -116,16 +126,16 @@ def _kernel(
                     + sc % 4
                 )
                 xv = x64[route * C + sc]
-                sw0 = ws[sfidx + 0].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                sw0 = cvt_e4m3_byte_to(ws[sfidx + 0], cutlass.Float32)
                 w0 = w64[(expert * H + row + 0) * C + sc]
                 g0 = cutlass.vector.full((4,), 0.0, dtype=cutlass.Float16)
-                sw1 = ws[sfidx + 16].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                sw1 = cvt_e4m3_byte_to(ws[sfidx + 16], cutlass.Float32)
                 w1 = w64[(expert * H + row + 1) * C + sc]
                 g1 = cutlass.vector.full((4,), 0.0, dtype=cutlass.Float16)
-                sw2 = ws[sfidx + 32].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                sw2 = cvt_e4m3_byte_to(ws[sfidx + 32], cutlass.Float32)
                 w2 = w64[(expert * H + row + 2) * C + sc]
                 g2 = cutlass.vector.full((4,), 0.0, dtype=cutlass.Float16)
-                sw3 = ws[sfidx + 48].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                sw3 = cvt_e4m3_byte_to(ws[sfidx + 48], cutlass.Float32)
                 w3 = w64[(expert * H + row + 3) * C + sc]
                 g3 = cutlass.vector.full((4,), 0.0, dtype=cutlass.Float16)
                 for b in range(4):

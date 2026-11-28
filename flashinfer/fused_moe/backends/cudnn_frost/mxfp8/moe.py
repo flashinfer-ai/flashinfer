@@ -14,11 +14,15 @@ from itertools import product
 import torch
 
 from .....fused_moe.api import QuantFormat, RoutingInputMode
-from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
+from .....fused_moe.runners import (
+    CutlassMxfp8Runner,
+    MoERunner,
+    _validate_prerouted_inputs,
+)
 from .....utils import get_compute_capability
 from .. import runtime as common
 from ..activations import ACTIVATIONS, activation_name
-from ..support import SUPPORTED_ARCHS, weight_view
+from ..support import SM8X_ARCH_NUMBERS, SUPPORTED_ARCHS, weight_view
 from ..compiler import require_moe_assembler
 from ..cache import require_graph_resource_retention
 from ..engine import (
@@ -48,7 +52,20 @@ _WEIGHT_KEYS = (
     "fc2_input_scale",
 )
 _TAG = "cudnn_frost-mxfp8-moe-v2"
-_UNSUPPORTED = "cuDNN Frost MXFP8 MoE kernels require SM107a or SM120a"
+_UNSUPPORTED = (
+    "cuDNN Frost MXFP8 MoE kernels require SM80, SM86, SM87, SM89, SM107a or SM120a"
+)
+
+
+class _Sm8xRunner(CutlassMxfp8Runner):
+    """CUTLASS's SM8x MXFP8 pipeline with the activation on GEMM1's float32
+    output, as Frost's own kernels run it."""
+
+    @staticmethod
+    def _sm8x_body_class():
+        from .....fused_moe.sm8x_fp8_moe import Sm8xFrostMxfp8MoE
+
+        return Sm8xFrostMxfp8MoE
 
 
 @functools.lru_cache(maxsize=None)
@@ -405,13 +422,17 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
             raise NotImplementedError(_UNSUPPORTED)
         major, minor = get_compute_capability(self.device)
         arch = f"sm_{major}{minor}a"
-        if arch not in SUPPORTED_ARCHS:
+        sm8x = major * 10 + minor in SM8X_ARCH_NUMBERS
+        if arch not in SUPPORTED_ARCHS and not sm8x:
             raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize or self.config.quant.per_token_scale:
             raise NotImplementedError(
                 "cuDNN Frost MXFP8 MoE requires finalized output without per-token scales"
             )
+        if sm8x:
+            self._attach_sm8x(_Sm8xRunner)
+            return
         sources = tuple(
             sorted(
                 {
@@ -433,6 +454,9 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
         require_compiler(arch, sources)
 
     def _build(self):
+        if self._sm8x is not None:
+            self._sm8x.build()
+            return
         device, activation = self.device, self.config.activation
         swizzled = self.config.quant.swizzled_scale_factors is True
         self._engine = FrostEngine(
@@ -539,6 +563,8 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
             raise ValueError(
                 "cuDNN Frost MXFP8 requires aligned contiguous tensors on the runner device"
             )
+        if self._sm8x is not None:
+            return self._pack_sm8x(act, view, "cutlass_mxfp8", sf1.ndim == 4)
         xsf = xsf.view(torch.uint8)
         shape = (t, h, i, e, k)
         state = self._engine.state(shape)
@@ -552,6 +578,8 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
+        if self._sm8x is not None:
+            return self._sm8x.get_valid_tactics(inputs, profile)
         state = prepared_state(self, inputs)
         if state is not None:
             return ranked_tactics(state, inputs, _TAG)
@@ -568,6 +596,8 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
         )
 
     def _input_cache_key_extras(self, inputs):
+        if self._sm8x is not None:
+            return self._sm8x._input_cache_key_extras(inputs)
         state = prepared_state(self, inputs)
         if state is not None:
             key, tactics = state.preparation_key, tuple(state.launches)
@@ -589,6 +619,8 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
         return (POLICY_VERSION, key, tactics)
 
     def validate_tactic(self, inputs, tactic):
+        if self._sm8x is not None:
+            return tactic == -1 or tactic in self._sm8x.get_valid_tactics(inputs, None)
         state = prepared_state(self, inputs)
         return tactic == -1 or tactic in (
             state.launches

@@ -22,6 +22,7 @@ utilities used by both rmsnorm_fp4quant.py and add_rmsnorm_fp4quant.py.
 import functools
 import math
 import operator
+import re
 from typing import Callable, Tuple
 
 import cutlass
@@ -67,6 +68,109 @@ def get_sm_version(device: int | torch.device | str | None = None) -> int:
         device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
     return props.major * 10 + props.minor
+
+
+# =============================================================================
+# Software lowering of narrow-format conversions the target lacks
+# =============================================================================
+# Each replacement is exact for every input and follows the hardware cvt:
+# ties-to-even, satfinite, NaN -> +6 (E2M1) and 0x7F (E4M3).
+
+_SW_REGS = ".reg .b32 sw_b, sw_m, sw_t, sw_s, sw_lo, sw_hi;\n.reg .f32 sw_f;\n.reg .pred sw_p;\n"
+# E2M1 midpoints as float bits; a tie rounds toward the even code.
+_E2M1_STEPS = (
+    ("gt", 0x3E800000), ("ge", 0x3F400000), ("gt", 0x3FA00000), ("ge", 0x3FE00000),
+    ("gt", 0x40200000), ("ge", 0x40600000), ("gt", 0x40A00000),
+)  # fmt: skip
+
+
+def _sw_e2m1(src: str, dst: str) -> str:
+    steps = "".join(
+        f"set.{op}.u32.u32 sw_t, sw_m, {t:#010x};\nsub.u32 {dst}, {dst}, sw_t;\n"
+        for op, t in _E2M1_STEPS
+    )
+    return (
+        f"mov.b32 sw_b, {src};\nand.b32 sw_m, sw_b, 0x7FFFFFFF;\nmov.u32 {dst}, 0;\n{steps}"
+        "shr.u32 sw_t, sw_b, 28;\nand.b32 sw_t, sw_t, 8;\n"
+        "setp.gt.u32 sw_p, sw_m, 0x7F800000;\nselp.u32 sw_t, 0, sw_t, sw_p;\n"
+        f"or.b32 {dst}, {dst}, sw_t;\n"
+    )
+
+
+def _sw_e4m3(src: str, dst: str) -> str:
+    # Normal range: round the f32 bits to 3 mantissa bits. Below 2^-6: rint(|x| * 2^9).
+    return (
+        f"mov.b32 sw_b, {src};\nand.b32 sw_m, sw_b, 0x7FFFFFFF;\n"
+        "shr.u32 sw_t, sw_m, 20;\nand.b32 sw_t, sw_t, 1;\nadd.u32 sw_t, sw_t, 0x7FFFF;\n"
+        "add.u32 sw_t, sw_m, sw_t;\nshr.u32 sw_t, sw_t, 20;\nsub.u32 sw_t, sw_t, 960;\n"
+        "mov.b32 sw_f, sw_m;\nmul.rn.f32 sw_f, sw_f, 0f44000000;\ncvt.rni.u32.f32 sw_s, sw_f;\n"
+        "setp.lt.u32 sw_p, sw_m, 0x3C800000;\nselp.u32 sw_t, sw_s, sw_t, sw_p;\n"
+        "min.u32 sw_t, sw_t, 0x7E;\nshr.u32 sw_s, sw_b, 24;\nand.b32 sw_s, sw_s, 0x80;\n"
+        "or.b32 sw_t, sw_t, sw_s;\nsetp.gt.u32 sw_p, sw_m, 0x7F800000;\n"
+        f"selp.u32 {dst}, 0x7F, sw_t, sw_p;\n"
+    )
+
+
+def _sw_pair(conv, d: str, a: str, b: str, width: int, cvt_dst: str) -> str:
+    # cvt.*x2.f32 d, a, b puts a in the upper half and b in the lower half.
+    return (
+        f"{{\n{_SW_REGS}{conv(b, 'sw_lo')}{conv(a, 'sw_hi')}shl.b32 sw_hi, sw_hi, {width};\n"
+        f"or.b32 sw_lo, sw_lo, sw_hi;\ncvt.{cvt_dst}.u32 {d}, sw_lo;\n}}"
+    )
+
+
+# The f16 high byte of each E2M1 magnitude comes from a prmt table; low bytes are 0.
+_SW_E2M1X2_TO_F16X2 = (
+    r"{\n.reg .b32 sw_x, sw_a, sw_c, sw_g, sw_l0, sw_l1;\n"
+    r"cvt.u32.u8 sw_x, \2;\nand.b32 sw_a, sw_x, 7;\nshl.b32 sw_a, sw_a, 4;\n"
+    r"and.b32 sw_c, sw_x, 0x70;\nshl.b32 sw_c, sw_c, 8;\nor.b32 sw_a, sw_a, sw_c;\n"
+    r"mov.b32 sw_l0, 0x3E3C3800;\nmov.b32 sw_l1, 0x46444240;\n"
+    r"prmt.b32 sw_a, sw_l0, sw_l1, sw_a;\nand.b32 sw_g, sw_x, 0x8;\nshl.b32 sw_g, sw_g, 12;\n"
+    r"or.b32 sw_a, sw_a, sw_g;\nand.b32 sw_g, sw_x, 0x80;\nshl.b32 sw_g, sw_g, 24;\n"
+    r"or.b32 \1, sw_a, sw_g;\n}"
+)
+# E4M3 bits shifted into f16 read as value * 2^-8, subnormals included; scale by 256.
+_SW_E4M3X2_TO_F16X2 = (
+    r"{\n.reg .b32 sw_x, sw_a, sw_c, sw_g, sw_k;\n.reg .pred sw_p;\n"
+    r"cvt.u32.u16 sw_x, \2;\nand.b32 sw_a, sw_x, 0x7F7F;\nshl.b32 sw_c, sw_a, 8;\n"
+    r"or.b32 sw_a, sw_a, sw_c;\nand.b32 sw_a, sw_a, 0x7F007F;\nshl.b32 sw_a, sw_a, 7;\n"
+    r"and.b32 sw_g, sw_x, 0x8080;\nshl.b32 sw_c, sw_g, 8;\nor.b32 sw_g, sw_g, sw_c;\n"
+    r"and.b32 sw_g, sw_g, 0x800080;\nshl.b32 sw_g, sw_g, 8;\nor.b32 sw_a, sw_a, sw_g;\n"
+    r"mov.b32 sw_k, 0x5C005C00;\nmul.rn.f16x2 sw_a, sw_a, sw_k;\n"
+    r"and.b32 sw_c, sw_x, 0x7F;\nsetp.eq.u32 sw_p, sw_c, 0x7F;\n"
+    r"and.b32 sw_c, sw_a, 0xFFFF0000;\nor.b32 sw_c, sw_c, 0x7FFF;\n"
+    r"selp.b32 sw_a, sw_c, sw_a, sw_p;\nand.b32 sw_c, sw_x, 0x7F00;\n"
+    r"setp.eq.u32 sw_p, sw_c, 0x7F00;\nand.b32 sw_c, sw_a, 0xFFFF;\n"
+    r"or.b32 sw_c, sw_c, 0x7FFF0000;\nselp.b32 \1, sw_c, sw_a, sw_p;\n}"
+)
+_OP = r"([^\s,;]+)"
+# (first target with the instruction, pattern, software replacement)
+_SW_RULES = (
+    ((10, 0), rf"cvt\.rn\.satfinite\.e2m1x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
+     _sw_pair(_sw_e2m1, r"\1", r"\2", r"\3", 4, "u8")),
+    ((10, 0), rf"cvt\.rn\.f16x2\.e2m1x2\s+{_OP},\s*{_OP};", _SW_E2M1X2_TO_F16X2),
+    ((8, 9), rf"cvt\.rn\.satfinite\.e4m3x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
+     _sw_pair(_sw_e4m3, r"\1", r"\2", r"\3", 8, "u16")),
+    ((8, 9), rf"cvt(?:\.rn)?\.f16x2\.e4m3x2\s+{_OP},\s*{_OP};", _SW_E4M3X2_TO_F16X2),
+    ((9, 0), rf"mul(?:\.rn)?\.bf16x2\s+{_OP},\s*{_OP},\s*{_OP};",
+     r"{\n.reg .b32 sw_z;\nmov.b32 sw_z, 0x80008000;\nfma.rn.bf16x2 \1, \2, \3, sw_z;\n}"),
+    ((10, 0), r"ld\.global\.v8\.u32\s+\{((?:[^,}]*,){3}[^,}]*),([^}]*)\},\s*\[([^\]]+)\];",
+     r"ld.global.v4.u32 {\1}, [\3];\nld.global.v4.u32 {\2}, [\3+16];"),
+)  # fmt: skip
+
+
+def target_arch():
+    """``(major, minor)`` of the target being traced."""
+    return cutlass.cutlass_dsl.CuTeDSL._get_dsl().get_arch_enum().value[:2]
+
+
+def target_inline_asm(res, operands, asm: str, constraints: str, **kwargs):
+    """``llvm.inline_asm`` with the conversions above lowered for the traced target."""
+    arch = target_arch()
+    for first, pattern, replace in _SW_RULES:
+        if arch < first:
+            asm = re.sub(pattern, replace, asm)
+    return llvm.inline_asm(res, operands, asm, constraints, **kwargs)
 
 
 # =============================================================================
@@ -680,7 +784,7 @@ def half2_to_float2_scaled(
 def bfloat2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
     """Multiply two BFloat2 values element-wise: (a.x*b.x, a.y*b.y)."""
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
             "mul.bf16x2 $0, $1, $2;",
@@ -813,7 +917,7 @@ def bfloat2_to_float2_scaled(
 def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
     """Convert float32 to E4M3 using native cvt.rn.satfinite.e4m3x2.f32."""
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [Float32(a).ir_value(loc=loc, ip=ip)],
             """
@@ -843,7 +947,7 @@ def cvt_e4m3x4_to_f32x4(
     Input: uint32 containing bytes [b0, b1, b2, b3] (low to high).
     Output: (f0, f1, f2, f3) as Float32.
     """
-    result = llvm.inline_asm(
+    result = target_inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
         [Uint32(packed).ir_value(loc=loc, ip=ip)],
         """
@@ -943,7 +1047,7 @@ def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     core decodes the same byte.
     """
     return Float32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
@@ -985,7 +1089,7 @@ def nvfp4_compute_output_scale(
         outputScale = rcp_approx(SFValue * rcp_approx(SFScaleVal));
     """
     return Float32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.f32(),
             [
                 Uint32(fp8_val).ir_value(loc=loc, ip=ip),
@@ -1026,7 +1130,7 @@ def nvfp4_compute_output_scale_rn(
 ) -> Float32:
     """Compute TE-exact NVFP4 output scale when FP4 quant fast math is disabled."""
     return Float32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.f32(),
             [
                 Uint32(fp8_val).ir_value(loc=loc, ip=ip),
@@ -1319,7 +1423,7 @@ def cvt_e2m1x8_f32(
 ) -> Uint32:
     """Convert eight float32 values to eight E2M1 (4-bit) values packed into uint32."""
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [
                 Float32(v0).ir_value(loc=loc, ip=ip),
@@ -2240,7 +2344,7 @@ def f16x2_to_f32x2(packed_h2: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Fl
 def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert one E4M3 byte to f32 through native E4M3-to-f16 conversion."""
     return Float32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
@@ -2262,6 +2366,16 @@ def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def cvt_e4m3_byte_to(byte, dtype, *, loc=None, ip=None):
+    """``byte.bitcast(Float8E4M3FN).to(dtype)``. The native E4M3 conversion needs
+    SM89; earlier targets decode the byte in software."""
+    if target_arch() >= (8, 9):
+        return byte.bitcast(cutlass.Float8E4M3FN).to(dtype)
+    value = cvt_e4m3_to_f32_via_f16(byte.to(Uint32), loc=loc, ip=ip)
+    return value if dtype is Float32 else value.to(dtype)
 
 
 @dsl_user_op
@@ -2362,7 +2476,7 @@ def fp4_decode_4bytes(
 def fp4_decode_2(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
     """Decode one FP4 byte into one f16x2 register."""
     return Uint32(
-        llvm.inline_asm(
+        target_inline_asm(
             T.i32(),
             [Uint32(byte_val).ir_value(loc=loc, ip=ip)],
             """

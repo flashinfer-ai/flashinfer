@@ -615,8 +615,8 @@ def test_nvfp4_kv_dequantize_paged_rejects_non_scalar_scale():
 def test_nvfp4_kv_quant(shape, dtype):
     """Test quantization kernel output shapes and basic validity."""
     cc = get_compute_capability()
-    if cc < 100:
-        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM100+)")
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM80+)")
 
     M, K = shape
     torch.manual_seed(42)
@@ -637,13 +637,53 @@ def test_nvfp4_kv_quant(shape, dtype):
     assert (fp4_output <= 255).all()
 
 
+def skip_unless_sm80_to_sm90():
+    cc = get_compute_capability()
+    if not 80 <= cc < 100:
+        pytest.skip(f"SM{cc}: the SM80-SM90 quantization path checks its inputs")
+
+
+@pytest.mark.parametrize(
+    "global_scale",
+    [torch.empty(0), torch.ones(1, dtype=torch.float16)],
+    ids=["empty", "float16"],
+)
+def test_nvfp4_kv_quant_rejects_bad_global_scale(global_scale):
+    skip_unless_sm80_to_sm90()
+    x = torch.randn((4, 32), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="global_scale must be a float32 tensor"):
+        flashinfer.nvfp4_kv_quantize(x, global_scale.cuda())
+
+
+def test_nvfp4_kv_quant_rejects_misaligned_input():
+    skip_unless_sm80_to_sm90()
+    M, K = 4, 32
+    x = torch.randn(1 + M * K, dtype=torch.bfloat16, device="cuda")[1:].view(M, K)
+    assert x.is_contiguous() and x.data_ptr() % 4 == 2
+    global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        flashinfer.nvfp4_kv_quantize(x, global_scale)
+
+
+def test_nvfp4_kv_quant_empty_input():
+    """No rows return empty outputs without launching a zero-sized grid."""
+    skip_unless_sm80_to_sm90()
+    x = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
+    global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(x, global_scale)
+    assert fp4_output.shape == (0, 8) and block_scales.shape == (0, 1)
+    # A failed launch would surface in the next kernel launch check.
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_nvfp4_kv_roundtrip(shape, dtype):
     """Test quantize -> dequantize roundtrip error is within FP4 precision."""
     cc = get_compute_capability()
-    if cc < 100:
-        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM100+)")
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM80+)")
 
     M, K = shape
     torch.manual_seed(42)

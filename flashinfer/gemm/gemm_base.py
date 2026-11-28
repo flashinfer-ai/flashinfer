@@ -2010,7 +2010,7 @@ def ragged_bmm(
     raise ValueError(f"Unsupported backend for ragged_bmm: {backend!r}")
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 110, 120, 121])
 def _cutile_ragged_block_scaled_bmm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2108,6 +2108,12 @@ def ragged_block_scaled_bmm(
     torch.Tensor
         The ragged block-scaled output tensor.
     """
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs it on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_ragged_block_scaled_bmm
+
+        return sm8x_ragged_block_scaled_bmm(
+            a, b, a_scale, b_scale, m_indptr, max_m_device, out_dtype, segment_alignment
+        )
     if backend == "cutile":
         from .kernels.cutile.ragged_block_scaled_bmm_cutile import (
             ragged_block_scaled_bmm as _ragged_block_scaled_bmm_cutile,
@@ -2130,7 +2136,7 @@ def ragged_block_scaled_bmm(
     raise ValueError(f"Unsupported backend for ragged_block_scaled_bmm: {backend!r}")
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 110, 120, 121])
 def _cutile_masked_scaled_bmm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2205,6 +2211,13 @@ def masked_scaled_bmm(
     torch.Tensor
         The output tensor ``C`` of shape ``(Q, M, N)``.
     """
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs it on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_masked_scaled_bmm
+
+        return sm8x_masked_scaled_bmm(
+            a, b, a_scale, b_scale, masked_m, block_scale_type, max_m_device,
+            transpose_a, transpose_b, out_dtype,
+        )  # fmt: skip
     if backend == "cutile":
         from .kernels.cutile.masked_scaled_bmm_cutile import (
             masked_scaled_bmm as _masked_scaled_bmm_cutile,
@@ -2226,7 +2239,7 @@ def masked_scaled_bmm(
     raise ValueError(f"Unsupported backend for masked_scaled_bmm: {backend!r}")
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 110, 120, 121])
 def _cutile_ragged_scaled_bmm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2315,6 +2328,13 @@ def ragged_scaled_bmm(
     torch.Tensor
         The ragged block-scaled output tensor ``C`` of shape ``(total_m, N)``.
     """
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs it on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_ragged_scaled_bmm
+
+        return sm8x_ragged_scaled_bmm(
+            a, b, a_scale, b_scale, m_indptr, block_scale_type, transpose_a,
+            transpose_b, swizzled_layout_a, a_global_scale, b_global_scale,
+        )  # fmt: skip
     if backend == "cutile":
         from .kernels.cutile.ragged_scaled_bmm_cutile import (
             ragged_scaled_bmm as _ragged_scaled_bmm_cutile,
@@ -3912,9 +3932,19 @@ def fp8_gemm_sm100(
         "cudnn": lambda: _cudnn_gemm_fp8_runner(),
         "cute-dsl_sm107": _cute_dsl_fp8_gemm_runner_sm107,
     }
-    runners = [
-        runner_factories[name]() for name in runner_names if name in runner_factories
-    ]
+    major, minor = get_compute_capability(a.device)
+    # SM8x has no FP8 MMA: every backend runs the SM8x dense GEMM, but SM89 keeps
+    # its native cuBLAS / cuDNN runners
+    if major == 8 and (minor != 9 or not {"cublas", "cudnn"} & set(runner_names)):
+        from .sm8x_fp8_dense import Sm8xFp8Runner
+
+        runners = [Sm8xFp8Runner(runner_names)]
+    else:
+        runners = [
+            runner_factories[name]()
+            for name in runner_names
+            if name in runner_factories
+        ]
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
@@ -7003,7 +7033,7 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _trtllm_low_latency_gemm_fp8_requirement(a: torch.Tensor, b: torch.Tensor, **_):
     if b.ndim != 3:
         raise ValueError(
@@ -7030,13 +7060,13 @@ def _check_mm_fp8_unprocessed_weight(a: torch.Tensor, b: torch.Tensor) -> None:
         raise ValueError("mm_fp8 requires FP8 operands")
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cublas_mm_fp8_requirement(a: torch.Tensor, b: torch.Tensor, **_):
     _check_mm_fp8_unprocessed_weight(a, b)
     return True
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_mm_fp8_requirement(
     a: torch.Tensor, b: torch.Tensor, backend: str = "auto", **_
 ):
@@ -7044,7 +7074,7 @@ def _cudnn_mm_fp8_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutlass_mm_fp8_requirement(a: torch.Tensor, b: torch.Tensor, **_):
     _check_mm_fp8_unprocessed_weight(a, b)
     if a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2:
@@ -7081,7 +7111,7 @@ def _fp8_unit_scale(device: torch.device) -> torch.Tensor:
     return torch.ones(1, dtype=torch.float32, device=device)
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _cutedsl_low_latency_blockscaled_gemm_fp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7261,9 +7291,10 @@ def mm_fp8(
                 f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
             )
 
-    if backend == "trtllm_low_latency":
+    sm8x = get_compute_capability(a.device)[0] == 8  # every backend runs fp8_gemm_sm100
+    if backend == "trtllm_low_latency" and not sm8x:
         trtllm_low_latency_gemm(a, b, alpha, out)
-    elif backend == "cutedsl_low_latency":
+    elif backend == "cutedsl_low_latency" and not sm8x:
         k = a.shape[1]
         scale_sizes = [((rows + 127) // 128) * (k // 128) * 512 for rows in (n, m)]
         workspace = _get_stream_cache_buf(
@@ -7296,7 +7327,7 @@ def mm_fp8(
             "mm_fp8_cutedsl_low_latency", [runner], TuningConfig(), inputs
         )
         runner(inputs=inputs, tactic=tactic)
-    elif runner_names:
+    elif runner_names or sm8x:
         # bmm_fp8 runners with batch 1; (n, k) row-major is bmm_fp8's column-major B.
         unit_scale = _fp8_unit_scale(a.device)
         workspace_buffer = _get_stream_cache_buf(
@@ -7304,12 +7335,12 @@ def mm_fp8(
         )
         fp8_gemm_sm100(
             a.unsqueeze(0),
-            b.t().unsqueeze(0),
+            b if b.ndim == 3 else b.t().unsqueeze(0),
             alpha if alpha is not None else unit_scale,
             unit_scale,
             out.unsqueeze(0),
             workspace_buffer,
-            runner_names,
+            runner_names or [backend],
         )
     else:
         raise ValueError(
@@ -7551,7 +7582,7 @@ def _check_mm_mxfp8_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7582,7 +7613,7 @@ def _cutlass_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _trtllm_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7611,7 +7642,7 @@ def _trtllm_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _cute_dsl_gemm_mxfp8_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -7630,11 +7661,12 @@ def _cute_dsl_gemm_mxfp8_requirement(
             "cute_dsl mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
         )
     _check_cute_dsl_availability()
-    _check_cute_dsl_arch(a.device)
+    if get_compute_capability(a.device)[0] != 8:  # SM8x generates no CuTe-DSL code
+        _check_cute_dsl_arch(a.device)
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _cutedsl_low_latency_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7666,7 +7698,7 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cudnn_mm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7779,11 +7811,12 @@ def _get_sm100_block_scaled_tactics(
 # SM100 CuTe-DSL kernel has the per-row alpha epilogue, and SM103 runs that
 # same kernel. The SM103 3xFP4 and SM107 kernels have no such epilogue, and the
 # SM100 kernel has not been validated with it on SM107, so SM107 is not
-# claimed. _cute_dsl_gemm_fp4_requirement is the single place that enforces
+# claimed. SM8x runs every backend on one dense GEMM (sm8x_fp4_dense), which
+# has the per-row alpha. _cute_dsl_gemm_fp4_requirement is the single place that enforces
 # this; the other FP4 backends never see a per-token alpha because
 # _heuristic_func_mm_fp4 drops them and _check_mm_fp4_problem_size rejects them
 # when requested explicitly.
-_CUTE_DSL_PER_TOKEN_ALPHA_CCS = (100, 103)
+_CUTE_DSL_PER_TOKEN_ALPHA_CCS = (80, 86, 87, 89, 100, 103)
 
 
 def _is_per_token_alpha(alpha_tensor) -> bool:
@@ -9273,9 +9306,16 @@ def mm_mxfp8(
     }
 
     runners: List[TunableRunner] = []
-    for cur_backend in backends:
-        built = backend_to_runner_factory[cur_backend]()
-        runners.extend(built if isinstance(built, list) else [built])
+    if major == 8:  # SM8x has no FP8 MMA: every backend runs the SM8x dense GEMM
+        from .sm8x_fp8_dense import sm8x_mxfp8_runner
+
+        runners.append(
+            sm8x_mxfp8_runner(a.device, list(backends) == ["trtllm"], use_8x4_sf_layout)
+        )
+    else:
+        for cur_backend in backends:
+            built = backend_to_runner_factory[cur_backend]()
+            runners.extend(built if isinstance(built, list) else [built])
 
     tuner = AutoTuner.get()
 
@@ -9659,7 +9699,7 @@ def _check_mm_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9702,7 +9742,7 @@ def _cudnn_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _trtllm_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -9730,7 +9770,7 @@ def _trtllm_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -9759,7 +9799,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9815,11 +9855,12 @@ def _cute_dsl_gemm_fp4_requirement(
                 f"only, got SM{major}{minor}."
             )
     _check_cute_dsl_availability()
-    _check_cute_dsl_arch(a.device)
+    if get_compute_capability(a.device)[0] != 8:  # SM8x generates no CuTe-DSL code
+        _check_cute_dsl_arch(a.device)
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _cutedsl_low_latency_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -11660,7 +11701,17 @@ def mm_fp4(
             use_8x4_sf_layout, enable_pdl
         ),
     }
-    runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
+    if major == 8:  # every backend runs the SM8x dense GEMM
+        from .sm8x_fp4_dense import sm8x_mm_fp4_runner
+
+        runners = [
+            sm8x_mm_fp4_runner(
+                a, b, a_descale, b_descale, alpha, out_dtype, out, use_8x4_sf_layout,
+                list(backends) == ["trtllm"],
+            )
+        ]  # fmt: skip
+    else:
+        runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
 
     inputs = [
         a,
@@ -11697,7 +11748,7 @@ def mm_fp4(
     return out
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11714,7 +11765,7 @@ def _cudnn_bmm_fp8_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cublas_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11729,7 +11780,7 @@ def _cublas_bmm_fp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutlass_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11750,8 +11801,9 @@ def _cutlass_bmm_fp8_requirement(
 
 # cute-dsl bmm_fp8 is Rubin (sm107) only; the heuristic below never offers it
 # on sm100/sm103, so advertising those here would let an explicit
-# backend="cute-dsl" through to an empty runner list and an assert.
-@supported_compute_capability([107])
+# backend="cute-dsl" through to an empty runner list and an assert. SM8x takes
+# the empty list to its dense GEMM.
+@supported_compute_capability([80, 86, 87, 89, 107])
 def _cute_dsl_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -11770,7 +11822,8 @@ def _cute_dsl_bmm_fp8_requirement(
         raise ValueError(
             "CuTe-DSL is not available. Please install cutlass with cute support."
         )
-    _check_cute_dsl_arch(A.device)
+    if get_compute_capability(A.device)[0] != 8:  # SM8x generates no CuTe-DSL code
+        _check_cute_dsl_arch(A.device)
 
     # Check dimensions are 3D (batch, m, k) and (batch, k, n)
     if A.dim() != 3 or B.dim() != 3:
@@ -12041,7 +12094,7 @@ def bmm_fp8(
     return out
 
 
-@supported_compute_capability([100, 103, 107, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 120, 121])
 def _cutlass_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12061,7 +12114,7 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _trtllm_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12119,7 +12172,7 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cutile_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12397,7 +12450,15 @@ def gemm_fp8_nt_groupwise(
     if backend == "auto":
         backend = gemm_fp8_nt_groupwise.suitable_auto_backends[0]
 
-    if backend == "cutlass":
+    if (
+        get_compute_capability(a.device)[0] == 8
+    ):  # SM8x runs every backend on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_gemm_fp8_nt_groupwise
+
+        sm8x_gemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, out, scale_major_mode, mma_sm, scale_granularity_mnk, backend
+        )  # fmt: skip
+    elif backend == "cutlass":
         if is_sm12x_supported(a.device):
             # SM120/121 doesn't use mma_sm parameter
             get_gemm_sm120_module().gemm_fp8_nt_groupwise(
@@ -12641,7 +12702,7 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
     )
 
 
-@supported_compute_capability([100, 103, 107, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 120, 121])
 def _check_gemm_fp8_nt_blockscaled_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12742,7 +12803,7 @@ def gemm_fp8_nt_blockscaled(
     )
 
 
-@supported_compute_capability([100, 103, 107, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 120, 121])
 def _check_group_gemm_fp8_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12923,6 +12984,17 @@ def group_gemm_fp8_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
+    if (
+        get_compute_capability(a.device)[0] == 8
+    ):  # SM8x runs both backends on its dense GEMM
+        from .sm8x_fp8_dense import sm8x_group_gemm_fp8_nt_groupwise
+
+        sm8x_group_gemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, m_indptr, out, scale_granularity_mnk, scale_major_mode,
+            backend,
+        )  # fmt: skip
+        return out
+
     # cuTile backend: pure cuda.tile Python kernel. A single fused persistent
     # launch handles all groups (boundaries read on-device from ``m_indptr``),
     # so it is CUDA-graph-capturable — no per-group host loop / D2H sync.
@@ -12979,7 +13051,7 @@ def group_gemm_fp8_nt_groupwise(
     return out
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -13173,7 +13245,11 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    if is_sm12x_supported(a.device):
+    if get_compute_capability(a.device)[0] == 8:
+        from .sm8x_fp8_dense import sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise
+
+        sm8x_group_gemm_mxfp8_mxfp4_nt_groupwise(a, b, a_scale, b_scale, m_indptr, out)
+    elif is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
         get_gemm_sm120_module().group_gemm_mxfp4_nt_groupwise(
             int_workspace_buffer,
@@ -13479,7 +13555,7 @@ def get_deepgemm_sm100_module():
     return module
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _check_group_deepgemm_fp8_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -13634,6 +13710,14 @@ def group_deepgemm_fp8_nt_groupwise(
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
 
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs its dense GEMM
+        from .sm8x_fp8_dense import sm8x_deepgemm_fp8_nt_groupwise
+
+        sm8x_deepgemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, m_indices, out, scale_granularity_mnk
+        )
+        return out
+
     m_grouped_fp8_gemm_nt_contiguous(
         (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
     )
@@ -13641,7 +13725,7 @@ def group_deepgemm_fp8_nt_groupwise(
     return out
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _check_group_gemm_fp8_nt_groupwise_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -13656,7 +13740,8 @@ def _check_group_gemm_fp8_nt_groupwise_contiguous(
     """Check tensor metadata and optionally the synchronized routing contract."""
     if not CUTE_DSL_AVAILABLE:
         raise ValueError("The cute_dsl backend requires nvidia-cutlass-dsl")
-    _check_cute_dsl_arch(a.device)
+    if get_compute_capability(a.device)[0] != 8:  # SM8x generates no CuTe-DSL code
+        _check_cute_dsl_arch(a.device)
     if scale_granularity_mnk != (1, 128, 128):
         raise ValueError(
             "The cute_dsl backend requires scale_granularity_mnk=(1, 128, 128), "
@@ -13835,6 +13920,15 @@ def group_gemm_fp8_nt_groupwise_contiguous(
         )
     if a.shape[0] == 0:
         return out
+    if get_compute_capability(a.device)[0] == 8:  # the SM8x group GEMM over the runs
+        from .sm8x_fp8_dense import sm8x_group_gemm_fp8_nt_groupwise
+
+        groups = torch.arange(b.shape[0] + 1, dtype=torch.int32, device=a.device)
+        m_indptr = torch.searchsorted(m_indices, groups, out_int32=True)
+        sm8x_group_gemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, m_indptr, out, (1, 128, 128), "K", "trtllm"
+        )
+        return out
 
     from .kernels.grouped_gemm_contiguous_blackwell import (
         grouped_gemm_fp8_nt_groupwise_contiguous_sm100,
@@ -13846,7 +13940,7 @@ def group_gemm_fp8_nt_groupwise_contiguous(
     return out
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -13918,7 +14012,7 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     )
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise_deepgemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -14148,6 +14242,14 @@ def batch_deepgemm_fp8_nt_groupwise(
         out = torch.empty(
             a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
         )
+
+    if get_compute_capability(a.device)[0] == 8:  # SM8x runs its dense GEMM
+        from .sm8x_fp8_dense import sm8x_deepgemm_fp8_nt_groupwise
+
+        sm8x_deepgemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, masked_m, out, scale_granularity_mnk
+        )
+        return out
 
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
 
@@ -14712,7 +14814,12 @@ def mxfp8_gemm_sm100(
     tuner = AutoTuner.get()
 
     runners = []
-    if "cudnn" in runner_names:
+    # SM8x serves every backend name on the SM8x dense GEMM
+    if get_compute_capability(a.device)[0] == 8:
+        from .sm8x_fp8_dense import sm8x_mxfp8_runner
+
+        runners.append(sm8x_mxfp8_runner(a.device))
+    elif "cudnn" in runner_names:
         runners.append(_cudnn_gemm_mxfp8_runner())
     assert runners, "No suitable runners found"
 
@@ -14727,7 +14834,7 @@ def mxfp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_mxfp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,

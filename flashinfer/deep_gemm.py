@@ -296,6 +296,11 @@ def hash_to_hex(s: str) -> str:
 @functools.lru_cache(maxsize=None)
 def must_be_k_major() -> bool:
     return {
+        # SM8x runs the grouped GEMMs on its dense GEMM with the SM100 operand contract
+        "80": False,
+        "86": False,
+        "87": False,
+        "89": False,
         "90a": True,
         "100a": False,
         "103a": False,

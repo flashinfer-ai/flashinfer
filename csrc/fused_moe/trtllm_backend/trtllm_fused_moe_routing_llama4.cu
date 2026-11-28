@@ -548,9 +548,12 @@ void run(Data const& data, void* stream) {
   bool const useSingleWarp =
       (data.mPtrScores == nullptr && data.mNumTokens <= WarpKernelMaxNumTokens) ||
       data.mNumTokens < WarpKernelMaxNumTokens;
+  // Below SM90 (no clusters) the histogram kernels take every batch beyond the warp kernel's.
+  int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const useSingleCluster =
-      data.mNumTokens <=
-      ((data.mPtrScores != nullptr) ? MaxNumTokensSingleClusterScores : MaxNumTokensSingleCluster);
+      (useSingleWarp || smMajor >= 9) &&
+      data.mNumTokens <= ((data.mPtrScores != nullptr) ? MaxNumTokensSingleClusterScores
+                                                       : MaxNumTokensSingleCluster);
   if (!useSingleCluster) {
     FLASHINFER_CHECK(data.mPtrTopKPacked != nullptr,
                      "When #tokens is large, `mPtrTopKPacked` is a required input.");

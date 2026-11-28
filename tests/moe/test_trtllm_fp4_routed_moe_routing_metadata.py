@@ -35,6 +35,8 @@ def experts():
     major, minor = get_compute_capability(torch.device("cuda"))
     if not TrtllmFp4Config.supported(major * 10 + minor):
         pytest.skip("TRT-LLM FP4 routed MoE is not supported on this GPU")
+    if major < 10:
+        pytest.skip("routing_metadata is built by the SM100 routing kernels")
     torch.manual_seed(0)
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
     w1 = torch.randn(LOCAL, 2 * INTERMEDIATE, HIDDEN, device="cuda") * 0.02

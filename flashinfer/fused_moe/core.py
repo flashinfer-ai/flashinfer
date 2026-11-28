@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 import threading
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
@@ -51,6 +51,7 @@ from ..trace.templates.moe import (
 )
 from ..autotuner import (
     AutoTuner,
+    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -68,8 +69,13 @@ from ..jit.fused_moe import (
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
+    gen_w4a16_moe_sm80_module,
 )
 from ..tllm_enums import (
+    DEFAULT_POWLU_M,
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    DEFAULT_SWIGLU_LIMIT,
     ActivationType,
     DtypeTrtllmGen,
     Fp8QuantizationType,
@@ -90,6 +96,7 @@ from .shared.inputs import (
 from .shared.validation import (
     validate_bf16_gemm1_activation_params as _validate_shared_bf16_gemm1_activation_params,
 )
+from .shared.validation import resolve_moe_act_sf_layout
 
 # Aliased to avoid clashing with the CUTLASS runner class of the same name that
 # get_cutlass_fused_moe_module() defines locally.
@@ -99,6 +106,12 @@ from .backends.trtllm import MoERunner as TrtllmMoERunner
 from .prepare import (
     interleave_moe_scales_for_sm90_mixed_gemm as interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm as interleave_moe_weights_for_sm90_mixed_gemm,
+)
+from .prepare import W4A16_SM80_TACTICS, _w4a16_records_geometry
+from .trtllm_gen_routing import (
+    _check_trtllm_gen_routing_supported,
+    _max_num_ctas_in_batch_dim,
+    get_trtllm_gen_routing_module,
 )
 from ..utils import (
     check_shape_dtype_device,
@@ -114,12 +127,15 @@ from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
     NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP44Over6Config,
+    env_flag_enabled,
+    nvfp4_4over6_cache_key,
     nvfp4_4over6_code,
     resolve_nvfp4_4over6,
 )
 from .utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
+    map_to_hybrid_bucket,
 )
 
 if TYPE_CHECKING:
@@ -1619,6 +1635,21 @@ def cutlass_fused_moe(
             - gemm2 weights block scales
             - gemm2 dequant scale
 
+        FP4 below SM100 (SM80 to SM90) runs on records, which hold the weights too, so the
+        weights give only shapes. NVFP4's weights block scales are the records of
+        :func:`prepare_records_nvfp4_weights`; the input is BF16, quantized as it is routed, or
+        NVFP4 with ``input_sf``. Without the two activation global scales the activations stay
+        BF16 (W4A16). MXFP4 (int64-packed with MXFP8 or FP8 input; below SM90 also uint8 with
+        ``use_w4_group_scaling``) takes the records of :func:`prepare_records_mxfp4_weights`
+        with their global scales in the dequant scales: [gemm1 records, gemm1 dequant scale,
+        gemm2 records, gemm2 dequant scale], FP8 per tensor input the gemm2 activation scale
+        third, GEMM2's input quantized as on SM100. Below SM90 ``use_wfp4afp8_humming`` takes
+        16-bit input and SM90's five scales (these records and dequant scales, the third unread),
+        GEMM1's and GEMM2's inputs FP8 E4M3 per token and row under dynamic scales as on SM90
+        (FP16: GEMM1 outputs past its range saturate before GEMM2's quantization; GEMM2's
+        rows stay unweighted in the 16-bit type before the top-k sum, as SM90's unfused
+        mixed-input path).
+
         FP8:
             - gemm1 dequant scale
             - gemm2 activation quant scale
@@ -1712,7 +1743,8 @@ def cutlass_fused_moe(
     use_wfp4afp8_humming : bool = False
         Selects the Humming-style MXFP4-weight x FP8-activation Hopper path with pre-MMA E8M0
         scale fusion. This flag is separate from W4A16 because both paths use uint8 FP4 weight
-        storage and ``use_w4_group_scaling=True``.
+        storage and ``use_w4_group_scaling=True``. Below SM90 the records run it with SM90's
+        numerics (see ``quant_scales``).
 
     tune_max_num_tokens : int = 8192
         Maximum number of tokens for tuning. Defaults to 8192.
@@ -1748,6 +1780,7 @@ def cutlass_fused_moe(
     profile_ids : Optional[List[int]]
         Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
         the runner's combined tactic list; ``-1`` keeps the default tactic for that GEMM.
+        The FP4 records below SM100 (see ``quant_scales``) reject it.
 
     workspace_buffer : Optional[torch.Tensor]
         Pre-allocated scratch buffer reused across calls to eliminate per-call workspace
@@ -1770,6 +1803,9 @@ def cutlass_fused_moe(
         per CUDA stream context; overlapping micro-batches on separate streams each need
         their own buffer. A buffer sized for the maximum token count is valid for all
         smaller counts on the same call.
+
+        The FP4 records below SM100 (see ``quant_scales``) take no workspace buffer: they
+        reject one, and :func:`cutlass_fused_moe_workspace_size` does not apply to them.
 
     backend : str
         ``"cutlass"`` preserves the existing backend. ``"cake"`` selects the
@@ -1904,9 +1940,10 @@ def cutlass_fused_moe(
 
     device_arch = f"{major * 10 + minor}"
 
-    if use_wfp4afp8_humming and device_arch != "90":
+    if use_wfp4afp8_humming and major >= 10:
         raise NotImplementedError(
-            "Humming-style MXFP4 x FP8 fused MoE is only implemented for SM90."
+            "Humming-style MXFP4 x FP8 fused MoE is only implemented for SM80 to SM90 (below "
+            "SM90 on records)."
         )
 
     if min_latency_mode:
@@ -1935,6 +1972,147 @@ def cutlass_fused_moe(
         check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
         )
+
+    # Below SM100 FP4 runs on records, which hold the weights too: the weights give only shapes.
+    # MXFP4: MXFP8 or FP8 activations, and below SM90 (which runs its CUTLASS kernels) BF16 or
+    # FP16 ones, Humming-style ones FP8 per token and row as on SM90.
+    fp8 = input.dtype == torch.float8_e4m3fn
+    mxfp4 = not use_packed_weights and (
+        (fp8 and fc1_expert_weights.dtype == torch.int64)
+        or (
+            use_w4_group_scaling
+            and major < 9
+            and fc1_expert_weights.dtype == torch.uint8
+        )
+    )
+    if major < 10 and (is_nvfp4 or mxfp4):
+        # NVFP4 (prepare_records_nvfp4_weights): quant_scales is [a1, w1 records, alpha1, a2,
+        # w2 records, alpha2], the 16-bit input quantized as it is routed (or NVFP4 input with
+        # input_sf), or for 16-bit activations [w1 records, alpha1, w2 records, alpha2]. MXFP4
+        # (prepare_records_mxfp4_weights, their global scales in the alphas): [w1 records, alpha1,
+        # w2 records, alpha2] for MXFP8 (input_sf) or 16-bit activations; FP8 per tensor ones
+        # also GEMM2's input scale third, Humming-style ones an unread scalar or [E] there.
+        w4a4 = is_nvfp4 and len(quant_scales) == 6
+        if (
+            not w4a4
+            and nvfp4_4over6 is not _UNSET
+            and resolved_nvfp4_4over6 is not None
+        ):
+            raise ValueError(
+                "nvfp4_4over6 requires NVFP4 activations; the W4A16 records path "
+                "(four quant_scales) quantizes none. Pass None or omit it."
+            )
+        codes = input_sf is not None
+        n = 5 if (fp8 and not use_mxfp8_act_scaling) or use_wfp4afp8_humming else 4
+        if (
+            len(quant_scales) != (6 if w4a4 else n)
+            or output_dtype not in (torch.bfloat16, torch.float16)
+            or input.dtype
+            != (torch.float8_e4m3fn if fp8 else torch.uint8 if codes else output_dtype)
+            or codes
+            != (w4a4 and input.dtype == torch.uint8 or fp8 and use_mxfp8_act_scaling)
+            or cluster_size != 1
+            or workspace_buffer is not None
+            or profile_ids is not None
+            or use_wfp4afp8_humming
+            and (
+                fp8
+                or not mxfp4
+                or quant_scales[2].shape not in ((), (fc1_expert_weights.shape[0],))
+                or quant_scales[2].dtype != torch.float32
+            )
+        ):
+            raise NotImplementedError(
+                "Below SM100 FP4 runs on records: NVFP4 with BF16 or FP16 input (or with "
+                "input_sf NVFP4), MXFP4 with MXFP8 (input_sf), FP8 per tensor or 16-bit input, and "
+                "output of BF16 or FP16 (16-bit input: that type); Humming-style MXFP4 16-bit "
+                "input, its third scale FP32, a scalar or [num_experts]"
+                "; no workspace_buffer or profile_ids."
+            )
+        act = ActivationType(activation_type)
+        if act == ActivationType.InvalidType:  # as CUTLASS's dispatch
+            raise ValueError(f"Invalid activation type: {activation_type}")
+        situ, inf = act == ActivationType.Situ, float("inf")
+        pt8 = (
+            fp8 and not codes
+        )  # FP8 per tensor: GEMM2's input FP8 under quant_scales[2]
+        idx = (1, 2, 4, 5) if w4a4 else (0, 1, 3, 4) if n == 5 else range(4)
+        r1, alpha1, r2, alpha2 = (quant_scales[i] for i in idx)
+        ext = _RecordsExt(
+            act,
+            (situ_beta, situ_linear_beta, None)
+            if situ
+            else (None, None, None)  # CUTLASS's GeGLU reads none of them
+            if act in (ActivationType.Geglu, ActivationType.GegluTanh)
+            else (swiglu_alpha, swiglu_beta, swiglu_limit),
+            {
+                ActivationType.Situ: (DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA, inf),
+                ActivationType.SwigluStep: (1.0, 0.0, 7.0),
+                ActivationType.PowLU: (DEFAULT_POWLU_M, 0.0, inf),
+            }.get(act, (1.0, 0.0, inf)),
+            bias1=fc1_expert_biases,
+            bias2=fc2_expert_biases if tp_rank == 0 else None,  # rank 0 adds it
+            x_fmt=(2 if pt8 else 1) if fp8 else 4 * use_wfp4afp8_humming,
+            fq=(3 if pt8 else 1) if fp8 else 4 * use_wfp4afp8_humming,
+            fq_inv=quant_scales[2].float().reshape(-1).expand(r1.shape[0]).contiguous()
+            if pt8
+            else None,
+        )
+        ids = token_selected_experts
+        if ep_rank:  # local ids; the other ranks' are skipped
+            ids = ids - ep_rank * r1.shape[0]
+        # all-to-all: the rows without a local expert stay as they are, as on SM100
+        keep = enable_alltoall and ep_size > 1
+        dst = torch.empty_like(output) if keep else output
+        x = input.view(torch.uint8) if fp8 else input
+        x_sf = input_sf
+        if codes and not swizzled_input_sf:
+            # NVFP4's K / 16 bytes a token, MXFP8's K / 32: the leading tokens', as SM100 reads
+            tokens, cols = input.shape[0], input.shape[1] // (32 if fp8 else 8)
+            byte = input_sf.element_size() == 1 and input_sf.dtype != torch.bool
+            if not byte or input_sf.numel() < tokens * cols:
+                raise ValueError(
+                    f"input_sf must hold a byte per linear block scale, {tokens} tokens of "
+                    f"{cols} at least; got {input_sf.dtype} {tuple(input_sf.shape)}."
+                )
+            x_sf = input_sf.view(torch.uint8).reshape(-1)[: tokens * cols]
+            x_sf = x_sf.view(tokens, cols)
+        inputs = [x, ids, token_final_scales, r1, alpha1, r2, alpha2, dst]
+        if w4a4:
+            inputs += [x_sf if codes else quant_scales[0], quant_scales[3]]
+        elif fp8:  # FP8 per tensor: the codes stand in for the unread scales
+            inputs += [x if pt8 else x_sf, None, None]
+        elif use_wfp4afp8_humming:  # x stands in for the unread scale
+            ts = x.new_empty(x.shape[0], dtype=torch.float32)  # token scales, written
+            inputs += [x, None, None, None, ts]
+        gated = act.is_gated
+        # int64 packs 16 E2M1 codes, uint8 two
+        inter = fc2_expert_weights.shape[2] * (
+            16 if fc2_expert_weights.dtype == torch.int64 else 2
+        )
+        # SM100's sizes: fc2's experts and hidden size (the input's), fc1's (gated) rows
+        experts = fc2_expert_weights.shape[0]
+        if (
+            fc1_expert_weights.shape[0] != experts
+            or r1.shape[0] != experts
+            or fc1_expert_weights.shape[1] != inter * (2 if gated else 1)
+            or fc2_expert_weights.shape[1]
+            != input.shape[1] * (2 if input.dtype == torch.uint8 else 1)
+        ):
+            raise ValueError(
+                "Below SM100 the records hold fc2_expert_weights' experts at its hidden size "
+                "(the input's), and fc1_expert_weights the same experts with intermediate_size "
+                "rows (gated: twice as many), as SM100 reads them."
+            )
+        swizzled = codes and swizzled_input_sf
+        recipe = resolve_nvfp4_4over6(nvfp4_4over6) if w4a4 else None
+        _records_moe(
+            inputs, inter, gated, tune_max_num_tokens, None, swizzled, recipe, ext
+        )
+        if keep:
+            local = ((ids >= 0) & (ids < r1.shape[0])).any(1, keepdim=True)
+            output.copy_(dst.where(local, output))
+        return [output]
 
     with torch.cuda.device(input.device):
         return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
@@ -2009,7 +2187,9 @@ def cutlass_fused_moe_workspace_size(
     Allocate the returned number of bytes once at model-load time (as a 1-D
     ``torch.uint8`` tensor) and pass the buffer as ``workspace_buffer=`` on
     every :func:`cutlass_fused_moe` call to eliminate the per-call
-    multi-GiB scratch allocation.
+    multi-GiB scratch allocation. The FP4 records below SM100 (see the
+    ``quant_scales`` of :func:`cutlass_fused_moe`) take no workspace buffer:
+    this size does not apply to them.
 
     Parameters
     ----------
@@ -2117,6 +2297,739 @@ def cutlass_fused_moe_workspace_size(
             use_packed_weights=use_packed_weights,
             use_wfp4afp8_humming=use_wfp4afp8_humming,
         )
+
+
+@functools.cache
+def _w4a16_moe_sm80_module(recipe=None, exact=False, act=None, f16=False):
+    return gen_w4a16_moe_sm80_module(recipe, exact, act, f16).build_and_load()
+
+
+@dataclass(frozen=True)
+class _RecordsExt:
+    """``_w4a16_moe_sm80``'s epilogue extensions, run by the ``act`` (``ActivationType``) module:
+    GEMM1's activation parameters ``params``, FP32 [E] or [1] (None: ``scalars``), bit i of
+    ``params_alpha`` scaling parameter i by alpha1[e]; bias ``bias1`` [E, I] (gated [E, 2I],
+    linear then gate) and ``bias2`` [E, H], FP32, BF16 or FP16, times alpha1 / alpha2 if
+    ``bias_alpha``; ``lora`` BF16 [tokens * top_k, 2I] (linear then gate) added before the
+    activation; ``rw`` [tokens, top_k] GEMM1's output times its routing weight (FP32, BF16 or
+    FP16); ``act_out``
+    BF16 [tokens * top_k, I] receives the activation (before ``rw``); ``up`` FP32 [E] the gated
+    linear half's own alpha (alpha1 [E, 2]); ``fc2_out`` per token SM100's
+    ``fc2_input_out`` as uint8 [entries, I' / 2], [entries, I' / 16] and FP32 [entries] (I' >= I;
+    not in the key: the autotuner's runs drop it); ``x_fmt`` 1, 2, 3 an MXFP8, FP8 (its scale in
+    alpha1) or MXFP4 ``x`` (uint8) under E8M0 ``x_scale`` per 32, restored by the prep; ``fq`` 1,
+    2, 3 GEMM2's input MXFP8, MXFP4 or FP8 (its scale in alpha2) of GEMM1's output times ``fq_inv``
+    (FP32 [E], or None), quantized and restored in place; both 4 (with ``per_token_scale``): FP8
+    E4M3 as SM90's Humming path, of a 16-bit ``x`` per token (``x_scale`` unread) and of GEMM2's
+    input per row, under dynamic scales. ``alpha_den`` FP32 [1] each: alpha1 and alpha2 are
+    weights' global scales, the GEMM alphas them over these, divided by the prep each call. Swiglu
+    at the default ``scalars`` and Relu2, without tensors, run the base module's GEMM1."""
+
+    act: int
+    params: Tuple[Optional[torch.Tensor], ...] = (None, None, None)
+    scalars: Tuple[float, float, float] = (1.0, 0.0, float("inf"))
+    params_alpha: int = 0
+    bias1: Optional[torch.Tensor] = None
+    bias2: Optional[torch.Tensor] = None
+    bias_alpha: bool = False
+    lora: Optional[torch.Tensor] = None
+    rw: Optional[torch.Tensor] = None
+    act_out: Optional[torch.Tensor] = None
+    up: Optional[torch.Tensor] = None
+    fc2_out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    x_fmt: int = 0
+    fq: int = 0
+    fq_inv: Optional[torch.Tensor] = None
+    alpha_den: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def hidden(self, x: torch.Tensor) -> int:  # x's values a row
+        return x.shape[1] * (
+            2 if x.dtype == torch.uint8 and self.x_fmt in (0, 3) else 1
+        )
+
+    def key(self) -> tuple:  # the autotuner's: the modules and what they read
+        tensors = (
+            *self.params,
+            self.bias1,
+            self.bias2,
+            self.lora,
+            self.rw,
+            self.act_out,
+            self.up,
+        )
+        return (
+            self.act,
+            self.x_fmt,
+            self.fq,
+            *(t is None for t in (*tensors, self.fq_inv)),
+        )
+
+    def gemms(self, tokens_x_top_k, w16=(torch.float32, torch.bfloat16)):
+        """GEMM1's and GEMM2's extension arguments, None where the base module runs it (``rw``
+        in FP32 unless of the ``w16`` types)."""
+        a, (alpha, beta, limit) = ActivationType(self.act), self.scalars
+        base1 = (a == ActivationType.Relu2) or (
+            a in (ActivationType.Swiglu, ActivationType.SwigluBias)
+            and (alpha, beta) == (1.0, 0.0)
+            and limit >= DEFAULT_SWIGLU_LIMIT
+        )
+        # the autotuner's inputs at other token counts drop the per-row tensors
+        m = tokens_x_top_k
+        rows = [t if t is not None and t.numel() == m * t.shape[-1] else None
+                for t in (self.lora, self.act_out)]  # fmt: skip
+        rw = self.rw if self.rw is not None and self.rw.numel() == m else None
+        rw = rw.float() if rw is not None and rw.dtype not in w16 else rw
+        tensors = (*self.params, self.bias1, self.lora, self.rw, self.act_out, self.up)
+        g1 = (*self.params, *self.scalars, self.params_alpha, self.bias1)
+        g1 += (self.bias_alpha, rows[0], rw, rows[1], self.up)
+        if base1 and all(t is None for t in tensors):
+            g1 = None
+        g2 = None
+        if self.bias2 is not None:
+            g2 = _RECORDS_NO_EXT[:7] + (self.bias2, self.bias_alpha) + (None,) * 4
+        return g1, g2
+
+
+_RECORDS_NO_EXT = (None,) * 3 + (0.0,) * 3 + (0, None, False) + (None,) * 4
+
+
+_W4A16_SM80_PT_TACTICS = W4A16_SM80_TACTICS[:4]  # per token: the base tiles 8 to 64
+
+
+def _check_records_device(x: torch.Tensor, *given: Any) -> None:
+    """As SM100's launchers: every tensor (also in a tuple or list) on the input's device."""
+    for v in given:
+        for t in v if isinstance(v, (tuple, list)) else (v,):
+            if isinstance(t, torch.Tensor) and t.device != x.device:
+                raise ValueError(
+                    "Below SM100 the MoE's tensors must be on the input's device."
+                )
+
+
+def _w4a16_moe_sm80(
+    x, topk_ids, topk_weights, r1, alpha1, r2, alpha2, out, intermediate_size, gated,
+    tactic=-1, x_scale=None, fc2_scale=None, fc2_den=None, slot_experts=None,
+    per_token_scale=None, sf_swizzled=False, recipe=None, exact=False, ext=None,
+) -> torch.Tensor:  # fmt: skip
+    """NVFP4 records MoE below SM100 (prep routing, GEMM1 with the activation, GEMM2 and the top-k
+    sum) at ``tactic`` of ``W4A16_SM80_TACTICS`` (-1: row tile 64). ``x``: BF16 or FP16 (an FP16
+    module end to end) [tokens, K], or
+    NVFP4 codes [tokens, K / 2] with ``x_scale`` their E4M3 block scales as uint8 (linear
+    [tokens, >= K / 16], or 128x4 ``sf_swizzled``), restored by the prep; per token (ReLU2) the
+    codes' ``per_token_scale`` (FP32 [tokens]). With 16-bit ``x`` and ``x_scale`` (W4A4, its FP32
+    global scale [1], or [E]: each (token, k) under its expert's) the prep quantizes it to NVFP4
+    and restores it, per token writing ``per_token_scale``. GEMM1 quantizes its output to NVFP4 under ``fc2_scale`` (over
+    ``fc2_den``), each [1] or [E]; per token row by row under ``fc2_den`` (FP32 [1], the base
+    inverse scale; None: the recipe's), GEMM2 dequantizing by ``fc2_scale`` ([1] or [E], or
+    None). ``alpha1``/``alpha2``: FP32 [E] (gated ``alpha1`` also [E, 2], linear then gate). Ids outside [0, E) are skipped; with
+    ``slot_experts`` they are slots, ``slot_experts[slot]`` their experts. ``out``: the top-k sum
+    [tokens, K], or None to return GEMM2's rows [tokens * top_k, K] in (token, k) order. The
+    NVFP4 activation quantizers run the 4over6 ``recipe`` (or the standard one), without fast
+    math if ``exact``. ``ext``: a ``_RecordsExt``."""
+    _check_records_device(
+        x, topk_ids, topk_weights, r1, alpha1, r2, alpha2, out, x_scale, fc2_scale,
+        fc2_den, slot_experts, per_token_scale, *(vars(ext).values() if ext else ()),
+    )  # fmt: skip
+    if x.dim() != 2:  # before its sizes are read
+        raise ValueError(f"Below SM100 the MoE's input is 2D, got {tuple(x.shape)}.")
+    pt = per_token_scale is not None
+    tactics = _W4A16_SM80_PT_TACTICS if pt else W4A16_SM80_TACTICS
+    tactic = W4A16_SM80_TACTICS[3] if tactic in (None, -1) else tuple(tactic)
+    if tactic not in tactics:
+        raise ValueError(f"Below SM100 the tactic is one of {tactics}, got {tactic}.")
+    row_tile, gemm1, gemm2 = tactic
+    dq = x_scale is not None  # the prep restores NVFP4 input into the 16-bit type
+    codes, finalize = x.dtype == torch.uint8, out is not None
+    xf = 0 if ext is None else ext.x_fmt
+    tokens, hidden = x.shape[0], (ext or _RecordsExt(0)).hidden(x)
+    num_experts, top_k, m = r1.shape[0], topk_ids.shape[1], topk_ids.numel()
+    routed = tokens, top_k
+    if (topk_ids.shape, topk_weights.shape) != (routed,) * 2 or not (
+        topk_weights.is_floating_point()
+    ):  # also unfinalized, which return them
+        raise ValueError("Routing ids and float weights must be [num_tokens, top_k].")
+    xt = out.dtype if codes and finalize else torch.bfloat16 if codes else x.dtype
+    if xt not in (torch.bfloat16, torch.float16) or (finalize and out.dtype != xt):
+        raise ValueError(f"Below SM100 the MoE runs BF16 or FP16 throughout, got {x.dtype} in, "
+                         f"{None if out is None else out.dtype} out.")  # fmt: skip
+    y = None if finalize else x.new_empty(m, hidden, dtype=xt)
+    w16 = (torch.float32, xt)  # 16-bit weights of the other type: FP32, exactly
+    if finalize and topk_weights.dtype not in w16:
+        topk_weights = topk_weights.float()
+    if tokens == 0:
+        return out if finalize else y
+    if alpha1.numel() == 2 * num_experts:  # [E, 2]: linear then gate half (w1's rows)
+        if not gated:
+            raise ValueError("alpha1 [E, 2] takes a gated activation.")
+        # each half its own alpha, over alpha_den as the prep divides the gate's
+        den1 = None if ext is None or ext.alpha_den is None else ext.alpha_den[0]
+        up = alpha1[:, 0].contiguous() if den1 is None else alpha1[:, 0] / den1
+        alpha1 = alpha1[:, 1].contiguous()
+        ext = replace(ext or _RecordsExt(ActivationType.Swiglu), up=up)
+    # 16-bit input under per-expert global scales: quantized per entry, GEMM1 reading entry rows
+    pe = dq and not codes and not xf and x_scale.numel() > 1
+    if slot_experts is not None and (
+        row_tile >= 64 or not dq or pe
+    ):  # the prep's slots: R < 64
+        topk_ids = slot_experts.index_select(0, topk_ids.view(-1)).view_as(topk_ids)
+        slot_experts = None
+    inter = intermediate_size
+    n1 = _w4a16_records_geometry(inter * (2 if gated else 1), hidden, gated)[0]
+    n2 = _w4a16_records_geometry(hidden, inter, False)[0]
+    max_blocks = (m + (row_tile - 1) * min(num_experts, m)) // row_tile
+    rows = max_blocks * row_tile
+    den = None if ext is None else ext.alpha_den
+    # Per token GEMM2's row scales first (8 B aligned); the prep's GEMM alphas last.
+    ints = (rows,) * pt + (1 + 2 * max_blocks, rows, (-(-m // 2048) + 1) * num_experts)
+    ints += (2 * num_experts * (den is not None),)
+    # The GEMM scratch from a 256 B boundary (its tiles on whole 128 B lines), then the restored x.
+    start = -(-sum(ints) // 64) * 256
+    xrows = m if pe else tokens
+    sizes = (rows * inter,) + (m * hidden,) * finalize + (xrows * hidden,) * dq
+    ws = x.new_empty(start + 2 * sum(sizes), dtype=torch.uint8)
+    *row_scales, meta, rowmap, workspace, alphas = (
+        ws[: 4 * sum(ints)].view(torch.int32).split(ints)
+    )
+    num = None
+    if den is not None:  # the prep's, from the scales as a CUDA graph replays
+        num, alphas = (alpha1, alpha2), alphas.view(torch.float32)
+        alpha1, alpha2 = alphas.split(num_experts)
+    blocked, *rest = ws[start:].view(xt).split(sizes)
+    y = rest.pop(0).view(m, hidden) if finalize else y
+    act = rest[0].view(xrows, hidden) if dq else x
+    f16 = xt == torch.float16
+    module = _w4a16_moe_sm80_module(recipe, exact, None, f16)
+    xa = None if ext is None else int(ext.act)  # the extension module's activation
+    m1 = m2 = module
+    e1 = e2 = _RECORDS_NO_EXT
+    g1, g2 = (None, None) if ext is None else ext.gemms(m, w16)
+    if (g1, g2) != (None, None):
+        mx = _w4a16_moe_sm80_module(recipe, exact, xa, f16)
+        m1, e1 = (mx, g1) if g1 is not None else (m1, e1)
+        m2, e2 = (mx, g2) if g2 is not None else (m2, e2)
+    if pt and (not codes or ext is not None and ext.fc2_out is not None):
+        # The prep (per_token_scale) or row_quant (fc2_out) writes the caller's tensors before
+        # the GEMMs check theirs: those checks first.
+        e = ext or _RecordsExt(0)
+        if inter % (32 if e.fq else 16) or inter > 16384:  # row_mx's, row_quant's
+            raise ValueError(
+                "Below SM100 per token the intermediate size is a multiple of 16 (an MX or "
+                "FP8 GEMM2 input: 32) of at most 16384."
+            )
+        scales: List[Tuple[Optional[torch.Tensor], Tuple[int, ...]]] = [
+            (fc2_scale, (1, num_experts)), (fc2_den, (1,)),
+            *((t, (1, num_experts)) for t in e.params),
+        ]  # fmt: skip
+        # per expert, GEMM1's (gated: both halves) and GEMM2's output rows
+        bias = [(e.bias1, inter * (2 if gated else 1)), (e.bias2, hidden)]
+        given = [r1, r2, alpha1, alpha2, *(t for t, _ in scales), *(t for t, _ in bias)]
+        given += [out, topk_weights] if finalize else []
+        bt = (torch.float32, torch.bfloat16, torch.float16)  # the biases'
+        if (
+            any(t is not None and not t.is_contiguous() for t in given)
+            or any(t is not None and (t.dtype != torch.float32 or t.numel() not in n)
+                   for t, n in scales)
+            or any(t is not None and (t.dtype not in bt or t.numel() != num_experts * n)
+                   for t, n in bias)
+            or r1.data_ptr() % 16 or r2.data_ptr() % 16 or per_token_scale.data_ptr() % 8
+            or finalize and (out.dim() != 2 or out.shape[1] != hidden or out.data_ptr() % 16)
+        ):  # fmt: skip
+            raise ValueError(
+                "Below SM100 per token the records' tensors are contiguous: the scales FP32 [1] "
+                "or [num_experts] (fc2_den [1]), the biases FP32, BF16 or FP16 [num_experts, N], "
+                "the records and output 16 B and per_token_scale 8 B aligned, the output "
+                "[num_tokens, hidden]."
+            )
+    # MX inputs: the extension module's prep
+    (_w4a16_moe_sm80_module(recipe, exact, xa, f16) if xf else module).prep(
+        topk_ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks,
+        x if dq else None, x_scale, act if dq else None, sf_swizzled, slot_experts,
+        None if codes else per_token_scale, xf,
+        *((None,) * 5 if num is None else (alphas, *num, *den)),
+    )  # fmt: skip
+    blocked = blocked.view(rows, inter)
+    fq = (
+        (None, None) if pt else (fc2_scale, fc2_den)
+    )  # per token: GEMM2's scales by row_quant
+    m1.gemm(
+        r1, alpha1, act, meta, rowmap, blocked, row_tile, 1 if gated else 2,
+        1 if pe else top_k, n1, hidden, inter, max_blocks, gemm1, *fq, None, None, None, None,
+        per_token_scale, 0, *e1,
+    )  # fmt: skip
+    rs2 = row_scales[0].view(torch.float32) if pt else None
+    if ext is not None and ext.fq:  # GEMM2's MX or FP8 input, in place
+        f4 = ext.fq == 4  # FP8 per row: rs2 alpha2 over the row's quant scale
+        _w4a16_moe_sm80_module(recipe, exact, xa, f16).row_mx(
+            blocked, meta, row_tile, max_blocks, ext.fq, alpha2 if f4 else ext.fq_inv,
+            rs2 if f4 else None,
+        )  # fmt: skip
+    elif pt:  # with fc2_out the rows also go there, by rowmap's entries
+        fo = None if ext is None else ext.fc2_out
+        rq = module if fo is None else _w4a16_moe_sm80_module(recipe, exact, xa, f16)
+        rq.row_quant(
+            blocked, meta, alpha2, fc2_scale, rs2, row_tile, max_blocks, fc2_den,
+            *((None,) * 4 if fo is None else (rowmap, *fo)),
+        )  # fmt: skip
+    # GEMM2 also writes out, the top-k sum of y (decode at row tile 8: in its last CTAs).
+    fin = (topk_weights, topk_ids, out, workspace) if finalize else (None,) * 4
+    m2.gemm(
+        r2, alpha2, blocked, meta, rowmap, y, row_tile, 0, top_k, n2, inter, hidden, max_blocks,
+        gemm2, None, None, *fin, rs2, num_experts if slot_experts is None else slot_experts.numel(),
+        *e2,
+    )  # fmt: skip
+    return out if finalize else y
+
+
+def _w4a16_moe_sm80_tuning(
+    num_experts: int,
+    num_tokens: int,
+    tune_max_num_tokens: int,
+    inputs: Sequence[Optional[torch.Tensor]] = (),
+    sf_swizzled: bool = False,
+    x_fmt: int = 0,
+) -> TuningConfig:
+    """Tuning of ``_w4a16_moe_sm80``'s ``inputs`` at ``num_tokens``' bucket: seeded BF16 input
+    (or E2M1 codes with E4M3 scales in [2^-1, 2^2)), expert ids (or each (token, k) its own slot of
+    ascending slot experts) and softmaxed weights, and the written outputs, at a cold L2."""
+
+    def seeded(fn, *args):
+        def init(shape, dtype, device):
+            generator = torch.Generator(device).manual_seed(515)
+            return fn(*args, shape, dtype=dtype, device=device, generator=generator)
+
+        return init
+
+    def empty(shape, dtype, device):
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    def given(i):
+        return len(inputs) > i and inputs[i] is not None
+
+    codes, slots = given(0) and inputs[0].dtype == torch.uint8, given(11)
+    randn = seeded(torch.randn)
+    dynamic = [0, 1, 2] + [7] * given(7) + [8] * (codes and not sf_swizzled)
+    dynamic += [11] * slots + [12] * given(12)
+    initializers = [
+        (0, seeded(torch.randint, 0, 256) if codes else randn),
+        (1, seeded(torch.randint, 0, num_experts)),
+        (2, lambda *args: randn(*args).softmax(-1)),
+    ]
+    initializers += [(7, empty)] * given(7)  # written
+    if given(12):  # per token: read with codes, else written
+        initializers.append((12, seeded(torch.rand) if codes else empty))
+    if codes:  # the scales by their bytes: FP8 has no random fill
+        scales = seeded(torch.randint, 48, 72)
+        initializers.append(
+            (8, lambda s, dtype, d: scales(s, torch.uint8, d).view(dtype))
+        )
+    constraints = []
+    if codes and sf_swizzled:  # 128x4 tiles over [tokens, K / 16] (MX: K / 32)
+        # x's bytes per 4 scales: NVFP4 32, MXFP8 128, MXFP4 64
+        per = {1: 128, 3: 64}.get(x_fmt, 32)
+        constraints.append(
+            ConstraintSpec(
+                8, 0, lambda s: -(-s[0][0] // 128) * 128 * -(-s[0][1] // per) * 4
+            )
+        )
+    if slots:  # a slot per (token, k)
+        constraints.append(ConstraintSpec(11, 0, lambda s: s[1][0] * s[1][1]))
+
+    def slot_routing(tensors):
+        ids, lut = tensors[1], tensors[11]
+        generator = torch.Generator(ids.device).manual_seed(515)
+        perm = torch.randperm(ids.numel(), generator=generator, device=ids.device)
+        tensors[1] = perm.to(ids.dtype).view_as(ids)
+        experts = torch.randint(
+            0, num_experts, (ids.numel(),), generator=generator, device=ids.device
+        )
+        tensors[11] = experts.sort().values.to(lut.dtype)
+        return tensors
+
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                tuple(dynamic),
+                (0,) * len(dynamic),
+                (map_to_hybrid_bucket(num_tokens, tune_max_num_tokens),),
+                make_hybrid_bucket_mapper(tune_max_num_tokens),
+            ),
+        ),
+        constraint_specs=tuple(constraints),
+        tensor_initializers=tuple(initializers),
+        inputs_pre_hook=slot_routing if slots else None,
+        use_cold_l2_cache=True,
+    )
+
+
+class _W4A16Sm80Runner(TunableRunner):
+    """``_w4a16_moe_sm80`` for the flat MoE APIs below SM100."""
+
+    def __init__(
+        self, intermediate_size, gated, sf_swizzled=False, recipe=None, exact=False, ext=None,
+    ):  # fmt: skip
+        self.intermediate_size, self.gated, self.ext = intermediate_size, gated, ext
+        self.sf_swizzled, self.recipe, self.exact = sf_swizzled, recipe, exact
+
+    def __hash__(self) -> int:  # the extension's tensors are per call: its key instead
+        ext = None if self.ext is None else (self.ext.key(), self.ext.scalars)
+        recipe = nvfp4_4over6_cache_key(self.recipe)
+        return hash(
+            (
+                self.intermediate_size,
+                self.gated,
+                self.sf_swizzled,
+                recipe,
+                self.exact,
+                ext,
+            )
+        )
+
+    def get_cache_key_extras(self, inputs) -> tuple:  # a module each
+        ext = None if self.ext is None else self.ext.key()
+        out = None if inputs[7] is None else inputs[7].dtype
+        a1 = (
+            inputs[8] if len(inputs) > 8 else None
+        )  # per expert: the prep's rows per entry
+        pe = a1 is not None and a1.dtype == torch.float32 and a1.numel() > 1
+        return (
+            nvfp4_4over6_cache_key(self.recipe),
+            self.exact,
+            ext,
+            inputs[0].dtype,
+            out,
+            pe,
+        )
+
+    def get_valid_tactics(self, inputs, profile) -> List[Tuple[int, int, int]]:
+        per_token = len(inputs) > 12 and inputs[12] is not None
+        return list(_W4A16_SM80_PT_TACTICS if per_token else W4A16_SM80_TACTICS)
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        return _w4a16_moe_sm80(
+            *inputs[:8], self.intermediate_size, self.gated, tactic, *inputs[8:],
+            sf_swizzled=self.sf_swizzled, recipe=self.recipe, exact=self.exact, ext=self.ext,
+        )  # fmt: skip
+
+
+def _records_moe(
+    inputs,
+    intermediate_size,
+    gated,
+    tune_max_num_tokens,
+    tactic=None,
+    sf_swizzled=False,
+    recipe=None,
+    ext=None,
+) -> torch.Tensor:
+    """The flat APIs' NVFP4 MoE below SM100 on the records of
+    ``prepare_records_nvfp4_weights``, at ``tactic`` or the AutoTuner's. ``inputs``:
+    ``_w4a16_moe_sm80``'s ``x, topk_ids, topk_weights, r1, alpha1, r2, alpha2, out``, then any of
+    ``x_scale, fc2_scale, fc2_den, slot_experts, per_token_scale``. With ``x_scale`` (NVFP4
+    activations) the quantizers run the 4over6 ``recipe``, without fast math under
+    FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH (or TRTLLM_...), read each call as on SM100."""
+    x, r1, alpha1, r2, alpha2 = (inputs[i] for i in (0, 3, 4, 5, 6))
+    experts = r1.shape[0]
+    hidden = (ext or _RecordsExt(0)).hidden(x)
+    rows1 = intermediate_size * (2 if gated else 1)
+    expected = (
+        (experts, _w4a16_records_geometry(rows1, hidden, gated)[3]),
+        (experts, _w4a16_records_geometry(hidden, intermediate_size, False)[3]),
+    )
+    if (
+        (tuple(r1.shape), tuple(r2.shape)) != expected
+        or (r1.dtype, r2.dtype) != (torch.uint8, torch.uint8)
+        or (alpha1.dtype, alpha2.dtype) != (torch.float32, torch.float32)
+        or not (alpha1.numel() == experts or gated and alpha1.shape == (experts, 2))
+        or alpha2.numel() != experts
+    ):
+        raise ValueError(
+            f"Below SM100 the FP4 block scales are the uint8 records {expected} of "
+            "prepare_records_nvfp4_weights (or _mxfp4_) at the valid (unpadded) sizes and the "
+            "alphas FP32 [num_experts] (alpha1 gated also [num_experts, 2]), got "
+            f"{r1.dtype} {tuple(r1.shape)}, {r2.dtype} {tuple(r2.shape)}, alphas {alpha1.dtype} "
+            f"{tuple(alpha1.shape)} and {alpha2.dtype} {tuple(alpha2.shape)}."
+        )
+    exact = (len(inputs) > 8 and inputs[8] is not None) and any(
+        env_flag_enabled(f"{p}_DISABLE_FP4_QUANT_FAST_MATH")
+        for p in ("FLASHINFER", "TRTLLM")
+    )
+    runner = functools.partial(
+        _W4A16Sm80Runner, intermediate_size, gated, sf_swizzled, recipe, exact
+    )
+    if tactic is None:  # the profiles do not write fc2_out
+        x_fmt = 0 if ext is None else ext.x_fmt
+        tuning = _w4a16_moe_sm80_tuning(
+            experts, x.shape[0], tune_max_num_tokens, inputs, sf_swizzled, x_fmt
+        )
+        tuned = runner(ext if ext is None else replace(ext, fc2_out=None))
+        _, tactic = AutoTuner.get().choose_one(
+            "flashinfer::w4a16_moe_sm80", [tuned], tuning, inputs
+        )
+    return runner(ext)(inputs, tactic=tactic)
+
+
+def _trtllm_routing_sm80(
+    routing_logits, routing_bias, routing_method_type, top_k, n_group, topk_group,
+    routed_scaling_factor, norm_topk_prob, enable_pdl, num_fused_shared_experts=0, gather=True,
+) -> Tuple[torch.Tensor, ...]:  # fmt: skip
+    """TRT-LLM routing below SM100: global ids, BF16 weights, fused shared experts last. As
+    ``trtllm_gen_routing``, but one-token tiles make each (token, k)'s permuted slot its own CTA
+    tile, so one gather gives its expert; without ``gather``, the slots, weights and each slot's
+    expert."""
+    method = RoutingMethodType(routing_method_type)
+    _check_trtllm_gen_routing_supported(routing_logits, routing_bias, method, top_k)
+    device, (tokens, experts) = routing_logits.device, routing_logits.shape
+    k, all_experts = (n + num_fused_shared_experts for n in (top_k, experts))
+    ctas = _max_num_ctas_in_batch_dim(tokens, k, all_experts, 1)
+    i32 = functools.partial(torch.empty, dtype=torch.int32, device=device)
+    slots, expert_of_slot = i32(tokens * k), i32(ctas)
+    weights = torch.empty((tokens, k), dtype=torch.bfloat16, device=device)
+    if tokens:  # the binding takes a token at least; it launches on the current device
+        with torch.cuda.device(device):
+            get_trtllm_gen_routing_module().trtllm_gen_routing(
+                routing_logits, routing_bias, i32(tokens * k), weights, i32(max(2 * all_experts, 512)),
+                i32(1), slots, i32(ctas), expert_of_slot, i32(ctas), i32(1), top_k,
+                num_fused_shared_experts, n_group or 0, topk_group or 0, 0, experts,
+                1.0 if routed_scaling_factor is None else float(routed_scaling_factor), 1, int(method),
+                norm_topk_prob, device_support_pdl(device) if enable_pdl is None else enable_pdl,
+            )  # fmt: skip
+    if not gather:
+        return slots.view(tokens, k), weights, expert_of_slot
+    return expert_of_slot.index_select(0, slots).view(tokens, k), weights
+
+
+def _trtllm_fp4_records_moe(
+    a, ids, weights, slot_experts=None, tactic=None
+) -> List[torch.Tensor]:
+    """The TRT-LLM FP4 MoE below SM100, on the records of ``prepare_records_nvfp4_weights`` in
+    the weight-scale slots, for ``a`` the arguments of ``trtllm_fp4_block_scale_routed_moe``
+    (or ``trtllm_fp4_block_scale_moe``) and the global expert ``ids`` with their ``weights``
+    (or slots with ``slot_experts``). The hidden states are NVFP4 (linear E4M3 block scales;
+    with ``per_token_scale`` per token), BF16 for BF16 activations, or BF16 quantized as they
+    are routed under ``hidden_states_scale`` (FP32 [1]; per token, ``per_token_scale``
+    receives the token scales). GEMM1's output is quantized under ``output1_scale_scalar``
+    (over ``output1_scale_gate_scalar`` when gated but SiTU, as on SM100). With NVFP4 activations
+    the biases and the SiTU / SwigluStep limits are in accumulator units, as on SM100 (the
+    limits in output units with ``_out_limits``, as ``RecordsNvfp4Runner`` passes its view's). On the
+    records of ``prepare_records_mxfp4_weights`` (their global scales in the scalars as NVFP4's:
+    ``output1_scale_gate_scalar`` [E] or [E, 2] linear then gate, a gated ``output1_scale_scalar``
+    with the gate half's) the hidden states are also MXFP8 (``float8_e4m3fn`` under linear E8M0
+    scales) or FP8 per tensor (its scale in the scalars), GEMM2's input MXFP8 or FP8 as on
+    SM100, and the biases and limits in output units. With ``gemm1_lora_delta``
+    the activation (BF16, (token, k) order, as GEMM2's rows) is appended to the return list.
+    With ``valid_hidden_size`` / ``valid_intermediate_size`` the records are of the valid
+    (unpadded) weights and the rest is padded as on SM100: the hidden states, biases and delta are
+    read at their valid columns, the finalized output is ``valid_hidden_size`` wide, and GEMM2's
+    rows and the activation are zero-padded; without them a finalized ``output`` narrower than
+    the hidden size receives its leading columns. Per token ``fc2_input_out`` receives GEMM2's
+    input as on SM100. With ``_input_scales`` (``RecordsNvfp4Runner``'s GEMM1 and GEMM2 input
+    scales, FP32 [1]) the gate and GEMM2 scalars are the weights' global scales and
+    ``output1_scale_scalar`` GEMM2's input scale, the alphas divided by the prep each call."""
+    x, x_scale, pt = a["hidden_states"], a["hidden_states_scale"], a["per_token_scale"]
+    dens = a.get("_input_scales")
+    s1, s_gate, s2 = (
+        a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
+    )
+    act, finalize = ActivationType(a["activation_type"]), a["do_finalize"]
+    r1, r2 = a["gemm1_weights_scale"], a["gemm2_weights_scale"]
+    # SM100's experts: the local ones, then the fused shared
+    if "local_num_experts" in a:
+        rows = a["local_num_experts"] + a["_nfse"]
+        if min(r1.shape[0], r2.shape[0]) < rows:
+            raise ValueError(
+                f"Below SM100 the records hold local_num_experts + num_fused_shared_experts "
+                f"({rows}) experts, got {r1.shape[0]} and {r2.shape[0]}."
+            )
+        r1, r2 = r1[:rows], r2[:rows]
+        s1, s_gate, s2 = (
+            t if t is None or not t.dim() else t[:rows] for t in (s1, s_gate, s2)
+        )
+    fp8 = x.dtype == torch.float8_e4m3fn  # MXFP8 (with x_scale) or FP8 per tensor
+    codes, w4a4 = x.dtype != torch.bfloat16, x_scale is not None and not fp8
+    if codes and x_scale is not None and "hidden_states_scale_layout" in a:  # SM100's
+        resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
+    nv = codes and not fp8  # NVFP4 codes
+    tokens, hidden = x.shape[0], x.shape[1] * (2 if nv else 1)
+    inter, out, fo = (a[n] for n in ("intermediate_size", "output", "fc2_input_out"))
+    _check_records_device(x, out, fo)  # before they are replaced or written
+    # SM100's checks: GEMM2's roundUp(valid, 128) columns within hidden, unfinalized rows as wide
+    _infer_trtllm_moe_output_hidden_size(hidden, a["valid_hidden_size"])
+    _check_valid_hidden_size_supports_finalize(a["valid_hidden_size"], finalize, hidden)
+    vh, vi = a["valid_hidden_size"], a["valid_intermediate_size"]
+    hv, iv = hidden if vh is None else vh, inter if vi is None else vi
+    gated, top_k = act.is_gated, ids.shape[1]
+    bf16_scale = (
+        not codes and w4a4 and (x_scale.dtype, x_scale.numel()) == (torch.float32, 1)
+    )
+    if (
+        (w4a4 != (nv or bf16_scale))
+        or x.dtype not in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
+        or (nv and x_scale.dtype not in (torch.float8_e4m3fn, torch.uint8))
+        or (fp8 and x_scale is not None and (
+            x_scale.element_size() != 1 or x_scale.dtype == torch.bool
+        ))
+        or (pt is not None and (
+            not w4a4 or pt.dtype != torch.float32 or pt.numel() != tokens
+            or not pt.is_contiguous()
+        ))
+        or hv % 16 or iv % 16 or not 0 < iv <= inter or (fp8 and (hv % 32 or iv % 32))
+        or (finalize and out is not None and (out.dim() != 2 or out.shape[0] != tokens or not (
+            out.shape[1] == hv if vh is not None else 0 < out.shape[1] <= hidden
+        )))
+        or s_gate is None or s2 is None or ((w4a4 or fp8 and x_scale is None) and s1 is None)
+        or a.get("workspace_buffer") is not None or a.get("routing_metadata") is not None
+    ):  # fmt: skip
+        raise NotImplementedError(
+            "Below SM100 TRT-LLM FP4 runs on records: NVFP4 hidden states, BF16 ones (with an "
+            "FP32 global scale for NVFP4 activations), per token NVFP4 activations, MXFP8 or FP8 "
+            "ones (MXFP4 records), with the GEMM scalars; valid sizes multiples of 16 (MXFP8 and "
+            "FP8: 32), the output [num_tokens, valid hidden] (without valid sizes at most hidden "
+            "wide: its leading columns); no workspace_buffer or routing_metadata."
+        )
+    if fo is not None and (  # SM100's checks
+        not isinstance(fo, (tuple, list)) or len(fo) != 3
+        or pt is None or a.get("_nfse") or inter % 16
+        or any(not t.is_contiguous() or t.dim() < 2 or t.shape[0] < tokens
+               or t.shape[1] != top_k for t in fo)
+        or (fo[0].dtype, fo[0].shape[2:]) != (torch.uint8, (inter // 2,)) or fo[0].data_ptr() % 8
+        or fo[1].dtype not in (torch.uint8, torch.float8_e4m3fn)
+        or fo[1].shape[2:] != (inter // 16,) or (fo[2].dtype, fo[2].dim()) != (torch.float32, 2)
+    ):  # fmt: skip
+        raise ValueError(
+            "fc2_input_out takes per_token_scale without fused shared experts or routing "
+            "metadata, three tensors: uint8 codes [>= num_tokens, top_k, intermediate_size / "
+            "2] (8 B aligned), E4M3 or uint8 block scales [..., intermediate_size / 16], FP32 "
+            "token scales [>= num_tokens, top_k], contiguous."
+        )
+    # localized_* (per-domain copies of the weights passed in full) only steer the SM100 kernels.
+    if a["local_expert_offset"]:  # local ids; the other ranks' are skipped
+        ids = ids - a["local_expert_offset"]
+    if codes and x_scale is not None:  # NVFP4's hidden / 16 bytes a token, MXFP8's / 32
+        cols = hidden // (16 if nv else 32)
+        if x_scale.numel() != tokens * cols:  # SM100 infers the block size from it
+            raise ValueError(
+                f"Below SM100 hidden_states_scale is linear [num_tokens, hidden / "
+                f"{16 if nv else 32}], got {tuple(x_scale.shape)}."
+            )
+        x_scale = x_scale.view(torch.uint8).reshape(tokens, cols)
+    if codes:
+        x = x.view(torch.uint8)
+    if hv < hidden:  # the valid columns
+        x = x[:, : hv // 2 if nv else hv].contiguous()
+        if codes and x_scale is not None:
+            x_scale = x_scale[:, : hv // (16 if nv else 32)].contiguous()
+    # GEMM2's input under s1, gated (but SiTU, or with dens) over the gate half's s_gate
+    sit = gated and act != ActivationType.Situ and dens is None
+    experts = r1.shape[0]
+    if s1 is not None and (s1.dim() > 1 or s1.numel() not in (1, experts)):
+        raise ValueError(  # SM100's [local_num_experts], or one for all
+            f"output1_scale_scalar must be [num_experts] or [1], got {tuple(s1.shape)}."
+        )
+    inv = None  # FP8 GEMM2 input, per expert
+    if fp8 and s1 is not None:
+        inv = s1.float().expand(experts)
+        inv = (
+            inv / s_gate.view(s_gate.shape[0], -1)[:, -1] if sit else inv
+        ).contiguous()
+    if fp8 and x_scale is None:  # per tensor: the codes stand in for the unread scales
+        x_scale = x
+
+    def valid(t, v, halves=1):  # the leading v columns of each half of t's rows
+        n = 0 if t is None else t.shape[-1] // halves
+        if n in (0, v):
+            return t
+        return t.unflatten(-1, (halves, n))[..., :v].flatten(-2).contiguous()
+
+    # SM100's narrower output without valid sizes: the leading columns of the full width
+    narrow = out if finalize and out is not None and out.shape[1] < hv else None
+    if finalize and (out is None or narrow is not None):
+        out = x.new_empty(
+            tokens, hv, dtype=torch.bfloat16 if narrow is None else narrow.dtype
+        )
+    inf, g = float("inf"), 2 if gated else 1
+    lora, act_out = a.get("gemm1_lora_delta"), None
+    if lora is not None:  # the routed slots: fused shared experts last, no delta
+        nfse = a.get("_nfse") or 0
+        shape = (tokens, top_k - nfse, 2 * inter)  # as SM100's launcher
+        if not gated or lora.dtype != torch.bfloat16 or lora.shape != shape:
+            raise ValueError(  # below SM100 GEMM1's gated epilogue adds it
+                "gemm1_lora_delta takes a gated activation, BF16 [num_tokens, top_k, 2 * "
+                "intermediate_size]."
+            )
+        lora = torch.nn.functional.pad(lora, (0, 0, 0, nfse))
+        lora = valid(lora.flatten(0, 1), iv, g)
+        act_out = x.new_empty(ids.numel(), iv, dtype=torch.bfloat16)
+    # Limits in accumulator units with NVFP4 activations, as SM100's; MoELayer's in output units
+    unit = ActivationType.Situ, ActivationType.SwigluStep
+    p = {  # per expert, the local ones first as on SM100
+        k: a[f"gemm{k}"] if a[f"gemm{k}"] is None else a[f"gemm{k}"][:experts]
+        for k in ("1_alpha", "1_beta", "1_clamp_limit", "1_bias", "2_bias")
+    }
+    p["1_bias"], p["2_bias"] = valid(p["1_bias"], iv, g), valid(p["2_bias"], hv)
+    if act in (ActivationType.Geglu, ActivationType.GegluTanh):
+        if p["1_clamp_limit"] is not None:
+            raise ValueError("Below SM100 GeGLU takes no gemm1_clamp_limit.")
+    if act == ActivationType.SwigluStep:  # its limit only, as on SM100
+        if p["1_alpha"] is not None or p["1_beta"] is not None:
+            raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
+    if fo is not None:  # by (token, k) entry
+        fo = (fo[0][:tokens].flatten(0, 1), fo[1][:tokens].view(torch.uint8).flatten(0, 1),
+              fo[2][:tokens].view(-1))  # fmt: skip
+    ext = _RecordsExt(
+        act,
+        (p["1_alpha"], p["1_beta"], p["1_clamp_limit"]),
+        {unit[0]: (1.0, 1.0, inf), unit[1]: (1.0, 0.0, 7.0)}.get(act, (1.0, 0.0, inf)),
+        4 if w4a4 and act in unit and not a.get("_out_limits") else 0,
+        p["1_bias"],
+        p["2_bias"],
+        w4a4,
+        lora,
+        act_out=act_out,
+        fc2_out=fo,
+        x_fmt=(2 if x_scale is x else 1) if fp8 else 0,
+        fq=(3 if x_scale is x else 1) if fp8 else 0,
+        fq_inv=inv,
+        alpha_den=dens,
+    )
+    inputs = [x, ids, weights, r1, s_gate, r2, s2, out if finalize else None]
+    if w4a4:  # NVFP4 GEMM2 input under s1, gated but SiTU over s_gate
+        den = s_gate if sit else None
+        if pt is not None:  # rows per token, GEMM2 dequantizing by s1 over s_gate
+            s1 = s1 if den is None else s1 / den.view(experts, -1)[:, -1]
+        inputs += [x_scale, s1, None if pt is not None else den]
+    else:
+        inputs += [x_scale if fp8 else None, None, None]
+    # 4over6 requantizes per token only, as on SM100.
+    recipe = None if pt is None else resolve_nvfp4_4over6(a["nvfp4_4over6"])
+    y = _records_moe(
+        inputs + [slot_experts, pt],
+        iv,
+        gated,
+        a["tune_max_num_tokens"],
+        tactic,
+        recipe=recipe,
+        ext=ext,
+    )
+    if fo is not None and (
+        experts < a["num_experts"] or a.get("routing_logits") is None
+    ):  # once the call ran, what the records skip zero as on SM100: the other experts'
+        # entries and the padded columns
+        skip = ((ids < 0) | (ids >= experts)).view(-1, 1)
+        for t, n in zip((*fo[:2], fo[2][:, None]), (iv // 2, iv // 16, 1), strict=True):
+            t[:, n:].zero_()
+            t[:, :n].masked_fill_(skip, 0)
+    pad = torch.nn.functional.pad  # to the padded widths, as on SM100
+    y = y if finalize or hv == hidden else pad(y, (0, hidden - hv))
+    act_out = (
+        act_out if act_out is None or iv == inter else pad(act_out, (0, inter - iv))
+    )
+    out = out if narrow is None else narrow.copy_(out[:, : narrow.shape[1]])
+    res = [out] if finalize else [y, weights]
+    if lora is not None or not finalize:
+        # (token, k) order: each (token, k) its own row, -1 on other ranks' experts.
+        rows = torch.arange(ids.numel(), dtype=torch.int32, device=ids.device)
+        res.append(torch.where(((ids >= 0) & (ids < experts)).view(-1), rows, -1))
+    return res + ([act_out] if lora is not None else [])
 
 
 # trtllmgen-moe-fp8
@@ -7291,13 +8204,17 @@ def _trtllm_fp4_nvfp4_4over6_code(
     if nvfp4_4over6 is _UNSET:
         return NVFP4_4OVER6_CODE_FROM_ENV
     resolved = resolve_nvfp4_4over6(nvfp4_4over6)
-    if resolved is not None and (
-        per_token_scale is None or hidden_states.dtype != torch.uint8
-    ):
+    # Below SM100 the records also quantize BF16 hidden states per token.
+    quantized = hidden_states.dtype == torch.uint8 or (
+        hidden_states.dtype == torch.bfloat16
+        and get_compute_capability(hidden_states.device)[0] < 10
+    )
+    if resolved is not None and (per_token_scale is None or not quantized):
         raise ValueError(
             "nvfp4_4over6 requires per_token_scale with NVFP4 (uint8) "
-            "hidden_states; no other path has a 4over6 requantization. Pass "
-            "None to turn 4over6 off, or omit it to read the environment."
+            "hidden_states (below SM100 also BF16); no other path has a 4over6 "
+            "requantization. Pass None to turn 4over6 off, or omit it to read the "
+            "environment."
         )
     return nvfp4_4over6_code(resolved)
 
@@ -7494,6 +8411,9 @@ def trtllm_fp4_block_scale_moe(
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
+    Below SM100 (SM80 to SM90) NVFP4 runs on records as in
+    :func:`trtllm_fp4_block_scale_routed_moe`, routed by the TRT-LLM routing kernels.
+
     Parameters
     ----------
     routing_logits : torch.Tensor
@@ -7685,7 +8605,7 @@ def trtllm_fp4_block_scale_moe(
         a single buffer. Requires ``do_finalize=True`` and no
         ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
         scratch that does not fit (a larger token count) is allocated per call.
-        Default ``None`` (allocate per call).
+        Default ``None`` (allocate per call). Below SM100 the records reject it.
 
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 4over6 recipe for the per-token requantization of the GEMM2
@@ -7790,6 +8710,37 @@ def trtllm_fp4_block_scale_moe(
         top_k,
         num_tokens=hidden_states.shape[0],
     )
+    if hidden_states.is_cuda and get_compute_capability(hidden_states.device)[0] < 10:
+        if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
+            raise ValueError(f"Invalid activation type: {activation_type}")
+        _check_records_device(
+            hidden_states, routing_logits, routing_bias, routing_replay_out
+        )
+        if routing_logits.shape != (hidden_states.shape[0], num_experts) or (
+            routing_bias is not None
+            and (routing_bias.shape, routing_bias.dtype)
+            not in (((num_experts,), torch.bfloat16), ((num_experts,), torch.float32))
+        ):  # as SM100's launcher
+            raise ValueError(
+                "routing_logits must be [num_tokens, num_experts], routing_bias BF16 or FP32 "
+                "[num_experts]."
+            )
+        # Records look each slot's expert up as they route, unless the ids are replayed,
+        # local to an EP rank (fewer local experts than routed) or returned unfinalized.
+        gather = (
+            routing_replay_out is not None
+            or local_expert_offset
+            or local_num_experts != routing_logits.shape[1]
+            or not do_finalize
+        )
+        ids, weights, *slot_experts = _trtllm_routing_sm80(
+            routing_logits, routing_bias, routing_method_type, top_k, n_group, topk_group,
+            routed_scaling_factor, norm_topk_prob, enable_pdl, _nfse, bool(gather),
+        )  # fmt: skip
+        res = _trtllm_fp4_records_moe(locals(), ids, weights, *slot_experts)
+        if routing_replay_out is not None:  # a call that runs
+            routing_replay_out[: ids.shape[0]].copy_(ids[:, :top_k])
+        return res
     localized = _flatten_localized_moe_args(
         localized_weights, localized_streams, localized_sm_count, hidden_states.device
     )
@@ -7898,6 +8849,14 @@ def trtllm_fp4_block_scale_routed_moe(
        id, low 16 bits = float16/bfloat16 weight, matching
        ``PackedScoreIdx`` in ``include/flashinfer/trtllm/fused_moe/RoutingKernel.h``).
     2. Unpacked format: ``topk_ids`` is a tuple ``(topk_ids, topk_weights)``.
+
+    Below SM100 (SM80 to SM90) NVFP4 runs on the records of
+    :func:`prepare_records_nvfp4_weights` in ``gemm1_weights_scale`` and
+    ``gemm2_weights_scale``; the weights are not read. ``hidden_states`` is NVFP4 as
+    below, BF16 quantized as it is routed under an FP32 [1] ``hidden_states_scale`` (per
+    token the base inverse scale, the token scales written to ``per_token_scale``), or BF16
+    activations (W4A16) without it. ``do_finalize=False`` returns GEMM2's rows in
+    ``(token, k)`` order.
 
     Parameters
     ----------
@@ -8064,7 +9023,7 @@ def trtllm_fp4_block_scale_routed_moe(
         a single buffer. Requires ``do_finalize=True`` and no
         ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
         scratch that does not fit (a larger token count) is allocated per call.
-        Default ``None`` (allocate per call).
+        Default ``None`` (allocate per call). Below SM100 the records reject it.
 
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 4over6 recipe for the per-token requantization of the GEMM2
@@ -8091,7 +9050,8 @@ def trtllm_fp4_block_scale_routed_moe(
         :func:`trtllm_fp4_block_scale_moe_routing_tile_n` gives the tile this
         call runs, the tuned one when there is one. The body
         allocates its own buffers. Not supported with ``gemm1_lora_delta``,
-        fused shared experts or ``workspace_buffer`` (``ValueError``).
+        fused shared experts or ``workspace_buffer`` (``ValueError``). Below SM100,
+        where no kernel populates it, passing it raises ``NotImplementedError``.
         Default ``None`` (route inside the call).
     localized_weights : Optional[List[Dict[str, torch.Tensor]]]
         Per-locality-domain weight shards for uGPU localization; see
@@ -8138,17 +9098,38 @@ def trtllm_fp4_block_scale_routed_moe(
         nvfp4_4over6, per_token_scale, hidden_states
     )
     _validate_fp4_nvfp4_hidden_size(hidden_states, hidden_states_scale)
-    topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
-    localized = _flatten_localized_moe_args(
-        localized_weights, localized_streams, localized_sm_count, hidden_states.device
-    )
-
     _nfse = _validate_fused_shared_experts(
         num_fused_shared_experts,
         local_expert_offset,
         local_num_experts,
         num_experts,
         routing_method_type,
+    )
+    topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+    if hidden_states.is_cuda and get_compute_capability(hidden_states.device)[0] < 10:
+        if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
+            raise ValueError(f"Invalid activation type: {activation_type}")
+        ids, weights = topk_ids_tensor, topk_weights
+        routed = (hidden_states.shape[0], top_k)
+        w16 = (torch.bfloat16, torch.float32)
+        if (ids.dtype, ids.shape) != (torch.int32, routed) or not (
+            weights is None or weights.dtype in w16 and weights.shape == routed
+        ):  # as SM100's launcher, before any output is written
+            raise ValueError(
+                "topk_ids must be int32 [num_tokens, top_k], topk_weights BF16 or FP32 as wide."
+            )
+        if weights is None:  # (expert id << 16) | BF16 weight
+            weights, ids = ids.view(torch.bfloat16)[..., ::2].contiguous(), ids >> 16
+        if _nfse:  # every token to the shared experts, weight 1
+            shared = torch.arange(_nfse, device=ids.device)
+            shared = (shared + num_experts).to(ids.dtype).expand(ids.shape[0], -1)
+            ids = torch.cat((ids, shared), 1)
+            weights = torch.cat(
+                (weights, torch.ones_like(shared, dtype=weights.dtype)), 1
+            )
+        return _trtllm_fp4_records_moe(locals(), ids, weights)
+    localized = _flatten_localized_moe_args(
+        localized_weights, localized_streams, localized_sm_count, hidden_states.device
     )
 
     # The kernel folds dequantScaleAb into scaleC and applies it to the bias
@@ -8643,7 +9624,9 @@ def trtllm_fused_moe_workspace_size(
     tensor) and pass it as ``workspace_buffer=`` to ``trtllm_*_moe`` /
     ``trtllm_*_routed_moe``. The launch then carves its routing maps,
     intermediate GEMM outputs and batched-GEMM workspaces from that buffer
-    instead of allocating and freeing them on every call.
+    instead of allocating and freeing them on every call. FP4 below SM100 runs
+    on records, which take no workspace buffer: this size does not apply to
+    them.
 
     With ``tactic=None``, the size is measured by the launcher's own allocation
     code, over every tile size at ``max_num_tokens``, so one buffer fits whichever

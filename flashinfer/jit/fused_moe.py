@@ -252,6 +252,54 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
 
 
+def gen_w4a16_moe_sm80_module(
+    recipe=None,
+    exact: bool = False,
+    act: Optional[int] = None,
+    f16: bool = False,
+    out: Optional[str] = None,
+) -> JitSpec:
+    """NVFP4 MoE records kernels (BF16, or FP16 if ``f16``, or NVFP4 activations): sm_80 code for SM80 to SM89,
+    plus sm_87 for SM87, and sm_90 for SM90. The NVFP4 activation quantizer runs in software (FLASHINFER_FP4_SW_CVT),
+    with the 4over6 ``recipe`` (an ``NVFP44Over6Config``) and without fast math if ``exact``
+    (FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH), a module each; with ``act`` (an
+    ``ActivationType``) the GEMMs' epilogue extensions for that activation. ``out`` ("f16" or
+    "f32"): a BF16 module whose GEMM2 (alone: no finalize, no row scales) writes FP16 or FP32."""
+    from ..quantization.nvfp4_quantization_utils import nvfp4_4over6_cache_key
+
+    archs = current_compilation_context.TARGET_CUDA_ARCHS
+    majors = {major for major, _ in archs}
+    flags = [f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors]
+    if (8, "7") in archs:  # Tegra (Jetson Orin) does not run desktop sm_80 cubins
+        flags.append("-gencode=arch=compute_80,code=sm_87")
+    if not flags:
+        raise RuntimeError("W4A16 MoE records kernels need an SM80 to SM90 target")
+    defines = "ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 FLASHINFER_FP4_SW_CVT FLASHINFER_FP4_SW_CVT_FFMA"
+    name = "w4a16_moe_sm80"
+    if recipe is not None:
+        defines += f" RECORDS_E4M3_MAX={recipe.e4m3_max} RECORDS_ERR_MODE={int(recipe.err_mode)}"
+        defines += f" RECORDS_ERR_FAST={int(recipe.err_use_fast_math)}"
+        name += "_" + nvfp4_4over6_cache_key(recipe)
+    if exact:
+        defines, name = defines + " RECORDS_EXACT", name + "_exact"
+    if act is not None:
+        defines, name = defines + f" RECORDS_ACT={int(act)}", name + f"_act{int(act)}"
+    if f16:
+        defines, name = defines + " RECORDS_F16", name + "_f16"
+    if out is not None:
+        if f16 or out not in ("f16", "f32"):
+            raise ValueError(f"out={out!r}: 'f16' or 'f32', a BF16 module's")
+        defines, name = defines + f" RECORDS_OUT_{out.upper()}", name + f"_out_{out}"
+    nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
+    return gen_jit_spec(
+        name,
+        [jit_env.FLASHINFER_CSRC_DIR / "w4a16_moe_sm80.cu"],
+        extra_cuda_cflags=flags + [f"-D{d}" for d in defines.split()],
+        extra_include_paths=[nv_internal, nv_internal / "include"],
+        use_fast_math=False,
+    )
+
+
 def gen_cutlass_fused_moe_module(
     nvcc_flags: List[str],
     device_arch: str,
@@ -576,7 +624,7 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
     ] + current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12]
+        supported_major_versions=[8, 9, 10, 12]
     )
 
     return gen_jit_spec(

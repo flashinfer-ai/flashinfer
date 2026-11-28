@@ -22,6 +22,11 @@ def _skip_if_not_sm100():
         pytest.skip("kernel requires SM100+ (Blackwell)")
 
 
+def _skip_if_not_sm80():
+    if _cc()[0] < 8:
+        pytest.skip("kernel requires SM80+")
+
+
 def _skip_if_not_sm100_or_103():
     """Gate for kernels that run on the SM100 family (SM100/SM103/SM107)."""
     major, minor = _cc()

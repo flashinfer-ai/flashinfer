@@ -334,7 +334,7 @@ def test_cudnn_config_registration_and_architecture_lists():
         assert not family.config_cls.supported(75)
         assert not family.config_cls.supported(130)
     assert CudnnGroupedGemmBf16Config.supported(80)
-    assert not CudnnGroupedGemmFp8PerTensorConfig.supported(80)  # FP8 starts at SM89
+    assert CudnnGroupedGemmFp8PerTensorConfig.supported(80)
     # Explicit opt-in only: never part of the default candidate list.
     default = MoEConfig(
         routing=RoutingConfig(num_experts=4, top_k=2),
@@ -438,9 +438,9 @@ def test_cudnn_check_support_rejects_unsupported_options():
         )._check_support()
     for key, arch in (
         (_BF16_KEY, 75),
-        (_FP8_KEY, 80),
+        (_FP8_KEY, 75),
         (_MXFP8_KEY, 90),
-        (_NVFP4_KEY, 89),
+        (_NVFP4_KEY, 90),
     ):
         runner = _detached_runner(key, _config(key))
         runner._device_arch = arch

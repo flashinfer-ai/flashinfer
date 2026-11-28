@@ -542,14 +542,17 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 
 # The FP8 kernels are validated on the SM100 family only — the outer JIT module
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
-_TRTLLM_ROUTED_FP8_ARCHS = (100, 103, 107)
+# SM80 / SM86 / SM87 / SM89 run the runners' semantics on the SM8x grouped GEMMs
+# (``sm8x_fp8_moe``).
+_TRTLLM_ROUTED_FP8_ARCHS = (80, 86, 87, 89, 100, 103, 107)
 
 # Prims-TS (CUTLASS primitives + task scheduling) GEMMs are SM100/SM103 only.
 _PRIMS_TS_ARCHS = (100, 103)
 
 # Dense BF16 follows the architecture dispatch already exposed by the flat
-# CUTLASS API.
-_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
+# CUTLASS API; SM80/86/87, which the CUTLASS module has no kernel for, run
+# ``sm8x_fp8_moe``.
+_CUTLASS_BF16_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
@@ -574,32 +577,36 @@ _CUTILE_SUPPORTED_ACTIVATIONS = (
 )
 
 # NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
-# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
-_CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121. SM8x runs
+# ``sm8x_fp8_moe``.
+_CUTLASS_NVFP4_ARCHS = (80, 86, 87, 89, 100, 103, 107, 110, 120, 121)
 
-# Per-tensor FP8 follows the dense CUTLASS architecture list.
-_CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
+# Per-tensor FP8 follows the dense CUTLASS architecture list; SM80/86/87, which
+# the CUTLASS module has no FP8 kernel for, run ``sm8x_fp8_moe``.
+_CUTLASS_FP8_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # DeepSeek-style 128x128 FP8 block scaling is Hopper-only in the flat API.
 _CUTLASS_FP8_BLOCK_ARCHS = (90,)
 
 # MXFP8 activations x MXFP4 weights matches a *wider* flat-API skip than
 # MXFP8 x MXFP8: ``capability[0] not in [10, 11, 12]`` (SM100/103/107, SM110,
-# SM120/121). Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
-_CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# SM120/121). Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``. SM8x runs
+# ``sm8x_fp8_moe``.
+_CUTLASS_MXFP8_MXFP4_ARCHS = (80, 86, 87, 89, 100, 103, 107, 110, 120, 121)
 
 # MXFP8 x MXFP8 follows the narrower flat skip: ``capability[0] not in [10]``
-# (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x.
-_CUTLASS_MXFP8_ARCHS = (100, 103, 107)
+# (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x. SM8x runs
+# ``sm8x_fp8_moe``.
+_CUTLASS_MXFP8_ARCHS = (80, 86, 87, 89, 100, 103, 107)
 
 # INT4 W4A8 and Humming MXFP4 x FP8 are Hopper mixed-input paths.
 _CUTLASS_W4A8_ARCHS = (90,)
 _CUTLASS_HUMMING_ARCHS = (90,)
 
 _CUDNN_GROUPED_GEMM_BF16_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
-_CUDNN_GROUPED_GEMM_FP8_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
-_CUDNN_GROUPED_GEMM_MXFP8_ARCHS = (100, 103, 107, 110, 120, 121)
-_CUDNN_GROUPED_GEMM_FP4_ARCHS = (100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_FP8_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_MXFP8_ARCHS = (80, 86, 87, 89, 100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_FP4_ARCHS = (80, 86, 87, 89, 100, 103, 107, 110, 120, 121)
 
 
 # Default MMA pair shared by the FP4 ``prepare_*`` helpers
@@ -3046,18 +3053,170 @@ class B12xW4A16Config:
         return "B12xW4A16Config()"
 
 
+_RECORDS_NVFP4_ARCHS = (80, 86, 87, 89, 90)
+
+
+@dataclass(frozen=True)
+class RecordsNvfp4Bf16Config:
+    """SM80 to SM90 NVFP4-weight x BF16-activation backend on the records kernels.
+
+    Records hold each expert's E2M1 codes and block scales together in the
+    MMA fragment order of the BF16 ``mma.sync`` kernels
+    (``csrc/w4a16_moe_sm80.cu``) and the activation parameters of
+    :class:`TrtllmFp4Config`'s view; one prepared view serves this backend and
+    :class:`RecordsNvfp4Config` (W4A4). Supports every NVFP4 x BF16 runner's
+    activations (limits in output units), packed or unpacked precomputed
+    routing, expert parallelism, BF16 output and ``do_finalize=True``. Fused
+    shared experts, per-token scales and an explicit 4over6 recipe are not
+    supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _RECORDS_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the records view from checkpoint NVFP4 weights.
+
+        Register it with ``MoEWeightPack.prepare_for("records_nvfp4_bf16", ...)``
+        or ``"records_nvfp4"``. See
+        :func:`flashinfer.fused_moe.prepare.prepare_records_nvfp4_weights`. The
+        view keeps ``hidden_size`` and ``intermediate_size``, which the runners
+        check the inputs against.
+        """
+        from .prepare import _activation_param_view, prepare_records_nvfp4_weights
+
+        activation = activation or SwiGLU()
+        view = prepare_records_nvfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=activation.type,
+            source_format=source_format,
+            device=device,
+        )
+        rows, device = num_local_experts, view["w1"].device
+        sizes = {"hidden_size": hidden_size, "intermediate_size": intermediate_size}
+        sizes["gated"] = activation.is_gated
+        return {**view, **_activation_param_view(activation, rows, device), **sizes}
+
+    def __repr__(self) -> str:
+        return "RecordsNvfp4Bf16Config()"
+
+
+@dataclass(frozen=True)
+class RecordsNvfp4Config(RecordsNvfp4Bf16Config):
+    """SM80 to SM90 NVFP4-weight x NVFP4-activation backend on the records kernels.
+
+    The W4A4 peer of :class:`RecordsNvfp4Bf16Config` over the same view, with
+    :class:`TrtllmFp4Config`'s NVFP4 x NVFP4 support: its routing modes,
+    expert parallelism, fused shared experts, per-token scales (with 4over6)
+    and ``do_finalize=False``, and every NVFP4 x NVFP4 runner's activations
+    (limits in output units, as the BF16 peer's). It takes TRT-LLM's NVFP4 hidden
+    states, or BF16 ones quantized to NVFP4 inside the op; GEMM1 quantizes its
+    output to NVFP4 for GEMM2, with the activation global scales of the
+    optional view keys ``"w1_input_global_scale"`` and
+    ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
+    ``1 / input_scale``; default 1, unread per token). The GEMMs run in BF16 on
+    exactly restored NVFP4 values.
+    """
+
+    def __repr__(self) -> str:
+        return "RecordsNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class RecordsMxfp4Config:
+    """SM80 to SM90 MXFP4-weight backend on the records kernels.
+
+    :class:`TrtllmFp4Config`'s MXFP4 x MXFP8 and MXFP4 x BF16 support, and
+    :class:`CuTileMxfp4Config`'s MXFP4 x MXFP4 (BF16 hidden states, packed
+    precomputed routing, no expert parallelism or fused shared experts,
+    ``do_finalize=True``), with every runner's activations of each pair (limits
+    in output units), on the records of
+    :func:`flashinfer.fused_moe.prepare.prepare_records_mxfp4_weights`.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _RECORDS_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w2_fp4,
+        w2_block_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the records view from checkpoint MXFP4 weights.
+
+        Register it with ``MoEWeightPack.prepare_for("records_mxfp4", ...)``.
+        The view keeps ``hidden_size`` and ``intermediate_size``, which the
+        runner checks the inputs against.
+        """
+        from .prepare import _activation_param_view, prepare_records_mxfp4_weights
+
+        activation = activation or SwiGLU()
+        view = prepare_records_mxfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w2_fp4,
+            w2_block_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=activation.type,
+            device=device,
+        )
+        rows, device = num_local_experts, view["w1"].device
+        sizes = {"hidden_size": hidden_size, "intermediate_size": intermediate_size}
+        sizes["gated"] = activation.is_gated
+        return {**view, **_activation_param_view(activation, rows, device), **sizes}
+
+    def __repr__(self) -> str:
+        return "RecordsMxfp4Config()"
+
+
 @dataclass(frozen=True)
 class CudnnFrostBf16Config:
     """Frost BF16 MoE on SM107 and SM120, with packed precomputed routing.
 
     Register prepared weights under ``cudnn_frost_bf16``. The canonical
     ``cutlass_bf16`` view is also accepted without conversion. Supported model
-    geometries follow the backend's measured BF16 shortlist.
+    geometries follow the backend's measured BF16 shortlist. On SM80/86/87/89
+    the same forward runs on the CUTLASS BF16 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassBf16Config.prepare_weights)
 
@@ -3080,11 +3239,13 @@ class CudnnFrostMxfp8Config:
     Register prepared weights under ``cudnn_frost_mxfp8``. The canonical
     ``cutlass_mxfp8`` view is also accepted without conversion. H/I must be
     multiples of 128. Pass the layer's quant config to prepare_activations.
+    On SM80/86/87/89 the same forward runs on the SM8x pipeline of the CUTLASS
+    MXFP8 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Config.prepare_activations)
@@ -3097,11 +3258,13 @@ class CudnnFrostNvfp4Config:
     Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
     ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
     multiples of 128. Pass the layer's quant config to prepare_activations.
+    On SM80/86/87/89 the same forward runs on the SM8x pipeline of the CUTLASS
+    NVFP4 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)
@@ -3114,12 +3277,14 @@ class CudnnFrostMxfp8Mxfp4Config:
     Requires packed precomputed routing and H/I divisible by 128. Register
     prepared weights under ``cudnn_frost_mxfp8_mxfp4``; the canonical
     ``cutlass_mxfp8_mxfp4`` view is also accepted without conversion.
-    Pass the layer's quant config to prepare_activations.
+    Pass the layer's quant config to prepare_activations. On SM80/86/87/89 the
+    same forward, input scales included, runs on the SM8x pipeline of the
+    CUTLASS MXFP8 × MXFP4 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Mxfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
@@ -3127,9 +3292,10 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM80/SM90/SM100/SM103/SM107/SM120.
+    """Low-token routed MoE on SM8x/SM90/SM100/SM103/SM107/SM120.
 
-    SM80 supports BF16/FP16 inputs and weights.
+    SM8x runs every SM120 format through the scalar FMA kernels; SM80 also
+    tunes Ampere MMA tiles for BF16/FP16.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
     NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
@@ -3214,7 +3380,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (80, 90, 100, 103, 107, 120)
+        return arch in (80, 86, 87, 89, 90, 100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
@@ -3899,6 +4065,9 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    RecordsNvfp4Bf16Config,
+    RecordsNvfp4Config,
+    RecordsMxfp4Config,
     BatchInvariantFp8PerTensorConfig,
     BatchInvariantFp4Config,
 ]
@@ -3948,6 +4117,9 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    RecordsNvfp4Bf16Config,
+    RecordsNvfp4Config,
+    RecordsMxfp4Config,
     BatchInvariantFp8PerTensorConfig,
     BatchInvariantFp4Config,
 )
@@ -4011,6 +4183,10 @@ _DEFAULT_BACKEND = BackendOptions(
         CuTileMxfp8Bf16Config(),
         CuTileMxfp8Config(),
         CuTileNvfp4Bf16Config(),
+        # Last of the backends that run below SM100.
+        RecordsNvfp4Bf16Config(),
+        RecordsNvfp4Config(),
+        RecordsMxfp4Config(),
         CudnnFrostBf16Config(),
         CudnnFrostMxfp8Config(),
         CudnnFrostNvfp4Config(),

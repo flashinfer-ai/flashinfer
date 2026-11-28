@@ -63,9 +63,9 @@ def test_fp8_blockscale_gemm(
     out_dtype,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10, 11, 12]:
+    if compute_capability[0] not in [8, 10, 11, 12]:
         pytest.skip(
-            "gemm_fp8_nt_blockscaled is only supported on SM100/103/107, SM110, and SM120/121 GPUs."
+            "gemm_fp8_nt_blockscaled is only supported on SM8x, SM100/103/107, SM110, and SM120/121 GPUs."
         )
     torch.random.manual_seed(0)
     tile_size = 128
@@ -550,14 +550,14 @@ def test_fp8_groupwise_group_gemm(
         pytest.skip(
             "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
         )
-    if compute_capability[0] not in [10, 12]:
+    if compute_capability[0] not in [8, 10, 12]:
         pytest.skip(
             "group_gemm_fp8_nt_groupwise is only supported on SM100/103/107, and SM120/121 GPUs."
         )
     if backend == "cutile":
         # cuTile group GEMM backend (added in #3426); mirror the capability
         # guards used by test_fp8_groupwise_gemm's cuTile branch.
-        if compute_capability[0] not in [10, 11, 12]:
+        if compute_capability[0] not in [8, 10, 11, 12]:
             pytest.skip(
                 "group_gemm_fp8_nt_groupwise cuTile backend requires SM100+ GPUs."
             )
@@ -645,7 +645,7 @@ def test_fp8_groupwise_group_gemm_cutile_tma_fast_path(
     aligned, satisfying the fast path's caller contract.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10, 11, 12]:
+    if compute_capability[0] not in [8, 10, 11, 12]:
         pytest.skip("group_gemm_fp8_nt_groupwise cuTile backend requires SM100+ GPUs.")
     if group_size > 1 and compute_capability[0] == 12:
         # Public-op validator raises for num_groups > 1 on SM120/121; mirror the
@@ -740,12 +740,12 @@ def test_fp8_groupwise_group_gemm_uneven_segments(
         pytest.skip(
             "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
         )
-    if compute_capability[0] not in [10, 12]:
+    if compute_capability[0] not in [8, 10, 12]:
         pytest.skip(
             "group_gemm_fp8_nt_groupwise is only supported on SM100/103/107, and SM120/121 GPUs."
         )
     if backend == "cutile":
-        if compute_capability[0] not in [10, 11, 12]:
+        if compute_capability[0] not in [8, 10, 11, 12]:
             pytest.skip(
                 "group_gemm_fp8_nt_groupwise cuTile backend requires SM100+ GPUs."
             )
@@ -816,9 +816,9 @@ def test_fp8_groupwise_group_deepgemm(
     out_dtype,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 10:
+    if compute_capability[0] not in [8, 10]:
         pytest.skip(
-            "group_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107 in trtllm backend."
+            "group_deepgemm_fp8_nt_groupwise is only supported on SM8x, SM100, SM103, SM107 in trtllm backend."
         )
     torch.random.manual_seed(0)
     m_per_group = m // group_size
@@ -857,9 +857,13 @@ def _assert_fp8_groupwise_group_cute_dsl(
     group_counts, n, k, use_non_default_stream=False, use_out=False
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in [(10, 0), (10, 3), (10, 7)]:
+    if compute_capability[0] != 8 and compute_capability not in [
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ]:
         pytest.skip(
-            "The contiguous grouped CuTe-DSL kernel requires SM100, SM103 or SM107"
+            "The contiguous grouped CuTe-DSL kernel requires SM8x, SM100, SM103 or SM107"
         )
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
@@ -941,8 +945,13 @@ def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k, use_ou
 
 def _require_grouped_cute_dsl(device="cuda"):
     """Skip unsupported environments before importing the optional kernel."""
-    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3), (10, 7)]:
-        pytest.skip("Requires SM100, SM103 or SM107")
+    compute_capability = get_compute_capability(torch.device(device))
+    if compute_capability[0] != 8 and compute_capability not in [
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ]:
+        pytest.skip("Requires SM8x, SM100, SM103 or SM107")
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
 
@@ -1096,6 +1105,8 @@ def test_grouped_cute_dsl_requires_arch(monkeypatch):
     import flashinfer.gemm.gemm_base as gb
 
     inputs = _grouped_cute_dsl_inputs()
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip("SM8x runs no CuTe-DSL kernel")
     checked = []
 
     def reject(device):
@@ -1137,6 +1148,8 @@ def test_grouped_cute_dsl_graph():
 def test_grouped_cute_dsl_launch_stream(monkeypatch, k):
     """Observe the actual DSL launch stream after warming compilation."""
     inputs = _grouped_cute_dsl_inputs(k=k)
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip("SM8x runs no CuTe-DSL kernel")
     import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
 
     group_gemm_fp8_nt_groupwise_contiguous(*inputs)
@@ -1169,6 +1182,8 @@ def test_grouped_cute_dsl_noncurrent_device(monkeypatch):
     """Compile and launch on the input device, preserving the caller's context."""
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two CUDA devices")
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip("SM8x runs no CuTe-DSL kernel")
     initial = torch.cuda.current_device()
     target = (initial + 1) % torch.cuda.device_count()
     inputs = _grouped_cute_dsl_inputs(m=257, device=f"cuda:{target}")
@@ -1204,6 +1219,8 @@ def test_grouped_cute_dsl_noncurrent_device(monkeypatch):
 def test_grouped_cute_dsl_reuses_m_specializations(monkeypatch, n, k, groups, reverse):
     """Reuse aligned/tail artifacts across growth, shrinkage and singleton M."""
     _require_grouped_cute_dsl()
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip("SM8x runs no CuTe-DSL kernel")
     import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
 
     monkeypatch.setattr(mod, "_COMPILED", {})
@@ -1247,6 +1264,8 @@ def test_grouped_cute_dsl_concurrent_cache_miss(monkeypatch, k):
     import threading
 
     inputs = _grouped_cute_dsl_inputs(k=k)
+    if get_compute_capability(torch.device("cuda"))[0] == 8:
+        pytest.skip("SM8x runs no CuTe-DSL kernel")
     import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
 
     producer = torch.cuda.current_stream()
@@ -1310,9 +1329,9 @@ def test_fp8_groupwise_batch_deepgemm_masked(
     backend,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 10:
+    if compute_capability[0] not in [8, 10]:
         pytest.skip(
-            "batch_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107."
+            "batch_deepgemm_fp8_nt_groupwise is only supported on SM8x, SM100, SM103, SM107."
         )
     cc = compute_capability[0] * 10 + compute_capability[1]
     if not batch_deepgemm_fp8_nt_groupwise.is_backend_supported(backend, cc):

@@ -75,7 +75,9 @@ def test_sm110_keeps_its_own_earlier_refusal(monkeypatch):
         _call(monkeypatch, (11, 0))
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize(
+    "capability", [(10, 0), (10, 3), (8, 0), (8, 6), (8, 7), (8, 9)]
+)
 def test_blackwell_still_reaches_the_kernel(monkeypatch, capability):
     seen = {}
 

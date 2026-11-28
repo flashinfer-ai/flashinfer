@@ -297,13 +297,11 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         backend,
     ):
         """cuTile ragged_block_scaled_bmm must match the native groupwise FP8 GEMM."""
-        if (
-            get_compute_capability(torch.device("cuda:0"))[0] == 8
-            and "float8" in dtype.__repr__()
+        if (  # SM8x runs it on its dense GEMM
+            backend == "cutile"
+            and not is_cuda_tile_available()
+            and get_compute_capability(torch.device("cuda:0"))[0] != 8
         ):
-            pytest.skip("FP8 is not supported on sm80 (Ampere).")
-
-        if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
         cc_major, cc_minor = get_compute_capability(torch.device("cuda:0"))
         cc_num = cc_major * 10 + cc_minor

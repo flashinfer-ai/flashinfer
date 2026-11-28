@@ -24,8 +24,8 @@ Quantization Kernels (EXPERIMENTAL)
 This subpackage hosts the backend kernel implementations behind the public
 quantization APIs:
 
-- CuTe-DSL kernels for MXFP4, MXFP8, and NVFP4 formats. These require SM100+
-  (Blackwell) GPUs and the ``nvidia-cutlass-dsl`` package.
+- CuTe-DSL kernels for MXFP4, MXFP8, and NVFP4 formats. These require SM80+
+  GPUs and the ``nvidia-cutlass-dsl`` package.
 - A cuTile kernel for grouped MXFP8 quantization in the ``cutile`` subpackage
   (``cutile/mxfp8_grouped_quantize_cutile.py``). This requires SM100+ and the
   ``cuda.tile`` package and does not depend on ``nvidia-cutlass-dsl``.

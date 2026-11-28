@@ -39,6 +39,13 @@ _Bf16Fp4Backend = Literal[
     "blackwell-tiled",
 ]
 _SourceBuiltBf16Fp4Backend = Literal["blackwell-native", "blackwell-tiled"]
+_BF16_FP4_BACKENDS = (
+    "cudnn",
+    "cute-dsl",
+    "cute-dsl-native",
+    "blackwell-native",
+    "blackwell-tiled",
+)
 
 
 def _check_mm_bf16_fp4_problem_size(
@@ -70,7 +77,7 @@ def _check_mm_bf16_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cudnn_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -109,7 +116,7 @@ def _cute_dsl_uses_sm100_layout(major: int, minor: int) -> bool:
     return (major, minor) in ((10, 0), (10, 3), (10, 7))
 
 
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 100, 103, 107, 110, 120, 121])
 def _cute_dsl_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -124,12 +131,16 @@ def _cute_dsl_bf16_fp4_requirement(
 ):
     major, minor = get_compute_capability(a.device)
     cc = major * 10 + minor
-    expected_dtype = (
-        torch.uint8 if _cute_dsl_uses_sm100_layout(major, minor) else torch.int32
-    )
-    if b.dtype != expected_dtype:
+    expected_dtypes: Tuple[torch.dtype, ...]
+    if major == 8:  # SM8x runs its records or either SM100+ layout
+        expected_dtypes = (torch.uint8, torch.int32)
+    elif _cute_dsl_uses_sm100_layout(major, minor):
+        expected_dtypes = (torch.uint8,)
+    else:
+        expected_dtypes = (torch.int32,)
+    if b.dtype not in expected_dtypes:
         raise ValueError(
-            f"cute-dsl bf16 x fp4 on SM{cc} expects the {expected_dtype} weight "
+            f"cute-dsl bf16 x fp4 on SM{cc} expects the {expected_dtypes[0]} weight "
             "returned by prepare_bf16_fp4_weights(..., backend='cute-dsl'); "
             f"got {b.dtype}."
         )
@@ -137,7 +148,7 @@ def _cute_dsl_bf16_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 100, 103])
 def _blackwell_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -153,10 +164,11 @@ def _blackwell_bf16_fp4_requirement(
     """Source-built Blackwell backends: the checks the compute path runs itself."""
     del enable_pdl
     from .gemm_bf16_fp4_blackwell import _validate_blackwell_bf16_fp4
+    from .sm8x_fp4_dense import check_sm8x_blackwell_records
 
-    _validate_blackwell_bf16_fp4(
-        a, b, b_descale, alpha, out_dtype or a.dtype, out, block_size, backend
-    )
+    args = (a, b, b_descale, alpha, out_dtype or a.dtype, out, block_size, backend)
+    if not check_sm8x_blackwell_records(*args):
+        _validate_blackwell_bf16_fp4(*args)
     return True
 
 
@@ -201,6 +213,10 @@ def prepare_bf16_fp4_weights(
             ``"cute-dsl"``, ``"blackwell-native"``, or
             ``"blackwell-tiled"``. The ``"cute-dsl-native"``
             backend returns the original canonical buffers without preparation.
+            On SM8x every backend returns the W4A16 records: ``b`` uint8
+            ``(N, ceil(size / N))`` with the records in its first ``size``
+            bytes, ``b_descale`` an empty ``float8_e4m3fn`` tensor and
+            ``alpha`` unchanged.
         block_size: SF block size.  Always 16 for FP4.
 
     Returns:
@@ -234,6 +250,14 @@ def prepare_bf16_fp4_weights(
             raise ValueError(f"alpha must be shape (1,); got {tuple(alpha.shape)}")
         if alpha.dtype != torch.float32:
             raise TypeError(f"alpha must be float32; got {alpha.dtype}")
+    if (
+        backend in _BF16_FP4_BACKENDS
+        and b.is_cuda
+        and get_compute_capability(b.device)[0] == 8
+    ):
+        from .sm8x_fp4_dense import sm8x_prepare_bf16_fp4
+
+        return sm8x_prepare_bf16_fp4(b, b_descale, alpha, block_size, backend)
     if backend == "cute-dsl-native":
         from .kernels.native_bf16_fp4.support import check_weights
 
@@ -326,6 +350,12 @@ def mm_bf16_fp4(
         ``(M, N)`` tensor of ``out_dtype``.
     """
     out_dtype = out_dtype or a.dtype
+    if get_compute_capability(a.device)[0] == 8:
+        from .sm8x_fp4_dense import sm8x_mm_bf16_fp4
+
+        return sm8x_mm_bf16_fp4(
+            a, b, b_descale, alpha, backend=backend, out_dtype=out_dtype, out=out
+        )
     if backend == "cute-dsl-native":
         from .kernels.native_bf16_fp4.runner import run
 

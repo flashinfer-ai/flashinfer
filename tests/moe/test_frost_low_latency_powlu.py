@@ -95,7 +95,8 @@ def test_powlu_epilogue_boundaries(activation, vector):
         parameters,
         vector,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
+        options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} "
+        "--enable-tvm-ffi",
     )
     compiled(up, gate, output)
     torch.testing.assert_close(

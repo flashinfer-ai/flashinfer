@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.quantization.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
-from tests.trace.reference_utils import _skip_if_not_sm100
+from tests.trace.reference_utils import _skip_if_not_sm80
 
 
 @pytest.mark.parametrize(
@@ -14,9 +14,7 @@ def test_mxfp4_quantize_reference_correctness(shape_kwargs):
     """Check MXFP4 payload, logical scale bytes, and decoding exactly."""
     import flashinfer
 
-    # fp4_quantize compiles on SM90+ but only produces correct output on
-    # SM100+ — on Hopper the kernel silently returns near-zero garbage.
-    _skip_if_not_sm100()
+    _skip_if_not_sm80()
     from flashinfer.trace.templates.quantize import mxfp4_quantize_trace
 
     inputs = mxfp4_quantize_trace.init(**shape_kwargs)

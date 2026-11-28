@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _check,
-    _skip_if_not_sm100,
+    _skip_if_not_sm80,
 )
 
 
@@ -16,8 +16,7 @@ def test_nvfp4_quantize_reference_correctness(shape_kwargs):
     """nvfp4_quantize kernel vs reference, dequantized round-trip."""
     import flashinfer
 
-    # Same SM100+ requirement as mxfp4_quantize above.
-    _skip_if_not_sm100()
+    _skip_if_not_sm80()
     from flashinfer.trace.templates.quantize import nvfp4_quantize_trace
 
     inputs = nvfp4_quantize_trace.init(**shape_kwargs)

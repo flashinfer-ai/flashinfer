@@ -50,7 +50,7 @@ from ..trace.templates.moe import (
     sm90_mixed_gemm_scale_interleave_trace,
     sm90_mixed_gemm_weight_interleave_trace,
 )
-from ..utils import get_compute_capability, round_up
+from ..utils import check_shape_dtype_device, get_compute_capability, round_up
 
 if TYPE_CHECKING:
     from .api import QuantConfig
@@ -2267,6 +2267,296 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
         "fc2_expert_scales": w2_scale.contiguous(),
         "fc1_input_scale": fake_input_scale,
         "fc2_input_scale": fake_input_scale.clone(),
+    }
+
+
+# Below SM100 W4A16 MoE runs on records (csrc/w4a16_moe_sm80.cu), kept in views. A record covers one
+# expert, 128 output columns and 128 K: 8192 B of E2M1 codes in MMA fragment order, then 1024 B of
+# U5 block scale bytes; a K tail of at most 64 takes a 5120 B record.
+# (m0, e0, e1, sign) bit positions per output register in a 16-bit half (hi half = +16).
+_W4A16_CODE_BITS = ((0, 1, 2, 9), (3, 4, 5, 12), (6, 7, 8, 15), (13, 10, 11, 14))
+
+# Below SM100 the records' (csrc/w4a16_moe_sm80.cu) tactics: row tile, GEMM1 and GEMM2 variant.
+# Variants: 0 the row tile's own; at row tile 64, 1 GEMM1 at 2 stages (GEMM2 as 0), 2 GEMM2 at 2
+# stages, 3 GEMM1 and 4 GEMM2 over two 128-column records per CTA, 5 GEMM2 as 4 with vector scale
+# loads; at row tile 96, 6 and 7 the 2-stage paths, 7 with 12 row parts. Untuned: row tile 64.
+W4A16_SM80_TACTICS = (
+    (8, 0, 0), (16, 0, 0), (32, 0, 0), (64, 0, 0), (96, 0, 0), (64, 1, 1), (64, 1, 2),
+    (64, 3, 2), (64, 3, 4), (64, 1, 4), (64, 3, 5), (64, 1, 5), (96, 6, 6), (96, 7, 7),
+)  # fmt: skip
+
+
+def _w4a16_records_geometry(n: int, k: int, gated: bool) -> Tuple[int, int, bool, int]:
+    """Record columns, K steps of 128, whether the last is a 5120 B record, an expert's bytes."""
+    cols = 2 * round_up(n // 2, 64) if gated else round_up(n, 128)
+    steps = (k + 127) // 128
+    half = k % 128 != 0 and k - 128 * (steps - 1) <= 64
+    size = cols // 128 * ((steps - 1) * 9216 + (5120 if half else 9216))
+    return cols, steps, half, size
+
+
+def _w4a16_records(
+    w: torch.Tensor, scale: torch.Tensor, gated: bool, u5: bool = False
+) -> torch.Tensor:
+    """Packed NVFP4 [E, N, K / 2] (low nibble = even K; gated: up rows, then gate rows) and its
+    linear E4M3 block scales [E, N, K / 16] (or with ``u5`` their U5 bytes, 0 a zero block) as
+    records [E, columns / 128 x K steps x record],
+    experts chunked to ~1 GiB of int32 buffers. Codes [half 2][warp 8][lane 32][4 words], 3 + 1
+    bits each; scales [warp 8][g 8][16 B] U5 bytes, byte 4 j2 + 2 hi + jl. Padding is zero codes."""
+    w = w.view(torch.uint8)
+    num_experts, n, half_k = w.shape
+    k, dev = 2 * half_k, w.device
+    sf, rows_from = scale.view(torch.uint8), None
+    if gated:  # to 64 up rows, then 64 gate rows, alternating
+        rows_from = (
+            torch.arange(n, device=dev).view(2, -1, 64).transpose(0, 1).flatten()
+        )
+    cols, steps, half, size = _w4a16_records_geometry(n, k, gated)
+    chunks, kf = cols // 128, 128 * steps
+    # Up to two int32 copies of an expert's padded codes live at once: cp and x.
+    chunk = max(1, (1 << 30) // (2 * 4 * cols * kf))
+    r = torch.arange(n, device=dev)
+    # Record column of each weight row (gated: stored rows alternate 64 up and 64 gate rows, and
+    # each warp's 16 record columns take 8 gate rows, then the matching 8 up rows).
+    col = r.view(-1, 8, 2, 8).flip(2).transpose(1, 2).flatten() if gated else r
+    # U5 byte of each E4M3 magnitude byte s (0..127): f(5) m(3), f = floor(log2 s) + 22. 0 -> 0 (the
+    # block's codes are zeroed), 0x7F (NaN) -> 0xFF (BF16 NaN). The kernels decode U5 u as the BF16
+    # bits 0x7000 | u << 4, s x 2^119. Built on the device, so CUDA graphs can capture it.
+    b = torch.arange(128, dtype=torch.uint8, device=dev)
+    # s = mant x 2^exp, mant >= 0.5
+    mant, exp = torch.frexp(b.view(torch.float8_e4m3fn).float())
+    enc = (exp + 21) << 3 | ((mant * 2 - 1) * 8).int()
+    u5_table = torch.where(b == 0, 0, torch.where(b == 127, 0xFF, enc))
+    out = torch.empty(num_experts, size, dtype=torch.uint8, device=dev)
+    for e0 in range(0, num_experts, chunk):
+        q, sb = w[e0 : e0 + chunk, :, : k // 2], sf[e0 : e0 + chunk, :, : k // 16]
+        if rows_from is not None:
+            q, sb = q[:, rows_from], sb[:, rows_from]
+        sb = sb.to(torch.int32)
+        m = q.shape[0]
+        codes = torch.stack((q & 0xF, q >> 4), dim=-1).view(m, n, k).to(torch.int32)
+        mag = sb if u5 else sb & 0x7F
+        # The scale's sign moves into the codes; a zero scale zeroes the magnitudes, keeping signs.
+        if not u5:
+            codes = codes ^ ((sb >> 7) << 3).repeat_interleave(16, dim=-1)
+        codes = torch.where((mag == 0).repeat_interleave(16, dim=-1), codes & 8, codes)
+        cp = torch.zeros(m, cols, kf, dtype=torch.int32, device=dev)
+        cp[:, col, :k] = codes
+        mp = torch.zeros(m, cols, kf // 16, dtype=torch.int32, device=dev)
+        mp[:, col, : k // 16] = mag
+        del codes, sb, mag
+        # (m, C, S, Jhi, W, g, t, Jlo, kh, hi, kl); i = 4 kh + 2 hi + kl -> reg i >> 1, half i & 1
+        x = cp.view(m, chunks, 8, 2, 8, steps, 2, 4, 2, 4, 2)
+        x = x.permute(0, 1, 5, 6, 2, 4, 9, 7, 8, 3, 10).contiguous()
+        x = x.view(m, chunks, steps, 2048, 8)
+        word = torch.zeros(m, chunks, steps, 2048, dtype=torch.int32, device=dev)
+        for i in range(8):
+            v, sh = x[..., i], 16 * (i & 1)
+            for bit, pos in enumerate(_W4A16_CODE_BITS[i >> 1]):
+                word |= ((v >> bit) & 1) << (pos + sh)
+        del x, cp
+        # (m, C, W, hi, g, S, Jhi, Jlo) -> (m, C, S, W, g, Jhi, hi, Jlo)
+        ub = (mp if u5 else u5_table[mp]).view(m, chunks, 8, 2, 8, steps, 4, 2)
+        sbytes = ub.permute(0, 1, 5, 2, 4, 6, 3, 7).contiguous().to(torch.uint8)
+        rec = torch.cat([word.view(torch.uint8), sbytes.flatten(3)], dim=-1)
+        if half:
+            tail = torch.cat([rec[:, :, -1, :4096], rec[:, :, -1, 8192:]], dim=-1)
+            rec = torch.cat([rec[:, :, :-1].reshape(m, chunks, -1), tail], dim=-1)
+        out[e0 : e0 + m] = rec.reshape(m, -1)
+        del mp, word, ub, sbytes, rec
+    return out
+
+
+@flashinfer_api
+def prepare_records_nvfp4_weights(
+    w1_fp4: torch.Tensor,
+    w1_block_scale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_block_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    source_format: str = "modelopt",
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the records view of the SM80 to SM90 NVFP4 runners from checkpoint NVFP4 weights.
+
+    Takes packed E2M1 ``w1_fp4 [E, rows, H / 2]`` (``rows`` ``2 * I`` in ``[up, gate]`` order
+    for a gated activation, else ``I``) and ``w2_fp4 [E, H, I / 2]``, their linear E4M3 block
+    scales (16-element K groups) and per-expert FP32 global scales. ``w1``/``w2`` of the view
+    are uint8 records (codes and block scales together, see ``csrc/w4a16_moe_sm80.cu``), so the
+    checkpoint tensors can be freed once it is built.
+
+    Parameters
+    ----------
+    w1_fp4, w2_fp4 : torch.Tensor
+        Packed E2M1 FC1 and FC2 weights, uint8.
+    w1_block_scale, w2_block_scale : torch.Tensor
+        Their linear float8_e4m3fn block scales.
+    w1_global_scale, w2_global_scale : torch.Tensor
+        Per-expert FP32 global scales ``[E]``.
+    num_local_experts, hidden_size, intermediate_size : int
+        ``E``, ``H`` and ``I``.
+    activation_type : ActivationType
+        A gated activation (``[up, gate]`` FC1 rows) or a plain one.
+    source_format : str
+        ``"modelopt"``, or ``"compressed_tensors"``, whose global scales are inverted.
+    device : Optional[torch.device]
+        Device of the records, by default that of ``w1_fp4``.
+
+    Returns
+    -------
+    Dict[str, torch.Tensor]
+        ``w1`` and ``w2`` records with ``w1_global_scale`` and ``w2_global_scale``.
+    """
+    activation_type = ActivationType(activation_type)
+    gated = activation_type.is_gated
+    if activation_type == ActivationType.InvalidType:
+        raise ValueError(f"unsupported records NVFP4 activation {activation_type!r}.")
+    if hidden_size % 16 or intermediate_size % (64 if gated else 16):
+        raise ValueError(
+            "records NVFP4 requires hidden_size % 16 == 0 and intermediate_size % 64 == 0 "
+            "(16 not gated)."
+        )
+    experts, rows = num_local_experts, intermediate_size * (2 if gated else 1)
+    for name, t, dtype, shape in (
+        ("w1_fp4", w1_fp4, torch.uint8, (experts, rows, hidden_size // 2)),
+        ("w1_block_scale", w1_block_scale, torch.float8_e4m3fn, (experts, rows, hidden_size // 16)),
+        ("w1_global_scale", w1_global_scale, torch.float32, (experts,)),
+        ("w2_fp4", w2_fp4, torch.uint8, (experts, hidden_size, intermediate_size // 2)),
+        ("w2_block_scale", w2_block_scale, torch.float8_e4m3fn, (experts, hidden_size, intermediate_size // 16)),
+        ("w2_global_scale", w2_global_scale, torch.float32, (experts,)),
+    ):  # fmt: skip
+        check_shape_dtype_device(t, shape, dtype, None, name)
+    source = source_format.lower().replace("-", "_")
+    if source not in ("modelopt", "modelopt_nvfp4", "compressed_tensors"):
+        raise ValueError(
+            f"source_format must be 'modelopt' or 'compressed_tensors', got {source_format!r}."
+        )
+    if source == "compressed_tensors":
+        w1_global_scale, w2_global_scale = 1.0 / w1_global_scale, 1.0 / w2_global_scale
+    device = torch.device(device if device is not None else w1_fp4.device)
+    return {
+        "w1": _w4a16_records(w1_fp4.to(device), w1_block_scale.to(device), gated),
+        "w1_global_scale": w1_global_scale.to(device).contiguous(),
+        "w2": _w4a16_records(w2_fp4.to(device), w2_block_scale.to(device), False),
+        "w2_global_scale": w2_global_scale.to(device).contiguous(),
+    }
+
+
+def _mxfp4_records_u5(
+    w: torch.Tensor, scale: torch.Tensor, halves: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """U5 bytes [E, N, K / 16] of MXFP4 ``w`` [E, N, K / 2] under E8M0 ``scale`` [E, N, K / 32],
+    and the FP32 alphas [E, halves] that restore them: in each expert's row half (``halves``
+    of N) a block of byte b holds 2^(b - 127) as U5 f = b - base (mantissa 0), base = 30 below
+    its largest nonzero block, and 2^(base - 105) moves to the alpha."""
+    b = scale.view(torch.uint8).to(torch.int32)
+    e, n, kb = b.shape
+    nonzero = (w.view(torch.uint8) & 0x77).view(e, n, kb, 16).amax(-1).bool()
+    if (b == 255).any():
+        raise ValueError("records MXFP4: E8M0 byte 255 (NaN) in the weight scales.")
+    grouped = b.reshape(e, halves, -1)  # a strided (e.g. transposed) scale copies here
+    nz = nonzero.view(e, halves, -1)
+    top = torch.where(nz, grouped, -1).amax(-1)
+    low = torch.where(nz, grouped, 255).amin(-1)
+    base = torch.where(top >= 0, top - 30, 105)
+    if (low - base < 1).any():  # f from 1 (0 is a zero block) to 30
+        bad = torch.nonzero(low - base < 1)[0].tolist()
+        raise ValueError(
+            f"records MXFP4: expert {bad[0]} spans more than 30 binades of nonzero block "
+            "scales; records hold 30 per expert (and gated half)."
+        )
+    f = grouped - base.unsqueeze(-1)
+    u5 = torch.where(nz, f << 3, 0).view(e, n, kb).repeat_interleave(2, dim=-1)
+    return u5.to(torch.uint8), torch.exp2((base - 105).float())
+
+
+@flashinfer_api
+def prepare_records_mxfp4_weights(
+    w1_fp4: torch.Tensor,
+    w1_block_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_block_scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the records view of the SM80 to SM90 MXFP4 runners from checkpoint MXFP4 weights.
+
+    Takes packed E2M1 ``w1_fp4 [E, rows, H / 2]`` (``rows`` ``2 * I`` in ``[up, gate]`` order
+    for a gated activation, else ``I``) and ``w2_fp4 [E, H, I / 2]`` with their linear E8M0 block
+    scales (uint8, 32-element K groups). The records hold 30 binades of block scales per expert,
+    the expert's power of two going to the FP32 ``w1_global_scale`` ([E], or [E, 2] up then gate
+    when a gated expert's halves need their own) and ``w2_global_scale`` [E] that scale the GEMMs
+    as NVFP4's global scales do. All-zero blocks hold no scale; an expert whose other blocks span
+    more than 30 binades raises. BF16 activations restore all 30 binades exactly; FP16 ones
+    restore the top 24 exactly and round blocks further below to FP16 subnormals.
+
+    Parameters
+    ----------
+    w1_fp4, w2_fp4 : torch.Tensor
+        Packed E2M1 FC1 and FC2 weights, uint8.
+    w1_block_scale, w2_block_scale : torch.Tensor
+        Their linear E8M0 block scales, uint8.
+    num_local_experts, hidden_size, intermediate_size : int
+        ``E``, ``H`` and ``I``.
+    activation_type : ActivationType
+        A gated activation (``[up, gate]`` FC1 rows) or a plain one.
+    device : Optional[torch.device]
+        Device of the records, by default that of ``w1_fp4``.
+
+    Returns
+    -------
+    Dict[str, torch.Tensor]
+        ``w1`` and ``w2`` records with ``w1_global_scale`` and ``w2_global_scale``.
+    """
+    activation_type = ActivationType(activation_type)
+    gated = activation_type.is_gated
+    if activation_type == ActivationType.InvalidType:
+        raise ValueError(f"unsupported records MXFP4 activation {activation_type!r}.")
+    if hidden_size % 32 or intermediate_size % (64 if gated else 32):
+        raise ValueError(
+            "records MXFP4 requires hidden_size % 32 == 0 and intermediate_size % 64 == 0 "
+            "(32 not gated)."
+        )
+    experts, rows = num_local_experts, intermediate_size * (2 if gated else 1)
+    for name, t, shape in (
+        ("w1_fp4", w1_fp4, (experts, rows, hidden_size // 2)),
+        ("w1_block_scale", w1_block_scale, (experts, rows, hidden_size // 32)),
+        ("w2_fp4", w2_fp4, (experts, hidden_size, intermediate_size // 2)),
+        ("w2_block_scale", w2_block_scale, (experts, hidden_size, intermediate_size // 32)),
+    ):  # fmt: skip
+        if t.element_size() != 1 or t.dtype == torch.bool or tuple(t.shape) != shape:
+            raise ValueError(  # their bytes, as uint8 or a byte type
+                f"{name} must be uint8 {shape}, got {t.dtype} {tuple(t.shape)}."
+            )
+    device = torch.device(device if device is not None else w1_fp4.device)
+    w1, s1, w2, s2 = (
+        t.to(device) for t in (w1_fp4, w1_block_scale, w2_fp4, w2_block_scale)
+    )
+    try:  # one shift per expert, else per gated half
+        u1, a1 = _mxfp4_records_u5(w1, s1, 1)
+    except ValueError:
+        if not gated:
+            raise
+        u1, a1 = _mxfp4_records_u5(w1, s1, 2)
+        # An all-zero half's records are zeros under any alpha: it takes the other's
+        nz = (w1.view(torch.uint8) & 0x77).view(experts, 2, -1).amax(-1).bool()
+        a1 = torch.where(nz, a1, a1.flip(-1))
+    u2, a2 = _mxfp4_records_u5(w2, s2, 1)
+    return {
+        "w1": _w4a16_records(w1, u1, gated, u5=True),
+        "w1_global_scale": a1.view(experts, -1).squeeze(-1).contiguous(),
+        "w2": _w4a16_records(w2, u2, False, u5=True),
+        "w2_global_scale": a2.view(experts).contiguous(),
     }
 
 

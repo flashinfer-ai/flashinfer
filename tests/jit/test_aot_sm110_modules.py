@@ -73,6 +73,16 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
                 monkeypatch.setattr(
                     module, attr, lambda *args, _result=result, **kwargs: _result
                 )
+    # SM80 and SM90 build their own MXFP8 quantization modules with the SM100
+    # generator; only its default argument builds the SM100 module.
+    monkeypatch.setattr(
+        aot,
+        "gen_mxfp8_quantization_sm100_module",
+        lambda device_arch="100": SimpleNamespace(
+            name="gen_mxfp8_quantization_sm100_module"
+            + ("" if device_arch == "100" else f"_sm{device_arch}")
+        ),
+    )
     for attr, stub in (overrides or {}).items():
         monkeypatch.setattr(aot, attr, stub)
     monkeypatch.setattr(aot, "_gen_blackwell_bf16_bmm_aot_specs", lambda caps: [])

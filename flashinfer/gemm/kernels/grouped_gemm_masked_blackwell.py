@@ -3543,6 +3543,11 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     enable_alpha_up: bool = False,
     enable_a_per_token_scale: bool = False,
 ) -> Callable:
+    if sm_version in ("sm_80", "sm_86", "sm_87", "sm_89"):
+        problem = dict(locals())
+        from ..sm8x_grouped_gemm_masked import sm8x_masked_gemm_api
+
+        return sm8x_masked_gemm_api(**problem)
     quantize_output = c_dtype == cutlass.Float4E2M1FN
 
     def get_cute_pointers(

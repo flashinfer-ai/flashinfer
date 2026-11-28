@@ -27,13 +27,9 @@ wraps negative there and faults with cudaErrorIllegalAddress.
 
 import pytest
 import torch
+from tests.utils.test_fp4_quantize import _is_fp4_supported
 
 from flashinfer.cute_dsl import is_cute_dsl_available
-from flashinfer.utils import (
-    is_sm100a_supported,
-    is_sm110a_supported,
-    is_sm12x_supported,
-)
 
 K = 2688
 # First row whose element offset row * K exceeds 2**31 - 1 is
@@ -54,21 +50,16 @@ def _enough_gpu_memory() -> bool:
 
 
 def _is_nvfp4_supported() -> bool:
-    """The per-token NVFP4 CuTe-DSL quantizer targets Blackwell (SM100+); skip on
-    older architectures (e.g. SM90/Hopper) where the kernel is unsupported."""
+    """The per-token NVFP4 CuTe-DSL quantizer needs SM80+ and CUDA >= 12.8."""
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
-    return (
-        is_sm100a_supported(device)
-        or is_sm110a_supported(device)
-        or is_sm12x_supported(device)
-    )
+    return _is_fp4_supported(device)
 
 
 @pytest.mark.skipif(
     not _is_nvfp4_supported(),
-    reason="per-token NVFP4 CuTe-DSL quantizer requires SM100+ (Blackwell) and CUDA >= 12.8",
+    reason="per-token NVFP4 CuTe-DSL quantizer requires SM80+ and CUDA >= 12.8",
 )
 @pytest.mark.skipif(not is_cute_dsl_available(), reason="CuteDSL not available")
 @pytest.mark.skipif(

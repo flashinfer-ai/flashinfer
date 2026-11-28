@@ -108,8 +108,8 @@ def _unswizzle_mxfp8_scales_128x4(
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backend):
-    if device == "cuda" and not _is_mxfp8_supported(torch.device(device)):
-        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if device == "cuda" and get_compute_capability(torch.device(device))[0] < 8:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 8")
 
     # Skip cute-dsl backend for CPU or if not available
     if backend == "cute-dsl":

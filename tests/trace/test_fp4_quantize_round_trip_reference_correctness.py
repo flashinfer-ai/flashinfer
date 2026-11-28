@@ -6,13 +6,13 @@ import pytest
 from tests.trace.reference_utils import (
     _assert_finite,
     _check,
-    _skip_if_not_sm100,
+    _skip_if_not_sm80,
 )
 
 
 @pytest.mark.parametrize("shape_kwargs", [dict(M=64, K=256), dict(M=17, K=128)])
 def test_fp4_quantize_round_trip_reference_correctness(shape_kwargs):
-    _skip_if_not_sm100()
+    _skip_if_not_sm80()
     from flashinfer.trace.templates.quantize import fp4_quantize_trace
     from flashinfer.trace.templates.moe import _unpack_fp4_e2m1
 

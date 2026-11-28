@@ -7,13 +7,9 @@ os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
 import pytest
 import torch
 from tests.quantization.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
+from tests.utils.test_fp4_quantize import _is_fp4_supported
 
 from flashinfer import fp4_quantize
-from flashinfer.utils import (
-    is_sm100a_supported,
-    is_sm110a_supported,
-    is_sm12x_supported,
-)
 
 DTYPES = [torch.float16, torch.bfloat16]
 UNALIGNED_M_SHAPES = [
@@ -30,14 +26,6 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 BLOCK_SIZE = 16
-
-
-def _is_fp4_supported(device: torch.device) -> bool:
-    return (
-        is_sm100a_supported(device)
-        or is_sm110a_supported(device)
-        or is_sm12x_supported(device)
-    )
 
 
 def _is_cute_dsl_available() -> bool:
@@ -73,7 +61,7 @@ def test_fp4_quantize_unaligned_m_non_swizzled(
 ) -> None:
     """Regression test: fp4_quantize with M not a multiple of 16 for linear SF."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0")

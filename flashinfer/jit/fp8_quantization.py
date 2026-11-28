@@ -15,12 +15,13 @@ limitations under the License.
 """
 
 from .core import JitSpec, gen_jit_spec, current_compilation_context
+from .fp4_quantization import sw_cvt_nvcc_flags
 from . import env as jit_env
 
 
-def gen_mxfp8_quantization_sm100_module() -> JitSpec:
+def gen_mxfp8_quantization_sm100_module(device_arch: str = "100") -> JitSpec:
     return gen_jit_spec(
-        "mxfp8_quantization_sm100",
+        f"mxfp8_quantization_sm{device_arch}",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp8Quantize.cpp",
@@ -30,8 +31,12 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
-            supported_major_versions=None, map_sm107_to_100f=True
+        extra_cuda_cflags=(
+            current_compilation_context.get_nvcc_flags_list(
+                supported_major_versions=None, map_sm107_to_100f=True
+            )
+            if device_arch == "100"
+            else sw_cvt_nvcc_flags(device_arch)
         )
         + [
             "-DENABLE_BF16",

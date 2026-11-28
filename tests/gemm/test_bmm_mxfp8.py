@@ -39,8 +39,8 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
     input_dtype = torch.bfloat16
     res_dtype = torch.bfloat16
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if backend == "cudnn" and compute_capability[0] != 10:
-        pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
+    if backend == "cudnn" and compute_capability[0] not in (8, 10):
+        pytest.skip("bmm_mxfp8 cudnn backend requires SM8x or SM10x.")
     if backend == "cutlass" and compute_capability[0] != 12:
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
     if backend == "cute-dsl" and tuple(compute_capability) != (10, 7):
@@ -165,8 +165,8 @@ def test_bmm_mxfp8_cudnn_scale_length_check_has_aligned_size_blind_spot():
 
 @pytest.mark.parametrize("m", [130, 200, 257, 384, 1000])
 def test_bmm_mxfp8_cudnn_dynamic_m(m: int):
-    if get_compute_capability(torch.device("cuda"))[0] != 10:
-        pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
+    if get_compute_capability(torch.device("cuda"))[0] not in (8, 10):
+        pytest.skip("bmm_mxfp8 cudnn backend requires SM8x or SM10x.")
     override_shape_available = (
         gemm_base._is_cudnn_override_shape_available()  # pyright: ignore[reportPrivateUsage]
     )

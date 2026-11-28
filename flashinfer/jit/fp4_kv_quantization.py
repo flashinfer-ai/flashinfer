@@ -20,7 +20,7 @@ from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 def gen_fp4_kv_quantization_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[8, 9, 10, 11, 12]
     )
     return gen_jit_spec(
         "fp4_kv_quant",

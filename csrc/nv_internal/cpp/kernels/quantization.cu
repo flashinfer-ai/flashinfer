@@ -477,6 +477,7 @@ struct Nvfp4QuantAndPerTokenScaleLauncher {
   dim3 grid;
   cudaStream_t stream;
   bool enable_pdl;
+  float const* globalScaleInvPtr;
 
   template <typename DisableFP4QuantFastMathTag, typename NVFP4ConfigTag>
   void operator()(DisableFP4QuantFastMathTag, NVFP4ConfigTag) const {
@@ -493,7 +494,11 @@ struct Nvfp4QuantAndPerTokenScaleLauncher {
           nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, SF_LAYOUT, /*CACHE_INPUT*/ false,
                                            DisableFP4QuantFastMathTag::value, NVFP4ConfigTag>,
           grid, block, smem_size, stream, m, n, input, globalScaleInv, expandedIdxToPermutedIdx,
+#if defined(FLASHINFER_FP4_SW_CVT)
+          weightOutput, scaleOutput, perTokenScaleOutput, globalScaleInvPtr);
+#else
           weightOutput, scaleOutput, perTokenScaleOutput);
+#endif
     }
   }
 };
@@ -505,7 +510,8 @@ void dispatchNvfp4QuantAndPerTokenScale(bool use4Over6, bool disableFP4QuantFast
                                         float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
                                         uint8_t* weightOutput, uint8_t* scaleOutput,
                                         float* perTokenScaleOutput, uint32_t smem_size, dim3 block,
-                                        dim3 grid, cudaStream_t stream, bool enable_pdl) {
+                                        dim3 grid, cudaStream_t stream, bool enable_pdl,
+                                        float const* globalScaleInvPtr) {
   Nvfp4QuantAndPerTokenScaleLauncher<T, SF_LAYOUT> launcher{m,
                                                             n,
                                                             input,
@@ -518,7 +524,8 @@ void dispatchNvfp4QuantAndPerTokenScale(bool use4Over6, bool disableFP4QuantFast
                                                             block,
                                                             grid,
                                                             stream,
-                                                            enable_pdl};
+                                                            enable_pdl,
+                                                            globalScaleInvPtr};
   dispatchConfiguredNVFP44Over6(use4Over6, disableFP4QuantFastMath, errMode, errUseFastMath,
                                 e4m3Max, launcher);
 }
@@ -528,9 +535,15 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput,
                                       uint8_t* scaleOutput, float* perTokenScaleOutput,
                                       QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-                                      cudaStream_t stream, bool enable_pdl) {
+                                      cudaStream_t stream, bool enable_pdl,
+                                      float const* globalScaleInvPtr) {
   // Kernel packs 16 values per thread via PackedVec load/store.
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+#if defined(FLASHINFER_FP4_SW_CVT)
+  TLLM_CHECK(!(globalScaleInvPtr && std::is_same_v<T, float>));  // Only fp16/bf16 kernels read it.
+#else
+  TLLM_CHECK(!globalScaleInvPtr);
+#endif
   // currently, nvfp4 per-token quantization kernel is only used on sm100f so always load 256bit.
   constexpr uint32_t ELTS_PER_THREAD = std::is_same_v<T, float> ? 8 : 16;
   constexpr uint32_t BLOCK_SIZE = 128;
@@ -551,7 +564,8 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   dispatchNvfp4QuantAndPerTokenScale<T, SF_LAYOUT>(                                        \
       recipe.use4Over6, disableFP4QuantFastMath, recipe.errMode, recipe.errUseFastMath,    \
       recipe.e4m3Max, m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, \
-      scaleOutput, perTokenScaleOutput, smem_size, block, grid, stream, enable_pdl)
+      scaleOutput, perTokenScaleOutput, smem_size, block, grid, stream, enable_pdl,        \
+      globalScaleInvPtr)
 
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
@@ -577,18 +591,18 @@ template void invokeNvfp4QuantAndPerTokenScale<float>(
     uint32_t m, uint32_t n, float const* input, float globalScaleInv,
     int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
     float* perTokenScaleOutput, QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-    cudaStream_t stream, bool enable_pdl);
+    cudaStream_t stream, bool enable_pdl, float const* globalScaleInvPtr);
 template void invokeNvfp4QuantAndPerTokenScale<half>(
     uint32_t m, uint32_t n, half const* input, float globalScaleInv,
     int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
     float* perTokenScaleOutput, QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-    cudaStream_t stream, bool enable_pdl);
+    cudaStream_t stream, bool enable_pdl, float const* globalScaleInvPtr);
 #ifdef ENABLE_BF16
 template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
     uint32_t m, uint32_t n, __nv_bfloat16 const* input, float globalScaleInv,
     int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
     float* perTokenScaleOutput, QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
-    cudaStream_t stream, bool enable_pdl);
+    cudaStream_t stream, bool enable_pdl, float const* globalScaleInvPtr);
 #endif
 
 // One warp per expanded row. Reads the layout nvfp4QuantAndPerTokenScaleKernel writes:
@@ -857,6 +871,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   // recipe was always silently ignored there. Python rejects an explicit one.
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+#ifndef FLASHINFER_FP4_QUANT_NO_TMA
     // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
       if (useTmaQuantization<T>(b, m, n, layout, multiProcessorCount)) {
@@ -867,6 +882,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
+#endif
     // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 16 values.
@@ -885,6 +901,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   } else
 #endif
   {
+#ifndef FLASHINFER_FP4_QUANT_NO_TMA
     // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
       if (useTmaQuantization<T>(b, m, n, layout, multiProcessorCount)) {
@@ -896,6 +913,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
+#endif
     // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 8 values.
@@ -1059,6 +1077,9 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   while (grid.x <= multiProcessorCount && block.x > 64) {
     grid.x *= 2;
     block.x = (block.x + 1) / 2;
+#if defined(FLASHINFER_FP4_SW_CVT)
+    block.x += block.x % 2;  // below SM100 two lanes share each scale: keep them in one block
+#endif
   }
 
   // TODO: Should relax this to allow any grid size.

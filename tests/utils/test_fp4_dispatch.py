@@ -30,7 +30,7 @@ def test_nvfp4_per_token_sf_vec_size_rejected_before_unsupported_arch(
     monkeypatch, backend
 ):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
-    capability_query = Mock(return_value=(9, 0))
+    capability_query = Mock(return_value=(7, 5))
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
 
     x = SimpleNamespace()
@@ -51,7 +51,7 @@ def test_nvfp4_per_token_sf_vec_size_rejected_before_unsupported_arch(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_fp4_explicit_recipe_rejected_before_unsupported_arch(monkeypatch, backend):
-    capability_query = Mock(return_value=(9, 0))
+    capability_query = Mock(return_value=(7, 5))
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
     scale_to = Mock(side_effect=AssertionError("global_scale.to must not run"))
     x = SimpleNamespace(device=torch.device("cuda:3"))
@@ -115,7 +115,7 @@ def test_pure_quantizer_parameters_rejected_before_unsupported_arch(
     monkeypatch, name, backend, kwargs, error
 ):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    capability_query = Mock(return_value=(9, 0))
+    capability_query = Mock(return_value=(7, 5))
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
     copy = Mock(side_effect=AssertionError("CUDA copy must not run"))
     scale_to = Mock(side_effect=AssertionError("global_scale.to must not run"))
@@ -148,7 +148,7 @@ def test_fp8_recipe_validation_before_unsupported_arch(
 ):
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    capability_query = Mock(return_value=(9, 0))
+    capability_query = Mock(return_value=(7, 5))
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
     copy = Mock(side_effect=AssertionError("CUDA copy must not run"))
     x = SimpleNamespace(
@@ -158,7 +158,7 @@ def test_fp8_recipe_validation_before_unsupported_arch(
     legacy_cuda_env = backend == "cuda" and from_env
     exception = RuntimeError if legacy_cuda_env else ValueError
     error = (
-        "nvfp4_quantize requires SM100 or newer; got SM90"
+        "nvfp4_quantize requires SM80 or newer; got SM75"
         if legacy_cuda_env
         else "requires fp16 or bf16 input"
     )
@@ -181,7 +181,7 @@ def test_per_token_host_scale_rejected_before_unsupported_arch(
     monkeypatch, backend, recipe
 ):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    capability_query = Mock(return_value=(9, 0))
+    capability_query = Mock(return_value=(7, 5))
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
 
     with pytest.raises(ValueError, match="does not match the requested NVFP4"):
@@ -197,7 +197,7 @@ def test_per_token_host_scale_rejected_before_unsupported_arch(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("capability", [(8, 9), (9, 0)])
+@pytest.mark.parametrize("capability", [(7, 0), (7, 5)])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 @pytest.mark.parametrize("name,kwargs", _CASES)
 def test_unsupported_quantizer_arch_rejected_before_backend(
@@ -222,7 +222,7 @@ def test_unsupported_quantizer_arch_rejected_before_backend(
 
     major, minor = capability
     with pytest.raises(
-        RuntimeError, match=f"{name} requires SM100 or newer; got SM{major}{minor}"
+        RuntimeError, match=f"{name} requires SM80 or newer; got SM{major}{minor}"
     ):
         _quantize(name, x, backend, kwargs)
 
@@ -237,7 +237,7 @@ class _BackendReached(Exception):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0)])
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0)])
 def test_supported_quantizer_arch_reaches_existing_dispatch(monkeypatch, capability):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     x = SimpleNamespace(
@@ -247,7 +247,7 @@ def test_supported_quantizer_arch_reaches_existing_dispatch(monkeypatch, capabil
         stride=lambda dim: 32 if dim == -2 else 1,
     )
     capability_query = Mock(
-        side_effect=lambda device: capability if device == x.device else (9, 0)
+        side_effect=lambda device: capability if device == x.device else (7, 5)
     )
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
     monkeypatch.setattr(fp4, "get_compute_capability", capability_query)
@@ -264,14 +264,14 @@ def test_supported_quantizer_arch_reaches_existing_dispatch(monkeypatch, capabil
 @pytest.mark.parametrize("name,kwargs", _CASES)
 def test_quantizer_rejects_real_unsupported_gpu(backend, name, kwargs):
     if not torch.cuda.is_available():
-        pytest.skip("Requires a CUDA GPU below SM100")
+        pytest.skip("Requires a CUDA GPU below SM80")
     device = torch.device("cuda", torch.cuda.current_device())
     major, minor = utils.get_compute_capability(device)
-    if major >= 10:
-        pytest.skip("Requires a CUDA GPU below SM100")
+    if major >= 8:
+        pytest.skip("Requires a CUDA GPU below SM80")
     x = torch.ones(2, 32, dtype=torch.bfloat16, device=device)
     with pytest.raises(
-        RuntimeError, match=f"requires SM100 or newer; got SM{major}{minor}"
+        RuntimeError, match=f"requires SM80 or newer; got SM{major}{minor}"
     ):
         _quantize(name, x, backend, kwargs)
 
@@ -280,9 +280,9 @@ def test_quantizer_rejects_real_unsupported_gpu(backend, name, kwargs):
 @pytest.mark.parametrize("name", ["nvfp4_quantize", "mxfp4_quantize"])
 def test_cpu_input_quantizer_checks_selected_cuda_device(monkeypatch, name):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
-    capability_query = Mock(return_value=(9, 0))
+    capability_query = Mock(return_value=(7, 5))
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
-    with pytest.raises(RuntimeError, match=f"{name} requires SM100 or newer; got SM90"):
+    with pytest.raises(RuntimeError, match=f"{name} requires SM80 or newer; got SM75"):
         _quantize(name, torch.ones(2, 32), "cuda", {})
     capability_query.assert_called_once_with(torch.device("cuda:3"))
 
@@ -309,7 +309,7 @@ def test_wrapper_rejects_unsupported_launch_device(monkeypatch, name, backend, k
     target = _wrapper_target(name, backend)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     capability_query = Mock(
-        side_effect=lambda device: (9, 0) if device == target else (10, 0)
+        side_effect=lambda device: (7, 5) if device == target else (10, 0)
     )
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
     item_read = Mock(side_effect=AssertionError("Tensor.item must not run"))
@@ -317,7 +317,7 @@ def test_wrapper_rejects_unsupported_launch_device(monkeypatch, name, backend, k
     if name == "nvfp4_quantize" and kwargs.get("per_token_activation"):
         kwargs = {"nvfp4_4over6": None, **kwargs}
     x = SimpleNamespace(device=torch.device("cuda:3"), is_cuda=True)
-    with pytest.raises(RuntimeError, match=f"{name} requires SM100 or newer; got SM90"):
+    with pytest.raises(RuntimeError, match=f"{name} requires SM80 or newer; got SM75"):
         _quantize(name, x, backend, kwargs)
     capability_query.assert_called_once_with(target)
     item_read.assert_not_called()
@@ -329,7 +329,7 @@ def test_wrapper_preserves_supported_launch_device(monkeypatch, name, backend, k
     target = _wrapper_target(name, backend)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     capability_query = Mock(
-        side_effect=lambda device: (10, 0) if device == target else (9, 0)
+        side_effect=lambda device: (10, 0) if device == target else (7, 5)
     )
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
     monkeypatch.setattr(fp4, "get_compute_capability", capability_query)

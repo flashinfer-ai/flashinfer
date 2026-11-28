@@ -15,6 +15,7 @@ from cutlass.cute.runtime import from_dlpack
 from .mxfp8.fma_fc1 import _kernel as fc1
 from .mxfp8.fma_fc2 import _kernel as fc2
 from .activation_config import lower_activation
+from ..io import combine
 
 
 @cute.jit
@@ -126,6 +127,65 @@ def launch(
     down(mid, msf, w2, s2, ids, scores, out, narrow, finalize, stream)
 
 
+@cute.jit
+def launch_wide(
+    q,
+    sf,
+    w1,
+    s1,
+    ids,
+    mid,
+    sf_storage,
+    w2,
+    s2,
+    scores,
+    routes,
+    out,
+    chunk_ids,
+    chunk_scores,
+    logical: cutlass.Constexpr,
+    limit: cutlass.Constexpr,
+    alpha: cutlass.Constexpr,
+    beta: cutlass.Constexpr,
+    activation: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
+    parameters: cutlass.Constexpr,
+    narrow: cutlass.Constexpr,
+    finalize: cutlass.Constexpr,
+    experts: cutlass.Constexpr,
+    stream,
+):
+    # A down block holds one warp per route, so more than 32 routes per token
+    # run as token-major chunks of at most 32 routes. Each chunk writes its
+    # unweighted BF16 route rows; the Tensor Core tactic's ordered combine then
+    # applies the routing weights over all top_k slots.
+    groups = cute.size(mid, mode=[1]) // 32
+    msf = cute.make_tensor(
+        sf_storage.iterator,
+        cute.make_layout((cute.size(ids), groups), stride=(groups, 1)),
+    )
+    gate_up(
+        q,
+        sf,
+        w1,
+        s1,
+        ids,
+        mid,
+        msf,
+        logical,
+        limit,
+        alpha,
+        beta,
+        activation,
+        gated,
+        parameters,
+        stream,
+    )
+    down(mid, msf, w2, s2, chunk_ids, chunk_scores, routes, narrow, False, stream)
+    if cutlass.const_expr(finalize):
+        combine(routes, ids, scores, out, experts, narrow, stream)
+
+
 def execute(inputs, config):
     # Use the same metadata-only compile cache and lock as the TC tactic.
     from ..runtime import _COMPILED, _COMPILE_LOCK, _load_cross_compiled
@@ -134,8 +194,8 @@ def execute(inputs, config):
     mid, sf_storage, routes, output, narrow = inputs[10:]
     t, h = q.shape
     k = config.routing.top_k
-    if not 1 <= k <= 32:
-        raise ValueError("FMA requires top_k between 1 and 32")
+    if k < 1 or (k > 32 and k > config.routing.num_experts):
+        raise ValueError("FMA requires top_k between 1 and max(32, num_experts)")
     p = mid.shape[1]
     # FMA uses the linear prefix of the per-call TC scale workspace. No extra
     # allocation, weight packing, or GPU conversion is needed to switch tactic.
@@ -170,6 +230,17 @@ def execute(inputs, config):
             scores,
             output if finalize else routes,
         )
+        entry, experts = launch, ()
+        if k > 32:
+            chunk = max(c for c in range(1, 33) if k % c == 0)
+            tensors = (
+                *tensors[:10],
+                routes,
+                output,
+                ids.view(-1, chunk),
+                scores.view(-1, chunk),
+            )
+            entry, experts = launch_wide, (config.routing.num_experts,)
         compiled = _COMPILED.get(key)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
@@ -182,7 +253,7 @@ def execute(inputs, config):
                     major, minor = torch.cuda.get_device_capability(q.device)
                     name, parameters = lower_activation(a)
                     compiled = cute.compile(
-                        launch,
+                        entry,
                         *(from_dlpack(v) for v in tensors),
                         config.experts.intermediate_size,
                         getattr(a, "limit", None),
@@ -193,8 +264,9 @@ def execute(inputs, config):
                         parameters,
                         narrow,
                         finalize,
+                        *experts,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
+                        options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} --enable-tvm-ffi",
                     )
                     compiled = _load_cross_compiled(compiled)
                     _COMPILED[key] = compiled

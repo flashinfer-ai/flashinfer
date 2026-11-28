@@ -60,7 +60,7 @@ def test_fp4_software_decoder_all_words():
             *(from_dlpack(v) for v in (words, scale, bits, out)),
             block,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
+            options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} --enable-tvm-ffi",
         )
         for value in values:
             scale.fill_(value)

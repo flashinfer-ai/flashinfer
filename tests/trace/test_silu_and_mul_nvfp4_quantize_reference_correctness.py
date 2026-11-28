@@ -5,7 +5,7 @@ import torch
 
 from tests.trace.reference_utils import (
     _check,
-    _skip_if_not_sm100,
+    _skip_if_not_sm80,
 )
 
 _BLOCK_SIZE = 16
@@ -38,7 +38,7 @@ def test_silu_and_mul_nvfp4_quantize_reference_correctness(shape_kwargs):
     from flashinfer.cute_dsl import is_cute_dsl_available
 
     # Skip only unsupported hardware or missing CuTe-DSL.
-    _skip_if_not_sm100()
+    _skip_if_not_sm80()
     if not is_cute_dsl_available():
         pytest.skip("CuTe-DSL backend not available")
 

@@ -29,6 +29,7 @@ from flashinfer.fused_moe.runners import (
     FireflyNvfp4Runner,
     MoERunner,
     PrimsTsRunner,
+    RecordsNvfp4Runner,
     TrtllmFp4RoutedRunner,
 )
 
@@ -42,6 +43,7 @@ _PER_TOKEN_RUNNERS = {
     CuteDslRunner,
     FireflyNvfp4Runner,
     PrimsTsRunner,
+    RecordsNvfp4Runner,
     TrtllmFp4RoutedRunner,
 }
 _RUNNERS = sorted(set(_BACKEND_RUNNERS.values()), key=lambda cls: cls.__name__)

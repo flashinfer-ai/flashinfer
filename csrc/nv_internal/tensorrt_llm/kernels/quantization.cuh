@@ -233,7 +233,7 @@ quantize_with_block_size(
 #endif
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
     float const* SFScale, void* out, uint32_t* SFout, QuantizationSFLayout layout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || defined(FLASHINFER_FP4_SW_CVT))
   // The elements per thread.
   static constexpr int ELTS_PER_THREAD =
       quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
@@ -272,7 +272,9 @@ quantize_with_block_size(
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
+#if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 
   // Get the caller-provided global scaling factor, which will be applied to the SF.
   float SFScaleVal = 1.0f;
@@ -465,7 +467,9 @@ quantize_with_block_size(
       }
     }
   }
+#if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.launch_dependents;");
+#endif
 #endif
 }
 
@@ -482,7 +486,7 @@ quantize_with_block_size_tma(
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
     float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout,
     const __grid_constant__ CUtensorMap tensor_map) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || defined(FLASHINFER_FP4_SW_CVT))
   using Traits = TmaKernelTraits<Type>;
   using SmemType = typename Traits::SmemType;
 
@@ -708,7 +712,7 @@ cvt_fp16_to_fp4_expert(
 #endif
     int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
     uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || defined(FLASHINFER_FP4_SW_CVT))
   using PackedVecT = PackedVec<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>;
   // Packed fp4 output type: 8 fp4 elts fit in 32 bits, 16 fp4 elts in 64 bits.
   using PackedFp4OutT =
@@ -940,11 +944,19 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
     // output
-    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput) {
+    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput
+#if defined(FLASHINFER_FP4_SW_CVT)
+    ,
+    float const* globalScaleInvPtr  // below SM100, the inverse global scale in device memory
+#endif
+) {
   constexpr int SF_VEC_SIZE = 16;
   int rowIdx = blockIdx.x;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
+#endif
+#if defined(FLASHINFER_FP4_SW_CVT)
+  if (globalScaleInvPtr != nullptr) globalScaleInv = *globalScaleInvPtr;
 #endif
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {

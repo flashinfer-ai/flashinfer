@@ -16,7 +16,7 @@ limitations under the License.
 
 from typing import List
 
-from .core import JitSpec, gen_jit_spec
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 from . import env as jit_env
 from .core import (
     sm100a_nvcc_flags,
@@ -78,8 +78,19 @@ def gen_fp4_quantization_sm107_module() -> JitSpec:
     return gen_fp4_quantization_module(nvcc_flags, "107")
 
 
+def sw_cvt_nvcc_flags(device_arch: str) -> List[str]:
+    if device_arch == "90":
+        return sm90a_nvcc_flags + ["-DFLASHINFER_FP4_SW_CVT"]
+    sm8x = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[8])
+    return sm8x + ["-DFLASHINFER_FP4_SW_CVT", "-DFLASHINFER_FP4_QUANT_NO_TMA"]
+
+
+def gen_fp4_quantization_sm80_module() -> JitSpec:
+    return gen_fp4_quantization_module(sw_cvt_nvcc_flags("80"), "80")
+
+
 def gen_fp4_quantization_sm90_module() -> JitSpec:
-    return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
+    return gen_fp4_quantization_module(sw_cvt_nvcc_flags("90"), "90")
 
 
 def gen_fp4_quantization_sm110_module() -> JitSpec:

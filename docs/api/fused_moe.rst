@@ -241,6 +241,8 @@ Utility Functions
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
     preprocess_moe_weights_for_sm90_mixed_gemm_humming
+    prepare_records_mxfp4_weights
+    prepare_records_nvfp4_weights
     fused_topk_deepseek
     hash_topk
 

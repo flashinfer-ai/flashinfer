@@ -92,7 +92,7 @@ def _check_disjoint(
 
 # The one definition of the supported devices: the calls' @backend_requirement
 # (and ``is_compute_capability_supported``) and the workspace queries all use it.
-_SUPPORTED_CCS = (90, 100, 103)
+_SUPPORTED_CCS = (80, 86, 87, 89, 90, 100, 103)
 
 
 def _check_arch(device: torch.device) -> None:
@@ -194,7 +194,7 @@ def mm_bf16_fp8_workspace_bytes(
         ``m > 0``).
     BackendSupportedError
         A device the kernels do not support (anything but compute capability
-        9.0, 10.0 or 10.3), as the call raises.
+        8.0, 8.6, 8.7, 8.9, 9.0, 10.0 or 10.3), as the call raises.
     """
     device = _resolve_device(device)
     _check_arch(device)
@@ -416,7 +416,7 @@ def mm_bf16_fp8(
     ----------
     a: torch.Tensor
         Activation, shape ``(..., K)``, ``bfloat16``, contiguous, on a CUDA
-        device (Hopper or Blackwell; every other tensor must be on the same
+        device (SM8x, Hopper or Blackwell; every other tensor must be on the same
         device).  Leading dimensions are flattened into ``M``; a leading
         dimension of 0 returns the empty output without launching.
     b: torch.Tensor
@@ -438,7 +438,7 @@ def mm_bf16_fp8(
         ``bfloat16``, on ``a``'s device, contiguous.  Allocated when omitted.
     backend: str
         ``"auto"`` (default) or ``"cute-dsl"``, the one implementation there
-        is (CuTe-DSL kernels for Hopper and Blackwell).
+        is (CuTe-DSL kernels for Hopper and Blackwell; SM8x runs its dense GEMM).
     tactic: Optional[str]
         Selects a tile or a split policy instead of the launcher's choice: a
         key of ``MM_BF16_FP8_TACTICS_SM100`` on Blackwell or of
@@ -477,7 +477,9 @@ def mm_bf16_fp8(
 
     Notes
     -----
-    Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a`` / ``sm_103a``);
+    Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a`` / ``sm_103a``), and
+    on SM8x, which has no FP8 MMA, as the SM8x dense GEMM (the weight restored
+    exactly to the activation dtype, ``tactic=None`` only);
     ``mm_bf16_fp8.is_compute_capability_supported(cc)`` answers for a device.  The
     kernels are CuTe-DSL, compiled on first use of each kernel variant a call
     resolves to (so the first call of a new configuration is slow), and are
@@ -525,7 +527,7 @@ def mm_bf16_fp8(
         anything is launched.
     BackendSupportedError
         A device the kernels do not support (anything but compute capability
-        9.0, 10.0 or 10.3).
+        8.0, 8.6, 8.7, 8.9, 9.0, 10.0 or 10.3).
     RuntimeError
         A launch failure reported by the CUDA runtime.
     """

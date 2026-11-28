@@ -75,6 +75,20 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
       : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
         "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
   return val;
+#elif defined(__CUDA_ARCH__)
+  // fp32_to_e2m1_sw of quantization_utils.cuh: ties-to-even at the E2M1 midpoints, NaN -> +6.
+  uint32_t val = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    uint32_t const bits = __float_as_uint(i % 2 ? array[i / 2].y : array[i / 2].x);
+    uint32_t const mag = bits & 0x7FFFFFFFu;
+    uint32_t const hi = mag >= 0x3FE00000u;
+    uint32_t const mid = mag >= (hi ? 0x40600000u : 0x3F400000u);
+    uint32_t const lo =
+        mag > (hi ? (mid ? 0x40A00000u : 0x40200000u) : (mid ? 0x3FA00000u : 0x3E800000u));
+    val |= ((mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | hi << 2 | mid << 1 | lo) << (4 * i);
+  }
+  return val;
 #else
   // E2M1 conversion requires SM100+; abort at runtime if this code path is ever reached.
   // Note: static_assert cannot be used here because NVCC evaluates both preprocessor branches.

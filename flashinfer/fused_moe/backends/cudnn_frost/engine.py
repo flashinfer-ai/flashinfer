@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 import torch
 
 from ....autotuner import TuningConfig
+from ...api import MoEWeightPack
 from ...utils import map_to_hybrid_bucket
 from . import runtime
 from .cache import LRUCache, retain_graph_resources
@@ -517,23 +518,62 @@ class FrostEngine:
 
 
 class FrostRunnerMixin:
-    """Shared runner operations; dtype adapters prepare the packed tensors."""
+    """Shared runner operations; dtype adapters prepare the packed tensors.
+
+    On SM8x, where no Frost source targets the device, an adapter attaches the
+    CUTLASS runner of its canonical view: it validates the Frost contract, then
+    packs, tunes and runs through that runner's SM8x pipeline.
+    """
+
+    # The attached CUTLASS runner on SM8x; replaces ``_engine``.
+    _sm8x: Any = None
 
     if TYPE_CHECKING:
         # Supplied by the dtype adapter and its MoERunner base at runtime.
         _engine: Any
         config: Any
+        device: Any
         _input_support: Callable
 
         def _require_built(self) -> None: ...
 
+    def _attach_sm8x(self, runner_cls) -> None:
+        # Keep a built runner across repeated check_support calls.
+        if type(self._sm8x) is not runner_cls:
+            self._sm8x = runner_cls(self.config, self.device)
+        self._sm8x.check_support()
+
+    def _pack_sm8x(
+        self,
+        act,
+        view,
+        canonical_key,
+        split_fc1_scales,
+        fc1_scale_key="fc1_expert_scales",
+    ):
+        """The attached runner's packed call over Frost's validated ``view``."""
+        if split_fc1_scales:
+            # [2, E, I, ...] halves hold whole 128-row scale tiles (I % 128 == 0),
+            # so they concatenate into each expert's canonical [2I, ...] tiles.
+            sf1 = view[fc1_scale_key]
+            view = dict(view)
+            view[fc1_scale_key] = sf1.transpose(0, 1).reshape(
+                sf1.shape[1], -1, sf1.shape[-1]
+            )
+        weights = MoEWeightPack(native_views={canonical_key: view})
+        inputs = self._sm8x.pack_inputs(act, weights)
+        return PackedInputs(inputs, None, self._sm8x.tuning_config)
+
     def _accepts_shape(self, act):
+        if self._sm8x is not None:
+            return self._input_support(self.config, act, self._sm8x._device_arch)
         return self._input_support(self.config, act, self._engine.arch_number)
 
     def refresh(self):
         """Refresh fixed compiler/artifact metadata without releasing live calls."""
         self._require_built()
-        self._engine.refresh()
+        if self._sm8x is None:  # SM8x has no compiled sources or artifacts.
+            self._engine.refresh()
 
     def forward(
         self,
@@ -545,4 +585,6 @@ class FrostRunnerMixin:
         **kwargs: Any,
     ):
         self._require_built()
+        if self._sm8x is not None:
+            return self._sm8x.forward(inputs, tactic, do_preparation)
         return self._engine.forward(inputs, tactic, launch_state=launch_state)

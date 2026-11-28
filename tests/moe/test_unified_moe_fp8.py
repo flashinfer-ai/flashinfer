@@ -64,6 +64,12 @@ pytestmark = pytest.mark.skipif(
     reason="TRTLLM block-FP8 MoE requires an arch in _TRTLLM_ROUTED_FP8_ARCHS",
 )
 
+# The legacy flat FP8 launchers run the trtllm-gen kernels themselves.
+_needs_flat_fp8_launcher = pytest.mark.skipif(
+    torch.cuda.is_available() and get_compute_capability(torch.device("cuda"))[0] < 10,
+    reason="the legacy flat FP8 launcher runs on the SM100 family only",
+)
+
 HIDDEN = 256
 INTERMEDIATE = 256
 NUM_EXPERTS = 8
@@ -1367,6 +1373,7 @@ def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
     )
 
 
+@_needs_flat_fp8_launcher
 @pytest.mark.parametrize(
     "variant,num_shared",
     [
@@ -1393,6 +1400,7 @@ def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
     _assert_fp8_close(actual, expected)
 
 
+@_needs_flat_fp8_launcher
 @pytest.mark.parametrize("activation", (GeGLU(), ReLU2()))
 def test_mxfp8_new_activations_match_flat_launcher(activation):
     pack, weights, config, view, (logits, bias) = _make_shared_expert_case(

@@ -10,8 +10,6 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     FrostLowLatencyConfig,
     MoEFinalizeConfig,
-    QuantConfig,
-    QuantFormat,
     SwiGLU,
     PowLU,
     ReLU2,
@@ -617,38 +615,6 @@ def test_sm80_typed_admitted_tactics_live_graph(tokens, dtype, activation):
         assert torch.isfinite(got).all()
         assert delta.norm() / expected.double().norm() < 0.01
         assert delta.abs().max() / expected.double().abs().max() < 0.03
-
-
-@pytest.mark.parametrize(
-    "weight",
-    [
-        QuantFormat.FP8PerTensor,
-        QuantFormat.DeepSeekFp8,
-        QuantFormat.NVFP4,
-        QuantFormat.MXFP4,
-        QuantFormat.MXINT4,
-    ],
-)
-def test_sm80_rejects_unqualified_quantized_weights(weight):
-    _require_grouped_tc()
-    if torch.cuda.get_device_capability() != (8, 0):
-        pytest.skip("SM80 format-admission boundary")
-    config, x, *_ = _inputs(SwiGLU(), tokens=1, hidden=256, intermediate=128)
-    config = replace(
-        config,
-        quant=QuantConfig(
-            weight=weight,
-            activation=(
-                QuantFormat.DeepSeekFp8
-                if weight is QuantFormat.DeepSeekFp8
-                else QuantFormat.BF16
-            ),
-            output=QuantFormat.BF16,
-        ),
-    )
-    runner = FrostLowLatencyRunner(config, x.device)
-    with pytest.raises(NotImplementedError, match="SM80 currently supports BF16/FP16"):
-        runner.check_support()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

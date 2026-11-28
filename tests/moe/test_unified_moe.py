@@ -4729,6 +4729,8 @@ class TestFusedSharedExpertsBackendGating:
             if r.supports_fused_shared_experts
         }
         assert supporting == {
+            "RecordsMxfp4Runner",
+            "RecordsNvfp4Runner",
             "TrtllmFp4RoutedRunner",
             "TrtllmFp8BlockRunner",
         }, (

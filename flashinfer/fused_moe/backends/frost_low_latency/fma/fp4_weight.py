@@ -4,7 +4,11 @@
 
 import cutlass
 from cutlass import cute
-from flashinfer.cute_dsl.fp4_common import fp4_decode_2, f16x2_to_f32x2
+from flashinfer.cute_dsl.fp4_common import (
+    cvt_e4m3_byte_to,
+    fp4_decode_2,
+    f16x2_to_f32x2,
+)
 from .nvfp4.fma_fc2 import _fp4_quad
 
 
@@ -92,7 +96,7 @@ def weight_scale(
         if byte == 255:
             bits = cutlass.Uint32(0x7FC00000)
         return bits.bitcast(cutlass.Float32)
-    return byte.bitcast(cutlass.Float8E4M3FN).to(cutlass.Float16)
+    return cvt_e4m3_byte_to(byte, cutlass.Float16)
 
 
 @cute.jit

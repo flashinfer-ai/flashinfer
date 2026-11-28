@@ -53,6 +53,7 @@ from .jit.cake_fmha import gen_cake_fmha_compat_module
 from .jit.cake_fp4_allreduce import gen_cake_fp4_allreduce_aot_modules
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
+    gen_fp4_quantization_sm80_module,
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm103_module,
@@ -113,6 +114,7 @@ from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
     gen_trtllm_gen_routing_module,
+    gen_w4a16_moe_sm80_module,
 )
 from .jit.cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module,
@@ -976,11 +978,27 @@ def gen_all_modules(
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_100a"))
         if has_cake_selective_state_update_sm103a:
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_103a"))
+        if has_sm80 and get_cuda_version() >= Version("12.8"):
+            jit_specs.append(gen_fp4_quantization_sm80_module())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module("80"))
+        # The records' BF16 and FP16 modules, each one for the SM80 and SM90 targets;
+        # their software conversions compile CUDA 12.8's E8M0 type
+        if (has_sm80 or has_sm90) and get_cuda_version() >= Version("12.8"):
+            jit_specs.append(gen_w4a16_moe_sm80_module())
+            jit_specs.append(gen_w4a16_moe_sm80_module(f16=True))
+            jit_specs.append(gen_trtllm_gen_routing_module())  # FP4 MoE routing
+        if has_sm80 and get_cuda_version() >= Version("12.8"):
+            # SM8x dense GEMMs' float16 and float32 outputs (the records GEMM2 writing them)
+            jit_specs.append(gen_w4a16_moe_sm80_module(out="f16"))
+            jit_specs.append(gen_w4a16_moe_sm80_module(out="f32"))
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
-            jit_specs.append(gen_fp4_quantization_sm90_module())
+            # The software conversions compile CUDA 12.8's E8M0 type, as on SM80
+            if get_cuda_version() >= Version("12.8"):
+                jit_specs.append(gen_fp4_quantization_sm90_module())
+                jit_specs.append(gen_mxfp8_quantization_sm100_module("90"))
             # The generic module only: the device-specific prebuilt-D variants are
             # selected at JIT time and must not follow the build host's GPU.
             jit_specs.append(gen_cutlass_fused_moe_sm90_module(enable_prebuilt_d=False))
@@ -1316,8 +1334,7 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
-        if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
-            jit_specs.append(gen_fp4_kv_quantization_module())
+        jit_specs.append(gen_fp4_kv_quantization_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")
