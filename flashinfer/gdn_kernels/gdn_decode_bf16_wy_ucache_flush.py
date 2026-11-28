@@ -156,6 +156,16 @@ except ImportError:
         )
     except ImportError:
         _UMMA_RUBIN = None
+# Philox4x32 (FlashInfer Mamba's generator) for stochastic rounding of the flushed state
+try:
+    from ._umma_helpers import philox4x32_streams as _philox4x32_streams
+except ImportError:
+    try:
+        from flashinfer.gdn_kernels._umma_helpers import (
+            philox4x32_streams as _philox4x32_streams,
+        )
+    except ImportError:
+        _philox4x32_streams = None
 
 
 # Problem dimensions. One CTA processes a full V tile per (request, head).
@@ -734,6 +744,121 @@ def _sts_st2_f32(smem_addr_i32, lo_f32, hi_f32):
     return Int32(r)
 
 
+def _sr_f16_ptx(x, r, d):
+    """PTX that rounds the f32 bits in ``x`` to fp16 stochastically with the 13 noise bits
+    ``r[12:0]`` and leaves the fp16 bits in the low half of ``d``: a mirror of
+    ``conversion::cvt_rs_f16_sw`` (include/flashinfer/mamba/conversion.cuh), so it runs on
+    every SM90+ GPU (cvt.rs needs sm_100a / sm_103a / sm_107a)."""
+    return (
+        f" and.b32 _sg, {x}, 0x80000000; and.b32 _ab, {x}, 0x7FFFFFFF;"
+        " shr.u32 _ex, _ab, 23;"
+        # value in units of 2^-13 fp16 ulps: subnormal fp16 range (exponent 90..112) is
+        # (mantissa | hidden bit) >> (113 - exponent) (PTX clamps shifts of 32+ to 0) ...
+        " and.b32 _mt, _ab, 0x007FFFFF; or.b32 _mt, _mt, 0x00800000;"
+        " mov.u32 _tm, 113; sub.u32 _tm, _tm, _ex; shr.u32 _mt, _mt, _tm;"
+        " setp.lt.u32 _pp, _ex, 90; selp.b32 _mt, 0, _mt, _pp;"
+        # ... and normal fp16 range is the f32 bits with the exponent rebiased (127 -> 15)
+        " sub.u32 _tm, _ab, 0x38000000; setp.ge.u32 _pp, _ex, 113;"
+        " selp.b32 _mt, _tm, _mt, _pp;"
+        # add the noise, truncate, saturate to infinity
+        f" and.b32 _tm, {r}, 0x1FFF; add.u32 _mt, _mt, _tm; shr.u32 _mt, _mt, 13;"
+        " min.u32 _mt, _mt, 0x7C00;"
+        # infinity stays infinity, NaN becomes the canonical NaN
+        " setp.gt.u32 _pp, _ab, 0x7F800000; selp.b32 _tm, 0x7E00, 0x7C00, _pp;"
+        " setp.ge.u32 _pp, _ab, 0x7F800000; selp.b32 _mt, _tm, _mt, _pp;"
+        f" shr.u32 _sg, _sg, 16; or.b32 {d}, _mt, _sg;"
+    )
+
+
+def _sr_pair_is_normal(lo_f32, hi_f32):
+    """1 when both values are finite with a magnitude of at least 2^-14 (the fp16 normal
+    range or above), else 0."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [lo_f32.ir_value(), hi_f32.ir_value()],
+        "{ .reg .b32 _a, _b; .reg .pred _p;"
+        " mov.b32 _a, $1; mov.b32 _b, $2;"
+        " and.b32 _a, _a, 0x7FFFFFFF; and.b32 _b, _b, 0x7FFFFFFF;"
+        # |x| in [0x38800000, 0x7F800000) <=> |x| - 0x38800000 < 0x47000000 (unsigned)
+        " sub.u32 _a, _a, 0x38800000; sub.u32 _b, _b, 0x38800000;"
+        " max.u32 _a, _a, _b; setp.lt.u32 _p, _a, 0x47000000;"
+        " selp.u32 $0, 1, 0, _p; }",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+def _sts_st2_f32_sr_normal(smem_addr_i32, lo_f32, hi_f32, rbits_u32):
+    """``_sts_st2_f32_sr_any`` for two values that ``_sr_pair_is_normal`` accepts, in a
+    third of the instructions: the noise added to the f32 bits, with the 13 bits below the
+    fp16 mantissa cleared, gives a value fp16 holds exactly (or one past 65504, which
+    cvt.rn takes to infinity like the saturation in ``_sr_f16_ptx``), so cvt.rn converts
+    the pair without rounding and the bits are the same."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            smem_addr_i32.ir_value(),
+            lo_f32.ir_value(),
+            hi_f32.ir_value(),
+            rbits_u32.ir_value(),
+        ],
+        "{ .reg .b32 _l, _h, _r, _v; .reg .f32 _fl, _fh;"
+        " and.b32 _r, $4, 0x1FFF; mov.b32 _l, $2; add.u32 _l, _l, _r;"
+        " and.b32 _l, _l, 0xFFFFE000;"
+        " shr.u32 _r, $4, 16; and.b32 _r, _r, 0x1FFF; mov.b32 _h, $3; add.u32 _h, _h, _r;"
+        " and.b32 _h, _h, 0xFFFFE000;"
+        " mov.b32 _fl, _l; mov.b32 _fh, _h; cvt.rn.f16x2.f32 _v, _fh, _fl;"
+        " st.shared.b32 [$1], _v;"
+        " mov.u32 $0, 0; }",
+        "=r,r,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
+@cute.jit
+def _sts_st2_f32_sr(smem_addr_i32, lo_f32, hi_f32, rbits_u32):
+    """Stochastic-rounding variant of ``_sts_st2_f32`` (fp16 state): ``lo`` is rounded with
+    ``rbits[12:0]`` and ``hi`` with ``rbits[28:16]``, the operand mapping of
+    ``cvt.rs.f16x2.f32``. Pairs in the fp16 normal range take the short path; zeros,
+    subnormals, infinities and NaNs take the full one."""
+    if _sr_pair_is_normal(lo_f32, hi_f32) != Int32(0):
+        _sts_st2_f32_sr_normal(smem_addr_i32, lo_f32, hi_f32, rbits_u32)
+    else:
+        _sts_st2_f32_sr_any(smem_addr_i32, lo_f32, hi_f32, rbits_u32)
+
+
+def _sts_st2_f32_sr_any(smem_addr_i32, lo_f32, hi_f32, rbits_u32):
+    """``_sts_st2_f32_sr`` for any pair of values (``_sr_f16_ptx`` on each)."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            smem_addr_i32.ir_value(),
+            lo_f32.ir_value(),
+            hi_f32.ir_value(),
+            rbits_u32.ir_value(),
+        ],
+        "{ .reg .b32 _x, _rh, _lo, _hi, _sg, _ab, _ex, _mt, _tm; .reg .pred _pp;"
+        " mov.b32 _x, $2;"
+        + _sr_f16_ptx("_x", "$4", "_lo")
+        + " mov.b32 _x, $3; shr.u32 _rh, $4, 16;"
+        + _sr_f16_ptx("_x", "_rh", "_hi")
+        + " shl.b32 _hi, _hi, 16; or.b32 _lo, _lo, _hi;"
+        " st.shared.b32 [$1], _lo;"
+        " mov.u32 $0, 0; }",
+        "=r,r,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
+
 def _sts_rg2_f32(smem_addr_i32, lo_f32, hi_f32):
     """RING-dtype variant of ``_sts_bf16x2_f32``: packs a U f32 pair to the
     ring element type before the 4-byte SMEM store. Used ONLY for the
@@ -1218,6 +1343,7 @@ class GdnDecodeUCacheFlushKernel:
         ab_native=False,
         ab_t_stride=0,
         pdl_trigger=False,
+        sr_rounds=0,
     ):
         assert disable_state_update, "State update not implemented in CuTeDSL kernel"
         # `bv` is accepted only for bench-script signature compatibility — this
@@ -1252,6 +1378,9 @@ class GdnDecodeUCacheFlushKernel:
         # kernel launched with use_pdl overlaps this one fully (the dependent
         # verify kernel consumes nothing we write).
         self._pdl_trigger = bool(pdl_trigger)
+        # Philox rounds of the stochastic rounding of the flushed (fp16) state; 0 rounds to
+        # nearest and never reads the seed.
+        self._sr_rounds = int(sr_rounds)
 
     @cute.jit
     def __call__(
@@ -1271,6 +1400,7 @@ class GdnDecodeUCacheFlushKernel:
         gHlen: cute.Tensor,
         gBase: cute.Tensor,
         gOut: cute.Tensor,
+        gSeed: cute.Tensor,
         scale: cutlass.Float32,
         HV: cutlass.Int32,
         V_DIM: cutlass.Int32,
@@ -1319,6 +1449,7 @@ class GdnDecodeUCacheFlushKernel:
             gHlen,
             gBase,
             gOut,
+            gSeed,
             scale,
             tiled_mma,
             HV,
@@ -1353,6 +1484,7 @@ class GdnDecodeUCacheFlushKernel:
         gHlen: cute.Tensor,
         gBase: cute.Tensor,
         gOut: cute.Tensor,
+        gSeed: cute.Tensor,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         HV: cutlass.Int32,
@@ -3071,6 +3203,19 @@ class GdnDecodeUCacheFlushKernel:
             _fa_colb = ((lane_id >> Int32(3)) & Int32(1)) * Int32(16)
             _fc_r0 = lane_id // Int32(4)
             _fc_c0 = (lane_id & Int32(3)) * Int32(2)
+            if const_expr(self._sr_rounds > 0):
+                # Stochastic rounding of S_h: Philox4x32 with key = seed. Each
+                # (half, strip, span) draw of this lane has the counter of its
+                # first pair, the flat [pool, HV, V, K] offset of (row _f_row0,
+                # column k0 = 64 half + 32 span + _fc_c0); stream 0 rounds row
+                # _f_row0, stream 1 (counter + 8, a column no lane starts at) row
+                # _f_row0 + 8, and word t the pair at column k0 + 8 t.
+                _seed = Int64(gSeed[0])
+                _seed_lo = cutlass.Uint32(_seed & Int64(0xFFFFFFFF))
+                _seed_hi = cutlass.Uint32(_seed >> Int64(32))
+                _sr_lane = (cache_idx64 * Int64(HV) + Int64(pid_hv)) * Int64(
+                    V_DIM_C * K_DIM
+                ) + Int64(_fc_r0 * Int32(K_DIM) + _fc_c0)
             for _fh in (1, 0):
                 # Barrier BEFORE anything in the iteration: for half-1 it
                 # publishes the w-scaled u stage to the fold's ldmatrix
@@ -3112,6 +3257,22 @@ class GdnDecodeUCacheFlushKernel:
                             + _ldm_row * Int32(K_PADDED * 2)
                             + Int32(_fh * 128 + _fspan * 64),
                         )
+                        if const_expr(self._sr_rounds > 0):
+                            # k0 + 8 <= 110 < K: the stream-1 counter does not
+                            # carry into the high word
+                            _sr_off = (
+                                _sr_lane
+                                + Int64(_fs * Int32(16 * K_DIM))
+                                + Int64(_fh * K_HALF + _fspan * 32)
+                            )
+                            _srw = _philox4x32_streams(
+                                _seed_lo,
+                                _seed_hi,
+                                cutlass.Uint32(_sr_off & Int64(0xFFFFFFFF)),
+                                cutlass.Uint32(_sr_off >> Int64(32)),
+                                2,
+                                self._sr_rounds,
+                            )
                         for _ft in cutlass.range_constexpr(4):
                             _f_col = Int32(_fspan * 32 + _ft * 8) + _fc_c0
                             _f_row0 = _fs * Int32(16) + _fc_r0
@@ -3124,7 +3285,10 @@ class GdnDecodeUCacheFlushKernel:
                             _sf0, _sf1 = _fold_fma_bf16x2(
                                 _s0p, _bdec_t, _frr[_ft * 4], _frr[_ft * 4 + 1]
                             )
-                            _sts_st2_f32(_sh_a0, _sf0, _sf1)
+                            if const_expr(self._sr_rounds > 0):
+                                _sts_st2_f32_sr(_sh_a0, _sf0, _sf1, _srw[0][_ft])
+                            else:
+                                _sts_st2_f32(_sh_a0, _sf0, _sf1)
                             _sh_a1 = _sw128_xor(
                                 _sH_base_vl
                                 + (_f_row0 + Int32(8)) * Int32(K_HALF * 2)
@@ -3134,7 +3298,10 @@ class GdnDecodeUCacheFlushKernel:
                             _sf2, _sf3 = _fold_fma_bf16x2(
                                 _s1p, _bdec_t, _frr[_ft * 4 + 2], _frr[_ft * 4 + 3]
                             )
-                            _sts_st2_f32(_sh_a1, _sf2, _sf3)
+                            if const_expr(self._sr_rounds > 0):
+                                _sts_st2_f32_sr(_sh_a1, _sf2, _sf3, _srw[1][_ft])
+                            else:
+                                _sts_st2_f32(_sh_a1, _sf2, _sf3)
                 sync_threads()
                 # coalesced flush of the updated half: consecutive lanes
                 # write consecutive 16-B chunks (8 chunks per 128-B SMEM
@@ -3221,6 +3388,7 @@ _NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "1") != "0"
 # call; caching turns the per-call `.to(bf16)` into a one-time (warm-up) cast that does
 # not appear in the captured CUDA graph. Safe for inference (weights never change).
 _BF16_CACHE: dict = {}
+_SEED_STUB: dict = {}  # per-device int64 [1] seed passed when stochastic rounding is off
 
 
 def _cached_bf16(t):
@@ -3359,9 +3527,12 @@ def gated_delta_rule_mtp_ucache_flush(
     differ in rounding only (fp32 accumulation in both, different summation
     orders). ``stochastic_rounding`` (``"philox"`` / ``"lcg"``, with
     ``rand_seed`` and ``philox_rounds``; off unless set) rounds the fp16
-    state written by flush rows stochastically and is implemented by the
-    UMMA backend only (see that function's docstring). ``rand_seed`` is
-    read only with one of those modes.
+    state written by flush rows stochastically (see the UMMA function's
+    docstring). The HMMA kernel implements ``"philox"`` for the fp16-state arm
+    in software on every SM90+ GPU: the same generator and noise-bit layout
+    per pair, with its own per-lane counters (see the fold in its kernel), so
+    its bits differ from the UMMA kernel's. ``rand_seed`` is read only with
+    one of those modes.
     """
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
@@ -3647,12 +3818,37 @@ def gated_delta_rule_mtp_ucache_flush(
             f"served by the UMMA backend only ({_why}); the HMMA kernel needs both "
             f"rings in {RING_TORCH}."
         )
+    sr_rounds = 0
     if stochastic_rounding not in (None, "none"):
-        raise NotImplementedError(
-            "gated_delta_rule_mtp_ucache_flush: stochastic rounding of the flushed state "
-            "is implemented by the UMMA backend only (SM100, bf16 IO and rings, fp16 "
-            "state); the HMMA kernel rounds to nearest."
-        )
+        if (
+            stochastic_rounding != "philox"
+            or torch.float16 != ST_TORCH
+            or _philox4x32_streams is None
+        ):
+            raise NotImplementedError(
+                "gated_delta_rule_mtp_ucache_flush: the HMMA kernel implements "
+                "stochastic rounding of the flushed state as 'philox' with fp16 "
+                f"state only (got {stochastic_rounding!r}, state {ST_TORCH})."
+            )
+        if not (
+            isinstance(rand_seed, torch.Tensor)
+            and rand_seed.numel() == 1
+            and rand_seed.dtype == torch.int64
+            and rand_seed.is_cuda
+        ):
+            raise ValueError(
+                "stochastic_rounding='philox' needs rand_seed, a single-element "
+                "int64 CUDA tensor"
+            )
+        if philox_rounds < 2:  # philox4x32_streams always runs rounds 1 and 2
+            raise ValueError(f"philox_rounds must be >= 2, got {philox_rounds}")
+        sr_rounds = int(philox_rounds)
+        seed_t = rand_seed.reshape(1)
+    else:
+        seed_t = _SEED_STUB.get(str(device))
+        if seed_t is None:  # never read: the round-to-nearest build has no SR code
+            seed_t = torch.zeros(1, dtype=torch.int64, device=device)
+            _SEED_STUB[str(device)] = seed_t
     if T not in (4, 8):
         raise NotImplementedError(
             f"gated_delta_rule_mtp_ucache_flush: T={T} unsupported — native T in "
@@ -3824,6 +4020,7 @@ def gated_delta_rule_mtp_ucache_flush(
         HV,
         H,
         V_dim,
+        sr_rounds,
     )
     if not _pools_contig and _qkv_rs == 0:
         raise NotImplementedError(
@@ -3901,6 +4098,7 @@ def gated_delta_rule_mtp_ucache_flush(
         mk_dyn(hist_len),
         mk_dyn(cache_base),
         mk_dyn(out16),
+        mk(seed_t),
         scale,
         HV,
         V_dim,
@@ -3920,6 +4118,7 @@ def gated_delta_rule_mtp_ucache_flush(
                 ab_native=_ab_native_flag,
                 ab_t_stride=_ab_ts,
                 pdl_trigger=pdl_trigger,
+                sr_rounds=sr_rounds,
             ),
             *args,
         )
