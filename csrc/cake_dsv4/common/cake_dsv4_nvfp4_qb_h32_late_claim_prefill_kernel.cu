@@ -681,6 +681,7 @@ kernel_cake_dsv4_nvfp4_qb_h32_late_claim_prefill(const __grid_constant__ CUtenso
                         " [%0], {%1};"
                         :: "r"(taddr + (unsigned int)(408 + (sm_row_base >> 5)) + (unsigned int)(sm_row_base << 16)), "r"(*reinterpret_cast<const uint32_t*>(&(sfa_regs + 6)[0])));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 9, 128;" ::: "memory");
                     if (warp == 0) {
@@ -1234,6 +1235,7 @@ kernel_cake_dsv4_nvfp4_qb_h32_late_claim_prefill(const __grid_constant__ CUtenso
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(t_dst), "r"(__float_as_uint(t_out[0])), "r"(__float_as_uint(t_out[1])), "r"(__float_as_uint(t_out[2])), "r"(__float_as_uint(t_out[3])) : "memory");
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(t_dst + 16), "r"(__float_as_uint(t_out[4])), "r"(__float_as_uint(t_out[5])), "r"(__float_as_uint(t_out[6])), "r"(__float_as_uint(t_out[7])) : "memory");
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     mbarrier_arrive(index_empty_addr + (co_info_stage) * 8);
                     co_info_stage += 1;
@@ -2998,6 +3000,7 @@ kernel_cake_dsv4_nvfp4_qb_h32_late_claim_prefill(const __grid_constant__ CUtenso
                                     smem_tdot[(int)((g_index_stage + 1 < 2) ? g_index_stage + 1 : (unsigned int)0) * 128 + t_u * 128 + g_warp * 32 + lane] = t_acc;
                                 }
                             }
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_arrive(tdot_full_addr + (((g_index_stage + 1 < 2) ? g_index_stage + 1 : (unsigned int)0)) * 8);
                             mbarrier_arrive(q_read_addr);
                         }
@@ -3350,6 +3353,7 @@ kernel_cake_dsv4_nvfp4_qb_h32_late_claim_prefill(const __grid_constant__ CUtenso
                         smem_tdot[(int)((g_index_stage + 1 < 2) ? g_index_stage + 1 : (unsigned int)0) * 128 + t_u_1 * 128 + g_warp * 32 + lane] = t_acc_1;
                     }
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(tdot_full_addr + (((g_index_stage + 1 < 2) ? g_index_stage + 1 : (unsigned int)0)) * 8);
                 mbarrier_arrive(q_read_addr);
             }

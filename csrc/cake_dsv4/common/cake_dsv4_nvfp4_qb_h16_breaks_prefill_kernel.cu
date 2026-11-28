@@ -640,6 +640,7 @@ kernel_cake_dsv4_nvfp4_qb_h16_breaks_prefill(const __grid_constant__ CUtensorMap
                         " [%0], {%1};"
                         :: "r"(taddr + (unsigned int)(408 + (sm_row_base >> 5)) + (unsigned int)(sm_row_base << 16)), "r"(*reinterpret_cast<const uint32_t*>(&(sfa_regs + 6)[0])));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 9, 128;" ::: "memory");
                     if (warp == 0) {
