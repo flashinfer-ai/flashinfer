@@ -1,0 +1,110 @@
+diff --git a/flashinfer/gemm/cake_quant_lora_gemm.py b/flashinfer/gemm/cake_quant_lora_gemm.py
+index 5dd9cb0fd75..9f3f545da8e 100644
+--- a/flashinfer/gemm/cake_quant_lora_gemm.py
++++ b/flashinfer/gemm/cake_quant_lora_gemm.py
+@@ -267,7 +267,9 @@ def sm90_fp8_lora_program(
+     ``waves_min`` cluster-tile waves over the launch's clusters -- ``(sm_count - sm_count % cluster_m) / cluster_m``
+     clusters, ``ceil(M / block_m)`` m-tiles paired per cluster, ``ceil(N / block_n)`` n-tiles -- the gated program
+     (TMA L2 policies: A evict_last, W evict_first; raster group ``gated_group_m``) wins; everywhere else the default
+-    program.  The selected record's ``group_m`` is the raster group the host passes.
++    program.  The selected record's ``group_m`` is the raster group the host passes, and its ``tiles_per_cluster``
++    the launch grid rule (:func:`launch_grid`): the gated program launches ``cluster_m * ceil(tiles / 4)`` CTAs so the
++    hardware dispatches clusters in tile order and the raster group's two m-pairs read each W n-tile together.
+     """
+     constants = record["dispatch"]
+     default_name, gated_name = (
+@@ -614,10 +616,28 @@ def launch_grid(record: dict, m: int, n: int, sm_count: int) -> tuple[int, int,
+         return (2 * min(sm_count // 2, num_tiles), 1, 1)
+     if rule == "sm90_persistent":
+         cluster_m = int(record["cluster_m"])
++        tiles_per_cluster = record.get("tiles_per_cluster")
++        if tiles_per_cluster:
++            # Dispatched grid: ``tiles_per_cluster`` cluster tiles per launched cluster, so the hardware starts clusters in
++            # tile order as earlier ones finish and the running wave stays a contiguous window of the raster; the persistent
++            # grid's static round robin drifts the clusters apart over hundreds of tiles and the W n-tile the raster
++            # group's m-pairs share is no longer L2-hot for the second pair (CAKE-2550 step 3).
++            num_tiles = sm90_cluster_tiles(record, m, n)
++            return (cluster_m * _ceil_div(num_tiles, int(tiles_per_cluster)), 1, 1)
+         return (sm_count - sm_count % cluster_m, 1, 1)
+     raise RuntimeError(f"unsupported generated grid rule {rule!r}")
+ 
+ 
++def sm90_cluster_tiles(record: dict, m: int, n: int) -> int:
++    """The SM90 kernel's cluster-tile count: ``pairs x n_tiles`` m-pair tiles (two 128-row tiles, one W tile) plus
++    ``tail x n_pairs`` single-m-tile tiles (one 128-row tile, two W tiles)."""
++    cluster_m = int(record["cluster_m"])
++    m_tiles = _ceil_div(m, int(record["block_m"]))
++    n_tiles = _ceil_div(n, int(record["block_n"]))
++    pairs, tail = divmod(m_tiles, cluster_m)
++    return pairs * n_tiles + tail * _ceil_div(n_tiles, cluster_m)
++
++
+ def select_cake_quant_lora_template(
+     *,
+     family: str,
+diff --git a/flashinfer/jit/cake_quant_lora_gemm.py b/flashinfer/jit/cake_quant_lora_gemm.py
+index e0daaf0cd9d..188bb380051 100644
+--- a/flashinfer/jit/cake_quant_lora_gemm.py
++++ b/flashinfer/jit/cake_quant_lora_gemm.py
+@@ -420,13 +420,14 @@
+         "block_n": 192,
+         "cluster_m": 2,
+         "group_m": 8,
++        "tiles_per_cluster": None,
+         "rules": {"m_min": 1, "n_multiple": 8, "k_multiple": 16, "max_mn": 4294967296},
+         "dispatch": {
+             "rule_id": "sm90_fp8_lora_dispatch_v0",
+             "default_template": "fp8_sm90",
+             "gated_template": "fp8_sm90_hint",
+             "default_group_m": 8,
+-            "gated_group_m": 1,
++            "gated_group_m": 2,
+             "panel_budget_bytes": 50331648,
+             "max_k": 32768,
+             "waves_min": 192,
+@@ -476,14 +477,15 @@
+         "adapter_states": ["none", "raw"],
+         "block_n": 192,
+         "cluster_m": 2,
+-        "group_m": 1,
++        "group_m": 2,
++        "tiles_per_cluster": 4,
+         "rules": {"m_min": 1, "n_multiple": 8, "k_multiple": 16, "max_mn": 4294967296},
+         "dispatch": {
+             "rule_id": "sm90_fp8_lora_dispatch_v0",
+             "default_template": "fp8_sm90",
+             "gated_template": "fp8_sm90_hint",
+             "default_group_m": 8,
+-            "gated_group_m": 1,
++            "gated_group_m": 2,
+             "panel_budget_bytes": 50331648,
+             "max_k": 32768,
+             "waves_min": 192,
+diff --git a/tests/gemm/test_cake_quant_lora_gemm.py b/tests/gemm/test_cake_quant_lora_gemm.py
+index 8bf4a2a9ea3..abd44d8fff0 100644
+--- a/tests/gemm/test_cake_quant_lora_gemm.py
++++ b/tests/gemm/test_cake_quant_lora_gemm.py
+@@ -2590,7 +2590,7 @@ def test_fp8_sm90_dispatch_rule():
+     assert (
+         (default["group_m"], gated["group_m"])
+         == (constants["default_group_m"], constants["gated_group_m"])
+-        == (8, 1)
++        == (8, 2)
+     )
+     assert default["form"] != gated["form"]
+     assert default["block_n"] == gated["block_n"] == constants["block_n"] == 192
+@@ -2688,7 +2688,13 @@ def test_launch_grid_rules():
+         PROGRAMS["fp8_blackwell_n256_clc_blocked"], 32768, 8192, 148
+     ) == (2 * 128 * 32, 1, 1)
+     assert launch_grid(PROGRAMS["fp8_sm90"], 129, 3072, 132) == (132, 1, 1)
+-    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (132, 1, 1)
++    # The gated program launches four cluster tiles per cluster: 512 m-pairs x 43 n-tiles = 22016 tiles -> 5504 clusters.
++    assert PROGRAMS["fp8_sm90"]["tiles_per_cluster"] is None
++    assert PROGRAMS["fp8_sm90_hint"]["tiles_per_cluster"] == 4
++    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 131072, 8192, 132) == (2 * 5504, 1, 1)
++    # A tail m-tile adds n_pairs single-m-tile tiles: 4097 rows = 33 m-tiles = 16 pairs + 1 tail, 3072 = 16 n-tiles
++    # -> 256 + 8 = 264 cluster tiles -> 66 clusters.
++    assert launch_grid(PROGRAMS["fp8_sm90_hint"], 4097, 3072, 132) == (2 * 66, 1, 1)
+ 
+ 
+ # --------------------------------------------------------------------------- #

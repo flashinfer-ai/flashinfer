@@ -1,0 +1,258 @@
+diff --git a/flashinfer/experimental/dense_projection_gemm/README.md b/flashinfer/experimental/dense_projection_gemm/README.md
+index 126d55e6b5f..1bbf54e1fd7 100644
+--- a/flashinfer/experimental/dense_projection_gemm/README.md
++++ b/flashinfer/experimental/dense_projection_gemm/README.md
+@@ -120,7 +120,7 @@ stream-K split, raster group, wave working set) and the L2 size (hint gate);
+ | L2 promotion, prefetch | `default_promo` = `none`, `default_pf` = 0 (measured, off); the symbol carries `_<promo>` / `_pf<n>` when set |
+ | template | `instance_symbol(instance_key(...))`, e.g. `dense_proj_gemm_kk_n256`, `dense_proj_gemm_kk_n128_hen`, `dense_proj_gemm_kn_n256_f32_tma1`, `dense_proj_gemm_nn_n256_f32_tma1`, `dense_proj_gemm_nn_n128_hen_t`, `dense_proj_gemm_kk_n256_m64`, `dense_proj_gemm_kk_n256_m256_ov_ht`, `dense_proj_gemm_nn_n160_m256_bz64`, `dense_proj_gemm_nn_n128_hen_t_skx`, `dense_proj_gemm_kn_n256_tma1_bg8`, `dense_proj_gemm_kn_n256_f32_v8_ef_s9`, `dense_proj_gemm_nn_n256_m256_sks_sb2`, `dense_proj_gemm_kk_n128_hen_c1` (round 13: `_pk` parked / `_ov` overlapped single-TMEM-buffer / `_ht` half-height-tail-wave tall epilogues; `htail` replaces the stream-K tail plan by 2 x tail whole-K half items when they fit the CTA pairs, so `ws_f32_elems = 0` and `sk_iters = sk_units * k_blocks`; `_bz64` = 32-column MN-major B panels (`b_swz` 64, smaller stages, deeper default pipeline), `_skx` = exact p-way K split of the tail tiles (`sk_exact`, pre-empts `sk_parts` / `htail`, p travels in `sk_iters`); `_sks` = synchronised stream-K tail (round 18: `sk_sync`, the tail tiles' main units over K steps [0, s) plus collector units over the leftovers, one fp32 slab per tail tile and a deterministic two-addend fixup; `sk_iters` = the main-unit count, `iters_per_unit` = s = ceil((q K + `sk_sync_m`) / (q + 1)); yields to `sk_exact`, pre-empts `sk_parts` / `htail`); `_bg8` = eight adjacent batch entries (heads) interleaved across the CTA pairs (`batch_group`, batched MLA rows only, 0 for a batch of one); `_ef` = fp32 v8 register stores with `L1::no_allocate.L2::evict_first` (`store_ef`), `_s9` = nine pipeline stages (oversized dynamic shared memory on sm_107a); round 19: `_sb<n>` = the slab path of the synchronised fixup (`sk_slab`: 1 early arrival, 2 + the bulk slab read through the dead mainloop stages, 3 + the fp32 output as the slab - the same `_sks` plan, forced to 0 without `sk_sync`; a rule's 3 yields to 2 when a caller forces the row-major fp32 register epilogue, a rule's 2 to 0 when the eight warp slabs do not fit a caller-forced pipeline), `_c1` = the single-CTA form (`cta1`: one `CTA_ROWS` x `BLOCK_N` tile per CTA with cluster dims (1, 1, 1), so `m_tiles` is not rounded to pairs, `pair_tiles` counts CTA tiles, `sm_pairs` is the SM count (`sm_units`), the grid is `num_full` CTAs and the form carries no tail policy; 128-row family only)) |
+ | grid | `(num_full + sk_units) * 2` CTAs: one cluster of two CTAs per `2 * CTA_ROWS` x `BLOCK_N` output tile plus the stream-K units; under `cta1` (round 19) `num_full` CTAs, one per `CTA_ROWS` x `BLOCK_N` tile, launched with the module's recorded cluster dims (1, 1, 1) |
+-| stream-K | `stream_k_plan(pair_tiles, k_blocks, sm_count // 2, sk="auto")`: only when the whole problem is one partial wave of CTA pairs whose halves fit the pairs (`pair_tiles <= pairs`, `2 * tail <= pairs`) and `k_blocks >= 16`, every tile is split into two K-aligned halves (`sk_units = 2 * pair_tiles`, `iters_per_unit = ceil(k_blocks / 2)`) with an in-kernel deterministic fixup; otherwise every work item is a whole tile (multi-wave tails stay data-parallel).  `sk=True` is the linearised-units policy (up to `pairs` units of >= 8 K steps), `sk="tiles"` the whole-tile diagnostic, `sk=False` off.  A measured `sk_parts = p` rule, or the caller knob `sk_parts`, instead splits every tail tile `p` ways when `p * tail` units fit the pairs and each keeps >= 8 K steps (`sk_parts_plan`).  The host asserts `tail_tiles * 16 <= 4096` slice counters |
++| stream-K | `stream_k_plan(pair_tiles, k_blocks, sm_count // 2, sk="auto")`: only when the whole problem is one partial wave of CTA pairs whose halves fit the pairs (`pair_tiles <= pairs`, `2 * tail <= pairs`) and `k_blocks >= 16`, the tiles' linearised K steps are cut into units of `iters_per_unit = ceil(k_blocks / 2)` (two K-aligned halves per tile on an even `k_blocks`), `sk_units = ceil(pair_tiles * k_blocks / iters_per_unit)` so that every unit holds a K step, with an in-kernel deterministic fixup; otherwise every work item is a whole tile (multi-wave tails stay data-parallel).  `sk=True` is the linearised-units policy (up to `pairs` units of >= 8 K steps), `sk="tiles"` the whole-tile diagnostic, `sk=False` off.  A measured `sk_parts = p` rule, or the caller knob `sk_parts`, instead splits every tail tile `p` ways when `p * tail` units fit the pairs and each keeps >= 8 K steps (`sk_parts_plan`).  The host asserts `tail_tiles * 16 <= 4096` slice counters, and `check_stream_k_plan` refuses a plan outside the kernel's launch contract: a unit without a K step on the `pd` 2 / `sk_slab` 2 / `stt` programs (they hand off the work in an item's last segment, so such a unit never finishes), or synchronised collectors outside `[1, tail_tiles]` (`[1, ...)` on the other `sk_sync` programs) |
+ 
+ `plan_dense_projection_gemm(A, B, out, sm_count=..., l2_bytes=...)` exposes
+ the plan (`GemmPlan`, including `wave_working_set_bytes`) without a device;
+diff --git a/flashinfer/experimental/dense_projection_gemm/cake_backend.py b/flashinfer/experimental/dense_projection_gemm/cake_backend.py
+index 58dc36ea5db..dcf8fc4c784 100644
+--- a/flashinfer/experimental/dense_projection_gemm/cake_backend.py
++++ b/flashinfer/experimental/dense_projection_gemm/cake_backend.py
+@@ -1373,12 +1373,16 @@ def stream_k_plan(
+     whole wave of CTA pairs (all of them when there are fewer tiles than pairs) are the tail.
+ 
+     * ``sk=False``: every work item is a whole tile.
+-    * ``sk="auto"`` (the launcher default): a K-aligned two-way split of a single partial
+-      wave -- unit ``u`` is tile ``u // 2``, K half ``u % 2`` -- so tiles sharing an A / B
+-      panel stay K-synchronised and every tile has exactly two parts (one slab read in the
+-      fixup).  Only when the whole problem is one partial wave whose halves fit the pairs
+-      (``pair_tiles <= pairs`` and ``2 * tail <= pairs``) and K has at least
+-      ``2 * SK_MIN_ITERS`` steps; multi-wave problems keep their tail data-parallel.
++    * ``sk="auto"`` (the launcher default): a two-way split of a single partial wave -- the
++      tail's ``tail * k_blocks`` K steps, linearised, cut into units of ``ceil(k_blocks / 2)``
++      steps.  On an even ``k_blocks`` unit ``u`` is tile ``u // 2``, K half ``u % 2``; on an odd
++      one a unit may cross into the next tile.  The units are the ``ceil(tail * k_blocks /
++      ceil(k_blocks / 2))`` that hold a K step (one fewer than ``2 * tail`` when ``k_blocks`` is
++      odd and ``2 * tail > k_blocks``): a unit without a K step never finishes in the programs
++      that hand off the work in an item's last segment (``pd`` 2, ``sk_slab`` 2, ``stt``).  Only
++      when the whole problem is one partial wave whose halves fit the pairs (``pair_tiles <=
++      pairs`` and ``2 * tail <= pairs``) and K has at least ``2 * SK_MIN_ITERS`` steps;
++      multi-wave problems keep their tail data-parallel.
+     * ``sk=True``: the tail tiles are linearised over their K steps and shared by up to
+       ``pairs`` (``max_units``) stream-K units of at least ``SK_MIN_ITERS`` contiguous K
+       steps; no stream-K when that cannot create more units than tail tiles.
+@@ -1398,7 +1402,7 @@ def stream_k_plan(
+         if pair_tiles > pairs or 2 * tail > pairs or k_blocks < 2 * SK_MIN_ITERS:
+             return pair_tiles, 0, 0, k_blocks
+         half = _ceil_div(k_blocks, 2)
+-        return pair_tiles - tail, tail, 2 * tail, half
++        return pair_tiles - tail, tail, _ceil_div(tail * k_blocks, half), half
+     total = tail * k_blocks
+     units = min(pairs, total // SK_MIN_ITERS, max_units or pairs)
+     if units <= tail:
+@@ -1410,6 +1414,34 @@ def stream_k_plan(
+     return pair_tiles - tail, tail, units, iters_per_unit
+ 
+ 
++def check_stream_k_plan(plan: "GemmPlan") -> None:
++    """Refuse a stream-K plan outside the program's launch contract (the Cake kernel's ``requires``) before it
++    launches.  The programs that hand off the work inside an item's last segment (``pd`` 2, ``sk_slab`` 2,
++    ``stt``) never finish an item that holds no K step: the linearised plan needs ``iters_per_unit >= 1`` and
++    ``(sk_units - 1) * iters_per_unit < sk_iters``, the synchronised one at most ``tail_tiles`` collectors.  Every
++    synchronised plan needs a collector for the K steps ``[s, k_blocks)`` of its tail tiles.  A plan without
++    stream-K units holds every condition."""
++    if not plan.sk_units:
++        return
++    handoff = plan.pd == 2 or plan.sk_slab == 2 or plan.stt
++    if plan.sk_sync:
++        collectors = plan.sk_collectors
++        if collectors < 1 or (handoff and collectors > plan.tail_tiles):
++            raise ValueError(
++                f"dense_projection_gemm: {plan.template} needs 1 <= collectors"
++                f"{' <= tail_tiles' if handoff else ''} (got {collectors} collectors, {plan.tail_tiles} tail tiles)"
++            )
++    elif handoff and not plan.sk_exact:
++        if (
++            plan.iters_per_unit < 1
++            or (plan.sk_units - 1) * plan.iters_per_unit >= plan.sk_iters
++        ):
++            raise ValueError(
++                f"dense_projection_gemm: {plan.template} needs every stream-K unit to hold a K step (got "
++                f"{plan.sk_units} units of {plan.iters_per_unit} over {plan.sk_iters} K steps)"
++            )
++
++
+ def sk_sync_plan(
+     pair_tiles: int,
+     k_blocks: int,
+@@ -2225,6 +2257,7 @@ def plan_dense_projection_gemm(
+         stt=bool(key[30]),
+         pro=int(key[31]),
+     )
++    check_stream_k_plan(plan)
+     if _fallback and plan.template not in KERNELS.get(arch, {}):
+         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
+         for allow_swap, use_rules in ((False, True), (True, False), (False, False)):
+diff --git a/tests/experimental/test_cake_dense_projection_gemm.py b/tests/experimental/test_cake_dense_projection_gemm.py
+index 2b8758793b1..eabd94a1ad7 100644
+--- a/tests/experimental/test_cake_dense_projection_gemm.py
++++ b/tests/experimental/test_cake_dense_projection_gemm.py
+@@ -15,6 +15,7 @@
+ """
+ 
+ import ast
++import dataclasses
+ import re
+ from collections import OrderedDict
+ from pathlib import Path
+@@ -61,6 +62,7 @@
+ instance_symbol = cake_backend.instance_symbol
+ sk_exact_plan = cake_backend.sk_exact_plan
+ sk_sync_plan = cake_backend.sk_sync_plan
++check_stream_k_plan = cake_backend.check_stream_k_plan
+ operand_view = cake_backend.operand_view
+ plan_dense_projection_gemm = cake_backend.plan_dense_projection_gemm
+ plan_router_fp32_gemm = cake_backend.plan_router_fp32_gemm
+@@ -3805,9 +3807,9 @@ def test_instance_key_rejects_bad_configurations():
+ 
+ @pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
+ def test_stream_k_plan_rules(pairs):
+-    # --- sk="auto" (the launcher default): a K-aligned two-way split of a single partial wave ---
+-    # every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an A / B
+-    # panel stay K-synchronised and the fixup reads one slab
++    # --- sk="auto" (the launcher default): a two-way split of a single partial wave ---
++    # on an even K every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an
++    # A / B panel stay K-synchronised and the fixup reads one slab
+     assert stream_k_plan(24, 96, pairs, sk="auto") == (0, 24, 48, 48)
+     assert stream_k_plan(pairs // 2, 96, pairs, sk="auto") == (
+         0,
+@@ -3815,12 +3817,12 @@ def test_stream_k_plan_rules(pairs):
+         2 * (pairs // 2),
+         48,
+     )
+-    assert stream_k_plan(10, 17, pairs, sk="auto") == (
+-        0,
+-        10,
+-        20,
+-        9,
+-    )  # odd K steps: ceil(k / 2)
++    # odd K steps: units of ceil(k / 2) over the linearised 10 x 17 steps; 2 x 10 units would leave the last one
++    # starting at step 19 x 9 = 171 of 170, so the plan has the 19 that hold a K step
++    assert stream_k_plan(10, 17, pairs, sk="auto") == (0, 10, 19, 9)
++    assert stream_k_plan(16, 17, pairs, sk="auto") == (0, 16, 31, 9)
++    # 15 x 9 < 8 x 17: still two units per tile
++    assert stream_k_plan(8, 17, pairs, sk="auto") == (0, 8, 16, 9)
+     assert stream_k_plan(10, 2 * SK_MIN_ITERS, pairs, sk="auto") == (
+         0,
+         10,
+@@ -3887,6 +3889,50 @@ def test_stream_k_plan_rules(pairs):
+     assert stream_k_plan(0, 96, pairs, sk=True) == (0, 0, 0, 96)
+ 
+ 
++@pytest.mark.parametrize("pairs", [74, 76, 106])  # 148 / 152 / 212 SMs
++def test_stream_k_plans_give_every_unit_a_k_step(pairs):
++    # a unit without a K step never finishes in the pd 2 / sk_slab 2 / stt programs (the work handoff runs in an
++    # item's last segment): every linearised policy plans the units that hold one, and nothing more
++    for tiles in range(1, 2 * pairs + 3):
++        for k_blocks in range(1, 80):
++            for sk in ("auto", True):
++                num_full, tail, units, ipu = stream_k_plan(tiles, k_blocks, pairs, sk)
++                if units:
++                    assert (
++                        ipu >= 1 and (units - 1) * ipu < tail * k_blocks <= units * ipu
++                    )
++
++
++def test_check_stream_k_plan_refuses_a_plan_outside_the_launch_contract():
++    # the dgrad of T = 1024, N = 1032, K = 1000 on 76 CTA pairs: 16 tail tiles of 17 K steps, one partial wave
++    E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
++    kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
++    plan, *_ = plan_dense_projection_gemm(
++        E(1024, 1032), E(1032, 1000), E(1024, 1000), pd=2, slots=2, epi="tma", **kw
++    )
++    assert plan.pd == 2 and (plan.tail_tiles, plan.k_blocks) == (16, 17)
++    assert (plan.sk_units, plan.iters_per_unit, plan.sk_iters) == (31, 9, 272)
++    check_stream_k_plan(plan)
++    # the 2 x tail units of the earlier plan: unit 31 starts at K step 279 of 272
++    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
++        check_stream_k_plan(dataclasses.replace(plan, sk_units=32))
++    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
++        check_stream_k_plan(dataclasses.replace(plan, iters_per_unit=0))
++    # the same empty unit is legal on a program that hands off at the bottom of the item loop
++    check_stream_k_plan(dataclasses.replace(plan, pd=0, sk_units=32))
++    # synchronised plans: a collector for every program, at most one per tail tile for the sk_slab 2 / stt ones
++    sync = dataclasses.replace(
++        plan, pd=0, sk_sync=True, sk_slab=2, sk_units=32, iters_per_unit=9
++    )
++    check_stream_k_plan(sync)
++    with pytest.raises(ValueError, match="collectors <= tail_tiles"):
++        check_stream_k_plan(dataclasses.replace(sync, sk_units=33))
++    check_stream_k_plan(dataclasses.replace(sync, sk_slab=0, sk_units=33))
++    for slab in (0, 2):
++        with pytest.raises(ValueError, match="1 <= collectors"):
++            check_stream_k_plan(dataclasses.replace(sync, sk_slab=slab, sk_units=16))
++
++
+ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
+     # pure planner mirror (_fallback=False): synthetic shapes may name instances the export never generated
+     # the 24-tile swapped weight gradient (indexer_hw, T = 1001): one partial wave, K = 16 steps -> split.  The
+@@ -4317,12 +4363,13 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
+                         and 2 * plan.tail_tiles <= plan.sm_pairs
+                     )
+                     assert plan.k_blocks >= 2 * SK_MIN_ITERS
++                    # the units of ceil(k_blocks / 2) K steps that hold one: 2 x tail on an even k_blocks
++                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
+                     assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
+                         0,
+                         plan.pair_tiles,
+-                        2 * plan.pair_tiles,
++                        -(-(plan.pair_tiles * plan.k_blocks) // plan.iters_per_unit),
+                     )
+-                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
+                 if plan.sk_units and not htail and sync_plan is None:
+                     assert (
+                         plan.ws_f32_elems
+@@ -5517,6 +5564,46 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
+     )
+ 
+ 
++# longer than a cold-cache JIT build; the hang this test guards against never returns
++@pytest.mark.timeout(300)
++def test_pd2_stream_k_on_an_odd_k_completes():
++    """The dgrad of T = 1024, N = 1032, K = 1000 is one partial wave of 16 tiles of 17 K steps.  Two units per tile
++    would leave the last one without a K step, and the pd 2 program waits for that unit's accumulator forever; the
++    planner plans the 31 units that hold one."""
++    if not _device_supported():
++        pytest.skip(
++            "requires a device with a registered generated instance "
++            "(compute capability 10.0 or 10.7)"
++        )
++    device = torch.device("cuda")
++    g = torch.Generator(device=device).manual_seed(SEED + 11)
++    T, N, K = 1024, 1032, 1000
++    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
++    W = (torch.randn(N, K, device=device, generator=g) * N**-0.5).to(torch.bfloat16)
++    v = dict(
++        A=G,
++        B=W,
++        out=torch.full((T, K), float("nan"), device=device, dtype=torch.bfloat16),
++    )
++    knobs = _registered_knobs(
++        v,
++        dict(pd=2, slots=2, epi="tma"),
++        dict(pd=2, slots=2, epi="tma", pro=15),
++        dict(pd=2, slots=1, epi="tma", pro=15),
++    )
++    prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"], **knobs)
++    plan = prepared.plan
++    assert plan.pd == 2 and plan.k_blocks == 17 and plan.tail_tiles * 2 <= plan.sm_pairs
++    assert (
++        (plan.sk_units - 1) * plan.iters_per_unit
++        < plan.sk_iters
++        < 2 * plan.tail_tiles * plan.iters_per_unit
++    )
++    prepared.launch()
++    torch.cuda.synchronize()
++    _check(v["out"], G.double() @ W.double())
++
++
+ def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
+     g = torch.Generator(device=device).manual_seed(seed)
+     X = torch.randn(T, K, device=device, generator=g)

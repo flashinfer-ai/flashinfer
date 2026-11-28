@@ -1,0 +1,1125 @@
+diff --git a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
+index 013f2c209ed..500505a012e 100644
+--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
+@@ -106,7 +106,7 @@ __global__ void activationKernel(KernelParams params) {
+   }
+ #endif
+ 
+-  for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z) {
++  for (int tokenIdx = blockIdx.z; tokenIdx < activeTokenCount(params); tokenIdx += gridDim.z) {
+     // Look over experts per token
+     for (int k = blockIdx.y; k < params.topK; k += gridDim.y) {
+       int const expandedIdx = tokenIdx * params.topK + k;
+@@ -267,7 +267,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
+ 
+   // Loop over tokens
+   for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
+-    for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < params.numTokens;
++    for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < activeTokenCount(params);
+          tokenCtaIdx += gridDim.y * NumTokensPerCta) {
+       for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
+            hiddenIdx += blockDim.x * gridDim.x) {
+@@ -287,7 +287,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
+ #pragma unroll
+         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+           int const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+-          if (tokenIdx >= params.numTokens) {
++          if (tokenIdx >= activeTokenCount(params)) {
+             break;
+           }
+ 
+@@ -335,7 +335,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
+         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+           if (threadIdx.x == 0) {
+             auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+-            if (tokenIdx >= params.numTokens) {
++            if (tokenIdx >= activeTokenCount(params)) {
+               break;
+             }
+             int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+@@ -357,7 +357,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
+ #pragma unroll
+         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+           auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+-          if (tokenIdx >= params.numTokens) {
++          if (tokenIdx >= activeTokenCount(params)) {
+             break;
+           }
+           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+@@ -677,6 +677,7 @@ namespace tg = batchedGemm::trtllm::gen;
+ template <typename KernelParams>
+ __global__ void finalizeKernel(KernelParams params) {
+   using Type = typename KernelParams::Type;
++  using TypeOut = typename KernelParams::TypeOut;
+   using TypeExpW = typename KernelParams::TypeExpW;
+ 
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+@@ -686,7 +687,7 @@ __global__ void finalizeKernel(KernelParams params) {
+   }
+ #endif
+ 
+-  for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
++  for (int tokenIdx = blockIdx.y; tokenIdx < activeTokenCount(params); tokenIdx += gridDim.y) {
+     // Loop over hidden dim
+     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
+          hiddenIdx += blockDim.x * gridDim.x) {
+@@ -711,7 +712,7 @@ __global__ void finalizeKernel(KernelParams params) {
+         }
+       }
+ 
+-      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
++      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<TypeOut>(data);
+     }
+   }
+ }
+@@ -841,6 +842,7 @@ struct FinalizeTraits<4, TypeExpW_> {
+ template <typename KernelParams>
+ __global__ void finalizeKernelVecLoad(KernelParams params) {
+   using Type = typename KernelParams::Type;
++  using TypeOut = typename KernelParams::TypeOut;
+   using TypeExpW = typename KernelParams::TypeExpW;
+   int constexpr TopKUnrollFactor = KernelParams::TopKUnrollFactor;
+ 
+@@ -860,10 +862,9 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
+   // Load 128-bits per thread, according to the smallest data type we read/write
+   constexpr int64_t FINALIZE_ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<Type>::value;
+   using InputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
+-  using OutputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
++  using OutputElem = cutlass::Array<TypeOut, FINALIZE_ELEM_PER_THREAD>;
+   using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+ 
+-  int64_t const tokenIdx = blockIdx.x;
+   int64_t const startOffset = threadIdx.x;
+   int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+   int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
+@@ -873,23 +874,8 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
+   __shared__ ScalePackedType scaleArrSmem[MaxTopK / TopKUnrollFactor];
+   __shared__ IdxPackedType permutedIdxArrSmem[MaxTopK / TopKUnrollFactor];
+ 
+-  for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
+-       kChunkIdx += blockDim.x) {
+-    int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
+-    auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(
+-        params.expandedIdxToPermutedIdx)[expandedIdx / TopKUnrollFactor];
+-    auto scalePacked = useScale ? reinterpret_cast<ScalePackedType const*>(
+-                                      params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
+-                                : ScalePackedType{TypeExpW(1.f)};
+-
+-    scaleArrSmem[kChunkIdx] = scalePacked;
+-    permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
+-  }
+-
+-  auto const offset = tokenIdx * params.hiddenDim;
+-  Type* outputPtr = params.outPtr + offset;
+-  auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
+   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
++  int64_t const numLiveTokens = activeTokenCount(params);
+ 
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+   // wait on primary kernel when using PDL
+@@ -897,44 +883,69 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
+     cudaGridDependencySynchronize();
+   }
+ #endif
+-  __syncthreads();
+-
+-  for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride) {
+-    ComputeElem threadOutput;
+-    threadOutput.fill(0);
+-    for (int kChunkIdx = 0; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx++) {
+-      auto permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxArrSmem[kChunkIdx]);
+-      InputElem inputElemArr[TopKUnrollFactor];
++
++  // One block per live token per iteration; the launcher sizes the grid by the SM count when a
++  // device token count is given, so no block is spent on the rows past it.
++  for (int64_t tokenIdx = blockIdx.x; tokenIdx < numLiveTokens; tokenIdx += gridDim.x) {
++    for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
++         kChunkIdx += blockDim.x) {
++      int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
++      auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(
++          params.expandedIdxToPermutedIdx)[expandedIdx / TopKUnrollFactor];
++      auto scalePacked = useScale ? reinterpret_cast<ScalePackedType const*>(
++                                        params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
++                                  : ScalePackedType{TypeExpW(1.f)};
++
++      scaleArrSmem[kChunkIdx] = scalePacked;
++      permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
++    }
++
++    auto const offset = tokenIdx * params.hiddenDim;
++    TypeOut* outputPtr = params.outPtr + offset;
++    auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
++
++    __syncthreads();
++
++    for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride) {
++      ComputeElem threadOutput;
++      threadOutput.fill(0);
++      for (int kChunkIdx = 0; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx++) {
++        auto permutedIdxArr =
++            *reinterpret_cast<IdxArrayType const*>(&permutedIdxArrSmem[kChunkIdx]);
++        InputElem inputElemArr[TopKUnrollFactor];
+ #pragma unroll
+-      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+-        auto const permutedIdx = permutedIdxArr[ki];
+-        if (permutedIdx == -1) {
+-          continue;
+-        }
++        for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
++          auto const permutedIdx = permutedIdxArr[ki];
++          if (permutedIdx == -1) {
++            continue;
++          }
+ 
+-        auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
++          auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
+ 
+-        float4 input =
+-            vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
+-        inputElemArr[ki] = *reinterpret_cast<InputElem const*>(&input);
+-      }
+-      auto scaleArr = *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[kChunkIdx]);
+-      auto const scaleFloatArr =
+-          arrayConvert<ScaleArrayType, cutlass::Array<float, TopKUnrollFactor>>(scaleArr);
++          float4 input =
++              vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
++          inputElemArr[ki] = *reinterpret_cast<InputElem const*>(&input);
++        }
++        auto scaleArr = *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[kChunkIdx]);
++        auto const scaleFloatArr =
++            arrayConvert<ScaleArrayType, cutlass::Array<float, TopKUnrollFactor>>(scaleArr);
+ 
+ #pragma unroll
+-      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+-        auto const permutedIdx = permutedIdxArr[ki];
+-        if (permutedIdx == -1) {
+-          continue;
++        for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
++          auto const permutedIdx = permutedIdxArr[ki];
++          if (permutedIdx == -1) {
++            continue;
++          }
++          auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
++          ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
++          threadOutput = threadOutput + scale * expertResult;
+         }
+-        auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
+-        ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
+-        threadOutput = threadOutput + scale * expertResult;
+       }
++      OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
++      outElemPtr[elemIndex] = outputElem;
+     }
+-    OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
+-    outElemPtr[elemIndex] = outputElem;
++    // The next token refills the shared index / scale arrays.
++    __syncthreads();
+   }
+ }
+ 
+@@ -955,7 +966,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
+   }
+ #endif
+ 
+-  for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
++  for (int tokenIdx = blockIdx.y; tokenIdx < activeTokenCount(params); tokenIdx += gridDim.y) {
+     // Loop over hidden dim
+     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
+          hiddenIdx += blockDim.x * gridDim.x) {
+@@ -1004,6 +1015,10 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ void run(Data const& data, void* stream) {
++  FLASHINFER_CHECK(data.mDtypeOut == tg::Dtype::Void || data.mDtypeOut == data.mDtypeElt ||
++                       (data.mDtypeOut == tg::Dtype::Fp32 && !data.mUseDeepSeekFp8 &&
++                        data.mDtypeElt != tg::Dtype::E4m3),
++                   "finalize: fp32 output needs bf16 / fp16 inputs");
+   if (data.mUseDeepSeekFp8) {
+     int const numThreads = 128;
+     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
+@@ -1031,7 +1046,19 @@ void run(Data const& data, void* stream) {
+           data.topK <= MaxTopK,
+           "Finalize kernel with vectorized loading is not supported for this TopK value: %d",
+           data.topK);
+-      LAUNCH_TOPK_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
++      // With a device token count the kernel strides over the live tokens, so a persistent grid
++      // (8 blocks per SM) replaces the one-block-per-buffer-row launch.
++      int numBlocksVec = data.numTokens;
++      if (data.numActiveTokensPtr != nullptr) {
++        static int const numSms = [] {
++          int device = 0, sms = 0;
++          CHECK_CUDA_ERROR(cudaGetDevice(&device));
++          CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
++          return sms;
++        }();
++        numBlocksVec = std::min(data.numTokens, 8 * numSms);
++      }
++      LAUNCH_TOPK_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/numBlocksVec,
+                        /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+     }
+   }
+diff --git a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh
+index ab09423d4c2..3f42ae968f7 100644
+--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh
+@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
+   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+   int32_t const laneIdx = cutlass::arch::LaneId();
+   auto scoreOffset = warpIdx * params.mNumExperts;
+-  bool validToken = warpIdx < params.mNumTokens;
++  bool validToken = warpIdx < routingActiveTokenCount(params);
+ 
+   static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
+   static constexpr int totalExpertCounts = BlockKernelMaxNumTokens * MaxNumExperts;
+@@ -283,7 +283,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
+     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+   }
+ 
+-  for (int tokenIdx = 0; tokenIdx < params.mNumTokens; tokenIdx++) {
++  for (int tokenIdx = 0; tokenIdx < routingActiveTokenCount(params); tokenIdx++) {
+ #pragma unroll
+     for (int e = 0; e < ExpertsPerThread; e++) {
+       int expert = threadIdx.x * ExpertsPerThread + e;
+@@ -423,7 +423,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
+   int32_t const numWarps = blockDim.x / WarpSize;
+ 
+   extern __shared__ char dynSmem[];
+-  int const numSlots = params.mNumTokens * MaxNumExperts;
++  int const numSlots = routingActiveTokenCount(params) * MaxNumExperts;
+   int8_t* smemKIdx = reinterpret_cast<int8_t*>(dynSmem);
+   int16_t* smemOffset = reinterpret_cast<int16_t*>(dynSmem + numSlots);
+   char* warpBase = dynSmem + numSlots + numSlots * 2;
+@@ -446,7 +446,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
+ #endif
+ 
+   // Phase 1: TopK — one warp per token (loop when numTokens > numWarps)
+-  for (int tokenIdx = warpIdx; tokenIdx < params.mNumTokens; tokenIdx += numWarps) {
++  for (int tokenIdx = warpIdx; tokenIdx < routingActiveTokenCount(params); tokenIdx += numWarps) {
+     if (params.mPtrTopKIds != nullptr) {
+       if (laneIdx < params.mTopK) {
+         auto const expandedIdx = tokenIdx * params.mTopK + laneIdx;
+@@ -514,7 +514,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
+       accExpertCount[e] = 0;
+       if (isLocal) {
+         int offset = expert;
+-        for (int j = 0; j < params.mNumTokens; j++) {
++        for (int j = 0; j < routingActiveTokenCount(params); j++) {
+           if (smemKIdx[offset] >= 0) {
+             smemOffset[offset] = static_cast<int16_t>(accExpertCount[e]);
+             accExpertCount[e]++;
+@@ -619,7 +619,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
+ 
+   // Phase 5: Permutation
+   if (threadIdx.x < NumThreadsExperts) {
+-    for (int tokenIdx = 0; tokenIdx < params.mNumTokens; tokenIdx++) {
++    for (int tokenIdx = 0; tokenIdx < routingActiveTokenCount(params); tokenIdx++) {
+ #pragma unroll
+       for (int e = 0; e < ExpertsPerThread; e++) {
+         int expert = threadIdx.x * ExpertsPerThread + e;
+@@ -740,7 +740,7 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
+   int32_t const laneIdx = cutlass::arch::LaneId();
+   auto warpTokenIdx = clusterBlockRank * ClusterNumWarps + warpIdx;
+   auto scoreOffset = warpTokenIdx * params.mNumExperts;
+-  bool validToken = warpTokenIdx < params.mNumTokens;
++  bool validToken = warpTokenIdx < routingActiveTokenCount(params);
+   auto block = cg::this_thread_block();
+   auto warp = cg::tiled_partition<WarpSize>(block);
+ 
+@@ -1035,7 +1035,8 @@ __global__ void __launch_bounds__(
+ 
+   // in this case, each warp represents a token, and we use a grid-stride loop
+   // over all warps/tokens
+-  for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
++  for (int tokenIdx = globalWarpIdx; tokenIdx < routingActiveTokenCount(params);
++       tokenIdx += globalWarpStride) {
+     auto scoreOffset = tokenIdx * params.mNumExperts;
+ 
+     BaseType laneTopKScore;
+diff --git a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu
+index 0df6c150974..0a1ee6f2ce4 100644
+--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu
+@@ -111,7 +111,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
+     // if we use `mPtrScores` as input, we need to perform the top-1 reduction
+     // for each token, we load the scores then use `reduceTopK` for this.
+     // each thread works on 4 experts, so a local reduction is done before
+-    for (int tokenIdx = 0; tokenIdx < params.mNumTokens; ++tokenIdx) {
++    for (int tokenIdx = 0; tokenIdx < routingActiveTokenCount(params); ++tokenIdx) {
+       auto scoreOffset = tokenIdx * params.mNumExperts;
+       int32_t warpMaxExpertIdx[MaxNumTopExperts];
+       InputT warpMaxScore[MaxNumTopExperts];
+@@ -145,12 +145,12 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
+     static_assert(WarpKernelMaxNumTokens <= WarpSize);
+     TypePacked scoreIdx = TypePacked{};
+     if (params.mPtrTopKIds != nullptr) {
+-      if (threadIdx.x < params.mNumTokens) {
++      if (threadIdx.x < routingActiveTokenCount(params)) {
+         scoreIdx = TypePacked{static_cast<OutputT>(params.mPtrTopKWeights[threadIdx.x]),
+                               static_cast<int16_t>(params.mPtrTopKIds[threadIdx.x])};
+       }
+     } else {
+-      if (threadIdx.x < params.mNumTokens) {
++      if (threadIdx.x < routingActiveTokenCount(params)) {
+         scoreIdx = TypePacked{static_cast<OutputT>(params.mPtrTopKPacked[threadIdx.x].score),
+                               static_cast<int16_t>(params.mPtrTopKPacked[threadIdx.x].idx)};
+         if (params.mPtrTopKWeights != nullptr) {
+@@ -163,7 +163,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
+ 
+     int32_t expertTokenCount = 0;
+     setBits</* IsZero= */ true>(expertTokenCount, 1, scoreIdx.idx % ExpertsPerThread);
+-    if (threadIdx.x < params.mNumTokens) {
++    if (threadIdx.x < routingActiveTokenCount(params)) {
+       smemExpertTokenCountFull[threadIdx.x][scoreIdx.idx / ExpertsPerThread] = expertTokenCount;
+       if (params.mPtrRoutingReplayOut != nullptr) {
+         params.mPtrRoutingReplayOut[threadIdx.x] = scoreIdx.idx;
+@@ -181,10 +181,11 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
+   int32_t expertOffset[WarpKernelMaxNumTokens + 1];
+ #pragma unroll
+   for (int tokenIdx = 0; tokenIdx < WarpKernelMaxNumTokens + 1; ++tokenIdx) {
+-    if (tokenIdx > params.mNumTokens) break;
++    if (tokenIdx > routingActiveTokenCount(params)) break;
+     // simple reduction for `expertCount`, and scan for `expertOffset`
+-    auto expertTokenCount =
+-        tokenIdx < params.mNumTokens ? smemExpertTokenCountFull[tokenIdx][threadIdx.x] : 0;
++    auto expertTokenCount = tokenIdx < routingActiveTokenCount(params)
++                                ? smemExpertTokenCountFull[tokenIdx][threadIdx.x]
++                                : 0;
+     expertOffset[tokenIdx] = expertCount;
+     expertCount += expertTokenCount;
+   }
+@@ -296,7 +297,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
+     // based on whether the offset for that token changed.
+     // we can then easily compute the final `expertIdx` and `permutedIdx` relative
+     // to this token and expert, and write them out.
+-    if (tokenIdx >= params.mNumTokens) break;
++    if (tokenIdx >= routingActiveTokenCount(params)) break;
+ 
+ #pragma unroll
+     for (int ii = 0; ii < ExpertsPerThread; ++ii) {
+@@ -351,7 +352,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
+   // TODO(mjoux): expand to more tokens (possibly)
+   auto warpTokenIdx = clusterBlockRank * NumWarps + warpIdx;
+   auto scoreOffset = warpTokenIdx * params.mNumExperts;
+-  bool validToken = warpTokenIdx < params.mNumTokens;
++  bool validToken = warpTokenIdx < routingActiveTokenCount(params);
+   InputT minScore = InputT{-INFINITY};
+ 
+   auto block = cg::this_thread_block();
+@@ -453,7 +454,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
+ 
+   // in this case, each warp represents a token, and we use a grid-stride loop
+   // over all warps/tokens
+-  for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
++  for (int tokenIdx = globalWarpIdx; tokenIdx < routingActiveTokenCount(params);
++       tokenIdx += globalWarpStride) {
+     auto scoreOffset = tokenIdx * params.mNumExperts;
+     int32_t warpMaxExpertIdx[MaxNumTopExperts];
+     InputT warpMaxScore[MaxNumTopExperts];
+diff --git a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu
+index e5e01da7d7a..19a53a224af 100644
+--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu
+@@ -61,7 +61,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
+                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
+                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
+-                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
++                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl,
++                 int32_t const* numActiveTokensPtr) {
+   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
+     // Only the grouped DeepSeek kernel below populates the fused shared-expert
+     // slots; routingCustom leaves them untouched, so reject rather than return
+@@ -103,6 +104,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
+     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+ 
+     routingData.mNumTokens = numTokens;
++    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
+     routingData.mNumExperts = numExperts;
+     routingData.mTopK = topK;
+     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+@@ -146,6 +148,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
+     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+ 
+     routingData.mNumTokens = numTokens;
++    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
+     routingData.mNumExperts = numExperts;
+     routingData.mTopK = topK;
+     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+@@ -187,6 +190,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
+     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+     routingData.mPtrTopKIds = expertIds;
+     routingData.mNumTokens = numTokens;
++    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
+     routingData.mNumExperts = numExperts;
+     routingData.mNumFusedSharedExperts = numFusedSharedExpert;
+     routingData.mNumExpertGroups = nGroup;
+@@ -247,6 +251,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
+     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+     routingData.mPtrTopKIds = expertIds;
+     routingData.mNumTokens = numTokens;
++    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
+     routingData.mNumExperts = numExperts;
+     routingData.mTopK = topK;
+     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+@@ -338,6 +343,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
+     // Inputs
+     //
+     routingData.mNumTokens = numTokens;
++    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
+     routingData.mNumExperts = numExperts;
+     routingData.mTopK = topK;
+     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+diff --git a/csrc/trtllm_fused_moe_kernel_launcher.cu b/csrc/trtllm_fused_moe_kernel_launcher.cu
+index 7388e5e7df1..130873f8a18 100644
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -1699,7 +1699,7 @@ class FusedMoeLauncher {
+         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+         use_routing_scales_on_input, use_deep_seek_fp8,
+         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+-        norm_topk_prob, replay_ptr, enable_pdl);
++        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -2155,7 +2155,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
+         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+         use_routing_scales_on_input, routing_use_deep_seek_fp8(),
+         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+-        norm_topk_prob, replay_ptr, enable_pdl);
++        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
+   }
+ 
+   Tensor expert_weights_tensor() const { return FusedMoeLauncher::expert_weights; }
+@@ -4530,7 +4530,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
+         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+         use_routing_scales_on_input, use_deep_seek_fp8,
+         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+-        norm_topk_prob, replay_ptr, enable_pdl);
++        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -5230,23 +5230,23 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
+       replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
+     }
+ 
+-    routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
+-                       args->num_experts, args->top_k, args->num_fused_shared_experts,
+-                       args->n_group, args->topk_group, args->local_expert_offset,
+-                       args->local_num_experts, args->routed_scaling_factor,
+-                       static_cast<int*>(topk_ids.data_ptr()),
+-                       static_cast<int*>(expert_count_histogram.data_ptr()),
+-                       static_cast<int*>(total_num_padded_tokens.data_ptr()),
+-                       static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+-                       static_cast<int*>(permuted_idx_to_expanded_idx_ptr()),
+-                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
+-                       expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
+-                       static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+-                       static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+-                       static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
+-                       mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
+-                       static_cast<RoutingMethodType>(routing_method_type), routing_stream,
+-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
++    routing_runner.run(
++        args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
++        args->num_fused_shared_experts, args->n_group, args->topk_group, args->local_expert_offset,
++        args->local_num_experts, args->routed_scaling_factor,
++        static_cast<int*>(topk_ids.data_ptr()),
++        static_cast<int*>(expert_count_histogram.data_ptr()),
++        static_cast<int*>(total_num_padded_tokens.data_ptr()),
++        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
++        static_cast<int*>(permuted_idx_to_expanded_idx_ptr()),
++        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
++        expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
++        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
++        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
++        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
++        use_routing_scales_on_input, use_deep_seek_fp8,
++        static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
++        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -5750,7 +5750,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
+     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
+     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
++    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
++    Optional<TensorView> num_active_tokens) {
+   auto activation_type = validateAndCastActivationType(act_type);
+   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                                              quantization_type, activation_type);
+@@ -5818,6 +5819,22 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
+ 
+   auto const num_tokens = hidden_states.size(0);
+   auto const hidden_size = hidden_states.size(1);
++  int32_t const* num_active_tokens_ptr = nullptr;
++  if (num_active_tokens.has_value()) {
++    TVM_FFI_ICHECK_EQ(num_active_tokens.value().dtype(), dl_int32)
++        << "num_active_tokens must be int32.";
++    TVM_FFI_ICHECK_EQ(num_active_tokens.value().numel(), 1)
++        << "num_active_tokens must hold a single count.";
++    TVM_FFI_ICHECK_EQ(num_active_tokens.value().device().device_id,
++                      hidden_states.device().device_id)
++        << "num_active_tokens must live on the hidden_states device.";
++    num_active_tokens_ptr = static_cast<int32_t const*>(num_active_tokens.value().data_ptr());
++  }
++  // A float32 output is produced by the finalize converting on store; GEMM2 still runs bf16.
++  TVM_FFI_ICHECK(output.dtype() == dl_bfloat16 || output.dtype() == dl_float32)
++      << "output must be bfloat16 or float32.";
++  btg::Dtype const finalize_out_dtype =
++      output.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Void;
+   TVM_FFI_ICHECK(!(gemm1_lora_delta.has_value() && gemm1_bias.has_value()))
+       << "gemm1_lora_delta and per-expert gemm1_bias cannot both be provided.";
+   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
+@@ -5869,6 +5886,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
+     args->do_finalize = do_finalize;
+     args->output = output.data_ptr();
+     args->output_scale = nullptr;
++    args->num_active_tokens_ptr = num_active_tokens_ptr;
++    args->mDtypeFinalizeOut = finalize_out_dtype;
+     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
+ 
+     // Create and initialize launcher for this tile size
+diff --git a/csrc/trtllm_fused_moe_runner.cu b/csrc/trtllm_fused_moe_runner.cu
+index 56a560d7c45..f0b8940440d 100644
+--- a/csrc/trtllm_fused_moe_runner.cu
++++ b/csrc/trtllm_fused_moe_runner.cu
+@@ -515,6 +515,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
+       args.intermediate_size * (isGatedActivation(args.activation_type) ? 2 : 1);
+   activationData.topK = totalExpertsPerToken;
+   activationData.numTokens = args.num_tokens;
++  activationData.numActiveTokensPtr = args.num_active_tokens_ptr;
+   activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
+ 
+   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
+@@ -531,6 +532,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
+   if (args.do_finalize) {
+     // Setup finalize data
+     finalizeData.mDtypeElt = args.mDtypeOut;
++    finalizeData.mDtypeOut = args.mDtypeFinalizeOut;
++    finalizeData.numActiveTokensPtr = args.num_active_tokens_ptr;
+     finalizeData.mDtypeExpW = args.mDtypeExpW;
+     finalizeData.mUsePdl = enablePdl;
+     finalizeData.mUseDeepSeekFp8 = false;
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index 3efb0921efc..ade4aab6da6 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -3117,6 +3117,7 @@ def trtllm_fp8_block_scale_moe_op(
+         routing_replay_out: Optional[torch.Tensor] = None,
+         valid_hidden_size: Optional[int] = None,
+         valid_intermediate_size: Optional[int] = None,
++        num_active_tokens: Optional[torch.Tensor] = None,
+     ) -> List[torch.Tensor]:
+         # Determine routing mode: compute from logits or use pre-computed
+         if routing_logits is None:
+@@ -3152,10 +3153,15 @@ def trtllm_fp8_block_scale_moe_op(
+                 num_tokens, output_width, do_finalize, hidden_states.device
+             )
+         elif do_finalize:
++            # bf16 is the kernel's native output; fp32 is converted on the finalize store.
++            if output.dtype not in (torch.bfloat16, torch.float32):
++                raise ValueError(
++                    f"output must be bfloat16 or float32, got {output.dtype}"
++                )
+             check_shape_dtype_device(
+                 output,
+                 None,
+-                torch.bfloat16,
++                output.dtype,
+                 hidden_states.device,
+                 "output",
+             )
+@@ -3334,6 +3340,7 @@ def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
+                 False,
+                 valid_hidden_size,
+                 valid_intermediate_size,
++                num_active_tokens,
+             )
+             # Reconstruct the public result without exposing dtype-specific body workspaces.
+             return _unpack_trtllm_moe_output(
+@@ -3436,9 +3443,10 @@ def _fake_trtllm_fp8_block_scale_moe(
+         routing_replay_out: Optional[torch.Tensor] = None,
+         valid_hidden_size: Optional[int] = None,
+         valid_intermediate_size: Optional[int] = None,
++        num_active_tokens: Optional[torch.Tensor] = None,
+     ) -> List[torch.Tensor]:
+         # Acknowledge mutation-only and fallback-only controls without executing the native op.
+-        _ = routing_replay_out, valid_intermediate_size
++        _ = routing_replay_out, valid_intermediate_size, num_active_tokens
+         # GEMM2 computes roundUp(valid_hidden_size, 128) columns, but finalize hands
+         # back only the leading valid_hidden_size of them -- mirror the eager op so
+         # torch.compile sees the same output shape.
+@@ -5877,6 +5885,7 @@ def trtllm_fp8_block_scale_moe(
+     *,
+     gemm1_bias: Optional[torch.Tensor] = None,
+     gemm2_bias: Optional[torch.Tensor] = None,
++    num_active_tokens: Optional[torch.Tensor] = None,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""FP8 block-scaled MoE operation.
+ 
+@@ -6028,6 +6037,15 @@ def trtllm_fp8_block_scale_moe(
+         (keyword-only).  This tensor must be in the same row layout as
+         ``gemm2_weights``.
+ 
++    num_active_tokens : Optional[torch.Tensor]
++        Device int32 scalar: the number of leading rows of ``hidden_states`` that hold
++        tokens. The routing, activation and finalize kernels skip the rows at or beyond it
++        (their routing ids may be stale) and leave them untouched in ``output``, and the
++        finalize runs a persistent grid sized by the SM count. Use it when a CUDA graph is
++        captured over a fixed-size buffer whose live prefix changes from step to step.
++        ``None`` treats every row as live. Pass a ``float32`` ``output`` to have the
++        finalize write fp32 directly.
++
+     Returns
+     -------
+     torch.Tensor or List[torch.Tensor]
+@@ -6093,6 +6111,7 @@ def trtllm_fp8_block_scale_moe(
+         routing_replay_out,
+         valid_hidden_size,
+         valid_intermediate_size,
++        num_active_tokens,
+     )
+ 
+     if do_finalize:
+@@ -6137,6 +6156,7 @@ def trtllm_fp8_block_scale_routed_moe(
+     gemm1_clamp_limit: Optional[torch.Tensor] = None,
+     valid_hidden_size: Optional[int] = None,
+     valid_intermediate_size: Optional[int] = None,
++    num_active_tokens: Optional[torch.Tensor] = None,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""Pre-routed FP8 block-scaled MoE operation.
+ 
+@@ -6286,6 +6306,15 @@ def trtllm_fp8_block_scale_routed_moe(
+         ``intermediate_size`` is treated as padded and only the valid region is
+         computed.  Default ``None`` (use the full ``intermediate_size``).
+ 
++    num_active_tokens : Optional[torch.Tensor]
++        Device int32 scalar: the number of leading rows of ``hidden_states`` that hold
++        tokens. The routing, activation and finalize kernels skip the rows at or beyond it
++        (their routing ids may be stale) and leave them untouched in ``output``, and the
++        finalize runs a persistent grid sized by the SM count. Use it when a CUDA graph is
++        captured over a fixed-size buffer whose live prefix changes from step to step.
++        ``None`` treats every row as live. Pass a ``float32`` ``output`` to have the
++        finalize write fp32 directly.
++
+     Returns
+     -------
+     torch.Tensor or List[torch.Tensor]
+@@ -6341,6 +6370,7 @@ def trtllm_fp8_block_scale_routed_moe(
+         None,  # routing_replay_out is not exposed by this routed wrapper
+         valid_hidden_size,
+         valid_intermediate_size,
++        num_active_tokens,
+     )
+ 
+     if do_finalize and gemm1_lora_delta is None:
+diff --git a/include/flashinfer/trtllm/fused_moe/DevKernel.h b/include/flashinfer/trtllm/fused_moe/DevKernel.h
+index 15c4557d4b8..e7cd0ef5c24 100644
+--- a/include/flashinfer/trtllm/fused_moe/DevKernel.h
++++ b/include/flashinfer/trtllm/fused_moe/DevKernel.h
+@@ -48,6 +48,17 @@ namespace moe::dev {
+ 
+ #define LAUNCH_ESC(...) __VA_ARGS__
+ 
++#if defined(__CUDACC__)
++// Tokens the activation / finalize kernels visit: the host count, clamped by the optional device
++// count (rows at or beyond it hold no token).
++template <typename Params>
++__device__ __forceinline__ int32_t activeTokenCount(Params const& params) {
++  return params.numActiveTokensPtr == nullptr
++             ? params.numTokens
++             : min(params.numTokens, __ldg(params.numActiveTokensPtr));
++}
++#endif
++
+ #define LAUNCH_PDL(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream) \
+   cudaLaunchConfig_t config{};                                                               \
+   config.gridDim = numBlocks;                                                                \
+@@ -116,27 +127,46 @@ namespace moe::dev {
+     FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
+   }
+ 
+-#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                  \
+-  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                  \
+-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks,          \
+-               numThreads, smemSize, stream);                                                     \
+-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {           \
+-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float, topK), kernel, numBlocks,    \
+-               numThreads, smemSize, stream);                                                     \
+-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {       \
+-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float, topK), kernel, numBlocks,      \
+-               numThreads, smemSize, stream);                                                     \
+-  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
+-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t, topK), kernel,       \
+-               numBlocks, numThreads, smemSize, stream);                                          \
+-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
+-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t, topK), kernel, \
+-               numBlocks, numThreads, smemSize, stream);                                          \
+-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {   \
+-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t, topK), kernel,   \
+-               numBlocks, numThreads, smemSize, stream);                                          \
+-  } else {                                                                                        \
+-    FLASHINFER_WARN("Unsupported pair");                                                          \
++// Finalize launches: KernelParams<elt, out, expW, topK, pdl>. The output type is the element type
++// unless Data::mDtypeOut asks for fp32 (bf16 / fp16 elements only).
++#define LAUNCH_EXPW_TYPED(data, kernel, typeElt, typeOut, topK, numBlocks, numThreads, smemSize, \
++                          stream)                                                                \
++  if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                      \
++    LAUNCH_PDL(data, false, LAUNCH_ESC(typeElt, typeOut, float, topK), kernel, numBlocks,        \
++               numThreads, smemSize, stream);                                                    \
++  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                           \
++    LAUNCH_PDL(data, false, LAUNCH_ESC(typeElt, typeOut, cutlass::bfloat16_t, topK), kernel,     \
++               numBlocks, numThreads, smemSize, stream);                                         \
++  } else {                                                                                       \
++    FLASHINFER_WARN("Unsupported dtypeExpW");                                                    \
++  }
++
++#define LAUNCH_EXPW_ELT(data, kernel, typeElt, topK, numBlocks, numThreads, smemSize, stream) \
++  if (data.mDtypeOut == tg::Dtype::Fp32) {                                                    \
++    LAUNCH_EXPW_TYPED(data, kernel, typeElt, float, topK, numBlocks, numThreads, smemSize,    \
++                      stream);                                                                \
++  } else if (data.mDtypeOut == tg::Dtype::Void || data.mDtypeOut == data.mDtypeElt) {         \
++    LAUNCH_EXPW_TYPED(data, kernel, typeElt, typeElt, topK, numBlocks, numThreads, smemSize,  \
++                      stream);                                                                \
++  } else {                                                                                    \
++    FLASHINFER_WARN("Unsupported dtypeOut");                                                  \
++  }
++
++#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                   \
++  if (data.mDtypeElt == tg::Dtype::Fp16) {                                                         \
++    LAUNCH_EXPW_ELT(data, kernel, cutlass::half_t, topK, numBlocks, numThreads, smemSize, stream); \
++  } else if (data.mDtypeElt == tg::Dtype::E4m3) {                                                  \
++    if (data.mDtypeOut == tg::Dtype::Void || data.mDtypeOut == tg::Dtype::E4m3) {                  \
++      LAUNCH_EXPW_TYPED(data, kernel, cutlass::float_e4m3_t, cutlass::float_e4m3_t, topK,          \
++                        numBlocks, numThreads, smemSize, stream);                                  \
++    } else {                                                                                       \
++      FLASHINFER_WARN("Unsupported dtypeOut for e4m3 elements");                                   \
++    }                                                                                              \
++  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                              \
++    LAUNCH_EXPW_ELT(data, kernel, cutlass::bfloat16_t, topK, numBlocks, numThreads, smemSize,      \
++                    stream);                                                                       \
++  } else {                                                                                         \
++    FLASHINFER_WARN("Unsupported dtypeElt");                                                       \
+   }
+ 
+ #define LAUNCH_TOPK_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream) \
+@@ -174,6 +204,8 @@ struct Data {
+ 
+   int32_t innerDim;
+   int32_t numTokens;
++  // Optional device count of leading live tokens; see MoERunnerArgs::num_active_tokens_ptr.
++  int32_t const* numActiveTokensPtr = nullptr;
+   int32_t topK;
+   int32_t* expandedIdxToPermutedIdx;
+ 
+@@ -206,6 +238,7 @@ struct KernelParams {
+ 
+   int32_t innerDim;
+   int32_t numTokens;
++  int32_t const* numActiveTokensPtr = nullptr;
+   int32_t topK;
+   int32_t* expandedIdxToPermutedIdx;
+ 
+@@ -229,6 +262,7 @@ struct KernelParams {
+ 
+     params.innerDim = data.innerDim;
+     params.numTokens = data.numTokens;
++    params.numActiveTokensPtr = data.numActiveTokensPtr;
+     params.topK = data.topK;
+     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+ 
+@@ -375,6 +409,8 @@ namespace tg = batchedGemm::trtllm::gen;
+ 
+ struct Data {
+   tg::Dtype mDtypeElt{tg::Dtype::Fp16};
++  // Output element type: Void means mDtypeElt; Fp32 converts bf16 / fp16 inputs on store.
++  tg::Dtype mDtypeOut{tg::Dtype::Void};
+   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
+   bool mUsePdl{false};
+   bool mUseDeepSeekFp8{false};
+@@ -388,6 +424,8 @@ struct Data {
+   int32_t* expandedIdxToPermutedIdx;
+ 
+   int32_t numTokens;
++  // Optional device count of leading live tokens; rows at or beyond it are not written.
++  int32_t const* numActiveTokensPtr = nullptr;
+   int32_t numExperts;
+   int32_t topK;
+   // Final output row width of the MoE block.
+@@ -397,16 +435,18 @@ struct Data {
+   int32_t const* totalNumPaddedTokens;
+ };
+ 
+-template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UsePdl_>
++template <typename Type_, typename TypeOut_, typename TypeExpW_, int TopKUnrollFactor_,
++          bool UsePdl_>
+ struct KernelParams {
+   using Type = Type_;
++  using TypeOut = TypeOut_;
+   using TypeExpW = TypeExpW_;
+   static constexpr int TopKUnrollFactor = TopKUnrollFactor_;
+   static constexpr bool UsePdl = UsePdl_;
+ 
+   Type const* inPtr;
+   TypeExpW const* expertWeightsPtr;
+-  Type* outPtr;
++  TypeOut* outPtr;
+ 
+   float* inDqSfsPtr = nullptr;
+   float* outDqSfsPtr = nullptr;
+@@ -416,6 +456,7 @@ struct KernelParams {
+   int32_t hiddenDim;
+   int32_t hiddenDimPadded;
+   int32_t numTokens;
++  int32_t const* numActiveTokensPtr = nullptr;
+   int32_t numExperts;
+   int32_t topK;
+   int32_t const* totalNumPaddedTokens;
+@@ -425,7 +466,8 @@ struct KernelParams {
+ 
+     params.inPtr = (Type*)data.inPtr;
+     params.expertWeightsPtr = (TypeExpW*)data.expertWeightsPtr;
+-    params.outPtr = (Type*)data.outPtr;
++    params.outPtr = (TypeOut*)data.outPtr;
++    params.numActiveTokensPtr = data.numActiveTokensPtr;
+     params.inDqSfsPtr = data.inDqSfsPtr;
+     params.outDqSfsPtr = data.outDqSfsPtr;
+ 
+diff --git a/include/flashinfer/trtllm/fused_moe/RoutingKernel.cuh b/include/flashinfer/trtllm/fused_moe/RoutingKernel.cuh
+index 1da526728a8..9a1514b40b0 100644
+--- a/include/flashinfer/trtllm/fused_moe/RoutingKernel.cuh
++++ b/include/flashinfer/trtllm/fused_moe/RoutingKernel.cuh
+@@ -314,7 +314,7 @@ __device__ void routingPermutation(KernelParams params,
+   __shared__ typename Scan::TempStorage tempStorage;
+ 
+   uint32_t const clusterThreadIdx = NumThreads * clusterBlockRank + threadIdx.x;
+-  auto expandedIdxSize = params.mNumTokens * params.mTopK;
++  auto expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
+ 
+   // number of experts may exceed number of threads — size by MaxNumExperts
+   __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
+@@ -423,7 +423,8 @@ __device__ void routingPermutation(KernelParams params,
+ #pragma unroll
+       for (int rank = 0; rank < NumBlocksPerCluster; rank++) {
+         int32_t const* remoteSmem = cg::cluster_group::map_shared_rank(smemExpertCount, rank);
+-        expertCounts[rank] = rank * NumWarps < params.mNumTokens ? remoteSmem[expert] : 0;
++        expertCounts[rank] =
++            rank * NumWarps < routingActiveTokenCount(params) ? remoteSmem[expert] : 0;
+       }
+ 
+       // Compute an exclusive prefix sum of the block-local count.
+@@ -604,7 +605,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
+   }
+ #endif  // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+ 
+-  uint32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
++  uint32_t const expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
+   uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+ 
+   // Use NumThreadsBlock (actual thread count) for grid-stride addressing
+@@ -695,7 +696,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
+ 
+   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+ 
+-  uint32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
++  uint32_t const expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
+   uint32_t const numTiles =
+       (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
+ 
+@@ -1022,7 +1023,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
+ 
+   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+ 
+-  auto expandedIdxSize = params.mNumTokens * params.mTopK;
++  auto expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
+ 
+   // Expanded-index assignment. The default grid stride spreads one CTA's
+   // indices over the whole batch; since an expert's rows are laid out in CTA
+diff --git a/include/flashinfer/trtllm/fused_moe/RoutingKernel.h b/include/flashinfer/trtllm/fused_moe/RoutingKernel.h
+index f2b54d12590..2195a31d814 100644
+--- a/include/flashinfer/trtllm/fused_moe/RoutingKernel.h
++++ b/include/flashinfer/trtllm/fused_moe/RoutingKernel.h
+@@ -107,6 +107,10 @@ struct DataBase {
+   // Metadata
+   //
+   int32_t mNumTokens;
++  // Optional device int32 count of leading tokens that carry routing. Tokens at or beyond it are
++  // skipped (their ids may be stale), so a CUDA graph captured over a fixed buffer pays for the
++  // live prefix only. Null means every one of mNumTokens tokens is live.
++  int32_t const* mPtrNumActiveTokens{nullptr};
+   int32_t mNumExperts;
+   int32_t mTopK;
+   int32_t mTileTokensDim;
+@@ -157,6 +161,7 @@ struct KernelParamsBase {
+ 
+   // Public scalar members
+   int32_t mNumTokens = 0;
++  int32_t const* mPtrNumActiveTokens = nullptr;
+   int32_t mNumExperts = 0;
+ 
+   int32_t mPaddingLog2 = -1;
+@@ -198,6 +203,7 @@ struct KernelParamsBase {
+     mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
+ 
+     mNumTokens = data.mNumTokens;
++    mPtrNumActiveTokens = data.mPtrNumActiveTokens;
+     mNumExperts = data.mNumExperts;
+ 
+     mPaddingLog2 = data.mPaddingLog2;
+@@ -213,6 +219,16 @@ struct KernelParamsBase {
+   }
+ };
+ 
++#if defined(__CUDACC__)
++// Tokens that carry routing: the host count, clamped by the optional device count.
++template <typename KernelParams>
++__device__ __forceinline__ int32_t routingActiveTokenCount(KernelParams const& params) {
++  return params.mPtrNumActiveTokens == nullptr
++             ? params.mNumTokens
++             : min(params.mNumTokens, __ldg(params.mPtrNumActiveTokens));
++}
++#endif
++
+ namespace routingPrecomputed {
+ 
+ /// Maximum number of tile-specific metadata outputs fused into one routing launch.
+diff --git a/include/flashinfer/trtllm/fused_moe/runner.h b/include/flashinfer/trtllm/fused_moe/runner.h
+index a01ae2dbd10..733f74456f1 100644
+--- a/include/flashinfer/trtllm/fused_moe/runner.h
++++ b/include/flashinfer/trtllm/fused_moe/runner.h
+@@ -150,7 +150,8 @@ class Runner {
+            batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
+            bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
+            batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
+-           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
++           int16_t* routing_replay_out = nullptr, bool enable_pdl = true,
++           int32_t const* numActiveTokensPtr = nullptr);
+ 
+  private:
+   friend class MoE::Runner;
+@@ -409,6 +410,12 @@ struct MoERunnerArgs {
+   btg::Dtype mDtypeElt{btg::Dtype::Void};
+   btg::Dtype mDtypeExpW{btg::Dtype::Bfloat16};
+   btg::Dtype mDtypeOut{btg::Dtype::Bfloat16};
++  // Finalize output type: Void keeps mDtypeOut, Fp32 writes the finalized rows as fp32 (GEMM2
++  // still produces mDtypeOut; the finalize converts on store).
++  btg::Dtype mDtypeFinalizeOut{btg::Dtype::Void};
++  // Optional device int32 count of leading live tokens, see Routing DataBase::mPtrNumActiveTokens.
++  // Routing, activation and finalize skip the rows at or beyond it.
++  int32_t const* num_active_tokens_ptr{nullptr};
+ 
+   // Apply routing scale factors to input activations
+   bool mUseRoutingScalesOnInput{false};
+diff --git a/tests/moe/test_trtllm_gen_fused_moe.py b/tests/moe/test_trtllm_gen_fused_moe.py
+index 0a61127f073..a5a7ff01f5e 100644
+--- a/tests/moe/test_trtllm_gen_fused_moe.py
++++ b/tests/moe/test_trtllm_gen_fused_moe.py
+@@ -3998,3 +3998,103 @@ def test_moe_lora_delta(
+     assert (real_reference - zero_reference).abs().max().item() > 0.05
+     # Kernel matches the dequant reference (delta injected on both sides).
+     check_accuracy(real_reference, real_actual, **moe_impl.get_tolerances())
++
++
++@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
++def test_fp8_block_scale_routed_num_active_tokens(output_dtype):
++    """Routed MXFP8 MoE with a device token count: rows at or beyond it carry stale local ids and
++    must be ignored and left untouched; the live rows match the unbounded call; fp32 output is the
++    bf16 result converted on the finalize store."""
++    compute_capability = get_compute_capability(torch.device(device="cuda"))
++    if compute_capability[0] not in [10]:
++        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
++
++    torch.manual_seed(0)
++    device = torch.device("cuda:0")
++    num_tokens, num_active = 64, 40
++    hidden_size, intermediate_size, num_experts, top_k = 512, 512, 64, 8
++    local_expert_offset, local_num_experts = 16, 16
++    activation_type = ActivationType.Relu2.value
++    fp8_quantization_type = Fp8QuantizationType.MxFp8
++
++    routing_logits = torch.randn((num_tokens, num_experts), device=device).to(
++        torch.bfloat16
++    )
++    hidden_states = torch.randn((num_tokens, hidden_size), device=device).to(
++        torch.bfloat16
++    )
++    gemm1_weights = torch.randn(
++        (num_experts, intermediate_size, hidden_size),
++        device=device,
++        dtype=torch.bfloat16,
++    )
++    gemm2_weights = torch.randn(
++        (num_experts, hidden_size, intermediate_size),
++        device=device,
++        dtype=torch.bfloat16,
++    )
++    quant_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
++    quant_weights = quant_impl.quantize_weights(
++        gemm1_weights, gemm2_weights, hidden_states
++    )
++    quant_inputs = quant_impl.quantize_inputs(hidden_states)
++    permute_info, expert_weights_full = routing_reference_renormalize(
++        routing_logits, top_k, num_experts, 8
++    )
++    topk_ids = permute_info["topKIndices"].to(torch.int32)
++    expert_weights = expert_weights_full.view(num_tokens, num_experts)[
++        torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
++    ].to(torch.bfloat16)
++    # Stale rows beyond the live prefix route to local experts; they must not be read.
++    topk_ids[num_active:] = local_expert_offset
++    packed_topk_ids = pack_topk_for_routed_moe(topk_ids, expert_weights)
++
++    local_slice = slice(local_expert_offset, local_expert_offset + local_num_experts)
++    common = dict(
++        routing_bias=None,
++        gemm1_weights=quant_weights["gemm1_weights"][local_slice].contiguous(),
++        gemm1_weights_scale=quant_weights["gemm1_scales"][local_slice].contiguous(),
++        gemm2_weights=quant_weights["gemm2_weights"][local_slice].contiguous(),
++        gemm2_weights_scale=quant_weights["gemm2_scales"][local_slice].contiguous(),
++        num_experts=num_experts,
++        top_k=top_k,
++        n_group=None,
++        topk_group=None,
++        intermediate_size=intermediate_size,
++        local_expert_offset=local_expert_offset,
++        local_num_experts=local_num_experts,
++        routed_scaling_factor=None,
++        routing_method_type=RoutingMethodType.Renormalize.value,
++        use_shuffled_weight=True,
++        weight_layout=WeightLayout.MajorK.value,
++        enable_pdl=True,
++        fp8_quantization_type=fp8_quantization_type,
++        activation_type=activation_type,
++    )
++    reference = trtllm_fp8_block_scale_routed_moe(
++        topk_ids=packed_topk_ids[:num_active].contiguous(),
++        hidden_states=quant_inputs["hidden_states"][:num_active].contiguous(),
++        hidden_states_scale=quant_inputs["hidden_states_scale"][
++            :num_active
++        ].contiguous(),
++        **common,
++    ).to(torch.float)
++
++    output = torch.full(
++        (num_tokens, hidden_size), 7.0, dtype=output_dtype, device=device
++    )
++    num_active_tokens = torch.tensor([num_active], dtype=torch.int32, device=device)
++    result = trtllm_fp8_block_scale_routed_moe(
++        topk_ids=packed_topk_ids,
++        hidden_states=quant_inputs["hidden_states"],
++        hidden_states_scale=quant_inputs["hidden_states_scale"],
++        output=output,
++        num_active_tokens=num_active_tokens,
++        **common,
++    )
++    assert result is output
++    live = output[:num_active].to(torch.bfloat16).to(torch.float)
++    close = torch.isclose(reference, live, atol=1e-2, rtol=1e-2)
++    mismatch_pct = (~close).float().mean().item() * 100
++    assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
++    assert torch.equal(output[num_active:], torch.full_like(output[num_active:], 7.0))

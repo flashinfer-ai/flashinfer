@@ -1,0 +1,33 @@
+diff --git a/flashinfer/fused_moe/runners.py b/flashinfer/fused_moe/runners.py
+index dd71a7c607d..ef23becb633 100644
+--- a/flashinfer/fused_moe/runners.py
++++ b/flashinfer/fused_moe/runners.py
+@@ -8442,10 +8442,7 @@ def pack_inputs(
+         self, act: MoEActivationPack, weights: MoEWeightPack
+     ) -> List[torch.Tensor]:
+         self._require_built()
+-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
+-            raise NotImplementedError(
+-                f"{type(self).__name__} supports only PackedPrecomputed routing."
+-            )
++        self._validate_pack_contract(act)
+         x = act.hidden_states_q
+         if x.ndim != 2 or x.dtype is not torch.bfloat16 or not x.is_contiguous():
+             raise TypeError(
+diff --git a/tests/trace/template_registry.py b/tests/trace/template_registry.py
+index 5f3ad690fdb..cdb9e5e320a 100644
+--- a/tests/trace/template_registry.py
++++ b/tests/trace/template_registry.py
+@@ -42,9 +42,12 @@
+     "flashinfer.comm.allreduce",
+     "flashinfer.comm.dcp_alltoall",
+     "flashinfer.comm.dcp_lse_reduce",
++    "flashinfer.comm.mnnvl_cutedsl_ag",
++    "flashinfer.comm.mnnvl_cutedsl_moe_finalize",
+     "flashinfer.comm.pcie_ipc_ar",
+     "flashinfer.comm.pcie_ipc_collectives.all_gather",
+     "flashinfer.comm.pcie_ipc_collectives.reduce_scatter",
++    "flashinfer.comm.tp_moe_finalize_rmsnorm",
+     "flashinfer.concat_ops",
+     "flashinfer.cudnn.decode",
+     "flashinfer.cudnn.prefill",

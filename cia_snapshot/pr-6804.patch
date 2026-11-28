@@ -1,0 +1,1297 @@
+diff --git a/examples/experimental/qsa_nvfp4.py b/examples/experimental/qsa_nvfp4.py
+new file mode 100644
+index 00000000000..1fb89c9f7e5
+--- /dev/null
++++ b/examples/experimental/qsa_nvfp4.py
+@@ -0,0 +1,61 @@
++"""Run QSA sparse paged attention over an NVFP4 KV cache (SM80 through SM90)."""
++
++import torch
++
++import flashinfer
++from flashinfer.sparse import qsa_sparse_paged_attention
++
++rows, num_qo_heads, num_kv_heads, head_dim = 4, 24, 2, 256
++num_blocks, page_size, selection_width = 64, 16, 512
++device = "cuda"
++
++# Quantize K/V into an NHD NVFP4 cache: packed E2M1 data plus one E4M3 scale per 16 dims.
++k, v = (
++    torch.randn(
++        num_blocks * page_size, num_kv_heads, head_dim, device=device
++    ).bfloat16()
++    for _ in range(2)
++)
++cache_shape = (num_blocks, page_size, num_kv_heads)
++data = tuple(
++    torch.empty(*cache_shape, head_dim // 2, dtype=torch.uint8, device=device)
++    for _ in range(2)
++)
++sf = tuple(
++    torch.empty(*cache_shape, head_dim // 16, dtype=torch.float8_e4m3fn, device=device)
++    for _ in range(2)
++)
++k_scale, v_scale = (x.abs().max().item() / (6 * 448) for x in (k, v))
++slots = torch.arange(num_blocks * page_size, device=device)
++flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
++    k, v, slots, data, sf, k_scale, v_scale
++)
++
++# One request owning every block; each row attends to selection_width logical tokens,
++# with the valid-entry count in the trailing column.
++block_table = torch.arange(num_blocks, dtype=torch.int32, device=device)[None]
++token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
++indices = torch.randint(
++    num_blocks * page_size, (rows, selection_width + 1), device=device
++)
++indices[:, -1] = selection_width
++q, gate = (
++    torch.randn(rows, num_qo_heads, head_dim, device=device).bfloat16()
++    for _ in range(2)
++)
++
++out = qsa_sparse_paged_attention(
++    q,
++    data[0],
++    data[1],
++    indices.int(),
++    block_table,
++    token_to_req,
++    False,
++    k_scale=k_scale,
++    v_scale=v_scale,
++    output_gate=gate,
++    k_sf=sf[0],
++    v_sf=sf[1],
++)
++print(out.shape, out.dtype)
+diff --git a/flashinfer/experimental/qsa_nvfp4/README.md b/flashinfer/experimental/qsa_nvfp4/README.md
+new file mode 100644
+index 00000000000..bd2285f82f6
+--- /dev/null
++++ b/flashinfer/experimental/qsa_nvfp4/README.md
+@@ -0,0 +1,40 @@
++# Experimental QSA NVFP4 sparse paged attention
++
++`flashinfer.sparse.qsa_sparse_paged_attention` runs the main attention of the Qwen
++QSA layer over an NVFP4 KV cache on SM80 through SM90. It implements the contract of
++vLLM's Triton `qsa_sparse_paged_attention` (same arguments, same order) and adds the
++NVFP4 block scales `k_sf` / `v_sf`. vLLM keeps its Triton kernel for BF16 and FP8
++caches; this backend covers the NVFP4 case it does not.
++
++It is reached only through that explicit experimental API: no AOT packaging and no
++automatic routing. The experimental lifecycle is owned by `@lesj0610`; the tracking
++issue is linked from the pull request that adds the package.
++
++## Contract
++
++- `q`: BF16 `[rows, num_qo_heads, 256]`; `num_qo_heads / num_kv_heads` is 1 to 16.
++- `k_cache`, `v_cache`: packed E2M1 `[num_blocks, page_size, num_kv_heads, 128]`,
++  `k_sf`, `v_sf`: E4M3 `[num_blocks, page_size, num_kv_heads, 16]`, the layout written
++  by `nvfp4_quantize_append_paged_kv_cache_with_slot_mapping`. Strides are free as long
++  as the last dim is contiguous and 16-byte aligned, so an HND cache is passed as its
++  `transpose(1, 2)` view.
++- `logical_indices`: int32 `[rows, selection_width + 1]` logical token indices; the
++  last column is the row's valid-entry count. `block_table` maps logical pages to cache
++  blocks per request and `token_to_req` gives each row's request. Entries that are
++  negative, past the table, unmapped or past the cache are skipped (never read).
++- `k_scale`, `v_scale`: NVFP4 global scales. `output_gate`: BF16 like `q`.
++- Output: `bf16(attention) * sigmoid(output_gate)`, the attention output rounded to BF16
++  before the FP32 gate, as in vLLM. Rows with no valid entry are zero.
++
++## Implementation
++
++`csrc/qsa_nvfp4_attention.cuh` holds two kernels: a split-K kernel with one CTA per
++(row, KV head, split) over 64-token tiles, and an LSE merge that also applies the gate
++when the selection is split. It uses SM80 instructions only (cp.async, mma.sync
++m16n8k16), so one JIT build serves SM80 through SM90. NVFP4 is decoded directly into
++MMA fragments: QK and PV both take BF16 operands (E2M1 times an E4M3 block scale is
++exact in BF16) and accumulate in FP32, with the global scales folded into the softmax
++scale and the output scale.
++
++The split count targets about 128 CTAs per launch (`backend.py`), one value per
++architecture family.
+diff --git a/flashinfer/experimental/qsa_nvfp4/__init__.py b/flashinfer/experimental/qsa_nvfp4/__init__.py
+new file mode 100644
+index 00000000000..49eeeb46530
+--- /dev/null
++++ b/flashinfer/experimental/qsa_nvfp4/__init__.py
+@@ -0,0 +1,19 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++# Experimental QSA sparse paged attention over an NVFP4 KV cache (SM80 through SM90).
++# Reached only through flashinfer.sparse.qsa_sparse_paged_attention; nothing is imported here
++# so that importing flashinfer never builds or loads this package.
+diff --git a/flashinfer/experimental/qsa_nvfp4/backend.py b/flashinfer/experimental/qsa_nvfp4/backend.py
+new file mode 100644
+index 00000000000..12c2bc39769
+--- /dev/null
++++ b/flashinfer/experimental/qsa_nvfp4/backend.py
+@@ -0,0 +1,195 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++# QSA sparse paged attention over an NVFP4 KV cache, for SM80 through SM90.
++
++import math
++from typing import Optional
++
++import torch
++
++from ...utils import get_compute_capability
++from .jit import get_qsa_nvfp4_module
++
++_HEAD_DIM = 256
++_TILE_TOKENS = 64
++_MAX_GROUP_SIZE = 16
++# Splits are sized so rows * kv_heads * splits reaches about this many CTAs. One value per
++# architecture family, never per device.
++_TARGET_CTAS = {8: 128, 9: 128}
++
++
++def _num_splits(
++    num_rows: int, num_kv_heads: int, selection_width: int, major: int
++) -> int:
++    num_tiles = math.ceil(selection_width / _TILE_TOKENS)
++    return min(
++        num_tiles, max(1, math.ceil(_TARGET_CTAS[major] / (num_rows * num_kv_heads)))
++    )
++
++
++def _check(condition: bool, message: str) -> None:
++    if not condition:
++        raise ValueError(message)
++
++
++def _check_aligned(tensor: torch.Tensor, name: str, num_bytes: int) -> None:
++    # The kernel moves rows in num_bytes vectors: base and every outer stride must be aligned.
++    element_size = tensor.element_size()
++    _check(
++        tensor.stride(-1) == 1
++        and tensor.data_ptr() % num_bytes == 0
++        and all(s * element_size % num_bytes == 0 for s in tensor.stride()[:-1]),
++        f"{name} needs a contiguous last dim and {num_bytes}-byte aligned base and strides",
++    )
++
++
++def qsa_sparse_paged_attention(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    logical_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    use_prefill_config: bool,
++    out: Optional[torch.Tensor] = None,
++    k_scale: Optional[float] = None,
++    v_scale: Optional[float] = None,
++    *,
++    output_gate: torch.Tensor,
++    k_sf: torch.Tensor,
++    v_sf: torch.Tensor,
++) -> torch.Tensor:
++    del (
++        use_prefill_config
++    )  # kept for the signature; the split rule does not depend on it
++    major = get_compute_capability(q.device)[0]
++    if major not in _TARGET_CTAS:
++        raise RuntimeError(
++            f"QSA NVFP4 attention supports SM80 through SM90, got SM{major}x"
++        )
++    _check(q.ndim == 3 and k_cache.ndim == 4, "q must be 3D and k_cache 4D")
++    num_rows, num_qo_heads, head_dim = q.shape
++    num_blocks, page_size, num_kv_heads, packed_dim = k_cache.shape
++    _check(q.dtype == torch.bfloat16, "q must be bfloat16")
++    _check(head_dim == _HEAD_DIM, f"head_dim must be {_HEAD_DIM}")
++    _check(packed_dim * 2 == head_dim, "k_cache must hold head_dim / 2 packed bytes")
++    _check(
++        k_cache.dtype == torch.uint8
++        and v_cache.shape == k_cache.shape
++        and v_cache.dtype == k_cache.dtype
++        and v_cache.stride() == k_cache.stride(),
++        "k_cache and v_cache must be uint8 views with the same shape and strides",
++    )
++    sf_shape = (num_blocks, page_size, num_kv_heads, head_dim // 16)
++    _check(
++        k_sf.dtype == torch.float8_e4m3fn
++        and tuple(k_sf.shape) == sf_shape
++        and v_sf.shape == k_sf.shape
++        and v_sf.dtype == k_sf.dtype
++        and v_sf.stride() == k_sf.stride(),
++        f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides",
++    )
++    _check(num_blocks > 0 and page_size > 0, "k_cache must not be empty")
++    _check(
++        num_qo_heads % num_kv_heads == 0
++        and num_qo_heads // num_kv_heads <= _MAX_GROUP_SIZE,
++        f"num_qo_heads must be a multiple of num_kv_heads, at most {_MAX_GROUP_SIZE}x",
++    )
++    _check(
++        logical_indices.ndim == 2
++        and logical_indices.shape[0] == num_rows
++        and logical_indices.shape[1] >= 2
++        and logical_indices.dtype == torch.int32
++        and logical_indices.stride(1) == 1,
++        "logical_indices must be int32 [rows, selection_width + 1] with a contiguous last dim",
++    )
++    _check(
++        block_table.ndim == 2
++        and block_table.numel() > 0
++        and block_table.dtype == torch.int32
++        and block_table.stride(1) == 1,
++        "block_table must be a non-empty int32 2D tensor with a contiguous last dim",
++    )
++    _check(
++        token_to_req.shape == (num_rows,)
++        and token_to_req.dtype == torch.int32
++        and token_to_req.is_contiguous(),
++        "token_to_req must be contiguous int32 [rows]",
++    )
++    _check(
++        k_scale is not None and v_scale is not None, "k_scale and v_scale are required"
++    )
++    _check(
++        output_gate.shape == q.shape
++        and output_gate.dtype == torch.bfloat16
++        and output_gate.is_contiguous(),
++        "output_gate must be contiguous bfloat16 with the shape of q",
++    )
++    if out is None:
++        out = torch.empty_like(q)
++    _check(
++        out.shape == q.shape and out.dtype == q.dtype,
++        "out must match q in shape and dtype",
++    )
++    tensors = (q, k_cache, v_cache, k_sf, v_sf, logical_indices, block_table)
++    _check(
++        all(x.device == q.device for x in (*tensors, token_to_req, output_gate, out)),
++        "all tensors must be on the same device",
++    )
++    _check_aligned(q, "q", 8)
++    for name, tensor in (
++        ("k_cache", k_cache),
++        ("v_cache", v_cache),
++        ("k_sf", k_sf),
++        ("v_sf", v_sf),
++        ("output_gate", output_gate),
++        ("out", out),
++    ):
++        _check_aligned(tensor, name, 16)
++    if num_rows == 0:
++        return out
++
++    num_splits = _num_splits(
++        num_rows, num_kv_heads, logical_indices.shape[1] - 1, major
++    )
++    if num_splits > 1:
++        partial_out = q.new_empty(
++            (num_splits, num_rows, num_qo_heads, head_dim), dtype=torch.float32
++        )
++        partial_lse = q.new_empty(
++            (num_splits, num_rows, num_qo_heads), dtype=torch.float32
++        )
++    else:
++        partial_out = partial_lse = out  # not read with a single split
++    get_qsa_nvfp4_module().run(
++        q,
++        k_cache,
++        v_cache,
++        k_sf,
++        v_sf,
++        logical_indices,
++        block_table,
++        token_to_req,
++        output_gate,
++        out,
++        partial_out,
++        partial_lse,
++        float(k_scale) * math.log2(math.e) / math.sqrt(head_dim),
++        float(v_scale),
++        num_splits,
++    )
++    return out
+diff --git a/flashinfer/experimental/qsa_nvfp4/csrc/qsa_nvfp4_attention.cu b/flashinfer/experimental/qsa_nvfp4/csrc/qsa_nvfp4_attention.cu
+new file mode 100644
+index 00000000000..6e831fee76c
+--- /dev/null
++++ b/flashinfer/experimental/qsa_nvfp4/csrc/qsa_nvfp4_attention.cu
+@@ -0,0 +1,71 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "qsa_nvfp4_attention.cuh"
++#include "tvm_ffi_utils.h"
++
++using namespace flashinfer;
++
++// Inputs are validated by the Python API; this only forwards pointers, strides and sizes.
++// partial_out / partial_lse are read only when num_splits > 1.
++void run(TensorView q, TensorView k_data, TensorView v_data, TensorView k_sf, TensorView v_sf,
++         TensorView indices, TensorView block_table, TensorView token_to_req, TensorView gate,
++         TensorView out, TensorView partial_out, TensorView partial_lse, double score_scale,
++         double output_scale, int64_t num_splits) {
++  qsa_nvfp4::Params p;
++  p.q = static_cast<const nv_bfloat16*>(q.data_ptr());
++  p.k_data = static_cast<const uint8_t*>(k_data.data_ptr());
++  p.v_data = static_cast<const uint8_t*>(v_data.data_ptr());
++  p.k_sf = static_cast<const uint8_t*>(k_sf.data_ptr());
++  p.v_sf = static_cast<const uint8_t*>(v_sf.data_ptr());
++  p.indices = static_cast<const int32_t*>(indices.data_ptr());
++  p.block_table = static_cast<const int32_t*>(block_table.data_ptr());
++  p.token_to_req = static_cast<const int32_t*>(token_to_req.data_ptr());
++  p.gate = static_cast<const nv_bfloat16*>(gate.data_ptr());
++  p.out = static_cast<nv_bfloat16*>(out.data_ptr());
++  p.partial_out = static_cast<float*>(partial_out.data_ptr());
++  p.partial_lse = static_cast<float*>(partial_lse.data_ptr());
++  p.q_stride_row = q.strides()[0];
++  p.q_stride_head = q.strides()[1];
++  p.data_stride_block = k_data.strides()[0];
++  p.data_stride_token = k_data.strides()[1];
++  p.data_stride_head = k_data.strides()[2];
++  p.sf_stride_block = k_sf.strides()[0];
++  p.sf_stride_token = k_sf.strides()[1];
++  p.sf_stride_head = k_sf.strides()[2];
++  p.indices_stride_row = indices.strides()[0];
++  p.table_stride_req = block_table.strides()[0];
++  p.out_stride_row = out.strides()[0];
++  p.out_stride_head = out.strides()[1];
++  p.score_scale = static_cast<float>(score_scale);
++  p.output_scale = static_cast<float>(output_scale);
++  p.num_rows = q.size(0);
++  p.num_qo_heads = q.size(1);
++  p.group_size = q.size(1) / k_data.size(2);
++  p.num_blocks = k_data.size(0);
++  p.page_size = k_data.size(1);
++  p.num_requests = block_table.size(0);
++  p.table_width = block_table.size(1);
++  p.topk = indices.size(1) - 1;
++  p.num_tiles = (p.topk + qsa_nvfp4::kTileTokens - 1) / qsa_nvfp4::kTileTokens;
++  p.num_splits = static_cast<int32_t>(num_splits);
++
++  ffi::CUDADeviceGuard device_guard(q.device().device_id);
++  const cudaError_t status = qsa_nvfp4::SparsePagedAttention(p, get_stream(q.device()));
++  TVM_FFI_ICHECK(status == cudaSuccess)
++      << "QSA NVFP4 sparse paged attention failed: " << cudaGetErrorString(status);
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);
+diff --git a/flashinfer/experimental/qsa_nvfp4/csrc/qsa_nvfp4_attention.cuh b/flashinfer/experimental/qsa_nvfp4/csrc/qsa_nvfp4_attention.cuh
+new file mode 100644
+index 00000000000..4cc63ca0c5c
+--- /dev/null
++++ b/flashinfer/experimental/qsa_nvfp4/csrc/qsa_nvfp4_attention.cuh
+@@ -0,0 +1,423 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef FLASHINFER_EXPERIMENTAL_QSA_NVFP4_ATTENTION_CUH_
++#define FLASHINFER_EXPERIMENTAL_QSA_NVFP4_ATTENTION_CUH_
++
++#include <cuda_bf16.h>
++
++#include <cstdint>
++#include <flashinfer/cp_async.cuh>
++#include <flashinfer/math.cuh>
++#include <flashinfer/mma.cuh>
++#include <flashinfer/vec_dtypes.cuh>
++
++namespace flashinfer {
++namespace qsa_nvfp4 {
++
++// Sparse paged GQA attention over an NVFP4 KV cache (head_dim 256), with the semantics of vLLM's
++// Triton qsa_sparse_paged_attention: one CTA per (row, KV head, split) walks 64-token tiles of the
++// row's selection, the attention output is rounded to BF16 before the FP32 output gate, and split
++// selections are merged through their log2-domain LSE.
++//
++// Within a tile, QK splits tokens across the four warps (warp w scores tokens 16w..16w+15 over
++// all 256 dims) and PV splits dims (warp w accumulates 64 output dims over all 64 tokens), so a
++// warp holds a 16x64 FP32 accumulator rather than 16x256.
++//
++// Both MMAs take BF16 operands and accumulate in FP32: E2M1 times an E4M3 block scale is exact in
++// BF16, and BF16 keeps small probabilities normal where FP16 would round them to subnormals.
++// NVFP4 is decoded straight into MMA B fragments. A dot product and an output column do not care
++// about the order of dims, so both are permuted:
++//  * QK: column 2t + 8a + b of k-step s reads physical dim 64t + 4s + 2a + b. Quad lane t then only
++//    touches dims [64t, 64t + 64), and one packed uint32 covers two k-steps of one token. Q is
++//    staged with the same permutation, already in A-fragment order.
++//  * PV: column n of warp w's n8 tile i is physical dim 64w + 8n + i. A lane reads one packed
++//    uint32 per token, and its output dims per row end up contiguous: [64w + 16t, +16).
++
++constexpr uint32_t kHeadDim = 256;
++constexpr uint32_t kPackedBytes = kHeadDim / 2;             // E2M1 bytes per (token, head)
++constexpr uint32_t kScaleBytes = kHeadDim / 16;             // E4M3 block scales per (token, head)
++constexpr uint32_t kRowBytes = kPackedBytes + kScaleBytes;  // 144: bank-conflict free for both
++constexpr uint32_t kTileTokens = 64;                        // the QK and PV read patterns
++constexpr uint32_t kNumWarps = 4;
++constexpr uint32_t kNumThreads = kNumWarps * 32;
++constexpr uint32_t kMergeThreads = kHeadDim / 4;
++constexpr float kMaskedScore = -1.0e20f;  // the Triton kernel's sentinel
++
++struct Params {
++  const nv_bfloat16* q;
++  const uint8_t* k_data;
++  const uint8_t* v_data;
++  const uint8_t* k_sf;
++  const uint8_t* v_sf;
++  const int32_t* indices;
++  const int32_t* block_table;
++  const int32_t* token_to_req;
++  const nv_bfloat16* gate;  // contiguous [num_rows, num_qo_heads, kHeadDim]
++  nv_bfloat16* out;
++  float* partial_out;  // [num_splits, num_rows, num_qo_heads, kHeadDim], split > 1 only
++  float* partial_lse;  // [num_splits, num_rows, num_qo_heads], split > 1 only
++  int64_t q_stride_row, q_stride_head;
++  int64_t data_stride_block, data_stride_token, data_stride_head;  // shared by K and V
++  int64_t sf_stride_block, sf_stride_token, sf_stride_head;        // shared by K and V
++  int64_t indices_stride_row, table_stride_req;
++  int64_t out_stride_row, out_stride_head;
++  float score_scale;   // log2(e) / sqrt(head_dim) * K global scale
++  float output_scale;  // V global scale
++  int32_t num_rows, num_requests, num_blocks, page_size, table_width;
++  int32_t topk, group_size, num_qo_heads, num_tiles, num_splits;
++};
++
++struct SharedStorage {
++  alignas(16) uint8_t kv[2][2][kTileTokens][kRowBytes];  // [stage][K, V][token][data | scales]
++  alignas(16) uint4 q[kHeadDim / 16][32];                // Q A fragments by k-step and lane
++  alignas(16) uint4 p[kNumWarps][32];                    // P A fragments; k-step w from warp w
++  float row_max[kNumWarps][16];
++  float row_sum[kNumWarps][16];
++  uint32_t valid[2][2];  // per stage: valid bits of tokens 0..31 and 32..63
++};
++
++__device__ __forceinline__ uint32_t mul_bf16x2(uint32_t a, uint32_t b) {
++  __nv_bfloat162 r =
++      __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), *reinterpret_cast<__nv_bfloat162*>(&b));
++  return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// Broadcast 16-bit element i (0..3) of a decoded uint2 to both halves of a 16x2 register.
++__device__ __forceinline__ uint32_t broadcast16(uint2 v, uint32_t i) {
++  return __byte_perm(i < 2 ? v.x : v.y, 0u, i % 2 ? 0x3232u : 0x1010u);
++}
++
++__device__ __forceinline__ float sigmoid(float x) {
++  return math::ptx_rcp(1.f + math::ptx_exp2(-x * math::log2e));
++}
++
++__device__ __forceinline__ uint32_t f32x2_to_bf16x2(float lo, float hi) {
++  __nv_bfloat162 r = __floats2bfloat162_rn(lo, hi);
++  return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// Thread j copies token j % 64 of the tile's K (j < 64) or V row, data and block scales, and the
++// K-side warps publish which tokens are valid. Invalid tokens are zero-filled, never read: a
++// masked score times a non-finite row would still poison the accumulator.
++__device__ __forceinline__ void issue_tile(const Params& p, SharedStorage& smem, uint32_t stage,
++                                           int tile, int row, int kv_head, bool request_ok,
++                                           int safe_request) {
++  const uint32_t token = threadIdx.x % kTileTokens;
++  const bool is_v = threadIdx.x >= kTileTokens;
++  const int column = tile * int(kTileTokens) + int(token);
++  const int logical =
++      column < p.topk ? p.indices[int64_t(row) * p.indices_stride_row + column] : -1;
++  const int safe_token = max(logical, 0);
++  const int logical_page = safe_token / p.page_size;
++  bool valid = request_ok && logical >= 0 && logical_page < p.table_width;
++  const int physical_page = valid ? p.block_table[int64_t(safe_request) * p.table_stride_req +
++                                                  min(logical_page, p.table_width - 1)]
++                                  : -1;
++  valid = valid && physical_page >= 0 && physical_page < p.num_blocks;
++  const int64_t block = max(physical_page, 0);
++  const int64_t offset = safe_token % p.page_size;
++  const uint8_t* data = (is_v ? p.v_data : p.k_data) + block * p.data_stride_block +
++                        offset * p.data_stride_token + kv_head * p.data_stride_head;
++  const uint8_t* sf = (is_v ? p.v_sf : p.k_sf) + block * p.sf_stride_block +
++                      offset * p.sf_stride_token + kv_head * p.sf_stride_head;
++  uint8_t* dst = smem.kv[stage][is_v][token];
++#pragma unroll
++  for (uint32_t c = 0; c < kPackedBytes / 16; ++c) {
++    cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch,
++                             cp_async::SharedMemFillMode::kFillZero>(dst + 16 * c, data + 16 * c,
++                                                                     valid);
++  }
++  cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch,
++                           cp_async::SharedMemFillMode::kFillZero>(dst + kPackedBytes, sf, valid);
++  const uint32_t bits = __ballot_sync(0xffffffffu, valid);
++  if (threadIdx.x < kTileTokens && threadIdx.x % 32 == 0) {
++    smem.valid[stage][threadIdx.x / 32] = bits;
++  }
++}
++
++__global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const Params p) {
++  __shared__ SharedStorage smem;
++  const int row = blockIdx.x, kv_head = blockIdx.y, split = blockIdx.z;
++  const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
++  const int request = p.token_to_req[row];
++  const bool request_ok = request >= 0 && request < p.num_requests;
++  const int safe_request = min(max(request, 0), p.num_requests - 1);
++  // The trailing column holds the row's valid-entry count, never a token index.
++  const int valid_count = p.indices[int64_t(row) * p.indices_stride_row + p.topk];
++  const int tile_end =
++      min(p.num_tiles, (min(valid_count, p.topk) + int(kTileTokens) - 1) / int(kTileTokens));
++  const int first_head = kv_head * p.group_size;
++
++  // Q in A-fragment order: k-step s, lane (g, t) holds rows g and g + 8 at dims 64t + 4s .. +3.
++  for (uint32_t e = threadIdx.x; e < kHeadDim / 16 * 32; e += kNumThreads) {
++    const uint32_t s = e / 32, eg = e % 32 / 4, et = e % 4;
++    const nv_bfloat16* src = p.q + int64_t(row) * p.q_stride_row +
++                             (first_head + int(eg)) * p.q_stride_head + 64 * et + 4 * s;
++    const uint2 lo =
++        int(eg) < p.group_size ? *reinterpret_cast<const uint2*>(src) : make_uint2(0, 0);
++    const uint2 hi = int(eg) + 8 < p.group_size
++                         ? *reinterpret_cast<const uint2*>(src + 8 * p.q_stride_head)
++                         : make_uint2(0, 0);
++    smem.q[s][e % 32] = make_uint4(lo.x, hi.x, lo.y, hi.y);
++  }
++
++  float o[4][8] = {};  // n16 accumulators: tiles 2c (o[c][0..3]) and 2c + 1 (o[c][4..7])
++  float m[2] = {kMaskedScore, kMaskedScore}, l[2] = {0.f, 0.f};  // rows g and g + 8
++
++  if (split < tile_end) issue_tile(p, smem, 0, split, row, kv_head, request_ok, safe_request);
++  cp_async::commit_group();
++  uint32_t stage = 0;
++  for (int tile = split; tile < tile_end; tile += p.num_splits, stage ^= 1) {
++    // wait_group only completes this thread's copies; the barrier publishes everyone's, and also
++    // retires the previous tile's PV, which frees the other stage and the P/exchange buffers.
++    cp_async::wait_group<0>();
++    __syncthreads();
++    if (tile + p.num_splits < tile_end) {
++      issue_tile(p, smem, stage ^ 1, tile + p.num_splits, row, kv_head, request_ok, safe_request);
++    }
++    cp_async::commit_group();
++
++    // QK: this warp's tokens g and g + 8 are the two n8 tiles of one n16 MMA.
++    const uint8_t* k0 = smem.kv[stage][0][16 * warp + g];
++    const uint8_t* k1 = smem.kv[stage][0][16 * warp + g + 8];
++    uint2 sf0, sf1;  // block scales 4t .. 4t + 3 of each token
++    uint32_t sf_bytes = *reinterpret_cast<const uint32_t*>(k0 + kPackedBytes + 4 * t);
++    fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&sf_bytes, &sf0);
++    sf_bytes = *reinterpret_cast<const uint32_t*>(k1 + kPackedBytes + 4 * t);
++    fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&sf_bytes, &sf1);
++    float s[8] = {};
++#pragma unroll
++    for (uint32_t h = 0; h < 2; ++h) {
++      const uint4 raw0 = *reinterpret_cast<const uint4*>(k0 + 32 * t + 16 * h);
++      const uint4 raw1 = *reinterpret_cast<const uint4*>(k1 + 32 * t + 16 * h);
++      const uint32_t w0[4] = {raw0.x, raw0.y, raw0.z, raw0.w};
++      const uint32_t w1[4] = {raw1.x, raw1.y, raw1.z, raw1.w};
++#pragma unroll
++      for (uint32_t i = 0; i < 4; ++i) {
++        const uint32_t pair = 4 * h + i;  // k-steps 2 * pair and 2 * pair + 1
++        uint32_t d0[4], d1[4];
++        e2m1x8_to_bf16x8(w0[i], d0);
++        e2m1x8_to_bf16x8(w1[i], d1);
++        const uint32_t scale0 = broadcast16(sf0, pair / 2), scale1 = broadcast16(sf1, pair / 2);
++#pragma unroll
++        for (uint32_t k = 0; k < 4; ++k) {
++          d0[k] = mul_bf16x2(d0[k], scale0);
++          d1[k] = mul_bf16x2(d1[k], scale1);
++        }
++        uint4 a = smem.q[2 * pair][lane];
++        uint32_t b[4] = {d0[0], d0[1], d1[0], d1[1]};
++        mma::mma_sync_m16n16k16_row_col_f16f16f32<nv_bfloat16>(s, &a.x, b);
++        a = smem.q[2 * pair + 1][lane];
++        uint32_t b2[4] = {d0[2], d0[3], d1[2], d1[3]};
++        mma::mma_sync_m16n16k16_row_col_f16f16f32<nv_bfloat16>(s, &a.x, b2);
++      }
++    }
++
++    // s[j]: row g + 8 * ((j / 2) % 2), warp-local token 8 * (j / 4) + 2t + j % 2.
++    const uint32_t valid_bits = smem.valid[stage][warp / 2] >> (16 * (warp % 2));
++    bool ok[8];
++    float row_max[2] = {kMaskedScore, kMaskedScore};
++#pragma unroll
++    for (uint32_t j = 0; j < 8; ++j) {
++      ok[j] = (valid_bits >> (8 * (j / 4) + 2 * t + j % 2)) & 1u;
++      s[j] = ok[j] ? s[j] * p.score_scale : kMaskedScore;
++      row_max[(j / 2) % 2] = fmaxf(row_max[(j / 2) % 2], s[j]);
++    }
++#pragma unroll
++    for (uint32_t r = 0; r < 2; ++r) {
++      row_max[r] = fmaxf(row_max[r], math::shfl_xor_sync(row_max[r], 1));
++      row_max[r] = fmaxf(row_max[r], math::shfl_xor_sync(row_max[r], 2));
++      if (t == 0) smem.row_max[warp][g + 8 * r] = row_max[r];
++    }
++    __syncthreads();
++
++    float m_new[2], row_sum[2] = {0.f, 0.f};
++#pragma unroll
++    for (uint32_t r = 0; r < 2; ++r) {
++      m_new[r] = m[r];
++#pragma unroll
++      for (uint32_t w = 0; w < kNumWarps; ++w)
++        m_new[r] = fmaxf(m_new[r], smem.row_max[w][g + 8 * r]);
++    }
++#pragma unroll
++    for (uint32_t j = 0; j < 8; ++j) {
++      s[j] = ok[j] ? math::ptx_exp2(s[j] - m_new[(j / 2) % 2]) : 0.f;
++      row_sum[(j / 2) % 2] += s[j];
++    }
++#pragma unroll
++    for (uint32_t r = 0; r < 2; ++r) {
++      row_sum[r] += math::shfl_xor_sync(row_sum[r], 1);
++      row_sum[r] += math::shfl_xor_sync(row_sum[r], 2);
++      if (t == 0) smem.row_sum[warp][g + 8 * r] = row_sum[r];
++    }
++    // The S accumulator layout is the PV A-fragment layout of this warp's 16 tokens.
++    smem.p[warp][lane] = make_uint4(f32x2_to_bf16x2(s[0], s[1]), f32x2_to_bf16x2(s[2], s[3]),
++                                    f32x2_to_bf16x2(s[4], s[5]), f32x2_to_bf16x2(s[6], s[7]));
++    __syncthreads();
++
++#pragma unroll
++    for (uint32_t r = 0; r < 2; ++r) {
++      const float alpha = math::ptx_exp2(m[r] - m_new[r]);
++      float tile_sum = 0.f;
++#pragma unroll
++      for (uint32_t w = 0; w < kNumWarps; ++w) tile_sum += smem.row_sum[w][g + 8 * r];
++      l[r] = l[r] * alpha + tile_sum;
++      m[r] = m_new[r];
++#pragma unroll
++      for (uint32_t c = 0; c < 4; ++c) {
++        o[c][2 * r] *= alpha;
++        o[c][2 * r + 1] *= alpha;
++        o[c][2 * r + 4] *= alpha;
++        o[c][2 * r + 5] *= alpha;
++      }
++    }
++
++    // PV: k-step kk is warp kk's tokens; this lane needs tokens 2t, 2t + 1, 2t + 8, 2t + 9 at
++    // physical dims 64 * warp + 8g .. + 7.
++#pragma unroll
++    for (uint32_t kk = 0; kk < kNumWarps; ++kk) {
++      uint4 a = smem.p[kk][lane];
++      const uint8_t* v_rows = smem.kv[stage][1][16 * kk];
++      uint32_t d[4][4], sf_packed = 0;
++#pragma unroll
++      for (uint32_t j = 0; j < 4; ++j) {
++        const uint8_t* v_row = v_rows + (2 * t + j % 2 + 8 * (j / 2)) * kRowBytes;
++        e2m1x8_to_bf16x8(*reinterpret_cast<const uint32_t*>(v_row + 32 * warp + 4 * g), d[j]);
++        sf_packed |= uint32_t(v_row[kPackedBytes + 4 * warp + g / 2]) << (8 * j);
++      }
++      uint2 sf;
++      fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&sf_packed, &sf);
++#pragma unroll
++      for (uint32_t j = 0; j < 4; ++j) {
++        const uint32_t scale = broadcast16(sf, j);
++#pragma unroll
++        for (uint32_t k = 0; k < 4; ++k) d[j][k] = mul_bf16x2(d[j][k], scale);
++      }
++#pragma unroll
++      for (uint32_t c = 0; c < 4; ++c) {
++        // Pair one dim across two tokens: n8 tile 2c takes the low halves, 2c + 1 the high.
++        uint32_t b[4] = {
++            __byte_perm(d[0][c], d[1][c], 0x5410u), __byte_perm(d[2][c], d[3][c], 0x5410u),
++            __byte_perm(d[0][c], d[1][c], 0x7632u), __byte_perm(d[2][c], d[3][c], 0x7632u)};
++        mma::mma_sync_m16n16k16_row_col_f16f16f32<nv_bfloat16>(o[c], &a.x, b);
++      }
++    }
++  }
++
++  const uint32_t dim0 = 64 * warp + 16 * t;
++#pragma unroll
++  for (uint32_t r = 0; r < 2; ++r) {
++    const int head = int(g + 8 * r);
++    if (head >= p.group_size) continue;
++    const bool has_values = l[r] > 0.f;
++    const float inv = p.output_scale / fmaxf(l[r], 1.0e-20f);
++    float v[16];
++#pragma unroll
++    for (uint32_t c = 0; c < 4; ++c) {
++      v[2 * c] = o[c][2 * r];
++      v[2 * c + 1] = o[c][2 * r + 4];
++      v[8 + 2 * c] = o[c][2 * r + 1];
++      v[9 + 2 * c] = o[c][2 * r + 5];
++    }
++#pragma unroll
++    for (uint32_t j = 0; j < 16; ++j) v[j] = has_values ? v[j] * inv : 0.f;
++    const int qo_head = first_head + head;
++    if (p.num_splits == 1) {
++      // Round to BF16 like the unfused path, then apply the gate in FP32.
++      const nv_bfloat16* gate =
++          p.gate + (int64_t(row) * p.num_qo_heads + qo_head) * kHeadDim + dim0;
++      nv_bfloat16* out =
++          p.out + int64_t(row) * p.out_stride_row + qo_head * p.out_stride_head + dim0;
++#pragma unroll
++      for (uint32_t h = 0; h < 2; ++h) {
++        uint4 gate8 = reinterpret_cast<const uint4*>(gate)[h], out8;
++        const nv_bfloat16* gv = reinterpret_cast<const nv_bfloat16*>(&gate8);
++        nv_bfloat16* ov = reinterpret_cast<nv_bfloat16*>(&out8);
++#pragma unroll
++        for (uint32_t j = 0; j < 8; ++j) {
++          const float attn = __bfloat162float(__float2bfloat16(v[8 * h + j]));
++          ov[j] = __float2bfloat16(attn * sigmoid(__bfloat162float(gv[j])));
++        }
++        reinterpret_cast<uint4*>(out)[h] = out8;
++      }
++    } else {
++      const int64_t partial_row = (int64_t(split) * p.num_rows + row) * p.num_qo_heads + qo_head;
++      float4* partial = reinterpret_cast<float4*>(p.partial_out + partial_row * kHeadDim + dim0);
++#pragma unroll
++      for (uint32_t j = 0; j < 4; ++j) {
++        partial[j] = make_float4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
++      }
++      if (warp == 0 && t == 0) {
++        p.partial_lse[partial_row] = has_values ? m[r] + math::ptx_log2(l[r]) : -math::inf;
++      }
++    }
++  }
++}
++
++// One CTA per (row, query head): LSE-weighted sum of the split outputs, BF16 rounding, FP32 gate.
++__global__ void __launch_bounds__(kMergeThreads) MergeKernel(const Params p) {
++  const int row = blockIdx.x, head = blockIdx.y;
++  const uint32_t dim = 4 * threadIdx.x;
++  auto partial_row = [&](int split) {
++    return (int64_t(split) * p.num_rows + row) * p.num_qo_heads + head;
++  };
++  float lse_max = -math::inf;
++  for (int split = 0; split < p.num_splits; ++split) {
++    lse_max = fmaxf(lse_max, p.partial_lse[partial_row(split)]);
++  }
++  float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
++  float denominator = 0.f;
++  if (lse_max > -math::inf) {
++    for (int split = 0; split < p.num_splits; ++split) {
++      const float weight = math::ptx_exp2(p.partial_lse[partial_row(split)] - lse_max);
++      const float4 part =
++          *reinterpret_cast<const float4*>(p.partial_out + partial_row(split) * kHeadDim + dim);
++      denominator += weight;
++      acc.x += weight * part.x;
++      acc.y += weight * part.y;
++      acc.z += weight * part.z;
++      acc.w += weight * part.w;
++    }
++  }
++  const float inv = denominator > 0.f ? 1.f / denominator : 0.f;
++  const float merged[4] = {acc.x * inv, acc.y * inv, acc.z * inv, acc.w * inv};
++  const uint2 gate4 = *reinterpret_cast<const uint2*>(
++      p.gate + (int64_t(row) * p.num_qo_heads + head) * kHeadDim + dim);
++  const nv_bfloat16* gv = reinterpret_cast<const nv_bfloat16*>(&gate4);
++  uint2 out4;
++  nv_bfloat16* ov = reinterpret_cast<nv_bfloat16*>(&out4);
++#pragma unroll
++  for (uint32_t j = 0; j < 4; ++j) {
++    const float attn = __bfloat162float(__float2bfloat16(merged[j]));
++    ov[j] = __float2bfloat16(attn * sigmoid(__bfloat162float(gv[j])));
++  }
++  *reinterpret_cast<uint2*>(p.out + int64_t(row) * p.out_stride_row + head * p.out_stride_head +
++                            dim) = out4;
++}
++
++inline cudaError_t SparsePagedAttention(const Params& p, cudaStream_t stream) {
++  const dim3 grid(p.num_rows, p.num_qo_heads / p.group_size, p.num_splits);
++  SparsePagedAttentionKernel<<<grid, kNumThreads, 0, stream>>>(p);
++  if (p.num_splits > 1) {
++    MergeKernel<<<dim3(p.num_rows, p.num_qo_heads), kMergeThreads, 0, stream>>>(p);
++  }
++  return cudaGetLastError();
++}
++
++}  // namespace qsa_nvfp4
++}  // namespace flashinfer
++
++#endif  // FLASHINFER_EXPERIMENTAL_QSA_NVFP4_ATTENTION_CUH_
+diff --git a/flashinfer/experimental/qsa_nvfp4/jit.py b/flashinfer/experimental/qsa_nvfp4/jit.py
+new file mode 100644
+index 00000000000..0ce488b278a
+--- /dev/null
++++ b/flashinfer/experimental/qsa_nvfp4/jit.py
+@@ -0,0 +1,37 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++import functools
++from pathlib import Path
++from typing import Any
++
++from ...jit.core import JitSpec, current_compilation_context, gen_jit_spec
++
++
++def gen_qsa_nvfp4_module() -> JitSpec:
++    # SM80 instructions only (cp.async, mma.sync m16n8k16); one build serves SM80 through SM90.
++    return gen_jit_spec(
++        "qsa_nvfp4_attention",
++        [Path(__file__).resolve().parent / "csrc" / "qsa_nvfp4_attention.cu"],
++        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
++            supported_major_versions=[8, 9]
++        ),
++    )
++
++
++@functools.cache
++def get_qsa_nvfp4_module() -> Any:
++    return gen_qsa_nvfp4_module().build_and_load()
+diff --git a/flashinfer/sparse.py b/flashinfer/sparse.py
+index f972efed881..48371d8a6af 100644
+--- a/flashinfer/sparse.py
++++ b/flashinfer/sparse.py
+@@ -19,7 +19,7 @@
+ 
+ import torch
+ 
+-from .api_logging import flashinfer_api
++from .api_logging import flashinfer_api, flashinfer_experimental_api
+ from .trace.templates.attention import (
+     block_sparse_attention_run_trace,
+     variable_block_sparse_attention_run_trace,
+@@ -2238,3 +2238,75 @@ def run(
+             ).contiguous()
+ 
+         return (out, lse) if return_lse else out
++
++
++@flashinfer_experimental_api(feature="QSA NVFP4 sparse paged attention")
++def qsa_sparse_paged_attention(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    logical_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    use_prefill_config: bool,
++    out: Optional[torch.Tensor] = None,
++    k_scale: Optional[float] = None,
++    v_scale: Optional[float] = None,
++    *,
++    output_gate: torch.Tensor,
++    k_sf: torch.Tensor,
++    v_sf: torch.Tensor,
++) -> torch.Tensor:
++    r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM90.
++
++    This is vLLM's ``qsa_sparse_paged_attention`` (Qwen QSA) contract for an NVFP4 main KV
++    cache: the same arguments in the same order, plus the block scales ``k_sf`` / ``v_sf``.
++
++    Parameters
++    ----------
++    q : torch.Tensor
++        BF16 queries ``[rows, num_qo_heads, 256]``.
++    k_cache, v_cache : torch.Tensor
++        Packed E2M1 data, uint8 ``[num_blocks, page_size, num_kv_heads, 128]``. Any strides with
++        a contiguous last dim and 16-byte alignment, so NHD and HND (transposed) views both work.
++    logical_indices : torch.Tensor
++        int32 ``[rows, selection_width + 1]``: logical token indices of each row's selection;
++        the last column holds the row's valid-entry count.
++    block_table : torch.Tensor
++        int32 ``[num_requests, max_blocks]`` mapping logical pages to cache blocks.
++    token_to_req : torch.Tensor
++        int32 ``[rows]`` request of each row.
++    use_prefill_config : bool
++        Accepted for signature compatibility; it does not change the result.
++    out : Optional[torch.Tensor]
++        Optional BF16 output with the shape of ``q``.
++    k_scale, v_scale : float
++        NVFP4 global scales of K and V.
++    output_gate : torch.Tensor
++        Contiguous BF16 gate with the shape of ``q``; the output is
++        ``bf16(attention) * sigmoid(output_gate)``.
++    k_sf, v_sf : torch.Tensor
++        E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16 dims.
++
++    Returns
++    -------
++    torch.Tensor
++        ``out`` when given, otherwise a new tensor.
++    """
++    from .experimental.qsa_nvfp4.backend import qsa_sparse_paged_attention as run
++
++    return run(
++        q,
++        k_cache,
++        v_cache,
++        logical_indices,
++        block_table,
++        token_to_req,
++        use_prefill_config,
++        out,
++        k_scale,
++        v_scale,
++        output_gate=output_gate,
++        k_sf=k_sf,
++        v_sf=v_sf,
++    )
+diff --git a/pyproject.toml b/pyproject.toml
+index 04aaf3325ab..a91e263a0a8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -127,6 +127,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
+ "flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
+ # Frozen native sources and manifest for the exact-SM110 XQA backend.
+ "flashinfer.experimental.sm110_xqa" = ["csrc/**"]
++# CUDA sources for the experimental SM80-SM90 QSA NVFP4 sparse paged attention.
++"flashinfer.experimental.qsa_nvfp4" = ["csrc/**"]
+ # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
+ # runtime; registered so non-editable installs ship them (PR #4069).
+ "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
+diff --git a/tests/experimental/test_qsa_nvfp4.py b/tests/experimental/test_qsa_nvfp4.py
+new file mode 100644
+index 00000000000..f2a96548d7d
+--- /dev/null
++++ b/tests/experimental/test_qsa_nvfp4.py
+@@ -0,0 +1,301 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++import math
++
++import pytest
++import torch
++
++import flashinfer
++from flashinfer.experimental.qsa_nvfp4.backend import _num_splits
++from flashinfer.sparse import qsa_sparse_paged_attention
++from flashinfer.utils import get_compute_capability
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available()
++    or get_compute_capability(torch.device("cuda"))[0] not in (8, 9),
++    reason="QSA NVFP4 attention runs on SM80 through SM90",
++)
++
++HEAD_DIM = 256
++PAGE_SIZE = 16
++WIDTH = 2051  # Qwen QSA selection width: budget 2048 + compress ratio 4 - 1
++NUM_REQUESTS, TABLE_WIDTH = 3, 160
++NUM_BLOCKS = NUM_REQUESTS * TABLE_WIDTH + 20
++_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
++
++
++def _dequant(data, sf, scale):
++    lut = torch.tensor(_E2M1 + [-x for x in _E2M1], device=data.device)
++    values = torch.stack((lut[(data & 15).long()], lut[(data >> 4).long()]), -1)
++    return values.flatten(-2) * sf.float().repeat_interleave(16, -1) * scale
++
++
++def _make_cache(num_kv_heads, layout, seed):
++    """Quantize random K/V into every slot with the NVFP4 writer, using one buffer of
++    [data | scales] rows per side like a packed vLLM page. Returns the kernel's
++    [blocks, tokens, heads, *] views, the global scales and the dequantized cache."""
++    gen = torch.Generator(device="cuda").manual_seed(seed)
++    slots = NUM_BLOCKS * PAGE_SIZE
++    k, v = (
++        scale * torch.randn(slots, num_kv_heads, HEAD_DIM, device="cuda", generator=gen)
++        for scale in (1.0, 3.0)
++    )
++    k, v = k.bfloat16(), v.bfloat16()
++    dims = (num_kv_heads, PAGE_SIZE) if layout == "HND" else (PAGE_SIZE, num_kv_heads)
++    row_bytes = HEAD_DIM // 2 + HEAD_DIM // 16
++    kv = torch.empty(NUM_BLOCKS, 2, *dims, row_bytes, dtype=torch.uint8, device="cuda")
++    data = tuple(kv[:, i, ..., : HEAD_DIM // 2] for i in range(2))
++    sf = tuple(
++        kv[:, i, ..., HEAD_DIM // 2 :].view(torch.float8_e4m3fn) for i in range(2)
++    )
++    scales = tuple(x.abs().max().item() / (6 * 448) for x in (k, v))
++    flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
++        k, v, torch.arange(slots, device="cuda"), data, sf, *scales, kv_layout=layout
++    )
++    if layout == "HND":
++        data, sf = (tuple(x.transpose(1, 2) for x in pair) for pair in (data, sf))
++    deq = tuple(_dequant(*args) for args in zip(data, sf, scales, strict=True))
++    return data, sf, scales, deq
++
++
++def _make_selection(rows, seed):
++    gen = torch.Generator().manual_seed(seed)
++    table = torch.randperm(NUM_BLOCKS, generator=gen)[: NUM_REQUESTS * TABLE_WIDTH]
++    table = table.view(NUM_REQUESTS, TABLE_WIDTH).int()
++    table[0, 1::5] = -1  # unmapped pages
++    table[1, 2] = NUM_BLOCKS + 5  # a block past the cache
++    token_to_req = torch.randint(NUM_REQUESTS, (rows,), generator=gen).int()
++    if rows > 3:
++        token_to_req[3] = -1  # a row without a request
++    # Tokens a little past the table, -1 entries, and counts full, 0, 1, then random.
++    # Like vLLM's expand, every entry past a row's count is -1.
++    indices = torch.randint(
++        TABLE_WIDTH * PAGE_SIZE + 64, (rows, WIDTH + 1), generator=gen
++    )
++    indices[:, ::7] = -1
++    if rows > 2:
++        indices[2, 0] = 5  # the count-1 row selects one real token (page 0 is mapped)
++    counts = torch.randint(WIDTH + 1, (rows,), generator=gen)
++    counts[:3] = torch.tensor([WIDTH, 0, 1])[:rows]
++    indices[:, :WIDTH][torch.arange(WIDTH) >= counts[:, None]] = -1
++    indices[:, -1] = counts
++    return table.cuda(), token_to_req.cuda(), indices.int().cuda()
++
++
++def _ulp_bf16(x):
++    """BF16 spacing at |x|, and 0 at 0."""
++    return torch.ldexp(torch.ones_like(x), torch.frexp(x)[1] - 8) * (x != 0)
++
++
++def _reference(q, cache, selection, gate, num_splits, chunk=64):
++    """Float64 references, row chunk by row chunk.
++
++    contract: the kernel's arithmetic -- 64-column tiles walked per split with an online
++    softmax, P rounded to BF16, LSE merge, BF16 rounding, FP32 gate, BF16 output -- and a
++    worst-case bound on how far one-ulp P rounding, FP32 scores (with exp2.approx), FP32
++    accumulation and the two output roundings can move the kernel from it.
++    exact: softmax attention times the gate, unrounded, and sum_n p_n |v_n| times the gate.
++    """
++    k_deq, v_deq = cache[3]
++    table, token_to_req, indices = selection
++    num_kv_heads = k_deq.shape[2]
++    log2_scale = math.log2(math.e) / math.sqrt(HEAD_DIM)
++    num_tiles = math.ceil(WIDTH / 64)
++    parts = []
++    for r0 in range(0, q.shape[0], chunk):
++        token = indices[r0 : r0 + chunk, :WIDTH].long()
++        req = token_to_req[r0 : r0 + chunk].long()
++        page = token.clamp(min=0) // PAGE_SIZE
++        block = table[
++            req.clamp(0, NUM_REQUESTS - 1)[:, None], page.clamp(max=TABLE_WIDTH - 1)
++        ]
++        valid = ((req >= 0) & (req < NUM_REQUESTS))[:, None] & (token >= 0)
++        valid &= (page < TABLE_WIDTH) & (block >= 0) & (block < NUM_BLOCKS)
++        slot = (block.long().clamp(0, NUM_BLOCKS - 1), token.clamp(min=0) % PAGE_SIZE)
++        k, v = (
++            x[slot].double() for x in (k_deq, v_deq)
++        )  # [rows, width, kv_heads, dim]
++        qd = q[r0 : r0 + chunk].double().unflatten(1, (num_kv_heads, -1))
++        mask = valid[:, None, None]
++        s = torch.einsum("rhgd,rwhd->rhgw", qd, k) * log2_scale
++        s_abs = (torch.einsum("rhgd,rwhd->rhgw", qd.abs(), k.abs()) * mask).amax(-1)
++        s = s.masked_fill(~mask, -1e20)
++        e = torch.exp2(s - s.amax(-1, keepdim=True)) * mask
++        p = e / e.sum(-1, keepdim=True).clamp(min=1e-300)
++        exact = torch.einsum("rhgw,rwhd->rhgd", p, v)
++        bound = torch.einsum("rhgw,rwhd->rhgd", p, v.abs())
++        splits = []
++        for split in range(num_splits):
++            m = torch.full(s.shape[:-1], -1e20, dtype=s.dtype, device=s.device)
++            l, acc, flip = torch.zeros_like(m), 0.0, 0.0
++            for tile in range(split, num_tiles, num_splits):
++                cols = slice(64 * tile, 64 * tile + 64)
++                m_new = torch.maximum(m, s[..., cols].amax(-1))
++                pt = torch.exp2(s[..., cols] - m_new[..., None]) * mask[..., cols]
++                pb = pt.bfloat16().double()
++                alpha = torch.exp2(m - m_new)[..., None]
++                acc = acc * alpha + torch.einsum("rhgw,rwhd->rhgd", pb, v[:, cols])
++                flip = flip * alpha + torch.einsum(
++                    "rhgw,rwhd->rhgd", _ulp_bf16(pb), v[:, cols].abs()
++                )
++                l, m = l * alpha[..., 0] + pt.sum(-1), m_new
++            lse = torch.where(l > 0, m + torch.log2(l), -math.inf)[..., None]
++            splits.append((acc / l[..., None], flip / l[..., None], lse))
++        out, flip, lse = (
++            torch.stack(x).nan_to_num(0) for x in zip(*splits, strict=True)
++        )
++        weight = torch.where(lse > -math.inf, torch.exp2(lse - lse.amax(0)), 0.0)
++        weight = (weight / weight.sum(0).clamp(min=1e-300)).nan_to_num(0)
++        # Relative error of each P: twice the FP32 score error bound, plus exp2.approx.
++        eps_p = 2 * HEAD_DIM * 2**-23 * math.log(2) * s_abs * log2_scale + 2**-21
++        parts.append(
++            (
++                (weight * out).sum(0),
++                (weight * flip).sum(0),
++                eps_p[..., None],
++                exact,
++                bound,
++            )
++        )
++    pre, flip, eps_p, exact, bound = (
++        torch.cat(x).flatten(1, 2) for x in zip(*parts, strict=True)
++    )
++    sigma = torch.sigmoid(gate.float())
++    rounded = pre.float().bfloat16()
++    contract = (rounded.float() * sigma).bfloat16().double()
++    sigma = sigma.double()
++    tolerance = (
++        sigma * (2 * _ulp_bf16(rounded.double()) + flip)
++        + sigma * (2 * eps_p + 2 * WIDTH * 2**-23) * bound
++        + _ulp_bf16(contract)
++    )
++    return contract, tolerance, exact * sigma, bound * sigma
++
++
++def _run(q, cache, selection, gate, out=None):
++    data, sf, (k_scale, v_scale), _ = cache
++    table, token_to_req, indices = selection
++    return qsa_sparse_paged_attention(
++        q,
++        data[0],
++        data[1],
++        indices,
++        table,
++        token_to_req,
++        False,
++        out,
++        k_scale,
++        v_scale,
++        output_gate=gate,
++        k_sf=sf[0],
++        v_sf=sf[1],
++    )
++
++
++def _inputs(rows, num_qo_heads, num_kv_heads, layout, seed):
++    gen = torch.Generator(device="cuda").manual_seed(seed)
++    q, gate = (
++        torch.randn(
++            rows, num_qo_heads, HEAD_DIM, device="cuda", generator=gen
++        ).bfloat16()
++        for _ in range(2)
++    )
++    # q and the cache draw from the same seed on purpose: some q rows then equal a cached
++    # K and their attention collapses onto that token, which stresses small probabilities.
++    return q, _make_cache(num_kv_heads, layout, seed), _make_selection(rows, seed), gate
++
++
++# rows x kv_heads of 2, 16, 32, 128 and 4096 give 33, 8, 4, 1 and 1 splits; groups 12, 16, 1.
++@pytest.mark.parametrize("layout", ["NHD", "HND"])
++@pytest.mark.parametrize(
++    "rows,num_qo_heads,num_kv_heads",
++    [
++        (1, 24, 2),
++        (8, 24, 2),
++        (16, 24, 2),
++        (64, 24, 2),
++        (2048, 24, 2),
++        (4, 16, 1),
++        (4, 2, 2),
++    ],
++)
++def test_matches_reference(layout, rows, num_qo_heads, num_kv_heads):
++    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, layout, rows)
++    out = _run(q, cache, selection, gate).double()
++    major = get_compute_capability(q.device)[0]
++    num_splits = _num_splits(rows, num_kv_heads, WIDTH, major)
++    contract, tolerance, exact, bound = _reference(
++        q, cache, selection, gate, num_splits
++    )
++    assert ((out - contract).abs() <= tolerance).all()
++    # Accuracy limit against exact attention; validated empirically, not a proven bound.
++    assert ((out - exact).abs() / bound.clamp(min=1e-12)).max().item() <= 2**-6
++    if rows > 2:
++        assert not out[1].any() and out[2].any()  # count 0; count 1 with a real token
++
++
++def test_cuda_graph_replay():
++    q, cache, selection, gate = _inputs(8, 24, 2, "HND", 7)
++    out = torch.empty_like(q)
++    _run(q, cache, selection, gate, out)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        _run(q, cache, selection, gate, out)
++    for dst, src in zip(selection, _make_selection(8, 8), strict=True):
++        dst.copy_(src)
++    q.copy_(torch.randn_like(q))
++    graph.replay()
++    torch.testing.assert_close(out, _run(q, cache, selection, gate), rtol=0, atol=0)
++
++
++def test_rejects_invalid_inputs():
++    q, cache, selection, gate = _inputs(4, 24, 2, "NHD", 0)
++    (k_data, v_data), (k_sf, v_sf), (k_scale, v_scale), _ = cache
++    table, token_to_req, indices = selection
++    args = dict(
++        q=q,
++        k_cache=k_data,
++        v_cache=v_data,
++        logical_indices=indices,
++        block_table=table,
++        token_to_req=token_to_req,
++        use_prefill_config=False,
++        k_scale=k_scale,
++        v_scale=v_scale,
++        output_gate=gate,
++        k_sf=k_sf,
++        v_sf=v_sf,
++    )
++    misaligned = torch.empty(q.numel() + 1, dtype=q.dtype, device="cuda")[1:].view(
++        q.shape
++    )
++    wide_group = torch.zeros(4, 48, HEAD_DIM, dtype=q.dtype, device="cuda")
++    for change in (
++        {"q": q.half()},
++        {"q": q[..., :128]},
++        {"q": misaligned},
++        {"q": wide_group, "output_gate": torch.zeros_like(wide_group)},
++        {"k_cache": k_data.view(torch.int8)},
++        {"v_sf": v_sf[..., :8]},
++        {"logical_indices": indices[:, :1]},
++        {"logical_indices": indices.long()},
++        {"token_to_req": token_to_req[:-1]},
++        {"k_scale": None},
++        {"output_gate": gate.half()},
++    ):
++        with pytest.raises(ValueError):
++            qsa_sparse_paged_attention(**{**args, **change})

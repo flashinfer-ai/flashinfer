@@ -1,0 +1,623 @@
+diff --git a/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/safe_quantize.py b/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/safe_quantize.py
+index a375b8a9b25..b575244aca6 100644
+--- a/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/safe_quantize.py
++++ b/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/safe_quantize.py
+@@ -1,10 +1,10 @@
+ # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: BSD-3-Clause
+-"""Fuse post-amax MXFP4 activation quantization without changing normal rounding.
++"""Safe MXFP4 activation quantization and BF16 input staging.
+ 
+-This module does not compute the row reduction. The caller supplies contiguous
+-FP32 input and its existing Torch absmax. Compilation is cached by static hidden
+-width and device, with symbolic token count and the TVM-FFI current stream.
++The FP32 quantizer consumes a supplied absmax. The BF16 stager reduces each
++finite input row directly before applying the same safe quantization math.
++Compilation uses symbolic token counts and the TVM-FFI current stream.
+ """
+ 
+ import functools
+@@ -54,9 +54,39 @@ def _div_rn(a: Float32, b: Float32):
+     )
+ 
+ 
++@cute.jit
++def _safe_scale(row_amax: Float32):
++    # Match the existing Torch scalar division and tiny-value rescaling exactly.
++    d = _mul_rn(row_amax, Float32(1.0 / _E4M3_MAX))
++    if d < Float32(_LEGACY_EPS):
++        d = Float32(_LEGACY_EPS)
++    tiny = (row_amax > Float32(0.0)) & (row_amax < Float32(_TINY_AMAX))
++    q = Float32(0.0)
++    if tiny:
++        safe_amax = row_amax
++        if safe_amax < Float32(_MIN_AMAX):
++            safe_amax = Float32(_MIN_AMAX)
++        q = _div_rn(Float32(_E4M3_MAX), safe_amax)
++        if q > Float32(_FP32_MAX):
++            q = Float32(_FP32_MAX)
++        d = _div_rn(Float32(1.0), q)
++    return d, q, tiny
++
++
++@cute.jit
++def _safe_scaled_value(value: Float32, d: Float32, q: Float32, tiny):
++    scaled = Float32(0.0)
++    if tiny:
++        scaled = _mul_rn(value, q)
++    else:
++        scaled = _div_rn(value, d)
++    return scaled
++
++
+ class _SafeE4M3Quantize:
+-    def __init__(self, hidden: int):
++    def __init__(self, hidden: int, top_k: int = 0):
+         self.hidden = hidden
++        self.top_k = top_k
+ 
+     @cute.jit
+     def __call__(
+@@ -66,9 +96,19 @@ def __call__(
+         payload: cute.Tensor,
+         scales: cute.Tensor,
+         stream,
++        topk_ids=None,
++        topk_weights=None,
++        ids_out=None,
++        weights_out=None,
+     ):
+         elements = Int64(cute.size(x, mode=[0])) * Int64(self.hidden)
+-        self.kernel(x, amax, payload, scales).launch(
++        if cutlass.const_expr(self.top_k > 0):
++            routes = Int64(cute.size(ids_out, mode=[0])) * Int64(self.top_k)
++            if routes > elements:
++                elements = routes
++        self.kernel(
++            x, amax, payload, scales, topk_ids, topk_weights, ids_out, weights_out
++        ).launch(
+             grid=((elements + _THREADS - 1) // _THREADS, 1, 1),
+             block=(_THREADS, 1, 1),
+             stream=stream,
+@@ -81,6 +121,10 @@ def kernel(
+         amax: cute.Tensor,
+         payload: cute.Tensor,
+         scales: cute.Tensor,
++        topk_ids=None,
++        topk_weights=None,
++        ids_out=None,
++        weights_out=None,
+     ):
+         tid, _, _ = cute.arch.thread_idx()
+         block, _, _ = cute.arch.block_idx()
+@@ -92,29 +136,29 @@ def kernel(
+             row_amax = amax[row, 0]
+             value = x[row, col]
+ 
+-            # Torch CUDA division by a CPU scalar uses multiplication by its
+-            # FP32 reciprocal. div.rn(amax, 448) can differ by one ULP here.
+-            d = _mul_rn(row_amax, Float32(1.0 / _E4M3_MAX))
+-            if d < Float32(_LEGACY_EPS):
+-                d = Float32(_LEGACY_EPS)
+-
+-            scaled = Float32(0.0)
+-            if (row_amax > Float32(0.0)) & (row_amax < Float32(_TINY_AMAX)):
+-                safe_amax = row_amax
+-                if safe_amax < Float32(_MIN_AMAX):
+-                    safe_amax = Float32(_MIN_AMAX)
+-                q = _div_rn(Float32(_E4M3_MAX), safe_amax)
+-                if q > Float32(_FP32_MAX):
+-                    q = Float32(_FP32_MAX)
+-                d = _div_rn(Float32(1.0), q)
+-                scaled = _mul_rn(value, q)
+-            else:
+-                # Do not replace this tensor/tensor division with value*rcp(d).
+-                scaled = _div_rn(value, d)
++            d, q, tiny = _safe_scale(row_amax)
++            scaled = _safe_scaled_value(value, d, q, tiny)
+ 
+             payload[row, col] = scaled.to(cutlass.Float8E4M3FN)
+             if col == Int64(0):
+-                scales[row, 0] = d
++                if cutlass.const_expr(self.top_k > 0):
++                    for wire_col in cutlass.range_constexpr(4):
++                        scales[row, wire_col] = d
++                else:
++                    scales[row, 0] = d
++
++        if cutlass.const_expr(self.top_k > 0):
++            routes = Int64(cute.size(ids_out, mode=[0])) * Int64(self.top_k)
++            if index < routes:
++                row = index // Int64(self.top_k)
++                col = index % Int64(self.top_k)
++                if row < Int64(cute.size(x, mode=[0])):
++                    ids_out[row, col] = topk_ids[row, col]
++                    weights_out[row, col] = topk_weights[row, col]
++                else:
++                    # Clear on every replay: the same workspace can be reused
++                    # by graphs with different live token counts.
++                    ids_out[row, col] = Int64(-1)
+ 
+ 
+ @functools.cache
+@@ -184,4 +228,172 @@ def quantize_from_amax(
+     return payload, scales
+ 
+ 
++@functools.cache
++def _compiled_stager(hidden: int, top_k: int, device_index: int):
++    del device_index
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError(
++            "safe E4M3 staging requires one eager warmup before CUDA Graph capture"
++        )
++    tokens, capacity = cute.sym_int(), cute.sym_int()
++
++    def tensor(dtype, shape, alignment):
++        return cute.runtime.make_fake_compact_tensor(
++            dtype, shape, stride_order=(1, 0), assumed_align=alignment
++        )
++
++    return cute.compile(
++        _SafeE4M3Quantize(hidden, top_k),
++        tensor(Float32, (tokens, hidden), 4),
++        tensor(Float32, (tokens, 1), 4),
++        tensor(cutlass.Float8E4M3FN, (capacity, hidden), 1),
++        tensor(Float32, (capacity, 4), 4),
++        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
++        tensor(Int64, (tokens, top_k), 8),
++        tensor(Float32, (tokens, top_k), 4),
++        tensor(Int64, (capacity, top_k), 8),
++        tensor(Float32, (capacity, top_k), 4),
++        options="--enable-tvm-ffi",
++    )
++
++
++def quantize_and_stage_from_amax(
++    x, amax, payload, scales, topk_ids, topk_weights, ids_out, weights_out
++):
++    """Write quantized data and routing directly to validated contiguous buffers.
++
++    The staging caller validates the shapes, dtypes, device and capacity before
++    selecting this path. Arithmetic is shared with ``quantize_from_amax``.
++    """
++    with torch.cuda.device(x.device):
++        compiled = _compiled_stager(x.shape[1], topk_ids.shape[1], x.device.index)
++        compiled(x, amax, payload, scales, topk_ids, topk_weights, ids_out, weights_out)
++
++
++class _BF16SafeStager:
++    """One CTA per live row, with separate CTAs clearing padded routing rows."""
++
++    def __init__(self, hidden: int, top_k: int):
++        self.hidden = hidden
++        self.top_k = top_k
++        self.threads = 256
++        self.slots = (hidden + self.threads - 1) // self.threads
++
++    @cute.jit
++    def __call__(
++        self, x, payload, scales, topk_ids, topk_weights, ids_out, weights_out, stream
++    ):
++        tokens = Int64(cute.size(x, mode=[0]))
++        tail = (Int64(cute.size(ids_out, mode=[0])) - tokens) * self.top_k
++        self.kernel(
++            x, payload, scales, topk_ids, topk_weights, ids_out, weights_out
++        ).launch(
++            grid=(tokens + (tail + self.threads - 1) // self.threads, 1, 1),
++            block=(self.threads, 1, 1),
++            stream=stream,
++        )
++
++    @cute.kernel
++    def kernel(self, x, payload, scales, topk_ids, topk_weights, ids_out, weights_out):
++        tid = cute.arch.thread_idx()[0]
++        row = cute.arch.block_idx()[0]
++        tokens = cute.size(x, mode=[0])
++        if row < tokens:
++            values = cute.make_rmem_tensor((self.slots,), Float32)
++            local_max = Float32(0.0)
++            for slot in cutlass.range_constexpr(self.slots):
++                col = tid + slot * self.threads
++                value = Float32(0.0)
++                if col < self.hidden:
++                    value = Float32(x[row, col])
++                values[slot] = value
++                magnitude = Float32(
++                    llvm.inline_asm(
++                        Float32.mlir_type,
++                        [value.ir_value()],
++                        "abs.f32 $0, $1;",
++                        "=f,f",
++                        has_side_effects=False,
++                        is_align_stack=False,
++                        asm_dialect=llvm.AsmDialect.AD_ATT,
++                    )
++                )
++                if magnitude > local_max:
++                    local_max = magnitude
++            for index in cutlass.range_constexpr(5):
++                peer = cute.arch.shuffle_sync_bfly(local_max, offset=1 << index)
++                if peer > local_max:
++                    local_max = peer
++            smem = cutlass.utils.SmemAllocator()
++            partials = smem.allocate_array(Float32, self.threads // 32)
++            lane = tid % 32
++            if lane == 0:
++                partials[tid // 32] = local_max
++            cute.arch.sync_threads()
++            row_amax = Float32(0.0)
++            if lane < self.threads // 32:
++                row_amax = partials[lane]
++            for index in cutlass.range_constexpr(5):
++                peer = cute.arch.shuffle_sync_bfly(row_amax, offset=1 << index)
++                if peer > row_amax:
++                    row_amax = peer
++            d, q, tiny = _safe_scale(row_amax)
++            for slot in cutlass.range_constexpr(self.slots):
++                col = tid + slot * self.threads
++                if col < self.hidden:
++                    scaled = _safe_scaled_value(values[slot], d, q, tiny)
++                    payload[row, col] = scaled.to(cutlass.Float8E4M3FN)
++            if tid < 4:
++                scales[row, tid] = d
++            for slot in cutlass.range_constexpr(
++                (self.top_k + self.threads - 1) // self.threads
++            ):
++                col = tid + slot * self.threads
++                if col < self.top_k:
++                    ids_out[row, col] = topk_ids[row, col]
++                    weights_out[row, col] = topk_weights[row, col]
++        else:
++            index = Int64(row - tokens) * self.threads + tid
++            tail = Int64(cute.size(ids_out, mode=[0]) - tokens) * self.top_k
++            if index < tail:
++                ids_out[tokens + index // self.top_k, index % self.top_k] = Int64(-1)
++
++
++@functools.cache
++def _compiled_bf16_stager(hidden: int, top_k: int, device_index: int):
++    del device_index
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError(
++            "BF16 safe staging requires eager warmup before CUDA Graph capture"
++        )
++    tokens, capacity = cute.sym_int(), cute.sym_int()
++
++    def tensor(dtype, shape, alignment):
++        return cute.runtime.make_fake_compact_tensor(
++            dtype, shape, stride_order=(1, 0), assumed_align=alignment
++        )
++
++    return cute.compile(
++        _BF16SafeStager(hidden, top_k),
++        tensor(cutlass.BFloat16, (tokens, hidden), 2),
++        tensor(cutlass.Float8E4M3FN, (capacity, hidden), 1),
++        tensor(Float32, (capacity, 4), 4),
++        tensor(Int64, (tokens, top_k), 8),
++        tensor(Float32, (tokens, top_k), 4),
++        tensor(Int64, (capacity, top_k), 8),
++        tensor(Float32, (capacity, top_k), 4),
++        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
++        options="--enable-tvm-ffi",
++    )
++
++
++def quantize_and_stage_bf16(
++    x, payload, scales, topk_ids, topk_weights, ids_out, weights_out
++):
++    """Read finite BF16 rows, reduce amax and stage into validated buffers."""
++    with torch.cuda.device(x.device):
++        compiled = _compiled_bf16_stager(x.shape[1], topk_ids.shape[1], x.device.index)
++        compiled(x, payload, scales, topk_ids, topk_weights, ids_out, weights_out)
++
++
+ __all__ = ["quantize_from_amax"]
+diff --git a/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/staging.py b/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/staging.py
+index 2f1bc9a207c..e30cffe81b2 100644
+--- a/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/staging.py
++++ b/flashinfer/moe_ep/backends/mega/kernel/sm90/fp8_mxfp4_bf16_pull_cutedsl/staging.py
+@@ -169,6 +169,46 @@ def stage_mega_moe_inputs(
+         _note_staged_tokens(topk_idx_out, 0)
+         return
+ 
++    if (
++        quantize_input
++        and safe_quantization
++        and hidden_states.is_cuda
++        and hidden_states.dtype == torch.bfloat16
++        and hidden_states.shape[1] > 0
++        # The row kernel uses 32-bit live-row offsets; retain the fallback
++        # when any live tensor would exceed that indexing range.
++        and num_tokens * max(hidden_states.shape[1], topk_ids.shape[1], 4) <= 2**31 - 1
++        and topk_ids.shape[0] == num_tokens
++        and topk_ids.shape[1] > 0
++        and topk_ids.dtype == torch.int64
++        and topk_weights.dtype == torch.float32
++        and all(
++            tensor.is_contiguous()
++            for tensor in (
++                hidden_states,
++                topk_ids,
++                topk_weights,
++                x_fp8,
++                x_sf,
++                topk_idx_out,
++                topk_weights_out,
++            )
++        )
++    ):
++        from .safe_quantize import quantize_and_stage_bf16
++
++        quantize_and_stage_bf16(
++            hidden_states,
++            x_fp8,
++            x_sf,
++            topk_ids,
++            topk_weights,
++            topk_idx_out,
++            topk_weights_out,
++        )
++        _note_staged_tokens(topk_idx_out, num_tokens)
++        return
++
+     if quantize_input:
+         quantized, logical_scale = _quantize_e4m3_per_token_full_hidden(
+             hidden_states, safe_quantization=safe_quantization
+diff --git a/flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/shim/hopper_mxfp4.py b/flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/shim/hopper_mxfp4.py
+index 45e9642b43e..081897b70a0 100644
+--- a/flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/shim/hopper_mxfp4.py
++++ b/flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/shim/hopper_mxfp4.py
+@@ -274,6 +274,15 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
+     _mega_key: Optional[tuple]
+     _mega: Optional[_CompiledMega]
+ 
++    @staticmethod
++    def _launch_cache_key(inputs: MegaMoEHopperFp8Inputs, num_tokens: int) -> tuple:
++        # Separate combine can write a shorter output view while the dispatch
++        # tensors retain their full symmetric capacity and the same pointers.
++        return MegaMoEHopperFp8Frontend._launch_cache_key(inputs, num_tokens) + (
++            tuple(inputs.output_activation.shape),
++            tuple(inputs.output_activation.stride()),
++        )
++
+     def apply_knobs(self, knobs: Optional[dict]) -> None:
+         """Apply only declared MXFP4 tactics; reject stale/cache-only fields."""
+         if knobs is None:
+@@ -591,12 +600,6 @@ def require_cuda(name: str, tensor: torch.Tensor) -> None:
+                 (buf_tokens, c.num_topk),
+                 torch.float32,
+             ),
+-            (
+-                "output_activation",
+-                inputs.output_activation,
+-                (buf_tokens, c.hidden),
+-                torch.bfloat16,
+-            ),
+         )
+         for name, tensor, token_shape, dtype in token_contracts:
+             require_cuda(name, tensor)
+@@ -607,6 +610,22 @@ def require_cuda(name: str, tensor: torch.Tensor) -> None:
+             if tensor.dtype != dtype:
+                 raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}.")
+ 
++        output = inputs.output_activation
++        require_cuda("output_activation", output)
++        if (
++            output.ndim != 2
++            or output.shape[1] != c.hidden
++            or not 0 < output.shape[0] <= buf_tokens
++            or (c.in_kernel_fc2_reduce and output.shape[0] != buf_tokens)
++        ):
++            raise ValueError(
++                "output_activation must have the full buffer shape for in-kernel "
++                "combine, or a nonempty prefix of its rows for separate combine; "
++                f"got {tuple(output.shape)} for ({buf_tokens}, {c.hidden})."
++            )
++        if output.dtype != torch.bfloat16:
++            raise ValueError(f"output_activation must be bfloat16, got {output.dtype}.")
++
+         e = c.num_experts_per_rank
+         packed_weight_contracts = (
+             (
+@@ -1240,8 +1259,13 @@ def hopper_mxfp4_mega_moe(
+         symm_buffer._frontend.set_gate_up_clamp(clamp)
+ 
+     inputs = _build_mxfp4_inputs(symm_buffer, transformed_l1, transformed_l2)
+-    # Launch the full padded workspace.  topk_idx[n:] == -1 masks tail rows;
+-    # this matches the kernel-team fused driver and keeps compile shape stable.
++    if n > 0 and not symm_buffer._frontend.config.in_kernel_fc2_reduce:
++        # Only final combine uses this view. Dispatch and peer FC2 writes retain
++        # the full capacity, including when different ranks have different n.
++        inputs.output_activation = inputs.output_activation[:n]
++    # Keep the collective launch at full capacity, including empty ranks that
++    # may serve peer experts. Empty outputs retain the existing reducer path,
++    # whose launcher requires a nonzero grid.
+     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
+     if y is None:
+         result = out[:n] if out is not None else symm_buffer.output_activation[:0]
+diff --git a/tests/moe_ep/test_sm90_mxfp4_fused_staging.py b/tests/moe_ep/test_sm90_mxfp4_fused_staging.py
+new file mode 100644
+index 00000000000..c642b727f77
+--- /dev/null
++++ b/tests/moe_ep/test_sm90_mxfp4_fused_staging.py
+@@ -0,0 +1,133 @@
++"""SM90 safe quantization must stage identical bytes into reusable workspaces."""
++
++import importlib
++
++import pytest
++import torch
++
++
++_PACKAGE = "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl"
++
++
++def _modules():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
++        pytest.skip("SM90 is required")
++    return importlib.import_module(_PACKAGE + ".staging"), importlib.import_module(
++        _PACKAGE + ".safe_quantize"
++    )
++
++
++def _workspace(capacity, hidden, topk, *, strided=False):
++    outputs, guards = [], []
++    for shape, dtype in (
++        ((capacity, hidden), torch.float8_e4m3fn),
++        ((capacity, 4), torch.float32),
++        ((capacity, topk), torch.int64),
++        ((capacity, topk), torch.float32),
++    ):
++        stride = 2 if strided else 1
++        count = shape[0] * shape[1] * stride
++        storage = torch.empty(count + 2, dtype=dtype, device="cuda")
++        storage.view(torch.uint8).fill_(0x5A)
++        outputs.append(storage[1:-1].view(shape[0], shape[1] * stride)[:, ::stride])
++        guards.append(storage)
++    return outputs, guards
++
++
++def _expected(quantizer, x, ids, weights, prior):
++    result = [t.clone() for t in prior]
++    n = x.shape[0]
++    if n:
++        fp32 = x.float()
++        payload, scales = quantizer(fp32, fp32.abs().amax(1, keepdim=True))
++        result[0][:n].copy_(payload)
++        result[1][:n].copy_(scales.expand(n, 4))
++        result[2][:n].copy_(ids)
++        result[3][:n].copy_(weights)
++    result[2][n:].fill_(-1)
++    return result
++
++
++@pytest.mark.arch_hopper
++@pytest.mark.parametrize("hidden,topk", [(129, 2), (4096, 4), (7168, 8)])
++def test_safe_staging_reuses_workspace_across_graphs(hidden, topk):
++    staging, safe = _modules()
++    torch.manual_seed(20261018)
++    x = torch.randn((33, hidden), device="cuda", dtype=torch.bfloat16)
++    x[0].zero_()
++    x[1].mul_(1e-32)
++    x[2, 0] = -128
++    # Reduction must retain finite BF16 extremes, including subnormals.
++    x[3].fill_(2.0**-133)
++    x[4].fill_(-torch.finfo(torch.bfloat16).max)
++    ids = torch.randint(-1, 64, (33, topk), device="cuda")
++    weights = torch.randn((33, topk), device="cuda")
++    outputs, guards = _workspace(65, hidden, topk)
++
++    def stage(n):
++        staging.stage_mega_moe_inputs(
++            x[:n],
++            weights[:n],
++            ids[:n],
++            *outputs,
++            quantize_input=True,
++            safe_quantization=True,
++        )
++
++    # Both large and small graphs share the same buffers. A later smaller
++    # batch must clear routes written by the larger graph on every replay.
++    graphs = {}
++    for n in (33, 1):
++        stage(n)
++        assert safe._compiled_bf16_stager.cache_info().currsize > 0
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            stage(n)
++        graphs[n] = graph
++    original = (x.clone(), ids.clone(), weights.clone())
++    for phase in ("original", "changed", "restored"):
++        if phase == "changed":
++            x.normal_()
++            ids.random_(-1, 64)
++            weights.normal_()
++        elif phase == "restored":
++            x.copy_(original[0])
++            ids.copy_(original[1])
++            weights.copy_(original[2])
++        for n in (33, 1, 0, 33, 1):
++            expected = _expected(
++                safe.quantize_from_amax, x[:n], ids[:n], weights[:n], outputs
++            )
++            if n:
++                graphs[n].replay()
++            else:
++                stage(n)
++            for actual, reference in zip(outputs, expected, strict=True):
++                assert torch.equal(
++                    actual.view(torch.uint8), reference.view(torch.uint8)
++                )
++            for storage in guards:
++                assert torch.all(storage[:1].view(torch.uint8) == 0x5A)
++                assert torch.all(storage[-1:].view(torch.uint8) == 0x5A)
++
++
++@pytest.mark.arch_hopper
++def test_safe_staging_preserves_strided_workspace_fallback(monkeypatch):
++    staging, safe = _modules()
++    x = torch.randn((4, 129), device="cuda", dtype=torch.bfloat16)
++    ids = torch.randint(-1, 64, (4, 2), device="cuda", dtype=torch.int32)
++    weights = torch.randn((4, 2), device="cuda")
++    outputs, _ = _workspace(9, 129, 2, strided=True)
++    expected = _expected(safe.quantize_from_amax, x, ids, weights, outputs)
++
++    def forbidden(*args, **kwargs):
++        pytest.fail("Unsupported layouts must retain the existing staging path")
++
++    monkeypatch.setattr(safe, "quantize_and_stage_bf16", forbidden)
++    staging.stage_mega_moe_inputs(
++        x, weights, ids, *outputs, quantize_input=True, safe_quantization=True
++    )
++    for actual, reference in zip(outputs, expected, strict=True):
++        assert torch.equal(
++            actual.contiguous().view(torch.uint8), reference.view(torch.uint8)
++        )
+diff --git a/tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py b/tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py
+index 969f04ad7cf..84744927890 100644
+--- a/tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py
++++ b/tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py
+@@ -501,5 +501,41 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(
+         )
+         torch.testing.assert_close(actual, y_reference, rtol=3.0e-2, atol=2.0e-2)
+         assert relative_l2.item() < 0.035
++
++        # Shrink/grow at the same workspace address, then replay the small
++        # graph after a larger launch. Padded output rows must remain untouched.
++        saved_routes = symm_buffer.topk_idx.clone()
++        small_graph = torch.cuda.CUDAGraph()
++        for live in (1, n):
++            symm_buffer.topk_idx.copy_(saved_routes)
++            symm_buffer.topk_idx[live:].fill_(-1)
++            symm_buffer.output_activation.fill_(float("nan"))
++            result = pkg.hopper_mxfp4_mega_moe(
++                None,
++                transformed_l1,
++                transformed_l2,
++                symm_buffer,
++                num_tokens=live,
++                sync=True,
++            )
++            assert torch.equal(result, y_first[:live])
++            assert symm_buffer.output_activation[live:].isnan().all()
++            if live == 1:
++                with torch.cuda.graph(small_graph):
++                    small_output = pkg.hopper_mxfp4_mega_moe(
++                        None,
++                        transformed_l1,
++                        transformed_l2,
++                        symm_buffer,
++                        num_tokens=live,
++                    )
++        symm_buffer.topk_idx[1:].fill_(-1)
++        for _ in range(3):
++            symm_buffer.output_activation.fill_(float("nan"))
++            small_graph.replay()
++            torch.cuda.synchronize()
++            assert torch.equal(small_output, y_first[:1])
++            assert symm_buffer.output_activation[1:].isnan().all()
++        small_graph.reset()
+     finally:
+         symm_buffer.destroy()

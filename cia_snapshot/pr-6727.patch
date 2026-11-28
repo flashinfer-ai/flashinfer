@@ -1,0 +1,2236 @@
+diff --git a/benchmarks/routines/gemm.py b/benchmarks/routines/gemm.py
+index 78c9cfb7fe4..0bc90c11173 100644
+--- a/benchmarks/routines/gemm.py
++++ b/benchmarks/routines/gemm.py
+@@ -156,6 +156,8 @@ def parse_gemm_args(line, parser):
+             "cublaslt",
+             "cute-dsl",
+             "cute-dsl-native",
++            "blackwell-native",
++            "blackwell-tiled",
+             "b12x",
+             "auto",
+             "tinygemm",
+diff --git a/flashinfer/gemm/gemm_bf16_fp4.py b/flashinfer/gemm/gemm_bf16_fp4.py
+index cc489eb7680..6ada2b833c8 100644
+--- a/flashinfer/gemm/gemm_bf16_fp4.py
++++ b/flashinfer/gemm/gemm_bf16_fp4.py
+@@ -38,6 +38,7 @@
+     "blackwell-native",
+     "blackwell-tiled",
+ ]
++_SourceBuiltBf16Fp4Backend = Literal["blackwell-native", "blackwell-tiled"]
+ 
+ 
+ def _check_mm_bf16_fp4_problem_size(
+@@ -130,121 +131,25 @@ def _cute_dsl_bf16_fp4_requirement(
+ 
+ 
+ @supported_compute_capability([100, 103])
+-def _blackwell_native_bf16_fp4_requirement(
++def _blackwell_bf16_fp4_requirement(
+     a: torch.Tensor,
+     b: torch.Tensor,
+     b_descale: torch.Tensor,
+     alpha: Optional[torch.Tensor] = None,
+     *,
+-    backend: _Bf16Fp4Backend,
++    backend: _SourceBuiltBf16Fp4Backend,
+     out_dtype: Optional[torch.dtype] = None,
+     out: Optional[torch.Tensor] = None,
+     block_size: int = 16,
+     enable_pdl: bool = True,
+ ):
+-    del alpha, backend, enable_pdl
+-    if int(a.shape[1]) % block_size != 0:
+-        raise ValueError(
+-            f"K={int(a.shape[1])} must be a multiple of block_size={block_size}"
+-        )
+-    if b.dim() != 2 or b.dtype != torch.uint8:
+-        raise ValueError(
+-            "blackwell-native expects the uint8 [N, K/2] weight returned by "
+-            "prepare_bf16_fp4_weights(..., backend='blackwell-native')"
+-        )
+-    n = int(b.shape[0])
+-    k = int(b.shape[1]) * 2
+-    if int(a.shape[1]) != k:
+-        raise ValueError(f"a.shape[1]={int(a.shape[1])} but prepared b encodes K={k}")
+-    if b_descale.dtype != torch.float8_e4m3fn or tuple(b_descale.shape) != (
+-        n,
+-        k // block_size,
+-    ):
+-        raise ValueError(
+-            "blackwell-native expects linear float8_e4m3fn scales with shape "
+-            f"{(n, k // block_size)}; got dtype={b_descale.dtype}, "
+-            f"shape={tuple(b_descale.shape)}"
+-        )
+-    requested_dtype = out_dtype or a.dtype
+-    if requested_dtype not in (torch.bfloat16, torch.float16):
+-        raise ValueError(
+-            "blackwell-native supports bfloat16 or float16 output; "
+-            f"got {requested_dtype}"
+-        )
+-    if not b.is_contiguous() or not b_descale.is_contiguous():
+-        raise ValueError("blackwell-native requires contiguous b and b_descale")
+-    if b.device != a.device or b_descale.device != a.device:
+-        raise ValueError("a, b, and b_descale must be on the same device")
+-    if out is not None and (
+-        tuple(out.shape) != (int(a.shape[0]), n)
+-        or out.dtype != requested_dtype
+-        or out.device != a.device
+-        or not out.is_contiguous()
+-    ):
+-        raise ValueError(
+-            "out must be contiguous, on the same device, and have shape/dtype "
+-            f"{(int(a.shape[0]), n)}/{requested_dtype}"
+-        )
+-    return True
+-
++    """Source-built Blackwell backends: the checks the compute path runs itself."""
++    del enable_pdl
++    from .gemm_bf16_fp4_blackwell import _validate_blackwell_bf16_fp4
+ 
+-@supported_compute_capability([100, 103])
+-def _blackwell_tiled_bf16_fp4_requirement(
+-    a: torch.Tensor,
+-    b: torch.Tensor,
+-    b_descale: torch.Tensor,
+-    alpha: Optional[torch.Tensor] = None,
+-    *,
+-    backend: _Bf16Fp4Backend,
+-    out_dtype: Optional[torch.dtype] = None,
+-    out: Optional[torch.Tensor] = None,
+-    block_size: int = 16,
+-    enable_pdl: bool = True,
+-):
+-    del alpha, backend, enable_pdl
+-    if int(a.shape[1]) % block_size != 0:
+-        raise ValueError(
+-            f"K={int(a.shape[1])} must be a multiple of block_size={block_size}"
+-        )
+-    if b.dim() != 2 or b.dtype != torch.int32 or int(b.shape[1]) % 2 != 0:
+-        raise ValueError(
+-            "blackwell-tiled expects the int32 [K/16, N*2] weight returned by "
+-            "prepare_bf16_fp4_weights(..., backend='blackwell-tiled')"
+-        )
+-    k_tiles = int(b.shape[0])
+-    n = int(b.shape[1]) // 2
+-    k = k_tiles * block_size
+-    if int(a.shape[1]) != k:
+-        raise ValueError(f"a.shape[1]={int(a.shape[1])} but prepared b encodes K={k}")
+-    if n % 64 != 0:
+-        raise ValueError(
+-            f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
+-        )
+-    if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != (k_tiles, n):
+-        raise ValueError(
+-            "blackwell-tiled expects S0E5M3 uint8 scales with shape "
+-            f"{(k_tiles, n)}; got dtype={b_descale.dtype}, "
+-            f"shape={tuple(b_descale.shape)}"
+-        )
+-    requested_dtype = out_dtype or a.dtype
+-    if requested_dtype != torch.bfloat16:
+-        raise ValueError(
+-            f"blackwell-tiled requires bfloat16 output; got {requested_dtype}"
+-        )
+-    if not b.is_contiguous() or not b_descale.is_contiguous():
+-        raise ValueError("blackwell-tiled requires contiguous b and b_descale")
+-    if b.device != a.device or b_descale.device != a.device:
+-        raise ValueError("a, b, and b_descale must be on the same device")
+-    if out is not None and (
+-        tuple(out.shape) != (int(a.shape[0]), n)
+-        or out.dtype != requested_dtype
+-        or out.device != a.device
+-        or not out.is_contiguous()
+-    ):
+-        raise ValueError(
+-            "out must be contiguous, on the same device, and have shape/dtype "
+-            f"{(int(a.shape[0]), n)}/{requested_dtype}"
+-        )
++    _validate_blackwell_bf16_fp4(
++        a, b, b_descale, alpha, out_dtype or a.dtype, out, block_size, backend
++    )
+     return True
+ 
+ 
+@@ -356,8 +261,8 @@ def prepare_bf16_fp4_weights(
+         "cudnn": _cudnn_bf16_fp4_requirement,
+         "cute-dsl": _cute_dsl_bf16_fp4_requirement,
+         "cute-dsl-native": check_native_bf16_fp4,
+-        "blackwell-native": _blackwell_native_bf16_fp4_requirement,
+-        "blackwell-tiled": _blackwell_tiled_bf16_fp4_requirement,
++        "blackwell-native": _blackwell_bf16_fp4_requirement,
++        "blackwell-tiled": _blackwell_bf16_fp4_requirement,
+     },
+     common_check=_check_mm_bf16_fp4_problem_size,
+ )
+diff --git a/flashinfer/gemm/gemm_bf16_fp4_blackwell.py b/flashinfer/gemm/gemm_bf16_fp4_blackwell.py
+index e8b8bf031b6..9faa31cb64e 100644
+--- a/flashinfer/gemm/gemm_bf16_fp4_blackwell.py
++++ b/flashinfer/gemm/gemm_bf16_fp4_blackwell.py
+@@ -731,87 +731,7 @@ def _prepare_blackwell_bf16_fp4(
+     raise ValueError(f"unknown source-built BF16 x FP4 backend {backend!r}")
+ 
+ 
+-def _validate_alpha(alpha: Optional[torch.Tensor], a: torch.Tensor) -> None:
+-    if alpha is None:
+-        return
+-    if alpha.device != a.device:
+-        raise ValueError(
+-            f"alpha must be on the same device as the GEMM inputs ({a.device}); "
+-            f"got {alpha.device}"
+-        )
+-    if (
+-        alpha.dtype != torch.float32
+-        or tuple(alpha.shape) != (1,)
+-        or not alpha.is_contiguous()
+-    ):
+-        raise ValueError(
+-            "alpha must be a contiguous float32 tensor with shape (1,); "
+-            f"got dtype={alpha.dtype}, shape={tuple(alpha.shape)}, "
+-            f"contiguous={alpha.is_contiguous()}"
+-        )
+-
+-
+-def _validate_blackwell_native_layout(
+-    a: torch.Tensor,
+-    b: torch.Tensor,
+-    b_descale: torch.Tensor,
+-) -> int:
+-    if b.dim() != 2 or b.dtype != torch.uint8:
+-        raise ValueError(
+-            "blackwell-native expects b as contiguous uint8 [N, K/2]; "
+-            f"got dtype={b.dtype}, shape={tuple(b.shape)}"
+-        )
+-    n = int(b.shape[0])
+-    k = int(b.shape[1]) * 2
+-    expected_scale_shape = (n, k // 16)
+-    if (
+-        b_descale.dtype != torch.float8_e4m3fn
+-        or tuple(b_descale.shape) != expected_scale_shape
+-    ):
+-        raise ValueError(
+-            "blackwell-native expects linear float8_e4m3fn scales "
+-            f"with shape {expected_scale_shape}; got dtype={b_descale.dtype}, "
+-            f"shape={tuple(b_descale.shape)}"
+-        )
+-    if int(a.shape[1]) != k:
+-        raise ValueError(
+-            f"a.shape[1]={int(a.shape[1])} but b.shape={tuple(b.shape)} encodes K={k}"
+-        )
+-    return n
+-
+-
+-def _validate_blackwell_tiled_layout(
+-    a: torch.Tensor,
+-    b: torch.Tensor,
+-    b_descale: torch.Tensor,
+-) -> int:
+-    if b.dim() != 2 or b.dtype != torch.int32 or int(b.shape[1]) % 2 != 0:
+-        raise ValueError(
+-            "blackwell-tiled expects b as contiguous int32 [K/16, N*2]; "
+-            f"got dtype={b.dtype}, shape={tuple(b.shape)}"
+-        )
+-    k_tiles = int(b.shape[0])
+-    n = int(b.shape[1]) // 2
+-    k = k_tiles * 16
+-    if n % 64 != 0:
+-        raise ValueError(
+-            f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
+-        )
+-    expected_scale_shape = (k_tiles, n)
+-    if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != expected_scale_shape:
+-        raise ValueError(
+-            "blackwell-tiled expects S0E5M3 uint8 scales "
+-            f"with shape {expected_scale_shape}; got dtype={b_descale.dtype}, "
+-            f"shape={tuple(b_descale.shape)}"
+-        )
+-    if int(a.shape[1]) != k:
+-        raise ValueError(
+-            f"a.shape[1]={int(a.shape[1])} but b.shape={tuple(b.shape)} encodes K={k}"
+-        )
+-    return n
+-
+-
+-def _compute_blackwell_bf16_fp4(
++def _validate_blackwell_bf16_fp4(
+     a: torch.Tensor,
+     b: torch.Tensor,
+     b_descale: torch.Tensor,
+@@ -819,63 +739,136 @@ def _compute_blackwell_bf16_fp4(
+     out_dtype: torch.dtype,
+     out: Optional[torch.Tensor],
+     block_size: int,
+-    enable_pdl: bool,
+     backend: BlackwellBf16Fp4Backend,
+-) -> torch.Tensor:
+-    """Validate the prepared ABI, select the route and launch the generated programs."""
++) -> Tuple[bool, int, int]:
++    """Validate the prepared ABI of one call and return ``(tiled, M, N)``.
++
++    The ``mm_bf16_fp4`` backend checker and :func:`_compute_blackwell_bf16_fp4`
++    both run this, so ``skip_check=True`` skips a duplicate run, not a check.
++    """
+ 
+-    _require_blackwell_source_arch(a.device)
+     if a.dim() != 2 or a.dtype != torch.bfloat16:
+         raise ValueError(
+             "source-built BF16 x FP4 GEMM expects a as bfloat16 [M, K]; "
+             f"got dtype={a.dtype}, shape={tuple(a.shape)}"
+         )
+-    if block_size != 16 or int(a.shape[1]) % block_size != 0:
++    k = int(a.shape[1])
++    if block_size != 16:
+         raise ValueError(
+             f"source-built BF16 x FP4 GEMM requires block_size=16 and K%16=0; "
+-            f"got block_size={block_size}, K={int(a.shape[1])}"
+-        )
+-    if not a.is_contiguous() or not b.is_contiguous() or not b_descale.is_contiguous():
+-        raise ValueError("a, b, and b_descale must be contiguous")
+-    if b.device != a.device or b_descale.device != a.device:
+-        raise ValueError(
+-            "a, b, and b_descale must be on the same device; got "
+-            f"{a.device}, {b.device}, and {b_descale.device}"
++            f"got block_size={block_size}, K={k}"
+         )
+-
++    if k % block_size != 0:
++        raise ValueError(f"K={k} must be a multiple of block_size={block_size}")
+     if backend == "blackwell-native":
+         tiled = False
+-        n = _validate_blackwell_native_layout(a, b, b_descale)
++        if b.dim() != 2 or b.dtype != torch.uint8:
++            raise ValueError(
++                "blackwell-native expects the uint8 [N, K/2] weight returned by "
++                "prepare_bf16_fp4_weights(..., backend='blackwell-native')"
++            )
++        n = int(b.shape[0])
++        encoded_k = int(b.shape[1]) * 2
++        if k != encoded_k:
++            raise ValueError(f"a.shape[1]={k} but prepared b encodes K={encoded_k}")
++        if b_descale.dtype != torch.float8_e4m3fn or tuple(b_descale.shape) != (
++            n,
++            k // block_size,
++        ):
++            raise ValueError(
++                "blackwell-native expects linear float8_e4m3fn scales with shape "
++                f"{(n, k // block_size)}; got dtype={b_descale.dtype}, "
++                f"shape={tuple(b_descale.shape)}"
++            )
+         if out_dtype not in (torch.bfloat16, torch.float16):
+             raise ValueError(
+                 f"blackwell-native supports bfloat16 or float16 output; got {out_dtype}"
+             )
+     elif backend == "blackwell-tiled":
+         tiled = True
+-        n = _validate_blackwell_tiled_layout(a, b, b_descale)
++        if b.dim() != 2 or b.dtype != torch.int32 or int(b.shape[1]) % 2 != 0:
++            raise ValueError(
++                "blackwell-tiled expects the int32 [K/16, N*2] weight returned by "
++                "prepare_bf16_fp4_weights(..., backend='blackwell-tiled')"
++            )
++        k_tiles = int(b.shape[0])
++        n = int(b.shape[1]) // 2
++        encoded_k = k_tiles * block_size
++        if k != encoded_k:
++            raise ValueError(f"a.shape[1]={k} but prepared b encodes K={encoded_k}")
++        if n % 64 != 0:
++            raise ValueError(
++                f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
++            )
++        if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != (k_tiles, n):
++            raise ValueError(
++                "blackwell-tiled expects S0E5M3 uint8 scales with shape "
++                f"{(k_tiles, n)}; got dtype={b_descale.dtype}, "
++                f"shape={tuple(b_descale.shape)}"
++            )
+         if out_dtype != torch.bfloat16:
+             raise ValueError(
+                 f"blackwell-tiled requires bfloat16 output; got {out_dtype}"
+             )
+     else:
+         raise ValueError(f"unknown source-built BF16 x FP4 backend {backend!r}")
+-
++    if not b.is_contiguous() or not b_descale.is_contiguous():
++        raise ValueError(f"{backend} requires contiguous b and b_descale")
++    if b.device != a.device or b_descale.device != a.device:
++        raise ValueError("a, b, and b_descale must be on the same device")
+     m = int(a.shape[0])
++    if out is not None and (
++        tuple(out.shape) != (m, n)
++        or out.dtype != out_dtype
++        or out.device != a.device
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "out must be contiguous, on the same device, and have shape/dtype "
++            f"{(m, n)}/{out_dtype}"
++        )
++    if not a.is_contiguous():
++        raise ValueError("a, b, and b_descale must be contiguous")
+     if m <= 0 or n <= 0:
+         raise ValueError(f"M and N must be positive; got M={m}, N={n}")
++    if alpha is not None:
++        if alpha.device != a.device:
++            raise ValueError(
++                f"alpha must be on the same device as the GEMM inputs ({a.device}); "
++                f"got {alpha.device}"
++            )
++        if (
++            alpha.dtype != torch.float32
++            or tuple(alpha.shape) != (1,)
++            or not alpha.is_contiguous()
++        ):
++            raise ValueError(
++                "alpha must be a contiguous float32 tensor with shape (1,); "
++                f"got dtype={alpha.dtype}, shape={tuple(alpha.shape)}, "
++                f"contiguous={alpha.is_contiguous()}"
++            )
++    return tiled, m, n
++
++
++def _compute_blackwell_bf16_fp4(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    b_descale: torch.Tensor,
++    alpha: Optional[torch.Tensor],
++    out_dtype: torch.dtype,
++    out: Optional[torch.Tensor],
++    block_size: int,
++    enable_pdl: bool,
++    backend: BlackwellBf16Fp4Backend,
++) -> torch.Tensor:
++    """Validate the prepared ABI, select the route and launch the generated programs."""
++
++    _require_blackwell_source_arch(a.device)
++    tiled, m, n = _validate_blackwell_bf16_fp4(
++        a, b, b_descale, alpha, out_dtype, out, block_size, backend
++    )
+     if out is None:
+         out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+-    elif tuple(out.shape) != (m, n):
+-        raise ValueError(f"out shape {tuple(out.shape)} != expected {(m, n)}")
+-    elif out.dtype != out_dtype:
+-        raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
+-    elif out.device != a.device or not out.is_contiguous():
+-        raise ValueError(
+-            "out must be contiguous and on the same device as a; got "
+-            f"device={out.device}, contiguous={out.is_contiguous()}"
+-        )
+-    _validate_alpha(alpha, a)
+-
+     _launch(
+         _plan(a, b, b_descale, alpha, out, tiled=tiled, enable_pdl=bool(enable_pdl))
+     )
+diff --git a/flashinfer/jit/blackwell_bf16_fp4.py b/flashinfer/jit/blackwell_bf16_fp4.py
+index 38141402c10..5489e595e14 100644
+--- a/flashinfer/jit/blackwell_bf16_fp4.py
++++ b/flashinfer/jit/blackwell_bf16_fp4.py
+@@ -19,12 +19,11 @@
+ # ``MODULES`` lists every physical program once: its device and binding
+ # translation units under ``csrc/blackwell_bf16_fp4`` (one source for every
+ # architecture in ``arches``), the compile flags of the source build, the
+-# tvm-ffi entry, the positional argument plan and the launch geometry:
+-# ``threads`` (block size), ``dynamic_smem_bytes``, ``cluster_dims`` (the
+-# thread-block cluster shape ``[x, y, z]``; ``[1, 1, 1]`` for a plain launch)
+-# and ``use_pdl``.  The generated binding fixes the cluster and PDL launch
+-# attributes into its ``cudaLaunchKernelExC`` call; the host reads
+-# ``cluster_dims`` only to size and check the launch grid.
++# tvm-ffi entry, the positional argument plan and ``cluster_dims`` (the
++# thread-block cluster shape ``[x, y, z]``; ``[1, 1, 1]`` for a plain launch).
++# The generated binding fixes the block size, dynamic shared memory, cluster
++# and PDL launch attributes into its ``cudaLaunchKernelExC`` call; the host
++# reads ``cluster_dims`` only to size and check the launch grid.
+ # ``ROUTES`` maps the logical kernel key selected by
+ # ``flashinfer.gemm.gemm_bf16_fp4_blackwell`` to its program.  Both tables are
+ # written by the generated-program export; do not edit them by hand.
+@@ -41,7 +40,6 @@
+ 
+ MODULES: dict[str, dict[str, Any]] = {
+     "cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf_binding.cu",
+@@ -61,14 +59,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_0260157ff19a2009e088": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_0260157ff19a2009e088",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0260157ff19a2009e088_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0260157ff19a2009e088_binding.cu",
+@@ -88,14 +82,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 30720,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_03663ccb5c3794adf73f": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_03663ccb5c3794adf73f_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_03663ccb5c3794adf73f_binding.cu",
+@@ -117,14 +107,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 218112,
+         "cluster_dims": [2, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_067916d318c62cedc87c": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_067916d318c62cedc87c",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_067916d318c62cedc87c_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_067916d318c62cedc87c_binding.cu",
+@@ -144,14 +130,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d_binding.cu",
+@@ -171,14 +153,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9_binding.cu",
+@@ -198,14 +176,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_0bc12861525b941fb731": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_0bc12861525b941fb731",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0bc12861525b941fb731_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0bc12861525b941fb731_binding.cu",
+@@ -225,14 +199,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8_binding.cu",
+@@ -252,14 +222,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_15183f16cdcea47666d4": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_15183f16cdcea47666d4",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_15183f16cdcea47666d4_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_15183f16cdcea47666d4_binding.cu",
+@@ -279,14 +245,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_17f70c3774940e052131": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_17f70c3774940e052131",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_17f70c3774940e052131_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_17f70c3774940e052131_binding.cu",
+@@ -306,14 +268,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594_binding.cu",
+@@ -333,14 +291,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_1ca53a59dd02a007f622": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_1ca53a59dd02a007f622",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1ca53a59dd02a007f622_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1ca53a59dd02a007f622_binding.cu",
+@@ -360,14 +314,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 30720,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd_binding.cu",
+@@ -387,14 +337,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_2091d6b6347b02e20937": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_2091d6b6347b02e20937",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2091d6b6347b02e20937_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2091d6b6347b02e20937_binding.cu",
+@@ -414,14 +360,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_237fdf62606f7aaa8048": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_237fdf62606f7aaa8048",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_237fdf62606f7aaa8048_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_237fdf62606f7aaa8048_binding.cu",
+@@ -441,14 +383,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_245b04e342922bec79a0": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_245b04e342922bec79a0",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_245b04e342922bec79a0_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_245b04e342922bec79a0_binding.cu",
+@@ -468,14 +406,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5_binding.cu",
+@@ -495,14 +429,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 47104,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580_binding.cu",
+@@ -524,14 +454,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 85120,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_2cc4a32a57472117df41": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_2cc4a32a57472117df41",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2cc4a32a57472117df41_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2cc4a32a57472117df41_binding.cu",
+@@ -551,14 +477,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 47104,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_2f1f07fe72294a63de83": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_2f1f07fe72294a63de83",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f1f07fe72294a63de83_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f1f07fe72294a63de83_binding.cu",
+@@ -578,14 +500,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_2f6a670baf612d2eca71": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_2f6a670baf612d2eca71",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f6a670baf612d2eca71_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f6a670baf612d2eca71_binding.cu",
+@@ -605,14 +523,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_317c4acf4da1909bd51e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_317c4acf4da1909bd51e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_317c4acf4da1909bd51e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_317c4acf4da1909bd51e_binding.cu",
+@@ -632,14 +546,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_3402204cb63059a8551f": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_3402204cb63059a8551f",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3402204cb63059a8551f_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3402204cb63059a8551f_binding.cu",
+@@ -661,14 +571,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 78976,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_390ff5549d35cde4b990": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_390ff5549d35cde4b990",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_390ff5549d35cde4b990_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_390ff5549d35cde4b990_binding.cu",
+@@ -688,14 +594,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521_binding.cu",
+@@ -715,14 +617,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_410a822b59152e28bf3a": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_410a822b59152e28bf3a",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_410a822b59152e28bf3a_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_410a822b59152e28bf3a_binding.cu",
+@@ -742,14 +640,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_44cc3fc32d80c039991b": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_44cc3fc32d80c039991b",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_44cc3fc32d80c039991b_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_44cc3fc32d80c039991b_binding.cu",
+@@ -769,14 +663,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 30720,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e_binding.cu",
+@@ -796,14 +686,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 218112,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa_binding.cu",
+@@ -823,14 +709,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9_binding.cu",
+@@ -852,14 +734,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 78976,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_5231418224f82e216679": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_5231418224f82e216679",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5231418224f82e216679_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5231418224f82e216679_binding.cu",
+@@ -879,14 +757,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5_binding.cu",
+@@ -906,14 +780,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1_binding.cu",
+@@ -933,14 +803,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_5415a49326aaf2478405": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_5415a49326aaf2478405",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5415a49326aaf2478405_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5415a49326aaf2478405_binding.cu",
+@@ -960,14 +826,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb_binding.cu",
+@@ -987,14 +849,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5_binding.cu",
+@@ -1016,14 +874,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 78976,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_63e7c7cecc879889b97a": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_63e7c7cecc879889b97a",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_63e7c7cecc879889b97a_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_63e7c7cecc879889b97a_binding.cu",
+@@ -1043,14 +897,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 73728,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0_binding.cu",
+@@ -1070,14 +920,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_692512cee52024c81cd3": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_692512cee52024c81cd3",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_692512cee52024c81cd3_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_692512cee52024c81cd3_binding.cu",
+@@ -1099,14 +945,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 196608,
+         "cluster_dims": [2, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_6b97292c5497a02ffed5": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_6b97292c5497a02ffed5",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6b97292c5497a02ffed5_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6b97292c5497a02ffed5_binding.cu",
+@@ -1126,14 +968,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_6d3ecebd787375da667e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_6d3ecebd787375da667e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6d3ecebd787375da667e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6d3ecebd787375da667e_binding.cu",
+@@ -1155,14 +993,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 196608,
+         "cluster_dims": [2, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac_binding.cu",
+@@ -1184,14 +1018,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 85120,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_732b4fb18587ae537f22": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_732b4fb18587ae537f22",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_732b4fb18587ae537f22_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_732b4fb18587ae537f22_binding.cu",
+@@ -1211,14 +1041,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 73728,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e_binding.cu",
+@@ -1238,14 +1064,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_73976e00e93c52d244b1": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73976e00e93c52d244b1_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73976e00e93c52d244b1_binding.cu",
+@@ -1267,14 +1089,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 196608,
+         "cluster_dims": [2, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20_binding.cu",
+@@ -1296,14 +1114,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 85120,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc_binding.cu",
+@@ -1323,14 +1137,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506_binding.cu",
+@@ -1350,14 +1160,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_7937a0f740c97f86d76a": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_7937a0f740c97f86d76a",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7937a0f740c97f86d76a_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7937a0f740c97f86d76a_binding.cu",
+@@ -1377,14 +1183,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 98304,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e_binding.cu",
+@@ -1404,14 +1206,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 30720,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_7b60c5816c1611ca1701": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_7b60c5816c1611ca1701",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7b60c5816c1611ca1701_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7b60c5816c1611ca1701_binding.cu",
+@@ -1431,14 +1229,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666_binding.cu",
+@@ -1458,14 +1252,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 98304,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_825e5f1f041667160dc6": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_825e5f1f041667160dc6",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_825e5f1f041667160dc6_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_825e5f1f041667160dc6_binding.cu",
+@@ -1485,14 +1275,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb_binding.cu",
+@@ -1512,14 +1298,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 47104,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_87242024d283a189416f": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_87242024d283a189416f",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_87242024d283a189416f_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_87242024d283a189416f_binding.cu",
+@@ -1539,14 +1321,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_8a751c88d50636b4efb9": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_8a751c88d50636b4efb9",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_8a751c88d50636b4efb9_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_8a751c88d50636b4efb9_binding.cu",
+@@ -1568,14 +1346,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 78976,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_916900985e3576f137a2": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_916900985e3576f137a2_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_916900985e3576f137a2_binding.cu",
+@@ -1595,14 +1369,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 98304,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e_binding.cu",
+@@ -1622,14 +1392,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_94e594f619f21558d45a": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_94e594f619f21558d45a",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_94e594f619f21558d45a_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_94e594f619f21558d45a_binding.cu",
+@@ -1649,14 +1415,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2_binding.cu",
+@@ -1676,14 +1438,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_964205318c4b32d14401": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_964205318c4b32d14401",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_964205318c4b32d14401_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_964205318c4b32d14401_binding.cu",
+@@ -1703,14 +1461,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b_binding.cu",
+@@ -1730,14 +1484,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971_binding.cu",
+@@ -1757,14 +1507,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 218112,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e_binding.cu",
+@@ -1784,14 +1530,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_a33d4197b54d8953d9be": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_a33d4197b54d8953d9be",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a33d4197b54d8953d9be_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a33d4197b54d8953d9be_binding.cu",
+@@ -1811,14 +1553,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_a961b62f20862d164a4d": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_a961b62f20862d164a4d",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a961b62f20862d164a4d_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a961b62f20862d164a4d_binding.cu",
+@@ -1838,14 +1576,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 218112,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_af124eba68ad18229e9e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_af124eba68ad18229e9e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_af124eba68ad18229e9e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_af124eba68ad18229e9e_binding.cu",
+@@ -1865,14 +1599,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 98304,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_b7136150009825ef5216": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_b7136150009825ef5216",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b7136150009825ef5216_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b7136150009825ef5216_binding.cu",
+@@ -1894,14 +1624,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 85120,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6_binding.cu",
+@@ -1921,14 +1647,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_bee1a475ab153a6e8530": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_bee1a475ab153a6e8530",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_bee1a475ab153a6e8530_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_bee1a475ab153a6e8530_binding.cu",
+@@ -1948,14 +1670,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 73728,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_c23e44493a5326e83be6": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_c23e44493a5326e83be6",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c23e44493a5326e83be6_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c23e44493a5326e83be6_binding.cu",
+@@ -1975,14 +1693,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33_binding.cu",
+@@ -2002,14 +1716,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18_binding.cu",
+@@ -2029,14 +1739,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd_binding.cu",
+@@ -2056,14 +1762,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9_binding.cu",
+@@ -2083,14 +1785,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b_binding.cu",
+@@ -2110,14 +1808,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58_binding.cu",
+@@ -2137,14 +1831,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_d8375102fff4eb1643d1": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_d8375102fff4eb1643d1",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d8375102fff4eb1643d1_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d8375102fff4eb1643d1_binding.cu",
+@@ -2164,14 +1854,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_db741aa36d51caefee17": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_db741aa36d51caefee17",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_db741aa36d51caefee17_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_db741aa36d51caefee17_binding.cu",
+@@ -2191,14 +1877,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_dfbf721a98d42045de27": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_dfbf721a98d42045de27",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_dfbf721a98d42045de27_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_dfbf721a98d42045de27_binding.cu",
+@@ -2218,14 +1900,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 47104,
+         "cluster_dims": [1, 1, 4],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_e14073c132ab76375064": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_e14073c132ab76375064",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e14073c132ab76375064_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e14073c132ab76375064_binding.cu",
+@@ -2245,14 +1923,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3_binding.cu",
+@@ -2272,14 +1946,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3_binding.cu",
+@@ -2299,14 +1969,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33_binding.cu",
+@@ -2326,14 +1992,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77_binding.cu",
+@@ -2353,14 +2015,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_e9b60f9d1678a0714152": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_e9b60f9d1678a0714152",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e9b60f9d1678a0714152_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e9b60f9d1678a0714152_binding.cu",
+@@ -2380,14 +2038,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 73728,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_f05e3d89f345095156e0": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_f05e3d89f345095156e0",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f05e3d89f345095156e0_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f05e3d89f345095156e0_binding.cu",
+@@ -2407,14 +2061,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 160,
+-        "dynamic_smem_bytes": 218112,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_f09a6b112cd48156248b": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_f09a6b112cd48156248b",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f09a6b112cd48156248b_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f09a6b112cd48156248b_binding.cu",
+@@ -2436,14 +2086,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 196608,
+         "cluster_dims": [2, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde_binding.cu",
+@@ -2463,14 +2109,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 96,
+-        "dynamic_smem_bytes": 150528,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6_binding.cu",
+@@ -2490,14 +2132,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_f963463e57b22269872e": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_f963463e57b22269872e",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f963463e57b22269872e_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f963463e57b22269872e_binding.cu",
+@@ -2517,14 +2155,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19_binding.cu",
+@@ -2544,14 +2178,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696_binding.cu",
+@@ -2571,14 +2201,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_fbb91c1770193c627a03": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_fbb91c1770193c627a03",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fbb91c1770193c627a03_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fbb91c1770193c627a03_binding.cu",
+@@ -2598,14 +2224,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3_binding.cu",
+@@ -2625,14 +2247,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": True,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1_binding.cu",
+@@ -2652,14 +2270,10 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 512,
+-        "dynamic_smem_bytes": 107520,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+     "cake_blackwell_bf16_fp4_ffb4392d5fa01f008308": {
+-        "kernel": "kernel_cake_blackwell_bf16_fp4_ffb4392d5fa01f008308",
+         "sources": [
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ffb4392d5fa01f008308_kernel.cu",
+             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ffb4392d5fa01f008308_binding.cu",
+@@ -2679,10 +2293,7 @@
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+         ],
+-        "threads": 256,
+-        "dynamic_smem_bytes": 62464,
+         "cluster_dims": [1, 1, 1],
+-        "use_pdl": False,
+         "arches": ["sm_100a", "sm_103a"],
+     },
+ }
+diff --git a/tests/gemm/test_blackwell_bf16_fp4.py b/tests/gemm/test_blackwell_bf16_fp4.py
+index fa8c09fa3ea..7fd2890c06a 100644
+--- a/tests/gemm/test_blackwell_bf16_fp4.py
++++ b/tests/gemm/test_blackwell_bf16_fp4.py
+@@ -1,11 +1,15 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
+ # SPDX-License-Identifier: Apache-2.0
+-"""Numerical tests of the public source-built GEMM backends on SM100/SM103."""
++"""Numerical and route tests of the source-built GEMM backends on SM100/SM103."""
++
++import re
+ 
+ import pytest
+ import torch
+ 
+ from flashinfer import mm_bf16_fp4, prepare_bf16_fp4_weights
++from flashinfer.gemm.gemm_bf16_fp4_blackwell import _cell_key, _select_route
++from flashinfer.jit.blackwell_bf16_fp4 import MODULES, ROUTES
+ 
+ # Smallest M whose 16-row activation-tile count exceeds the CUDA Y grid limit.
+ LARGE_M = 65535 * 16 + 16
+@@ -400,7 +404,7 @@ def test_blackwell_bf16_fp4_numerical(
+ 
+ @pytest.mark.parametrize("backend", ["blackwell-native", "blackwell-tiled"])
+ def test_blackwell_bf16_fp4_many_distinct_activations(blackwell_device, backend):
+-    """Every call encodes its own descriptors; distinct activation and output buffers never exhaust a cache."""
++    """Distinct activation and output buffers each get freshly encoded descriptors."""
+ 
+     m, n, k = 3, 64, 256
+     generator = torch.Generator(device=blackwell_device).manual_seed(7)
+@@ -411,16 +415,14 @@ def test_blackwell_bf16_fp4_many_distinct_activations(blackwell_device, backend)
+             (m, k), dtype=torch.bfloat16, device=blackwell_device, generator=generator
+         )
+         * 0.125
+-        for _ in range(4200)
++        for _ in range(8)
+     ]
+     outputs = [mm_bf16_fp4(a, *prepared, backend=backend) for a in activations]
+     torch.cuda.synchronize()
+-    # Every 700th call, plus the two calls on either side of the 4096-call mark
+-    # where the previous binding's fixed-size descriptor cache ran out.
+-    for index in (*range(0, 4200, 700), 4096, 4199):
++    for a, out in zip(activations, outputs, strict=True):
+         torch.testing.assert_close(
+-            outputs[index],
+-            _reference(activations[index], reference_weights, None, torch.bfloat16),
++            out,
++            _reference(a, reference_weights, None, torch.bfloat16),
+             atol=1e-2,
+             rtol=1e-2,
+         )
+@@ -508,3 +510,279 @@ def test_blackwell_bf16_fp4_cuda_graph_capture(blackwell_device, backend, shape)
+     torch.testing.assert_close(
+         out, (reference.float() * 0.5).to(torch.bfloat16), atol=1e-2, rtol=1e-2
+     )
++
++
++def _operands(device, backend, shape=(16, 64, 1024)):
++    """Valid operands; for this shape the tiled route reads A through a raw pointer."""
++
++    a, (b, b_descale, _alpha), _reference = _case(
++        device, backend, shape, torch.bfloat16, None, 3
++    )
++    return a, b, b_descale
++
++
++def _rejects(exc, message, a, b, b_descale, alpha=None, **kwargs):
++    with pytest.raises(exc, match=re.escape(message)):
++        mm_bf16_fp4(a, b, b_descale, alpha, **kwargs)
++
++
++@pytest.mark.parametrize("backend", ["blackwell-native", "blackwell-tiled"])
++def test_blackwell_bf16_fp4_rejects_invalid_operands(blackwell_device, backend):
++    """Every invalid operand raises before any program is built or launched."""
++
++    a, b, s = _operands(blackwell_device, backend)
++    f32 = dict(dtype=torch.float32, device=blackwell_device)
++    contiguous_b = f"{backend} requires contiguous b and b_descale"
++    alpha_message = "alpha must be a contiguous float32 tensor with shape (1,)"
++    cases = [
++        ("a, b, and b_descale must be contiguous", a.t().contiguous().t(), b, s),
++        (contiguous_b, a, b.t().contiguous().t(), s),
++        (contiguous_b, a, b, s.t().contiguous().t()),
++        ("a, b, and b_descale must be on the same device", a, b.cpu(), s),
++        ("K=1016 must be a multiple of block_size=16", a[:, :1016], b, s),
++        ("a.shape[1]=512 but prepared b encodes K=1024", a[:, :512], b, s),
++        ("M and N must be positive; got M=0, N=64", a[:0], b, s),
++        (alpha_message, a, b, s, torch.ones((1,), **f32).to(torch.float16)),
++        (alpha_message, a, b, s, torch.ones((2,), **f32)),
++        (alpha_message, a, b, s, torch.ones((), **f32)),
++        ("alpha must be on the same device as a", a, b, s, torch.ones((1,))),
++    ]
++    for message, *operands in cases:
++        _rejects(ValueError, message, *operands, backend=backend)
++    _rejects(
++        TypeError, "a must be bfloat16", a.to(torch.float16), b, s, backend=backend
++    )
++    out = torch.empty((16, 64), dtype=torch.bfloat16, device=blackwell_device)
++    out_message = (
++        "out must be contiguous, on the same device, and have shape/dtype "
++        "(16, 64)/torch.bfloat16"
++    )
++    for bad_out in (out[:, :32], out.to(torch.float16), out.t().contiguous().t()):
++        _rejects(ValueError, out_message, a, b, s, backend=backend, out=bad_out)
++
++
++def test_blackwell_bf16_fp4_rejects_wrong_layout(blackwell_device):
++    """Operands in the other backend's layout, N % 64 != 0, N = 0, bad out dtypes."""
++
++    native, tiled = "blackwell-native", "blackwell-tiled"
++    a, b_n, s_n = _operands(blackwell_device, native)
++    _, b_t, s_t = _operands(blackwell_device, tiled)
++    a_n0, b_n0, s_n0 = _operands(blackwell_device, native, (16, 0, 1024))
++    s_n_u8, s_t_i8 = s_n.view(torch.uint8), s_t.view(torch.int8)
++    cases = [
++        (native, "blackwell-native expects the uint8 [N, K/2] weight", a, b_t, s_t),
++        (tiled, "blackwell-tiled expects the int32 [K/16, N*2] weight", a, b_n, s_n),
++        (native, "linear float8_e4m3fn scales with shape (64, 64)", a, b_n, s_n_u8),
++        (tiled, "S0E5M3 uint8 scales with shape (64, 64)", a, b_t, s_t_i8),
++        (tiled, "N to be a multiple of 64; got N=32", a, b_t[:, :64], s_t[:, :32]),
++        (native, "M and N must be positive; got M=16, N=0", a_n0, b_n0, s_n0),
++    ]
++    for backend, message, *operands in cases:
++        _rejects(ValueError, message, *operands, backend=backend)
++    _rejects(
++        ValueError,
++        "blackwell-tiled requires bfloat16 output; got torch.float16",
++        a,
++        b_t,
++        s_t,
++        backend=tiled,
++        out_dtype=torch.float16,
++    )
++    _rejects(
++        ValueError,
++        "out_dtype must be bfloat16 or float16; got torch.float32",
++        a,
++        b_n,
++        s_n,
++        backend=native,
++        out_dtype=torch.float32,
++    )
++
++
++@pytest.mark.parametrize("backend", ["blackwell-native", "blackwell-tiled"])
++def test_blackwell_bf16_fp4_skip_check_still_validates(blackwell_device, backend):
++    """``skip_check=True`` skips the API checker; the compute path rejects the same."""
++
++    a, b, s = _operands(blackwell_device, backend)
++    bad_alpha = torch.ones((2,), dtype=torch.float32, device=blackwell_device)
++    bad_out = torch.empty((1, 64), dtype=torch.bfloat16, device=blackwell_device)
++    for operands, kwargs in (
++        ((a.t().contiguous().t(), b, s), {}),
++        ((a[:0], b, s), {}),
++        ((a[:, :512].contiguous(), b, s), {}),
++        ((a, b.t().contiguous().t(), s), {}),
++        ((a, b.cpu(), s), {}),
++        ((a, b, s, bad_alpha), {}),
++        ((a, b, s), dict(out_dtype=torch.float32)),
++        ((a, b, s), dict(out=bad_out)),
++    ):
++        with pytest.raises(ValueError):
++            mm_bf16_fp4(*operands, backend=backend, skip_check=True, **kwargs)
++
++
++# Route of every test row, replayed without a GPU or a JIT build: the inputs
++# ``(backend, (M, N, K), out dtype, alpha, PDL)`` and the stages
++# ``((route cell, launch grid), ...)`` that ``_select_route`` returns at
++# ``ROUTE_SM_COUNT`` SMs (the SM count only sizes persistent grids).  A route
++# change updates the rows it moves.  The CUDA-graph rows ``tiled-m16`` and
++# ``native-m768`` share their route with ``tiled-m16-alpha-out-pdl`` and
++# ``native-m768-n2112-k2048`` and are not repeated.
++ROUTE_SM_COUNT = 148
++EXPECTED_ROUTES = {
++    "native-m16-bf16": (
++        ("blackwell-native", (16, 1024, 1024), torch.bfloat16, None, False),
++        (("cudnn_smk_k4_n16_bf16:alpha0:pdl0", (64, 1, 1)),),
++    ),
++    "tiled-m16-bf16": (
++        ("blackwell-tiled", (16, 1024, 1024), torch.bfloat16, None, False),
++        (("cute_smk_s1_m16_z4_bf16:alpha0:pdl0", (16, 1, 4)),),
++    ),
++    "native-m16-fp16-alpha-out-pdl": (
++        ("blackwell-native", (16, 1024, 1024), torch.float16, 0.75, True),
++        (("cudnn_smk_k4_n16_f16:alpha1:pdl1", (64, 1, 1)),),
++    ),
++    "tiled-m16-alpha-out-pdl": (
++        ("blackwell-tiled", (16, 1024, 1024), torch.bfloat16, 0.75, True),
++        (("cute_smk_s1_m16_z4_bf16:alpha1:pdl1", (16, 1, 4)),),
++    ),
++    "native-ragged-m-n-k48": (
++        ("blackwell-native", (7, 65, 48), torch.bfloat16, -0.5, False),
++        (("cudnn_cp_async_bf16:alpha1:pdl0:grid2d", (2, 1, 1)),),
++    ),
++    "native-m1-ragged-n-k16": (
++        ("blackwell-native", (1, 129, 16), torch.float16, None, True),
++        (("cudnn_cp_async_f16:alpha0:pdl1:grid2d", (3, 1, 1)),),
++    ),
++    "native-large-m-tail": (
++        ("blackwell-native", (129, 192, 128), torch.bfloat16, 0.75, True),
++        (("cudnn_cp_async_bf16:alpha1:pdl1:grid2d", (3, 9, 1)),),
++    ),
++    "tiled-short-k-ragged-m": (
++        ("blackwell-tiled", (7, 4160, 192), torch.bfloat16, -0.5, False),
++        (("cute_smk_s1_bf16:alpha1:pdl0", (65, 1, 1)),),
++    ),
++    "tiled-ragged-m-k48": (
++        ("blackwell-tiled", (13, 192, 48), torch.bfloat16, None, True),
++        (("cute_warp_mma_m16_k48_bf16:alpha0:pdl1", (3, 1, 1)),),
++    ),
++    "tiled-k16-persistent": (
++        ("blackwell-tiled", (33, 128, 16), torch.bfloat16, 0.5, True),
++        (("cute_warp_mma_m16_k16_bf16:alpha1:pdl1", (6, 1, 1)),),
++    ),
++    "tiled-k32": (
++        ("blackwell-tiled", (5, 4096, 32), torch.bfloat16, None, False),
++        (("cute_warp_mma_m16_k32_bf16:alpha0:pdl0", (64, 1, 1)),),
++    ),
++    "tiled-m64-route": (
++        ("blackwell-tiled", (40, 256, 256), torch.bfloat16, -0.25, True),
++        (("cute_warp_mma_m64_bf16:alpha1:pdl1", (4, 1, 1)),),
++    ),
++    "tiled-generic-fallback-k80": (
++        ("blackwell-tiled", (17, 64, 80), torch.bfloat16, None, False),
++        (("cute_bf16:alpha0:pdl0:grid2d", (1, 2, 1)),),
++    ),
++    "tiled-m32-long-k": (
++        ("blackwell-tiled", (17, 3072, 3072), torch.bfloat16, 0.75, True),
++        (("cute_smk_s2_m32_z6_bf16:alpha1:pdl1", (48, 1, 6)),),
++    ),
++    "native-fp16-cp-async-alpha": (
++        ("blackwell-native", (33, 128, 192), torch.float16, 0.5, False),
++        (("cudnn_cp_async_f16:alpha1:pdl0:grid2d", (2, 3, 1)),),
++    ),
++    "native-m768-n2112-k2048": (
++        ("blackwell-native", (768, 2112, 2048), torch.bfloat16, 0.75, True),
++        (("cudnn_tcgen05_m128_cg2_bf16:alpha1:pdl1", (132, 1, 1)),),
++    ),
++    "native-m1-n4096-k4096": (
++        ("blackwell-native", (1, 4096, 4096), torch.bfloat16, None, True),
++        (("cudnn_smk_k4_z4c_bf16:alpha0:pdl1", (64, 1, 4)),),
++    ),
++    "native-large-m-flat-grid": (
++        ("blackwell-native", (LARGE_M, 64, 16), torch.bfloat16, None, True),
++        (("cudnn_cp_async_bf16:alpha0:pdl1:flat", (65536, 1, 1)),),
++    ),
++    "tiled-large-m-flat-grid": (
++        ("blackwell-tiled", (LARGE_M, 64, 80), torch.bfloat16, 0.5, False),
++        (("cute_bf16:alpha1:pdl0:flat", (65536, 1, 1)),),
++    ),
++    "many-distinct-native": (
++        ("blackwell-native", (3, 64, 256), torch.bfloat16, None, True),
++        (("cudnn_tma_bf16:alpha0:pdl1:grid2d", (1, 1, 1)),),
++    ),
++    "many-distinct-tiled": (
++        ("blackwell-tiled", (3, 64, 256), torch.bfloat16, None, True),
++        (("cute_smk_s1_bf16:alpha0:pdl1", (1, 1, 1)),),
++    ),
++    "graph-native-m16": (
++        ("blackwell-native", (16, 1024, 1024), torch.bfloat16, 0.75, True),
++        (("cudnn_smk_k4_n16_bf16:alpha1:pdl1", (64, 1, 1)),),
++    ),
++    "graph-native-split-k": (
++        ("blackwell-native", (1, 4096, 4096), torch.bfloat16, 0.75, True),
++        (("cudnn_smk_k4_z4c_bf16:alpha1:pdl1", (64, 1, 4)),),
++    ),
++    "tiled-m768-n2112-k2048-alpha-pdl": (
++        ("blackwell-tiled", (768, 2112, 2048), torch.bfloat16, 1.0, True),
++        (("cute_tcgen05_m128_cg2_n128_bf16:alpha1:pdl1", (102, 1, 1)),),
++    ),
++}
++# Program (``MODULES`` key suffix) behind every cell the rows above reach.
++EXPECTED_PROGRAMS = {
++    "cudnn_cp_async_bf16:alpha0:pdl1:flat": "734a89d3a2dae4a7cb1e",
++    "cudnn_cp_async_bf16:alpha1:pdl0:grid2d": "525782f3f3e0be42ccb5",
++    "cudnn_cp_async_bf16:alpha1:pdl1:grid2d": "5231418224f82e216679",
++    "cudnn_cp_async_f16:alpha0:pdl1:grid2d": "17f70c3774940e052131",
++    "cudnn_cp_async_f16:alpha1:pdl0:grid2d": "931adc9ba7101cfcd57e",
++    "cudnn_smk_k4_n16_bf16:alpha0:pdl0": "ffb4392d5fa01f008308",
++    "cudnn_smk_k4_n16_bf16:alpha1:pdl1": "7468dc6cc46a70c1decc",
++    "cudnn_smk_k4_n16_f16:alpha1:pdl1": "1d093cef4e9d03349cbd",
++    "cudnn_smk_k4_z4c_bf16:alpha0:pdl1": "af124eba68ad18229e9e",
++    "cudnn_smk_k4_z4c_bf16:alpha1:pdl1": "916900985e3576f137a2",
++    "cudnn_tcgen05_m128_cg2_bf16:alpha1:pdl1": "f09a6b112cd48156248b",
++    "cudnn_tma_bf16:alpha0:pdl1:grid2d": "245b04e342922bec79a0",
++    "cute_bf16:alpha0:pdl0:grid2d": "1bf5950bdb68b3a00594",
++    "cute_bf16:alpha1:pdl0:flat": "2f1f07fe72294a63de83",
++    "cute_smk_s1_bf16:alpha0:pdl1": "1ca53a59dd02a007f622",
++    "cute_smk_s1_bf16:alpha1:pdl0": "7ab95684b2efbc6cbe8e",
++    "cute_smk_s1_m16_z4_bf16:alpha0:pdl0": "2cc4a32a57472117df41",
++    "cute_smk_s1_m16_z4_bf16:alpha1:pdl1": "dfbf721a98d42045de27",
++    "cute_smk_s2_m32_z6_bf16:alpha1:pdl1": "2b7eedebd8f3fb650580",
++    "cute_tcgen05_m128_cg2_n128_bf16:alpha1:pdl1": "03663ccb5c3794adf73f",
++    "cute_warp_mma_m16_k16_bf16:alpha1:pdl1": "964205318c4b32d14401",
++    "cute_warp_mma_m16_k32_bf16:alpha0:pdl0": "6b97292c5497a02ffed5",
++    "cute_warp_mma_m16_k48_bf16:alpha0:pdl1": "4d0cccec3b78ae116caa",
++    "cute_warp_mma_m64_bf16:alpha1:pdl1": "bee1a475ab153a6e8530",
++}
++
++
++@pytest.mark.parametrize("case_id", list(EXPECTED_ROUTES))
++def test_blackwell_bf16_fp4_route_selection(case_id):
++    """Each row selects its pinned cells, grids and programs."""
++
++    inputs, expected = EXPECTED_ROUTES[case_id]
++    backend, (m, n, k), out_dtype, alpha_value, enable_pdl = inputs
++    stages = _select_route(
++        m,
++        n,
++        k,
++        tiled=backend == "blackwell-tiled",
++        output_bf16=out_dtype == torch.bfloat16,
++        has_alpha=alpha_value is not None,
++        enable_pdl=enable_pdl,
++        sm_count=ROUTE_SM_COUNT,
++    )
++    # ``_cell_key`` takes every stage field but the grid; a signature change
++    # updates this call and the cell spellings in the tables above.
++    actual = tuple(
++        (_cell_key(component, has_alpha, pdl, flat_grid), grid)
++        for component, has_alpha, pdl, flat_grid, grid in stages
++    )
++    assert actual == expected
++    for cell, _grid in actual:
++        assert ROUTES[cell] == f"cake_blackwell_bf16_fp4_{EXPECTED_PROGRAMS[cell]}"
++
++
++def test_blackwell_bf16_fp4_route_table():
++    """Every route names a registered program and every program is routed."""
++
++    assert set(ROUTES.values()) == set(MODULES)

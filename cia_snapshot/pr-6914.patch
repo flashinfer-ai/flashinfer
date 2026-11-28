@@ -1,0 +1,3196 @@
+diff --git a/flashinfer/experimental/b12x/comm/pcie/__init__.py b/flashinfer/experimental/b12x/comm/pcie/__init__.py
+index 577367e3020..0cca5e75fcd 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/__init__.py
++++ b/flashinfer/experimental/b12x/comm/pcie/__init__.py
+@@ -6,6 +6,18 @@
+ ``AllReduce.plan`` performs its existing world/message routing during planning.
+ Pools select only channels provisioned before preparation.
+ 
++Fused one-shot reduction supports up to 36 contiguous rows with independently
++declared input, residual, normalization weight, and output dtypes (FP16, BF16,
++or FP32). Declare the actual ``residual``, ``weight``, and ``out`` tensors with
++``AllReduce.plan(inp, operation="all_reduce_fused_add_rms_norm", ...)``.
++``zero_centered=True`` applies ``1 + weight``. ``reduction_dtype`` optionally
++rounds the FP32 collective sum before adding the residual. Both arithmetic
++options must match between planning and execution. ``residual_out=residual``
++updates the residual in place; normalized output requires separate storage.
++For FP32 residuals and BF16 normalized output, use an FP32 residual tensor and
++BF16 ``out`` at both calls. These options specialize the existing one-shot
++kernel; DMA and hierarchical collectives do not provide this operation.
++
+ - ``AllReduce``: peer-safe world-size dispatch. TP2-TP8 use the all-peer
+   oneshot path; TP9/TP10/TP12/TP16 use bounded-degree islands of up to four GPUs.
+ - ``OneshotAllReduce``: low-level one-shot all-reduce
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py b/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py
+index f04f45b0b77..3afe385e7dd 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_dcp_a2a_cute.py
+@@ -21,7 +21,7 @@
+ from b12x._lib.utils.device import current_cuda_stream
+ from b12x._lib.utils.pointers import make_ptr
+ 
+-from ._dcp_cute_common import block_pair_barrier
++from ._dcp_cute_common import _membar_sys, block_pair_barrier
+ from ._cute_intrinsics import (
+     float_order_key,
+     redux_max_u32,
+@@ -608,7 +608,13 @@ def kernel(
+         # through the copy and barrier phases, which materially increases the
+         # graph kernel's register footprint.  Only the local pointer is needed
+         # before the barrier; form each remote address at its eventual use.
+-        local_staging = staging[self._rank] + slot_offset
++        # Two ranks push only the peer's heads into the peer's staging, which the
++        # peer then reads from its own memory; wider worlds stage every head
++        # locally and pull.
++        if cutlass.const_expr(self._world_size == 2):
++            local_staging = staging[1 - self._rank] + slot_offset
++        else:
++            local_staging = staging[self._rank] + slot_offset
+         local_stage_words = self._staging_words(local_staging)
+         local_stage_lse = self._staging_lse(local_staging, lse_offset)
+ 
+@@ -617,29 +623,37 @@ def kernel(
+             batch_index = row // heads_per_rank
+             local_head = row - batch_index * heads_per_rank
+             for destination in cutlass.range_constexpr(self._world_size):
+-                source_row = (
+-                    Int64(batch_index) * Int64(total_heads)
+-                    + Int64(destination) * Int64(heads_per_rank)
+-                    + Int64(local_head)
+-                )
+-                input_base = (
+-                    Int64(batch_index) * input_stride_batch
+-                    + (Int64(destination) * Int64(heads_per_rank) + Int64(local_head))
+-                    * input_stride_head
+-                )
+-                staging_base = source_row * Int64(packs_per_head)
+-                pack = lane
+-                while pack < packs_per_head:
+-                    _copy_16b(
+-                        local_output + input_base * Int64(4) + Int64(pack) * Int64(4),
+-                        local_stage_words
+-                        + staging_base * Int64(4)
+-                        + Int64(pack) * Int64(4),
++                if cutlass.const_expr(
++                    self._world_size != 2 or destination != self._rank
++                ):
++                    source_row = (
++                        Int64(batch_index) * Int64(total_heads)
++                        + Int64(destination) * Int64(heads_per_rank)
++                        + Int64(local_head)
++                    )
++                    input_base = (
++                        Int64(batch_index) * input_stride_batch
++                        + (
++                            Int64(destination) * Int64(heads_per_rank)
++                            + Int64(local_head)
++                        )
++                        * input_stride_head
+                     )
+-                    pack += Int32(32)
+-                if lane == Int32(0):
+-                    value = cute.arch.load(local_lse + source_row, Float32)
+-                    cute.arch.store(local_stage_lse + source_row, value)
++                    staging_base = source_row * Int64(packs_per_head)
++                    pack = lane
++                    while pack < packs_per_head:
++                        _copy_16b(
++                            local_output
++                            + input_base * Int64(4)
++                            + Int64(pack) * Int64(4),
++                            local_stage_words
++                            + staging_base * Int64(4)
++                            + Int64(pack) * Int64(4),
++                        )
++                        pack += Int32(32)
++                    if lane == Int32(0):
++                        value = cute.arch.load(local_lse + source_row, Float32)
++                        cute.arch.store(local_stage_lse + source_row, value)
+             row += warp_stride
+ 
+         block_pair_barrier(
+@@ -649,6 +663,11 @@ def kernel(
+             world_size=self._world_size,
+             max_blocks=_MAX_BLOCKS,
+         )
++        if cutlass.const_expr(self._world_size == 2):
++            # Acquire the peer's pushed partials before reading them locally.
++            if Int32(tidx) == Int32(0):
++                _membar_sys()
++            cute.arch.sync_threads()
+ 
+         row = warp_first
+         while row < rows:
+@@ -664,8 +683,9 @@ def kernel(
+             lane_lse_base = Int64(local_lse.toint())
+             for source_index in cutlass.range_constexpr(1, self._world_size):
+                 source = (self._rank + source_index) % self._world_size
++                incoming = self._rank if self._world_size == 2 else source
+                 source_lse_base = (
+-                    Int64(staging[source].toint()) + slot_offset + lse_offset
++                    Int64(staging[incoming].toint()) + slot_offset + lse_offset
+                 )
+                 if lane == Int32(source_index):
+                     lane_lse_base = source_lse_base
+@@ -721,8 +741,9 @@ def kernel(
+                 if cutlass.const_expr(source == self._rank):
+                     source_address = local_output.toint() + local_base * Int64(16)
+                 else:
++                    incoming = self._rank if self._world_size == 2 else source
+                     source_address = _add_u64_opaque(
+-                        staging[source].toint(),
++                        staging[incoming].toint(),
+                         slot_offset + staging_base * Int64(16),
+                     )
+                 payload_row_addresses[source_index] = source_address
+@@ -976,28 +997,34 @@ def kernel(
+             32
+         )
+         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
+-        total_heads = local_heads * Int32(self._world_size)
+-        rows = batch * total_heads
+-        local_stage = self._staging_words(staging[self._rank])
+-
+-        row = warp_first
+-        while row < rows:
+-            batch_index = row // total_heads
+-            global_head = row - batch_index * total_heads
+-            source_rank = global_head // local_heads
+-            if source_rank == Int32(self._rank):
+-                local_head = global_head - source_rank * local_heads
+-                base = (
+-                    Int64(batch_index) * Int64(local_heads) + Int64(local_head)
+-                ) * Int64(packs_per_head)
+-                pack = lane
+-                while pack < packs_per_head:
+-                    _copy_16b(
+-                        local_input + base * Int64(4) + Int64(pack) * Int64(4),
+-                        local_stage + base * Int64(4) + Int64(pack) * Int64(4),
+-                    )
+-                    pack += Int32(32)
+-            row += warp_stride
++        local_packs = local_heads * packs_per_head
++        tiles_per_rank = (local_packs + Int32(31)) // Int32(32)
++        tiles_per_batch = tiles_per_rank * Int32(self._world_size)
++        tiles = batch * tiles_per_batch
++        # Two ranks push each rank's segments into the peer's staging, where the
++        # peer reads them from its own memory after the barrier: PCIe carries
++        # posted writes instead of reads. Wider worlds stage locally and pull.
++        if cutlass.const_expr(self._world_size == 2):
++            local_stage = self._staging_words(staging[1 - self._rank])
++        else:
++            local_stage = self._staging_words(staging[self._rank])
++
++        # Assign complete 512-byte segments to warps, independently of head
++        # boundaries. Each rank stages and reads the same CTA's segments.
++        tile = warp_first
++        while tile < tiles:
++            batch_index = tile // tiles_per_batch
++            batch_tile = tile - batch_index * tiles_per_batch
++            source_rank = batch_tile // tiles_per_rank
++            rank_tile = batch_tile - source_rank * tiles_per_rank
++            pack = rank_tile * Int32(32) + lane
++            if source_rank == Int32(self._rank) and pack < local_packs:
++                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
++                _copy_16b(
++                    local_input + source_pack * Int64(4),
++                    local_stage + source_pack * Int64(4),
++                )
++            tile += warp_stride
+ 
+         block_pair_barrier(
+             signals,
+@@ -1006,39 +1033,41 @@ def kernel(
+             world_size=self._world_size,
+             max_blocks=_MAX_BLOCKS,
+         )
++        if cutlass.const_expr(self._world_size == 2):
++            # Acquire the peer's pushed segments before reading them locally.
++            if Int32(tidx) == Int32(0):
++                _membar_sys()
++            cute.arch.sync_threads()
+ 
+-        row = warp_first
+-        while row < rows:
+-            batch_index = row // total_heads
+-            global_head = row - batch_index * total_heads
+-            source_rank = global_head // local_heads
+-            local_head = global_head - source_rank * local_heads
+-            source_base = (
+-                Int64(batch_index) * Int64(local_heads) + Int64(local_head)
+-            ) * Int64(packs_per_head)
+-            output_base = Int64(row) * Int64(packs_per_head)
+-            # Resolve the peer's base address first and copy once. Cloning the
+-            # whole pack loop into all sixteen arms of the constexpr chain
+-            # bloats the kernel and pays the chain on every row.
+-            source_address = Int64((local_input + source_base * Int64(4)).toint())
+-            for source in cutlass.range_constexpr(self._world_size):
+-                if source_rank == Int32(source):
+-                    if cutlass.const_expr(source == self._rank):
+-                        source_words = local_input
+-                    else:
+-                        source_words = self._staging_words(staging[source])
+-                    source_address = Int64(
+-                        (source_words + source_base * Int64(4)).toint()
+-                    )
+-            output_address = Int64((output + output_base * Int64(4)).toint())
+-            pack = lane
+-            while pack < packs_per_head:
++        tile = warp_first
++        while tile < tiles:
++            batch_index = tile // tiles_per_batch
++            batch_tile = tile - batch_index * tiles_per_batch
++            source_rank = batch_tile // tiles_per_rank
++            rank_tile = batch_tile - source_rank * tiles_per_rank
++            pack = rank_tile * Int32(32) + lane
++            if pack < local_packs:
++                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
++                output_pack = (
++                    Int64(batch_index) * Int64(self._world_size) + Int64(source_rank)
++                ) * Int64(local_packs) + Int64(pack)
++                source_address = Int64((local_input + source_pack * Int64(4)).toint())
++                for source in cutlass.range_constexpr(self._world_size):
++                    if source_rank == Int32(source):
++                        if cutlass.const_expr(source == self._rank):
++                            source_words = local_input
++                        elif cutlass.const_expr(self._world_size == 2):
++                            source_words = self._staging_words(staging[self._rank])
++                        else:
++                            source_words = self._staging_words(staging[source])
++                        source_address = Int64(
++                            (source_words + source_pack * Int64(4)).toint()
++                        )
+                 _copy_16b_addr(
+-                    source_address + Int64(pack) * Int64(16),
+-                    output_address + Int64(pack) * Int64(16),
++                    source_address,
++                    Int64((output + output_pack * Int64(4)).toint()),
+                 )
+-                pack += Int32(32)
+-            row += warp_stride
++            tile += warp_stride
+ 
+         if cutlass.const_expr(self._device_slot_selection):
+             if Int32(tidx) == Int32(0):
+@@ -1932,7 +1961,7 @@ def _get_compiled_all_gather_heads(
+         current_cuda_stream(),
+         compile_spec=KernelCompileSpec.from_key(
+             "comm.pcie.dcp_a2a.all_gather_heads",
+-            12,
++            13,
+             key,
+             labels=(
+                 "world_size",
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_dcp_preparation.py b/flashinfer/experimental/b12x/comm/pcie/_dcp_preparation.py
+index b91905d8cae..a40d94667f0 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/_dcp_preparation.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_dcp_preparation.py
+@@ -14,6 +14,7 @@
+ import torch
+ 
+ from b12x._lib.compile_pool import CompileJob
++from b12x._lib.compile_plan import load_programs
+ from b12x._lib.program_cache import program_cache
+ from b12x.preparation import (
+     FrozenMapping,
+@@ -298,7 +299,9 @@ def plan(
+         raise ValueError("DCP invocation semantics belong in PcieQuery")
+ 
+     def materialize(selection, device):
+-        launchers = compile_dcp_surface(TUNING.encode_query(query), device.ordinal)
++        launchers = load_programs(
++            compile_dcp_surface(TUNING.encode_query(query), device.ordinal)
++        )
+         return _DcpExecutionState(query, runtime, MappingProxyType(dict(launchers)))
+ 
+     resident = int(getattr(runtime, "_slot_bytes", 0)) * 2
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_dma_kernels.py b/flashinfer/experimental/b12x/comm/pcie/_dma_kernels.py
+index ccfdced0ed1..7e7ae16ec0e 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/_dma_kernels.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_dma_kernels.py
+@@ -270,6 +270,69 @@ def _wait_flag_sys(flag_addr: Int64, counter_addr: Int64, *, loc=None, ip=None)
+     )
+ 
+ 
++@dsl_user_op
++def _wait_flag_read_sys(
++    flag_addr: Int64, counter_addr: Int64, *, loc=None, ip=None
++) -> Uint32:
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                Int64(flag_addr).ir_value(loc=loc, ip=ip),
++                Int64(counter_addr).ir_value(loc=loc, ip=ip),
++            ],
++            """{
++            .reg .pred pending;
++            .reg .u32 observed;
++            .reg .s32 delta;
++            ld.global.u32 $0, [$2];
++            add.u32 $0, $0, 1;
++        wait_reduce_again:
++            ld.acquire.sys.global.u32 observed, [$1];
++            sub.s32 delta, observed, $0;
++            setp.lt.s32 pending, delta, 0;
++            @pending bra wait_reduce_again;
++        }""",
++            "=r,l,l",
++            has_side_effects=True,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def _finish_wait_reduce(
++    done: Int64, counter: Int64, expected: Uint32, blocks: Uint32, *, loc=None, ip=None
++):
++    llvm.inline_asm(
++        None,
++        [
++            Int64(done).ir_value(loc=loc, ip=ip),
++            Int64(counter).ir_value(loc=loc, ip=ip),
++            Uint32(expected).ir_value(loc=loc, ip=ip),
++            Uint32(blocks).ir_value(loc=loc, ip=ip),
++        ],
++        """{
++            .reg .u32 ticket;
++            .reg .pred last;
++            atom.acq_rel.gpu.global.add.u32 ticket, [$0], 1;
++            add.u32 ticket, ticket, 1;
++            setp.eq.u32 last, ticket, $3;
++            @last st.global.u32 [$0], 0;
++            @last st.global.u32 [$1], $2;
++        }""",
++        "l,l,r,r",
++        has_side_effects=True,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++
++
+ @dsl_user_op
+ def _unpack_bf16x2(packed: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+     result = llvm.inline_asm(
+@@ -583,8 +646,9 @@ def kernel(self, flag: cute.Tensor, counter: cute.Tensor) -> None:
+ 
+ 
+ class _AddLaunch:
+-    def __init__(self, dtype_name: str) -> None:
++    def __init__(self, dtype_name: str, wait=False) -> None:
+         self._dtype_name = dtype_name
++        self.wait = bool(wait)
+ 
+     @cute.jit
+     def __call__(
+@@ -592,6 +656,7 @@ def __call__(
+         dst_ptr: cute.Pointer,
+         a_ptr: cute.Pointer,
+         b_ptr: cute.Pointer,
++        wait_pointers: tuple,
+         packs: Int64,
+         grid_x: Int32,
+         stream: cuda.CUstream,
+@@ -600,6 +665,7 @@ def __call__(
+             _one_tensor(dst_ptr),
+             _one_tensor(a_ptr),
+             _one_tensor(b_ptr),
++            wait_pointers,
+             packs,
+         ).launch(
+             grid=(grid_x, 1, 1),
+@@ -614,11 +680,20 @@ def kernel(
+         dst: cute.Tensor,
+         a_src: cute.Tensor,
+         b_src: cute.Tensor,
++        wait_pointers: tuple,
+         packs: Int64,
+     ) -> None:
+         tidx, _, _ = cute.arch.thread_idx()
+         bidx, _, _ = cute.arch.block_idx()
+         gdim, _, _ = cute.arch.grid_dim()
++        expected = Uint32(0)
++        if cutlass.const_expr(self.wait):
++            if tidx == 0:
++                expected = _wait_flag_read_sys(
++                    get_ptr_as_int64(_one_tensor(wait_pointers[0]), Int64(0)),
++                    get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
++                )
++            cute.arch.sync_threads()
+         idx = Int64(bidx) * Int64(_THREADS) + Int64(tidx)
+         step = Int64(gdim) * Int64(_THREADS)
+         while idx < packs:
+@@ -656,6 +731,18 @@ def kernel(
+                 )
+             idx += step
+ 
++        if cutlass.const_expr(self.wait):
++            # The last CTA advances the counter only after every CTA has read
++            # the same expected value and completed its reduction.
++            cute.arch.sync_threads()
++            if tidx == 0:
++                _finish_wait_reduce(
++                    get_ptr_as_int64(_one_tensor(wait_pointers[2]), Int64(0)),
++                    get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
++                    expected,
++                    Uint32(gdim),
++                )
++
+ 
+ class _QuantLaunch:
+     def __init__(self, codec: str) -> None:
+@@ -1205,16 +1292,17 @@ def _compiled_flag(wait: bool) -> Callable:
+ 
+ 
+ @functools.cache
+-def _compiled_add(dtype_name: str) -> Callable:
++def _compiled_add(dtype_name: str, wait=False) -> Callable:
+     dtype = _dtype_type(dtype_name)
+-    launch = _AddLaunch(dtype_name)
++    launch = _AddLaunch(dtype_name, wait)
+     return _compile(
+         "comm.pcie_dma.add",
+-        (dtype_name,),
++        (dtype_name, bool(wait)),
+         launch,
+         _fake_ptr(dtype, 16),
+         _fake_ptr(dtype, 16),
+         _fake_ptr(dtype, 16),
++        tuple(_fake_ptr(Uint32, 4) for _ in range(3)) if wait else (),
+         Int64(1),
+         Int32(1),
+     )
+@@ -1315,6 +1403,7 @@ class DmaLaunchers:
+     set_flag: Callable
+     wait_flag: Callable
+     add: tuple[Callable, ...]
++    wait_add: tuple[Callable, ...]
+     quant: Callable | None = None
+     dequant_store: Callable | None = None
+     dequant_accum: Callable | None = None
+@@ -1327,6 +1416,7 @@ def __b12x_dependencies__(self):
+             self.set_flag,
+             self.wait_flag,
+             self.add,
++            self.wait_add,
+             self.quant,
+             self.dequant_store,
+             self.dequant_accum,
+@@ -1344,7 +1434,7 @@ def __b12x_programs__(self):
+ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
+     """Resolve the primitive programs reachable by declaration metadata."""
+ 
+-    if int(world_size) not in (2, 4, 6, 8, 10):
++    if int(world_size) not in (2, 3, 4, 6, 8, 10):
+         raise ValueError(f"unsupported DMA world size {world_size}")
+     mode = str(wire_mode)
+     codec = "i8" if mode.startswith("i8") else "mx" if mode.startswith("mx") else "e4m3"
+@@ -1354,6 +1444,7 @@ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
+         set_flag=_compiled_flag(False),
+         wait_flag=_compiled_flag(True),
+         add=tuple(_compiled_add(dtype) for dtype in _DTYPES),
++        wait_add=tuple(_compiled_add(dtype, True) for dtype in _DTYPES),
+         quant=_compiled_quant(codec) if compressed else None,
+         dequant_store=_compiled_dequant_store(codec) if compressed else None,
+         dequant_accum=_compiled_dequant_accum(codec, int(world_size) - 1)
+@@ -1406,17 +1497,26 @@ def dma_wait_flag(self, flag_ptr: int, counter_ptr: int) -> None:
+         )
+ 
+     def dma_add(
+-        self, dst_ptr: int, a_ptr: int, b_ptr: int, elems: int, dtype_code: int
++        self,
++        dst_ptr: int,
++        a_ptr: int,
++        b_ptr: int,
++        elems: int,
++        dtype_code: int,
++        *,
++        wait=None,
+     ) -> None:
+         dtype_name = _DTYPES[int(dtype_code)]
+         dtype = _dtype_type(dtype_name)
+         elems_per_pack = 4 if dtype_name == "fp32" else 8
+         packs = int(elems) // elems_per_pack
+-        raw = self._require_launchers().add[int(dtype_code)]
++        launchers = self._require_launchers()
++        raw = (launchers.add if wait is None else launchers.wait_add)[int(dtype_code)]
+         raw(
+             _ptr(dtype, dst_ptr, 16),
+             _ptr(dtype, a_ptr, 16),
+             _ptr(dtype, b_ptr, 16),
++            () if wait is None else tuple(_ptr(Uint32, p, 4) for p in wait),
+             packs,
+             _grid_for_packs(packs),
+             current_cuda_stream(),
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_dma_preparation.py b/flashinfer/experimental/b12x/comm/pcie/_dma_preparation.py
+index 330458a7fcf..210b79f3781 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/_dma_preparation.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_dma_preparation.py
+@@ -215,7 +215,7 @@ def memory(config, device):
+         required = (
+             int(query.setup["slab_nbytes"])
+             + int(query.setup["stage_nbytes"])
+-            + 2 * int(query.setup["flag_slots"]) * 4
++            + 3 * int(query.setup["flag_slots"]) * 4
+         )
+         # The runtime owns its IPC slab/stage before declaration; preparation
+         # retains and reports the exact pre-existing resident envelope.
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_oneshot_cute.py b/flashinfer/experimental/b12x/comm/pcie/_oneshot_cute.py
+index 04bba87bca6..4c88dd051f5 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/_oneshot_cute.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_oneshot_cute.py
+@@ -8,7 +8,7 @@
+ 
+ from __future__ import annotations
+ 
+-import functools
++import os
+ from collections.abc import Callable
+ 
+ import cuda.bindings.driver as cuda
+@@ -19,6 +19,7 @@
+ from b12x._lib.compiler import KernelCompileSpec
+ from b12x._lib.compiler import compile as b12x_compile
+ from b12x._lib.compile_plan import attach_programs
++from b12x._lib.program_cache import program_cache
+ from b12x._lib.intrinsics.memory import (
+     ld_global_v4_u32,
+     st_global_v4_f32,
+@@ -29,6 +30,7 @@
+ from b12x._lib.utils.device import current_cuda_stream
+ from b12x._lib.utils.pointers import make_ptr
+ 
++from ._dcp_cute_common import _membar_sys
+ from ._cute_intrinsics import (
+     add_bf16x2,
+     add_f16x2,
+@@ -190,6 +192,7 @@ def __init__(
+             "pull",
+             "tp2_remote_push",
+             "tp2_remote_push_stream",
++            "tp2_remote_push_simple",
+         ):
+             raise ValueError(f"invalid plain oneshot transport {transport!r}")
+         if transport.startswith("tp2_remote_push") and (
+@@ -209,6 +212,7 @@ def __init__(
+         self._slot_bias = int(slot_bias) & 1
+         self._transport = transport
+         self._threads = int(threads)
++        self._pdl = _ONESHOT_PDL and transport == "pull"
+ 
+     @cute.jit
+     def __call__(
+@@ -343,6 +347,8 @@ def kernel(
+                     stage_index += stride
+ 
+             self._multi_gpu_barrier(signal_ptrs)
++            if cutlass.const_expr(self._pdl):
++                cute.arch.griddepcontrol_launch_dependents()
+ 
+             while index < size_packs:
+                 accumulator = cute.make_rmem_tensor(
+@@ -383,6 +389,86 @@ def kernel(
+             # records not touched by this shape.
+             expected_generation = generation + Uint32(2)
+ 
++            if cutlass.const_expr(self._transport == "tp2_remote_push_simple"):
++                # Match NCCL Simple publication: the payload crosses PCIe once,
++                # 16 bytes per pack, and each CTA then raises one generation line
++                # after a system fence. LL records take 32 bytes per pack, so the
++                # last lines of the incoming capacity hold the CTA flags. A flag
++                # validates only on this generation in every lane, which neither
++                # an older flag nor an LL record carries.
++                flag_offset = (
++                    plain_capacity_packs * Int64(32)
++                    - Int64(_MAX_BLOCKS * 16)
++                    + Int64(bidx) * Int64(16)
++                )
++                publish_index = index
++                while publish_index < size_packs:
++                    words = ld_global_v4_u32(
++                        input_base + Int64(publish_index) * Int64(16)
++                    )
++                    st_global_v4_u32(
++                        peer_write_base + Int64(publish_index) * Int64(16),
++                        words[0],
++                        words[1],
++                        words[2],
++                        words[3],
++                    )
++                    publish_index += stride
++                cute.arch.sync_threads()
++                if Int32(tidx) == Int32(0):
++                    _membar_sys()
++                    st_relaxed_sys_global_v4_u32(
++                        peer_write_base + flag_offset,
++                        expected_generation,
++                        expected_generation,
++                        expected_generation,
++                        expected_generation,
++                    )
++                    flag = ld_relaxed_sys_global_v4_u32(local_poll_base + flag_offset)
++                    waiting = (
++                        (flag[0] ^ expected_generation)
++                        | (flag[1] ^ expected_generation)
++                        | (flag[2] ^ expected_generation)
++                        | (flag[3] ^ expected_generation)
++                    )
++                    while waiting != Uint32(0):
++                        flag = ld_relaxed_sys_global_v4_u32(
++                            local_poll_base + flag_offset
++                        )
++                        waiting = (
++                            (flag[0] ^ expected_generation)
++                            | (flag[1] ^ expected_generation)
++                            | (flag[2] ^ expected_generation)
++                            | (flag[3] ^ expected_generation)
++                        )
++                    _membar_sys()
++                cute.arch.sync_threads()
++                while index < size_packs:
++                    local_words = ld_global_v4_u32(
++                        input_base + Int64(index) * Int64(16)
++                    )
++                    peer_words = ld_relaxed_sys_global_v4_u32(
++                        local_poll_base + Int64(index) * Int64(16)
++                    )
++                    packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
++                    for word in cutlass.range_constexpr(4):
++                        if cutlass.const_expr(self._dtype_name == "float16"):
++                            packed_sum[word] = add_f16x2(
++                                local_words[word], peer_words[word]
++                            )
++                        else:
++                            packed_sum[word] = add_bf16x2(
++                                local_words[word], peer_words[word]
++                            )
++                    st_global_v4_u32(
++                        output_base + Int64(index) * Int64(16),
++                        packed_sum[0],
++                        packed_sum[1],
++                        packed_sum[2],
++                        packed_sum[3],
++                    )
++                    index += stride
++
+             if cutlass.const_expr(self._transport == "tp2_remote_push"):
+                 publish_index = index
+                 while publish_index < size_packs:
+@@ -411,34 +497,28 @@ def kernel(
+                     )
+                     publish_index += stride
+ 
+-            while index < size_packs:
+-                local_words = ld_global_v4_u32(input_base + Int64(index) * Int64(16))
+-                if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
+-                    peer_line_address = peer_write_base + Int64(index) * Int64(32)
+-                    st_relaxed_sys_global_v4_u32(
+-                        peer_line_address,
+-                        local_words[0],
+-                        expected_generation,
+-                        local_words[1],
+-                        expected_generation,
++            if cutlass.const_expr(self._transport != "tp2_remote_push_simple"):
++                while index < size_packs:
++                    local_words = ld_global_v4_u32(
++                        input_base + Int64(index) * Int64(16)
+                     )
+-                    st_relaxed_sys_global_v4_u32(
+-                        peer_line_address + Int64(16),
+-                        local_words[2],
+-                        expected_generation,
+-                        local_words[3],
+-                        expected_generation,
+-                    )
+-                line_address = local_poll_base + Int64(index) * Int64(32)
+-                line0 = ld_relaxed_sys_global_v4_u32(line_address)
+-                line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
+-                waiting = (
+-                    (line0[1] ^ expected_generation)
+-                    | (line0[3] ^ expected_generation)
+-                    | (line1[1] ^ expected_generation)
+-                    | (line1[3] ^ expected_generation)
+-                )
+-                while waiting != Uint32(0):
++                    if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
++                        peer_line_address = peer_write_base + Int64(index) * Int64(32)
++                        st_relaxed_sys_global_v4_u32(
++                            peer_line_address,
++                            local_words[0],
++                            expected_generation,
++                            local_words[1],
++                            expected_generation,
++                        )
++                        st_relaxed_sys_global_v4_u32(
++                            peer_line_address + Int64(16),
++                            local_words[2],
++                            expected_generation,
++                            local_words[3],
++                            expected_generation,
++                        )
++                    line_address = local_poll_base + Int64(index) * Int64(32)
+                     line0 = ld_relaxed_sys_global_v4_u32(line_address)
+                     line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
+                     waiting = (
+@@ -447,25 +527,34 @@ def kernel(
+                         | (line1[1] ^ expected_generation)
+                         | (line1[3] ^ expected_generation)
+                     )
+-                peer_words = (line0[0], line0[2], line1[0], line1[2])
+-                packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
+-                for word in cutlass.range_constexpr(4):
+-                    if cutlass.const_expr(self._dtype_name == "float16"):
+-                        packed_sum[word] = add_f16x2(
+-                            local_words[word], peer_words[word]
+-                        )
+-                    else:
+-                        packed_sum[word] = add_bf16x2(
+-                            local_words[word], peer_words[word]
++                    while waiting != Uint32(0):
++                        line0 = ld_relaxed_sys_global_v4_u32(line_address)
++                        line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
++                        waiting = (
++                            (line0[1] ^ expected_generation)
++                            | (line0[3] ^ expected_generation)
++                            | (line1[1] ^ expected_generation)
++                            | (line1[3] ^ expected_generation)
+                         )
+-                st_global_v4_u32(
+-                    output_base + Int64(index) * Int64(16),
+-                    packed_sum[0],
+-                    packed_sum[1],
+-                    packed_sum[2],
+-                    packed_sum[3],
+-                )
+-                index += stride
++                    peer_words = (line0[0], line0[2], line1[0], line1[2])
++                    packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
++                    for word in cutlass.range_constexpr(4):
++                        if cutlass.const_expr(self._dtype_name == "float16"):
++                            packed_sum[word] = add_f16x2(
++                                local_words[word], peer_words[word]
++                            )
++                        else:
++                            packed_sum[word] = add_bf16x2(
++                                local_words[word], peer_words[word]
++                            )
++                    st_global_v4_u32(
++                        output_base + Int64(index) * Int64(16),
++                        packed_sum[0],
++                        packed_sum[1],
++                        packed_sum[2],
++                        packed_sum[3],
++                    )
++                    index += stride
+ 
+             if generation == Uint32(_PLAIN_GRAPH_LAST_EPOCH):
+                 # Matching CTAs finish reading before either rank clears records.
+@@ -505,8 +594,25 @@ def __init__(
+         device_slot_selection: bool,
+         slot_bias: int,
+         threads: int,
++        residual_dtype: str | None = None,
++        weight_dtype: str | None = None,
++        output_dtype: str | None = None,
++        zero_centered: bool = False,
++        reduction_dtype: str | None = None,
+     ) -> None:
+         super().__init__(dtype_name)
++        self._residual_dtype = residual_dtype or dtype_name
++        self._weight_dtype = weight_dtype or dtype_name
++        self._output_dtype = output_dtype or dtype_name
++        for dtype in (self._residual_dtype, self._weight_dtype, self._output_dtype):
++            if dtype not in _DTYPE_PACK_ELEMS:
++                raise ValueError(f"unsupported fused RMSNorm dtype {dtype!r}")
++        if reduction_dtype not in (None, "float32", "float16", "bfloat16"):
++            raise ValueError(
++                f"unsupported reduction rounding dtype {reduction_dtype!r}"
++            )
++        self._zero_centered = bool(zero_centered)
++        self._reduction_dtype = reduction_dtype
+         if mode not in (
+             "registered",
+             "stage_pull",
+@@ -537,6 +643,78 @@ def __init__(
+         # slots when one graph-owned channel alternates between those shapes.
+         self._barrier_rank_offset = 8 if mode == "stage_tp8_owner" else 0
+ 
++    @cute.jit
++    def _load_operand(
++        self,
++        values: cute.Tensor,
++        pointer: cute.Pointer,
++        index: Int64,
++        dtype: cutlass.Constexpr[str],
++    ) -> None:
++        address = Int64(pointer.toint())
++        if cutlass.const_expr(dtype == self._dtype_name):
++            self._load_accumulate(values, address + index * Int64(16), True)
++        elif cutlass.const_expr(dtype == "float32"):
++            for pack in cutlass.range_constexpr(self._pack_elems // 4):
++                words = ld_global_v4_u32(
++                    address
++                    + (index * Int64(self._pack_elems) + Int64(pack * 4)) * Int64(4)
++                )
++                for lane in cutlass.range_constexpr(4):
++                    values[pack * 4 + lane] = u32_as_f32(words[lane])
++        else:
++            # Four FP32 transport lanes occupy two words in a 16-bit operand.
++            words = cute.recast_ptr(pointer, dtype=cutlass.Uint32)
++            for pair in cutlass.range_constexpr(self._pack_elems // 2):
++                packed = words[index * Int64(self._pack_elems // 2) + Int64(pair)]
++                if cutlass.const_expr(dtype == "float16"):
++                    low, high = unpack_f16x2(packed)
++                else:
++                    low, high = unpack_bf16x2(packed)
++                values[pair * 2] = low
++                values[pair * 2 + 1] = high
++
++    @cute.jit
++    def _store_operand(
++        self,
++        pointer: cute.Pointer,
++        index: Int64,
++        values: cute.Tensor,
++        dtype: cutlass.Constexpr[str],
++    ) -> None:
++        address = Int64(pointer.toint())
++        if cutlass.const_expr(dtype == self._dtype_name):
++            self._store_accumulator(address + index * Int64(16), values)
++        elif cutlass.const_expr(dtype == "float32"):
++            for pack in cutlass.range_constexpr(self._pack_elems // 4):
++                st_global_v4_f32(
++                    address
++                    + (index * Int64(self._pack_elems) + Int64(pack * 4)) * Int64(4),
++                    values[pack * 4],
++                    values[pack * 4 + 1],
++                    values[pack * 4 + 2],
++                    values[pack * 4 + 3],
++                )
++        else:
++            for pair in cutlass.range_constexpr(self._pack_elems // 2):
++                if cutlass.const_expr(dtype == "float16"):
++                    packed = pack_f32x2_to_f16x2(values[pair * 2], values[pair * 2 + 1])
++                else:
++                    packed = pack_f32x2_to_bf16x2(
++                        values[pair * 2], values[pair * 2 + 1]
++                    )
++                st_global_u32(
++                    address
++                    + (index * Int64(self._pack_elems // 2) + Int64(pair)) * Int64(4),
++                    packed,
++                )
++
++    @cute.jit
++    def _normalize(self, value: Float32, scale: Float32, inv_rms: Float32) -> Float32:
++        if cutlass.const_expr(self._zero_centered):
++            return (value * inv_rms) * (Float32(1.0) + scale)
++        return value * (inv_rms * scale)
++
+     @cute.jit
+     def __call__(
+         self,
+@@ -811,7 +989,7 @@ def _reduce_pack(
+         self,
+         peer_ptrs: cute.Pointer,
+         input_base: Int64,
+-        residual_base: Int64,
++        residual_ptr: cute.Pointer,
+         index: Int64,
+         total_packs: Int64,
+         shard_packs: Int64,
+@@ -875,11 +1053,15 @@ def _reduce_pack(
+                     Int64(peer_ptrs[peer_rank]) + index * Int64(16),
+                     peer_index == 0,
+                 )
+-        self._load_accumulate(
+-            accumulator,
+-            residual_base + index * Int64(16),
+-            False,
+-        )
++        for lane in cutlass.range_constexpr(self._pack_elems):
++            if cutlass.const_expr(self._reduction_dtype == "bfloat16"):
++                accumulator[lane] = accumulator[lane].to(cutlass.BFloat16).to(Float32)
++            elif cutlass.const_expr(self._reduction_dtype == "float16"):
++                accumulator[lane] = accumulator[lane].to(cutlass.Float16).to(Float32)
++        residual = cute.make_rmem_tensor((self._pack_elems,), Float32)
++        self._load_operand(residual, residual_ptr, index, self._residual_dtype)
++        for lane in cutlass.range_constexpr(self._pack_elems):
++            accumulator[lane] = accumulator[lane] + residual[lane]
+ 
+     @cute.jit
+     def _block_reduce(
+@@ -933,10 +1115,6 @@ def kernel(
+         total_packs = Int64(rows) * Int64(hidden_packs)
+ 
+         input_base = Int64(input_ptr.toint())
+-        residual_base = Int64(residual_ptr.toint())
+-        weight_base = Int64(weight_ptr.toint())
+-        output_base = Int64(output_ptr.toint())
+-        residual_output_base = Int64(residual_output_ptr.toint())
+         self_signal = Int64(signal_ptrs[self._rank])
+         if cutlass.const_expr(self._device_slot_selection):
+             generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+@@ -1024,14 +1202,14 @@ def kernel(
+                     self._reduce_pack(
+                         peer_ptrs,
+                         input_base,
+-                        residual_base,
++                        residual_ptr,
+                         index,
+                         total_packs,
+                         shard_packs,
+                         accumulator,
+                     )
+-                    self._store_accumulator(
+-                        residual_output_base + index * Int64(16), accumulator
++                    self._store_operand(
++                        residual_output_ptr, index, accumulator, self._residual_dtype
+                     )
+                     for lane in cutlass.range_constexpr(self._pack_elems):
+                         value = accumulator[lane]
+@@ -1047,14 +1225,14 @@ def kernel(
+                 self._reduce_pack(
+                     peer_ptrs,
+                     input_base,
+-                    residual_base,
++                    residual_ptr,
+                     index,
+                     total_packs,
+                     shard_packs,
+                     accumulator,
+                 )
+-                self._store_accumulator(
+-                    residual_output_base + index * Int64(16), accumulator
++                self._store_operand(
++                    residual_output_ptr, index, accumulator, self._residual_dtype
+                 )
+                 for lane in cutlass.range_constexpr(self._pack_elems):
+                     value = accumulator[lane]
+@@ -1114,19 +1292,21 @@ def kernel(
+                 col = col0 + Int32(pack_number) * col_stride
+                 if col < hidden_packs:
+                     scale = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+-                    self._load_accumulate(
+-                        scale, weight_base + Int64(col) * Int64(16), True
++                    self._load_operand(
++                        scale, weight_ptr, Int64(col), self._weight_dtype
+                     )
+                     normalized = cute.make_rmem_tensor(
+                         (self._pack_elems,), cutlass.Float32
+                     )
+                     for lane in cutlass.range_constexpr(self._pack_elems):
+-                        normalized[lane] = values[pack_number, lane] * (
+-                            inv_rms * scale[lane]
++                        normalized[lane] = self._normalize(
++                            values[pack_number, lane], scale[lane], inv_rms
+                         )
+-                    self._store_accumulator(
+-                        output_base + (row_offset + Int64(col)) * Int64(16),
++                    self._store_operand(
++                        output_ptr,
++                        row_offset + Int64(col),
+                         normalized,
++                        self._output_dtype,
+                     )
+         else:
+             col = col0
+@@ -1134,15 +1314,13 @@ def kernel(
+                 index = row_offset + Int64(col)
+                 value = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+                 scale = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+-                self._load_accumulate(
+-                    value,
+-                    residual_output_base + index * Int64(16),
+-                    True,
++                self._load_operand(
++                    value, residual_output_ptr, index, self._residual_dtype
+                 )
+-                self._load_accumulate(scale, weight_base + Int64(col) * Int64(16), True)
++                self._load_operand(scale, weight_ptr, Int64(col), self._weight_dtype)
+                 for lane in cutlass.range_constexpr(self._pack_elems):
+-                    value[lane] = value[lane] * (inv_rms * scale[lane])
+-                self._store_accumulator(output_base + index * Int64(16), value)
++                    value[lane] = self._normalize(value[lane], scale[lane], inv_rms)
++                self._store_operand(output_ptr, index, value, self._output_dtype)
+                 col += col_stride
+ 
+         if cutlass.const_expr(self._device_slot_selection):
+@@ -1154,6 +1332,13 @@ def kernel(
+                 )
+ 
+ 
++# Release the dependent launch once this rank's input is published and every
++# peer has arrived. The dependent kernel (the mHC partial) waits in-kernel for
++# this grid to complete before reading its output, so the release only hides
++# the dependent's launch latency and can never expose a partial result.
++_ONESHOT_PDL = os.getenv("B12X_PCIE_ONESHOT_PDL", "0") != "0"
++
++
+ def _dummy(dtype, alignment: int):
+     return make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=alignment)
+ 
+@@ -1211,7 +1396,7 @@ def is_oneshot_launcher_prepared(
+     )
+ 
+ 
+-@functools.cache
++@program_cache
+ def get_oneshot_launcher(
+     dtype_name: str,
+     world_size: int,
+@@ -1234,7 +1419,7 @@ def get_oneshot_launcher(
+         threads,
+         device_index,
+     )
+-    del device_index  # retained in the functools and preparation keys
++    del device_index  # Retained in the launcher and preparation keys.
+     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
+     launch = _OneshotLaunch(
+         dtype_name,
+@@ -1255,6 +1440,7 @@ def get_oneshot_launcher(
+         slot_bias,
+         str(transport),
+         int(threads),
++        ("pdl", bool(launch._pdl)),
+     )
+     raise_if_kernel_resolution_frozen(
+         "cute.compile", target=launch, cache_key=cache_key
+@@ -1274,7 +1460,7 @@ def get_oneshot_launcher(
+         1,
+         1,
+         current_cuda_stream(),
+-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 4, cache_key),
++        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 5, cache_key),
+     )
+ 
+     def run(
+@@ -1342,6 +1528,11 @@ def _fused_oneshot_process_key(
+     slot_bias: int,
+     threads: int,
+     device_index: int,
++    residual_dtype: str | None = None,
++    weight_dtype: str | None = None,
++    output_dtype: str | None = None,
++    zero_centered: bool = False,
++    reduction_dtype: str | None = None,
+ ) -> tuple[object, ...]:
+     return (
+         str(dtype_name),
+@@ -1354,6 +1545,11 @@ def _fused_oneshot_process_key(
+         int(slot_bias) & 1 if device_slot_selection else 0,
+         int(threads),
+         int(device_index),
++        residual_dtype or dtype_name,
++        weight_dtype or dtype_name,
++        output_dtype or dtype_name,
++        bool(zero_centered),
++        reduction_dtype,
+     )
+ 
+ 
+@@ -1368,6 +1564,11 @@ def is_fused_oneshot_launcher_prepared(
+     slot_bias: int,
+     threads: int,
+     device_index: int,
++    residual_dtype: str | None = None,
++    weight_dtype: str | None = None,
++    output_dtype: str | None = None,
++    zero_centered: bool = False,
++    reduction_dtype: str | None = None,
+ ) -> bool:
+     """Return whether this exact fused graph launcher is already loaded."""
+ 
+@@ -1383,12 +1584,17 @@ def is_fused_oneshot_launcher_prepared(
+             slot_bias,
+             threads,
+             device_index,
++            residual_dtype,
++            weight_dtype,
++            output_dtype,
++            zero_centered,
++            reduction_dtype,
+         )
+         in _PREPARED_FUSED_ONESHOT_LAUNCHERS
+     )
+ 
+ 
+-@functools.cache
++@program_cache
+ def get_fused_oneshot_launcher(
+     dtype_name: str,
+     world_size: int,
+@@ -1400,6 +1606,11 @@ def get_fused_oneshot_launcher(
+     slot_bias: int,
+     threads: int,
+     device_index: int,
++    residual_dtype: str | None = None,
++    weight_dtype: str | None = None,
++    output_dtype: str | None = None,
++    zero_centered: bool = False,
++    reduction_dtype: str | None = None,
+ ) -> Callable[..., None]:
+     process_key = _fused_oneshot_process_key(
+         dtype_name,
+@@ -1412,6 +1623,11 @@ def get_fused_oneshot_launcher(
+         slot_bias,
+         threads,
+         device_index,
++        residual_dtype,
++        weight_dtype,
++        output_dtype,
++        zero_centered,
++        reduction_dtype,
+     )
+     del device_index
+     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
+@@ -1425,6 +1641,11 @@ def get_fused_oneshot_launcher(
+         device_slot_selection,
+         slot_bias,
+         threads,
++        residual_dtype,
++        weight_dtype,
++        output_dtype,
++        zero_centered,
++        reduction_dtype,
+     )
+     cache_key = (
+         dtype_name,
+@@ -1436,6 +1657,11 @@ def get_fused_oneshot_launcher(
+         bool(device_slot_selection),
+         slot_bias,
+         int(threads),
++        residual_dtype or dtype_name,
++        weight_dtype or dtype_name,
++        output_dtype or dtype_name,
++        bool(zero_centered),
++        reduction_dtype,
+     )
+     raise_if_kernel_resolution_frozen(
+         "cute.compile", target=launch, cache_key=cache_key
+@@ -1457,7 +1683,7 @@ def get_fused_oneshot_launcher(
+         1,
+         current_cuda_stream(),
+         compile_spec=KernelCompileSpec.from_key(
+-            "comm.pcie.oneshot_fused_rmsnorm", 1, cache_key
++            "comm.pcie.oneshot_fused_rmsnorm", 2, cache_key
+         ),
+     )
+ 
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_oneshot_preparation.py b/flashinfer/experimental/b12x/comm/pcie/_oneshot_preparation.py
+index ace33cc1fd7..751d13d85b3 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/_oneshot_preparation.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_oneshot_preparation.py
+@@ -51,6 +51,38 @@ def _dtype_name(dtype: torch.dtype) -> str:
+     }[dtype]
+ 
+ 
++def _fused_semantics(
++    dtype,
++    *,
++    residual_dtype=None,
++    weight_dtype=None,
++    output_dtype=None,
++    zero_centered=False,
++    reduction_dtype=None,
++):
++    supported = (torch.float16, torch.bfloat16, torch.float32)
++    operands = {
++        "residual_dtype": residual_dtype or dtype,
++        "weight_dtype": weight_dtype or dtype,
++        "output_dtype": output_dtype or dtype,
++    }
++    if any(
++        value not in supported for value in operands.values()
++    ) or reduction_dtype not in (None, *supported):
++        raise ValueError(
++            "fused RMSNorm operands and reduction rounding require FP16, BF16, or FP32"
++        )
++    if type(zero_centered) is not bool:
++        raise TypeError("zero_centered must be a boolean")
++    return {
++        **{key: _dtype_name(value) for key, value in operands.items()},
++        "zero_centered": zero_centered,
++        "reduction_dtype": (
++            None if reduction_dtype is None else _dtype_name(reduction_dtype)
++        ),
++    }
++
++
+ def _input_from_call(call: Mapping[str, object]) -> torch.Tensor:
+     inp = call.get("inp")
+     if not isinstance(inp, torch.Tensor):
+@@ -153,6 +185,11 @@ def query_from_metadata(
+     dtype: torch.dtype,
+     strides: tuple[int, ...] | None = None,
+     alignment: int = 16,
++    residual_dtype: torch.dtype | None = None,
++    weight_dtype: torch.dtype | None = None,
++    output_dtype: torch.dtype | None = None,
++    zero_centered: bool = False,
++    reduction_dtype: torch.dtype | None = None,
+ ) -> PcieQuery:
+     """Extract a native declaration from immutable invocation metadata only."""
+     tensor = _InvocationTensor(
+@@ -179,9 +216,14 @@ def query_from_metadata(
+         launcher = _plain_launcher_metadata(backend, native, tensor)
+         registered = not launcher["stage_input"]
+     else:
+-        if tensor.ndim == 0 or tensor.shape[-1] * tensor.element_size() % 16:
++        if (
++            tensor.ndim == 0
++            or tensor.numel() == 0
++            or tensor.shape[-1] * tensor.element_size() % 16
++            or tensor.stride() != _contiguous_strides(tensor.shape)
++        ):
+             raise ValueError(
+-                "fused oneshot input last dimension must occupy 16-byte packs"
++                "fused oneshot input must be nonempty and contiguous with 16-byte row packs"
+             )
+         mode, single_cta, register_normalize, threads = backend._fused_launch_config(
+             native, tensor
+@@ -196,6 +238,14 @@ def query_from_metadata(
+         ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
+         ctas = max(1, min(ctas, 36 // rows))
+         launcher = {
++            **_fused_semantics(
++                dtype,
++                residual_dtype=residual_dtype,
++                weight_dtype=weight_dtype,
++                output_dtype=output_dtype,
++                zero_centered=zero_centered,
++                reduction_dtype=reduction_dtype,
++            ),
+             "dtype": _dtype_name(dtype),
+             "mode": mode,
+             "single_cta": single_cta,
+@@ -256,9 +306,14 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
+     if not runtime.should_allreduce(inp):
+         raise ValueError("input does not satisfy PCIe oneshot requirements")
+     if surface in _FUSED_SURFACES and (
+-        inp.ndim == 0 or inp.shape[-1] * inp.element_size() % 16
++        inp.ndim == 0
++        or inp.numel() == 0
++        or not inp.is_contiguous()
++        or inp.shape[-1] * inp.element_size() % 16
+     ):
+-        raise ValueError("fused oneshot input last dimension must occupy 16-byte packs")
++        raise ValueError(
++            "fused oneshot input must be nonempty and contiguous with 16-byte row packs"
++        )
+     backend = runtime._ext
+     dtype = _dtype_name(inp.dtype)
+     stage_input = native.eager_tables is not None
+@@ -279,6 +334,14 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
+         ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
+         ctas = max(1, min(ctas, 36 // rows))
+         launcher = {
++            **_fused_semantics(
++                inp.dtype,
++                residual_dtype=getattr(values.get("residual"), "dtype", inp.dtype),
++                weight_dtype=getattr(values.get("weight"), "dtype", inp.dtype),
++                output_dtype=getattr(values.get("out"), "dtype", inp.dtype),
++                zero_centered=values.get("zero_centered", False),
++                reduction_dtype=values.get("reduction_dtype"),
++            ),
+             "dtype": dtype,
+             "mode": mode,
+             "single_cta": single_cta,
+@@ -373,6 +436,11 @@ def compile_oneshot_surface(query_payload, ordinal):
+                     variant[1],
+                     call["threads"],
+                     call["device_index"],
++                    residual_dtype=call["residual_dtype"],
++                    weight_dtype=call["weight_dtype"],
++                    output_dtype=call["output_dtype"],
++                    zero_centered=call["zero_centered"],
++                    reduction_dtype=call["reduction_dtype"],
+                 )
+                 for variant in variants
+             }
+@@ -442,6 +510,33 @@ def run_plain(self, inp, out):
+ 
+     def run_fused(self, inp, residual, weight, out, residual_out, epsilon):
+         self._require_bound_input(inp)
++        if self.query.surface not in _FUSED_SURFACES:
++            raise ValueError("fused RMSNorm requires a fused preparation plan")
++        for name, tensor, shape, dtype in (
++            ("residual", residual, inp.shape, self.query.call["residual_dtype"]),
++            ("weight", weight, inp.shape[-1:], self.query.call["weight_dtype"]),
++            ("output", out, inp.shape, self.query.call["output_dtype"]),
++            (
++                "residual output",
++                residual_out,
++                inp.shape,
++                self.query.call["residual_dtype"],
++            ),
++        ):
++            if (
++                tensor.shape != shape
++                or tensor.dtype != getattr(torch, dtype)
++                or tensor.device != inp.device
++                or not tensor.is_contiguous()
++                or tensor.data_ptr() % 16
++            ):
++                raise ValueError(
++                    f"fused RMSNorm {name} metadata differs from the prepared plan"
++                )
++        if out.data_ptr() == residual_out.data_ptr():
++            raise ValueError("output and residual output must not alias")
++        if not epsilon >= 0:
++            raise ValueError("epsilon must be non-negative")
+         return self.runtime._run_prepared_fused(
+             inp,
+             residual,
+diff --git a/flashinfer/experimental/b12x/comm/pcie/_tuning.py b/flashinfer/experimental/b12x/comm/pcie/_tuning.py
+index d43085cd344..d0bfc2cb693 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/_tuning.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_tuning.py
+@@ -13,11 +13,11 @@
+ # Native execution surfaces after the all-reduce manager's plan-time routing.
+ # Values are supported worlds, never a set of transports to race.
+ SURFACES = {
+-    "OneshotAllReduce.all_reduce": (2, 4, 6, 8, 10),
+-    "OneshotAllReduce.all_reduce_fused_add_rms_norm": (2, 4, 6, 8, 10),
+-    "OneshotAllReducePool.all_reduce": (2, 4, 6, 8, 10),
+-    "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 4, 6, 8, 10),
+-    "DmaAllReduce.all_reduce": (2, 4, 6, 8, 10),
++    "OneshotAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
++    "OneshotAllReduce.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
++    "OneshotAllReducePool.all_reduce": (2, 3, 4, 6, 8, 10),
++    "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
++    "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
+     "PCIeTwoShotBF16.all_reduce": (4,),
+     "PCIeTwoShotBF16.reduce_scatter": (4,),
+     "PCIeTwoShotBF16.all_gather": (4,),
+@@ -80,6 +80,6 @@ def _validate_query(query: PcieQuery, device) -> None:
+         )
+ 
+ 
+-TUNING = replace(TUNING, query_schema_version=22, validate_query=_validate_query)
++TUNING = replace(TUNING, query_schema_version=24, validate_query=_validate_query)
+ 
+ __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]
+diff --git a/flashinfer/experimental/b12x/comm/pcie/pcie_allreduce.py b/flashinfer/experimental/b12x/comm/pcie/pcie_allreduce.py
+index 501a24f8cd8..b9a50ef46e2 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_allreduce.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_allreduce.py
+@@ -153,6 +153,7 @@ def from_exchange_group(
+         max_size: int = DEFAULT_MAX_SIZE,
+         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
+         ext_module=None,
++        ipc=None,
+         single_channel: bool = False,
+         max_concurrent_channels: int = 1,
+     ) -> "PCIeAllReduce":
+@@ -167,6 +168,7 @@ def from_exchange_group(
+                 max_size=max_size,
+                 rank_data_bytes=rank_data_bytes,
+                 ext_module=ext_module,
++                ipc=ipc,
+                 single_channel=single_channel,
+                 max_concurrent_channels=max_concurrent_channels,
+             )
+@@ -182,12 +184,14 @@ def from_exchange_group(
+                 device=device,
+                 max_elements=max_size // torch.bfloat16.itemsize,
+                 ext_module=ext_module,
++                ipc=ipc,
+             )
+         island_rs = cls._maybe_island_rs(
+             exchange_group=exchange_group,
+             device=device,
+             max_size=max_size,
+             algorithm_override=algorithm_override,
++            ipc=ipc,
+         )
+         return cls(
+             runtime,
+@@ -203,6 +207,7 @@ def _maybe_island_rs(
+         device: torch.device | int | str,
+         max_size: int,
+         algorithm_override: str,
++        ipc: object = None,
+     ) -> Any:
+         """Attach the equal-quarter runtime after an explicit policy opt-in.
+ 
+@@ -228,6 +233,7 @@ def _maybe_island_rs(
+                 exchange_group=exchange_group,
+                 device=device,
+                 max_elements=elements - (elements % 2),
++                ipc=ipc,
+             )
+         except RuntimeError as exc:
+             if dist.get_rank(group=exchange_group) == 0:
+@@ -401,6 +407,8 @@ def all_reduce_fused_add_rms_norm(
+         plan: Plan,
+         out: Optional[torch.Tensor] = None,
+         residual_out: Optional[torch.Tensor] = None,
++        zero_centered: bool = False,
++        reduction_dtype: torch.dtype | None = None,
+         peer_input_ptrs: Optional[Sequence[int]] = None,
+         stream: object = None,
+         channel_id: Optional[str] = None,
+@@ -415,6 +423,8 @@ def all_reduce_fused_add_rms_norm(
+             plan=plan,
+             out=out,
+             residual_out=residual_out,
++            zero_centered=zero_centered,
++            reduction_dtype=reduction_dtype,
+             peer_input_ptrs=peer_input_ptrs,
+             stream=stream,
+             channel_id=channel_id,
+diff --git a/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py b/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py
+index 3d3462bd269..f251bd7661f 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py
+@@ -569,6 +569,7 @@ def from_exchange_group(
+         head_dim: int,
+         query_head_dim: Optional[int] = None,
+         ext_module=None,
++        ipc=None,
+         stream_affine: bool = True,
+     ) -> "PCIeDCPA2A":
+         rank = dist.get_rank(group=exchange_group)
+@@ -621,8 +622,10 @@ def validate_factory_arguments():
+             exchange_group=exchange_group,
+         )
+ 
++        supplied_ipc = ipc
++
+         def prepare():
+-            prepared_ipc = CudaRTLibrary()
++            prepared_ipc = supplied_ipc if supplied_ipc is not None else CudaRTLibrary()
+             prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
+             layout = _staging_layout(
+                 signal_bytes=(
+diff --git a/flashinfer/experimental/b12x/comm/pcie/pcie_dma.py b/flashinfer/experimental/b12x/comm/pcie/pcie_dma.py
+index c1785375ac1..bcf1b66055d 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_dma.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_dma.py
+@@ -33,7 +33,7 @@
+     torch.float16: 1,
+     torch.float32: 2,
+ }
+-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
++SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
+ FLAG_STRIDE = 128
+ FLAG_SLOTS = 256
+ MAX_PIECES = 8
+@@ -178,6 +178,7 @@ def __init__(
+         max_bytes: int,
+         ext_module=None,
+         fp8: Optional[str] = None,
++        ipc=None,
+     ) -> None:
+         # Kept only as a source-compatible keyword for callers that used to
+         # inject the removed C++ extension.  Device work is always CuTe DSL.
+@@ -194,8 +195,12 @@ def __init__(
+         if self.device.type != "cuda":
+             raise ValueError("PCIe ring allreduce requires a CUDA device")
+         self.max_bytes = int(max_bytes)
+-        self._ipc = CudaRTLibrary()
+-        self._ipc.cudaSetDevice(self.device.index or 0)
++        # Callers may supply the shared-memory allocator, e.g. VMM storage
++        # that an exporter retains at recorded addresses.
++        if ipc is None:
++            ipc = CudaRTLibrary()
++            ipc.cudaSetDevice(self.device.index or 0)
++        self._ipc = ipc
+         self._kernels = _load_kernels(self._ipc)
+         self._closed = False
+         self._eager_replays: dict[
+@@ -222,6 +227,7 @@ def __init__(
+         self._wait_counters = torch.zeros(
+             FLAG_SLOTS, dtype=torch.int32, device=self.device
+         )
++        self._wait_done = torch.zeros(FLAG_SLOTS, dtype=torch.int32, device=self.device)
+         self._copy_stream = torch.cuda.Stream(device=self.device)
+         self._flag_stream = torch.cuda.Stream(device=self.device)
+         # Separate CE/flag streams for the a2a broadcast phase so allgather
+@@ -607,10 +613,13 @@ def fp8_stage_piece(chunk: int, piece: int) -> int:
+                         self._flag_ptr(nxt, slot(k, p)),
+                         self._counter_ptr(self._send_counters, slot(k, p)),
+                     )
+-                kernels.dma_wait_flag(
++                wait = (
+                     self._flag_ptr(rank, slot(k, p)),
+                     self._counter_ptr(self._wait_counters, slot(k, p)),
++                    self._counter_ptr(self._wait_done, slot(k, p)),
+                 )
++                if not reduce_phase or compressed_reduce:
++                    kernels.dma_wait_flag(*wait[:2])
+                 if reduce_phase:
+                     if compressed_reduce:
+                         payload = fp8_scratch_piece(rank, k, p)
+@@ -632,6 +641,7 @@ def fp8_stage_piece(chunk: int, piece: int) -> int:
+                             scratch_piece(rank, k, p),
+                             piece_elems,
+                             dtype_code,
++                            wait=wait,
+                         )
+                 elif compressed_step:
+                     payload = fp8_scratch_piece(rank, k, p)
+@@ -690,6 +700,21 @@ def _prime_prepared(self, state) -> None:
+             self._kernels.dma_copy(scratch, scratch, 16)
+             for dtype_code, elems in ((0, 8), (1, 8), (2, 4)):
+                 self._kernels.dma_add(scratch, scratch, scratch, elems, dtype_code)
++                self._kernels.dma_set_flag(
++                    flag, self._counter_ptr(self._send_counters, slot)
++                )
++                self._kernels.dma_add(
++                    scratch,
++                    scratch,
++                    scratch,
++                    elems,
++                    dtype_code,
++                    wait=(
++                        flag,
++                        self._counter_ptr(self._wait_counters, slot),
++                        self._counter_ptr(self._wait_done, slot),
++                    ),
++                )
+             if self._fp8:
+                 if self._fp8_stage is None or self._fp8_stage.numel() < 512:
+                     raise RuntimeError(
+diff --git a/flashinfer/experimental/b12x/comm/pcie/pcie_hierarchical.py b/flashinfer/experimental/b12x/comm/pcie/pcie_hierarchical.py
+index 81b61ee5b99..db86c57d240 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_hierarchical.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_hierarchical.py
+@@ -174,6 +174,7 @@ def __init__(
+         max_elements: int,
+         blocks: Optional[int] = None,
+         ext_module=None,
++        ipc: Optional[CudaRTLibrary] = None,
+     ) -> None:
+         del ext_module  # native-extension injection is obsolete
+         self.group = exchange_group
+@@ -203,7 +204,7 @@ def __init__(
+         self.vectorized_bf16x2 = _vectorized_bf16x2_from_env()
+         self.vectorized_bf16x2_max_elements = _vectorized_bf16x2_max_elements_from_env()
+         self._layout = _make_layout(self.max_elements)
+-        self._ipc = CudaRTLibrary()
++        self._ipc = ipc if ipc is not None else CudaRTLibrary()
+         self._ipc.cudaSetDevice(self.device.index or 0)
+         self._slab_ptrs: tuple[int, ...] = ()
+         self._local_ptr = 0
+diff --git a/flashinfer/experimental/b12x/comm/pcie/pcie_island_rs.py b/flashinfer/experimental/b12x/comm/pcie/pcie_island_rs.py
+index 3e5de721e8d..507d2091027 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_island_rs.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_island_rs.py
+@@ -84,7 +84,9 @@ def __init__(
+         device: torch.device | int | str,
+         max_elements: int,
+         blocks: Optional[int] = None,
++        ipc: object = None,
+     ) -> None:
++        """``ipc`` supplies the CUDA IPC allocator for the slab, as the hierarchical runtime accepts."""
+         self.group = exchange_group
+         self.rank = dist.get_rank(group=exchange_group)
+         self.world_size = dist.get_world_size(group=exchange_group)
+@@ -119,7 +121,7 @@ def __init__(
+         self.final_offset = _align_up(self.part_offset + 2 * quarter_bytes)
+         self.slab_bytes = _align_up(self.final_offset + 2 * vector_bytes)
+ 
+-        self._ipc = CudaRTLibrary()
++        self._ipc = CudaRTLibrary() if ipc is None else ipc
+         self._ipc.cudaSetDevice(self.device.index or 0)
+         self._slab_ptrs: tuple[int, ...] = ()
+         self._local_ptr = 0
+diff --git a/flashinfer/experimental/b12x/comm/pcie/pcie_oneshot.py b/flashinfer/experimental/b12x/comm/pcie/pcie_oneshot.py
+index 5cc1507acde..f0f760d369c 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_oneshot.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_oneshot.py
+@@ -22,12 +22,13 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
+-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
++SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
+ SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+ DEFAULT_MAX_SIZE = 8 * 1024 * 1024
+ DEFAULT_RANK_DATA_BYTES = 8 * 1024 * 1024
+ TP2_PLAIN_REMOTE_PUSH_MAX_ROWS = 512
+ TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_ROWS = 64
++_TP2_SIMPLE_THREADS = 128
+ TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE = 4096
+ TP2_PLAIN_REMOTE_PUSH_MAX_BYTES = (
+     TP2_PLAIN_REMOTE_PUSH_MAX_ROWS
+@@ -149,9 +150,9 @@ def _tp2_plain_remote_push_enabled() -> bool:
+ 
+ 
+ def _tp4_remote_push_enabled() -> bool:
+-    """Enable the qualified fused TP4 remote-write transport."""
++    """Enable the qualified fused TP4 remote-write transport by default."""
+ 
+-    return os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
++    return os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "1") not in ("", "0")
+ 
+ 
+ def _tp8_owner_reduce_enabled() -> bool:
+@@ -1521,9 +1522,13 @@ def register_pcie_buffers(
+ 
+     @staticmethod
+     def _launch_geometry(size_packs: int) -> tuple[int, int]:
+-        threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "256"))
++        # Longer payloads need enough outstanding peer loads to fill PCIe.
++        bulk = size_packs >= 2048
++        threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "512" if bulk else "256"))
+         threads = min(512, max(64, (threads // 32) * 32))
+-        block_limit = int(os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8"))
++        block_limit = int(
++            os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "32" if bulk else "8")
++        )
+         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
+             raise ValueError(
+                 f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {_MAX_BLOCKS}]"
+@@ -1537,7 +1542,7 @@ def _tp2_plain_remote_push_geometry(
+         inp: torch.Tensor,
+         *,
+         graph_channel: bool,
+-    ) -> Optional[tuple[int, int, bool]]:
++    ) -> Optional[tuple[int, int, str]]:
+         """Return TP2 peer-push geometry for a graph-owned plain all-reduce.
+ 
+         The protocol requires device-selected alternating slots, which are
+@@ -1557,25 +1562,12 @@ def _tp2_plain_remote_push_geometry(
+         rows = _tp2_plain_remote_push_rows(inp)
+         if rows is None or inp.numel() * inp.element_size() > state.eager_buffer_bytes:
+             return None
++        # LL records double the bytes on PCIe, which only one-row latency repays.
++        # Larger reductions publish Simple payloads with one flag per CTA.
+         if rows == 1:
+-            return 64, 36, False
+-        if rows == 2:
+-            return 128, 36, True
+-        if rows <= 4:
+-            return 256, 36, True
+-        if rows <= 6:
+-            return 64, 16, False
+-        if rows <= 8:
+-            return 256, 32, False
+-        if rows <= 14:
+-            return 64, 16, False
+-        if rows <= 16:
+-            return 64, 36, True
+-        if rows <= 22:
+-            return 128, 16, False
+-        if rows <= 24:
+-            return 128, 32, True
+-        return 128, 16, False
++            return 64, 36, "ll"
++        packs = inp.numel() * inp.element_size() // 16
++        return _TP2_SIMPLE_THREADS, min(36, -(-packs // _TP2_SIMPLE_THREADS)), "simple"
+ 
+     @classmethod
+     def _plain_launch_config(
+@@ -1593,8 +1585,12 @@ def _plain_launch_config(
+             graph_channel=graph_channel,
+         )
+         if remote_push is not None:
+-            threads, blocks, stream_mode = remote_push
+-            transport = "tp2_remote_push_stream" if stream_mode else "tp2_remote_push"
++            threads, blocks, mode = remote_push
++            transport = {
++                "ll": "tp2_remote_push",
++                "stream": "tp2_remote_push_stream",
++                "simple": "tp2_remote_push_simple",
++            }[mode]
+             return transport, threads, blocks
+         threads, blocks = cls._launch_geometry(inp.numel() * inp.element_size() // 16)
+         return "pull", threads, blocks
+@@ -1651,8 +1647,8 @@ def _plain_graph_plan_key(
+         )
+ 
+     @staticmethod
+-    def _fused_threads() -> int:
+-        threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", "256"))
++    def _fused_threads(default: int = 256) -> int:
++        threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", str(default)))
+         return min(512, max(64, (threads // 32) * 32))
+ 
+     @staticmethod
+@@ -1665,7 +1661,7 @@ def _fused_topology_mode(
+         if (
+             state.eager_tables is None
+             or state.eager_buffer_bytes is None
+-            or inp.dtype not in (torch.float16, torch.bfloat16)
++            or inp.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+             or inp.ndim == 0
+         ):
+             return None
+@@ -1677,6 +1673,7 @@ def _fused_topology_mode(
+         if (
+             state.world_size == 8
+             and tp8_owner
++            and inp.dtype in (torch.float16, torch.bfloat16)
+             and hidden in (4096, 6144)
+             and 2 <= rows <= 8
+         ):
+@@ -1688,7 +1685,13 @@ def _fused_topology_mode(
+             and 1 <= rows <= 32
+         ):
+             return "stage_remote_push"
+-        if state.world_size == 2 and tp2_remote and hidden == 4096 and 1 <= rows <= 32:
++        if (
++            state.world_size == 2
++            and tp2_remote
++            and inp.dtype in (torch.float16, torch.bfloat16)
++            and hidden == 4096
++            and 1 <= rows <= 32
++        ):
+             return "stage_remote_push"
+         return None
+ 
+@@ -1701,7 +1704,14 @@ def _fused_launch_config(
+         pack_elems = 16 // inp.element_size()
+         hidden_packs = int(inp.shape[-1]) // pack_elems
+         rows = inp.numel() // int(inp.shape[-1])
+-        threads = cls._fused_threads()
++        topology_mode = cls._fused_topology_mode(state, inp)
++        threads = cls._fused_threads(
++            512
++            if state.world_size == 4
++            and inp.dtype == torch.float32
++            and topology_mode == "stage_remote_push"
++            else 256
++        )
+         override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
+         if override > 0:
+             ctas_per_row = override
+@@ -1714,7 +1724,6 @@ def _fused_launch_config(
+         register_normalize = (hidden_packs + ctas_per_row * threads - 1) // (
+             ctas_per_row * threads
+         ) <= _REG_PACKS
+-        topology_mode = cls._fused_topology_mode(state, inp)
+         if topology_mode is not None:
+             mode = topology_mode
+         elif state.eager_tables is None:
+@@ -3188,9 +3197,17 @@ def all_reduce_fused_add_rms_norm(
+         plan: Plan,
+         out: Optional[torch.Tensor] = None,
+         residual_out: Optional[torch.Tensor] = None,
++        zero_centered: bool = False,
++        reduction_dtype: torch.dtype | None = None,
+         peer_input_ptrs: Optional[Sequence[int]] = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """All-reduce ``inp``, add ``residual``, and apply RMSNorm."""
++        """All-reduce, optionally round, add the residual, then apply RMSNorm.
++
++        The plan declares independent residual, weight, and output dtypes.
++        ``zero_centered`` uses ``1 + weight``; ``reduction_dtype`` rounds the
++        FP32 collective sum before residual addition. Residual output may
++        alias the residual input, retaining FP32 storage across layers.
++        """
+         with _device_guard(self.device):
+             return self._all_reduce_fused_on_device(
+                 inp,
+@@ -3200,6 +3217,8 @@ def all_reduce_fused_add_rms_norm(
+                 plan=plan,
+                 out=out,
+                 residual_out=residual_out,
++                zero_centered=zero_centered,
++                reduction_dtype=reduction_dtype,
+                 peer_input_ptrs=peer_input_ptrs,
+             )
+ 
+@@ -3213,6 +3232,8 @@ def _all_reduce_fused_on_device(
+         plan: Plan,
+         out: Optional[torch.Tensor] = None,
+         residual_out: Optional[torch.Tensor] = None,
++        zero_centered: bool = False,
++        reduction_dtype: torch.dtype | None = None,
+         peer_input_ptrs: Optional[Sequence[int]] = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Guarded implementation for the fused public entry point."""
+@@ -3236,43 +3257,28 @@ def _all_reduce_fused_on_device(
+             raise ValueError(
+                 "the last input dimension must occupy a multiple of 16 bytes"
+             )
+-        if residual.device != inp.device:
+-            raise ValueError("residual tensor must be on the same device as the input")
+-        if residual.shape != inp.shape or residual.dtype != inp.dtype:
+-            raise ValueError("residual tensor must match input shape and dtype")
+-        if not _is_weak_contiguous(residual):
+-            raise ValueError("residual tensor must be weak-contiguous")
+-        if weight.device != inp.device:
+-            raise ValueError("weight tensor must be on the same device as the input")
+-        if weight.shape != (hidden_size,) or weight.dtype != inp.dtype:
+-            raise ValueError(
+-                "weight tensor must match the input dtype and last dimension"
+-            )
+-        if not weight.is_contiguous():
+-            raise ValueError("weight tensor must be contiguous")
+-        if epsilon < 0:
+-            raise ValueError("epsilon must be non-negative")
+-
+-        if out is None:
+-            out = torch.empty_like(inp)
+-        if residual_out is None:
+-            residual_out = torch.empty_like(residual)
+-        for name, tensor in (("output", out), ("residual output", residual_out)):
+-            if tensor.device != inp.device:
+-                raise ValueError(
+-                    f"{name} tensor must be on the same device as the input"
+-                )
+-            if tensor.shape != inp.shape or tensor.dtype != inp.dtype:
+-                raise ValueError(f"{name} tensor must match input shape and dtype")
+-            if not _is_weak_contiguous(tensor):
+-                raise ValueError(f"{name} tensor must be weak-contiguous")
+-        if out.data_ptr() == residual_out.data_ptr():
+-            raise ValueError("output and residual output must not alias")
+-
+         if peer_input_ptrs is not None:
+             raise ValueError("peer input registration belongs to oneshot preparation")
+         state = require_prepared(plan, "comm.pcie", self.device)
+         state.require_runtime(self)
++        if not state.query.surface.endswith(".all_reduce_fused_add_rms_norm"):
++            raise ValueError("fused RMSNorm requires a fused preparation plan")
++        from ._oneshot_preparation import _fused_semantics
++
++        semantics = _fused_semantics(
++            inp.dtype, zero_centered=zero_centered, reduction_dtype=reduction_dtype
++        )
++        if any(
++            semantics[key] != state.query.call[key]
++            for key in ("zero_centered", "reduction_dtype")
++        ):
++            raise ValueError("fused RMSNorm arithmetic differs from the prepared plan")
++        if out is None:
++            out = torch.empty_like(
++                inp, dtype=getattr(torch, state.query.call["output_dtype"])
++            )
++        if residual_out is None:
++            residual_out = torch.empty_like(residual)
+         state.run_fused(inp, residual, weight, out, residual_out, float(epsilon))
+         return out, residual_out
+ 
+@@ -3614,6 +3620,7 @@ def from_exchange_group(
+         max_size: int = DEFAULT_MAX_SIZE,
+         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
+         ext_module=None,
++        ipc=None,
+         single_channel: bool = False,
+         max_concurrent_channels: int = 1,
+     ) -> "PCIeOneshotAllReducePool":
+@@ -3626,6 +3633,7 @@ def from_exchange_group(
+             max_size=max_size,
+             rank_data_bytes=rank_data_bytes,
+             ext_module=ext_module,
++            ipc=ipc,
+             single_channel=single_channel,
+             max_concurrent_channels=max_concurrent_channels,
+         )
+@@ -4006,6 +4014,8 @@ def all_reduce_fused_add_rms_norm(
+         plan: Plan,
+         out: Optional[torch.Tensor] = None,
+         residual_out: Optional[torch.Tensor] = None,
++        zero_centered: bool = False,
++        reduction_dtype: torch.dtype | None = None,
+         peer_input_ptrs: Optional[Sequence[int]] = None,
+         stream: object = None,
+         channel_id: Optional[str] = None,
+@@ -4019,6 +4029,8 @@ def all_reduce_fused_add_rms_norm(
+                 plan=plan,
+                 out=out,
+                 residual_out=residual_out,
++                zero_centered=zero_centered,
++                reduction_dtype=reduction_dtype,
+                 peer_input_ptrs=peer_input_ptrs,
+                 stream=stream,
+                 channel_id=channel_id,
+@@ -4034,6 +4046,8 @@ def _all_reduce_fused_on_device(
+         plan: Plan,
+         out: Optional[torch.Tensor] = None,
+         residual_out: Optional[torch.Tensor] = None,
++        zero_centered: bool = False,
++        reduction_dtype: torch.dtype | None = None,
+         peer_input_ptrs: Optional[Sequence[int]] = None,
+         stream: object = None,
+         channel_id: Optional[str] = None,
+@@ -4051,6 +4065,8 @@ def run() -> tuple[torch.Tensor, torch.Tensor]:
+                 plan=plan,
+                 out=out,
+                 residual_out=residual_out,
++                zero_centered=zero_centered,
++                reduction_dtype=reduction_dtype,
+                 peer_input_ptrs=peer_input_ptrs,
+             )
+ 
+diff --git a/flashinfer/experimental/b12x/comm/pcie/pcie_vocab_argmax.py b/flashinfer/experimental/b12x/comm/pcie/pcie_vocab_argmax.py
+index 02548b37dd1..15d09a487e6 100644
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_vocab_argmax.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_vocab_argmax.py
+@@ -113,7 +113,9 @@ def __init__(
+         device: torch.device | int | str,
+         local_vocab_size: int,
+         max_batch_size: int = MAX_BATCH_SIZE,
++        ipc: object = None,
+     ) -> None:
++        """``ipc`` supplies the CUDA IPC allocator for the exchange slabs, as other PCIe runtimes accept."""
+         self.group = exchange_group
+         self.rank = dist.get_rank(group=exchange_group)
+         self.world_size = dist.get_world_size(group=exchange_group)
+@@ -172,7 +174,7 @@ def normalize_and_validate():
+         self._closed = True
+ 
+         def prepare_runtime():
+-            return CudaRTLibrary()
++            return CudaRTLibrary() if ipc is None else ipc
+ 
+         self._ipc = _run_collective_preallocation_setup(
+             owner="PCIe vocabulary argmax runtime preparation",
+@@ -201,12 +203,14 @@ def from_exchange_group(
+         device: torch.device | int | str,
+         local_vocab_size: int,
+         max_batch_size: int = MAX_BATCH_SIZE,
++        ipc: object = None,
+     ) -> "PCIeVocabParallelArgmax":
+         return cls(
+             exchange_group=exchange_group,
+             device=device,
+             local_vocab_size=local_vocab_size,
+             max_batch_size=max_batch_size,
++            ipc=ipc,
+         )
+ 
+     @classmethod
+diff --git a/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py b/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py
+index 048c78b265e..733d80c9760 100644
+--- a/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py
++++ b/tests/experimental/b12x/comm/test_pcie_dcp_a2a.py
+@@ -264,7 +264,7 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
+         (
+             kernels._get_compiled_all_gather_heads,
+             "comm.pcie.dcp_a2a.all_gather_heads",
+-            12,
++            13,
+         ),
+     )
+     for launcher, identity, version in identities:
+diff --git a/tests/experimental/b12x/comm/test_pcie_dcp_a2a_gpu.py b/tests/experimental/b12x/comm/test_pcie_dcp_a2a_gpu.py
+index 6d28467a7b7..b0270657542 100644
+--- a/tests/experimental/b12x/comm/test_pcie_dcp_a2a_gpu.py
++++ b/tests/experimental/b12x/comm/test_pcie_dcp_a2a_gpu.py
+@@ -612,12 +612,18 @@ def _check_graph(
+             channel.all_gather_heads(
+                 odd_input, odd_output, plan=plans["all_gather_heads", odd_input.dtype]
+             )
++    # Two ranks push into each other's staging, so a peer's next replay must
++    # not land before this rank's snapshot.
++    stream.synchronize()
++    dist.barrier()
+     snapshots = [_local_staging_words(channel, stream)]
++    dist.barrier()
+     for value in (1.0, 2.0):
+         with torch.cuda.stream(stream):
+             odd_input.fill_(value)
+             odd_graph.replay()
+         snapshots.append(_local_staging_words(channel, stream))
++        dist.barrier()
+         torch.testing.assert_close(
+             odd_output, torch.full_like(odd_output, value), rtol=0, atol=0
+         )
+@@ -923,7 +929,17 @@ def _check_queued_mixed_grid_graph(
+         )
+ 
+ 
+-def _worker(rank: int, world_size: int, port: int) -> None:
++def _worker(
++    rank: int,
++    world_size: int,
++    port: int,
++    heads_per_rank: int | None,
++    query_head_dim: int,
++) -> None:
++    global TOTAL_HEADS, QUERY_HEAD_DIM
++    if heads_per_rank is not None:
++        TOTAL_HEADS = heads_per_rank * world_size
++    QUERY_HEAD_DIM = query_head_dim
+     torch.cuda.set_device(rank)
+     device = torch.device("cuda", rank)
+     dist.init_process_group(
+@@ -1067,7 +1083,8 @@ def unexpected_allocate(*args, **kwargs):
+         dist.destroy_process_group()
+ 
+ 
+-def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
++@pytest.mark.parametrize("heads_per_rank,query_head_dim", [(None, 576), (3, 64)])
++def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(heads_per_rank, query_head_dim):
+     if (
+         os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
+         or os.getenv("B12X_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
+@@ -1082,7 +1099,12 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
+         pytest.skip(
+             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
+         )
+-    mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
++    mp.spawn(
++        _worker,
++        args=(world_size, _free_port(), heads_per_rank, query_head_dim),
++        nprocs=world_size,
++        join=True,
++    )
+ 
+ 
+ def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
+diff --git a/tests/experimental/b12x/comm/test_pcie_dma_gpu.py b/tests/experimental/b12x/comm/test_pcie_dma_gpu.py
+index 51c73753773..5658ceb023e 100644
+--- a/tests/experimental/b12x/comm/test_pcie_dma_gpu.py
++++ b/tests/experimental/b12x/comm/test_pcie_dma_gpu.py
+@@ -7,6 +7,7 @@
+ import pytest
+ import torch
+ import torch.distributed as dist
++import torch.multiprocessing as mp
+ from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
+ from b12x.comm.pcie._dma_kernels import DmaKernels, compile_launchers
+ from b12x.comm.pcie._dma_preparation import (
+@@ -439,3 +440,62 @@ def test_pcie_dma_preparation_tolerates_rank_skew_and_replays() -> None:
+                     process.kill()
+             for process in workers.processes:
+                 process.join(timeout=5)
++
++
++@pytest.mark.parametrize(
++    "dtype,dtype_code", [(torch.bfloat16, 0), (torch.float16, 1), (torch.float32, 2)]
++)
++def test_fused_receive_reduce_replay_and_grid_changes(dtype, dtype_code):
++    device = torch.device("cuda:0")
++    torch.cuda.set_device(device)
++    kernels = DmaKernels(CudaRTLibrary())
++    kernels.install(compile_launchers(world_size=2, wire_mode=""))
++    flags, sent, waited, done = (
++        torch.zeros(1, device=device, dtype=torch.int32) for _ in range(4)
++    )
++    left = torch.randn(65536, device=device).to(dtype)
++    received = torch.empty_like(left)
++    source = torch.randn_like(left)
++    outputs = [torch.empty_like(left[:n]) for n in (8, 65536, 512)]
++    producer = torch.cuda.Stream(device=device)
++    main = torch.cuda.current_stream(device)
++    wait = flags.data_ptr(), waited.data_ptr(), done.data_ptr()
++
++    def execute():
++        for output in outputs:
++            producer.wait_stream(main)
++            with torch.cuda.stream(producer):
++                received.copy_(source)
++                kernels.dma_set_flag(flags.data_ptr(), sent.data_ptr())
++            kernels.dma_add(
++                output.data_ptr(),
++                left.data_ptr(),
++                received.data_ptr(),
++                output.numel(),
++                dtype_code,
++                wait=wait,
++            )
++            main.wait_stream(producer)
++
++    execute()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        execute()
++    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
++    for iteration in range(12):
++        left.mul_(0.75)
++        source.add_(0.125)
++        for output in outputs:
++            output.fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
++        for output in outputs:
++            expected = (
++                left[: output.numel()].float() + source[: output.numel()].float()
++            ).to(dtype)
++            torch.testing.assert_close(output, expected, rtol=0, atol=0)
++            del expected
++        torch.testing.assert_close(sent, waited, rtol=0, atol=0)
++        assert not done.any()
++    graph.reset()
+diff --git a/tests/experimental/b12x/comm/test_pcie_dma_kernels.py b/tests/experimental/b12x/comm/test_pcie_dma_kernels.py
+index 3e3b2fee52c..c4e1780c07d 100644
+--- a/tests/experimental/b12x/comm/test_pcie_dma_kernels.py
++++ b/tests/experimental/b12x/comm/test_pcie_dma_kernels.py
+@@ -79,13 +79,21 @@ def fake_tp10(*args):
+     legacy = dma_kernels.DmaKernels(ipc=None)
+     legacy.install(
+         dma_kernels.DmaLaunchers(
+-            set_flag=object(), wait_flag=object(), add=(), dequant_accum=fake_legacy
++            set_flag=object(),
++            wait_flag=object(),
++            add=(),
++            wait_add=(),
++            dequant_accum=fake_legacy,
+         )
+     )
+     tp10 = dma_kernels.DmaKernels(ipc=None)
+     tp10.install(
+         dma_kernels.DmaLaunchers(
+-            set_flag=object(), wait_flag=object(), add=(), dequant_accum=fake_tp10
++            set_flag=object(),
++            wait_flag=object(),
++            add=(),
++            wait_add=(),
++            dequant_accum=fake_tp10,
+         )
+     )
+     legacy._dequant_accum(
+diff --git a/tests/experimental/b12x/comm/test_pcie_oneshot.py b/tests/experimental/b12x/comm/test_pcie_oneshot.py
+index 6a84091422c..c7006f2e4c6 100644
+--- a/tests/experimental/b12x/comm/test_pcie_oneshot.py
++++ b/tests/experimental/b12x/comm/test_pcie_oneshot.py
+@@ -333,16 +333,17 @@ def _make_cute_state(
+     ("rows", "expected"),
+     (
+         (1, ("tp2_remote_push", 64, 36)),
+-        (2, ("tp2_remote_push_stream", 128, 36)),
+-        (4, ("tp2_remote_push_stream", 256, 36)),
+-        (6, ("tp2_remote_push", 64, 16)),
+-        (8, ("tp2_remote_push", 256, 32)),
+-        (16, ("tp2_remote_push_stream", 64, 36)),
+-        (24, ("tp2_remote_push_stream", 128, 32)),
+-        (32, ("tp2_remote_push", 128, 16)),
+-        (128, ("tp2_remote_push", 128, 16)),
+-        (256, ("tp2_remote_push", 128, 16)),
+-        (512, ("tp2_remote_push", 128, 16)),
++        (2, ("tp2_remote_push_simple", 128, 8)),
++        (3, ("tp2_remote_push_simple", 128, 12)),
++        (4, ("tp2_remote_push_simple", 128, 16)),
++        (6, ("tp2_remote_push_simple", 128, 24)),
++        (8, ("tp2_remote_push_simple", 128, 32)),
++        (16, ("tp2_remote_push_simple", 128, 36)),
++        (24, ("tp2_remote_push_simple", 128, 36)),
++        (32, ("tp2_remote_push_simple", 128, 36)),
++        (128, ("tp2_remote_push_simple", 128, 36)),
++        (256, ("tp2_remote_push_simple", 128, 36)),
++        (512, ("tp2_remote_push_simple", 128, 36)),
+     ),
+ )
+ def test_plain_tp2_remote_push_uses_qualified_geometry(
+@@ -424,8 +425,8 @@ def test_plain_graph_plan_freezes_prepared_channel_contract(monkeypatch) -> None
+     state.eager_buffer_bytes = 0
+     state.plain_remote_push_region_packs = 0
+ 
+-    assert plan.transport == "tp2_remote_push"
+-    assert (plan.threads, plan.blocks) == (64, 16)
++    assert plan.transport == "tp2_remote_push_simple"
++    assert (plan.threads, plan.blocks) == (128, 24)
+     assert plan.eager_buffer_bytes == TP2_PLAIN_REMOTE_PUSH_MAX_BYTES
+     assert plan.transport_policy[2] is True
+     assert plan.remote_push_region_packs > 0
+@@ -459,14 +460,14 @@ def fake_get_oneshot_launcher(*args):
+ 
+     key = backend._plain_graph_plan_key(inp)
+     plan = state.plain_graph_plans[key]
+-    assert plan.transport == "tp2_remote_push"
+-    assert (plan.threads, plan.blocks) == (64, 16)
++    assert plan.transport == "tp2_remote_push_simple"
++    assert (plan.threads, plan.blocks) == (128, 24)
+     assert launchers[0]._transport == "pull"
+     assert not launchers[0]._device_slot_selection
+     assert [
+         (launcher._device_slot_selection, launcher._slot_bias, launcher._transport)
+         for launcher in launchers[1:]
+-    ] == [(True, 0, "tp2_remote_push"), (True, 1, "tp2_remote_push")]
++    ] == [(True, 0, "tp2_remote_push_simple"), (True, 1, "tp2_remote_push_simple")]
+ 
+ 
+ def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None:
+@@ -499,13 +500,13 @@ def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None
+     backend.all_reduce(7, inp, torch.empty_like(inp), 0, 0)
+ 
+     key = backend._plain_graph_plan_key(inp)
+-    assert state.plain_graph_plans[key].transport == "tp2_remote_push"
++    assert state.plain_graph_plans[key].transport == "tp2_remote_push_simple"
+     assert (
+         state.plain_graph_plans[key].threads,
+         state.plain_graph_plans[key].blocks,
+     ) == (
+-        64,
+-        16,
++        128,
++        20,
+     )
+     assert len(launches) == 1
+ 
+@@ -620,7 +621,7 @@ def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
+             4,
+             "B12X_PCIE_TP4_REMOTE_PUSH",
+             (32, 6144),
+-            "stage_pull",
++            "stage_remote_push",
+             "stage_remote_push",
+         ),
+     ),
+@@ -668,6 +669,24 @@ def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
+     assert mode == "stage_remote_push"
+ 
+ 
++@pytest.mark.parametrize("rows", (1, 4, 7, 32, 33))
++@pytest.mark.parametrize("hidden", (4096, 6144))
++def test_tp4_remote_push_float32_contract(monkeypatch, rows, hidden) -> None:
++    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
++    monkeypatch.delenv("B12X_PCIE_TP4_REMOTE_PUSH", raising=False)
++    monkeypatch.delenv("B12X_PCIE_FUSED_THREADS", raising=False)
++    monkeypatch.delenv("B12X_PCIE_FUSED_CTAS_PER_ROW", raising=False)
++    geometry = _CuTeOneshotBackend._fused_launch_config(
++        _make_cute_state(4), torch.empty((rows, hidden), dtype=torch.float32)
++    )
++    mode, single_cta, register_normalize, threads = geometry
++    assert mode == ("stage_remote_push" if rows <= 32 else "stage_pull")
++    if rows <= 32:
++        assert threads == 512
++        assert register_normalize
++        assert single_cta == (rows > 1)
++
++
+ @pytest.mark.parametrize(
+     ("world_size", "env_name", "shape"),
+     (
+@@ -716,12 +735,12 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
+         monkeypatch.delenv(name, raising=False)
+ 
+     assert not _uses_sharded_eager_storage(2)
+-    assert not _uses_sharded_eager_storage(4)
++    assert _uses_sharded_eager_storage(4)
+     assert _uses_sharded_eager_storage(8)
+     assert _eager_storage_shards(2) == 3
+-    assert _eager_storage_shards(4) == 1
++    assert _eager_storage_shards(4) == 4
+     assert _eager_storage_shards(8) == 8
+-    assert _transport_policy_contract() == (False, False, True, False, True)
++    assert _transport_policy_contract() == (False, False, True, True, True)
+ 
+     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+     monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")
+diff --git a/tests/experimental/b12x/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py b/tests/experimental/b12x/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py
+index 826b3097b01..af895af3ae6 100644
+--- a/tests/experimental/b12x/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py
++++ b/tests/experimental/b12x/comm/test_pcie_oneshot_fused_rmsnorm_gpu.py
+@@ -146,15 +146,33 @@ def geometry(node) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+     return worker
+ 
+ 
+-def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
++def _prepare_fused_execution(
++    channel,
++    inp,
++    residual,
++    weight,
++    epsilon,
++    *,
++    name,
++    output_dtype=None,
++    zero_centered=False,
++    reduction_dtype=None,
++):
+     """Build the real collective preparation request used by oneshot tests."""
++    out = torch.empty_like(inp, dtype=output_dtype or inp.dtype)
+     query = query_from_runtime(
+         channel,
+         surface="OneshotAllReducePool.all_reduce_fused_add_rms_norm",
+-        call={"inp": inp},
++        call={
++            "inp": inp,
++            "residual": residual,
++            "weight": weight,
++            "out": out,
++            "zero_centered": zero_centered,
++            "reduction_dtype": reduction_dtype,
++        },
+     )
+     declaration = oneshot_plan(query, runtime=channel)
+-    out = torch.empty_like(inp)
+     ranks = tuple(range(dist.get_world_size()))
+     collective = CollectiveRequirement(key=name, ranks=ranks)
+     original_residual = residual.clone()
+@@ -169,6 +187,7 @@ def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
+             out=out,
+             residual_out=residual,
+             epsilon=epsilon,
++            reset=lambda: residual.copy_(original_residual),
+         ),
+     )
+     session = PreparationSession(device=channel.device, autotune=False)
+@@ -182,6 +201,122 @@ def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
+     return session, result, declaration, out
+ 
+ 
++def _run_mixed_graphs(pool, device, rank):
++    """Alternate mixed-precision graphs on one IPC channel with in-place residuals."""
++    epsilon, hidden = 1e-6, 4096
++    channel_id = "graph:mixed-rmsnorm"
++    pool.prepare_channels((channel_id,))
++    cases = (
++        (torch.float32, torch.float32, torch.bfloat16, True, None),
++        (torch.float32, torch.float32, torch.bfloat16, True, torch.bfloat16),
++        (torch.bfloat16, torch.bfloat16, torch.bfloat16, True, None),
++        (torch.float16, torch.float32, torch.float16, False, None),
++    )
++    graphs, resources, failures = [], [], []
++    try:
++        for case, (dtype, weight_dtype, output_dtype, centered, rounding) in enumerate(
++            cases
++        ):
++            for rows in (1, 4, 7, 36):
++                inp, residual, weight = _make_inputs(rows, hidden, dtype, device, rank)
++                residual = residual.float()
++                weight = weight.to(weight_dtype)
++                options = {"zero_centered": centered, "reduction_dtype": rounding}
++                graph = torch.cuda.CUDAGraph(keep_graph=True)
++                with pool.capture(channel_id=channel_id) as channel:
++                    session, result, plan, out = _prepare_fused_execution(
++                        channel,
++                        inp,
++                        residual,
++                        weight,
++                        epsilon,
++                        name=f"mixed-rmsnorm:{case}:{rows}",
++                        output_dtype=output_dtype,
++                        **options,
++                    )
++                    resources.append((session, result))
++                    with torch.cuda.graph(graph):
++                        pool.all_reduce_fused_add_rms_norm(
++                            inp,
++                            residual,
++                            weight,
++                            epsilon,
++                            plan=plan,
++                            out=out,
++                            residual_out=residual,
++                            channel_id=channel_id,
++                            **options,
++                        )
++                _cuda_graph_kernel_chain(graph)
++                graphs.append((graph, inp, residual, weight, out, centered, rounding))
++
++        for iteration in range(3):
++            for graph, inp, residual, weight, out, centered, rounding in reversed(
++                graphs
++            ):
++                next_input, next_residual, _ = _make_inputs(
++                    inp.shape[0],
++                    hidden,
++                    inp.dtype,
++                    device,
++                    rank,
++                    iteration=iteration + 17,
++                )
++                inp.copy_(next_input)
++                residual.copy_(next_residual)
++                out.fill_(float("nan"))
++                reduced = inp.to(torch.float32, copy=True)
++                dist.all_reduce(reduced)
++                residual_bounds = None
++                if rounding is not None:
++                    reduced = reduced.to(rounding).float()
++                    sums = torch.stack((inp.double(), inp.double().abs()))
++                    dist.all_reduce(sums)
++                    steps = dist.get_world_size() - 1
++                    unit_roundoff = torch.finfo(torch.float32).eps / 2
++                    error = sums[1] * (
++                        steps * unit_roundoff / (1 - steps * unit_roundoff)
++                    )
++                    # Reduction orders can straddle a BF16 rounding midpoint.
++                    residual_bounds = tuple(
++                        residual + value.to(rounding).float()
++                        for value in (sums[0] - error, sums[0] + error)
++                    )
++                expected_residual = residual + reduced
++                expected = expected_residual * torch.rsqrt(
++                    expected_residual.square().mean(-1, keepdim=True) + epsilon
++                )
++                expected = (expected * (weight.float() + int(centered))).to(out.dtype)
++                allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
++                graph.replay()
++                torch.cuda.synchronize(device)
++                try:
++                    assert (
++                        torch.cuda.memory_stats(device)["allocation.all.allocated"]
++                        == allocated
++                    )
++                    torch.testing.assert_close(
++                        residual,
++                        expected_residual
++                        if residual_bounds is None
++                        else residual.clamp(*residual_bounds),
++                        rtol=2e-5,
++                        atol=2e-5,
++                    )
++                    torch.testing.assert_close(out, expected, rtol=8e-3, atol=8e-3)
++                except AssertionError as exc:
++                    failures.append(
++                        f"{inp.dtype}, rows={inp.shape[0]}, rounding={rounding}: {exc}"
++                    )
++        assert not failures, "\n".join(failures)
++    finally:
++        for graph, *_ in graphs:
++            graph.reset()
++        for session, result in resources:
++            result.close()
++            session.close()
++
++
+ def _run_eager(
+     pool: PCIeOneshotAllReducePool,
+     device: torch.device,
+@@ -312,7 +447,7 @@ def _run_graph(
+         )
+         or (
+             world_size == 4
+-            and os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
++            and os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "1") not in ("", "0")
+         )
+         or (
+             world_size == 8
+@@ -393,6 +528,7 @@ def _run_tp8_graph_mode_transition(
+     channel = pool.for_stream(stream, channel_id=channel_id)
+ 
+     calls = []
++    resources = []
+     modes = []
+     state = channel._ext._state(channel._ptr)
+     for rows, iteration in ((1, 41), (4, 43)):
+@@ -404,11 +540,18 @@ def _run_tp8_graph_mode_transition(
+             rank,
+             iteration=iteration,
+         )
+-        out = torch.empty_like(inp)
+-        calls.append((inp, residual, weight, out))
+         modes.append(_CuTeOneshotBackend._fused_launch_config(state, inp)[0])
+         with torch.cuda.stream(stream):
+-            channel.prepare_graph_fused_add_rms_norm(inp)
++            session, result, plan, out = _prepare_fused_execution(
++                channel,
++                inp,
++                residual,
++                weight,
++                epsilon,
++                name=f"transition:{rows}",
++            )
++        resources.append((session, result))
++        calls.append((inp, residual, weight, out, plan))
+     assert modes == ["stage_pull", "stage_tp8_owner"]
+ 
+     graph = torch.cuda.CUDAGraph(keep_graph=True)
+@@ -416,12 +559,13 @@ def _run_tp8_graph_mode_transition(
+         pool.capture(stream=stream, channel_id=channel_id),
+         torch.cuda.graph(graph, stream=stream),
+     ):
+-        for inp, residual, weight, out in calls:
++        for inp, residual, weight, out, plan in calls:
+             pool.all_reduce_fused_add_rms_norm(
+                 inp,
+                 residual,
+                 weight,
+                 epsilon,
++                plan=plan,
+                 out=out,
+                 residual_out=residual,
+                 stream=stream,
+@@ -430,7 +574,9 @@ def _run_tp8_graph_mode_transition(
+ 
+     for replay in range(3):
+         expected = []
+-        for rows, (inp, residual, weight, _out) in zip((1, 4), calls, strict=True):
++        for rows, (inp, residual, weight, _out, _plan) in zip(
++            (1, 4), calls, strict=True
++        ):
+             next_inp, next_residual, _ = _make_inputs(
+                 rows,
+                 hidden_size,
+@@ -445,15 +591,19 @@ def _run_tp8_graph_mode_transition(
+ 
+         graph.replay()
+         stream.synchronize()
+-        for (_inp, residual, _weight, out), (
++        for (_inp, residual, _weight, out, _plan), (
+             expected_out,
+             expected_residual,
+         ) in zip(calls, expected, strict=True):
+             _assert_close(out, expected_out, dtype)
+             _assert_close(residual, expected_residual, dtype)
++    graph.reset()
++    for session, result in resources:
++        result.close()
++        session.close()
+ 
+ 
+-def _worker(rank: int, world_size: int, port: int) -> None:
++def _worker(rank: int, world_size: int, port: int, mixed: bool) -> None:
+     torch.cuda.set_device(rank)
+     device = torch.device(f"cuda:{rank}")
+     dist.init_process_group(
+@@ -466,11 +616,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
+     pool = PCIeOneshotAllReducePool.from_process_group(
+         process_group=dist.group.WORLD,
+         device=device,
+-        max_input_bytes=128 * 1024,
+-        max_size=128 * 1024,
++        max_input_bytes=(1024 if mixed else 128) * 1024,
++        max_size=(1024 if mixed else 128) * 1024,
++        single_channel=mixed,
+         max_concurrent_channels=2,
+     )
+     try:
++        if mixed:
++            _run_mixed_graphs(pool, device, rank)
++            return
+         pool.prepare_channels(
+             (
+                 "eager:fused-rmsnorm",
+@@ -490,11 +644,12 @@ def _worker(rank: int, world_size: int, port: int) -> None:
+         dist.destroy_process_group()
+ 
+ 
+-def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
++@pytest.mark.parametrize("mixed", [False, True], ids=["same-dtype", "fp32-residual"])
++def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph(mixed) -> None:
+     if not torch.cuda.is_available():
+         pytest.skip("CUDA is not available")
+     world_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
+-    if world_size not in (2, 4, 6, 8, 10):
++    if world_size not in (2, 3, 4, 6, 8, 10):
+         pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
+     if torch.cuda.device_count() < world_size:
+         pytest.skip(
+@@ -502,7 +657,7 @@ def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
+         )
+     context = mp.spawn(
+         _worker,
+-        args=(world_size, _free_port()),
++        args=(world_size, _free_port(), mixed),
+         nprocs=world_size,
+         join=False,
+     )
+diff --git a/tests/experimental/b12x/comm/test_pcie_oneshot_torture.py b/tests/experimental/b12x/comm/test_pcie_oneshot_torture.py
+index b712a9d6542..2deb58cd853 100644
+--- a/tests/experimental/b12x/comm/test_pcie_oneshot_torture.py
++++ b/tests/experimental/b12x/comm/test_pcie_oneshot_torture.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import ctypes
++from contextlib import ExitStack
+ import os
+ import socket
+ 
+@@ -15,6 +16,13 @@
+     PCIeOneshotAllReducePool,
+     _tp2_plain_remote_push_enabled,
+ )
++from b12x.comm.pcie._oneshot_preparation import (
++    _prepare_fused_call,
++    _prepare_plain_call,
++    plan,
++    query_from_runtime,
++)
++from b12x.preparation import CollectiveRequirement, PreparationSession
+ from b12x.comm.pcie._oneshot_cute import (
+     _PLAIN_GRAPH_ARRIVED_OFFSET,
+     _PLAIN_GRAPH_EPOCH_OFFSET,
+@@ -93,8 +101,42 @@ def _read_local_u32(channel, source: int, stream: torch.cuda.Stream) -> int:
+     return value.value
+ 
+ 
++def _prepare_plan(prepared: ExitStack, channel, inp, out, **fused):
++    surface = (
++        "OneshotAllReduce.all_reduce_fused_add_rms_norm"
++        if fused
++        else "OneshotAllReduce.all_reduce"
++    )
++    query = query_from_runtime(channel, surface=surface, call={"inp": inp})
++    declaration = plan(query, runtime=channel)
++    collective = CollectiveRequirement(
++        key=surface, ranks=tuple(range(channel.world_size))
++    )
++    session = prepared.enter_context(
++        PreparationSession(device=inp.device, autotune=False)
++    )
++    prepare_call = _prepare_fused_call if fused else _prepare_plain_call
++    request = declaration.request(
++        name=surface,
++        collective=collective,
++        prepare_call=lambda state: prepare_call(state, inp=inp, out=out, **fused),
++    )
++    result = session.prepare(
++        (request,),
++        coordinator=lambda progress: (
++            collective.key if progress.ready_collectives else None
++        ),
++    )
++    prepared.enter_context(result)
++    return declaration
++
++
+ def _run_eager(
+-    pool: PCIeOneshotAllReducePool, device: torch.device, rank: int, world_size: int
++    pool: PCIeOneshotAllReducePool,
++    device: torch.device,
++    rank: int,
++    world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     remote_push = _tp2_plain_remote_push_active(world_size)
+     dtypes = (
+@@ -113,14 +155,18 @@ def _run_eager(
+     )
+     rank_sum = _rank_sum(world_size)
+ 
++    channel = pool.for_stream(channel_id="eager:default")
+     for dtype in dtypes:
+         for shape in shapes:
+             inp = torch.empty(shape, device=device, dtype=dtype)
+             out = torch.empty_like(inp)
++            declaration = _prepare_plan(prepared, channel, inp, out)
+             for iteration in range(TORTURE_EAGER_ITERS):
+                 base = float((iteration % 64) * 3)
+                 inp.fill_(base + rank)
+-                pool.all_reduce(inp, out=out, channel_id="eager:default")
++                pool.all_reduce(
++                    inp, plan=declaration, out=out, channel_id="eager:default"
++                )
+                 torch.cuda.synchronize(device)
+                 _assert_constant(out, world_size * base + rank_sum)
+ 
+@@ -130,6 +176,7 @@ def _run_graph_scratch_reuse(
+     device: torch.device,
+     rank: int,
+     world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     stream = torch.cuda.Stream(device=device)
+     rank_sum = _rank_sum(world_size)
+@@ -150,11 +197,11 @@ def fill_sources(iteration: int) -> None:
+     graph = torch.cuda.CUDAGraph()
+     with pool.capture(stream, channel_id="graph:torture") as graph_channel:
+         with torch.cuda.stream(stream):
+-            graph_channel.prepare_graph_all_reduce(scratch)
++            declaration = _prepare_plan(prepared, graph_channel, scratch, outs[0])
+         with torch.cuda.graph(graph, stream=stream):
+             for layer in range(layers):
+                 scratch.copy_(sources[layer])
+-                graph_channel.all_reduce(scratch, out=outs[layer])
++                graph_channel.all_reduce(scratch, plan=declaration, out=outs[layer])
+     stream.synchronize()
+ 
+     for iteration in range(TORTURE_GRAPH_REPLAYS):
+@@ -210,11 +257,12 @@ def _run_multistream(
+     device: torch.device,
+     rank: int,
+     world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     stream_a = torch.cuda.Stream(device=device)
+     stream_b = torch.cuda.Stream(device=device)
+-    pool.for_stream(stream_a, channel_id="eager:a")
+-    pool.for_stream(stream_b, channel_id="eager:b")
++    channel_a = pool.for_stream(stream_a, channel_id="eager:a")
++    channel_b = pool.for_stream(stream_b, channel_id="eager:b")
+     rank_sum = _rank_sum(world_size)
+ 
+     remote_push = _tp2_plain_remote_push_active(world_size)
+@@ -225,15 +273,20 @@ def _run_multistream(
+     inp_b = torch.empty(shape_b, device=device, dtype=torch.bfloat16)
+     out_b = torch.empty_like(inp_b)
+ 
++    with torch.cuda.stream(stream_a):
++        plan_a = _prepare_plan(prepared, channel_a, inp_a, out_a)
++    with torch.cuda.stream(stream_b):
++        plan_b = _prepare_plan(prepared, channel_b, inp_b, out_b)
++
+     for iteration in range(TORTURE_MULTISTREAM_ITERS):
+         base_a = float(iteration % 64)
+         base_b = float(100 + (iteration % 64) * 2)
+         with torch.cuda.stream(stream_a):
+             inp_a.fill_(base_a + rank)
+-            pool.all_reduce(inp_a, out=out_a, channel_id="eager:a")
++            pool.all_reduce(inp_a, plan=plan_a, out=out_a, channel_id="eager:a")
+         with torch.cuda.stream(stream_b):
+             inp_b.fill_(base_b + rank)
+-            pool.all_reduce(inp_b, out=out_b, channel_id="eager:b")
++            pool.all_reduce(inp_b, plan=plan_b, out=out_b, channel_id="eager:b")
+         stream_a.synchronize()
+         stream_b.synchronize()
+         _assert_constant(out_a, world_size * base_a + rank_sum)
+@@ -245,6 +298,7 @@ def _run_tp2_mixed_protocol_reuse(
+     device: torch.device,
+     rank: int,
+     world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     """Alternate pull, fused, and peer-push protocols on one eager channel."""
+ 
+@@ -255,33 +309,54 @@ def _run_tp2_mixed_protocol_reuse(
+     rank_sum = _rank_sum(world_size)
+ 
+     pull_input = torch.full((1, 6144), 11.0 + rank, device=device, dtype=torch.bfloat16)
+-    pull_output = pool.all_reduce(pull_input, channel_id=channel_id)
++    pull_output = torch.empty_like(pull_input)
++    pull_plan = _prepare_plan(prepared, channel, pull_input, pull_output)
++    pool.all_reduce(pull_input, plan=pull_plan, out=pull_output, channel_id=channel_id)
+     torch.cuda.synchronize(device)
+     _assert_constant(pull_output, world_size * 11.0 + rank_sum)
+ 
+     fp32_input = torch.full((2048,), 13.0 + rank, device=device, dtype=torch.float32)
+-    fp32_output = pool.all_reduce(fp32_input, channel_id=channel_id)
++    fp32_output = torch.empty_like(fp32_input)
++    fp32_plan = _prepare_plan(prepared, channel, fp32_input, fp32_output)
++    pool.all_reduce(fp32_input, plan=fp32_plan, out=fp32_output, channel_id=channel_id)
+     torch.cuda.synchronize(device)
+     _assert_constant(fp32_output, world_size * 13.0 + rank_sum)
+ 
+     push_input = torch.full((1, 4096), 17.0 + rank, device=device, dtype=torch.bfloat16)
+-    push_output = pool.all_reduce(push_input, channel_id=channel_id)
++    push_output = torch.empty_like(push_input)
++    push_plan = _prepare_plan(prepared, channel, push_input, push_output)
++    pool.all_reduce(push_input, plan=push_plan, out=push_output, channel_id=channel_id)
+     torch.cuda.synchronize(device)
+     _assert_constant(push_output, world_size * 17.0 + rank_sum)
+ 
+     residual = torch.full_like(push_input, 0.25)
+     weight = torch.ones(4096, device=device, dtype=torch.bfloat16)
++    fused_out = torch.empty_like(push_input)
++    residual_out = torch.empty_like(residual)
++    fused_plan = _prepare_plan(
++        prepared,
++        channel,
++        push_input,
++        fused_out,
++        residual=residual,
++        weight=weight,
++        residual_out=residual_out,
++        epsilon=1e-6,
++    )
+     pool.all_reduce_fused_add_rms_norm(
+         push_input,
+         residual,
+         weight,
+         1e-6,
++        plan=fused_plan,
++        out=fused_out,
++        residual_out=residual_out,
+         channel_id=channel_id,
+     )
+     torch.cuda.synchronize(device)
+ 
+     push_input.fill_(23.0 + rank)
+-    push_output = pool.all_reduce(push_input, channel_id=channel_id)
++    pool.all_reduce(push_input, plan=push_plan, out=push_output, channel_id=channel_id)
+     torch.cuda.synchronize(device)
+     _assert_constant(push_output, world_size * 23.0 + rank_sum)
+ 
+@@ -298,6 +373,7 @@ def _run_tp2_payload_patterns(
+     device: torch.device,
+     rank: int,
+     world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     """Exercise peer-push publication with zeros and lane-varying payloads."""
+ 
+@@ -315,7 +391,10 @@ def _run_tp2_payload_patterns(
+             patterns.append(pattern.to(torch.bfloat16).view(4, 4096))
+         inp = patterns[rank]
+         expected = patterns[0] + patterns[1]
+-        pool.all_reduce(inp, out=output, channel_id="eager:default")
++        if iteration == 0:
++            channel = pool.for_stream(channel_id="eager:default")
++            declaration = _prepare_plan(prepared, channel, inp, output)
++        pool.all_reduce(inp, plan=declaration, out=output, channel_id="eager:default")
+         torch.cuda.synchronize(device)
+         assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+ 
+@@ -325,6 +404,7 @@ def _run_tp2_graph_payload_patterns(
+     device: torch.device,
+     rank: int,
+     world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     """Validate every qualified graph geometry with arbitrary payload bits."""
+ 
+@@ -352,14 +432,16 @@ def _run_tp2_graph_payload_patterns(
+         source.zero_()
+     with pool.capture(stream, channel_id="graph:payload") as graph_channel:
+         with torch.cuda.stream(stream):
+-            for scratch in scratches:
+-                graph_channel.prepare_graph_all_reduce(scratch)
++            declarations = [
++                _prepare_plan(prepared, graph_channel, scratch, output)
++                for scratch, output in zip(scratches, outputs, strict=True)
++            ]
+         with torch.cuda.graph(graph, stream=stream):
+-            for source, scratch, output in zip(
+-                sources, scratches, outputs, strict=True
++            for source, scratch, output, declaration in zip(
++                sources, scratches, outputs, declarations, strict=True
+             ):
+                 scratch.copy_(source)
+-                graph_channel.all_reduce(scratch, out=output)
++                graph_channel.all_reduce(scratch, plan=declaration, out=output)
+     stream.synchronize()
+ 
+     for iteration in range(TORTURE_PAYLOAD_ITERS):
+@@ -395,6 +477,7 @@ def _run_tp2_graph_weak_contiguous_storage(
+     device: torch.device,
+     rank: int,
+     world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     """Validate graph peer-push over a dense, non-contiguous logical view."""
+ 
+@@ -408,10 +491,10 @@ def _run_tp2_graph_weak_contiguous_storage(
+     graph = torch.cuda.CUDAGraph()
+     with pool.capture(stream, channel_id="graph:weak-contiguous") as graph_channel:
+         with torch.cuda.stream(stream):
+-            graph_channel.prepare_graph_all_reduce(scratch)
++            declaration = _prepare_plan(prepared, graph_channel, scratch, output)
+         with torch.cuda.graph(graph, stream=stream):
+             scratch.copy_(source)
+-            graph_channel.all_reduce(scratch, out=output)
++            graph_channel.all_reduce(scratch, plan=declaration, out=output)
+     stream.synchronize()
+ 
+     lane = torch.arange(source.numel(), device=device, dtype=torch.float32).view_as(
+@@ -437,6 +520,7 @@ def _run_tp2_graph_generation_wrap(
+     device: torch.device,
+     rank: int,
+     world_size: int,
++    prepared: ExitStack,
+ ) -> None:
+     """Replay the peer-push kernel across uint32 generation wraparound."""
+ 
+@@ -450,10 +534,10 @@ def _run_tp2_graph_generation_wrap(
+ 
+     with pool.capture(stream, channel_id="graph:wrap") as graph_channel:
+         with torch.cuda.stream(stream):
+-            graph_channel.prepare_graph_all_reduce(scratch)
++            declaration = _prepare_plan(prepared, graph_channel, scratch, output)
+         with torch.cuda.graph(graph, stream=stream):
+             scratch.copy_(source)
+-            graph_channel.all_reduce(scratch, out=output)
++            graph_channel.all_reduce(scratch, plan=declaration, out=output)
+     stream.synchronize()
+ 
+     backend_state = graph_channel._ext._state(graph_channel._ptr)
+@@ -533,15 +617,17 @@ def _graph_payload_worker(rank: int, world_size: int, port: int) -> None:
+         max_input_bytes=TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
+         max_concurrent_channels=2,
+     )
++    prepared = ExitStack()
+     try:
+         pool.prepare_channels(("graph:payload", "graph:weak-contiguous", "graph:wrap"))
+-        _run_tp2_graph_payload_patterns(pool, device, rank, world_size)
++        _run_tp2_graph_payload_patterns(pool, device, rank, world_size, prepared)
+         dist.barrier()
+-        _run_tp2_graph_weak_contiguous_storage(pool, device, rank, world_size)
++        _run_tp2_graph_weak_contiguous_storage(pool, device, rank, world_size, prepared)
+         dist.barrier()
+-        _run_tp2_graph_generation_wrap(pool, device, rank, world_size)
++        _run_tp2_graph_generation_wrap(pool, device, rank, world_size, prepared)
+         torch.cuda.synchronize(device)
+     finally:
++        prepared.close()
+         pool.close()
+         dist.destroy_process_group()
+ 
+@@ -565,6 +651,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
+         ),
+         max_concurrent_channels=2,
+     )
++    prepared = ExitStack()
+     try:
+         pool.prepare_channels(
+             (
+@@ -574,17 +661,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
+                 "graph:torture",
+             )
+         )
+-        _run_eager(pool, device, rank, world_size)
++        _run_eager(pool, device, rank, world_size, prepared)
+         dist.barrier()
+-        _run_tp2_mixed_protocol_reuse(pool, device, rank, world_size)
++        _run_tp2_mixed_protocol_reuse(pool, device, rank, world_size, prepared)
+         dist.barrier()
+-        _run_tp2_payload_patterns(pool, device, rank, world_size)
++        _run_tp2_payload_patterns(pool, device, rank, world_size, prepared)
+         dist.barrier()
+-        _run_graph_scratch_reuse(pool, device, rank, world_size)
++        _run_graph_scratch_reuse(pool, device, rank, world_size, prepared)
+         dist.barrier()
+-        _run_multistream(pool, device, rank, world_size)
++        _run_multistream(pool, device, rank, world_size, prepared)
+         torch.cuda.synchronize(device)
+     finally:
++        prepared.close()
+         pool.close()
+         dist.destroy_process_group()
+ 
+@@ -594,8 +682,8 @@ def test_pcie_oneshot_eager_graph_and_multistream_torture():
+         pytest.skip("CUDA is not available")
+     available = torch.cuda.device_count()
+     requested = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
+-    if requested not in (2, 4, 6, 8, 10):
+-        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
++    if requested not in (2, 3, 4, 6, 8, 10):
++        pytest.skip("PCIe oneshot only supports world sizes 2, 3, 4, 6, 8, and 10")
+     if available < requested:
+         pytest.skip(f"need {requested} CUDA devices, found {available}")
+     mp.spawn(_worker, args=(requested, _free_port()), nprocs=requested, join=True)
+@@ -642,6 +730,7 @@ def _shape_growth_wrap_worker(
+     )
+     stream = torch.cuda.Stream(device=device)
+     graphs, inputs, outputs = [], [], []
++    prepared = ExitStack()
+     try:
+         for rows in (1, 4):
+             source = torch.full(
+@@ -654,10 +743,10 @@ def _shape_growth_wrap_worker(
+             stream.wait_stream(torch.cuda.current_stream(device))
+             with pool.capture(stream) as channel:
+                 with torch.cuda.stream(stream):
+-                    channel.prepare_graph_all_reduce(source)
++                    declaration = _prepare_plan(prepared, channel, source, output)
+                 graph = torch.cuda.CUDAGraph()
+                 with torch.cuda.graph(graph, stream=stream):
+-                    channel.all_reduce(source, out=output)
++                    channel.all_reduce(source, plan=declaration, out=output)
+             stream.synchronize()
+             graphs.append(graph)
+             inputs.append(source)
+@@ -718,6 +807,7 @@ def _shape_growth_wrap_worker(
+     finally:
+         for graph in graphs:
+             graph.reset()
++        prepared.close()
+         pool.close()
+         dist.destroy_process_group()
+ 
+@@ -733,3 +823,118 @@ def test_tp2_graph_rollover_clears_unused_shape_capacity(dtype_name, retained_ta
+         nprocs=2,
+         join=True,
+     )
++
++
++def _prepared_plain_worker(rank: int, world_size: int, port: int) -> None:
++    from b12x.comm.pcie._oneshot_preparation import (
++        _prepare_plain_call,
++        plan,
++        query_from_runtime,
++    )
++    from b12x.preparation import CollectiveRequirement, PreparationSession
++
++    torch.cuda.set_device(rank)
++    device = torch.device("cuda", rank)
++    dist.init_process_group(
++        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
++    )
++    pool = PCIeOneshotAllReducePool.from_process_group(
++        process_group=dist.group.WORLD,
++        device=device,
++        max_input_bytes=4096 * 2560 * 4,
++        max_size=4096 * 2560 * 4,
++        max_concurrent_channels=1,
++    )
++    streams = []
++    try:
++        pool.prepare_channels(
++            tuple(
++                f"prepared:{dtype}:{elements}"
++                for dtype in (torch.float16, torch.bfloat16, torch.float32)
++                for elements in (8, 4096, 32768, 4096 * 2560)
++            )
++        )
++        for dtype in (torch.float16, torch.bfloat16, torch.float32):
++            for elements in (8, 4096, 32768, 4096 * 2560):
++                stream = torch.cuda.Stream(device=device)
++                streams.append(stream)
++                with torch.cuda.stream(stream):
++                    inp = torch.full(
++                        (elements,), float(rank), dtype=dtype, device=device
++                    )
++                    out = torch.empty_like(inp)
++                    channel_id = f"prepared:{dtype}:{elements}"
++                    channel = pool.for_stream(channel_id=channel_id)
++                    query = query_from_runtime(
++                        channel,
++                        surface="OneshotAllReducePool.all_reduce",
++                        call={"inp": inp},
++                    )
++                    declaration = plan(query, runtime=channel)
++                    collective = CollectiveRequirement(
++                        key=channel_id, ranks=tuple(range(world_size))
++                    )
++                    with PreparationSession(device=device, autotune=False) as session:
++                        request = declaration.request(
++                            name=channel_id,
++                            collective=collective,
++                            prepare_call=lambda state: _prepare_plain_call(
++                                state, inp=inp, out=out
++                            ),
++                        )
++                        result = session.prepare(
++                            (request,),
++                            coordinator=lambda progress: (
++                                collective.key if progress.ready_collectives else None
++                            ),
++                        )
++                        with result:
++                            for iteration in range(16):
++                                inp.fill_(rank + iteration)
++                                pool.all_reduce(
++                                    inp,
++                                    plan=declaration,
++                                    out=out,
++                                    channel_id=channel_id,
++                                )
++                                torch.cuda.synchronize(device)
++                                _assert_constant(
++                                    out, _rank_sum(world_size) + world_size * iteration
++                                )
++                            graph = torch.cuda.CUDAGraph()
++                            with pool.capture(channel_id=channel_id):
++                                with torch.cuda.graph(graph):
++                                    pool.all_reduce(
++                                        inp,
++                                        plan=declaration,
++                                        out=out,
++                                        channel_id=channel_id,
++                                    )
++                            with kernel_resolution_guard(
++                                "prepared TP3 plain all-reduce replay"
++                            ):
++                                for iteration in range(16):
++                                    inp.fill_(rank - iteration)
++                                    out.fill_(float("nan"))
++                                    graph.replay()
++                                    torch.cuda.synchronize(device)
++                                    _assert_constant(
++                                        out,
++                                        _rank_sum(world_size) - world_size * iteration,
++                                    )
++                    dist.barrier()
++    finally:
++        pool.close()
++        dist.destroy_process_group()
++
++
++def test_pcie_oneshot_prepared_plain_eager_and_graph():
++    world_size = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
++    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
++        pytest.skip(f"requires {world_size} CUDA devices")
++    mp.spawn(
++        _prepared_plain_worker,
++        args=(world_size, _free_port()),
++        nprocs=world_size,
++        join=True,
++    )
+diff --git a/tests/experimental/b12x/comm/test_pcie_preparation_compile.py b/tests/experimental/b12x/comm/test_pcie_preparation_compile.py
+index 8a2d584ebc3..123eeec1c39 100644
+--- a/tests/experimental/b12x/comm/test_pcie_preparation_compile.py
++++ b/tests/experimental/b12x/comm/test_pcie_preparation_compile.py
+@@ -16,6 +16,51 @@
+ from b12x.preparation import FrozenMapping
+ 
+ 
++@pytest.mark.parametrize(
++    "factory,args",
++    [
++        ("get_oneshot_launcher", ("bfloat16", 2, 0, True, False, 0, "pull", 256, 0)),
++        (
++            "get_fused_oneshot_launcher",
++            ("bfloat16", 2, 0, "stage_pull", False, False, False, 0, 256, 0),
++        ),
++    ],
++)
++def test_oneshot_planning_memo_is_evicted_before_in_process_compile(
++    monkeypatch, factory, args
++):
++    from b12x._lib.compile_plan import (
++        DeferredCuTeKernel,
++        ProgramKey,
++        evict_planning_artifacts,
++    )
++    from b12x.comm.pcie import _oneshot_cute as kernels
++
++    program = ProgramKey("cute", f"test-{factory}")
++    deferred = DeferredCuTeKernel(program, ("test", factory))
++    compiled = Mock(__b12x_programs__=(program,), __b12x_dependencies__=())
++    compile_kernel = Mock(side_effect=(deferred, compiled))
++    monkeypatch.setattr(kernels, "b12x_compile", compile_kernel)
++    monkeypatch.setattr(kernels, "make_ptr", lambda *args, **kwargs: 0)
++    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
++    monkeypatch.setattr(
++        kernels, "raise_if_kernel_resolution_frozen", lambda *args, **kwargs: None
++    )
++    launcher = getattr(kernels, factory)
++    launcher.cache_clear()
++    try:
++        planned = launcher(*args)
++        assert launcher(*args) is planned
++        assert compile_kernel.call_count == 1
++        evict_planning_artifacts((program,))
++        ready = launcher(*args)
++        assert ready is not planned
++        assert ready.__b12x_dependencies__ == (compiled,)
++        assert compile_kernel.call_count == 2
++    finally:
++        launcher.cache_clear()
++
++
+ @pytest.mark.parametrize("world", [9, 10, 12])
+ @pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+ @pytest.mark.parametrize("operation", ["all_gather_heads", "lse_reduce_scatter"])
+@@ -204,3 +249,44 @@ def test_dcp_compile_factory_retains_eager_and_graph_programs(operation):
+     launchers = compile_dcp_surface(payload, ordinal)
+     assert set(program_keys(launchers)) == set(description.programs)
+     load_programs(launchers)
++
++
++def test_dcp_materialization_resolves_graph_program_before_capture(monkeypatch):
++    from types import SimpleNamespace
++
++    from b12x._lib import compiler
++    from b12x._lib.compile_plan import DeferredCuTeKernel, ProgramKey
++    from b12x._lib.runtime_control import kernel_resolution_guard
++    from b12x.comm.pcie import _dcp_preparation as preparation
++
++    kernels = {
++        slot: DeferredCuTeKernel(
++            ProgramKey("cute", f"dcp-materialize-{slot}"), ("dcp", slot)
++        )
++        for slot in (False, True)
++    }
++    monkeypatch.setattr(preparation, "compile_dcp_surface", lambda *args: kernels)
++    monkeypatch.setattr(compiler, "_memory_cache_get", lambda key: None)
++    monkeypatch.setattr(compiler, "_memory_cache_put", lambda *args: None)
++    loaded = []
++
++    def load(key):
++        loaded.append(key)
++        return lambda: key
++
++    monkeypatch.setattr(compiler, "_load_cute_compile_from_disk", load)
++    query = PcieQuery(
++        surface="DcpAllToAll.all_gather_heads",
++        world_size=2,
++        rank=0,
++        topology="pcie_ipc",
++        call=FrozenMapping(),
++        setup=FrozenMapping(),
++    )
++    runtime = SimpleNamespace(rank=0, world_size=2, device=torch.device("cuda:0"))
++    declaration = preparation.plan(query, runtime=runtime)
++    state = declaration._materialize(None, SimpleNamespace(ordinal=0))
++    with kernel_resolution_guard("prepared capture"):
++        assert state.launcher(False)() == "dcp-materialize-False"
++        assert state.launcher(True)() == "dcp-materialize-True"
++    assert len(loaded) == 2

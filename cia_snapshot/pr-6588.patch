@@ -1,0 +1,286 @@
+diff --git a/include/flashinfer/attention/cascade.cuh b/include/flashinfer/attention/cascade.cuh
+index 71ee5b7aee0..8984c9ebeea 100644
+--- a/include/flashinfer/attention/cascade.cuh
++++ b/include/flashinfer/attention/cascade.cuh
+@@ -48,7 +48,8 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__
+                                  uint32_t num_heads, uint32_t head_dim) {
+   uint32_t tx = threadIdx.x, ty = threadIdx.y;
+   uint32_t pos = blockIdx.x;
+-  uint32_t head_idx = ty;
++  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
++  if (head_idx >= num_heads) return;
+ 
+   float s_a_val = s_a[pos * num_heads + head_idx];
+   float s_b_val = s_b[pos * num_heads + head_idx];
+@@ -96,7 +97,8 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
+   if (mask != nullptr && mask[pos] == 0) return;
+ 
+   uint32_t tx = threadIdx.x, ty = threadIdx.y;
+-  uint32_t head_idx = ty;
++  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
++  if (head_idx >= num_heads) return;
+ 
+   float s_val = s[pos * num_heads + head_idx];
+   float s_other_val = s_other[pos * num_heads + head_idx];
+@@ -184,7 +186,8 @@ __global__ void AttentionSumKernel(DTypeIn* __restrict__ V, DTypeO* __restrict__
+                                    uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
+   uint32_t tx = threadIdx.x, ty = threadIdx.y;
+   uint32_t pos = blockIdx.x;
+-  uint32_t head_idx = ty;
++  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
++  if (head_idx >= num_heads) return;
+ 
+   if (num_index_sets == 0) {
+     vec_t<DTypeO, vec_size> v;
+@@ -222,7 +225,8 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
+                                   uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
+   uint32_t tx = threadIdx.x, ty = threadIdx.y;
+   uint32_t pos = blockIdx.x;
+-  uint32_t head_idx = ty;
++  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
++  if (head_idx >= num_heads) return;
+ 
+   if (num_index_sets == 0) {
+     vec_t<DTypeO, vec_size> v;
+@@ -558,6 +562,15 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
+ #endif
+ }
+ 
++/*!
++ * \brief blockDim.y for the merge kernels that map each head to one row of bdx threads.
++ * \note Heads beyond one block are tiled over gridDim.y, so bdx * bdy stays within the
++ *   1024-thread block limit (e.g. more than 64 heads of dim 128 in a 16-bit type).
++ */
++inline uint32_t merge_heads_per_block(uint32_t bdx, uint32_t num_heads) {
++  return std::max(1U, std::min(num_heads, 1024U / bdx));
++}
++
+ /*!
+  * \brief Merge the self-attention state of two index sets A and B.
+  * \tparam DTypeIn The data type of v_a and v_b.
+@@ -582,8 +595,8 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
+   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+     uint32_t bdx = HEAD_DIM / vec_size;
+-    uint32_t bdy = num_heads;
+-    dim3 nblks(seq_len);
++    uint32_t bdy = merge_heads_per_block(bdx, num_heads);
++    dim3 nblks(seq_len, ceil_div(num_heads, bdy));
+     dim3 nthrs(bdx, bdy);
+     auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeO>;
+     void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &s_merged, &num_heads, &head_dim};
+@@ -614,8 +627,8 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
+   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+     constexpr uint32_t vec_size = std::max(16U / sizeof(DType), HEAD_DIM / 32U);
+     uint32_t bdx = HEAD_DIM / vec_size;
+-    uint32_t bdy = num_heads;
+-    dim3 nblks(seq_len);
++    uint32_t bdy = merge_heads_per_block(bdx, num_heads);
++    dim3 nblks(seq_len, ceil_div(num_heads, bdy));
+     dim3 nthrs(bdx, bdy);
+     auto kernel = MergeStateInPlaceKernel<vec_size, DType>;
+     void* args[] = {&v, &s, &v_other, &s_other, &mask, &num_heads, &head_dim};
+@@ -662,8 +675,8 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
+           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+     } else {
+-      uint32_t bdy = num_heads;
+-      dim3 nblks(seq_len);
++      uint32_t bdy = merge_heads_per_block(bdx, num_heads);
++      dim3 nblks(seq_len, ceil_div(num_heads, bdy));
+       dim3 nthrs(bdx, bdy);
+       auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeO>;
+       void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
+@@ -679,8 +692,8 @@ cudaError_t AttentionSum(DTypeIn* v, DTypeO* v_sum, uint32_t num_index_sets, uin
+   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+     constexpr uint32_t bdx = HEAD_DIM / vec_size;
+-    uint32_t bdy = num_heads;
+-    dim3 nblks(seq_len);
++    uint32_t bdy = merge_heads_per_block(bdx, num_heads);
++    dim3 nblks(seq_len, ceil_div(num_heads, bdy));
+     dim3 nthrs(bdx, bdy);
+     auto kernel = AttentionSumKernel<vec_size, DTypeIn, DTypeO>;
+     void* args[] = {&v, &v_sum, &num_index_sets, &num_heads, &head_dim};
+diff --git a/tests/attention/test_merge_state_many_heads.py b/tests/attention/test_merge_state_many_heads.py
+new file mode 100644
+index 00000000000..1119b9e49fe
+--- /dev/null
++++ b/tests/attention/test_merge_state_many_heads.py
+@@ -0,0 +1,118 @@
++"""Merge kernels that give each head its own row of threads must handle more heads than
++one block can hold.
++
++MergeState, MergeStateInPlace, MergeStates (``num_index_sets < seq_len``) and
++AttentionSum launch ``head_dim / vec_size`` threads per head. Past 1024 threads per
++block (e.g. more than 64 heads of dim 128 in a 16-bit type) the launch failed with
++"invalid configuration argument", which also broke the split-KV path of single prefill.
++"""
++
++import math
++
++import pytest
++import torch
++
++import flashinfer
++from tests.test_helpers.test_helpers import ref_single_prefill
++
++# (head_dim, num_heads); the smaller count per head_dim is the largest that fit in one
++# block before heads were tiled over gridDim.y.
++HEAD_CONFIGS = [
++    (64, 128),
++    (64, 160),
++    (128, 64),
++    (128, 96),
++    (128, 128),
++    (256, 32),
++    (256, 64),
++    (512, 32),
++    (512, 48),
++]
++
++
++def ref_merge_state(v_a, s_a, v_b, s_b):
++    s_merged = torch.logaddexp2(s_a, s_b)
++    w_a = torch.exp2(s_a - s_merged).unsqueeze(-1)
++    w_b = torch.exp2(s_b - s_merged).unsqueeze(-1)
++    return w_a * v_a.float() + w_b * v_b.float(), s_merged
++
++
++def ref_merge_states(v, s):
++    s_merged = torch.logsumexp(s * math.log(2.0), dim=1) / math.log(2.0)
++    w = torch.exp2(s - s_merged.unsqueeze(1)).unsqueeze(-1)
++    return (w * v.float()).sum(dim=1), s_merged
++
++
++def _rand_state(*shape, dtype):
++    v = torch.randn(*shape, dtype=dtype, device="cuda")
++    s = torch.randn(*shape[:-1], dtype=torch.float32, device="cuda")
++    return v, s
++
++
++@pytest.mark.parametrize("head_dim,num_heads", HEAD_CONFIGS)
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++def test_merge_state_many_heads(head_dim, num_heads, dtype):
++    torch.manual_seed(0)
++    seq_len = 17
++    v_a, s_a = _rand_state(seq_len, num_heads, head_dim, dtype=dtype)
++    v_b, s_b = _rand_state(seq_len, num_heads, head_dim, dtype=dtype)
++
++    v, s = flashinfer.merge_state(v_a, s_a, v_b, s_b)
++
++    v_ref, s_ref = ref_merge_state(v_a, s_a, v_b, s_b)
++    torch.testing.assert_close(v.float(), v_ref, rtol=2e-2, atol=2e-2)
++    torch.testing.assert_close(s, s_ref, rtol=1e-3, atol=1e-3)
++
++
++@pytest.mark.parametrize("head_dim,num_heads", HEAD_CONFIGS)
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++def test_merge_state_in_place_many_heads(head_dim, num_heads, dtype):
++    torch.manual_seed(0)
++    seq_len = 17
++    v, s = _rand_state(seq_len, num_heads, head_dim, dtype=dtype)
++    v_other, s_other = _rand_state(seq_len, num_heads, head_dim, dtype=dtype)
++    mask = torch.arange(seq_len, device="cuda") % 3 != 0
++    v_orig, s_orig = v.clone(), s.clone()
++
++    flashinfer.merge_state_in_place(v, s, v_other, s_other, mask=mask)
++
++    v_ref, s_ref = ref_merge_state(v_orig, s_orig, v_other, s_other)
++    torch.testing.assert_close(v[mask].float(), v_ref[mask], rtol=2e-2, atol=2e-2)
++    torch.testing.assert_close(s[mask], s_ref[mask], rtol=1e-3, atol=1e-3)
++    # Masked-out positions stay untouched.
++    torch.testing.assert_close(v[~mask], v_orig[~mask], rtol=0, atol=0)
++    torch.testing.assert_close(s[~mask], s_orig[~mask], rtol=0, atol=0)
++
++
++# seq_len > num_index_sets takes the per-position MergeStatesKernel; the other case takes
++# MergeStatesLargeNumIndexSetsKernel, which already tiled heads over the grid.
++@pytest.mark.parametrize("seq_len,num_index_sets", [(17, 3), (3, 17)])
++@pytest.mark.parametrize("head_dim,num_heads", HEAD_CONFIGS)
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++def test_merge_states_many_heads(seq_len, num_index_sets, head_dim, num_heads, dtype):
++    torch.manual_seed(0)
++    v, s = _rand_state(seq_len, num_index_sets, num_heads, head_dim, dtype=dtype)
++
++    v_merged, s_merged = flashinfer.merge_states(v, s)
++
++    v_ref, s_ref = ref_merge_states(v, s)
++    torch.testing.assert_close(v_merged.float(), v_ref, rtol=2e-2, atol=2e-2)
++    torch.testing.assert_close(s_merged, s_ref, rtol=1e-3, atol=1e-3)
++
++
++# A short query over few KV heads with a large GQA group leaves SMs idle, so single
++# prefill splits the KV range and merges the partial states with MergeStates over
++# (qo_len, num_qo_heads); qo_len > num_chunks selects the per-position kernel.
++@pytest.mark.parametrize("head_dim,num_qo_heads", [(128, 128), (256, 64)])
++@pytest.mark.parametrize("qo_len", [16, 48])
++def test_single_prefill_split_kv_many_heads(head_dim, num_qo_heads, qo_len):
++    torch.manual_seed(0)
++    num_kv_heads, kv_len = 8, 4096
++    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.bfloat16, device="cuda")
++    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
++    v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
++
++    o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False)
++
++    o_ref, _ = ref_single_prefill(q, k, v, causal=False)
++    torch.testing.assert_close(o.float(), o_ref.float(), rtol=2e-2, atol=2e-2)
+diff --git a/tests/utils/test_jit_example.py b/tests/utils/test_jit_example.py
+index e3b9b9f8880..25f8acc0294 100644
+--- a/tests/utils/test_jit_example.py
++++ b/tests/utils/test_jit_example.py
+@@ -135,7 +135,14 @@ def test_single_decode_mask():
+ """
+ 
+ 
+-def test_flash_sigmoid():
++# The second shape makes single prefill split the KV range; FlashSigmoid has no softmax,
++# so the partial outputs are combined by AttentionSum over 128 query heads. Its outputs sum
++# 4096 sigmoid-weighted values (|o| ~ 30), so the fp16 partials differ by a few ulp there.
++@pytest.mark.parametrize(
++    "qo_len,num_qo_heads,num_kv_heads,kv_len,atol",
++    [(128, 8, 8, 1027, 2e-2), (32, 128, 8, 4096, 1e-1)],
++)
++def test_flash_sigmoid(qo_len, num_qo_heads, num_kv_heads, kv_len, atol):
+     torch.manual_seed(42)
+     variant_decl = flash_sigmoid_sm80_decl
+     jit_module = gen_customize_single_prefill_module(
+@@ -156,18 +163,21 @@ def test_flash_sigmoid():
+ 
+     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
+ 
+-    q = torch.randn(128, 8, 128, dtype=torch.float16, device="cuda")
+-    k = torch.randn(1027, 8, 128, dtype=torch.float16, device="cuda")
+-    v = torch.randn(1027, 8, 128, dtype=torch.float16, device="cuda")
++    q = torch.randn(qo_len, num_qo_heads, 128, dtype=torch.float16, device="cuda")
++    k = torch.randn(kv_len, num_kv_heads, 128, dtype=torch.float16, device="cuda")
++    v = torch.randn(kv_len, num_kv_heads, 128, dtype=torch.float16, device="cuda")
+     logits_scale = 1.0 / math.sqrt(128)
+     sigmoid_bias = 0.25
+     o = f(q, k, v, logits_scale, sigmoid_bias, mask_mode=MaskMode.NON_CAUSAL.value)
+ 
++    group_size = num_qo_heads // num_kv_heads
++    k_ref = k.float().repeat_interleave(group_size, dim=1)
++    v_ref = v.float().repeat_interleave(group_size, dim=1)
+     p = torch.sigmoid(
+-        torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * logits_scale + sigmoid_bias
++        torch.einsum("mhd,nhd->hmn", q.float(), k_ref) * logits_scale + sigmoid_bias
+     )
+-    o_ref = torch.einsum("hmn,nhd->mhd", p, v.float()).half()
+-    torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
++    o_ref = torch.einsum("hmn,nhd->mhd", p, v_ref).half()
++    torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=atol)
+ 
+ 
+ def test_dump_logits():
+@@ -1090,7 +1100,8 @@ def test_batch_decode_jit_wellknown_alibi_buffer(use_tensor_cores):
+ 
+ if __name__ == "__main__":
+     test_single_decode_mask()
+-    test_flash_sigmoid()
++    test_flash_sigmoid(128, 8, 8, 1027, 2e-2)
++    test_flash_sigmoid(32, 128, 8, 4096, 1e-1)
+     test_dump_logits()
+     test_batch_decode_flash_sigmoid(False)
+     test_batch_decode_flash_sigmoid(True)

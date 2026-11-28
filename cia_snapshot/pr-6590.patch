@@ -1,0 +1,264 @@
+diff --git a/csrc/cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_db015a53334184a3005e_kernel.cu b/csrc/cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_db015a53334184a3005e_kernel.cu
+index 4d5a0792979..698d964bee6 100644
+--- a/csrc/cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_db015a53334184a3005e_kernel.cu
++++ b/csrc/cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_db015a53334184a3005e_kernel.cu
+@@ -506,7 +506,7 @@ kernel_cake_trtllm_mla_blackwell_db015a53334184a3005e(const __grid_constant__ CU
+                     int s_wait_phase = pipeline_tile >> 1 & 1;
+                     mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                     int s_off = ((phase != 0) ? 64 : 0);
+-                    int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                    int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                     float _tmem_load_0[64];
+                     asm volatile(
+                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_kernel.cu
+index 74fbcc53b3b..261e8ac8214 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_0a58ba24b3133512b928_kernel.cu
+@@ -435,7 +435,7 @@ kernel_cake_mla_varq_dcp_decode_0a58ba24b3133512b928(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_2694148151c989006fa4_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_2694148151c989006fa4_kernel.cu
+index a93a93ee93a..f6e759abb14 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_2694148151c989006fa4_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_2694148151c989006fa4_kernel.cu
+@@ -403,7 +403,7 @@ kernel_cake_mla_varq_dcp_decode_2694148151c989006fa4(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_4ad9a542b809cf44d979_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_4ad9a542b809cf44d979_kernel.cu
+index 1c3b91b3ba8..52c4cc88f12 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_4ad9a542b809cf44d979_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_4ad9a542b809cf44d979_kernel.cu
+@@ -435,7 +435,7 @@ kernel_cake_mla_varq_dcp_decode_4ad9a542b809cf44d979(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_54bce6b66e691dc646b1_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_54bce6b66e691dc646b1_kernel.cu
+index 64427615f06..a886894869d 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_54bce6b66e691dc646b1_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_54bce6b66e691dc646b1_kernel.cu
+@@ -402,7 +402,7 @@ kernel_cake_mla_varq_dcp_decode_54bce6b66e691dc646b1(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4_kernel.cu
+index 3b03d26a6d4..73f928e98f0 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4_kernel.cu
+@@ -402,7 +402,7 @@ kernel_cake_mla_varq_dcp_decode_557713ccd2895b2aa3e4(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712_kernel.cu
+index 19e335692fd..8db5b2a011d 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712_kernel.cu
+@@ -435,7 +435,7 @@ kernel_cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_be8f417457dc53a8e527_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_be8f417457dc53a8e527_kernel.cu
+index bb3d3006c40..f94d07360b6 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_be8f417457dc53a8e527_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_be8f417457dc53a8e527_kernel.cu
+@@ -403,7 +403,7 @@ kernel_cake_mla_varq_dcp_decode_be8f417457dc53a8e527(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_kernel.cu b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_kernel.cu
+index d6ef8c2044d..ab471d10538 100644
+--- a/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_kernel.cu
++++ b/flashinfer/experimental/cake_mla_varq_dcp_decode/csrc/cake_mla_varq_dcp_decode/cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2_kernel.cu
+@@ -435,7 +435,7 @@ kernel_cake_mla_varq_dcp_decode_ffdb0eb3b15e52f2b9a2(const __grid_constant__ CUt
+                         int s_wait_phase = pipeline_tile >> 1 & 1;
+                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                         int s_off = ((phase != 0) ? 64 : 0);
+-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
++                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
+                         float _tmem_load_0[64];
+                         asm volatile(
+                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+diff --git a/tests/attention/test_trtllm_gen_mla.py b/tests/attention/test_trtllm_gen_mla.py
+index 05b3a898d9f..7be7d8db2dc 100644
+--- a/tests/attention/test_trtllm_gen_mla.py
++++ b/tests/attention/test_trtllm_gen_mla.py
+@@ -1,6 +1,7 @@
+ import inspect
+ import math
+ from types import SimpleNamespace
++from typing import Optional
+ import random
+ 
+ import pytest
+@@ -1027,15 +1028,17 @@ def trtllm_mla_blackwell_reference(
+     block_tables: torch.Tensor,
+     seq_lens: torch.Tensor,
+     softmax_scale: float,
++    page_size: int = 32,
++    sinks: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     kv_flat = kv_cache.reshape(-1, 576)
+     outputs = []
+     for batch_index in range(query.shape[0]):
+         seq_len = int(seq_lens[batch_index].item())
+-        pages = block_tables[batch_index, : (seq_len + 31) // 32]
++        pages = block_tables[batch_index, : (seq_len + page_size - 1) // page_size]
+         indices = (
+-            pages[:, None] * 32
+-            + torch.arange(32, device=query.device, dtype=torch.int32)[None, :]
++            pages[:, None] * page_size
++            + torch.arange(page_size, device=query.device, dtype=torch.int32)[None, :]
+         ).reshape(-1)[:seq_len]
+         batch_outputs = []
+         for query_index in range(query.shape[1]):
+@@ -1051,7 +1054,12 @@ def trtllm_mla_blackwell_reference(
+                 query[batch_index, query_index, :, 512:].float(),
+                 kv[:, 512:].float(),
+             )
+-            probabilities = F.softmax(logits * softmax_scale, dim=-1)
++            logits = logits * softmax_scale
++            if sinks is not None:
++                # The sink is one extra logit per head that takes probability
++                # mass but contributes no value.
++                logits = torch.cat([logits, sinks.float()[:, None]], dim=-1)
++            probabilities = F.softmax(logits, dim=-1)[:, : kv.shape[0]]
+             batch_outputs.append(
+                 torch.einsum("hk,kd->hd", probabilities, kv[:, :512].float())
+             )
+@@ -2159,11 +2167,19 @@ def decode():
+ 
+ 
+ @pytest.mark.parametrize(
+-    "batch_size,q_len_per_request",
+-    [(1, 4), (1, 8), (4, 2), (4, 4), (4, 8), (4, 16)],
++    "batch_size,q_len_per_request,page_size,enable_sink",
++    [
++        (1, 4, 32, False),
++        (1, 8, 32, False),
++        (4, 2, 32, False),
++        (4, 4, 32, False),
++        (4, 8, 32, False),
++        (4, 16, 32, False),
++        (1, 1, 64, True),
++    ],
+ )
+ def test_trtllm_mla_blackwell_bf16_dispatch(
+-    batch_size: int, q_len_per_request: int
++    batch_size: int, q_len_per_request: int, page_size: int, enable_sink: bool
+ ) -> None:
+     if not torch.cuda.is_available():
+         pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
+@@ -2172,20 +2188,27 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
+ 
+     device = torch.device("cuda")
+     torch.manual_seed(42)
+-    page_size = 32
+     max_seq_len = 1024
+     pages_per_sequence = max_seq_len // page_size
++    # Inputs of magnitude 0.5 give a peaked softmax, so a score read from the
++    # wrong keys moves the output well past the tolerance; near-uniform
++    # probabilities from small inputs would hide it.
+     query = (
+-        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.05
++        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.5
+     ).to(torch.bfloat16)
+     kv_cache = (
+         torch.randn(batch_size * pages_per_sequence, page_size, 576, device=device)
+-        * 0.05
++        * 0.5
+     ).to(torch.bfloat16)
+     block_tables = torch.arange(
+         batch_size * pages_per_sequence, dtype=torch.int32, device=device
+     ).reshape(batch_size, pages_per_sequence)
+     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
++    sinks = (
++        torch.randn(128, dtype=torch.float32, device=device) * 2.0
++        if enable_sink
++        else None
++    )
+     workspace = torch.empty(1, dtype=torch.uint8, device=device)
+     bmm1_scale = 1.0 / (192**0.5)
+ 
+@@ -2201,10 +2224,11 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
+         max_seq_len=max_seq_len,
+         bmm1_scale=bmm1_scale,
+         bmm2_scale=1.0,
++        sinks=[sinks] if enable_sink else None,
+         backend="cake",
+     )
+     reference = trtllm_mla_blackwell_reference(
+-        query, kv_cache, block_tables, seq_lens, bmm1_scale
++        query, kv_cache, block_tables, seq_lens, bmm1_scale, page_size, sinks
+     )
+     assert output.shape == (batch_size, q_len_per_request, 128, 512)
+     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+diff --git a/tests/experimental/test_cake_mla_varq_dcp_decode.py b/tests/experimental/test_cake_mla_varq_dcp_decode.py
+index fb7d49beeac..31f7abd3066 100644
+--- a/tests/experimental/test_cake_mla_varq_dcp_decode.py
++++ b/tests/experimental/test_cake_mla_varq_dcp_decode.py
+@@ -48,6 +48,10 @@
+ 
+ _LATENT_DIM = HEAD_DIM_V
+ _SOFTMAX_SCALE = 1.0 / math.sqrt(_LATENT_DIM)
++# Inputs of magnitude 0.5 give a peaked softmax, so a score read from the wrong
++# keys moves the output well past the tolerance; near-uniform probabilities
++# from small inputs would hide it.
++_INPUT_SCALE = 0.5
+ _PAGE_PERMUTATION_RANK_STRIDE = 7919
+ 
+ 
+@@ -309,7 +313,7 @@ def _make_batched_inputs(
+             device=device,
+             dtype=storage_dtype,
+         )
+-        * 0.1
++        * _INPUT_SCALE
+     ).to(dtype)
+     query = torch.cat([dense[b, :q] for b, q in enumerate(q_lens)])
+     global_kv = (
+@@ -320,7 +324,7 @@ def _make_batched_inputs(
+             device=device,
+             dtype=storage_dtype,
+         )
+-        * 0.1
++        * _INPUT_SCALE
+     ).to(dtype)
+     cum_seq_lens_q = torch.tensor(
+         [0, *torch.cumsum(torch.tensor(q_lens), 0).tolist()],

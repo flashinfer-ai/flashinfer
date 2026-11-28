@@ -1,0 +1,1193 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 29f6bbc9b4b..03f81fed5e2 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -31,6 +31,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
+ | Enable debug build | `export FLASHINFER_JIT_DEBUG=1` |
+ | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
+ | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
++| Set SM100-family MXFP8 CuTe-DSL compile workers (default 4; 0/1 means on-demand) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS=4` |
++| Limit MXFP8 CuTe-DSL autotune candidates (experimental; default 0 keeps full search) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=32` |
+ | Limit parallel ninja jobs | `export MAX_JOBS=4` |
+ | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
+ | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
+@@ -138,6 +140,13 @@ CUDA graph times separate.
+ 
+ ## Testing
+ 
++`benchmarks/bench_mxfp8_startup.py --output-dir /path/to/new/results` compares
++MXFP8 GEMM startup with persistence disabled, serial disk-cache population,
++parallel population, fresh-process disk hits, and saved tuning winners. It uses
++isolated caches and checks results after CUDA graph replay. Run on B200/B300;
++the default shapes exercise the SM100-family persistent/split-K runner. See
++`docs/design_docs/cute_dsl_kernel_cache.md` for the scope and cache layers.
++
+ Run the regular test suite:
+ 
+ ```bash
+diff --git a/benchmarks/bench_mxfp8_startup.py b/benchmarks/bench_mxfp8_startup.py
+new file mode 100644
+index 00000000000..b92e5c20a86
+--- /dev/null
++++ b/benchmarks/bench_mxfp8_startup.py
+@@ -0,0 +1,238 @@
++"""Measure MXFP8 cold compilation, disk reuse, and cached-winner startup.
++
++Each case runs in a fresh process. The baseline disables disk persistence and
++precompilation but keeps the current kernel/candidate set. It is not a replay
++of an older release or a full vLLM model. Use --output-dir with a new directory.
++"""
++
++import argparse
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import time
++
++
++def child(args):
++    import statistics
++    import torch
++    import torch.nn.functional as F
++    import flashinfer
++    from flashinfer.autotuner import AutoTuner
++    from flashinfer.fp8_quantization import mxfp8_quantize
++    from flashinfer.gemm import gemm_mm_fp4_cute_dsl as compiler
++    from flashinfer.gemm import gemm_mm_mxfp8_precompile as precompile
++    from flashinfer.testing import bench_gpu_time
++
++    counts = {"parent_compile_calls": 0, "profile_calls": 0, "pool_tasks": 0}
++    phase_wall = {"parent_compile_s": 0.0, "profile_s": 0.0, "pool_s": 0.0}
++    make_compile = compiler._make_blockscaled_gemm_compile_fn
++
++    def traced_make(*a, **kw):
++        fn = make_compile(*a, **kw)
++
++        def compile_fn():
++            counts["parent_compile_calls"] += 1
++            if args.forbid_compile:
++                raise RuntimeError("warm process unexpectedly compiled a GEMM")
++            start = time.perf_counter()
++            try:
++                return fn()
++            finally:
++                phase_wall["parent_compile_s"] += time.perf_counter() - start
++
++        return compile_fn
++
++    compiler._make_blockscaled_gemm_compile_fn = traced_make
++    profile = AutoTuner._profile_single_kernel
++
++    def traced_profile(self, *a, **kw):
++        counts["profile_calls"] += 1
++        start = time.perf_counter()
++        try:
++            return profile(self, *a, **kw)
++        finally:
++            phase_wall["profile_s"] += time.perf_counter() - start
++
++    AutoTuner._profile_single_kernel = traced_profile
++    pool = precompile._run_mm_mxfp8_precompile_pool
++
++    def traced_pool(payloads, workers):
++        counts["pool_tasks"] += len(payloads)
++        start = time.perf_counter()
++        try:
++            return pool(payloads, workers)
++        finally:
++            phase_wall["pool_s"] += time.perf_counter() - start
++
++    precompile._run_mm_mxfp8_precompile_pool = traced_pool
++    if args.forbid_compile:
++
++        def unexpected_pool(*a, **kw):
++            counts["unexpected_pool"] = True
++            raise RuntimeError("warm process unexpectedly started a compile pool")
++
++        precompile._run_mm_mxfp8_precompile_pool = unexpected_pool
++
++    torch.manual_seed(1234)
++    buckets = tuple(int(x) for x in args.buckets.split(","))
++    m = max(buckets)
++    weight = torch.randn((args.n, args.k), dtype=torch.bfloat16, device="cuda")
++    w, ws = mxfp8_quantize(weight, is_sf_swizzled_layout=True)
++    operands = {}
++    for rows in buckets:
++        x = torch.randn((rows, args.k), dtype=torch.bfloat16, device="cuda")
++        a, scale = mxfp8_quantize(x, is_sf_swizzled_layout=True)
++        operands[rows] = (
++            x,
++            a,
++            scale,
++            torch.empty((rows, args.n), device="cuda", dtype=torch.bfloat16),
++        )
++
++    def run(rows):
++        _, a, scale, out = operands[rows]
++        return flashinfer.mm_mxfp8(
++            a, w.T, scale, ws, out=out, out_dtype=torch.bfloat16, backend="cute-dsl"
++        )
++
++    tuner = AutoTuner.get()
++    configs = Path(os.environ["FLASHINFER_WORKSPACE_BASE"]) / "winners.json"
++    if args.load_winners:
++        assert tuner.load_configs(str(configs))
++    torch.cuda.synchronize()
++    start = time.perf_counter()
++    with flashinfer.autotune(tuning_buckets=buckets):
++        run(m)
++    torch.cuda.synchronize()
++    tune_wall = time.perf_counter() - start
++    if args.load_winners:
++        assert counts["profile_calls"] == 0, "saved winners unexpectedly retuned"
++    tuner.save_configs(str(configs))
++    # Keep the override active during replay so bucket key identities match.
++    validations = []
++    with flashinfer.autotune(False, tuning_buckets=buckets):
++        for rows in buckets:
++            output = run(rows)
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph):
++                run(rows)
++            graph.replay()
++            torch.cuda.synchronize()
++            reference = operands[rows][0].float() @ weight.float().T
++            cosine = F.cosine_similarity(
++                reference.flatten(), output.float().flatten(), dim=0
++            ).item()
++            assert torch.isfinite(output).all() and cosine > 0.98, (rows, cosine)
++            times = bench_gpu_time(
++                lambda: run(rows),
++                enable_cupti=False,
++                use_cuda_graph=True,
++                cold_l2_cache=False,
++                dry_run_iters=5,
++                repeat_iters=20,
++            )
++            validations.append(
++                {
++                    "m": rows,
++                    "cosine_after_graph": cosine,
++                    "warm_graph_median_ms": statistics.median(times),
++                }
++            )
++    if args.forbid_compile:
++        assert counts["parent_compile_calls"] == 0 and not counts.get("unexpected_pool")
++    result = dict(
++        case=args.child_case,
++        gpu=torch.cuda.get_device_name(),
++        cc=torch.cuda.get_device_capability(),
++        torch=torch.__version__,
++        flashinfer_version_metadata=flashinfer.__version__,
++        flashinfer_source=str(Path(flashinfer.__file__).resolve()),
++        n=args.n,
++        k=args.k,
++        buckets=buckets,
++        tune_wall_s=tune_wall,
++        warm_graph_median_ms=next(
++            item["warm_graph_median_ms"] for item in validations if item["m"] == m
++        ),
++        **counts,
++        # Profile wall includes on-demand compilation: these spans overlap.
++        phase_wall=phase_wall,
++        validations=validations,
++        object_count=len(
++            list(Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).rglob("*mm_mxfp8*/*.o"))
++        ),
++    )
++    (Path(args.output_dir) / f"{args.child_case}.json").write_text(
++        json.dumps(result, indent=2)
++    )
++    print(json.dumps(result))
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output-dir", required=True)
++    parser.add_argument("--n", type=int, default=1024)
++    parser.add_argument("--k", type=int, default=7168)
++    parser.add_argument("--buckets", default="8,64,256")
++    parser.add_argument("--top-n", type=int, default=0)
++    parser.add_argument("--child-case")
++    parser.add_argument("--forbid-compile", action="store_true")
++    parser.add_argument("--load-winners", action="store_true")
++    args = parser.parse_args()
++    if args.child_case:
++        child(args)
++        return
++    root = Path(args.output_dir).resolve()
++    root.mkdir(parents=True, exist_ok=False)
++    cases = [
++        ("baseline", "baseline", 0, True, False, False),
++        ("disk_cold", "serial", 1, False, False, False),
++        ("disk_warm", "serial", 1, False, True, False),
++        ("cached_winners", "serial", 1, False, True, True),
++        ("parallel_cold", "parallel", 4, False, False, False),
++        ("parallel_warm", "parallel", 4, False, True, False),
++    ]
++    summary = []
++    for name, cache, workers, disabled, forbid, winners in cases:
++        env = dict(
++            os.environ,
++            FLASHINFER_WORKSPACE_BASE=str(root / cache),
++            FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS=str(workers),
++            FLASHINFER_CUTE_DSL_DISABLE_CACHE=str(int(disabled)),
++            FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=str(args.top_n),
++        )
++        command = [
++            sys.executable,
++            str(Path(__file__).resolve()),
++            "--output-dir",
++            str(root),
++            "--n",
++            str(args.n),
++            "--k",
++            str(args.k),
++            "--buckets",
++            args.buckets,
++            "--child-case",
++            name,
++        ]
++        if forbid:
++            command.append("--forbid-compile")
++        if winners:
++            command.append("--load-winners")
++        start = time.perf_counter()
++        with (root / f"{name}.log").open("w") as log:
++            subprocess.run(
++                command, env=env, stdout=log, stderr=subprocess.STDOUT, check=True
++            )
++        result = json.loads((root / f"{name}.json").read_text())
++        result["process_wall_s"] = time.perf_counter() - start
++        result["top_n"] = args.top_n
++        summary.append(result)
++        (root / "summary.json").write_text(json.dumps(summary, indent=2))
++        print(json.dumps(result), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/design_docs/cute_dsl_kernel_cache.md b/docs/design_docs/cute_dsl_kernel_cache.md
+index 5ea40416b16..8aaf365f2ff 100644
+--- a/docs/design_docs/cute_dsl_kernel_cache.md
++++ b/docs/design_docs/cute_dsl_kernel_cache.md
+@@ -225,10 +225,54 @@ The benchmark command
+ `flashinfer_benchmark.py --routine nvfp4_quantize ... --backends cuda cute-dsl`
+ compiles on the first run and is compile-free on every subsequent run.
+ 
+-## 5. Limitations and future work
++## 5. SM100-family MXFP8 startup
++
++`mm_mxfp8(backend="cute-dsl")` persists the SM100-family persistent and
++tcgen05 split-K GEMMs. The key includes tile and cluster geometry, swap/prefetch,
++PDL, output dtype, split-K count, batch size, and active-cluster count. It uses a
++separate `mm_mxfp8` namespace from FP4. Source invalidation also covers the
++split-K kernel and the parallel compiler's constructor choices.
++
++Before profiling, the runner precompiles missing tactics using up to four
++spawned processes. `FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS` sets the upper
++bound; CPU affinity and available host/cgroup memory can lower it. Values 0 or 1
++use ordinary on-demand compilation. A lock per cache directory coordinates
++precompile pools across TP ranks sharing that cache. Each waiting rank rechecks
++the artifacts after acquiring the lock. Separate caches do not coordinate.
++Worker failures fall back to the normal compile path; disabling JIT or the
++CuTe-DSL disk cache also disables precompilation.
++
++`FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=0` preserves the full search and its
++order. Positive values opt into the FP4 analytical ranking for persistent
++tactics, while retaining every eligible split-K tactic. The budget must fit
++those split-K tactics plus at least one persistent candidate. This ranking
++needs MXFP8 workload validation before becoming a default: a startup reduction
++alone does not establish steady-state performance parity. The newer warp
++split-K runner and SM107/SM12x paths are outside this change.
++
++Use the following regression harness with a **new** output directory:
++
++```bash
++python benchmarks/bench_mxfp8_startup.py --output-dir /tmp/mxfp8-startup-full
++python benchmarks/bench_mxfp8_startup.py --output-dir /tmp/mxfp8-startup-top32 --top-n 32
++```
++
++The harness runs each case in a fresh process and records tuning wall time,
++process wall time, parent compile calls, artifact count, graph-replay numerics,
++and GPU execution time. Warm cases fail if GEMM compilation is attempted.
++Three cache states matter: an empty kernel cache; cached kernels with tuning
++still required; cached kernels **and** saved tuning winners. The baseline uses
++the same current kernels with persistence and precompilation disabled, so this
++is a component comparison, not a reproduction of an older release or a full
++model's startup. The default K=7168 avoids the separate warp split-K path.
++Track these cases on target hardware along with full vLLM TP startup: unique
++profiles/tactics, compilation versus profiling time, rank waits, and correctness.
++
++## 6. Limitations and future work
+ 
+-- **Adoption**: persistent caching is wired into CuTe-DSL call sites including nvfp4 quantization, FP4 GEMM, top-k, and SM12x MoE. The SM90 BF16/FP16 fused MoE uses direct `cute.compile` calls with module-local process caches instead. Other persistent-cache call sites should follow the pattern here: wrap the existing `cute.compile` call in a closure and name the specialization. The kernel name is the **sole per-kernel cache key** (`meta.json` guards only module-wide facts), so a name function must encode every codegen parameter — new adopters should replicate the naming tests in `tests/jit/test_cute_dsl_cache.py` (signature coverage of the kernel getters + per-argument perturbation) for their own name functions.
++- **Adoption**: persistent caching is wired into CuTe-DSL call sites including nvfp4 quantization, FP4 and SM100 MXFP8 GEMM, top-k, and SM12x MoE. The SM90 BF16/FP16 fused MoE uses direct `cute.compile` calls with module-local process caches instead. Other persistent-cache call sites should follow the pattern here: wrap the existing `cute.compile` call in a closure and name the specialization. The kernel name is the **sole per-kernel cache key** (`meta.json` guards only module-wide facts), so a name function must encode every codegen parameter — new adopters should replicate the naming tests in `tests/jit/test_cute_dsl_cache.py` (signature coverage of the kernel getters + per-argument perturbation) for their own name functions.
+ - **No `JitSpecRegistry` / AOT integration**: the registry now *accepts* any `JitSpec` backend, but cute-dsl kernels do not register themselves yet (only `gen_jit_spec()` registers), so they are invisible to the `flashinfer` CLI's module listing and to `flashinfer aot` / `flashinfer-jit-cache` packaging. (`FLASHINFER_DISABLE_JIT` *is* honored — it comes free from the shared `build_and_load()` template method.) AOT support would additionally require the spec to become declarative data (a factory reference + parameters) instead of a compile closure, so specs can be enumerated and prebuilt offline; then prebuild the module directories or link them into `.so`s (see 3.1).
+ - **Cross-compile keying**: the arch key mirrors `CUTE_DSL_ARCH`-else-device, but a per-compile `gpu_arch` override passed through `cute.compile` options would not be reflected. No current call site does this.
+ - **Single-target-arch assumption (heterogeneous multi-GPU)**: the cache key records what `cute.compile` actually compiles for — the DSL's resolved target (`CUTE_DSL_ARCH`, else the *current* device). Compiling for a non-current device in a mixed-arch process is not supported: it would require steering the compilation itself (per-compile `gpu_arch`) together with the key, not just parameterizing the key. The in-process `@functools.cache` level has the same current-device assumption today, so the disk cache does not regress multi-GPU behavior.
+ - **Module-granular wipes**: a single source edit recompiles every cached specialization of that module on next use. Acceptable for development (matches nvcc behavior); irrelevant for deployments with immutable packages.
++- **Portable prebuilt CuTe-DSL artifacts**: the current source hash includes absolute file paths. Shipping these kernels in `flashinfer-jit-cache` needs a portable source identity, compiler/architecture compatibility checks, and a loader for packaged artifacts; copying objects from a developer's writable cache is insufficient.
+diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
+index a96aedf4afa..4d7734ed991 100644
+--- a/flashinfer/gemm/gemm_base.py
++++ b/flashinfer/gemm/gemm_base.py
+@@ -57,13 +57,17 @@
+     map_to_hybrid_bucket_uncapped,
+ )
+ from .gemm_mm_fp4_cute_dsl import (
++    _blockscaled_mxfp8_gemm_cache_key_files,
+     _compile_block_scaled_gemm,
++    _mxfp8_blockscaled_kernel_disk_name,
+     _mm_fp4_cache_key,
+     mm_fp4_l2_policy,
++    _mm_mxfp8_cache_key,
+     _prepare_alpha_for_launch,
+     per_token_alpha_mode,
+     precompile_mm_fp4_tactics,
+ )
++from .gemm_mm_mxfp8_precompile import precompile_mm_mxfp8_tactics
+ from .gemm_mm_mxfp8_cute_dsl import (
+     _b12x_gemm_mxfp8_requirement,
+     _b12x_gemm_mxfp8_runner,
+@@ -76,6 +80,7 @@
+     _SM107_MXFP8_MMA_TILER_K,
+     _get_sm107_mxfp8_tactics,
+     _rank_mm_fp4_autotune_tactics,
++    _rank_mm_mxfp8_autotune_tactics,
+     _select_sm100_mm_fp4_cute_dsl_tactic,
+     _select_sm107_mm_fp4_cute_dsl_tactic,
+     _select_sm107_mm_mxfp8_cute_dsl_tactic,
+@@ -6455,7 +6460,7 @@ def get_valid_tactics(
+             )
+             valid_tactics = [(*tactic, 1) for tactic in base_tactics]
+             if not out.is_contiguous():
+-                return valid_tactics
++                return self._rank_tactics(valid_tactics, a, n, real_k)
+ 
+             for split_k_slices in split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
+                 if warp_serves and real_k < 4096:
+@@ -6475,7 +6480,38 @@ def get_valid_tactics(
+                             split_k_slices,
+                         )
+                     )
+-            return valid_tactics
++            return self._rank_tactics(valid_tactics, a, n, real_k)
++
++        def _rank_tactics(self, tactics, a, n, real_k):
++            budget = int(
++                os.environ.get("FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS", "0")
++            )
++            if budget < 0:
++                raise ValueError("MXFP8 tactic budget must be nonnegative")
++            if budget == 0:
++                return tactics
++            return _rank_mm_mxfp8_autotune_tactics(
++                tactics, a.shape[0], n, real_k, get_device_sm_count(a.device), budget
++            )
++
++        def precompile_tactics(self, inputs, tactics, profile, **kwargs) -> bool:
++            a, b = inputs[:2]
++            try:
++                precompile_mm_mxfp8_tactics(
++                    [tactic for tactic in tactics if tactic != -1],
++                    a.shape[0],
++                    b.shape[1],
++                    a.shape[1],
++                    enable_pdl,
++                    out_dtype,
++                    _CUTE_DSL_MM_MXFP8_KERNEL_CACHE,
++                    a.device,
++                )
++            except Exception as exc:
++                logger.warning(
++                    "MXFP8 precompilation failed; compiling on demand: %s", exc
++                )
++            return True
+ 
+         def forward(
+             self,
+@@ -6489,6 +6525,9 @@ def forward(
+             real_k = a.shape[1]
+             n = b.shape[1]
+ 
++            if do_preparation:
++                return out
++
+             sf_vec_size = 32
+             sf_dtype = cutlass.Float8E8M0FNU
+             batch_size = 1
+@@ -6593,7 +6632,7 @@ def forward(
+             sf_n = (kernel_n + 127) // 128
+             sf_k = (real_k // sf_vec_size + 3) // 4
+ 
+-            cache_key = (
++            cache_key = _mm_mxfp8_cache_key(
+                 sf_vec_size,
+                 mma_tiler_mn,
+                 cluster_shape_mn,
+@@ -6637,6 +6676,10 @@ def forward(
+                 sf_k=sf_k,
+                 batch_size=batch_size,
+                 cluster_shape_k=split_k_slices,
++                cache_module_name="mm_mxfp8",
++                device_index=get_device_index(a.device),
++                disk_kernel_name_fn=_mxfp8_blockscaled_kernel_disk_name,
++                cache_key_files_fn=_blockscaled_mxfp8_gemm_cache_key_files,
+             )
+ 
+             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
+diff --git a/flashinfer/gemm/gemm_mm_fp4_cute_dsl.py b/flashinfer/gemm/gemm_mm_fp4_cute_dsl.py
+index 13418953e71..61f88982e63 100644
+--- a/flashinfer/gemm/gemm_mm_fp4_cute_dsl.py
++++ b/flashinfer/gemm/gemm_mm_fp4_cute_dsl.py
+@@ -41,6 +41,19 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
+     )
+ 
+ 
++def _blockscaled_mxfp8_gemm_cache_key_files() -> tuple:
++    """Source files whose content invalidates the on-disk mm_mxfp8 kernels."""
++    from . import gemm_base, gemm_mm_mxfp8_precompile
++    from .kernels import dense_blockscaled_gemm_sm100_splitk
++
++    return (
++        *_blockscaled_gemm_cache_key_files(),
++        dense_blockscaled_gemm_sm100_splitk.__file__,
++        gemm_mm_mxfp8_precompile.__file__,
++        gemm_base.__file__,
++    )
++
++
+ def _compile_block_scaled_gemm(
+     cache,
+     cache_key,
+@@ -59,6 +72,8 @@ def _compile_block_scaled_gemm(
+     cache_module_name=None,
+     device_index=None,
+     per_token_alpha=None,
++    disk_kernel_name_fn=None,
++    cache_key_files_fn=None,
+ ):
+     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
+ 
+@@ -109,11 +124,15 @@ def _compile_block_scaled_gemm(
+     else:
+         from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+ 
++        if disk_kernel_name_fn is None:
++            disk_kernel_name_fn = _blockscaled_kernel_disk_name
++        if cache_key_files_fn is None:
++            cache_key_files_fn = _blockscaled_gemm_cache_key_files
+         compiled_gemm = build_and_load_cute_dsl_kernel(
+             cache_module_name,
+-            _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters),
++            disk_kernel_name_fn(cache_key, batch_size, max_active_clusters),
+             compile_kernel,
+-            extra_key_files=_blockscaled_gemm_cache_key_files(),
++            extra_key_files=cache_key_files_fn(),
+         )
+ 
+     result = (compiled_gemm, max_active_clusters)
+@@ -166,6 +185,51 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
+     )
+ 
+ 
++def _mm_mxfp8_cache_key(
++    sf_vec_size,
++    mma_tiler_mn,
++    cluster_shape_mn,
++    swap_ab,
++    use_prefetch,
++    enable_pdl,
++    out_dtype,
++    split_k_slices,
++):
++    """In-memory and on-disk specialization key for SM100 mm_mxfp8."""
++    return (
++        sf_vec_size,
++        mma_tiler_mn,
++        cluster_shape_mn,
++        swap_ab,
++        use_prefetch,
++        enable_pdl,
++        out_dtype,
++        split_k_slices,
++    )
++
++
++def _mxfp8_blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
++    """On-disk kernel name encoding every SM100 mm_mxfp8 codegen parameter."""
++    (
++        sf_vec_size,
++        mma_tiler_mn,
++        cluster_shape_mn,
++        swap_ab,
++        use_prefetch,
++        enable_pdl,
++        out_dtype,
++        split_k_slices,
++    ) = cache_key
++    dtype = str(out_dtype).removeprefix("torch.")
++    return (
++        f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
++        f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
++        f"_swap{int(swap_ab)}_pf{int(use_prefetch)}"
++        f"_pdl{int(enable_pdl)}_{dtype}_splitk{split_k_slices}"
++        f"_b{batch_size}_mac{max_active_clusters}"
++    )
++
++
+ def _make_blockscaled_gemm_compile_fn(
+     gemm,
+     ab_cutlass_dtype,
+diff --git a/flashinfer/gemm/gemm_mm_mxfp8_precompile.py b/flashinfer/gemm/gemm_mm_mxfp8_precompile.py
+new file mode 100644
+index 00000000000..317f4496f22
+--- /dev/null
++++ b/flashinfer/gemm/gemm_mm_mxfp8_precompile.py
+@@ -0,0 +1,166 @@
++"""Precompile SM100-family MXFP8 tactics into the CuTe-DSL disk cache."""
++
++import hashlib
++import logging
++import os
++from multiprocessing import get_context
++
++import torch
++from filelock import FileLock
++
++from ..utils import get_device_index
++from .gemm_mm_fp4_cute_dsl import (
++    _available_host_memory_bytes,
++    _blockscaled_mxfp8_gemm_cache_key_files,
++    _make_blockscaled_gemm_compile_fn,
++    _mm_mxfp8_cache_key,
++    _mxfp8_blockscaled_kernel_disk_name,
++)
++
++logger = logging.getLogger(__name__)
++
++
++def _get_mm_mxfp8_compile_workers():
++    workers = int(os.environ.get("FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS", "4"))
++    if workers <= 1:
++        return workers
++    cpu_count = (
++        len(os.sched_getaffinity(0))
++        if hasattr(os, "sched_getaffinity")
++        else (os.cpu_count() or 1)
++    )
++    available = _available_host_memory_bytes()
++    # Match the FP4 compiler's conservative per-worker RAM allowance.
++    memory_cap = workers if available is None else available // (1 << 30)
++    return min(workers, cpu_count, memory_cap)
++
++
++def _mm_mxfp8_precompile_worker(payload):
++    name = payload["kernel_name"]
++    try:
++        torch.cuda.set_device(payload["device_index"])
++        import cutlass
++
++        from ..cute_dsl.utils import torch_to_cutlass_dtype
++        from ..jit.cute_dsl_core import JitSpecCuteDsl
++        from .kernels.dense_blockscaled_gemm_sm100 import (
++            Sm100BlockScaledPersistentDenseGemmKernel,
++        )
++        from .kernels.dense_blockscaled_gemm_sm100_splitk import (
++            Sm100BlockScaledSplitKGemmKernel,
++        )
++
++        sf_vec_size, tile, cluster, swap, prefetch, pdl, dtype, slices = payload[
++            "cache_key"
++        ]
++        kernel = (
++            Sm100BlockScaledSplitKGemmKernel(sf_vec_size, tile, slices, pdl)
++            if slices > 1
++            else Sm100BlockScaledPersistentDenseGemmKernel(
++                sf_vec_size, tile, cluster, prefetch, pdl
++            )
++        )
++        compile_fn = _make_blockscaled_gemm_compile_fn(
++            kernel,
++            ab_cutlass_dtype=cutlass.Float8E4M3FN,
++            sf_dtype=cutlass.Float8E8M0FNU,
++            c_cutlass_dtype=torch_to_cutlass_dtype(dtype),
++            ab_assumed_align=16,
++            swap_ab=swap,
++            sf_m=payload["sf_m"],
++            sf_n=payload["sf_n"],
++            sf_k=payload["sf_k"],
++            batch_size=1,
++            max_active_clusters=payload["max_active_clusters"],
++        )
++        spec = JitSpecCuteDsl("mm_mxfp8", name, compile_fn, payload["source_sha256"])
++        if not spec.is_compiled:
++            spec.compile_and_persist()
++        return name, None
++    except Exception as exc:  # noqa: BLE001 -- forward retries missing artifacts
++        return name, f"{type(exc).__name__}: {exc}"
++
++
++def _run_mm_mxfp8_precompile_pool(payloads, workers):
++    logger.info(
++        "[mm_mxfp8 cute-dsl] precompiling %d tactics with %d workers",
++        len(payloads),
++        workers,
++    )
++    with get_context("spawn").Pool(workers) as pool:
++        results = pool.map(_mm_mxfp8_precompile_worker, payloads)
++    for name, error in results:
++        if error is not None:
++            logger.warning(
++                "[mm_mxfp8 cute-dsl] precompile failed for %s: %s; retrying on demand",
++                name,
++                error,
++            )
++
++
++def precompile_mm_mxfp8_tactics(
++    tactics, m, n, k, enable_pdl, out_dtype, kernel_cache, device
++):
++    from ..cute_dsl.utils import get_max_active_clusters
++    from ..jit.core import get_tmpdir
++    from ..jit.cute_dsl_core import (
++        JitSpecCuteDsl,
++        _hash_source_files,
++        cute_dsl_cache_disabled,
++    )
++
++    if (
++        os.environ.get("FLASHINFER_DISABLE_JIT")
++        or cute_dsl_cache_disabled()
++        or _get_mm_mxfp8_compile_workers() <= 1
++    ):
++        return
++    device_index = get_device_index(device)
++    # Occupancy and compilation-target lookup both depend on the current device.
++    with torch.cuda.device(device_index):
++        source_hash = _hash_source_files(_blockscaled_mxfp8_gemm_cache_key_files())
++        module = JitSpecCuteDsl("mm_mxfp8", "precompile", None, source_hash)
++        cache_identity = hashlib.sha256(str(module.module_dir).encode()).hexdigest()[
++            :16
++        ]
++        # TP ranks share one pool at a time on a host/cache. Recheck disk entries
++        # after acquiring the lock, so waiting ranks do not compile them again.
++        with FileLock(
++            get_tmpdir() / f"mm_mxfp8_{cache_identity}.precompile.lock",
++            thread_local=False,
++        ):
++            workers = _get_mm_mxfp8_compile_workers()
++            if workers <= 1:
++                return
++            max_clusters = {}
++            payloads = {}
++            for tile, cluster, swap, prefetch, slices in tactics:
++                key = _mm_mxfp8_cache_key(
++                    32, tile, cluster, swap, prefetch, enable_pdl, out_dtype, slices
++                )
++                if (device_index, key) in kernel_cache:
++                    continue
++                cluster_size = cluster[0] * cluster[1] * slices
++                if cluster_size not in max_clusters:
++                    max_clusters[cluster_size] = get_max_active_clusters(cluster_size)
++                mac = max_clusters[cluster_size]
++                name = _mxfp8_blockscaled_kernel_disk_name(key, 1, mac)
++                spec = JitSpecCuteDsl("mm_mxfp8", name, None, source_hash)
++                if spec.is_compiled:
++                    continue
++                kernel_m, kernel_n = (n, m) if swap else (m, n)
++                payloads[name] = dict(
++                    kernel_name=name,
++                    cache_key=key,
++                    device_index=device_index,
++                    sf_m=(kernel_m + 127) // 128,
++                    sf_n=(kernel_n + 127) // 128,
++                    sf_k=(k // 32 + 3) // 4,
++                    max_active_clusters=mac,
++                    source_sha256=source_hash,
++                )
++            # One new specialization is cheaper to compile in the caller.
++            if len(payloads) > 1:
++                _run_mm_mxfp8_precompile_pool(
++                    list(payloads.values()), min(workers, len(payloads))
++                )
+diff --git a/flashinfer/gemm/kernels/utils.py b/flashinfer/gemm/kernels/utils.py
+index e4e1806e9b6..4bf285a9d8b 100644
+--- a/flashinfer/gemm/kernels/utils.py
++++ b/flashinfer/gemm/kernels/utils.py
+@@ -213,6 +213,30 @@ def score(tactic):
+     return sorted(valid_tactics, key=score, reverse=True)[:max_tactics]
+ 
+ 
++def _rank_mm_mxfp8_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tactics):
++    """Optional bounded search; keep all low-M split-K candidates.
++
++    The shared score was calibrated for FP4. MXFP8 uses the full search by
++    default until target-GPU comparisons establish a suitable candidate budget.
++    """
++    if max_tactics == 0 or len(valid_tactics) <= max_tactics:
++        return valid_tactics
++    split_k = [t for t in valid_tactics if t[-1] > 1]
++    persistent = [t for t in valid_tactics if t[-1] == 1]
++    if max_tactics < len(split_k) + 1:
++        raise ValueError(
++            "MXFP8 tactic budget must retain split-K and at least one persistent tactic"
++        )
++    ranked = sorted(
++        persistent,
++        key=lambda t: _score_block_scaled_tactic(
++            m, n, real_k, sm_count, t[0], t[1], t[2]
++        ),
++        reverse=True,
++    )
++    return ranked[: max_tactics - len(split_k)] + split_k
++
++
+ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
+     """Select the best tactic for mm_fp4(backend='cute-dsl').
+ 
+diff --git a/tests/jit/test_cute_dsl_cache.py b/tests/jit/test_cute_dsl_cache.py
+index 82aeece3606..eacf0e11d46 100644
+--- a/tests/jit/test_cute_dsl_cache.py
++++ b/tests/jit/test_cute_dsl_cache.py
+@@ -350,8 +350,12 @@ def test_nvfp4_kernel_name_is_symbol_safe():
+ import torch  # noqa: E402
+ 
+ from flashinfer.gemm.gemm_mm_fp4_cute_dsl import (  # noqa: E402
++    _blockscaled_mxfp8_gemm_cache_key_files,
+     _blockscaled_kernel_disk_name,
++    _compile_block_scaled_gemm,
++    _mxfp8_blockscaled_kernel_disk_name,
+     _mm_fp4_cache_key,
++    _mm_mxfp8_cache_key,
+ )
+ 
+ # A baseline argument set and, for each argument, a distinct alternative.
+@@ -495,3 +499,214 @@ def load(choice):
+         assert len(builds) == 2
+     assert load(tactic) == (updated if change == "layout" else first)
+     assert len(builds) == (1 if change == "policy" else 2)
++
++
++# ---------------------------------------------------------------------------
++# mm_mxfp8 SM100 cache adopter
++# ---------------------------------------------------------------------------
++
++MM_MXFP8_NAME_BASELINE = {
++    "sf_vec_size": 32,
++    "mma_tiler_mn": (128, 128),
++    "cluster_shape_mn": (2, 1),
++    "swap_ab": False,
++    "use_prefetch": False,
++    "enable_pdl": False,
++    "out_dtype": torch.bfloat16,
++    "split_k_slices": 1,
++    "batch_size": 1,
++    "max_active_clusters": 74,
++}
++MM_MXFP8_NAME_PERTURBED = {
++    "sf_vec_size": 16,
++    "mma_tiler_mn": (256, 64),
++    "cluster_shape_mn": (1, 2),
++    "swap_ab": True,
++    "use_prefetch": True,
++    "enable_pdl": True,
++    "out_dtype": torch.float16,
++    "split_k_slices": 4,
++    "batch_size": 2,
++    "max_active_clusters": 148,
++}
++
++
++def _mm_mxfp8_name(**kwargs):
++    cache_key = _mm_mxfp8_cache_key(
++        kwargs["sf_vec_size"],
++        kwargs["mma_tiler_mn"],
++        kwargs["cluster_shape_mn"],
++        kwargs["swap_ab"],
++        kwargs["use_prefetch"],
++        kwargs["enable_pdl"],
++        kwargs["out_dtype"],
++        kwargs["split_k_slices"],
++    )
++    return _mxfp8_blockscaled_kernel_disk_name(
++        cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
++    )
++
++
++def test_mm_mxfp8_cache_key_schema_is_fully_exercised():
++    name_only_params = {"batch_size", "max_active_clusters"}
++    assert set(inspect.signature(_mm_mxfp8_cache_key).parameters) == (
++        set(MM_MXFP8_NAME_BASELINE) - name_only_params
++    )
++
++
++@pytest.mark.parametrize("param", sorted(MM_MXFP8_NAME_BASELINE))
++def test_mm_mxfp8_kernel_name_varies_with_every_argument(param):
++    """Every SM100 MXFP8 specialization must own a distinct artifact name."""
++    baseline_name = _mm_mxfp8_name(**MM_MXFP8_NAME_BASELINE)
++    kwargs = dict(MM_MXFP8_NAME_BASELINE)
++    kwargs[param] = MM_MXFP8_NAME_PERTURBED[param]
++    perturbed_name = _mm_mxfp8_name(**kwargs)
++    assert perturbed_name != baseline_name, (
++        f"_mxfp8_blockscaled_kernel_disk_name ignores argument {param!r}: "
++        "two different kernel specializations would collide on one cache artifact."
++    )
++    for name in (baseline_name, perturbed_name):
++        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
++
++
++def test_mm_mxfp8_source_fingerprint_covers_splitk_kernel():
++    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm100_splitk
++
++    assert (
++        dense_blockscaled_gemm_sm100_splitk.__file__
++        in _blockscaled_mxfp8_gemm_cache_key_files()
++    )
++
++
++def test_blockscaled_compile_accepts_operation_specific_disk_cache(monkeypatch):
++    """MXFP8 can reuse the FP4 harness without reusing its cache schema."""
++    from flashinfer.cute_dsl import utils as cute_dsl_utils
++    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
++    from flashinfer.jit import cute_dsl_core
++
++    cache_key = _mm_mxfp8_cache_key(
++        *(
++            MM_MXFP8_NAME_BASELINE[key]
++            for key in (
++                "sf_vec_size",
++                "mma_tiler_mn",
++                "cluster_shape_mn",
++                "swap_ab",
++                "use_prefetch",
++                "enable_pdl",
++                "out_dtype",
++                "split_k_slices",
++            )
++        )
++    )
++    compile_kernel = object()
++    extra_key_files = ("mxfp8_kernel.py",)
++    calls = []
++
++    monkeypatch.setattr(cute_dsl_utils, "get_max_active_clusters", lambda _: 17)
++    monkeypatch.setattr(
++        gemm_mm_fp4_cute_dsl,
++        "_make_blockscaled_gemm_compile_fn",
++        lambda *args, **kwargs: compile_kernel,
++    )
++
++    def fake_build(module_name, kernel_name, compile_fn, *, extra_key_files):
++        calls.append((module_name, kernel_name, compile_fn, extra_key_files))
++        return "compiled"
++
++    monkeypatch.setattr(cute_dsl_core, "build_and_load_cute_dsl_kernel", fake_build)
++
++    result = _compile_block_scaled_gemm(
++        {},
++        cache_key,
++        object,
++        ab_cutlass_dtype=object(),
++        sf_dtype=object(),
++        c_cutlass_dtype=object(),
++        ab_assumed_align=16,
++        cluster_shape_mn=(2, 1),
++        swap_ab=False,
++        sf_m=1,
++        sf_n=1,
++        sf_k=1,
++        batch_size=2,
++        cache_module_name="mm_mxfp8",
++        device_index=0,
++        disk_kernel_name_fn=lambda key, batch, clusters: (
++            f"mxfp8_{key[-1]}_{batch}_{clusters}"
++        ),
++        cache_key_files_fn=lambda: extra_key_files,
++    )
++
++    assert result == ("compiled", 17)
++    assert calls == [("mm_mxfp8", "mxfp8_1_2_17", compile_kernel, extra_key_files)]
++
++
++def _mm_mxfp8_split_k_test_tactic(m, k):
++    """Derive the wiring test tactic from the split-K kernel contract."""
++    import cutlass
++
++    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk import (
++        Sm100BlockScaledSplitKGemmKernel,
++    )
++
++    split_k_slices = Sm100BlockScaledSplitKGemmKernel.SUPPORTED_SPLIT_K_SLICES[0]
++    assert Sm100BlockScaledSplitKGemmKernel.is_valid_tactic(
++        m, k, cutlass.Float8E4M3FN, split_k_slices
++    )
++    return (
++        Sm100BlockScaledSplitKGemmKernel.mma_tiler_mn_for_m(m),
++        (1, 1),
++        True,
++        False,
++        split_k_slices,
++    )
++
++
++@pytest.mark.parametrize(
++    "m,n,k,tactic",
++    [
++        pytest.param(
++            64,
++            128,
++            256,
++            ((128, 128), (1, 1), False, False, 1),
++            id="persistent",
++        ),
++        pytest.param(
++            8,
++            128,
++            256,
++            _mm_mxfp8_split_k_test_tactic(8, 256),
++            id="split-k",
++        ),
++    ],
++)
++def test_mm_mxfp8_runner_routes_to_disk_cache(monkeypatch, m, n, k, tactic):
++    from flashinfer.gemm import gemm_base
++
++    compile_calls = []
++
++    def fake_compile(*args, **kwargs):
++        compile_calls.append((args, kwargs))
++        return (lambda *launch_args: None), 1
++
++    monkeypatch.setattr(gemm_base, "_compile_block_scaled_gemm", fake_compile)
++    monkeypatch.setattr(gemm_base, "_prepare_alpha_for_launch", lambda *args: None)
++    monkeypatch.setattr(gemm_base, "get_device_index", lambda device: 0)
++
++    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 0, False, torch.bfloat16)
++    a = torch.empty((m, k))
++    b = torch.empty((k, n))
++    out = torch.empty((m, n))
++    scale = torch.empty(1)
++    runner.forward([a, b, scale, scale, torch.bfloat16, out, None], tactic=tactic)
++
++    assert len(compile_calls) == 1
++    args, kwargs = compile_calls[0]
++    split_k_slices = tactic[-1]
++    assert args[1][-1] == split_k_slices
++    assert kwargs["cluster_shape_k"] == split_k_slices
++    assert kwargs["cache_module_name"] == "mm_mxfp8"
++    assert kwargs["disk_kernel_name_fn"] is _mxfp8_blockscaled_kernel_disk_name
++    assert kwargs["cache_key_files_fn"] is _blockscaled_mxfp8_gemm_cache_key_files
+diff --git a/tests/jit/test_mxfp8_precompile.py b/tests/jit/test_mxfp8_precompile.py
+new file mode 100644
+index 00000000000..f4642d1f3a5
+--- /dev/null
++++ b/tests/jit/test_mxfp8_precompile.py
+@@ -0,0 +1,204 @@
++"""MXFP8 precompilation preserves the kernel contract and shares cache work."""
++
++import contextlib
++from concurrent.futures import ThreadPoolExecutor
++import json
++import time
++
++import pytest
++import torch
++
++pytest.importorskip("cutlass")
++
++from flashinfer.gemm import gemm_mm_mxfp8_precompile as precompile
++from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _mm_mxfp8_cache_key
++from flashinfer.gemm.kernels.utils import _rank_mm_mxfp8_autotune_tactics
++from flashinfer.jit import cute_dsl_core
++
++PERSISTENT = ((128, 128), (1, 1), False, False, 1)
++SPLITK = ((128, 8), (1, 1), True, False, 2)
++
++
++@pytest.fixture
++def cpu_cache(monkeypatch, tmp_path):
++    from flashinfer.cute_dsl import utils
++
++    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_103a")
++    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
++    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
++    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
++    monkeypatch.setattr(precompile, "_get_mm_mxfp8_compile_workers", lambda: 4)
++    monkeypatch.setattr(
++        precompile.torch.cuda, "device", lambda _: contextlib.nullcontext()
++    )
++    monkeypatch.setattr(utils, "get_max_active_clusters", lambda size: 148 // size)
++    return tmp_path
++
++
++def prepare(tactics, memory_cache=None):
++    precompile.precompile_mm_mxfp8_tactics(
++        tactics,
++        8,
++        512,
++        4096,
++        False,
++        torch.bfloat16,
++        {} if memory_cache is None else memory_cache,
++        torch.device("cuda:0"),
++    )
++
++
++def test_concurrent_preparation_rechecks_disk_and_deduplicates(cpu_cache, monkeypatch):
++    pools = []
++
++    def fake_pool(payloads, workers):
++        pools.append((payloads, workers))
++        time.sleep(0.05)  # let the peer encounter the outstanding compile
++        for payload in payloads:
++            spec = cute_dsl_core.JitSpecCuteDsl(
++                "mm_mxfp8", payload["kernel_name"], None, payload["source_sha256"]
++            )
++            spec.module_dir.mkdir(parents=True, exist_ok=True)
++            spec.object_path.write_bytes(b"compiled")
++            spec.meta_path.write_text(json.dumps(spec.expected_meta))
++
++    monkeypatch.setattr(precompile, "_run_mm_mxfp8_precompile_pool", fake_pool)
++    tactics = [PERSISTENT, PERSISTENT, SPLITK]
++    with ThreadPoolExecutor(2) as executor:
++        futures = [executor.submit(prepare, tactics) for _ in range(2)]
++        for future in futures:
++            future.result()
++    assert len(pools) == 1
++    payloads, workers = pools[0]
++    assert len(payloads) == workers == 2
++    split = next(p for p in payloads if p["cache_key"][-1] == 2)
++    assert (split["sf_m"], split["sf_n"], split["sf_k"]) == (4, 1, 32)
++    assert split["max_active_clusters"] == 74
++    prepare(tactics)
++    assert len(pools) == 1
++
++
++@pytest.mark.parametrize(
++    "mode", ["disabled", "jit_disabled", "memory", "single", "one_worker"]
++)
++def test_no_unnecessary_compile_pool(cpu_cache, monkeypatch, mode):
++    def unexpected(*args):
++        pytest.fail("a compile pool should not be needed")
++
++    monkeypatch.setattr(precompile, "_run_mm_mxfp8_precompile_pool", unexpected)
++    cache = {}
++    tactics = [PERSISTENT, SPLITK]
++    if mode == "disabled":
++        monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
++    elif mode == "jit_disabled":
++        monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
++    elif mode == "memory":
++        for tile, cluster, swap, prefetch, slices in tactics:
++            cache[
++                (
++                    0,
++                    _mm_mxfp8_cache_key(
++                        32, tile, cluster, swap, prefetch, False, torch.bfloat16, slices
++                    ),
++                )
++            ] = object()
++    elif mode == "single":
++        tactics = [PERSISTENT]
++    else:
++        monkeypatch.setattr(precompile, "_get_mm_mxfp8_compile_workers", lambda: 1)
++    prepare(tactics, cache)
++
++
++@pytest.mark.parametrize("tactic", [PERSISTENT, SPLITK])
++def test_worker_builds_fp8_persistent_and_splitk_contract(monkeypatch, tactic):
++    import cutlass
++    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm100 as persistent
++    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm100_splitk as splitk
++
++    created = []
++    compiled = []
++    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
++    monkeypatch.setattr(
++        persistent,
++        "Sm100BlockScaledPersistentDenseGemmKernel",
++        lambda *a: created.append(("persistent", a)),
++    )
++    monkeypatch.setattr(
++        splitk,
++        "Sm100BlockScaledSplitKGemmKernel",
++        lambda *a: created.append(("splitk", a)),
++    )
++    monkeypatch.setattr(
++        precompile,
++        "_make_blockscaled_gemm_compile_fn",
++        lambda gemm, **kw: compiled.append(kw),
++    )
++    monkeypatch.setattr(
++        cute_dsl_core.JitSpecCuteDsl, "is_compiled", property(lambda self: False)
++    )
++    monkeypatch.setattr(
++        cute_dsl_core.JitSpecCuteDsl, "compile_and_persist", lambda self: None
++    )
++    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_103a")
++    tile, cluster, swap, prefetch, slices = tactic
++    payload = dict(
++        kernel_name="test",
++        cache_key=_mm_mxfp8_cache_key(
++            32, tile, cluster, swap, prefetch, True, torch.bfloat16, slices
++        ),
++        device_index=0,
++        sf_m=1,
++        sf_n=1,
++        sf_k=32,
++        max_active_clusters=74,
++        source_sha256="test",
++    )
++    assert precompile._mm_mxfp8_precompile_worker(payload) == ("test", None)
++    expected = (
++        ("splitk", (32, tile, slices, True))
++        if slices > 1
++        else ("persistent", (32, tile, cluster, prefetch, True))
++    )
++    assert created == [expected]
++    assert compiled[0]["ab_cutlass_dtype"] is cutlass.Float8E4M3FN
++    assert compiled[0]["sf_dtype"] is cutlass.Float8E8M0FNU
++    assert compiled[0]["ab_assumed_align"] == 16
++    assert compiled[0]["swap_ab"] == swap
++
++
++def test_worker_budget_respects_cpu_and_cgroup(monkeypatch):
++    monkeypatch.setenv("FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS", "8")
++    monkeypatch.setattr(precompile.os, "sched_getaffinity", lambda _: {0, 1, 2, 3})
++    monkeypatch.setattr(precompile, "_available_host_memory_bytes", lambda: 2 << 30)
++    assert precompile._get_mm_mxfp8_compile_workers() == 2
++    monkeypatch.setattr(precompile, "_available_host_memory_bytes", lambda: 0)
++    assert precompile._get_mm_mxfp8_compile_workers() == 0
++
++
++def test_runner_precompiles_only_tactics_selected_by_tuner(monkeypatch):
++    from flashinfer.gemm import gemm_base
++
++    calls = []
++    monkeypatch.setattr(
++        gemm_base, "precompile_mm_mxfp8_tactics", lambda *args: calls.append(args)
++    )
++    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 3, False, torch.bfloat16)
++    a, b = torch.empty(8, 4096), torch.empty(4096, 512)
++    assert runner.precompile_tactics([a, b], [-1, SPLITK], None)
++    assert calls[0][0] == [SPLITK]
++    assert calls[0][1:4] == (8, 512, 4096)
++
++
++def test_top_n_preserves_splitk_and_full_search_order():
++    candidates = [((128, n), (1, 1), False, False, 1) for n in (64, 128, 192, 256)] + [
++        SPLITK
++    ]
++    assert (
++        _rank_mm_mxfp8_autotune_tactics(candidates, 8, 512, 4096, 148, 0) is candidates
++    )
++    bounded = _rank_mm_mxfp8_autotune_tactics(candidates, 8, 512, 4096, 148, 3)
++    assert len(bounded) == 3
++    assert SPLITK in bounded
++    assert set(bounded) <= set(candidates)
++    with pytest.raises(ValueError, match="budget"):
++        _rank_mm_mxfp8_autotune_tactics(candidates, 8, 512, 4096, 148, 1)
