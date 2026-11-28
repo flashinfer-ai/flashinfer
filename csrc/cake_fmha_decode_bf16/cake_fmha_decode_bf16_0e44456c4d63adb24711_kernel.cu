@@ -240,7 +240,7 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -311,7 +311,7 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* smem_corr0 = reinterpret_cast<float*>(smem_raw + 1024);
     const int smem_corr0_addr = smem + 1024;
     float* smem_corr1 = reinterpret_cast<float*>(smem_raw + 1088);
@@ -345,6 +345,8 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
     unsigned int* smem_sk_flag = reinterpret_cast<unsigned int*>(smem_raw + 143360);
     const int smem_sk_flag_addr = smem + 143360;
 #endif
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Qt))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");
@@ -352,17 +354,15 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
         if (elect_sync()) {
             #pragma unroll
             for (int line = 0; line < (BATCH_SIZE * 4 + 127) / 128; line++) {
-                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(causal_seqlens_kv_global + (line * 32))));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(causal_seqlens_kv_global + line * 32)));
             }
         }
     }
 
 #if __CUDA_ARCH__ == 1030
-    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 28 barriers)
-    // Mbarriers at smem_raw[0..224)
+    // Mbarrier init (28 barriers at smem_raw[0..224))
 #else
-    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (24 barriers at smem_raw[0..192))
 #endif
 
     if (warp == 0) {
@@ -506,15 +506,15 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_s0 = taddr;
+    const unsigned int tmem_tmem_s1 = taddr + 8;
+    const unsigned int tmem_tmem_stats0 = taddr + 16;
+    const unsigned int tmem_tmem_stats1 = taddr + 48;
+    const unsigned int tmem_tmem_o0 = taddr + 80;
+    const unsigned int tmem_tmem_o1 = taddr + 88;
 
     // Kernel post-init ops
-    const int tmem_tmem_s0 = taddr;
-    const int tmem_tmem_s1 = taddr + 8;
-    const int tmem_tmem_stats0 = taddr + 16;
-    const int tmem_tmem_stats1 = taddr + 48;
-    const int tmem_tmem_o0 = taddr + 80;
-    const int tmem_tmem_o1 = taddr + 88;
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
     }
@@ -525,8 +525,8 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
         { // softmax_main
             int is_wg1 = ((warp >= 4) ? 1 : 0);
             const int tmem_row_base_v = warp % 4 * 32;
-            int my_tmem_s_base = taddr + (unsigned int)(((is_wg1 != 0) ? 8 : 0)) + (unsigned int)(tmem_row_base_v << 16);
-            int my_tmem_stats = taddr + (unsigned int)(((is_wg1 != 0) ? 48 : 16)) + (unsigned int)(tmem_row_base_v << 16);
+            int my_tmem_s_base = taddr + (unsigned int)((is_wg1 != 0) ? 8 : 0) + (unsigned int)(tmem_row_base_v << 16);
+            int my_tmem_stats = taddr + (unsigned int)((is_wg1 != 0) ? 48 : 16) + (unsigned int)(tmem_row_base_v << 16);
             const int warp_in_wg = warp % 4;
             const int wg_tid = warp_in_wg * 32 + lane;
             int col_pair = wg_tid % 4;
@@ -565,15 +565,15 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                 even_offset = cta_n_blocks / 2 - 3;
             }
             cut = cut - cut_offset + even_offset;
-            int cut_0 = (int)((unsigned long long)sk_group_hi * total_pairs / (unsigned long long)sk_groups);
-            int cut_offset_1 = cut_0 % (cta_n_blocks / 2);
-            int even_offset_2 = cut_offset_1 - cut_offset_1 % 2;
-            if (even_offset_2 == cta_n_blocks / 2 - 1) {
-                even_offset_2 = cta_n_blocks / 2 - 3;
+            int cut_3 = (int)((unsigned long long)sk_group_hi * total_pairs / (unsigned long long)sk_groups);
+            int cut_offset_3 = cut_3 % (cta_n_blocks / 2);
+            int even_offset_3 = cut_offset_3 - cut_offset_3 % 2;
+            if (even_offset_3 == cta_n_blocks / 2 - 1) {
+                even_offset_3 = cta_n_blocks / 2 - 3;
             }
-            cut_0 = cut_0 - cut_offset_1 + even_offset_2;
+            cut_3 = cut_3 - cut_offset_3 + even_offset_3;
             unsigned int tile_begin = (unsigned int)(cut / (cta_n_blocks / 2));
-            unsigned int tile_end = (unsigned int)((cut_0 - 1) / (cta_n_blocks / 2) + 1);
+            unsigned int tile_end = (unsigned int)((cut_3 - 1) / (cta_n_blocks / 2) + 1);
             unsigned int _phase_stats_empty_0 = 1;
             unsigned int _phase_corr_empty_1_0 = 1;
             unsigned int _phase_corr_empty_0_0 = 1;
@@ -611,8 +611,8 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                     part_lo = cut - tile_first;
                 }
                 int part_hi = cta_n_blocks_1 / 2;
-                if (cut_0 < tile_first + cta_n_blocks_1 / 2) {
-                    part_hi = cut_0 - tile_first;
+                if (cut_3 < tile_first + cta_n_blocks_1 / 2) {
+                    part_hi = cut_3 - tile_first;
                 }
                 int part_blocks = 2 * (part_hi - part_lo);
                 int split = 0;
@@ -924,21 +924,21 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                 sk_group_hi_1 = sk_groups_1;
             }
             int cut_1 = (int)((unsigned long long)sk_group_lo_1 * total_pairs_1 / (unsigned long long)sk_groups_1);
-            int cut_offset_2 = cut_1 % (cta_n_blocks_2 / 2);
-            int even_offset_1 = cut_offset_2 - cut_offset_2 % 2;
+            int cut_offset_1 = cut_1 % (cta_n_blocks_2 / 2);
+            int even_offset_1 = cut_offset_1 - cut_offset_1 % 2;
             if (even_offset_1 == cta_n_blocks_2 / 2 - 1) {
                 even_offset_1 = cta_n_blocks_2 / 2 - 3;
             }
-            cut_1 = cut_1 - cut_offset_2 + even_offset_1;
-            int cut_0_1 = (int)((unsigned long long)sk_group_hi_1 * total_pairs_1 / (unsigned long long)sk_groups_1);
-            int cut_offset_1_1 = cut_0_1 % (cta_n_blocks_2 / 2);
-            int even_offset_2_1 = cut_offset_1_1 - cut_offset_1_1 % 2;
-            if (even_offset_2_1 == cta_n_blocks_2 / 2 - 1) {
-                even_offset_2_1 = cta_n_blocks_2 / 2 - 3;
+            cut_1 = cut_1 - cut_offset_1 + even_offset_1;
+            int cut_4 = (int)((unsigned long long)sk_group_hi_1 * total_pairs_1 / (unsigned long long)sk_groups_1);
+            int cut_offset_4 = cut_4 % (cta_n_blocks_2 / 2);
+            int even_offset_4 = cut_offset_4 - cut_offset_4 % 2;
+            if (even_offset_4 == cta_n_blocks_2 / 2 - 1) {
+                even_offset_4 = cta_n_blocks_2 / 2 - 3;
             }
-            cut_0_1 = cut_0_1 - cut_offset_1_1 + even_offset_2_1;
+            cut_4 = cut_4 - cut_offset_4 + even_offset_4;
             unsigned int tile_begin_1 = (unsigned int)(cut_1 / (cta_n_blocks_2 / 2));
-            unsigned int tile_end_1 = (unsigned int)((cut_0_1 - 1) / (cta_n_blocks_2 / 2) + 1);
+            unsigned int tile_end_1 = (unsigned int)((cut_4 - 1) / (cta_n_blocks_2 / 2) + 1);
             unsigned int _phase_corr_scale_0 = 0;
             unsigned int _phase_corr_scale_1 = 0;
             unsigned int _phase_o_ready_0_0 = 0;
@@ -973,8 +973,8 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                     part_lo_1 = cut_1 - tile_first_1;
                 }
                 int part_hi_1 = cta_n_blocks_1_1 / 2;
-                if (cut_0_1 < tile_first_1 + cta_n_blocks_1_1 / 2) {
-                    part_hi_1 = cut_0_1 - tile_first_1;
+                if (cut_4 < tile_first_1 + cta_n_blocks_1_1 / 2) {
+                    part_hi_1 = cut_4 - tile_first_1;
                 }
                 int part_blocks_1 = 2 * (part_hi_1 - part_lo_1);
                 int split_1 = 0;
@@ -1283,21 +1283,21 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                 sk_group_hi_2 = sk_groups_2;
             }
             int cut_2 = (int)((unsigned long long)sk_group_lo_2 * total_pairs_2 / (unsigned long long)sk_groups_2);
-            int cut_offset_3 = cut_2 % (cta_n_blocks_3 / 2);
-            int even_offset_3 = cut_offset_3 - cut_offset_3 % 2;
-            if (even_offset_3 == cta_n_blocks_3 / 2 - 1) {
-                even_offset_3 = cta_n_blocks_3 / 2 - 3;
+            int cut_offset_2 = cut_2 % (cta_n_blocks_3 / 2);
+            int even_offset_2 = cut_offset_2 - cut_offset_2 % 2;
+            if (even_offset_2 == cta_n_blocks_3 / 2 - 1) {
+                even_offset_2 = cta_n_blocks_3 / 2 - 3;
             }
-            cut_2 = cut_2 - cut_offset_3 + even_offset_3;
-            int cut_0_2 = (int)((unsigned long long)sk_group_hi_2 * total_pairs_2 / (unsigned long long)sk_groups_2);
-            int cut_offset_1_2 = cut_0_2 % (cta_n_blocks_3 / 2);
-            int even_offset_2_2 = cut_offset_1_2 - cut_offset_1_2 % 2;
-            if (even_offset_2_2 == cta_n_blocks_3 / 2 - 1) {
-                even_offset_2_2 = cta_n_blocks_3 / 2 - 3;
+            cut_2 = cut_2 - cut_offset_2 + even_offset_2;
+            int cut_2_1 = (int)((unsigned long long)sk_group_hi_2 * total_pairs_2 / (unsigned long long)sk_groups_2);
+            int cut_offset_2_1 = cut_2_1 % (cta_n_blocks_3 / 2);
+            int even_offset_2_1 = cut_offset_2_1 - cut_offset_2_1 % 2;
+            if (even_offset_2_1 == cta_n_blocks_3 / 2 - 1) {
+                even_offset_2_1 = cta_n_blocks_3 / 2 - 3;
             }
-            cut_0_2 = cut_0_2 - cut_offset_1_2 + even_offset_2_2;
+            cut_2_1 = cut_2_1 - cut_offset_2_1 + even_offset_2_1;
             unsigned int tile_begin_2 = (unsigned int)(cut_2 / (cta_n_blocks_3 / 2));
-            unsigned int tile_end_2 = (unsigned int)((cut_0_2 - 1) / (cta_n_blocks_3 / 2) + 1);
+            unsigned int tile_end_2 = (unsigned int)((cut_2_1 - 1) / (cta_n_blocks_3 / 2) + 1);
             unsigned int _phase_q_full_0 = 0;
             unsigned int _phase_o_empty_0_0 = 1;
             unsigned int _phase_p_full_0_0 = 0;
@@ -1333,8 +1333,8 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                     part_lo_2 = cut_2 - tile_first_2;
                 }
                 int part_hi_2 = cta_n_blocks_1_2 / 2;
-                if (cut_0_2 < tile_first_2 + cta_n_blocks_1_2 / 2) {
-                    part_hi_2 = cut_0_2 - tile_first_2;
+                if (cut_2_1 < tile_first_2 + cta_n_blocks_1_2 / 2) {
+                    part_hi_2 = cut_2_1 - tile_first_2;
                 }
                 int part_blocks_2 = 2 * (part_hi_2 - part_lo_2);
                 int split_2 = 0;
@@ -1830,22 +1830,22 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
             if (sk_group_hi_3 > sk_groups_3) {
                 sk_group_hi_3 = sk_groups_3;
             }
-            int cut_3 = (int)((unsigned long long)sk_group_lo_3 * total_pairs_3 / (unsigned long long)sk_groups_3);
-            int cut_offset_4 = cut_3 % (cta_n_blocks_4 / 2);
-            int even_offset_4 = cut_offset_4 - cut_offset_4 % 2;
-            if (even_offset_4 == cta_n_blocks_4 / 2 - 1) {
-                even_offset_4 = cta_n_blocks_4 / 2 - 3;
+            int cut_5 = (int)((unsigned long long)sk_group_lo_3 * total_pairs_3 / (unsigned long long)sk_groups_3);
+            int cut_offset_5 = cut_5 % (cta_n_blocks_4 / 2);
+            int even_offset_5 = cut_offset_5 - cut_offset_5 % 2;
+            if (even_offset_5 == cta_n_blocks_4 / 2 - 1) {
+                even_offset_5 = cta_n_blocks_4 / 2 - 3;
             }
-            cut_3 = cut_3 - cut_offset_4 + even_offset_4;
-            int cut_0_3 = (int)((unsigned long long)sk_group_hi_3 * total_pairs_3 / (unsigned long long)sk_groups_3);
-            int cut_offset_1_3 = cut_0_3 % (cta_n_blocks_4 / 2);
-            int even_offset_2_3 = cut_offset_1_3 - cut_offset_1_3 % 2;
-            if (even_offset_2_3 == cta_n_blocks_4 / 2 - 1) {
-                even_offset_2_3 = cta_n_blocks_4 / 2 - 3;
+            cut_5 = cut_5 - cut_offset_5 + even_offset_5;
+            int cut_0 = (int)((unsigned long long)sk_group_hi_3 * total_pairs_3 / (unsigned long long)sk_groups_3);
+            int cut_offset_0 = cut_0 % (cta_n_blocks_4 / 2);
+            int even_offset_0 = cut_offset_0 - cut_offset_0 % 2;
+            if (even_offset_0 == cta_n_blocks_4 / 2 - 1) {
+                even_offset_0 = cta_n_blocks_4 / 2 - 3;
             }
-            cut_0_3 = cut_0_3 - cut_offset_1_3 + even_offset_2_3;
-            unsigned int tile_begin_3 = (unsigned int)(cut_3 / (cta_n_blocks_4 / 2));
-            unsigned int tile_end_3 = (unsigned int)((cut_0_3 - 1) / (cta_n_blocks_4 / 2) + 1);
+            cut_0 = cut_0 - cut_offset_0 + even_offset_0;
+            unsigned int tile_begin_3 = (unsigned int)(cut_5 / (cta_n_blocks_4 / 2));
+            unsigned int tile_end_3 = (unsigned int)((cut_0 - 1) / (cta_n_blocks_4 / 2) + 1);
             #pragma unroll 1
             for (unsigned int tile_idx_la = tile_begin_3; tile_idx_la < tile_end_3; tile_idx_la++) {
                 unsigned int ordered_3 = tile_idx_la - 1;
@@ -1872,12 +1872,12 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                 }
                 int tile_first_3 = (int)ordered_3 * (cta_n_blocks_1_3 / 2);
                 int part_lo_3 = 0;
-                if (cut_3 > tile_first_3) {
-                    part_lo_3 = cut_3 - tile_first_3;
+                if (cut_5 > tile_first_3) {
+                    part_lo_3 = cut_5 - tile_first_3;
                 }
                 int part_hi_3 = cta_n_blocks_1_3 / 2;
-                if (cut_0_3 < tile_first_3 + cta_n_blocks_1_3 / 2) {
-                    part_hi_3 = cut_0_3 - tile_first_3;
+                if (cut_0 < tile_first_3 + cta_n_blocks_1_3 / 2) {
+                    part_hi_3 = cut_0 - tile_first_3;
                 }
                 int part_blocks_3 = 2 * (part_hi_3 - part_lo_3);
                 int split_3 = 0;
@@ -2130,22 +2130,22 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
             if (sk_group_hi_4 > sk_groups_4) {
                 sk_group_hi_4 = sk_groups_4;
             }
-            int cut_4 = (int)((unsigned long long)sk_group_lo_4 * total_pairs_4 / (unsigned long long)sk_groups_4);
-            int cut_offset_5 = cut_4 % (cta_n_blocks_5 / 2);
-            int even_offset_5 = cut_offset_5 - cut_offset_5 % 2;
-            if (even_offset_5 == cta_n_blocks_5 / 2 - 1) {
-                even_offset_5 = cta_n_blocks_5 / 2 - 3;
+            int cut_6 = (int)((unsigned long long)sk_group_lo_4 * total_pairs_4 / (unsigned long long)sk_groups_4);
+            int cut_offset_6 = cut_6 % (cta_n_blocks_5 / 2);
+            int even_offset_6 = cut_offset_6 - cut_offset_6 % 2;
+            if (even_offset_6 == cta_n_blocks_5 / 2 - 1) {
+                even_offset_6 = cta_n_blocks_5 / 2 - 3;
             }
-            cut_4 = cut_4 - cut_offset_5 + even_offset_5;
-            int cut_0_4 = (int)((unsigned long long)sk_group_hi_4 * total_pairs_4 / (unsigned long long)sk_groups_4);
-            int cut_offset_1_4 = cut_0_4 % (cta_n_blocks_5 / 2);
-            int even_offset_2_4 = cut_offset_1_4 - cut_offset_1_4 % 2;
-            if (even_offset_2_4 == cta_n_blocks_5 / 2 - 1) {
-                even_offset_2_4 = cta_n_blocks_5 / 2 - 3;
+            cut_6 = cut_6 - cut_offset_6 + even_offset_6;
+            int cut_1_1 = (int)((unsigned long long)sk_group_hi_4 * total_pairs_4 / (unsigned long long)sk_groups_4);
+            int cut_offset_1_1 = cut_1_1 % (cta_n_blocks_5 / 2);
+            int even_offset_1_1 = cut_offset_1_1 - cut_offset_1_1 % 2;
+            if (even_offset_1_1 == cta_n_blocks_5 / 2 - 1) {
+                even_offset_1_1 = cta_n_blocks_5 / 2 - 3;
             }
-            cut_0_4 = cut_0_4 - cut_offset_1_4 + even_offset_2_4;
-            unsigned int tile_begin_4 = (unsigned int)(cut_4 / (cta_n_blocks_5 / 2));
-            unsigned int tile_end_4 = (unsigned int)((cut_0_4 - 1) / (cta_n_blocks_5 / 2) + 1);
+            cut_1_1 = cut_1_1 - cut_offset_1_1 + even_offset_1_1;
+            unsigned int tile_begin_4 = (unsigned int)(cut_6 / (cta_n_blocks_5 / 2));
+            unsigned int tile_end_4 = (unsigned int)((cut_1_1 - 1) / (cta_n_blocks_5 / 2) + 1);
             unsigned int _phase_q_empty_0 = 1;
             #pragma unroll 1
             for (unsigned int tile_idx_l = tile_begin_4; tile_idx_l < tile_end_4; tile_idx_l++) {
@@ -2173,12 +2173,12 @@ kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtens
                 }
                 int tile_first_4 = (int)ordered_4 * (cta_n_blocks_1_4 / 2);
                 int part_lo_4 = 0;
-                if (cut_4 > tile_first_4) {
-                    part_lo_4 = cut_4 - tile_first_4;
+                if (cut_6 > tile_first_4) {
+                    part_lo_4 = cut_6 - tile_first_4;
                 }
                 int part_hi_4 = cta_n_blocks_1_4 / 2;
-                if (cut_0_4 < tile_first_4 + cta_n_blocks_1_4 / 2) {
-                    part_hi_4 = cut_0_4 - tile_first_4;
+                if (cut_1_1 < tile_first_4 + cta_n_blocks_1_4 / 2) {
+                    part_hi_4 = cut_1_1 - tile_first_4;
                 }
                 int part_blocks_4 = 2 * (part_hi_4 - part_lo_4);
                 int split_4 = 0;

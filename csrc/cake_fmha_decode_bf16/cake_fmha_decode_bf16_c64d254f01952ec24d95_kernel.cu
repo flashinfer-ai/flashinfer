@@ -240,7 +240,7 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -304,7 +304,7 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* smem_corr0 = reinterpret_cast<float*>(smem_raw + 1024);
     const int smem_corr0_addr = smem + 1024;
     float* smem_corr1 = reinterpret_cast<float*>(smem_raw + 1088);
@@ -342,6 +342,8 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
     int* smem_la = reinterpret_cast<int*>(smem_raw + 143376);
     const int smem_la_addr = smem + 143376;
 #endif
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Qt))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");
@@ -349,7 +351,7 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
         if (elect_sync()) {
             #pragma unroll
             for (int line = 0; line < (BATCH_SIZE * 4 + 127) / 128; line++) {
-                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(causal_seqlens_kv_global + (line * 32))));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(causal_seqlens_kv_global + line * 32)));
             }
         }
     }
@@ -403,9 +405,9 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
         { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, la_lane_end, 16, 32); if (lane >= 16) { la_lane_end += peer; } }
         unsigned int la_lane_first = la_lane_end - la_lane_sum;
         unsigned int sk_total;
-        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(sk_total) : "r"(la_lane_sum));
+        asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(sk_total) : "r"(la_lane_sum));
         unsigned int p2_prev;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(p2_prev) : "r"(la_last_pairs));
+        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(p2_prev) : "r"(la_last_pairs));
         unsigned int la_group_prev = 0;
         if (la_group_lo > 0) {
             la_group_prev = la_group_lo - 1;
@@ -445,34 +447,34 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
             }
         }
         unsigned int _warp_redux_0;
-        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_0) : "r"(la_cnt_p));
+        asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_0) : "r"(la_cnt_p));
         int unit_p = (int)_warp_redux_0;
         unsigned int first_p;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(first_p) : "r"(la_beg_p));
+        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(first_p) : "r"(la_beg_p));
         unsigned int _warp_redux_1;
-        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_1) : "r"(la_end_p));
+        asm volatile("redux.sync.min.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_1) : "r"(la_end_p));
         unsigned int pairs_p = _warp_redux_1 - first_p;
         if (raw_p >= sk_total) {
             unit_p = -1;
         }
         unsigned int _warp_redux_2;
-        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_2) : "r"(la_cnt_l));
+        asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_2) : "r"(la_cnt_l));
         int unit_l = (int)_warp_redux_2;
         unsigned int first_l;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(first_l) : "r"(la_beg_l));
+        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(first_l) : "r"(la_beg_l));
         unsigned int _warp_redux_3;
-        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_3) : "r"(la_end_l));
+        asm volatile("redux.sync.min.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_3) : "r"(la_end_l));
         unsigned int pairs_l = _warp_redux_3 - first_l;
         if (raw_l >= sk_total) {
             unit_l = -1;
         }
         unsigned int _warp_redux_4;
-        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_4) : "r"(la_cnt_h));
+        asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_4) : "r"(la_cnt_h));
         int unit_h = (int)_warp_redux_4;
         unsigned int first_h;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(first_h) : "r"(la_beg_h));
+        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(first_h) : "r"(la_beg_h));
         unsigned int _warp_redux_5;
-        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(la_end_h));
+        asm volatile("redux.sync.min.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_5) : "r"(la_end_h));
         unsigned int pairs_h = _warp_redux_5 - first_h;
         if (raw_h >= sk_total) {
             unit_h = -1;
@@ -486,7 +488,7 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
             }
         }
         unsigned int _warp_redux_6;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_6) : "r"(la_beg_hb));
+        asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_6) : "r"(la_beg_hb));
         unsigned int pairs_hb = first_h - _warp_redux_6;
         unsigned int cut_p = sk_total;
         if (unit_p >= 0) {
@@ -561,11 +563,9 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
     }
 
 #if __CUDA_ARCH__ == 1030
-    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 28 barriers)
-    // Mbarriers at smem_raw[0..224)
+    // Mbarrier init (28 barriers at smem_raw[0..224))
 #else
-    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (24 barriers at smem_raw[0..192))
 #endif
 
     if (warp == 0) {
@@ -709,15 +709,15 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_s0 = taddr;
+    const unsigned int tmem_tmem_s1 = taddr + 8;
+    const unsigned int tmem_tmem_stats0 = taddr + 16;
+    const unsigned int tmem_tmem_stats1 = taddr + 48;
+    const unsigned int tmem_tmem_o0 = taddr + 80;
+    const unsigned int tmem_tmem_o1 = taddr + 88;
 
     // Kernel post-init ops
-    const int tmem_tmem_s0 = taddr;
-    const int tmem_tmem_s1 = taddr + 8;
-    const int tmem_tmem_stats0 = taddr + 16;
-    const int tmem_tmem_stats1 = taddr + 48;
-    const int tmem_tmem_o0 = taddr + 80;
-    const int tmem_tmem_o1 = taddr + 88;
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
     }
@@ -728,8 +728,8 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
         { // softmax_main
             int is_wg1 = ((warp >= 4) ? 1 : 0);
             const int tmem_row_base_v = warp % 4 * 32;
-            int my_tmem_s_base = taddr + (unsigned int)(((is_wg1 != 0) ? 8 : 0)) + (unsigned int)(tmem_row_base_v << 16);
-            int my_tmem_stats = taddr + (unsigned int)(((is_wg1 != 0) ? 48 : 16)) + (unsigned int)(tmem_row_base_v << 16);
+            int my_tmem_s_base = taddr + (unsigned int)((is_wg1 != 0) ? 8 : 0) + (unsigned int)(tmem_row_base_v << 16);
+            int my_tmem_stats = taddr + (unsigned int)((is_wg1 != 0) ? 48 : 16) + (unsigned int)(tmem_row_base_v << 16);
             const int warp_in_wg = warp % 4;
             const int wg_tid = warp_in_wg * 32 + lane;
             int col_pair = wg_tid % 4;
@@ -2071,11 +2071,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             pg_k_la[0 + 2] = _ivld_0.z;
                             pg_k_la[0 + 3] = _ivld_0.w;
                         }
-                        int kkeys_left = visible_local_keys_3 - pg_base_la * 16;
+                        int keys_left = visible_local_keys_3 - pg_base_la * 16;
                         #pragma unroll
-                        for (int kj = 0; kj < 4; kj++) {
-                            if (kj * 16 >= kkeys_left) {
-                                pg_k_la[kj] = 1073741824;
+                        for (int j = 0; j < 4; j++) {
+                            if (j * 16 >= keys_left) {
+                                pg_k_la[j] = 1073741824;
                             }
                         }
                         mbarrier_wait(kv_empty_addr + (kv_stage_la) * 8, _phase_kv_empty);
@@ -2136,11 +2136,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             pg_v_la[0 + 2] = _ivld_1.z;
                             pg_v_la[0 + 3] = _ivld_1.w;
                         }
-                        int keys_left = visible_local_keys_3 - vpg_base_la * 16;
+                        int keys_left_1 = visible_local_keys_3 - vpg_base_la * 16;
                         #pragma unroll
-                        for (int j = 0; j < 4; j++) {
-                            if (j * 16 >= keys_left) {
-                                pg_v_la[j] = 1073741824;
+                        for (int j_1 = 0; j_1 < 4; j_1++) {
+                            if (j_1 * 16 >= keys_left_1) {
+                                pg_v_la[j_1] = 1073741824;
                             }
                         }
                         int pg_nk_la[4];
@@ -2153,11 +2153,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             pg_nk_la[0 + 2] = _ivld_2.z;
                             pg_nk_la[0 + 3] = _ivld_2.w;
                         }
-                        int kkeys_left_1 = visible_local_keys_3 - npg_base_la * 16;
+                        int keys_left_0 = visible_local_keys_3 - npg_base_la * 16;
                         #pragma unroll
-                        for (int kj_1 = 0; kj_1 < 4; kj_1++) {
-                            if (kj_1 * 16 >= kkeys_left_1) {
-                                pg_nk_la[kj_1] = 1073741824;
+                        for (int j_2 = 0; j_2 < 4; j_2++) {
+                            if (j_2 * 16 >= keys_left_0) {
+                                pg_nk_la[j_2] = 1073741824;
                             }
                         }
 #if __CUDA_ARCH__ == 1030
@@ -2242,11 +2242,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             tpg_v_la[0 + 2] = _ivld_3.z;
                             tpg_v_la[0 + 3] = _ivld_3.w;
                         }
-                        int keys_left_1 = visible_local_keys_3 - tvpg_base_la * 16;
+                        int keys_left_2 = visible_local_keys_3 - tvpg_base_la * 16;
                         #pragma unroll
-                        for (int j_1 = 0; j_1 < 4; j_1++) {
-                            if (j_1 * 16 >= keys_left_1) {
-                                tpg_v_la[j_1] = 1073741824;
+                        for (int j_3 = 0; j_3 < 4; j_3++) {
+                            if (j_3 * 16 >= keys_left_2) {
+                                tpg_v_la[j_3] = 1073741824;
                             }
                         }
 #if __CUDA_ARCH__ == 1030
@@ -2384,11 +2384,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             pg_k[0 + 2] = _ivld_0.z;
                             pg_k[0 + 3] = _ivld_0.w;
                         }
-                        int kkeys_left_2 = visible_local_keys_4 - (pg_base + 4) * 16;
+                        int keys_left_3 = visible_local_keys_4 - (pg_base + 4) * 16;
                         #pragma unroll
-                        for (int kj_2 = 0; kj_2 < 4; kj_2++) {
-                            if (kj_2 * 16 >= kkeys_left_2) {
-                                pg_k[kj_2] = 1073741824;
+                        for (int j_4 = 0; j_4 < 4; j_4++) {
+                            if (j_4 * 16 >= keys_left_3) {
+                                pg_k[j_4] = 1073741824;
                             }
                         }
                         mbarrier_wait(kv_empty_addr + (kv_stage) * 8, _phase_kv_empty_1);
@@ -2450,11 +2450,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             pg_v[0 + 2] = _ivld_1.z;
                             pg_v[0 + 3] = _ivld_1.w;
                         }
-                        int keys_left_2 = visible_local_keys_4 - (vpg_base + 4) * 16;
+                        int keys_left_4 = visible_local_keys_4 - (vpg_base + 4) * 16;
                         #pragma unroll
-                        for (int j_2 = 0; j_2 < 4; j_2++) {
-                            if (j_2 * 16 >= keys_left_2) {
-                                pg_v[j_2] = 1073741824;
+                        for (int j_5 = 0; j_5 < 4; j_5++) {
+                            if (j_5 * 16 >= keys_left_4) {
+                                pg_v[j_5] = 1073741824;
                             }
                         }
                         int pg_nk[4];
@@ -2467,11 +2467,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             pg_nk[0 + 2] = _ivld_2.z;
                             pg_nk[0 + 3] = _ivld_2.w;
                         }
-                        int kkeys_left_3 = visible_local_keys_4 - (npg_base + 4) * 16;
+                        int keys_left_1_1 = visible_local_keys_4 - (npg_base + 4) * 16;
                         #pragma unroll
-                        for (int kj_3 = 0; kj_3 < 4; kj_3++) {
-                            if (kj_3 * 16 >= kkeys_left_3) {
-                                pg_nk[kj_3] = 1073741824;
+                        for (int j_6 = 0; j_6 < 4; j_6++) {
+                            if (j_6 * 16 >= keys_left_1_1) {
+                                pg_nk[j_6] = 1073741824;
                             }
                         }
 #if __CUDA_ARCH__ == 1030
@@ -2558,11 +2558,11 @@ kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95(const __grid_constant__ CUtens
                             tpg_v[0 + 2] = _ivld_3.z;
                             tpg_v[0 + 3] = _ivld_3.w;
                         }
-                        int keys_left_3 = visible_local_keys_4 - (tvpg_base + 4) * 16;
+                        int keys_left_5 = visible_local_keys_4 - (tvpg_base + 4) * 16;
                         #pragma unroll
-                        for (int j_3 = 0; j_3 < 4; j_3++) {
-                            if (j_3 * 16 >= keys_left_3) {
-                                tpg_v[j_3] = 1073741824;
+                        for (int j_7 = 0; j_7 < 4; j_7++) {
+                            if (j_7 * 16 >= keys_left_5) {
+                                tpg_v[j_7] = 1073741824;
                             }
                         }
 #if __CUDA_ARCH__ == 1030

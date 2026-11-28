@@ -275,7 +275,7 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -362,7 +362,7 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* smem_corr0 = reinterpret_cast<float*>(smem_raw + 1024);
     const int smem_corr0_addr = smem + 1024;
     float* smem_corr1 = reinterpret_cast<float*>(smem_raw + 1088);
@@ -400,16 +400,16 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 177152);
     const int work_response_addr = smem + 177152;
 #endif
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Qt))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");
 
 #if __CUDA_ARCH__ == 1030
-    // Mbarrier init (25 pipeline groups, 0 ordered-sequence groups, 54 barriers)
-    // Mbarriers at smem_raw[0..432)
+    // Mbarrier init (54 barriers at smem_raw[0..432))
 #else
-    // Mbarrier init (25 pipeline groups, 0 ordered-sequence groups, 52 barriers)
-    // Mbarriers at smem_raw[0..416)
+    // Mbarrier init (52 barriers at smem_raw[0..416))
 #endif
 
     if (tid == 0) {
@@ -630,16 +630,17 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
 
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_s0 = taddr;
+    const unsigned int tmem_tmem_s1 = taddr + 8;
+    const unsigned int tmem_tmem_stats0 = taddr + 16;
+    const unsigned int tmem_tmem_stats1 = taddr + 48;
+    const unsigned int tmem_tmem_o0 = taddr + 80;
+    const unsigned int tmem_tmem_o1 = taddr + 88;
 
     // Kernel post-init ops
-    const int tmem_tmem_s0 = taddr;
-    const int tmem_tmem_s1 = taddr + 8;
-    const int tmem_tmem_stats0 = taddr + 16;
-    const int tmem_tmem_stats1 = taddr + 48;
-    const int tmem_tmem_o0 = taddr + 80;
-    const int tmem_tmem_o1 = taddr + 88;
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
     }
@@ -651,8 +652,8 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
             int instance_id = (warp - 0) / 4;
             int is_wg1 = instance_id;
             const int tmem_row_base_v = warp % 4 * 32;
-            int my_tmem_s_base = taddr + (unsigned int)(((is_wg1 != 0) ? 8 : 0)) + (unsigned int)(tmem_row_base_v << 16);
-            int my_tmem_stats = taddr + (unsigned int)(((is_wg1 != 0) ? 48 : 16)) + (unsigned int)(tmem_row_base_v << 16);
+            int my_tmem_s_base = taddr + (unsigned int)((is_wg1 != 0) ? 8 : 0) + (unsigned int)(tmem_row_base_v << 16);
+            int my_tmem_stats = taddr + (unsigned int)((is_wg1 != 0) ? 48 : 16) + (unsigned int)(tmem_row_base_v << 16);
             const int warp_in_wg = warp % 4;
             const int wg_tid = warp_in_wg * 32 + lane;
             int col_pair = wg_tid % 4;
@@ -2200,7 +2201,6 @@ kernel_cake_fmha_decode_bf16_394b0caa8e0362fe9988(const __grid_constant__ CUtens
     // ---- Role: load_warp ----
     if (warp == 15) {
         { // load_warp_main
-            asm volatile("griddepcontrol.wait;" ::: "memory");
             int page_slot_l = 0;
             unsigned int work_stage_l = 0;
             unsigned int throttle_stage_l = 0;
