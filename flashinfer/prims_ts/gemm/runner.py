@@ -15,7 +15,7 @@ Dtype and epilogue select the cache entry; they are not tactics.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -116,6 +116,7 @@ def _constraints(output_scale_rows) -> tuple[ConstraintSpec, ...]:
         ConstraintSpec(9, 0, _output_rows),
         ConstraintSpec(10, 0, _activation_scale_rows),
         ConstraintSpec(12, 0, output_scale_rows),
+        ConstraintSpec(16, 0, _output_rows),
     )
 
 
@@ -157,6 +158,7 @@ class GemmIdentity:
     head_dim: Optional[int]
     is_neox: Optional[bool]
     has_qkv_scale: bool
+    has_delta: bool = False
 
 
 class PrimsTsGemmRunner(TunableRunner):
@@ -190,7 +192,7 @@ class PrimsTsGemmRunner(TunableRunner):
             # Tactic tuples gained use_tma_store. Keep this so a winner saved
             # before that field is not replayed.
             "tma_store",
-        )
+        ) + (("delta",) if identity.has_delta else ())
 
     def precompile_tactics(self, inputs, tactics, profile, **kwargs) -> bool:
         del profile
@@ -226,6 +228,7 @@ class PrimsTsGemmRunner(TunableRunner):
             scale_c,
             scale_gate,
             qkv_scale,
+            delta,
         ) = inputs
         identity = self.identity
         if tactic == -1:
@@ -251,6 +254,8 @@ class PrimsTsGemmRunner(TunableRunner):
                 has_qkv_scale=identity.has_qkv_scale,
                 tactic=tactic,
             )
+        if identity.has_delta:
+            config = replace(config, has_delta=True)
         packed = identity.operand_format == "nvfp4_e2m1"
         _launch(
             config,
@@ -272,6 +277,7 @@ class PrimsTsGemmRunner(TunableRunner):
             scale_c=scale_c,
             scale_gate=scale_gate,
             qkv_scale=qkv_scale,
+            delta=delta,
         )
         return output
 
@@ -304,6 +310,7 @@ def launch_dense_gemm(
     scale_c: Optional[torch.Tensor] = None,
     scale_gate: Optional[torch.Tensor] = None,
     qkv_scale: Optional[torch.Tensor] = None,
+    delta: Optional[torch.Tensor] = None,
 ) -> None:
     """Pick a cached tactic, or the historical default, then launch."""
     identity = GemmIdentity(
@@ -315,6 +322,7 @@ def launch_dense_gemm(
         head_dim,
         is_neox,
         has_qkv_scale,
+        delta is not None,
     )
     runner = PrimsTsGemmRunner(op_name, identity)
     inputs = [
@@ -334,6 +342,7 @@ def launch_dense_gemm(
         scale_c,
         scale_gate,
         qkv_scale,
+        delta,
     ]
     chosen, tactic = AutoTuner.get().choose_one(
         op_name,
