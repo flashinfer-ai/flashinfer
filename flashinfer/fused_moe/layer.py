@@ -79,6 +79,7 @@ from .api import (
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
+    SpecializedFp8BlockSmallTConfig,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -120,6 +121,7 @@ from .runners import (
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
     SM12xNvfp4Runner,
+    SpecializedFp8BlockSmallTRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -177,6 +179,7 @@ _RunnerT = Union[
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
     SM12xNvfp4Runner,
+    SpecializedFp8BlockSmallTRunner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -227,6 +230,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Config: SM12xNvfp4Bf16Runner,
     SM12xNvfp4Config: SM12xNvfp4Runner,
+    SpecializedFp8BlockSmallTConfig: SpecializedFp8BlockSmallTRunner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
@@ -313,10 +317,16 @@ class MoELayer:
                 )
                 runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
+                # build() binds backend resources (a JIT module, workspace
+                # plans); an optional backend whose build fails must reject
+                # THIS candidate so selection continues over the remaining
+                # usable backends, not abort layer construction. Building at
+                # init also keeps module loading outside any later CUDA
+                # graph capture.
+                runner.build()
             except (NotImplementedError, ValueError, RuntimeError) as exc:
                 rejected.append(f"{runner_cls.__name__}: {exc}")
                 continue
-            runner.build()
             self.runners.append(runner)
             self._tuning_runner_ids.append(backend_index)
 

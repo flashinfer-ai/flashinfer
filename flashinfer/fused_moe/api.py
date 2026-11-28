@@ -2397,6 +2397,47 @@ class CutlassFp8BlockConfig:
         return "CutlassFp8BlockConfig()"
 
 
+@dataclass(frozen=True)
+class SpecializedFp8BlockSmallTConfig:
+    """Specialized SM90 small/banded-batch MoE backend for the DeepSeek
+    128x128 FP8 block-scale contract (an agent-generated kernel; its own
+    module, :mod:`flashinfer.fused_moe.smallt_sm90` — not a CUTLASS kernel).
+
+    Same weight and routing contract as :class:`CutlassFp8BlockConfig`:
+    prepare weights once with either class and register the view under
+    either backend key — the runner accepts the ``"cutlass_fp8_block"``
+    view as its own, with no second weight copy. Externally prepared views
+    must supply finite, strictly positive FC1 and FC2 block scales.
+
+    Before CUDA graph capture, finish all eager calls that could donate a
+    workspace on the device, not just calls on the capture stream. Capture
+    can adopt a buffer from another stream without waiting for its last use.
+
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM90) and
+    the runner gates the kernel's contract (dsfp8 quant, canonical SwiGLU,
+    each band's geometry) and per-call token bands (T <= 16 and
+    256 <= T <= 4096, the measured won bands), so under ``backend=auto``
+    the ``MoELayer`` per-token-bucket shootout times the specialized kernel
+    directly on matching layers and routes to it where it wins. The runner
+    serves ONLY the kernel's own domain: out-of-band calls are declined at
+    eligibility time and served by whichever other configured backend wins
+    them (the stock dsfp8 backend, by default never this one).
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) makes the
+    runner decline every call.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 90
+
+    # The specialized kernel consumes the stock CUTLASS dsfp8 weight view
+    # unchanged (fc1 [up; gate] stacking, [128,128] f32 block-scale grids).
+    prepare_weights = staticmethod(CutlassFp8BlockConfig.prepare_weights)
+
+    def __repr__(self) -> str:
+        return "SpecializedFp8BlockSmallTConfig()"
+
+
 def _mxfp8_activation_quant(
     quant: Optional[QuantConfig],
     pair: tuple[QuantFormat, QuantFormat],
@@ -3887,6 +3928,7 @@ BackendConfigType = Union[
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
     CutlassFp8BlockConfig,
+    SpecializedFp8BlockSmallTConfig,
     CutlassMxfp8Mxfp4Config,
     CutlassMxfp8Config,
     CutlassW4A8Config,
@@ -3936,6 +3978,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
     CutlassFp8BlockConfig,
+    SpecializedFp8BlockSmallTConfig,
     CutlassMxfp8Mxfp4Config,
     CutlassMxfp8Config,
     CutlassW4A8Config,
@@ -4003,6 +4046,17 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Stock DeepSeek-fp8 block-scale backend (SM90): the incumbent that
+        # serves every dsfp8 call the specialized small-T candidate below
+        # declines (the 17..255 token gap and off-contract geometry) — with
+        # neither of these in the default list, SM90 dsfp8 layers would have
+        # no default backend at all (TrtllmFp8BlockConfig is SM100+).
+        CutlassFp8BlockConfig(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runners gate arch + contract; out-of-domain calls are declined
+        # and served by the other candidates).
+        SpecializedFp8BlockSmallTConfig(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),

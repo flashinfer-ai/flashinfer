@@ -2833,6 +2833,294 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
         return [inputs[6], inputs[7]]
 
 
+class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
+    """Unified adapter for the specialized SM90 small-T dsfp8 MoE kernel
+    (:mod:`flashinfer.fused_moe.smallt_sm90`; an agent-generated kernel).
+
+    ``forward`` calls the kernel's own module directly
+    (:func:`~flashinfer.fused_moe.smallt_sm90._moe_smallt_sm90_dispatch`) —
+    the kernel is not a CUTLASS kernel and does not route through
+    ``cutlass_fused_moe``. The runner serves EXACTLY the kernel's measured
+    domain: ``_accepts_shape`` admits only the won token bands (T <= 16 and
+    256 <= T <= 4096) with each band's geometry, so ``MoELayer``'s
+    ``backend=auto`` per-token-bucket shootout times the specialized kernel
+    on in-band buckets — as a first-class named candidate — and never routes
+    an out-of-band call here. A declined dispatch after acceptance raises
+    rather than silently serving the call with another kernel (a backend
+    carries only its own behavior).
+
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) makes
+    ``_accepts_shape`` decline every call, so auto selects among the
+    remaining backends.
+
+    The specialized kernel has no tactic space, so ``get_valid_tactics``
+    returns the single sentinel tactic and tactic preparation is a no-op.
+    Reuses ``CutlassFp8BlockRunner``'s packing and support checks (same
+    quant family, archs and prepared-weight view); the kernel manages its
+    own fp16 intermediate workspace, so no CUTLASS workspace is allocated.
+    """
+
+    backend_key = "specialized_fp8_block_smallt"
+    # The specialized kernel consumes the stock CUTLASS dsfp8 weight view
+    # unchanged, so a pack prepared for that backend serves this one too.
+    weight_view_aliases = ("cutlass_fp8_block",)
+    # Weight-view keys that request per-expert activation overrides — a
+    # stock-kernel feature the specialized kernel does not implement, so a
+    # view carrying any of them is declined at eligibility time.
+    _ACTIVATION_OVERRIDE_KEYS: ClassVar[tuple[str, ...]] = (
+        "gemm1_alpha",
+        "gemm1_beta",
+        "gemm1_clamp_limit",
+    )
+    # The kernel implements the canonical gated-SiLU epilogue only.
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+    )
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        # The config-static slice of the kernel's allowlist; the per-call
+        # slice (token bands and each band's geometry, contiguity, kill
+        # switch) is gated by _accepts_shape and re-validated by the
+        # dispatch itself.
+        if self.config.experts.intermediate_size % 128:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires 128-aligned intermediate_size "
+                f"(the [128,128] block-scale grid), got "
+                f"{self.config.experts.intermediate_size}."
+            )
+        if self.config.activation != SwiGLU():
+            raise NotImplementedError(
+                f"{type(self).__name__} implements only the canonical "
+                f"SwiGLU() epilogue; got {self.config.activation!r}."
+            )
+
+    def _build(self) -> None:
+        # No CUTLASS inner runner: this backend launches only its own
+        # module. Build it at layer init, never inside a CUDA graph capture
+        # (the dispatch refuses to compile under capture); a failed JIT
+        # build rejects the backend here, so MoELayer reports the reason
+        # and selects among the remaining candidates.
+        from .smallt_sm90 import _disabled, _get_module
+
+        # Keep the runner registered; check deferred availability before
+        # selection if the switch is subsequently cleared.
+        self._jit_deferred = _disabled()
+        if self._jit_deferred:
+            return
+
+        if _get_module() is None:
+            from .smallt_sm90 import _module_error
+
+            raise RuntimeError(
+                f"{type(self).__name__}: specialized module build failed "
+                f"({_module_error})."
+            )
+
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        # The specialized kernel manages its own plan-sized scratch inside
+        # smallt_sm90; the CUTLASS workspace the base class sizes here is
+        # never consumed by this runner's forward. Sizing it anyway would
+        # load (and on first use, build) the stock CUTLASS module and retain
+        # a large per-(bucket, hidden) allocation on BOTH packing paths
+        # (pack_inputs and the tuning-input hook), so this override keeps
+        # only the token-ceiling check and binds no CUTLASS resource.
+        max_num_tokens = self.config.execution.tune_max_num_tokens
+        if num_tokens > max_num_tokens:
+            raise ValueError(
+                f"workspace num_tokens={num_tokens} exceeds tune_max_num_tokens="
+                f"{max_num_tokens}."
+            )
+
+    def _band_geometry_ok(self, num_tokens: int, hidden_size: int) -> bool:
+        from .smallt_sm90 import _BAND2_LO, _BAND2_HI, _MAX_TOKENS
+
+        routing = self.config.routing
+        intermediate = self.config.experts.intermediate_size
+        if 1 <= num_tokens <= _MAX_TOKENS:
+            if num_tokens == 1 and not (
+                hidden_size % 512 == 0 and intermediate == 256 and routing.top_k == 9
+            ):
+                return False
+            if hidden_size % 128:
+                return False
+            # The dispatch's shared-memory predicate, verbatim: without it the
+            # runner accepts small-band geometries (e.g. H=4096, I=14336,
+            # top_k=2 at T=4) whose dispatch declines, and forward then raises
+            # out of the auto shootout instead of letting the stock backend
+            # serve the call.
+            from .smallt_sm90 import _smallt_smem_reason
+
+            return (
+                _smallt_smem_reason(
+                    num_tokens, hidden_size, intermediate, routing.top_k
+                )
+                is None
+            )
+        if _BAND2_LO <= num_tokens <= _BAND2_HI:
+            return (
+                routing.top_k == 9
+                and routing.num_experts <= 288
+                and hidden_size % 256 == 0
+                and intermediate == 256
+            )
+        return False
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        from .smallt_sm90 import _VEC_ALIGN, _disabled
+
+        if _disabled():
+            return False
+        hidden = act.hidden_states_q
+        if hidden.ndim != 2 or hidden.data_ptr() % _VEC_ALIGN:
+            return False
+        return self._band_geometry_ok(act.num_tokens, hidden.shape[1])
+
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        if not super().accepts(act, weights):
+            return False
+        # A stock dsfp8 view may carry per-expert activation overrides
+        # (gemm1_alpha / gemm1_beta / gemm1_clamp_limit). Declining such
+        # views here lets MoELayer skip this candidate and serve the call
+        # with a backend that implements them; the pack_inputs raise below
+        # stays as a defensive check for callers that bypass eligibility.
+        for key in (self.backend_key, *self.weight_view_aliases):
+            view = weights.native_views.get(key)
+            if view is not None and any(
+                name in view for name in self._ACTIVATION_OVERRIDE_KEYS
+            ):
+                return False
+        # Validate vector-load addresses on every pack, including warm calls.
+        # These pointer checks do not repack inputs or allocate an output.
+        from .smallt_sm90 import _VEC_ALIGN
+
+        for key in (self.backend_key, *self.weight_view_aliases):
+            view = weights.native_views.get(key)
+            if view is not None:
+                if any(
+                    view[name].data_ptr() % _VEC_ALIGN
+                    for name in ("fc1_expert_weights", "fc2_expert_weights")
+                ):
+                    return False
+                break
+        if not self._jit_deferred:
+            return True
+
+        from . import smallt_sm90 as smallt
+
+        if smallt._module is None:
+            if smallt._module_error is not None:
+                return False
+            device = act.hidden_states_q.device
+            if device.type != "cuda":
+                return False
+            with torch.cuda.device(device):
+                if (
+                    hasattr(torch.cuda, "is_current_stream_capturing")
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    return False
+                # A deferred build used to follow dispatch's structural guard.
+                # Keep that ordering even for packs that pass the runner checks.
+                inputs = self.pack_inputs(act, weights)
+                try:
+                    reason = smallt._eligibility(
+                        inputs[1],
+                        inputs[2],
+                        inputs[3],
+                        inputs[4],
+                        inputs[5],
+                        torch.bfloat16,
+                        self._quant_scales(inputs),
+                        inputs[0],
+                        flags={},
+                    )
+                except Exception:
+                    # Match dispatch's guard-failure decline. Build and launch
+                    # failures retain their own handling.
+                    return False
+                if reason is not None:
+                    return False
+                if smallt._get_module() is None:
+                    return False
+        self._jit_deferred = False
+        return True
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        # Accept a pack prepared for the stock dsfp8 backend: the view is the
+        # same tensors, registered under this key on first use so the base
+        # class's exact-key lookup finds it.
+        if self.backend_key not in weights.native_views:
+            for alias in self.weight_view_aliases:
+                if alias in weights.native_views:
+                    weights.prepare_for(self.backend_key, weights.get_view(alias))
+                    break
+        inputs = super().pack_inputs(act, weights)
+        # Per-expert activation-scalar overrides are a stock-kernel feature
+        # the specialized kernel does not implement; never drop them.
+        overridden = [
+            name for name, t in self._activation_params.items() if t is not None
+        ]
+        if overridden:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not consume per-expert "
+                f"activation overrides {overridden}."
+            )
+        return inputs
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self._require_built()
+        self._validate_input_count(inputs)
+        # No tactic space: the specialized kernel's launch is fully
+        # determined by the call shape.
+        return [-1]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        self._validate_input_count(inputs)
+        if do_preparation:
+            return inputs[0]  # no tactics to prepare
+
+        from .smallt_sm90 import _fallback_reasons, _moe_smallt_sm90_dispatch
+
+        before = dict(_fallback_reasons)
+        out = _moe_smallt_sm90_dispatch(
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            torch.bfloat16,
+            self._quant_scales(inputs),
+            inputs[0],
+            flags={},
+        )
+        if out is None:
+            # _accepts_shape admitted the call, so a decline here is a
+            # call-time state change (kill switch flipped, uncompiled under
+            # capture, guard mismatch). Raising keeps the backend
+            # honest: it never serves a call with a different kernel.
+            new_reasons = [
+                reason
+                for reason, count in _fallback_reasons.items()
+                if count > before.get(reason, 0)
+            ]
+            raise RuntimeError(
+                f"{type(self).__name__}: the specialized kernel declined an "
+                f"accepted call ({'; '.join(new_reasons) or 'unknown reason'})."
+            )
+        return inputs[0]
+
+
 class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS MXFP8 x MXFP4 fused MoE.
 
