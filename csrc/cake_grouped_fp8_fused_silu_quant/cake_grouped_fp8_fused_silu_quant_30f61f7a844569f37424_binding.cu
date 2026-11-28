@@ -239,6 +239,14 @@ void Run(TensorView a_A, TensorView a_A64, TensorView a_B, TensorView a_out_q, T
   check_same_device(a_m_indices, a_A, "m_indices", "A");
   TVM_FFI_CHECK((a_K >= 128LL), ValueError)
       << KERNEL_NAME << ": requires (K >= 128)";
+  TVM_FFI_CHECK((a_K <= 32768LL), ValueError)
+      << KERNEL_NAME << ": requires (K <= 32768)";
+  TVM_FFI_CHECK((a_M >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (M >= 1)";
+  TVM_FFI_CHECK((a_M <= 8388608LL), ValueError)
+      << KERNEL_NAME << ": requires (M <= 8388608)";
+  TVM_FFI_CHECK((a_N <= 8388607LL), ValueError)
+      << KERNEL_NAME << ": requires (N <= 8388607)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
