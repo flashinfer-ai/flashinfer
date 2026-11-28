@@ -939,7 +939,37 @@ def _run_mla(
     kpe_scale: float | None = None,
     ckv_scale_arr: torch.Tensor | None = None,
     head_dim_kpe: int = HEAD_DIM_KPE,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run the batched MLA kernel for one backend and return its output.
+
+    Args:
+        backend: Kernel backend name ("fa3" or "fa2").
+        q_nope: Query tensor without positional encoding, shape
+            [batch * qo_len, num_heads, HEAD_DIM_CKV].
+        q_pe: Query tensor with positional encoding, shape
+            [batch * qo_len, num_heads, head_dim_kpe].
+        ckv: KV latent tensor, either BF16 or FP8 E4M3.
+        kpe: KV positional-encoding tensor, either BF16 or FP8 E4M3.
+        qo_indptr: Query offsets for the batch.
+        kv_indptr: KV page offsets for the batch.
+        kv_indices: KV page indices.
+        kv_len_arr: KV length per batch entry.
+        num_heads: Number of query heads.
+        page_size: KV page size.
+        causal: Whether to apply the causal mask.
+        sm_scale: Softmax scale.
+        q_dtype: Query dtype.
+        kv_dtype: KV dtype.
+        ckv_scale: Per-tensor cKV scale for FP8 KV.
+        kpe_scale: Per-tensor KPE scale for FP8 KV.
+        ckv_scale_arr: Per-row cKV scale array for FP8 KV.
+        head_dim_kpe: KPE head dimension (0 for NoPE MLA).
+        return_lse: Also return the log-sum-exp tensor.
+
+    Returns:
+        The attention output, or (output, lse) when return_lse is True.
+    """
     device = q_nope.device
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
@@ -964,7 +994,7 @@ def _run_mla(
         kwargs["kpe_scale"] = kpe_scale
     if ckv_scale_arr is not None:
         kwargs["ckv_scale_arr"] = ckv_scale_arr
-    return wrapper.run(q_nope, q_pe, ckv, kpe, **kwargs)
+    return wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=return_lse, **kwargs)
 
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
@@ -1157,6 +1187,217 @@ def test_batch_mla_fp8_kv_matches_bf16_reference(
         f"max_abs_diff={max_diff:.4e} mean={mean_diff:.4e} rel={rel:.4e} "
         f"o_bf16.norm={o_bf16.norm().item():.4f} o_fp8.norm={o_fp8.norm().item():.4f}"
     )
+
+
+@pytest.mark.parametrize("head_dim_kpe", [0, HEAD_DIM_KPE])
+@pytest.mark.parametrize("kv_len", [64, 256])
+def test_batch_mla_fp8_kv_folded_scale_matches_bf16_reference(head_dim_kpe, kv_len):
+    """A per-tensor FP8 KV scale can be folded into the logits and the output
+    instead of scaling every dequantized element (noPE MLA, or
+    kpe_scale == ckv_scale). The folded kernel must match the BF16 reference
+    run on the dequantized FP8 KV within BF16 precision."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
+
+    torch.manual_seed(0xF01D)
+    device = torch.device("cuda:0")
+    batch_size, num_heads, qo_len, page_size = 2, 16, 1, 16
+
+    q_nope = (
+        torch.randn(
+            batch_size * qo_len,
+            num_heads,
+            HEAD_DIM_CKV,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 10.0
+    )
+    q_pe = (
+        torch.randn(
+            batch_size * qo_len,
+            num_heads,
+            head_dim_kpe,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 10.0
+    )
+
+    num_pages = batch_size * kv_len // page_size
+    ckv_fp32 = torch.randn(num_pages, page_size, HEAD_DIM_CKV, device=device) * 0.1
+    kpe_fp32 = torch.randn(num_pages, page_size, head_dim_kpe, device=device) * 0.1
+    amax = ckv_fp32.abs().max().item()
+    if head_dim_kpe > 0:
+        amax = max(amax, kpe_fp32.abs().max().item())
+    scale = amax / 448.0
+    ckv_fp8 = (ckv_fp32 / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    kpe_fp8 = (kpe_fp32 / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    ckv_ref = _ref_dequant_to_bf16(ckv_fp8, scale)
+    kpe_ref = _ref_dequant_to_bf16(kpe_fp8, scale)
+
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * qo_len
+    )
+    kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * (
+        kv_len // page_size
+    )
+    kv_len_arr = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    kv_indices = torch.arange(0, num_pages, dtype=torch.int32, device=device)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV + head_dim_kpe)
+
+    o_bf16 = _run_mla(
+        "fa3",
+        q_nope,
+        q_pe,
+        ckv_ref,
+        kpe_ref,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads=num_heads,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        head_dim_kpe=head_dim_kpe,
+    )
+    # Guard against a degenerate test: with near-zero logits the softmax is
+    # uniform, and the uniform-average output falls inside the tolerance below.
+    pages_per_batch = kv_len // page_size
+    uniform = torch.stack(
+        [
+            ckv_ref[b * pages_per_batch : (b + 1) * pages_per_batch]
+            .float()
+            .mean(dim=(0, 1))
+            for b in range(batch_size)
+        ]
+    )
+    uniform = (
+        uniform.view(batch_size, 1, 1, HEAD_DIM_CKV)
+        .expand(batch_size, qo_len, num_heads, HEAD_DIM_CKV)
+        .reshape_as(o_bf16)
+    )
+    assert (uniform - o_bf16.float()).abs().max().item() > 1.5e-2, (
+        "degenerate test: the uniform-average output is within tolerance of "
+        "the BF16 reference; increase the query magnitude"
+    )
+    o_fp8 = _run_mla(
+        "fa3",
+        q_nope,
+        q_pe,
+        ckv_fp8,
+        kpe_fp8,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads=num_heads,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        ckv_scale=scale,
+        kpe_scale=scale,
+        head_dim_kpe=head_dim_kpe,
+    )
+
+    torch.cuda.synchronize()
+    diff = (o_fp8.float() - o_bf16.float()).abs()
+    max_diff = diff.max().item()
+    assert max_diff < 1.5e-2, (
+        f"head_dim_kpe={head_dim_kpe} kv_len={kv_len}: "
+        f"max_abs_diff={max_diff:.4e} mean={diff.mean().item():.4e}"
+    )
+
+
+@pytest.mark.parametrize("kv_len", [63, 64, 65, 2047, 2048, 2049])
+def test_batch_mla_fp8_nope_folded_scale_page_one_matches_bf16_reference(kv_len):
+    """Cover the GLM-5.3-Flash sparse MLA shape around tile and top-k boundaries."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 NoPE MLA requires SM90a")
+
+    torch.manual_seed(0x53F1A5)
+    device = torch.device("cuda:0")
+    num_heads, scale = 16, 0.0037
+    q_nope = (
+        torch.randn(1, num_heads, HEAD_DIM_CKV, device=device, dtype=torch.bfloat16)
+        * 4.0
+    )
+    q_pe = torch.empty(1, num_heads, 0, device=device, dtype=torch.bfloat16)
+    ckv_fp8 = (
+        (torch.randn(kv_len, 1, HEAD_DIM_CKV, device=device) * 64)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+    )
+    kpe_fp8 = torch.empty(kv_len, 1, 0, device=device, dtype=torch.float8_e4m3fn)
+    ckv_ref = _ref_dequant_to_bf16(ckv_fp8, scale)
+    kpe_ref = torch.empty(kv_len, 1, 0, device=device, dtype=torch.bfloat16)
+
+    qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+    kv_indices = torch.randperm(kv_len, dtype=torch.int32, device=device)
+    kv_len_arr = torch.tensor([kv_len], dtype=torch.int32, device=device)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV)
+
+    o_bf16, lse_bf16 = _run_mla(
+        "fa3",
+        q_nope,
+        q_pe,
+        ckv_ref,
+        kpe_ref,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads=num_heads,
+        page_size=1,
+        causal=False,
+        sm_scale=sm_scale,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        head_dim_kpe=0,
+        return_lse=True,
+    )
+    # Guard against a degenerate test: with near-zero logits the softmax is
+    # uniform, and the uniform average falls inside the tolerance below.
+    uniform = ckv_ref.float().mean(dim=(0, 1)).view(1, 1, 1, HEAD_DIM_CKV)
+    uniform = uniform.expand(1, 1, num_heads, HEAD_DIM_CKV).reshape_as(o_bf16)
+    assert (uniform - o_bf16.float()).abs().max().item() > 2e-2, (
+        "degenerate test: the uniform-average output is within tolerance of "
+        "the BF16 reference; increase the query magnitude"
+    )
+    o_fp8, lse_fp8 = _run_mla(
+        "fa3",
+        q_nope,
+        q_pe,
+        ckv_fp8,
+        kpe_fp8,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads=num_heads,
+        page_size=1,
+        causal=False,
+        sm_scale=sm_scale,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        ckv_scale=scale,
+        kpe_scale=1.0,
+        head_dim_kpe=0,
+        return_lse=True,
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(o_fp8, o_bf16, rtol=2e-2, atol=2e-2)
+    # The folded-scale LSE error is at most ~4.7e-3 in these configs; keep a
+    # dedicated bound instead of reusing the output tolerance (2e-2 would
+    # allow ~0.15 at kv_len=63).
+    torch.testing.assert_close(lse_fp8, lse_bf16, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("ckv_magnitude", [0.01, 0.1, 1.0])
