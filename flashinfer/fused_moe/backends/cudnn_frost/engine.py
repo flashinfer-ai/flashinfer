@@ -543,14 +543,21 @@ class FrostRunnerMixin:
             self._sm8x = runner_cls(self.config, self.device)
         self._sm8x.check_support()
 
-    def _pack_sm8x(self, act, view, canonical_key, split_fc1_scales):
+    def _pack_sm8x(
+        self,
+        act,
+        view,
+        canonical_key,
+        split_fc1_scales,
+        fc1_scale_key="fc1_expert_scales",
+    ):
         """The attached runner's packed call over Frost's validated ``view``."""
         if split_fc1_scales:
             # [2, E, I, ...] halves hold whole 128-row scale tiles (I % 128 == 0),
             # so they concatenate into each expert's canonical [2I, ...] tiles.
-            sf1 = view["fc1_expert_scales"]
+            sf1 = view[fc1_scale_key]
             view = dict(view)
-            view["fc1_expert_scales"] = sf1.transpose(0, 1).reshape(
+            view[fc1_scale_key] = sf1.transpose(0, 1).reshape(
                 sf1.shape[1], -1, sf1.shape[-1]
             )
         weights = MoEWeightPack(native_views={canonical_key: view})

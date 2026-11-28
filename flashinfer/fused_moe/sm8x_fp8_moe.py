@@ -202,13 +202,14 @@ class _Sm8xCutlassMoEBase(_Sm8xMoEBodyBase):
         alpha_input: Optional[int],
         layout: _GroupedGemmLayout,
         inputs: List[torch.Tensor],
+        dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        """CUTLASS's epilogue ``bf16(alpha[e] * acc)`` on a float32 GEMM output."""
+        """CUTLASS's epilogue ``dtype(alpha[e] * acc)`` on a float32 GEMM output."""
         if alpha_input is None:
             return acc
         row_expert = layout.row_expert(acc.shape[0])
         alpha = inputs[alpha_input].index_select(0, row_expert)[:, None]
-        return acc.mul_(alpha).to(torch.bfloat16)
+        return acc.mul_(alpha).to(dtype)
 
     def _gemm2_operand(
         self,
@@ -335,7 +336,9 @@ class Sm8xCutlassMxfp8MoE(_Sm8xCutlassMxfp8MoEBase):
             torch.float32,
             None,
         )
-        return self._epilogue(acc, self._gemm1_alpha_input, layout, inputs)
+        return self._epilogue(
+            acc, self._gemm1_alpha_input, layout, inputs, workspace.gemm1_out.dtype
+        )
 
     def _gemm2(self, inputs, layout, workspace, intermediate, tactic) -> torch.Tensor:
         from .prepare import _quantize_mxfp8_rows
@@ -372,7 +375,7 @@ class Sm8xCutlassMxfp8Mxfp4MoE(_Sm8xCutlassMxfp8MoEBase):
             inputs[5],
             layout.m_indptr,
             self._alpha(self._gemm1_alpha_input, inputs),
-            torch.bfloat16,
+            workspace.gemm1_out.dtype,
             workspace.gemm1_out,
             32,
         )
@@ -394,13 +397,23 @@ class Sm8xCutlassMxfp8Mxfp4MoE(_Sm8xCutlassMxfp8MoEBase):
         )
 
 
+class Sm8xFrostMxfp8MoE(Sm8xCutlassMxfp8MoE):
+    """``CudnnFrostMxfp8MoeRunner`` on SM8x: the CUTLASS pipeline with GEMM1's
+    descaled float32 output kept for the activation, as Frost fuses the activation
+    into its float32 accumulator."""
+
+    _gemm1_out_dtype = torch.float32
+
+
 class Sm8xFrostMxfp8Mxfp4MoE(Sm8xCutlassMxfp8Mxfp4MoE):
     """``CudnnFrostMxfp8Mxfp4MoeRunner`` on SM8x: the CUTLASS pipeline's packed
     inputs, with Frost's per-expert ``fc1_input_scale`` and ``fc2_input_scale``
-    scaling each GEMM's float32 output before its BF16 store."""
+    scaling each GEMM's float32 output; GEMM1's stays float32 for the activation,
+    as Frost fuses the activation into its accumulator."""
 
     _gemm1_alpha_input = 7
     _gemm2_alpha_input = 8
+    _gemm1_out_dtype = torch.float32
 
 
 class Sm8xCutlassNvfp4MoE(_Sm8xCutlassMoEBase, _CudnnGroupedGemmBlockScaleRunnerBase):
@@ -431,6 +444,14 @@ class Sm8xCutlassNvfp4MoE(_Sm8xCutlassMoEBase, _CudnnGroupedGemmBlockScaleRunner
         # CUTLASS: [out, hidden, ids, weights, w1, w2, fc1_act_global, w1_scale,
         # fc1_dequant, fc2_act_global, w2_scale, fc2_dequant, hidden_states_scale].
         # GEMM1 reads the pre-quantized activations, so fc1_act_global is unused.
+        num_experts = inputs[8].shape[0]
+        for name, scale in (("fc1", inputs[6]), ("fc2", inputs[9])):
+            # The flat CUTLASS binding's rule: one value, or one per local expert.
+            if scale.ndim > 1 or (scale.ndim == 1 and scale.shape[0] != num_experts):
+                raise ValueError(
+                    f"{type(self).__name__} requires a 0-d or [{num_experts}] "
+                    f"{name}_act_global_scale, got shape {tuple(scale.shape)}."
+                )
         return [
             *inputs[1:6],
             inputs[7],
@@ -464,7 +485,7 @@ class Sm8xCutlassNvfp4MoE(_Sm8xCutlassMoEBase, _CudnnGroupedGemmBlockScaleRunner
             inputs[5],
             layout.m_indptr,
             inputs[self._gemm1_alpha_input],
-            torch.bfloat16,
+            workspace.gemm1_out.dtype,
             workspace.gemm1_out,
             16,
         )
@@ -497,6 +518,14 @@ class Sm8xCutlassNvfp4MoE(_Sm8xCutlassMoEBase, _CudnnGroupedGemmBlockScaleRunner
             None,
             16,
         )
+
+
+class Sm8xFrostNvfp4MoE(Sm8xCutlassNvfp4MoE):
+    """``CudnnFrostNvfp4MoeRunner`` on SM8x: GEMM1's descaled float32 output stays
+    float32 for the activation, as Frost fuses the activation into its
+    accumulator."""
+
+    _gemm1_out_dtype = torch.float32
 
 
 def _route_repeated_experts(

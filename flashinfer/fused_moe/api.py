@@ -3258,11 +3258,13 @@ class CudnnFrostNvfp4Config:
     Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
     ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
     multiples of 128. Pass the layer's quant config to prepare_activations.
+    On SM80/86/87/89 the same forward runs on the SM8x pipeline of the CUTLASS
+    NVFP4 runner.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (107, 120)
+        return arch in (80, 86, 87, 89, 107, 120)
 
     prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)

@@ -10737,7 +10737,7 @@ class _GroupedGemmWorkspace:
 
     num_rows: int
     permuted_hidden_states: torch.Tensor  # [rows, H / k_pack], activation dtype
-    gemm1_out: torch.Tensor  # [rows, 2I | I] bf16
+    gemm1_out: torch.Tensor  # [rows, 2I | I], the runner's _gemm1_out_dtype
     # [rows, I] bf16 activation output; only live rows are written, so padding
     # rows keep finite values from earlier calls. The FP8 runner rescales it in
     # place to requantize it.
@@ -10784,6 +10784,8 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
     # GEMM2's operand dtype: the bf16 activation output, or its E4M3
     # requantization for FP8.
     _intermediate_dtype: ClassVar[torch.dtype] = torch.bfloat16
+    # GEMM1's stored output, the activation's input.
+    _gemm1_out_dtype: ClassVar[torch.dtype] = torch.bfloat16
     _k_pack: ClassVar[int] = 1  # elements per stored byte along K (2 for packed FP4)
 
     def __init__(self, config: MoEConfig, device: torch.device) -> None:
@@ -10931,7 +10933,7 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 dtype=self._x_dtype,
                 device=self.device,
             ),
-            gemm1_out=empty(rows, self._gemm1_rows),
+            gemm1_out=empty(rows, self._gemm1_rows, dtype=self._gemm1_out_dtype),
             intermediate=torch.zeros(
                 rows,
                 self.config.experts.intermediate_size,

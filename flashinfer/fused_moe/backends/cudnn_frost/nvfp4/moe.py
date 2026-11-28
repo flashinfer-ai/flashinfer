@@ -8,17 +8,22 @@ owned by this runner; no other backend executes any part of its pipeline.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from itertools import product
 
 import torch
 
 from .....fused_moe.api import QuantFormat, RoutingInputMode
-from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
+from .....fused_moe.runners import (
+    CutlassNvfp4Runner,
+    MoERunner,
+    _validate_prerouted_inputs,
+)
 from .....utils import get_compute_capability
 from .. import runtime as common
 from ..activations import ACTIVATIONS, activation_name
-from ..support import SUPPORTED_ARCHS, weight_view
+from ..support import SM8X_ARCH_NUMBERS, SUPPORTED_ARCHS, weight_view
 from .support import is_eligible
 from ..compiler import require_moe_assembler
 from ..cache import (
@@ -53,7 +58,28 @@ _WEIGHT_KEYS = (
     "fc2_dequant_scale",
 )
 _TAG = "cudnn_frost-nvfp4-moe-v3"
-_UNSUPPORTED = "cuDNN Frost NVFP4 MoE kernels require SM107a or SM120a"
+_UNSUPPORTED = (
+    "cuDNN Frost NVFP4 MoE kernels require SM80, SM86, SM87, SM89, SM107a or SM120a"
+)
+
+
+class _Sm8xRunner(CutlassNvfp4Runner):
+    """CUTLASS's SM8x NVFP4 pipeline with Frost's quantization contract: linear
+    activation scales (Frost unswizzles a swizzled pack before handing it over),
+    the activation on GEMM1's float32 output and a plain NVFP4 intermediate, as
+    Frost's own kernels produce."""
+
+    @staticmethod
+    def _sm8x_body_class():
+        from .....fused_moe.sm8x_fp8_moe import Sm8xFrostNvfp4MoE
+
+        return Sm8xFrostNvfp4MoE
+
+    def __init__(self, config, device):
+        quant = dataclasses.replace(
+            config.quant, swizzled_scale_factors=None, nvfp4_4over6=None
+        )
+        super().__init__(dataclasses.replace(config, quant=quant), device)
 
 
 def _tensor_version(tensor):
@@ -443,13 +469,17 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
             raise NotImplementedError(_UNSUPPORTED)
         major, minor = get_compute_capability(self.device)
         arch = f"sm_{major}{minor}a"
-        if arch not in SUPPORTED_ARCHS:
+        sm8x = major * 10 + minor in SM8X_ARCH_NUMBERS
+        if arch not in SUPPORTED_ARCHS and not sm8x:
             raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize or self.config.quant.per_token_scale:
             raise NotImplementedError(
                 "cuDNN Frost NVFP4 MoE requires finalized output without per-token scales"
             )
+        if sm8x:
+            self._attach_sm8x(_Sm8xRunner)
+            return
         sources = tuple(
             sorted(
                 {
@@ -474,6 +504,9 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
         require_compiler(arch, sources)
 
     def _build(self):
+        if self._sm8x is not None:
+            self._sm8x.build()
+            return
         device, activation = self.device, self.config.activation
         swizzled = self.config.quant.swizzled_scale_factors is True
         self._engine = FrostEngine(
@@ -611,6 +644,25 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
         self._check_scale(a2, positive=True)
         self._check_scale(alpha1, positive=False)
         self._check_scale(alpha2, positive=False)
+        if self._sm8x is not None:
+            if swizzled:
+                from .....gemm.sm8x_fp4_dense import _unswizzle
+
+                act = dataclasses.replace(
+                    act,
+                    hidden_states_scale=_unswizzle(xsf.view(torch.uint8), t, h // 16),
+                )
+            # Frost's activation globals are scalars; CUTLASS takes a 0-d global or
+            # one per local expert.
+            view = dict(
+                view,
+                fc1_act_global_scale=a1.reshape(()),
+                fc2_act_global_scale=a2.reshape(()),
+            )
+            split = tuple(sf1.shape) == (mult, e, i, h // 16)
+            return self._pack_sm8x(
+                act, view, "cutlass_nvfp4", split, "fc1_weight_block_scale"
+            )
         xsf = xsf.view(torch.uint8)
         a1 = a1.reshape(1)
         a2 = a2.reshape(1)
@@ -640,6 +692,8 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
+        if self._sm8x is not None:
+            return self._sm8x.get_valid_tactics(inputs, profile)
         state = prepared_state(self, inputs, hidden_multiplier=2)
         if state is not None:
             return ranked_tactics(state, inputs, _TAG)
@@ -657,6 +711,8 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
         )
 
     def _input_cache_key_extras(self, inputs):
+        if self._sm8x is not None:
+            return self._sm8x._input_cache_key_extras(inputs)
         state = prepared_state(self, inputs, hidden_multiplier=2)
         if state is not None:
             key, tactics = state.preparation_key, tuple(state.launches)
@@ -679,6 +735,8 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
         return (POLICY_VERSION, key, tactics)
 
     def validate_tactic(self, inputs, tactic):
+        if self._sm8x is not None:
+            return tactic == -1 or tactic in self._sm8x.get_valid_tactics(inputs, None)
         state = prepared_state(self, inputs, hidden_multiplier=2)
         return tactic == -1 or tactic in (
             state.launches

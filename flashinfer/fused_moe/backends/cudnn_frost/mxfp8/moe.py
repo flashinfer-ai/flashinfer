@@ -57,6 +57,17 @@ _UNSUPPORTED = (
 )
 
 
+class _Sm8xRunner(CutlassMxfp8Runner):
+    """CUTLASS's SM8x MXFP8 pipeline with the activation on GEMM1's float32
+    output, as Frost's own kernels run it."""
+
+    @staticmethod
+    def _sm8x_body_class():
+        from .....fused_moe.sm8x_fp8_moe import Sm8xFrostMxfp8MoE
+
+        return Sm8xFrostMxfp8MoE
+
+
 @functools.lru_cache(maxsize=None)
 def _module(arch):
     from .....jit.cudnn_frost import gen_cudnn_frost_moe_module
@@ -420,7 +431,7 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
                 "cuDNN Frost MXFP8 MoE requires finalized output without per-token scales"
             )
         if sm8x:
-            self._attach_sm8x(CutlassMxfp8Runner)
+            self._attach_sm8x(_Sm8xRunner)
             return
         sources = tuple(
             sorted(
