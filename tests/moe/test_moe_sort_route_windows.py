@@ -72,6 +72,7 @@ def _run_moe_sort(num_tokens: int, tile_size: int, seed: int):
         num_local_experts=LOCAL_EXPERTS,
         tile_tokens_dim=tile_size,
         enable_pdl=False,
+        padding=num_tokens * TOP_K,
     )
     torch.cuda.synchronize()
     return selected, outputs
@@ -137,6 +138,7 @@ def test_permutation_is_a_bijection_over_local_routes(num_tokens, tile_size):
 
     # Each tile holds rows of a single expert.
     rows = permuted_to_expanded[: num_tiles * tile_size].view(num_tiles, tile_size)
+    assert torch.all(rows[~live] == num_tokens * TOP_K)
     safe_rows = rows.long().clamp(0, flat_selected.numel() - 1)
     row_expert = torch.where(live, flat_selected[safe_rows].long(), -1)
     want = tile_expert[:num_tiles].long()[:, None].expand_as(row_expert)

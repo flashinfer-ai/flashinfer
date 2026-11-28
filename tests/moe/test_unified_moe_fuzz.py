@@ -186,6 +186,7 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     RoutingInputMode,
 )
+from flashinfer.fused_moe import get_colonels_tactics
 from flashinfer.fused_moe.api import (
     # Typed activation values
     GELU,
@@ -206,6 +207,8 @@ from flashinfer.fused_moe.api import (
     CudnnGroupedGemmFp8PerTensorConfig,
     CudnnGroupedGemmMxfp8Config,
     CudnnGroupedGemmNvfp4Config,
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -292,6 +295,8 @@ pytestmark = [
 # code. A "True" backend MUST reproduce bitwise; flip to False only with evidence (and ideally an
 # upstream note), because a deterministic->non-deterministic regression is exactly a bug to catch.
 _DETERMINISTIC = {
+    "colonels_bf16": False,  # BF16 atomic accumulation in the fused down projection
+    "colonels_fp8_block": False,  # same atomic accumulation contract
     "cutlass_bf16": True,
     "cutlass_w4a16": True,
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
@@ -1215,7 +1220,7 @@ _DTYPE = {
     ),
     "bf16": DTypeHandler(
         variant="bf16",
-        candidate_configs=(TrtllmBf16Config, CutlassBf16Config),
+        candidate_configs=(TrtllmBf16Config, CutlassBf16Config, ColonelsBf16Config),
         snap=_bf16_snap,
         make_act_pack=_bf16_act_pack,
         make_act_pack_logits=_bf16_act_pack_logits,
@@ -1227,7 +1232,7 @@ _DTYPE = {
     ),
     "deepseekfp8": DTypeHandler(
         variant="deepseekfp8",
-        candidate_configs=(TrtllmFp8BlockConfig,),
+        candidate_configs=(TrtllmFp8BlockConfig, ColonelsFp8BlockConfig),
         snap=_block_fp8_snap,
         make_act_pack=lambda x, ids, weights: _block_fp8_act_pack(
             x, ids, weights, variant="deepseekfp8"
@@ -2953,6 +2958,23 @@ def test_unified_moe_fuzz(cfg):
         BackendCfg
         for BackendCfg in handler.candidate_configs
         if BackendCfg in _BACKEND_RUNNERS and BackendCfg.supported(sm)
+    ]
+    activation = _activation_for(cfg)
+    # Colonels uses fixed default SwiGLU parameters and an aligned fused GEMM.
+    wired_backends = [
+        B
+        for B in wired_backends
+        if B not in (ColonelsBf16Config, ColonelsFp8BlockConfig)
+        or (
+            (
+                activation == SwiGLU()
+                or (B is ColonelsBf16Config and isinstance(activation, ReLU2))
+            )
+            and any(
+                t.supports_shape(cfg.hidden, cfg.intermediate, activation.is_gated)
+                for t in get_colonels_tactics(sm, fp8=B is ColonelsFp8BlockConfig)
+            )
+        )
     ]
     if cfg.is_fromlogits:
         # In-kernel routing restricts to FromLogits-capable backends (CuteDSL is pre-routed-only,

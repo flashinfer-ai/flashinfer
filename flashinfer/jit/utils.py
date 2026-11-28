@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import pathlib
+import tempfile
 
 import torch
 
@@ -26,9 +28,15 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
                 return
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-    # UTF-8, not the locale encoding (cp1252 on Windows): generated sources can hold non-ASCII text.
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(temporary, path)
+    finally:
+        pathlib.Path(temporary).unlink(missing_ok=True)
 
 
 dtype_map = {

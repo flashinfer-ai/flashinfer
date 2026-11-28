@@ -1,0 +1,31 @@
+#include "flashinfer/colonels/fused_moe_w8a8_up_down_acc.cuh"
+{% include "binding.jinja" %}
+launch_fused_moe_kernel_up_down_acc<
+        {{ config.BM }},
+        {{ config.BN }},
+        {{ config.WN }},
+        {{ config.STAGES }}
+    >(
+        x,
+        x_scale,
+        w,
+        w_scale,
+        w2,
+        w2_scale,
+        out,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        M,
+        N,
+        K,
+        num_experts,
+        sorted_num,
+        block_m,
+        scaling_factor,
+        stream
+    );
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);

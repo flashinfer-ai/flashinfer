@@ -33,6 +33,8 @@ from ..autotuner import AutoTuner
 from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
+    ColonelsBf16Config,
+    ColonelsFp8BlockConfig,
     BackendOptions,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -130,6 +132,7 @@ from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
 from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
+from .backends.colonels.runner import ColonelsRunnerBF16, ColonelsRunnerFP8
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .batch_invariant.runner import BatchInvariantMoeRunner
 from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
@@ -138,6 +141,8 @@ from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    ColonelsRunnerBF16,
+    ColonelsRunnerFP8,
     BatchInvariantMoeRunner,
     BatchInvariantFp8PerTensorRunner,
     FrostLowLatencyRunner,
@@ -188,7 +193,11 @@ _RunnerT = Union[
 ]
 
 # Map backend-config class -> runner class
+
+
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    ColonelsBf16Config: ColonelsRunnerBF16,
+    ColonelsFp8BlockConfig: ColonelsRunnerFP8,
     BatchInvariantBf16Config: BatchInvariantMoeRunner,
     FrostLowLatencyConfig: FrostLowLatencyRunner,
     CakeStepFunConfig: CakeStepFunRunner,
@@ -389,8 +398,8 @@ class MoELayer:
                 f"runners: [{mvp}].{hint}{reasons}"
             )
 
-        # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
-        # routing input mode).  See the MoELayer reuse contract (CR4): the
+        # Cross-backend winner cache, keyed by token-count bucket, activation
+        # width, routing mode, and eligible candidates. See the reuse contract (CR4): the
         # fastest backend can differ across token-count buckets, so each bucket
         # caches its own winner; the mode qualifier keeps a winner tuned for
         # one routing input style (e.g. pre-routed → CuteDSL) from being
@@ -411,7 +420,8 @@ class MoELayer:
 
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
-        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+        per ``(token-count bucket, activation width, mode, eligible candidates)``
+        so repeated calls skip reselection.
         Candidate pools containing Frost low-latency use exact token counts
         because their bounded tactics need not cover every row in a bucket.
 
@@ -456,7 +466,7 @@ class MoELayer:
             bucket = act_pack.num_tokens
         # Candidate positions distinguish different options for the same backend
         # and prevent changing weight views or shape eligibility from reusing a winner.
-        winner_key = (bucket, mode, eligible)
+        winner_key = (bucket, act_pack.hidden_states_q.shape[1], mode, eligible)
         winner = self._winners.get(winner_key)
         if winner is None:
             runners = [self.runners[index] for index in eligible]

@@ -257,6 +257,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       }
       params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta] = min(mnLimit1, mnLimit2);
       initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+      initRoutingExpandedIdxPadding(params, min(mnLimit1, mnLimit2), mnLimit1);
     }
     ctaOffsetExp += finalNumCta;
   }

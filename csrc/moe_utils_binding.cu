@@ -17,12 +17,15 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <tvm/ffi/optional.h>
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
+
+#include <limits>
 
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
@@ -31,6 +34,10 @@
 using namespace tensorrt_llm::kernels::cute_dsl;
 
 namespace {
+__global__ void read_num_sm_ids_kernel(int* output) {
+  asm volatile("mov.u32 %0, %%nsmid;" : "=r"(*output));
+}
+
 // Helper function to compute log2 of a value (returns -1 if not power of 2)
 inline int32_t computeLog2(int32_t val) {
   int32_t n = val;
@@ -44,6 +51,15 @@ inline int32_t computeLog2(int32_t val) {
   return out;
 }
 }  // namespace
+
+void read_num_sm_ids(int64_t output_ptr, int64_t stream_ptr) {
+  read_num_sm_ids_kernel<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream_ptr)>>>(
+      reinterpret_cast<int*>(output_ptr));
+  auto status = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(read_num_sm_ids, read_num_sm_ids);
 
 // ============================ moePermute bindings ============================
 
@@ -369,13 +385,21 @@ void moe_sort(
     int64_t expert_counts_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
-    int64_t cuda_stream_ptr) {
+    int64_t cuda_stream_ptr, ffi::Optional<int64_t> padding) {
   // Set up the routing data structure
   moe::dev::routing::routingDeepSeek::Data routingData;
 
   // Configure dtypes
   routingData.mDtypeOutput = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   routingData.mUsePdl = use_pdl;
+  routingData.mFillExpandedIdxPadding = padding.has_value();
+  if (padding.has_value()) {
+    auto const value = padding.value();
+    TVM_FFI_ICHECK(value >= std::numeric_limits<int32_t>::min() &&
+                   value <= std::numeric_limits<int32_t>::max())
+        << "padding must fit in int32";
+    routingData.mExpandedIdxPadding = static_cast<int32_t>(value);
+  }
   routingData.mUseContiguousRouteWindows = num_tokens >= kContiguousRouteWindowMinTokens;
 
   // Input tensors (pre-computed expert selections)
