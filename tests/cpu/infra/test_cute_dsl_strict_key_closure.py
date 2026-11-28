@@ -513,8 +513,9 @@ def test_cute_dsl_core_closure_excludes_unrelated_module_generators(real_package
 def test_gemm_kernel_closure_excludes_attention_stack(real_package):
     # gemm_svdquant reaches flashinfer/__init__.py through the trace
     # templates' function-local ``from flashinfer import ...``.
-    # The attention trace template imports prims_ts._scales at module load
-    # time; that helper and its package initializer are real dependencies.
+    # The attention trace template imports prims_ts.common.scales at module
+    # load time; that helper and its package initializers are real
+    # dependencies.
     closure = source_analysis._package_import_closure(
         real_package / "gemm" / "gemm_svdquant.py"
     )
@@ -527,5 +528,6 @@ def test_gemm_kernel_closure_excludes_attention_stack(real_package):
     )
     assert attention == [
         "attention/prims_ts/__init__.py",
-        "attention/prims_ts/_scales.py",
+        "attention/prims_ts/common/__init__.py",
+        "attention/prims_ts/common/scales.py",
     ]

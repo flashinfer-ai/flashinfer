@@ -24,14 +24,16 @@ import math
 import pytest
 import torch
 
-from flashinfer.attention.prims_ts.sage.config import _INT8_QK_COMPUTE_CAPABILITIES
+from flashinfer.attention.prims_ts.variants.sage.config import (
+    INT8_QK_COMPUTE_CAPABILITIES,
+)
 
 FP8 = torch.float8_e4m3fn
 
 # INT8 Q/K launch only where the tcgen05 MMA takes INT8 operands.
 REQUIRES_INT8_QK_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in _INT8_QK_COMPUTE_CAPABILITIES,
+    or torch.cuda.get_device_capability() not in INT8_QK_COMPUTE_CAPABILITIES,
     reason="INT8 Q/K Sage attention requires SM100",
 )
 # INT8 Q/K are drawn with this standard deviation and their scales divided by
@@ -139,7 +141,7 @@ def fold(
 def reference_sage_scales(
     layout, params, *, batch_size: int, num_kv_heads: int
 ) -> torch.Tensor:
-    """Build the prepared scales from the flat tensors as ``_SageScaleLayout`` describes them.
+    """Build the prepared scales from the flat tensors as ``SageScaleLayout`` describes them.
 
     Per sequence (batch entry and KV head): each K section's atoms in word
     order, a token past the section's length taking its last scale and

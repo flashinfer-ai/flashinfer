@@ -35,13 +35,13 @@ from flashinfer.attention.prims_ts import (
     SageAttentionParams,
     block_sparse_attention,
 )
-from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
-from flashinfer.attention.prims_ts.sage.config import validate_sage_recipe
-from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+from flashinfer.attention.prims_ts.variants.block_sparse import config as sparse_config
+from flashinfer.attention.prims_ts.variants.sage.config import validate_sage_recipe
+from flashinfer.attention.prims_ts.variants.decode.kernel.device.constants import (
     E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
 )
-from flashinfer.attention.prims_ts.sage.layout import _SageQSection
+from flashinfer.attention.prims_ts.variants.sage.layout import SageQSection
 
 from tests.attention.test_attention_ts_block_sparse import (
     _HEAD_DIM,
@@ -376,8 +376,8 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
             use_proxy_routes=case.routes == "proxy",
             share_pattern_across_kv_heads=case.share_pattern_across_kv_heads,
         )
-    select_scheduler = sparse_config._select_block_sparse_scheduler
-    sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+    select_scheduler = sparse_config.select_block_sparse_scheduler
+    sparse_config.resolve_block_sparse_launch_spec.cache_clear()
     try:
         with pytest.MonkeyPatch.context() as monkeypatch:
             if case.persistent:
@@ -385,7 +385,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
                 # persistent scheduler; keep its Q tile and force the choice.
                 monkeypatch.setattr(
                     sparse_config,
-                    "_select_block_sparse_scheduler",
+                    "select_block_sparse_scheduler",
                     lambda **kwargs: (select_scheduler(**kwargs)[0], True),
                 )
             wrapper.plan(
@@ -409,8 +409,8 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
                 **route_kwargs,
             )
     finally:
-        sparse_config._resolve_block_sparse_launch_spec.cache_clear()
-    policy = dict(wrapper._policy)
+        sparse_config.resolve_block_sparse_launch_spec.cache_clear()
+    policy = dict(wrapper.policy)
     assert policy["tile_size_q"] == (64 if case.kv_tile == 256 else 128)
     assert policy["tile_size_kv"] == case.kv_tile
     assert policy["scheduler"] == ("persistent" if case.persistent else "static")
@@ -681,7 +681,7 @@ def test_prepared_sage_scales_match_flat_scales(case: _SageCase) -> None:
     )
     wrapper.run(q, k, v, sage=params, **_routing(case, patterns, summaries, valid))
     torch.cuda.synchronize()
-    state = wrapper._plan_state
+    state = wrapper.plan_state
     layout = state.sage_scales_layout
     assert layout.q_rows.tiles > 1
     expected = reference_sage_scales(
@@ -819,7 +819,7 @@ def test_sage_q_rows_round_trip(heads_interleaved: bool) -> None:
     decode that tile and row back.
     """
 
-    rows = _SageQSection(
+    rows = SageQSection(
         seq_len_q=300,
         q_block_size=2,
         heads_q_per_kv=4,
@@ -845,7 +845,7 @@ def test_sage_q_rows_pad_grouped_tiles() -> None:
     finite, and the next tile starts 128 words later.
     """
 
-    rows = _SageQSection(
+    rows = SageQSection(
         seq_len_q=40,
         q_block_size=1,
         heads_q_per_kv=7,
@@ -937,7 +937,7 @@ def _sage_decode_config(
 
     import cutlass
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.selection import (
         make_decode_config,
     )
 
@@ -1001,7 +1001,7 @@ def test_sage_decode_config_rejects_unsupported_launches(
 def _mixed_proxy_config():
     """A block-sparse proxy plan with 16-token K scales and 4-token summary scales."""
 
-    spec = sparse_config._resolve_block_sparse_launch_spec(
+    spec = sparse_config.resolve_block_sparse_launch_spec(
         device_index=0,
         batch_size=1,
         seq_len_q=128,
@@ -1025,7 +1025,7 @@ def _mixed_proxy_config():
         v_dtype_key="float8_e4m3fn",
         sage=SageAttentionConfig(k_block_size=16, k_summary_block_size=4),
     )
-    return sparse_config._make_block_sparse_config(spec.compile_key)
+    return sparse_config.make_block_sparse_config(spec.compile_key)
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -1043,7 +1043,7 @@ def _mixed_proxy_config():
 def test_sage_schedule_passes_strict_validation(make_config) -> None:
     """The scale resources appear in the resource dependency graph."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.kernel import (
         build_decode_task_manager,
     )
 

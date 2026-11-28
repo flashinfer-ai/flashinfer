@@ -107,10 +107,10 @@ def test_validation_only_mla_schedule_keeps_exhaustive_checking(monkeypatch):
     """The JIT-time optimization must preserve explicit offline verification."""
     pytest.importorskip("cutlass", minversion="4.7.0")
     from cutlass.experimental.task_scheduling.task_manager import TaskManager
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.throughput_2cta.config import (
         make_mla_decode_config,
     )
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
+    from flashinfer.attention.prims_ts.variants.mla_decode.kernel.throughput_2cta.kernel import (
         build_mla_decode_task_manager,
     )
 

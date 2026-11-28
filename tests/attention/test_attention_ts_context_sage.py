@@ -329,7 +329,7 @@ def test_context_sage_prepared_scales_match_reference(
     out = wrapper.run(q, k, v, sage=params)
     torch.cuda.synchronize()
     assert out.shape == q.shape and out.dtype == torch.bfloat16
-    state = wrapper._plan_state.sage
+    state = wrapper.plan_state.sage
     assert state is not None
     reference = reference_sage_scales(
         state.layout, params, batch_size=batch_size, num_kv_heads=num_kv_heads

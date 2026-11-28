@@ -244,7 +244,7 @@ import flashinfer.gemm
 import flashinfer.kda_decode
 import flashinfer.norm
 import flashinfer.sampling
-from flashinfer.attention.prims_ts.block_sparse import (
+from flashinfer.attention.prims_ts.variants.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
     block_sparse_attention,
@@ -2927,13 +2927,13 @@ with contextlib.suppress(Exception):
 # reusable-wrapper public surfaces (SM100/SM103 only).
 for _pts_semantic_PS in (32, 4):
     with contextlib.suppress(Exception):
-        from flashinfer.attention.prims_ts.decode import (
+        from flashinfer.attention.prims_ts.variants.decode import (
             BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
         )
-        from flashinfer.attention.prims_ts.decode import (
+        from flashinfer.attention.prims_ts.variants.decode import (
             batch_decode_with_paged_kv_cache as _attention_ts_decode,
         )
-        from flashinfer.attention.prims_ts.decode import (
+        from flashinfer.attention.prims_ts.variants.decode import (
             get_prims_ts_batch_decode_workspace_size as _prims_ts_fmha_ws_size,
         )
 
@@ -3065,13 +3065,13 @@ for _pts_semantic_PS in (32, 4):
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
 with contextlib.suppress(Exception):
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
     )
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         batch_mla_decode_with_paged_kv_cache as _attention_ts_mla_decode,
     )
-    from flashinfer.attention.prims_ts.mla_decode import (
+    from flashinfer.attention.prims_ts.variants.mla_decode import (
         get_prims_ts_batch_mla_decode_workspace_size as _prims_ts_mla_ws_size,
     )
 

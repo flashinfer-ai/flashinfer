@@ -67,6 +67,19 @@ assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
 
 
 @pytest.mark.cpu_only
+def test_sage_config_legacy_import_keeps_module_identity():
+    _run_isolated(
+        """
+from importlib import import_module
+
+legacy = import_module("flashinfer.attention.prims_ts.sage.config")
+canonical = import_module("flashinfer.attention.prims_ts.variants.sage.config")
+assert legacy is canonical
+"""
+    )
+
+
+@pytest.mark.cpu_only
 def test_prims_ts_bootstrap_scopes_work_tile_info_customization():
     from flashinfer.prims_ts import is_prims_ts_available
 

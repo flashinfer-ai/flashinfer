@@ -11,6 +11,7 @@ These host contracts are not GPU/JIT or full decode numerical qualification.
 import argparse
 import ast
 import builtins
+import hashlib
 import math
 from pathlib import Path
 import struct
@@ -707,7 +708,7 @@ def test_benchmark_times_canonical_public_replay_with_caller_storage():
         "deepseek_v41_decode": decode,
         "deepseek_v41_decode_workspace_size": size,
         "workspace_views": views,
-        "_partition": partition,
+        "partition": partition,
     }
     exec(
         compile(ast.Module(body=[function], type_ignores=[]), str(_BENCHMARK), "exec"),
@@ -832,19 +833,19 @@ def test_native_source_hashes_without_importing_modules():
     assert set(bindings) == {"PRIMS_TS_SOURCES"}
     sources = bindings["PRIMS_TS_SOURCES"]
     assert {
-        "experimental/deepseek_v41/prims_ts/_sparse_views.py",
-        "experimental/deepseek_v41/prims_ts/_workspace.py",
+        "experimental/deepseek_v41/prims_ts/sparse_views.py",
+        "experimental/deepseek_v41/prims_ts/workspace.py",
         "experimental/deepseek_v41/prims_ts/__init__.py",
         "experimental/deepseek_v41/prims_ts/kernel.py",
         "experimental/deepseek_v41/prims_ts/resources.py",
         "cute_dsl/fp4_common.py",
-        "attention/prims_ts/kernels/mla_decode/helpers/ops.py",
-        "attention/prims_ts/kernels/mla_decode/helpers/sparse_indices.py",
-        "attention/prims_ts/kernels/task_compat.py",
+        "attention/prims_ts/variants/mla_decode/kernel/device/ops.py",
+        "attention/prims_ts/variants/mla_decode/kernel/device/sparse_indices.py",
+        "attention/prims_ts/device/task.py",
     }.issubset(sources)
     assert not {
         "experimental/deepseek_v41/prims_ts/_metadata.py",
-        "attention/prims_ts/kernels/mla_decode/sparse_views.py",
+        "attention/prims_ts/variants/mla_decode/kernel/sparse_views.py",
     }.intersection(sources)
     assert not any("mxfp8" in source for source in sources)
     main = definition(_BENCHMARK, "main")
@@ -892,6 +893,71 @@ def test_native_source_hashes_without_importing_modules():
         for relative in sources
     }
     assert all(path.is_file() for path in paths.values())
+
+
+def test_prims_ts_compile_keys_shared_packing_source():
+    flashinfer = _ROOT / "flashinfer"
+    prims_ts = flashinfer / "attention/prims_ts"
+    deepseek = flashinfer / "experimental/deepseek_v41"
+    adapter = deepseek / "prims_ts"
+    adapter_path = adapter / "__init__.py"
+    cache_path = prims_ts / "compile_cache.py"
+    build_and_load = Mock()
+    cutlass = Mock(__version__="4.8.0", CUDA_VERSION=SimpleNamespace(major=13, minor=2))
+
+    def source(path):
+        assert path.is_file()
+        return SimpleNamespace(__file__=str(path))
+
+    imports = {
+        (0, "cutlass"): cutlass,
+        (0, "cutlass.cute"): cutlass,
+        (4, "cute_dsl.availability"): SimpleNamespace(require_cute_dsl_arch=Mock()),
+        (4, "attention.prims_ts.compile_cache"): SimpleNamespace(
+            kernel_source_files=extract(
+                cache_path, "kernel_source_files", Path=Path, __file__=str(cache_path)
+            )
+        ),
+        (4, "jit.cute_dsl_core"): SimpleNamespace(
+            build_and_load_cute_dsl_kernel=build_and_load
+        ),
+        (4, "cute_dsl"): SimpleNamespace(
+            fp4_common=source(flashinfer / "cute_dsl/fp4_common.py")
+        ),
+        (2, ""): SimpleNamespace(
+            hca_v41_primitives=source(deepseek / "hca_v41_primitives.py")
+        ),
+        (1, ""): SimpleNamespace(
+            kernel=Mock(__file__=str(adapter / "kernel.py")),
+            resources=source(adapter / "resources.py"),
+            sparse_views=source(adapter / "sparse_views.py"),
+            workspace=source(adapter / "workspace.py"),
+        ),
+    }
+
+    def stub_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if (level, name) in imports:
+            return imports[level, name]
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    compile_decode = extract(
+        adapter_path,
+        "compile",
+        __file__=str(adapter_path),
+        __builtins__={**vars(builtins), "__import__": stub_import},
+        hashlib=hashlib,
+        torch=SimpleNamespace(
+            cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)
+        ),
+        device_sm_count=lambda _: 148,
+    )
+    compile_decode(0, 128)
+
+    keyed_files = {
+        Path(path) for path in build_and_load.call_args.kwargs["extra_key_files"]
+    }
+    assert prims_ts / "device/packing.py" in keyed_files
+    assert adapter / "resources.py" in keyed_files
 
 
 def test_example_uses_common_descale_hnd_and_output_only_caller_buffers():
@@ -953,26 +1019,26 @@ def test_single_kv_pipe_task_scales(use_defaults):
     """Check setup plumbing with host mocks, not actual CuTe loop lowering."""
     kernel = (
         _ROOT
-        / "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py"
+        / "flashinfer/attention/prims_ts/variants/mla_decode/kernel/latency_1cta/kernel.py"
     )
 
     class HostFloat32:
         def __init__(self, value):
             self.value = value
 
-    function = definition(kernel, "_make_single_kv_pipe_task_graph")
+    function = definition(kernel, "make_single_kv_pipe_task_graph")
     setup_end = next(
         index
         for index, node in enumerate(function.body)
         if isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Call)
-        and ast.unparse(node.value.func) == "_check_persistent_scheduler_modes"
+        and ast.unparse(node.value.func) == "validate_persistent_scheduler_modes"
     )
     supplied_scale, supplied_output = object(), object()
     namespace = {
         "scale_softmax_log2": None if use_defaults else supplied_scale,
         "output_scale": None if use_defaults else supplied_output,
-        "_default_scales": extract(kernel, "_default_scales", Float32=HostFloat32),
+        "default_scales": extract(kernel, "default_scales", Float32=HostFloat32),
     }
     exec(
         compile(
@@ -995,8 +1061,8 @@ def test_single_kv_pipe_task_scales(use_defaults):
 @pytest.fixture
 def native_task():
     """Execute task state/control plumbing, without a CuTe import or lowering."""
-    kernels = _ROOT / "flashinfer/attention/prims_ts/kernels"
-    path = kernels / "mla_decode/throughput_latency_1cta/tasks.py"
+    prims_ts = _ROOT / "flashinfer/attention/prims_ts"
+    path = prims_ts / "variants/mla_decode/kernel/latency_1cta/tasks/common.py"
     task = next(
         node
         for node in ast.parse(path.read_text()).body
@@ -1022,10 +1088,10 @@ def native_task():
             self.body_calls.append(kwargs)
 
     context_kwargs = extract(
-        kernels / "task_compat.py",
+        prims_ts / "device/task.py",
         "task_context_kwargs",
         ResourceContext=object,
-        _TASK_ACCEPTS_CONTEXT=True,
+        TASK_ACCEPTS_CONTEXT=True,
     )
     namespace = dict(
         Task=HostTask,
@@ -1057,9 +1123,9 @@ def native_task():
 def test_native_task_body_guard_preserves_initialization_and_context(
     native_task, accepts_context, active
 ):
-    native_task.context_kwargs.__globals__["_TASK_ACCEPTS_CONTEXT"] = accepts_context
+    native_task.context_kwargs.__globals__["TASK_ACCEPTS_CONTEXT"] = accepts_context
     task = native_task.task(warp_idx=4)
-    task._runtime_body_active = active
+    task.runtime_body_active = active
     context = SimpleNamespace(tmem_ptr_i32=None)
     task.init_variables(context)
     assert task.initialized

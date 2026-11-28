@@ -168,7 +168,7 @@ def test_runtime_dense_kv_domain_graph_replay() -> None:
 
     arch = BaseDSL._get_dsl().get_arch_enum()
     assert (arch.major, arch.minor) == torch.cuda.get_device_capability()
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    assert dict(wrapper.plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
     def run(validate=False):
         return wrapper.run(q, k, v, qo, ko, out=output, lse=stats, validate=validate)

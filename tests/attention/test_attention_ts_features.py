@@ -30,12 +30,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from flashinfer.attention.prims_ts._compile_cache import (
-    _compile_cache_key,
-    _kernel_source_files,
+from flashinfer.attention.prims_ts.compile_cache import (
+    compile_cache_key,
+    kernel_source_files,
     build_and_load_attention_kernel,
 )
-from flashinfer.attention.prims_ts import _compile_cache, _hardware
+from flashinfer.attention.prims_ts import compile_cache as _compile_cache
+from flashinfer.attention.prims_ts.common import hardware as _hardware
 
 pytestmark = pytest.mark.arch_blackwell
 
@@ -50,24 +51,24 @@ class _Spec:
 
 def test_compile_identity_tracks_codegen_but_not_device_placement():
     spec = _Spec()
-    key = _compile_cache_key(spec, "--opt-level 3")
+    key = compile_cache_key(spec, "--opt-level 3")
     assert key is not None
-    assert key == _compile_cache_key(
+    assert key == compile_cache_key(
         replace(spec, device_index=1, kernel=object()), "--opt-level 3"
     )
-    assert key != _compile_cache_key(replace(spec, shape=(256, 256)), "--opt-level 3")
-    assert key != _compile_cache_key(
+    assert key != compile_cache_key(replace(spec, shape=(256, 256)), "--opt-level 3")
+    assert key != compile_cache_key(
         replace(spec, kernel_signature=("kernel", 8)), "--opt-level 3"
     )
-    assert key != _compile_cache_key(spec, "--opt-level 2")
-    assert _compile_cache_key(spec, "", (132,)) != _compile_cache_key(spec, "", (148,))
+    assert key != compile_cache_key(spec, "--opt-level 2")
+    assert compile_cache_key(spec, "", (132,)) != compile_cache_key(spec, "", (148,))
 
 
 def test_keys_are_stable_across_processes():
     script = """
-from flashinfer.attention.prims_ts._compile_cache import _compile_cache_key
-from flashinfer.attention.prims_ts.kernels.stage import FmhaStage
-print(_compile_cache_key((128, FmhaStage.Loop, None, True), '--opt-level 3'))
+from flashinfer.attention.prims_ts.compile_cache import compile_cache_key
+from flashinfer.attention.prims_ts.device.stage import WorkStage
+print(compile_cache_key((128, WorkStage.Loop, None, True), '--opt-level 3'))
 """
     keys = [
         subprocess.check_output([sys.executable, "-c", script], text=True).strip()
@@ -81,7 +82,7 @@ def test_enum_identity_does_not_alias_an_integer():
     class Mode(enum.IntEnum):
         FIRST = 1
 
-    assert _compile_cache_key((Mode.FIRST,), "") != _compile_cache_key((1,), "")
+    assert compile_cache_key((Mode.FIRST,), "") != compile_cache_key((1,), "")
 
 
 def test_unknown_compile_values_bypass_persistence(monkeypatch):
@@ -108,7 +109,7 @@ def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch, tmp_
     capability = [(10, 0)]
     source = tmp_path / "kernel.py"
     source.write_text("pass")
-    monkeypatch.setattr(_compile_cache, "_kernel_source_files", lambda: (str(source),))
+    monkeypatch.setattr(_compile_cache, "kernel_source_files", lambda: (str(source),))
     hash_sources = Mock(wraps=cute_dsl_core._hash_source_files)
     monkeypatch.setattr(cute_dsl_core, "_hash_source_files", hash_sources)
     monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
@@ -146,26 +147,26 @@ def test_family_targets_keep_physical_device_defaults_distinct(monkeypatch, tmp_
 
 def test_source_dependencies_include_shared_attention_code():
     sources = {
-        Path(path).relative_to(Path(_hardware.__file__).parent).as_posix()
-        for path in _kernel_source_files()
+        Path(path).relative_to(Path(_hardware.__file__).parents[1]).as_posix()
+        for path in kernel_source_files()
     }
     assert {
-        "decode.py",
-        "context.py",
-        "mla_decode.py",
-        "sage/config.py",
-        "sage/index.py",
-        "sage/layout.py",
-        "sage/prepare.py",
-        "_compile_cache.py",
-        "_block_sparse/compiler.py",
-        "_block_sparse/prepared.py",
-        "kernels/mask.py",
-        "kernels/separate_reduction.py",
-        "kernels/task_compat.py",
-        "kernels/fmha_decode/block_sparse_prepare.py",
-        "kernels/fmha_context/fmha_kernel.py",
-        "kernels/mla_decode/throughput_2cta/kernel.py",
+        "variants/decode/__init__.py",
+        "variants/context/__init__.py",
+        "variants/mla_decode/__init__.py",
+        "variants/sage/config.py",
+        "variants/sage/kernel/index.py",
+        "variants/sage/layout.py",
+        "variants/sage/kernel/prepare.py",
+        "compile_cache.py",
+        "variants/block_sparse/compile.py",
+        "variants/block_sparse/prepared.py",
+        "device/mask.py",
+        "device/lse_merge.py",
+        "device/task.py",
+        "variants/block_sparse/kernel/prepare.py",
+        "variants/context/kernel/kernel.py",
+        "variants/mla_decode/kernel/throughput_2cta/kernel.py",
     } <= sources
 
 
@@ -207,8 +208,8 @@ def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypa
         "cuOccupancyMaxPotentialClusterSize",
         lambda *_: (driver.CUresult.CUDA_SUCCESS, (16, 8)[device[0]]),
     )
-    _hardware._query_max_active_clusters.cache_clear()
-    _hardware._cluster_limits.cache_clear()
+    _hardware.query_max_active_clusters.cache_clear()
+    _hardware.cluster_limits.cache_clear()
     try:
         assert _hardware.get_max_active_clusters(1) == 148
         assert _hardware.get_max_active_clusters(1) == 148
@@ -225,8 +226,8 @@ def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypa
         assert _hardware.get_max_active_clusters(2) == 73
         assert calls == [(0, 1), (0, 2), (0, 16), (1, 1), (1, 2), (1, 2)]
     finally:
-        _hardware._query_max_active_clusters.cache_clear()
-        _hardware._cluster_limits.cache_clear()
+        _hardware.query_max_active_clusters.cache_clear()
+        _hardware.cluster_limits.cache_clear()
 
 
 @pytest.mark.skipif(
@@ -236,7 +237,9 @@ def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypa
 )
 @pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
 def test_sparse_inspection_reuses_block_geometry(paged, tmp_path, monkeypatch):
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import block_sparse_inspect
+    from flashinfer.attention.prims_ts.variants.block_sparse.kernel import (
+        inspect as block_sparse_inspect,
+    )
     from flashinfer.jit import env as jit_env
     from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl
 
@@ -331,15 +334,15 @@ def test_public_attention_disk_cache_in_fresh_processes(tmp_path):
 import sys
 import pytest
 import torch
-from flashinfer.attention.prims_ts import _compile_cache
+from flashinfer.attention.prims_ts import compile_cache as _compile_cache
 from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl
 
-original_key = _compile_cache._compile_cache_key
+original_key = _compile_cache.compile_cache_key
 def checked_key(*args, **kwargs):
     key = original_key(*args, **kwargs)
     assert key is not None, 'compile specification bypassed disk cache'
     return key
-_compile_cache._compile_cache_key = checked_key
+_compile_cache.compile_cache_key = checked_key
 
 if sys.argv[1] == 'warm':
     current = torch.cuda.current_device()
@@ -409,7 +412,7 @@ def test_kv_tile_is_fully_visible(
     expected: bool,
 ) -> None:
     pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_is_fully_visible
+    from flashinfer.attention.prims_ts.device.mask import kv_tile_is_fully_visible
 
     assert (
         kv_tile_is_fully_visible(
@@ -436,7 +439,7 @@ def test_kv_tile_needs_right_mask(
     expected: bool,
 ) -> None:
     pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_needs_right_mask
+    from flashinfer.attention.prims_ts.device.mask import kv_tile_needs_right_mask
 
     assert (
         kv_tile_needs_right_mask(tile_offset_k, tile_size_kv, visible_end) is expected
@@ -450,7 +453,7 @@ def test_unmasked_kv_tile_range_matches_per_tile_visibility() -> None:
     Bounds past its 16-bit fields may only shrink the range.
     """
     pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts.kernels.mask import (
+    from flashinfer.attention.prims_ts.device.mask import (
         kv_tile_in_range,
         kv_tile_is_fully_visible,
         pack_kv_tile_range,

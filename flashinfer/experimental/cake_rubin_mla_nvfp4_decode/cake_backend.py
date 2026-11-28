@@ -527,7 +527,7 @@ def device_units_pairs(device_index: int) -> tuple[int, int]:
     :func:`units_pairs_for_sm_count`.  The values shape the plan's cost model and item order only."""
     sm = cake_jit.sm_count(device_index)
     try:
-        from ...attention.prims_ts._hardware import get_max_active_clusters
+        from ...attention.prims_ts.common.hardware import get_max_active_clusters
 
         with torch.cuda.device(device_index):
             mac4 = int(get_max_active_clusters(4))

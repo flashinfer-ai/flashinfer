@@ -142,7 +142,7 @@ def workspace_host(monkeypatch):
         _PRIVATE / "_utils.py", "_dsv41_workspace_utils_cpu", monkeypatch
     )
     module = _load_host(
-        _PRIVATE / "prims_ts/_workspace.py",
+        _PRIVATE / "prims_ts/workspace.py",
         "_dsv41_workspace_cpu",
         monkeypatch,
         torch=torch,
@@ -196,7 +196,7 @@ def workspace_host(monkeypatch):
     # Production global lookups see only these declared host simulations.
     # The real Torch CUDA guard remains installed and is never called.
     monkeypatch.setattr(module, "torch", HostTorch())
-    imports["experimental.deepseek_v41.prims_ts._workspace"] = module
+    imports["experimental.deepseek_v41.prims_ts.workspace"] = module
     assert torch.cuda._initialized == initialized and not blocked
     try:
         yield SimpleNamespace(
@@ -262,7 +262,7 @@ def test_workspace_size_and_real_cpu_views(workspace_host, k):
     before = storage.clone()
     views = host.module.workspace_views(storage, batch, k)
     assert host.torch.equal(storage, before)
-    sections = host.module._sections(batch, k)
+    sections = host.module.sections(batch, k)
     end = 0
     for name, shape, dtype in sections:
         view = getattr(views, name)
@@ -333,7 +333,7 @@ def test_signed_byte_workspace_with_nonzero_storage_offset(workspace_host):
     before = owner.clone()
     views = host.module.workspace_views(storage, 2, 64, backend="prims-ts")
     assert storage.storage_offset() == 32
-    for name, _, _ in host.module._sections(2, 64):
+    for name, _, _ in host.module.sections(2, 64):
         view = getattr(views, name)
         assert view.data_ptr() % 32 == 0
         assert storage.data_ptr() <= view.data_ptr()
@@ -396,22 +396,22 @@ def test_workspace_views_reject_without_writing(workspace_host, fault):
 @pytest.mark.parametrize("positive", (False, True))
 def test_scalar_range_rejects_without_cuda(workspace_host, value, positive):
     with pytest.raises(ValueError, match="scalar|FP32"):
-        workspace_host.module._scalar(value, "scale", positive=positive)
+        workspace_host.module.scalar(value, "scale", positive=positive)
 
 
 @pytest.mark.parametrize("value", (0.0, -1.0, 1e-100))
 def test_bmm1_requires_positive_after_fp32_rounding(workspace_host, value):
     with pytest.raises(ValueError, match="positive finite"):
-        workspace_host.module._scalar(value, "bmm1_scale", positive=True)
+        workspace_host.module.scalar(value, "bmm1_scale", positive=True)
 
 
 def test_scalar_no_tensor_and_fp32_values(workspace_host):
     host = workspace_host
     with pytest.raises(ValueError, match="Python scalar"):
-        host.module._scalar(host.torch.tensor(1.0, device="cpu"), "scale")
-    assert host.module._scalar(0, "bmm2") == 0.0
-    assert host.module._scalar(-2.0, "bmm2") == -2.0
-    value = host.module._scalar(1.0000001, "bmm1", positive=True)
+        host.module.scalar(host.torch.tensor(1.0, device="cpu"), "scale")
+    assert host.module.scalar(0, "bmm2") == 0.0
+    assert host.module.scalar(-2.0, "bmm2") == -2.0
+    value = host.module.scalar(1.0000001, "bmm1", positive=True)
     assert value == struct.unpack("f", struct.pack("f", 1.0000001))[0]
 
 

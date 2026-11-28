@@ -54,25 +54,32 @@ from flashinfer.deepseek_v41 import (
 
 
 PRIMS_TS_SOURCES = (
-    "experimental/deepseek_v41/prims_ts/_sparse_views.py",
-    "experimental/deepseek_v41/prims_ts/_workspace.py",
+    "experimental/deepseek_v41/prims_ts/sparse_views.py",
+    "experimental/deepseek_v41/prims_ts/workspace.py",
     "experimental/deepseek_v41/hca_v41_primitives.py",
     "experimental/deepseek_v41/prims_ts/__init__.py",
     "experimental/deepseek_v41/prims_ts/kernel.py",
     "experimental/deepseek_v41/prims_ts/resources.py",
     "cute_dsl/fp4_common.py",
-    "attention/prims_ts/kernels/mla_decode/helpers/ops.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/tasks.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/config.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/smem_resources.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_corr.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_p.py",
-    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_s.py",
-    "attention/prims_ts/kernels/mla_decode/helpers/sparse_indices.py",
-    "attention/prims_ts/kernels/task_compat.py",
-    "attention/prims_ts/kernels/separate_reduction.py",
+    "attention/prims_ts/variants/mla_decode/kernel/device/ops.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/kernel.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/__init__.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/common.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/correction.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/load.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/mma.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/page_offsets.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/scheduler.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/tasks/softmax.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/config.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/parallel_reduction.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/resources/smem_resources.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/resources/tmem_corr.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/resources/tmem_p.py",
+    "attention/prims_ts/variants/mla_decode/kernel/latency_1cta/resources/tmem_s.py",
+    "attention/prims_ts/variants/mla_decode/kernel/device/sparse_indices.py",
+    "attention/prims_ts/device/task.py",
+    "attention/prims_ts/device/lse_merge.py",
 )
 
 
@@ -383,8 +390,8 @@ def prepare_decode(args, backend):
     if backend != "prims-ts":
         raise ValueError("backend must be cute-dsl or prims-ts")
 
-    from flashinfer.experimental.deepseek_v41.prims_ts import _partition
-    from flashinfer.experimental.deepseek_v41.prims_ts._workspace import (
+    from flashinfer.experimental.deepseek_v41.prims_ts import partition
+    from flashinfer.experimental.deepseek_v41.prims_ts.workspace import (
         workspace_views,
     )
 
@@ -423,7 +430,7 @@ def prepare_decode(args, backend):
         assert result is out
         return result, lse
 
-    kv_splits, head_dim_ctas = _partition(batch, compressed_k, q.device.index)
+    kv_splits, head_dim_ctas = partition(batch, compressed_k, q.device.index)
     return call, {
         "workspace_bytes": workspace.numel(),
         "split": kv_splits,

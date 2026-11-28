@@ -21,18 +21,18 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from flashinfer.attention.prims_ts._scales import normalize_scale, resolve_scale
-from flashinfer.attention.prims_ts.block_sparse import (
+from flashinfer.attention.prims_ts.common.scales import normalize_scale, resolve_scale
+from flashinfer.attention.prims_ts.variants.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
     block_sparse_attention,
     block_sparse_attention_with_paged_kv_cache,
 )
-from flashinfer.attention.prims_ts.decode import (
+from flashinfer.attention.prims_ts.variants.decode import (
     BatchDecodePagedTSWrapper,
     batch_decode_with_paged_kv_cache,
 )
-from flashinfer.attention.prims_ts.mla_decode import (
+from flashinfer.attention.prims_ts.variants.mla_decode import (
     BatchMLADecodePagedTSWrapper,
     batch_mla_decode_with_paged_kv_cache,
 )
@@ -131,7 +131,7 @@ def _trace_case(family, bound, scales):
     if family in ("decode", "mla"):
         names = ("softmax_scale", "output_scale")
     if bound:
-        wrapper._plan_state = SimpleNamespace(**state)
+        wrapper.plan_state = SimpleNamespace(**state)
         return wrapper.run, kwargs, names
     kwargs.update(zip(names, scales, strict=True))
     return api, kwargs, names
@@ -184,7 +184,7 @@ def test_prims_ts_float_scale_trace_keeps_values_runtime():
             "dtype": "float32",
             "optional": True,
         }
-    api.__self__._plan_state.output_scale = 2.5
+    api.__self__.plan_state.output_scale = 2.5
     assert fi_trace(api, **kwargs) == inherited
 
 
@@ -237,7 +237,7 @@ def test_prims_ts_trace_prefers_planned_device_and_scale():
         replacement = torch.empty(1, device="cuda:0")
         other_device = torch.empty(1, device="cuda:1")
     state = SimpleNamespace(device=planned.device, softmax_scale=planned)
-    kwargs = {"self": SimpleNamespace(_plan_state=state), "q": other_device}
+    kwargs = {"self": SimpleNamespace(plan_state=state), "q": other_device}
     inherited = _prims_ts_trace_scale_values(kwargs, ("softmax_scale",), bound=True)
     assert inherited["softmax_scale"]._base is planned
     explicit = _prims_ts_trace_scale_values(
@@ -257,7 +257,7 @@ def test_prims_ts_trace_omitted_scale_defaults():
     names = ("softmax_scale", "output_scale")
     assert _prims_ts_trace_scale_values({}, names, bound=False) == dict.fromkeys(names)
     state = SimpleNamespace(softmax_scale=0.25, output_scale=1.5)
-    kwargs = {"self": SimpleNamespace(_plan_state=state), "softmax_scale": None}
+    kwargs = {"self": SimpleNamespace(plan_state=state), "softmax_scale": None}
     assert _prims_ts_trace_scale_values(kwargs, names, bound=True) == {
         "softmax_scale": 0.25,
         "output_scale": 1.5,

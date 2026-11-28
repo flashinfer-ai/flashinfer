@@ -10,14 +10,64 @@ import cutlass
 import cutlass.cute as cute
 
 
-def _make_fp8_attention(
+class Fp8SwaDecodeKernel:
+    def __init__(self, attention, kv_splits=1):
+        self.attention = attention
+        self.kv_splits = kv_splits
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Tensor,
+        swa_cache: cute.Tensor,
+        main_cache: cute.Tensor,
+        indices: cute.Tensor,
+        topk_lens: cute.Tensor,
+        seq_lens: cute.Tensor,
+        sinks: object,
+        out: cute.Tensor,
+        lse: cute.Tensor,
+        partials: object,
+        bmm1_scale: cutlass.Float32,
+        bmm2_scale: cutlass.Float32,
+        stream: object,
+    ):
+        final_lse = cute.make_tensor(
+            lse.iterator,
+            cute.make_layout((64, 1, indices.shape[0]), stride=(1, 64, 64)),
+        )
+        # Preserve the native six-slot ABI. The producer-owned binder consumes
+        # the original combined table/live lengths instead of prepared lists.
+        direct = (indices, None, seq_lens, topk_lens, sinks, None)
+        self.attention(
+            q,
+            q,
+            main_cache,
+            swa_cache,
+            None,
+            out,
+            final_lse,
+            partials,
+            cutlass.Int32(self.kv_splits),
+            seq_lens,
+            None,
+            direct,
+            bmm1_scale,
+            bmm2_scale,
+            stream,
+        )
+
+
+def make_fp8_attention(
     compressed_k, sm_count, native_fp4, head_dim_ctas=1, kv_splits=1, persistent=False
 ):
-    from ....attention.prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
-    from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
+    from ....attention.prims_ts.variants.mla_decode.kernel.sparse_selection import (
+        SparseMlaProfile,
+    )
+    from ....attention.prims_ts.variants.mla_decode.kernel.latency_1cta.kernel import (
         ThroughputLatencyMlaDecodeTs,
     )
-    from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+    from ....attention.prims_ts.variants.mla_decode.kernel.latency_1cta.config import (
         MlaProfile,
     )
     from .resources import MixedFp8KvProducer
@@ -94,51 +144,3 @@ def _make_fp8_attention(
     # costs 2-6% once the grid covers more SMs (e.g. B16/K512: 12.50 vs 11.74 us).
     attention.pdl_entry_trigger_max_ctas = sm_count // 4
     return attention
-
-
-class Fp8SwaDecodeKernel:
-    def __init__(self, attention, kv_splits=1):
-        self.attention = attention
-        self.kv_splits = kv_splits
-
-    @cute.jit
-    def __call__(
-        self,
-        q: cute.Tensor,
-        swa_cache: cute.Tensor,
-        main_cache: cute.Tensor,
-        indices: cute.Tensor,
-        topk_lens: cute.Tensor,
-        seq_lens: cute.Tensor,
-        sinks: object,
-        out: cute.Tensor,
-        lse: cute.Tensor,
-        partials: object,
-        bmm1_scale: cutlass.Float32,
-        bmm2_scale: cutlass.Float32,
-        stream: object,
-    ):
-        final_lse = cute.make_tensor(
-            lse.iterator,
-            cute.make_layout((64, 1, indices.shape[0]), stride=(1, 64, 64)),
-        )
-        # Preserve the native six-slot ABI. The producer-owned binder consumes
-        # the original combined table/live lengths instead of prepared lists.
-        direct = (indices, None, seq_lens, topk_lens, sinks, None)
-        self.attention(
-            q,
-            q,
-            main_cache,
-            swa_cache,
-            None,
-            out,
-            final_lse,
-            partials,
-            cutlass.Int32(self.kv_splits),
-            seq_lens,
-            None,
-            direct,
-            bmm1_scale,
-            bmm2_scale,
-            stream,
-        )

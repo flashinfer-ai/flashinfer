@@ -23,16 +23,22 @@ from itertools import accumulate
 import pytest
 import torch
 
-from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
+import flashinfer.attention.prims_ts.variants.decode as decode_package
+import flashinfer.attention.prims_ts.variants.decode.launch as decode_launch
+import flashinfer.attention.prims_ts.variants.decode.plan as decode_plan
+import flashinfer.attention.prims_ts.variants.decode.validation as decode_validation
+from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
-    _build_q_token_kv_block_sparse_metadata as build_prims_ts_q_token_kv_block_sparse_metadata,
-    _get_q_token_kv_block_sparse_metadata_output_shapes as get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes,
-    _get_prims_ts_q_token_kv_block_sparse_workspace_layout,
-    _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors,
-    _prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_q_token_kv_block_sparse_attention,
-    _validate_wide_metadata_fits,
+    prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_q_token_kv_block_sparse_attention,
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
+)
+from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata.metadata import (
+    build_metadata as build_prims_ts_q_token_kv_block_sparse_metadata,
+    get_metadata_output_shapes as get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes,
+    get_workspace_layout,
+    get_workspace_layout_from_tensors,
+    validate_wide_metadata_fits,
 )
 from flashinfer.decode import (
     make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_q_token_kv_block_sparse_qo_indptr,
@@ -48,6 +54,19 @@ _REQUIRES_PRIMS_TS_ATTENTION = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="QToken-KvBlock-Sparse-Attention tests require SM100, SM103 or SM107",
 )
+
+
+_DECODE_MODULES = (decode_package, decode_launch, decode_plan, decode_validation)
+
+
+def _patch_decode(monkeypatch, name, value):
+    """Patch a helper in every split module that looks it up."""
+    patched = False
+    for module in _DECODE_MODULES:
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, value)
+            patched = True
+    assert patched, name
 
 
 @contextmanager
@@ -638,7 +657,7 @@ def test_q_token_kv_block_sparse_workspace_size_rejects_signed_locator_overflow(
 def test_unified_q_token_kv_block_sparse_workspace_8k_q_128k_kv_owns_metadata_outputs() -> (
     None
 ):
-    layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
+    layout = get_workspace_layout(
         8192,
         512,
         2048,
@@ -1352,7 +1371,7 @@ def test_wide_group_sort_union_long_context_matches_reference(
     """G16/G32 bit-map unions over long prefixes match a host reference, plane by plane."""
 
     try:
-        _validate_wide_metadata_fits(
+        validate_wide_metadata_fits(
             group_size, max_seq_len_kv, 4, torch.cuda.current_device()
         )
     except ValueError as error:
@@ -1440,8 +1459,8 @@ def test_wide_group_sort_union_long_context_matches_reference(
 @pytest.mark.parametrize("packed", (False, True))
 def test_query_major_memberships_graph(group_size: int, packed: bool) -> None:
     """Check eight-slot masks, ragged/inert routes and mask-tile boundaries."""
-    from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
-        _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan,
+    from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata.metadata import (
+        prepare_metadata_plan,
     )
 
     # The two context bounds exercise shared-map and bounded-sort producers.
@@ -1472,7 +1491,7 @@ def test_query_major_memberships_graph(group_size: int, packed: bool) -> None:
     indices = torch.empty((4, capacity), dtype=torch.int32, device="cuda")
     members = torch.empty((4, capacity // 4), dtype=torch.int32, device="cuda")
     seq_lens = torch.empty(4, dtype=torch.int32, device="cuda")
-    plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
+    plan = prepare_metadata_plan(
         blocks,
         table,
         requests,
@@ -2064,12 +2083,14 @@ def _run_private_q_token_kv_block_sparse_decode(
 ) -> torch.Tensor:
     """Exercise the lower-level QToken-KvBlock-Sparse-Attention route without exposing it publicly."""
 
-    from flashinfer.attention.prims_ts.decode import (
-        _prepare_prims_ts_batch_decode_plan,
-        _resolve_decode_workspace_layout,
+    from flashinfer.attention.prims_ts.variants.decode.plan import (
+        prepare_batch_decode_plan,
+    )
+    from flashinfer.attention.prims_ts.variants.decode.launch import (
+        resolve_decode_workspace_layout,
     )
 
-    layout = _resolve_decode_workspace_layout(
+    layout = resolve_decode_workspace_layout(
         int(query.shape[0]),
         int(query.shape[-2]),
         int(k_cache.shape[1]),
@@ -2095,7 +2116,7 @@ def _run_private_q_token_kv_block_sparse_decode(
             q_token_kv_block_sparse_page_indices.shape[0],
             0,
         )
-    plan, prepared_out = _prepare_prims_ts_batch_decode_plan(
+    plan, prepared_out = prepare_batch_decode_plan(
         query,
         (k_cache, v_cache),
         workspace,
@@ -2145,8 +2166,6 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
     split-KV launch.
     """
 
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     batch_size = 1
     num_kv_heads = 1
     head_dim = 256
@@ -2156,8 +2175,8 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
     num_q_token_kv_block_sparse_pages = len(segment_memberships) * pages_per_kv128
     max_seq_len = num_q_token_kv_block_sparse_pages * sparse_page_size
 
-    decode_module._resolve_decode_launch_spec.cache_clear()
-    spec = decode_module._resolve_decode_launch_spec(
+    decode_launch.resolve_decode_launch_spec.cache_clear()
+    spec = decode_launch.resolve_decode_launch_spec(
         torch.cuda.current_device(),
         batch_size,
         num_qo_heads,
@@ -2272,8 +2291,6 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
     monkeypatch: pytest.MonkeyPatch,
     group_size: int,
 ) -> None:
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     num_routes = table.shape[0]
     num_qo_heads = 12
@@ -2301,7 +2318,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
         max_seq_len_kv=table.shape[1] * storage_page_size,
         out_dtype=torch.bfloat16,
     )
-    workspace_layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
+    workspace_layout = get_workspace_layout(
         blocks.shape[0],
         blocks.shape[1],
         table.shape[1],
@@ -2322,11 +2339,11 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
     calls: dict[str, object] = {}
 
     class FakeAttentionPlan:
-        _direct_q1_inputs = ()
-        _flat_locator_heads = 1
-        _uses_route_order = False
+        direct_q1_inputs = ()
+        flat_locator_heads = 1
+        uses_route_order = False
 
-        def _run_unchecked(
+        def run_unchecked(
             self,
             actual_query: torch.Tensor,
             out: torch.Tensor,
@@ -2386,9 +2403,9 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
         )
         return FakeAttentionPlan(), expected_output
 
-    monkeypatch.setattr(
-        decode_module,
-        "_prepare_prims_ts_batch_decode_plan",
+    _patch_decode(
+        monkeypatch,
+        "prepare_batch_decode_plan",
         fake_prepare,
     )
     assert (
@@ -2437,8 +2454,6 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
     monkeypatch: pytest.MonkeyPatch,
     group_size: int,
 ) -> None:
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     batch_size = 2
     groups_per_request = 1
@@ -2477,11 +2492,11 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
     calls: dict[str, torch.Tensor] = {}
 
     class FakeAttentionPlan:
-        _direct_q1_inputs = ()
-        _flat_locator_heads = 1
-        _uses_route_order = False
+        direct_q1_inputs = ()
+        flat_locator_heads = 1
+        uses_route_order = False
 
-        def _run_unchecked(
+        def run_unchecked(
             self,
             actual_query: torch.Tensor,
             out: torch.Tensor,
@@ -2524,9 +2539,9 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
         assert actual_output.data_ptr() == output.data_ptr()
         return FakeAttentionPlan(), actual_output
 
-    monkeypatch.setattr(
-        decode_module,
-        "_prepare_prims_ts_batch_decode_plan",
+    _patch_decode(
+        monkeypatch,
+        "prepare_batch_decode_plan",
         fake_prepare,
     )
     result = prims_ts_q_token_kv_block_sparse_attention(
@@ -2553,8 +2568,6 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
     monkeypatch: pytest.MonkeyPatch,
     group_size: int,
 ) -> None:
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     query = torch.zeros(2, 1, group_size, 12, 256, dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
@@ -2583,11 +2596,11 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
     calls: dict[str, bool] = {}
 
     class FakeAttentionPlan:
-        _direct_q1_inputs = ()
-        _flat_locator_heads = 1
-        _uses_route_order = False
+        direct_q1_inputs = ()
+        flat_locator_heads = 1
+        uses_route_order = False
 
-        def _run_unchecked(
+        def run_unchecked(
             self,
             actual_query: torch.Tensor,
             actual_output: torch.Tensor,
@@ -2620,9 +2633,9 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
         assert actual_output.shape == actual_query.shape
         return FakeAttentionPlan(), actual_output
 
-    monkeypatch.setattr(
-        decode_module,
-        "_prepare_prims_ts_batch_decode_plan",
+    _patch_decode(
+        monkeypatch,
+        "prepare_batch_decode_plan",
         fake_prepare,
     )
     plan = prepare_prims_ts_q_token_kv_block_sparse_attention(
@@ -2932,8 +2945,6 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
     group_size: int,
     dtype: torch.dtype,
 ) -> None:
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     num_routes = table.shape[0]
     query_shape = _fixed_q_token_kv_block_sparse_shape(num_routes, group_size)
@@ -2948,7 +2959,7 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
     )
     v_cache = torch.zeros_like(k_cache)
     output = torch.empty_like(query, dtype=torch.bfloat16)
-    layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
+    layout = get_workspace_layout(
         blocks.shape[0],
         blocks.shape[1],
         table.shape[1],
@@ -2970,11 +2981,11 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
     calls: dict[str, object] = {}
 
     class FakeAttentionPlan:
-        _direct_q1_inputs = ()
-        _flat_locator_heads = 1
-        _uses_route_order = False
+        direct_q1_inputs = ()
+        flat_locator_heads = 1
+        uses_route_order = False
 
-        def _run_unchecked(
+        def run_unchecked(
             self,
             actual_query: torch.Tensor,
             actual_output: torch.Tensor,
@@ -3013,9 +3024,9 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         assert kwargs["query_major_memberships"] == layout.query_major_memberships
         return FakeAttentionPlan(), actual_output
 
-    monkeypatch.setattr(
-        decode_module,
-        "_prepare_prims_ts_batch_decode_plan",
+    _patch_decode(
+        monkeypatch,
+        "prepare_batch_decode_plan",
         fake_prepare,
     )
     plan = prepare_prims_ts_q_token_kv_block_sparse_attention(
@@ -3046,14 +3057,14 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
     assert calls["ran"] is True
     assert torch.all(views.attention_workspace_buffer == 0x5A)
     assert (
-        plan._metadata_plan.q_token_kv_block_sparse_page_indices.data_ptr()
+        plan.metadata_plan.q_token_kv_block_sparse_page_indices.data_ptr()
         == views.q_token_kv_block_sparse_page_indices.data_ptr()
     )
     assert (
-        plan._metadata_plan.q_token_kv_block_sparse_page_memberships.data_ptr()
+        plan.metadata_plan.q_token_kv_block_sparse_page_memberships.data_ptr()
         == views.q_token_kv_block_sparse_page_memberships.data_ptr()
     )
-    assert plan._metadata_plan.seq_lens.data_ptr() == views.seq_lens.data_ptr()
+    assert plan.metadata_plan.seq_lens.data_ptr() == views.seq_lens.data_ptr()
     expected = _reference(
         blocks,
         table,
@@ -3173,8 +3184,6 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
 def test_prepared_packed_q_token_kv_block_sparse_does_not_materialize_route_offsets_on_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from flashinfer.attention.prims_ts import decode as decode_module
-
     group_size = 4
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     query = torch.zeros((8, 12, 256), dtype=torch.bfloat16, device="cuda")
@@ -3212,9 +3221,9 @@ def test_prepared_packed_q_token_kv_block_sparse_does_not_materialize_route_offs
     ) -> tuple[object, object]:
         return lambda *_args: None, None
 
-    monkeypatch.setattr(
-        decode_module,
-        "_get_compiled_decode",
+    _patch_decode(
+        monkeypatch,
+        "get_compiled_decode",
         fake_get_compiled_decode,
     )
     original_to = torch.Tensor.to
@@ -3284,7 +3293,7 @@ def test_prepared_q_token_kv_block_sparse_plan_replays_without_counter_reset(
     )
     v_cache = torch.randn_like(k_cache)
     output = torch.empty_like(query)
-    layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
+    layout = get_workspace_layout(
         blocks.shape[0],
         blocks.shape[1],
         table.shape[1],
@@ -3340,7 +3349,7 @@ def test_prepared_q_token_kv_block_sparse_plan_replays_without_counter_reset(
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
     if layout.uses_split_kv:
         assert not torch.count_nonzero(
-            plan._attention_plan._workspace.split_kv_counter
+            plan.attention_plan.workspace.split_kv_counter
         ).item()
 
 
@@ -3349,8 +3358,6 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     monkeypatch,
 ) -> None:
     """Exercise the production low-grid Q1 policy and its PDL reducer."""
-
-    from flashinfer.attention.prims_ts import decode as decode_module
 
     batch_size = 16
     num_qo_heads = 6
@@ -3365,8 +3372,8 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     ) // storage_page_size
 
     device_index = torch.cuda.current_device()
-    decode_module._resolve_decode_launch_spec.cache_clear()
-    spec = decode_module._resolve_decode_launch_spec(
+    decode_launch.resolve_decode_launch_spec.cache_clear()
+    spec = decode_launch.resolve_decode_launch_spec(
         device_index,
         batch_size,
         num_qo_heads,
@@ -3396,7 +3403,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     assert spec.config.use_parallel_separate_reduction_pdl
     assert spec.config.use_pdl
 
-    standalone_spec = decode_module._resolve_decode_launch_spec(
+    standalone_spec = decode_launch.resolve_decode_launch_spec(
         device_index,
         batch_size,
         num_qo_heads,
@@ -3507,7 +3514,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     def unexpected_metadata(*args, **kwargs):
         raise AssertionError("G1 must not launch a separate metadata kernel")
 
-    monkeypatch.setattr(type(plan._metadata_plan), "run", unexpected_metadata)
+    monkeypatch.setattr(type(plan.metadata_plan), "run", unexpected_metadata)
 
     def reference_for_context(visible_tokens: int) -> torch.Tensor:
         reference = torch.empty_like(query, dtype=torch.float32)
@@ -3545,7 +3552,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     short_reference = reference_for_context(short_context_length)
     torch.testing.assert_close(output.float(), short_reference, rtol=1e-2, atol=1e-2)
     assert not torch.count_nonzero(
-        plan._attention_plan._workspace.split_kv_counter
+        plan.attention_plan.workspace.split_kv_counter
     ).item()
 
     query_positions.fill_(context_length - 1)
@@ -3794,7 +3801,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_grouped_tp4_bs256_cuda_graph(
         out=prepared_output,
         max_seq_len_kv=max_storage_pages * storage_page_size,
     )
-    assert plan._metadata_plan.release_attention_pdl is True
+    assert plan.metadata_plan.release_attention_pdl is True
 
     def run() -> None:
         plan.run(
@@ -3861,8 +3868,8 @@ def test_prepared_q_token_kv_block_sparse_fp8_grouped_tp4_bs256_cuda_graph(
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(
-        plan._metadata_plan.seq_lens[active_groups:],
-        torch.ones_like(plan._metadata_plan.seq_lens[active_groups:]),
+        plan.metadata_plan.seq_lens[active_groups:],
+        torch.ones_like(plan.metadata_plan.seq_lens[active_groups:]),
     )
     assert torch.isfinite(prepared_output).all()
     torch.testing.assert_close(
@@ -3921,7 +3928,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
         dtype=torch.uint8,
         device="cuda",
     )
-    unified_layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
+    unified_layout = get_workspace_layout(
         blocks.shape[0],
         block_topk,
         table.shape[1],
@@ -4324,7 +4331,7 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     writes E4M3 tiles for FP8 Q and exact BF16 tiles for BF16 Q.
     """
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+    from flashinfer.attention.prims_ts.variants.decode.kernel.config import (
         get_max_active_clusters_for_cluster_size,
     )
 
@@ -4834,7 +4841,7 @@ def test_persistent_routes_run_longest_first(
     # Only shared patterns take the order, so per-head patterns reserve no
     # route-order region, even with one KV head.
     for share, route_order_bytes in ((True, 4 * (qo_indptr.numel() - 1)), (False, 0)):
-        layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
+        layout = get_workspace_layout_from_tensors(
             query,
             caches[0],
             table,
@@ -4883,22 +4890,22 @@ def test_persistent_routes_run_longest_first(
         qo_indptr=qo_indptr,
         kv_scale_factors=kv_scale_factors,
     )
-    assert single_wave._prepared_plan._metadata_plan.route_order is None
+    assert single_wave.prepared_plan.metadata_plan.route_order is None
 
     wrapper = plan(True)
     for run in range(3):  # run 1 reuses the rearmed counter; run 2 has a short tail
         if run == 2:
-            prepared = wrapper._prepared_plan
-            wrapper._prepared_plan = dataclasses.replace(
+            prepared = wrapper.prepared_plan
+            wrapper.prepared_plan = dataclasses.replace(
                 prepared,
-                _metadata_plan=dataclasses.replace(
-                    prepared._metadata_plan, route_order_tail=8
+                metadata_plan=dataclasses.replace(
+                    prepared.metadata_plan, route_order_tail=8
                 ),
             )
         output = torch.full_like(query, float("nan"))
         if run:
             # Poison the published order: a stale one fails the checks below.
-            wrapper._prepared_plan._metadata_plan.route_order.fill_(-1)
+            wrapper.prepared_plan.metadata_plan.route_order.fill_(-1)
         wrapper.run(
             query,
             caches,
@@ -4912,7 +4919,7 @@ def test_persistent_routes_run_longest_first(
         )
         torch.cuda.synchronize()
 
-        metadata = wrapper._prepared_plan._metadata_plan
+        metadata = wrapper.prepared_plan.metadata_plan
         assert metadata.route_order is not None
         routes = qo_indptr.numel() - 1
         order = metadata.route_order.cpu()
@@ -5003,8 +5010,8 @@ def test_group_suggestion_caps_route_unions_at_causal_context() -> None:
     G4 at 4096 queries), where a single request-length cap preferred G4.
     """
 
-    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
-        _mean_route_union_tokens,
+    from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata.selection import (
+        mean_route_union_tokens,
     )
 
     for prefix in (0, 100, 4000, 65536):
@@ -5018,7 +5025,7 @@ def test_group_suggestion_caps_route_unions_at_causal_context() -> None:
                     ]
                     expected = max(1, -(-sum(capped) // routes))
                     assert (
-                        _mean_route_union_tokens(
+                        mean_route_union_tokens(
                             union, group_size, seq_len_q, prefix + seq_len_q
                         )
                         == expected
@@ -5366,10 +5373,8 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
     ).contiguous()
     table = torch.arange(2 * 129, dtype=torch.int32, device="cuda").reshape(2, 129)
     if group_size in (3, 5):
-        from flashinfer.attention.prims_ts import decode as decode_module
-
-        decode_module._resolve_decode_launch_spec.cache_clear()
-        split_spec = decode_module._resolve_decode_launch_spec(
+        decode_launch.resolve_decode_launch_spec.cache_clear()
+        split_spec = decode_launch.resolve_decode_launch_spec(
             torch.cuda.current_device(),
             qo_indptr.numel() - 1,
             num_query_heads,
@@ -6032,7 +6037,9 @@ def test_fixed_query_lengths_match_explicit_metadata_and_replay(
 def test_sparse_d192_full_head_stage(monkeypatch) -> None:
     """A full D192 stage preserves the output of the partial-band pipeline."""
     from dataclasses import replace
-    from flashinfer.attention.prims_ts import _q_token_kv_block_sparse_policy as policy
+    from flashinfer.attention.prims_ts.variants.q_token_kv_block_sparse_metadata import (
+        selection as policy,
+    )
 
     select = policy.select_sparse_launch
 
@@ -6043,13 +6050,15 @@ def test_sparse_d192_full_head_stage(monkeypatch) -> None:
 
     monkeypatch.setattr(policy, "select_sparse_launch", full_head_stage)
     # The normal public path caches launch selection independently of the policy helper.
-    from flashinfer.attention.prims_ts.decode import _resolve_decode_launch_spec
+    from flashinfer.attention.prims_ts.variants.decode.launch import (
+        resolve_decode_launch_spec,
+    )
 
-    _resolve_decode_launch_spec.cache_clear()
+    resolve_decode_launch_spec.cache_clear()
     try:
         _check_current_block_budget_case(4, 192, False, 32, 2, False, torch.bfloat16)
     finally:
-        _resolve_decode_launch_spec.cache_clear()
+        resolve_decode_launch_spec.cache_clear()
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
@@ -6199,8 +6208,8 @@ def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale):
     wrapper, run, check, _, _ = _global_scale_qtoken_case(scales)
     run()
     check(*values)
-    assert wrapper._prepared_plan._attention_plan._direct_q1_inputs
-    assert wrapper._prepared_plan._attention_plan._compiled_reducer is None
+    assert wrapper.prepared_plan.attention_plan.direct_q1_inputs
+    assert wrapper.prepared_plan.attention_plan.compiled_reducer is None
     scale = scales[updated_scale]
     changed = list(values)
     changed[updated_scale] *= 1.5
@@ -6227,7 +6236,7 @@ def test_qtoken_direct_q1_pdl_query_offsets():
     )
     run()
     check(0.125, 0.75)
-    assert wrapper._prepared_plan._attention_plan._direct_q1_inputs
+    assert wrapper.prepared_plan.attention_plan.direct_q1_inputs
     late_store(offsets[2:], 2)
     torch.cuda.synchronize()
 
