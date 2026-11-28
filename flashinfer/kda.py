@@ -26,7 +26,7 @@ decode and speculative decode retain the backend exposed by
 
 import functools
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 
@@ -206,6 +206,7 @@ def recurrent_kda(
         "cudnn",
     ] = "auto",
     batch_invariant: bool = False,
+    sm_locality_domains: Optional[Sequence[int]] = None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -405,6 +406,19 @@ def recurrent_kda(
             selects the row of the ``state_checkpoints`` pool written for packed
             completed-boundary entry ``i``. The kernel writes the pool directly;
             no temporary checkpoint tensor or scatter is used.
+        sm_locality_domains (Optional[Sequence[int]]):
+            Opt-in die-local scheduling of the CuTe DSL BT=16 prefill on a GPU
+            with two locality domains (two dies, each with its own memory):
+            the locality domain (0 or 1) of every SM, by SM id. Blocks on
+            domain-0 SMs then take requests ``[0, ceil(N / 2))`` first and
+            blocks on domain-1 SMs the rest, so a caller that homes the two
+            halves of its packed tensors and state rows on the matching
+            domains gets die-local memory traffic. A device-generated
+            longest-first order is kept within each half; an explicit
+            ``seq_order`` is used as given. Results are bitwise unchanged.
+            Ignored (stock scheduling) for one request, when the map does not
+            cover every SM or does not name exactly domains 0 and 1, and by
+            the other backends and ``batch_invariant=True``.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
@@ -1173,6 +1187,7 @@ def recurrent_kda(
                     checkpoint_cu_starts=checkpoint_cu_starts,
                     checkpoint_state_indices=checkpoint_state_indices,
                     checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    sm_locality_domains=sm_locality_domains,
                 )
 
     use_flash_kda_prefill = (
@@ -1372,6 +1387,51 @@ class RecurrentKDAPrefillWrapper:
         self._impl.plan(cu_seqlens, non_blocking=non_blocking)
 
     @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
+    def scratch_layout(
+        self, seq_lens: Sequence[int], num_heads: int
+    ) -> tuple[int, list[list[tuple[int, int]]]]:
+        """Size and layout of the scratch buffer ``run`` uses for these lengths.
+
+        Returns ``(num_bytes, ranges)``: ``ranges[i]`` lists the ``(start,
+        stop)`` byte ranges that hold sequence ``i``'s intermediate factors.
+        ``num_bytes`` is 0 when the shape needs no scratch.  The size depends
+        only on the number of sequences, their total length and ``num_heads``.
+        """
+
+        from .kda_prefill_cute import _scratch_layout
+
+        return _scratch_layout(seq_lens, num_heads, self.device)
+
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
+    def set_scratch(self, scratch: torch.Tensor) -> None:
+        """Use a caller-owned scratch buffer instead of allocating one.
+
+        ``scratch`` is a contiguous, 16-byte-aligned 1-D uint8 tensor on this
+        wrapper's device with at least ``scratch_layout(...)[0]`` bytes; its
+        contents need not be initialized.  Call it before the first ``run``.  This lets a caller
+        that places memory (see ``sm_locality_domains`` of
+        :func:`flashinfer.kda.recurrent_kda`) home each sequence's scratch
+        with that sequence's other data.
+        """
+
+        if self._impl.total_tokens is not None:
+            raise RuntimeError("set_scratch must be called before the first run")
+        if (
+            scratch.dtype != torch.uint8
+            or scratch.ndim != 1
+            or scratch.device != self.device
+            or not scratch.is_contiguous()
+            or scratch.data_ptr() % 16 != 0
+        ):
+            raise ValueError(
+                "scratch must be a contiguous, 16-byte-aligned 1-D uint8 "
+                "tensor on the wrapper's device"
+            )
+        workspace = self._impl.workspace
+        workspace.__dict__["_cute_dsl_workspace"] = scratch
+        workspace.__dict__["_cute_dsl_workspace_is_callers"] = True
+
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
     def run(
         self,
         q: torch.Tensor,
@@ -1394,6 +1454,7 @@ class RecurrentKDAPrefillWrapper:
         checkpoint_every_n_tokens: int = 0,
         checkpoint_state_indices: Optional[torch.Tensor] = None,
         ssm_state_indices: Optional[torch.Tensor] = None,
+        sm_locality_domains: Optional[Sequence[int]] = None,
     ) -> (
         tuple[torch.Tensor, Optional[torch.Tensor]]
         | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -1421,4 +1482,5 @@ class RecurrentKDAPrefillWrapper:
             checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             ssm_state_indices=ssm_state_indices,
+            sm_locality_domains=sm_locality_domains,
         )

@@ -324,6 +324,48 @@ def force_route(mode: Optional[str]) -> Iterator[None]:
         _ROUTE_MODE.reset(token)
 
 
+def _die1_sm_mask(sm_locality_domains, sm_count: int, num_sequences: int) -> tuple:
+    """Compile-time ``DIE1_SM_MASK`` of the die-local kernel variant, or ``()``.
+
+    Signed 32-bit words: bit ``s % 32`` of word ``s // 32`` is set when SM ``s``
+    is on locality domain 1.  ``()`` keeps the stock build: no map, a single
+    sequence (nothing to split), a map that does not cover every SM, or one that
+    does not name exactly domains 0 and 1.
+    """
+
+    if sm_locality_domains is None or num_sequences < 2:
+        return ()
+    domains = [int(domain) for domain in sm_locality_domains]
+    if len(domains) != sm_count or set(domains) != {0, 1}:
+        return ()
+    words = [0] * ((sm_count + 31) // 32)
+    for sm, domain in enumerate(domains):
+        words[sm // 32] |= domain << (sm % 32)
+    return tuple(word - (1 << 32) if word >> 31 else word for word in words)
+
+
+def _scratch_layout(
+    seq_lens, num_heads: int, device: torch.device
+) -> tuple[int, list[list[tuple[int, int]]]]:
+    """``RecurrentKDAPrefillWrapper.scratch_layout`` for the CuTe DSL backend."""
+
+    from .kda_kernels.kda_chunked_bt16 import (
+        _decomp_ws_bytes,
+        _route_for_workspace,
+        workspace_ranges,
+    )
+
+    seq_lens = [int(seq_len) for seq_len in seq_lens]
+    route = _ROUTE_MODE.get() or "auto"
+    if _route_for_workspace(len(seq_lens), num_heads, device, route) == "engine":
+        return 0, [[] for _ in seq_lens]
+    capacity = _max_packed_chunks(sum(seq_lens), len(seq_lens))
+    return (
+        _decomp_ws_bytes(num_heads, capacity),
+        workspace_ranges(seq_lens, num_heads, capacity),
+    )
+
+
 def _get_compiled_cute_dsl_kda(
     *,
     mode: Optional[str] = None,
@@ -334,6 +376,7 @@ def _get_compiled_cute_dsl_kda(
     has_state_ckpt: bool,
     has_state_indices: bool,
     has_checkpoint_state_indices: bool,
+    die1_sm_mask: tuple = (),
 ):
     # Keep the large CuTe DSL module lazy so normal Cake and decode imports do
     # not initialize its compilation stack.
@@ -357,6 +400,7 @@ def _get_compiled_cute_dsl_kda(
         has_state_indices=has_state_indices,
         has_checkpoint_state_indices=has_checkpoint_state_indices,
         mode=mode,
+        die1_sm_mask=die1_sm_mask,
     )
 
 
@@ -382,6 +426,7 @@ def _run_cute_dsl_kda_prefill(
     checkpoint_every_n_tokens: int,
     state_indices: Optional[torch.Tensor] = None,
     checkpoint_state_indices: Optional[torch.Tensor] = None,
+    sm_locality_domains=None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -481,6 +526,22 @@ def _run_cute_dsl_kda_prefill(
         cu_seqlens = cu_seqlens.to(torch.int64)
 
     route = _ROUTE_MODE.get()
+    die1_sm_mask, die_claim = (), None
+    if sm_locality_domains is not None:
+        die1_sm_mask = _die1_sm_mask(
+            sm_locality_domains,
+            torch.cuda.get_device_properties(q.device).multi_processor_count,
+            num_sequences,
+        )
+    if die1_sm_mask:
+        # The claim counter must not be shared with a launch this one can
+        # overlap: it lives on the caller's workspace (one stream) or is new
+        # for every call.
+        die_claim = getattr(prefill_workspace, "_cute_dsl_die_claim", None)
+        if die_claim is None:
+            die_claim = torch.zeros(1, dtype=torch.int64, device=q.device)
+            if prefill_workspace is not None:
+                prefill_workspace.__dict__["_cute_dsl_die_claim"] = die_claim
     compiled = _get_compiled_cute_dsl_kda(
         **({} if route is None else {"mode": route}),
         lower_bound=float(lower_bound),
@@ -490,6 +551,7 @@ def _run_cute_dsl_kda_prefill(
         has_state_ckpt=state_checkpoints is not None,
         has_state_indices=state_indices is not None,
         has_checkpoint_state_indices=checkpoint_state_indices is not None,
+        die1_sm_mask=die1_sm_mask,
     )
     planned_cu_chunks = (
         getattr(prefill_workspace, "_cute_dsl_cu_chunks", None)
@@ -574,6 +636,7 @@ def _run_cute_dsl_kda_prefill(
             planned_cu_chunks=planned_cu_chunks,
             planned_total_chunks=planned_total_chunks,
             generate_planned_metadata=generate_planned_metadata,
+            die_claim=die_claim,
             **checkpoint_kwargs,
         )
 
@@ -597,6 +660,12 @@ def _run_cute_dsl_kda_prefill(
                     raise RuntimeError(
                         "backend='cute-dsl' prefill workspace is not large enough "
                         "for CUDA graph capture; warm the largest shape first"
+                    )
+                if getattr(workspace_owner, "_cute_dsl_workspace_is_callers", False):
+                    raise ValueError(
+                        "the buffer passed to set_scratch is smaller than this "
+                        f"call needs ({workspace_bytes} bytes); size it with "
+                        "scratch_layout"
                     )
                 workspace = torch.empty(
                     workspace_bytes, dtype=torch.uint8, device=q.device
