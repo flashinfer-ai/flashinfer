@@ -214,8 +214,9 @@ def _run_fp8(
     m_indptr: Optional[torch.Tensor] = None,
     m_keys: Optional[torch.Tensor] = None,
     masked_m: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
 ) -> None:
-    """``out = scale_a * scale_b * (a @ b)``: ``a`` ``(batch, M, K)``, ``b`` ``(batch, K, N)``
+    """``out = scale_a * scale_b * (a @ b) + bias``: ``a`` ``(batch, M, K)``, ``b`` ``(batch, K, N)``
     (``shuffled``: the trtllm weight, batch 1: per-tensor ``(K / 128, N, 128)``, MXFP8 its
     rows in the shuffle), ``out`` ``(batch, M, N)``; ``mx``: the MXFP8 block scales of the
     stacked rows (``a8x4``: ``A``'s in the 8x4 layout); ``gm`` (batch 1): groupwise, the FP32
@@ -223,7 +224,9 @@ def _run_fp8(
     128)][ceil(K / 128)]`` (any strides). ``a`` and ``out`` batch 1 routed to ``b[i]``:
     ``m_indptr`` (groupwise) rows ``m_indptr[i] .. m_indptr[i + 1]``, ``m_keys`` (MXFP8,
     ``scale_b`` each group's at a 128-row atom) the rows of key ``i``; ``masked_m``: the first
-    ``masked_m[i]`` rows of batch ``i``. Rows routed nowhere are left unwritten."""
+    ``masked_m[i]`` rows of batch ``i``. Rows routed nowhere are left unwritten. ``bias``
+    (per-tensor scales, unrouted): ``(N,)`` of ``out``'s type, added to the FP32 result before
+    the one rounding, as cuBLASLt's bias epilogue."""
     batches, m, k = (int(x) for x in a.shape)
     n = int(out.shape[2])
     routed = m_indptr is not None or m_keys is not None
@@ -259,7 +262,7 @@ def _run_fp8(
                     out[i : i + 1, r0 : r0 + rows], r, shuffled, mx, a8x4, gm,
                     None if m_indptr is None else m_indptr - r0,
                     None if m_keys is None else m_keys[r0 : r0 + rows],
-                    None if masked_m is None else masked_m[i : i + 1] - r0,
+                    None if masked_m is None else masked_m[i : i + 1] - r0, bias,
                 )  # fmt: skip
         return
     x = a.view(torch.uint8)
@@ -293,15 +296,19 @@ def _run_fp8(
         ids = torch.where(t < masked_m[:, None], i[:, None], -1).view(-1)
     if ids is not None:
         _route_rows(ids, groups, r, max_blocks, meta, rowmap, workspace)
-    direct = n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
+    # with a bias the GEMM writes FP32 and the bias joins it before the one rounding
+    tdtype = out.dtype if bias is None else torch.float32
+    direct = (
+        bias is None and n % 8 == 0 and out.is_contiguous() and out.data_ptr() % 16 == 0
+    )
     target = (
         out.view(rows, n)
         if direct
-        else torch.empty((rows, _pad(n, 8)), dtype=out.dtype, device=a.device)
+        else torch.empty((rows, _pad(n, 8)), dtype=tdtype, device=a.device)
     )
     if not direct and (routed or masked_m is not None):  # rows routed nowhere kept
         target[:, :n].view(batches, m, n).copy_(out)
-    gemm = module if out.dtype == torch.bfloat16 else _out_module(out.dtype)
+    gemm = module if tdtype == torch.bfloat16 else _out_module(tdtype)
     alpha, beta, sf, asf, gsa, gsb = scale_a, scale_b, None, None, None, None
     if mx:
         alpha, beta, sf, asf = _ones(a.device), None, scale_b, scale_a
@@ -313,6 +320,8 @@ def _run_fp8(
         w, alpha, beta, act, meta, rowmap, target, r, n, k, max_blocks, groups, rs, ks, bs,
         _FMT[b.dtype], shuffled, sf, asf, a8x4, sf_bstride, gsa, gsb, max(gm, 1), None,
     )  # fmt: skip
+    if bias is not None:
+        target = target[:, :n] + bias.float()
     if not direct:
         out.copy_(target[:, :n].view(batches, m, n))
 
@@ -364,7 +373,8 @@ def _check(
 
 class Sm8xFp8Runner(TunableRunner):
     """``_run_fp8`` behind ``fp8_gemm_sm100`` (``mm_fp8``, ``bmm_fp8``) as an autotuner
-    candidate on its inputs ``[a, b, scale_a, scale_b, out, workspace]``; tactic: the row tile."""
+    candidate on its inputs ``[a, b, scale_a, scale_b, out, workspace]`` (plus ``bias`` when
+    given); tactic: the row tile."""
 
     def __init__(self, names: Sequence[str]):
         self.names = tuple(names)
@@ -377,6 +387,7 @@ class Sm8xFp8Runner(TunableRunner):
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         a, b, scale_a, scale_b, out = inputs[:5]
+        bias = inputs[6] if len(inputs) > 6 else None
         shuffled = _check(self.names, a, b, out, scale_a, scale_b)
         _run_fp8(
             a,
@@ -386,6 +397,7 @@ class Sm8xFp8Runner(TunableRunner):
             out,
             64 if tactic in (None, -1) else tactic,
             shuffled,
+            bias=bias,
         )
         return out
 
