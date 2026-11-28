@@ -46,6 +46,7 @@ import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 from flashinfer.cute_dsl.fp4_common import (
     bfloat2_to_float2_scaled,
     cvt_f32x2_to_bfloat2,
@@ -1228,7 +1229,9 @@ def kernel(
                 )
             if tid == 0:
                 cute.arch.mbarrier_arrive_and_expect_tx(xbar.iterator, TMAX * 4)
-            cute.arch.mbarrier_wait(xbar.iterator, 0)
+            # The peer's push_peer_f32 complete-tx releases at cluster scope:
+            # acquire at cluster scope before recv is read.
+            mbarrier_wait_acquire_cluster(xbar.iterator, cutlass.Int32(0))
             if tid < TMAX:
                 tot2[tid] = tot[tid] + recv[tid]
             cute.arch.barrier()
