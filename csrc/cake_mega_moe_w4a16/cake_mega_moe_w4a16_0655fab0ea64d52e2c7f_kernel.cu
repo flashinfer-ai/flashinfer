@@ -49,16 +49,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
-
 #include <math_constants.h>
 
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int* __restrict__ topk_ids, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ output, int* tokens_per_rank, unsigned int* epoch, int hidden, int32_t mega_pg_world, int32_t mega_pg_rank, CakePeerPointerTable<unsigned int> mega_pg_flags, unsigned int* completion, CakePeerPointerTable<unsigned int> completion_peers)
+kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int* __restrict__ topk_ids, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ output, int* tokens_per_rank, unsigned int* epoch, int hidden, int mega_pg_world, int mega_pg_rank, const __grid_constant__ CakePeerPointerTable<unsigned int> mega_pg_flags, unsigned int* completion, const __grid_constant__ CakePeerPointerTable<unsigned int> completion_peers)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -83,7 +79,7 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
         unsigned long long row = (unsigned long long)hidden;
         int ids[8];
         float scores[8];
-        unsigned long long first_route = (unsigned long long)first_token * 8;
+        unsigned long long first_route = (unsigned long long)first_token * 8ull;
         {
             const int4* _ivptr_0 = reinterpret_cast<const int4*>(topk_ids + first_route + 0);
             int4 _ivld_0;
@@ -94,7 +90,7 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
             ids[0 + 3] = _ivld_0.w;
         }
         {
-            const int4* _ivptr_1 = reinterpret_cast<const int4*>(topk_ids + (first_route + 4) + 0);
+            const int4* _ivptr_1 = reinterpret_cast<const int4*>(topk_ids + (first_route + 4ull) + 0);
             int4 _ivld_1;
             _ivld_1 = *_ivptr_1;
             ids[4 + 0] = _ivld_1.x;
@@ -110,7 +106,7 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
             scores[0 + 3] = _v4.w;
         }
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + (first_route + 4) + 0);
+            float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + (first_route + 4ull) + 0);
             scores[4 + 0] = _v4.x;
             scores[4 + 1] = _v4.y;
             scores[4 + 2] = _v4.z;
@@ -135,7 +131,7 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
         float values[8];
         float accum[8];
         for (int token = first_token; token < live_tokens; token += token_stride) {
-            unsigned long long route_offset = (unsigned long long)token * 8;
+            unsigned long long route_offset = (unsigned long long)token * 8ull;
             unsigned long long route_base = route_offset * row + (unsigned long long)column;
             #pragma unroll
             for (int route_slot = 0; route_slot < 8; route_slot++) {
@@ -215,7 +211,7 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
             reinterpret_cast<int4*>(output + ((unsigned long long)token * row + (unsigned long long)column))[0] = reinterpret_cast<int4*>(_packed_0)[0];
             int next_token = token + token_stride;
             if (next_token < live_tokens) {
-                unsigned long long next_route = (unsigned long long)next_token * 8;
+                unsigned long long next_route = (unsigned long long)next_token * 8ull;
                 {
                     const int4* _ivptr_5 = reinterpret_cast<const int4*>(topk_ids + next_route + 0);
                     int4 _ivld_5;
@@ -226,7 +222,7 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
                     ids[0 + 3] = _ivld_5.w;
                 }
                 {
-                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(topk_ids + (next_route + 4) + 0);
+                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(topk_ids + (next_route + 4ull) + 0);
                     int4 _ivld_6;
                     _ivld_6 = *_ivptr_6;
                     ids[4 + 0] = _ivld_6.x;
@@ -242,7 +238,7 @@ kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int*
                     scores[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + (next_route + 4) + 0);
+                    float4 _v4 = *reinterpret_cast<const float4*>(topk_weights + (next_route + 4ull) + 0);
                     scores[4 + 0] = _v4.x;
                     scores[4 + 1] = _v4.y;
                     scores[4 + 2] = _v4.z;

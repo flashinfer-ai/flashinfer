@@ -26,7 +26,7 @@
 template <typename T, int Capacity = 8>
 struct __align__(16) CakePeerPointerTable { T* ptrs[Capacity]; };
 
-extern "C" __global__ void kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int* __restrict__ topk_ids, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ output, int* tokens_per_rank, unsigned int* epoch, int hidden, int32_t mega_pg_world, int32_t mega_pg_rank, CakePeerPointerTable<unsigned int> mega_pg_flags, unsigned int* completion, CakePeerPointerTable<unsigned int> completion_peers);
+extern "C" __global__ void kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f(__nv_bfloat16* route_terms, int* __restrict__ topk_ids, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ output, int* tokens_per_rank, unsigned int* epoch, int hidden, int mega_pg_world, int mega_pg_rank, const __grid_constant__ CakePeerPointerTable<unsigned int> mega_pg_flags, unsigned int* completion, const __grid_constant__ CakePeerPointerTable<unsigned int> completion_peers);
 
 namespace cake_binding_kernel_cake_mega_moe_w4a16_0655fab0ea64d52e2c7f {
 
