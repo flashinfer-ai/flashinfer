@@ -79,9 +79,9 @@ def _expected_paged_index_topk(
         ),
         seqlens_per_query=seqlens,
     )
-    raw = torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).indices.to(
-        torch.int32
-    )
+    # Deterministic tie-break: (score desc, index asc), matching the kernel's
+    # two-phase select. Stable argsort on -logits gives that order per row.
+    raw = torch.argsort(-logits, dim=1, stable=True)[:, :topk].to(torch.int32)
     return raw
 
 

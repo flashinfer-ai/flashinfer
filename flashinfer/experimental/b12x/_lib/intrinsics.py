@@ -646,6 +646,24 @@ def ld_global_cg_f32(base_ptr: Int64, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def ld_global_cg_i32(base_ptr: Int64, *, loc=None, ip=None) -> Int32:
+    """Load an int32 from global memory at L2 (.cg), bypassing L1."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "ld.global.cg.s32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_global_b16(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
     """Load one 16-bit global-memory payload into a 32-bit register.
 
@@ -2390,6 +2408,22 @@ def threadfence(*, loc=None, ip=None):
         None,
         [],
         "membar.gl;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def threadfence_sys(*, loc=None, ip=None):
+    """Emit membar.sys — threadfence across system memory (strongest)."""
+    llvm.inline_asm(
+        None,
+        [],
+        "membar.sys;",
         "",
         has_side_effects=True,
         is_align_stack=False,

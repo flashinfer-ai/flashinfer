@@ -31,6 +31,9 @@ from b12x._lib.compiler import (
 from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
     atomic_add_shared_i32,
+    get_ptr_as_int64,
+    ld_global_cg_f32,
+    ld_global_cg_i32,
     ld_shared_i32,
     ld_shared_i32_relaxed,
     red_add_shared_i32,
@@ -66,6 +69,31 @@ def _resolve_smem_candidate_capacity(*, topk: int) -> int:
     if int(topk) == 512:
         return _TOPK512_SMEM_CANDIDATES
     return _DEFAULT_SMEM_CANDIDATES
+
+
+@cute.jit
+def _tie_break_column_index(
+    carry_indices,
+    row_start: Int32,
+    output_index_offset: Int32,
+    carry_base: Int32,
+    chunk_len: Int32,
+    vidx: Int32,
+    is_first: cutlass.Constexpr[bool],
+) -> Int32:
+    """Logical K-column index for a virtual candidate index (the tie-break key),
+    mirroring _emit_global_index_virtual without physical-slot translation. Carry
+    candidates resolve through carry_indices so the supertile fold perturbs by the
+    same column identity the reference sees."""
+    col = Int32(0)
+    if cutlass.const_expr(is_first):
+        col = row_start + vidx + output_index_offset
+    else:
+        if vidx < chunk_len:
+            col = row_start + vidx + output_index_offset
+        else:
+            col = Int32(carry_indices[carry_base + (vidx - chunk_len)])
+    return col
 
 
 @dsl_user_op
@@ -321,6 +349,8 @@ def _exact_overflow_fallback(
     s_hist0: cute.Tensor,
     s_hist1: cute.Tensor,
     s_out: cute.Tensor,
+    s_cand0: cute.Tensor,
+    s_cand1: cute.Tensor,
     h0: Int32,
     ctr: Int32,
     thr: Int32,
@@ -329,8 +359,10 @@ def _exact_overflow_fallback(
     lr: Int32,
     flat: cutlass.Constexpr[bool],
     flat_values,
+    flat_lindex,
     input_tensor,
     carry_values,
+    carry_indices,
     row_base: Int32,
     row_start: Int32,
     carry_base: Int32,
@@ -339,6 +371,7 @@ def _exact_overflow_fallback(
     block_k: cutlass.Constexpr[int],
     is_tiled: cutlass.Constexpr[bool],
     is_first: cutlass.Constexpr[bool],
+    output_index_offset: Int32,
 ):
     """Exact overflow fallback shared by the tiled and fused radix kernels.
 
@@ -366,23 +399,22 @@ def _exact_overflow_fallback(
         cute.arch.sync_threads()
         idx_base = Int32(tx)
         while idx_base < n_total:
-            ex_key = _convert_to_uint32(
-                _fallback_load_value(
-                    flat,
-                    idx_base,
-                    flat_values,
-                    input_tensor,
-                    carry_values,
-                    row_base,
-                    row_start,
-                    carry_base,
-                    chunk_len,
-                    block_q,
-                    block_k,
-                    is_tiled,
-                    is_first,
-                )
+            ex_val = _fallback_load_value(
+                flat,
+                idx_base,
+                flat_values,
+                input_tensor,
+                carry_values,
+                row_base,
+                row_start,
+                carry_base,
+                chunk_len,
+                block_q,
+                block_k,
+                is_tiled,
+                is_first,
             )
+            ex_key = _convert_to_uint32(ex_val)
             if cutlass.const_expr(ex_round == 0):
                 _smem_red_add(h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1))
             else:
@@ -431,33 +463,173 @@ def _exact_overflow_fallback(
     cute.arch.sync_threads()
     idx_base = Int32(tx)
     while idx_base < n_total:
-        ex_key = _convert_to_uint32(
-            _fallback_load_value(
-                flat,
-                idx_base,
-                flat_values,
-                input_tensor,
-                carry_values,
-                row_base,
-                row_start,
-                carry_base,
-                chunk_len,
-                block_q,
-                block_k,
-                is_tiled,
-                is_first,
-            )
+        ex_val = _fallback_load_value(
+            flat,
+            idx_base,
+            flat_values,
+            input_tensor,
+            carry_values,
+            row_base,
+            row_start,
+            carry_base,
+            chunk_len,
+            block_q,
+            block_k,
+            is_tiled,
+            is_first,
         )
+        ex_key = _convert_to_uint32(ex_val)
         if ex_key > ex_pivot:
             ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
             if ex_pos < topk_static:
                 s_out[ex_pos] = idx_base
         idx_base += Int32(_THREADS_PER_CTA)
     cute.arch.sync_threads()
-    idx_base = Int32(tx)
-    while idx_base < n_total:
-        ex_key = _convert_to_uint32(
-            _fallback_load_value(
+    # Pivot ties (key == ex_pivot) are filled deterministically by logical
+    # column (ascending), not by _smem_xadd arrival order.
+    winner_count = Int32(_smem_ld(ctr, Int32(0)))
+    _deterministic_tie_fill(
+        tx,
+        n_total,
+        topk_static - winner_count,
+        ex_pivot,
+        s_hist0,
+        s_hist1,
+        s_out,
+        winner_count,
+        s_cand0,
+        s_cand1,
+        h0,
+        ctr,
+        thr,
+        ni0,
+        ni1,
+        lr,
+        flat,
+        False,
+        flat_values,
+        flat_lindex,
+        input_tensor,
+        carry_values,
+        carry_indices,
+        row_base,
+        row_start,
+        carry_base,
+        chunk_len,
+        block_q,
+        block_k,
+        is_tiled,
+        is_first,
+        output_index_offset,
+    )
+
+
+@cute.jit
+def _deterministic_tie_fill(
+    tx: Int32,
+    n_total: Int32,
+    remaining: Int32,
+    pivot_key: Uint32,
+    s_hist0: cute.Tensor,
+    s_hist1: cute.Tensor,
+    s_out: cute.Tensor,
+    out_base: Int32,
+    s_cand0: cute.Tensor,
+    s_cand1: cute.Tensor,
+    h0: Int32,
+    ctr: Int32,
+    thr: Int32,
+    ni0: Int32,
+    ni1: Int32,
+    lr: Int32,
+    flat: cutlass.Constexpr[bool],
+    cg_load: cutlass.Constexpr[bool],
+    flat_values,
+    flat_lindex,
+    input_tensor,
+    carry_values,
+    carry_indices,
+    row_base: Int32,
+    row_start: Int32,
+    carry_base: Int32,
+    chunk_len: Int32,
+    block_q: cutlass.Constexpr[int],
+    block_k: cutlass.Constexpr[int],
+    is_tiled: cutlass.Constexpr[bool],
+    is_first: cutlass.Constexpr[bool],
+    output_index_offset: Int32,
+):
+    """Deterministic pivot-tie fill (two-phase selection, phase 2).
+
+    Among the candidates whose true score key equals ``pivot_key``, select the
+    ``remaining`` smallest logical K-columns and write their candidate indices
+    into ``s_out[out_base : out_base+remaining]`` in ascending column order.
+    Re-scans the ``n_total`` candidates and reuses the radix machinery with the
+    logical column as an ascending integer key, so exact score ties resolve by
+    column identity rather than ``_smem_xadd`` arrival order. Only invoked when
+    the histogram implies pivot ties (``remaining > 0``), so the no-tie common
+    case pays nothing. All 1024 threads must call this.
+
+    ``flat`` selects the source: the fused kernel passes ``flat_values``/
+    ``flat_lindex`` (value and logical-index arrays); the tiled kernel passes
+    the virtual-index loaders (``flat`` False) so carry candidates resolve
+    through ``carry_indices``.
+    """
+    # ---- phase A: ascending radix-select on the logical column ----
+    # pivot_col = remaining-th smallest logical column among key == pivot_key.
+    if tx == Int32(0):
+        _smem_st(thr, Int32(0), remaining)
+        _smem_st(ni1, Int32(0), Int32(0))
+    cute.arch.sync_threads()
+    col_prefix = Uint32(0)
+    for tf_round in cutlass.range_constexpr(4):
+        tf_shift = Uint32(24 - tf_round * 8)
+        tf_prefix = Uint32(_smem_ld(ni1, Int32(0)))
+        if tx < Int32(256):
+            s_hist0[tx] = Int32(0)
+        cute.arch.sync_threads()
+        idx_base = Int32(tx)
+        tf_full_limit = n_total - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+        tf_mask = Uint32(
+            0 if tf_round == 0 else (0xFFFFFFFF << (32 - tf_round * 8)) & 0xFFFFFFFF
+        )
+        while idx_base < tf_full_limit:
+            for tf_scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
+                tf_idx = idx_base + Int32(tf_scan_u * _THREADS_PER_CTA)
+                tf_val = _fallback_load_value(
+                    flat,
+                    tf_idx,
+                    flat_values,
+                    input_tensor,
+                    carry_values,
+                    row_base,
+                    row_start,
+                    carry_base,
+                    chunk_len,
+                    block_q,
+                    block_k,
+                    is_tiled,
+                    is_first,
+                )
+                if _convert_to_uint32(tf_val) == pivot_key:
+                    if cutlass.const_expr(flat):
+                        tf_col = Int32(flat_lindex[tf_idx])
+                    else:
+                        tf_col = _tie_break_column_index(
+                            carry_indices,
+                            row_start,
+                            output_index_offset,
+                            carry_base,
+                            chunk_len,
+                            tf_idx,
+                            is_first,
+                        )
+                    if (Uint32(tf_col) & tf_mask) == tf_prefix:
+                        tf_byte = Int32((Uint32(tf_col) >> tf_shift) & Uint32(0xFF))
+                        _smem_red_add(h0, tf_byte, Int32(1))
+            idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
+        while idx_base < n_total:
+            tf_val = _fallback_load_value(
                 flat,
                 idx_base,
                 flat_values,
@@ -472,12 +644,161 @@ def _exact_overflow_fallback(
                 is_tiled,
                 is_first,
             )
-        )
-        if ex_key == ex_pivot:
-            ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
-            if ex_pos < topk_static:
-                s_out[ex_pos] = idx_base
+            if _convert_to_uint32(tf_val) == pivot_key:
+                if cutlass.const_expr(flat):
+                    tf_col = Int32(flat_lindex[idx_base])
+                else:
+                    tf_col = _tie_break_column_index(
+                        carry_indices,
+                        row_start,
+                        output_index_offset,
+                        carry_base,
+                        chunk_len,
+                        idx_base,
+                        is_first,
+                    )
+                if (Uint32(tf_col) & tf_mask) == tf_prefix:
+                    tf_byte = Int32((Uint32(tf_col) >> tf_shift) & Uint32(0xFF))
+                    _smem_red_add(h0, tf_byte, Int32(1))
+            idx_base += Int32(_THREADS_PER_CTA)
+        cute.arch.sync_threads()
+        # Inclusive prefix sum (ascending): s_hist0[tx] = sum(hist[0..tx]).
+        for tf_stage in cutlass.range_constexpr(8):
+            tf_j = Int32(1 << tf_stage)
+            if tx < Int32(256):
+                if (tf_stage & 1) == 0:
+                    tf_v = Int32(s_hist0[tx])
+                    if tx >= tf_j:
+                        tf_v = tf_v + Int32(s_hist0[tx - tf_j])
+                    s_hist1[tx] = tf_v
+                else:
+                    tf_v = Int32(s_hist1[tx])
+                    if tx >= tf_j:
+                        tf_v = tf_v + Int32(s_hist1[tx - tf_j])
+                    s_hist0[tx] = tf_v
+            cute.arch.sync_threads()
+        if tx < Int32(256):
+            tf_cum = Int32(s_hist0[tx])
+            tf_cum_prev = Int32(0)
+            if tx > Int32(0):
+                tf_cum_prev = Int32(s_hist0[tx - Int32(1)])
+            tf_rem = Int32(_smem_ld(thr, Int32(0)))
+            if (tf_cum >= tf_rem) & (tf_cum_prev < tf_rem):
+                _smem_st(thr, Int32(0), tf_rem - tf_cum_prev)
+                _smem_st(ni0, Int32(0), Int32(tx))
+        cute.arch.sync_threads()
+        if tx == Int32(0):
+            tf_byte = Uint32(_smem_ld(ni0, Int32(0)))
+            _smem_st(thr, Int32(0), _smem_ld(thr, Int32(0)))
+            col_prefix = col_prefix | (tf_byte << tf_shift)
+            _smem_st(ni1, Int32(0), Int32(col_prefix))
+        cute.arch.sync_threads()
+    pivot_col = Int32(_smem_ld(ni1, Int32(0)))
+
+    # ---- phase B: collect the selected pivot ties (col <= pivot_col) ----
+    if tx == Int32(0):
+        _smem_st(ctr, Int32(0), Int32(0))
+    cute.arch.sync_threads()
+    idx_base = Int32(tx)
+    tf_full_limit = n_total - Int32((_SCAN_UNROLL - 1) * _THREADS_PER_CTA)
+    while idx_base < tf_full_limit:
+        for tf_scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
+            tf_idx = idx_base + Int32(tf_scan_u * _THREADS_PER_CTA)
+            if cutlass.const_expr(flat and cg_load):
+                tf_val = ld_global_cg_f32(get_ptr_as_int64(flat_values, tf_idx))
+            else:
+                tf_val = _fallback_load_value(
+                    flat,
+                    tf_idx,
+                    flat_values,
+                    input_tensor,
+                    carry_values,
+                    row_base,
+                    row_start,
+                    carry_base,
+                    chunk_len,
+                    block_q,
+                    block_k,
+                    is_tiled,
+                    is_first,
+                )
+            if _convert_to_uint32(tf_val) == pivot_key:
+                if cutlass.const_expr(flat and cg_load):
+                    tf_col = ld_global_cg_i32(get_ptr_as_int64(flat_lindex, tf_idx))
+                elif cutlass.const_expr(flat):
+                    tf_col = Int32(flat_lindex[tf_idx])
+                else:
+                    tf_col = _tie_break_column_index(
+                        carry_indices,
+                        row_start,
+                        output_index_offset,
+                        carry_base,
+                        chunk_len,
+                        tf_idx,
+                        is_first,
+                    )
+                if tf_col <= pivot_col:
+                    tf_pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                    s_cand0[tf_pos] = tf_idx
+                    s_cand1[tf_pos] = tf_col
+        idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
+    while idx_base < n_total:
+        if cutlass.const_expr(flat and cg_load):
+            tf_val = ld_global_cg_f32(get_ptr_as_int64(flat_values, idx_base))
+        else:
+            tf_val = _fallback_load_value(
+                flat,
+                idx_base,
+                flat_values,
+                input_tensor,
+                carry_values,
+                row_base,
+                row_start,
+                carry_base,
+                chunk_len,
+                block_q,
+                block_k,
+                is_tiled,
+                is_first,
+            )
+        if _convert_to_uint32(tf_val) == pivot_key:
+            if cutlass.const_expr(flat and cg_load):
+                tf_col = ld_global_cg_i32(get_ptr_as_int64(flat_lindex, idx_base))
+            elif cutlass.const_expr(flat):
+                tf_col = Int32(flat_lindex[idx_base])
+            else:
+                tf_col = _tie_break_column_index(
+                    carry_indices,
+                    row_start,
+                    output_index_offset,
+                    carry_base,
+                    chunk_len,
+                    idx_base,
+                    is_first,
+                )
+            if tf_col <= pivot_col:
+                tf_pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                s_cand0[tf_pos] = idx_base
+                s_cand1[tf_pos] = tf_col
         idx_base += Int32(_THREADS_PER_CTA)
+    cute.arch.sync_threads()
+    out_count = Int32(_smem_ld(ctr, Int32(0)))
+
+    # ---- phase C: emit in ascending column order ----
+    # Columns are unique, so rank_i = #{j : col_j < col_i} is a permutation of
+    # [0, out_count). The O(out_count^2) rank scan is affordable because this
+    # path only runs on tie-heavy rows and out_count <= topk.
+    i = Int32(tx)
+    while i < out_count:
+        my_col = Int32(s_cand1[i])
+        rank = Int32(0)
+        j = Int32(0)
+        while j < out_count:
+            if Int32(s_cand1[j]) < my_col:
+                rank = rank + Int32(1)
+            j = j + Int32(1)
+        s_out[out_base + rank] = Int32(s_cand0[i])
+        i = i + Int32(_THREADS_PER_CTA)
     cute.arch.sync_threads()
 
 
@@ -1039,6 +1360,9 @@ class DSATiledTopkKernel:
                     topk = Int32(-1)
 
                 # Stage 2: refine with 8-bit radix passes
+                # Accumulate the exact pivot score key (MSD byte first) so the
+                # deterministic pivot-tie fill below can re-find key == pivot.
+                pivot_key = Uint32(0)
                 for round_idx in cutlass.range_constexpr(4):
                     if topk != Int32(-1):
                         r_idx_is_0 = (round_idx % 2) == 0
@@ -1086,6 +1410,7 @@ class DSATiledTopkKernel:
                         cute.arch.sync_threads()
 
                         sub_threshold = _smem_ld(thr, Int32(0))
+                        pivot_key = (pivot_key << Uint32(8)) | Uint32(sub_threshold)
                         topk = topk - Int32(s_hist0[sub_threshold + Int32(1)])
 
                         # Quick exit
@@ -1157,11 +1482,9 @@ class DSATiledTopkKernel:
                                 else:
                                     if Int32(bin) == sub_threshold:
                                         if cutlass.const_expr(round_idx == 3):
-                                            old_rem = _smem_xadd(
-                                                lr, Int32(0), Int32(-1)
-                                            )
-                                            if old_rem > Int32(0):
-                                                s_out[topk_static - old_rem] = c_idx
+                                            # Pivot ties are filled deterministically by
+                                            # _deterministic_tie_fill after the refine loop.
+                                            pass
                                         else:
                                             cand_pos = (
                                                 _smem_xadd(ni0, Int32(0), Int32(1))
@@ -1207,6 +1530,8 @@ class DSATiledTopkKernel:
                         s_hist0,
                         s_hist1,
                         s_out,
+                        s_cand0,
+                        s_cand1,
                         h0,
                         ctr,
                         thr,
@@ -1215,8 +1540,10 @@ class DSATiledTopkKernel:
                         lr,
                         flat=False,
                         flat_values=input_tensor,
+                        flat_lindex=carry_indices,
                         input_tensor=input_tensor,
                         carry_values=carry_values,
+                        carry_indices=carry_indices,
                         row_base=row_base,
                         row_start=row_start,
                         carry_base=out_base,
@@ -1225,6 +1552,46 @@ class DSATiledTopkKernel:
                         block_k=self.block_k,
                         is_tiled=self.is_tiled,
                         is_first=self.is_first,
+                        output_index_offset=output_index_offset,
+                    )
+                elif topk > Int32(0):
+                    # No overflow: the refine above emitted every winner with
+                    # score > pivot and left `topk` pivot-tie slots. Fill them
+                    # deterministically by logical column (ascending), not by
+                    winner_count = Int32(_smem_ld(ctr, Int32(0)))
+                    _deterministic_tie_fill(
+                        tx,
+                        total_len,
+                        topk,
+                        pivot_key,
+                        s_hist0,
+                        s_hist1,
+                        s_out,
+                        winner_count,
+                        s_cand0,
+                        s_cand1,
+                        h0,
+                        ctr,
+                        thr,
+                        ni0,
+                        ni1,
+                        lr,
+                        False,
+                        False,
+                        input_tensor,
+                        carry_indices,
+                        input_tensor,
+                        carry_values,
+                        carry_indices,
+                        row_base,
+                        row_start,
+                        out_base,
+                        length,
+                        self.block_q,
+                        self.block_k,
+                        self.is_tiled,
+                        self.is_first,
+                        output_index_offset,
                     )
 
             cute.arch.sync_threads()

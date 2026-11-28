@@ -1386,9 +1386,9 @@ def test_contiguous_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
         metadata=metadata,
         preinitialize_invalid_logits=False,
     )
-    expected = torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).indices.to(
-        torch.int32
-    )
+    # Deterministic tie-break: (score desc, index asc), matching the kernel's
+    # two-phase select. Stable argsort on -logits gives that order per row.
+    expected = torch.argsort(-logits, dim=1, stable=True)[:, :topk].to(torch.int32)
 
     torch.cuda.synchronize(device)
     assert actual.shape == (q_rows, topk)
@@ -1458,9 +1458,9 @@ def test_contiguous_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
         metadata=metadata,
         preinitialize_invalid_logits=False,
     )
-    expected = torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).indices.to(
-        torch.int32
-    )
+    # Deterministic tie-break: (score desc, index asc), matching the kernel's
+    # two-phase select. Values are gathered from unperturbed logits.
+    expected = torch.argsort(-logits, dim=1, stable=True)[:, :topk].to(torch.int32)
 
     torch.cuda.synchronize(device)
     assert actual.shape == (q_rows, topk)
