@@ -94,7 +94,9 @@ from .trace.templates.gemm import (
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .utils import (
+    _PACKED_INDEX_BACKENDS,
     SINGLE_KERNEL_TMP_SIZE,
+    _to_device_packed,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -4567,7 +4569,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     )
                 owned.copy_(qo_indptr, non_blocking=non_blocking)
                 self._qo_indptr_buf = owned
-            else:
+            elif self._backend == "cudnn":
                 self._qo_indptr_buf = qo_indptr.to(
                     self.device, non_blocking=non_blocking
                 )
@@ -4576,16 +4578,27 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # Graph mode above still refreshes every retained FA2 buffer.
                 self._paged_kv_indptr_buf = None
                 self._paged_kv_last_page_len_buf = None
+                self._paged_kv_indices_buf = paged_kv_indices.to(
+                    self.device, non_blocking=non_blocking
+                )
             else:
-                self._paged_kv_indptr_buf = paged_kv_indptr.to(
-                    self.device, non_blocking=non_blocking
+                # One device buffer for the host index tensors: see _to_device_packed.
+                (
+                    self._paged_kv_indptr_buf,
+                    self._paged_kv_last_page_len_buf,
+                    self._qo_indptr_buf,
+                    self._paged_kv_indices_buf,
+                ) = _to_device_packed(
+                    (
+                        paged_kv_indptr,
+                        paged_kv_last_page_len,
+                        qo_indptr,
+                        paged_kv_indices,
+                    ),
+                    self.device,
+                    non_blocking,
+                    pack=self._backend in _PACKED_INDEX_BACKENDS,
                 )
-                self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(
-                    self.device, non_blocking=non_blocking
-                )
-            self._paged_kv_indices_buf = paged_kv_indices.to(
-                self.device, non_blocking=non_blocking
-            )
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask.to(
                     self.device, non_blocking=non_blocking
